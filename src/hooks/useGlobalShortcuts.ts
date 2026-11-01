@@ -28,6 +28,8 @@ export interface ShortcutContext {
   togglePalette: () => void;
   /** ⌘⇧P: the "Open a pull request" composer for the active workspace. */
   openPrComposer: () => void;
+  /** The active workspace's checked-out branch (`"HEAD"` when detached), or null. */
+  activeBranch: () => string | null;
   openSearch: (mode: "files" | "text") => void;
   bumpLayout: () => void;
   openSettings: (tab: "general" | "usage") => void;
@@ -60,6 +62,11 @@ const DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"] as const;
 function digitOf(e: KeyboardEvent): number | null {
   const d = /^Digit([1-9])$/.exec(e.code ?? "")?.[1] ?? (/^[1-9]$/.test(e.key) ? e.key : null);
   return d ? parseInt(d, 10) : null;
+}
+
+/** Whether the key went to a CodeMirror editor or an xterm terminal. */
+function inEditorOrTerminal(target: EventTarget | null | undefined): boolean {
+  return target instanceof Element && !!target.closest(".cm-editor, .xterm");
 }
 
 export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
@@ -156,13 +163,21 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     run: (_e, c) => (c.togglePalette(), true),
   },
   {
+    // Leaves the key to a focused code editor or terminal, and needs the
+    // active workspace on a named branch — there's nothing to open from else.
     id: "open-pull-request",
     chords: ["⌘⇧P"],
     scope: "global",
     shift: true,
     alt: false,
     keys: ["p", "P"],
-    run: (_e, c) => (c.openPrComposer(), true),
+    run: (e, c) => {
+      if (inEditorOrTerminal(e.target) || !c.activeWorkspaceId) return false;
+      const branch = c.activeBranch();
+      if (!branch || branch === "HEAD") return false;
+      c.openPrComposer();
+      return true;
+    },
   },
   {
     id: "file-finder",

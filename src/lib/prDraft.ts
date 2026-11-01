@@ -100,7 +100,13 @@ function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-const bare = (b: string) => b.replace(/^origin\//, "");
+/** The branch a base names on its repo: a remote-tracking pick (`upstream/main`,
+ *  listed in `remote`) loses its remote; a local branch (`release/1.0`) stays
+ *  whole. `origin/` is stripped even when the list hasn't loaded. */
+export function bareBase(base: string, list: Partial<Pick<BranchList, "remote">> = {}): string {
+  if (list.remote?.includes(base)) return base.slice(base.indexOf("/") + 1);
+  return base.replace(/^origin\//, "");
+}
 
 /** Whether `head` can open a pull request: a named branch that isn't the
  *  repository's default branch (`list.repoDefault`; `list.local[0]` is only the
@@ -115,10 +121,10 @@ export function canOpenPrFrom(head: string | null | undefined, list: Pick<Branch
 export function prBaseFor(
   head: string | null | undefined,
   fromBranch: string | null | undefined,
-  list: Pick<BranchList, "repoDefault">,
+  list: Pick<BranchList, "repoDefault"> & Partial<Pick<BranchList, "remote">>,
 ): string | null {
   for (const b of [fromBranch, list.repoDefault]) {
-    if (b && bare(b) !== head) return b;
+    if (b && bareBase(b, list) !== head) return b;
   }
   return null;
 }

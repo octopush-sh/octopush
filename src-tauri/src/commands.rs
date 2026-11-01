@@ -4917,12 +4917,26 @@ pub async fn create_pull_request(
     if title.trim().is_empty() {
         return Err(AppError::Other("A pull request needs a title.".into()));
     }
-    let branch = {
+    // The base repo and head owner come from the remotes, so a fork, a base
+    // picked as `upstream/main` and `gh repo set-default` all open the PR the
+    // draft was written against. Scoped: `Repository` is !Send.
+    let (branch, base_branch, repo_arg, head) = {
         let repo = crate::git_ops::open_repo(std::path::Path::new(&path))?;
-        crate::git_ops::current_branch(&repo)
-            .ok_or_else(|| AppError::Other("not on a named branch".into()))?
+        let branch = crate::git_ops::current_branch(&repo)
+            .ok_or_else(|| AppError::Other("not on a named branch".into()))?;
+        let target = crate::git_ops::pr_target(&repo, &base, &branch);
+        let slug = |r: &Option<String>| r.as_deref().and_then(|r| crate::git_ops::remote_slug(&repo, r));
+        let base_url = slug(&target.base_remote);
+        let head_url = slug(&target.head_remote);
+        let repo_arg = base_url.as_ref().map(|u| crate::github::gh_repo_arg(&u.host, &u.owner, &u.repo));
+        let head = crate::github::pr_head_label(
+            &branch,
+            head_url.as_ref().map(|u| u.owner.as_str()),
+            base_url.as_ref().map(|u| u.owner.as_str()),
+        );
+        (branch, target.base_branch, repo_arg, head)
     };
-    if !crate::github::pr_head_is_valid(&base, &branch) {
+    if !crate::github::pr_head_is_valid(&base_branch, &branch) {
         return Err(AppError::Other(format!(
             "A pull request needs a branch other than its base ({branch})."
         )));
@@ -4935,8 +4949,9 @@ pub async fn create_pull_request(
     std::io::Write::write_all(&mut body_file, body.as_bytes())
         .map_err(|e| AppError::Other(format!("couldn't write the PR body: {e}")))?;
     let (cmd, cmd_env) = crate::github::pr_create_command(
-        &base,
-        &branch,
+        repo_arg.as_deref(),
+        &base_branch,
+        &head,
         &title,
         &body_file.path().to_string_lossy(),
         draft,

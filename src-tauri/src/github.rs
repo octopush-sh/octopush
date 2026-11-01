@@ -205,37 +205,67 @@ pub struct PrDraftContext {
 /// base, head, title and body file travel as environment variables and the
 /// command only says `"$VAR"`, which bash, zsh and fish all expand as one
 /// argument (fish treats `\'` inside single quotes as an escape, so
-/// single-quoting is not safe there). The body goes through `--body-file`. A
-/// remote base picked as `origin/main` is opened against `main`; a title is
-/// one line.
+/// single-quoting is not safe there). The body goes through `--body-file`.
+/// `base` is the bare branch on the base repo (`git_ops::pr_target`), `repo`
+/// that repo as `host/owner/repo` (`--repo`, so gh's own pick can't differ
+/// from the draft's), `head` the branch or `owner:branch` on a fork. A title
+/// is one line.
 pub fn pr_create_command(
+    repo: Option<&str>,
     base: &str,
     head: &str,
     title: &str,
     body_file: &str,
     draft: bool,
 ) -> (String, Vec<(&'static str, String)>) {
-    let base = base.strip_prefix("origin/").unwrap_or(base);
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let mut cmd = String::from(
         "gh pr create --base \"$OCTOPUSH_PR_BASE\" --head \"$OCTOPUSH_PR_HEAD\" --title \"$OCTOPUSH_PR_TITLE\" --body-file \"$OCTOPUSH_PR_BODY_FILE\"",
     );
-    if draft {
-        cmd.push_str(" --draft");
-    }
-    let env = vec![
+    let mut env = vec![
         ("OCTOPUSH_PR_BASE", base.to_string()),
         ("OCTOPUSH_PR_HEAD", head.to_string()),
         ("OCTOPUSH_PR_TITLE", title),
         ("OCTOPUSH_PR_BODY_FILE", body_file.to_string()),
     ];
+    if let Some(repo) = repo {
+        cmd.push_str(" --repo \"$OCTOPUSH_PR_REPO\"");
+        env.push(("OCTOPUSH_PR_REPO", repo.to_string()));
+    }
+    if draft {
+        cmd.push_str(" --draft");
+    }
     (cmd, env)
 }
 
+/// `gh --repo` for a remote: `owner/repo` on github.com (its URL may say
+/// `ssh.github.com:443`, which gh doesn't know as a host), else
+/// `host/owner/repo` for GitHub Enterprise.
+pub fn gh_repo_arg(host: &str, owner: &str, repo: &str) -> String {
+    let host = host.split(':').next().unwrap_or(host);
+    if host == "github.com" || host == "ssh.github.com" {
+        format!("{owner}/{repo}")
+    } else {
+        format!("{host}/{owner}/{repo}")
+    }
+}
+
+/// `gh pr create --head` for `branch` pushed to a repo owned by `head_owner`:
+/// `owner:branch` when it differs from the base repo's owner (a fork — gh
+/// can't find a bare branch name there), else the bare branch.
+pub fn pr_head_label(branch: &str, head_owner: Option<&str>, base_owner: Option<&str>) -> String {
+    match head_owner {
+        Some(o) if !o.is_empty() && !base_owner.is_some_and(|b| b.eq_ignore_ascii_case(o)) => {
+            format!("{o}:{branch}")
+        }
+        _ => branch.to_string(),
+    }
+}
+
 /// Whether opening a PR from `head` onto `base` makes sense: never from a
-/// branch onto itself (that would only push the base branch).
+/// branch onto itself (that would only push the base branch). `base` is the
+/// bare branch, its remote already stripped (`git_ops::pr_target`).
 pub fn pr_head_is_valid(base: &str, head: &str) -> bool {
-    let base = base.strip_prefix("origin/").unwrap_or(base);
     // A detached HEAD reports itself as "HEAD": not a branch to open from.
     !head.trim().is_empty() && head != "HEAD" && head != base
 }

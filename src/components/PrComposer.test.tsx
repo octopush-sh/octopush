@@ -166,6 +166,44 @@ describe("PrComposer", () => {
     expect(ipcMock.pushBranch).not.toHaveBeenCalled();
   });
 
+  it("re-drafts against a new base, upstream included", async () => {
+    ready();
+    ipcMock.listBranches.mockResolvedValue({
+      local: ["main", "feat/csv"],
+      remote: ["origin/main", "upstream/main"],
+      repoDefault: "main",
+    });
+    renderComposer();
+    await screen.findByText(/Drafted by/);
+    fireEvent.click(screen.getByRole("button", { name: "main" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "upstream/main" }));
+    await waitFor(() => expect(ipcMock.aiComplete).toHaveBeenCalledTimes(2));
+    expect(ipcMock.prDraftContext).toHaveBeenLastCalledWith("/w", "upstream/main");
+  });
+
+  it("a new base keeps the human's edits and only re-checks the diff", async () => {
+    ready();
+    renderComposer();
+    await screen.findByText(/Drafted by/);
+    const body = screen.getByLabelText("Pull request description") as HTMLTextAreaElement;
+    fireEvent.change(body, { target: { value: "my words" } });
+    fireEvent.click(screen.getByRole("button", { name: "main" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "origin/main" }));
+    expect(await screen.findByText(/Your edits are kept/)).toBeTruthy();
+    expect(ipcMock.prDraftContext).toHaveBeenLastCalledWith("/w", "origin/main");
+    expect(ipcMock.aiComplete).toHaveBeenCalledTimes(1);
+    expect(body.value).toBe("my words");
+  });
+
+  it("no changes against the base → the create button stays disabled", async () => {
+    ready();
+    ipcMock.prDraftContext.mockResolvedValue({ branch: "feat/csv", diff: "", commits: [], template: null });
+    renderComposer();
+    expect(await screen.findByText(/no changes against main/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Open the pull request" })).toBeDisabled();
+    expect(ipcMock.aiComplete).not.toHaveBeenCalled();
+  });
+
   it("Escape closes", async () => {
     ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: false, ghAuthenticated: false });
     const onClose = vi.fn();

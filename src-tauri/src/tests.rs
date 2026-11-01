@@ -13579,7 +13579,7 @@ mod open_pull_request_tests {
     #[test]
     fn pr_create_command_passes_every_value_through_the_environment() {
         let title = "Fix it's \"quoting\" $(rm -rf ~) a\\'; open -a Calculator #";
-        let (cmd, env) = pr_create_command("main", "feat/x", title, "/tmp/b.md", false);
+        let (cmd, env) = pr_create_command(None, "main", "feat/x", title, "/tmp/b.md", false);
         // The command is constant: nothing from the user is spliced into it.
         assert_eq!(
             cmd,
@@ -13598,7 +13598,7 @@ mod open_pull_request_tests {
         // `printf` stands in for gh: the shell must hand the title over as one
         // unchanged argument, metacharacters and all.
         let title = "a\\'; echo PWNED # $(id) `id`";
-        let (_, env) = pr_create_command("main", "feat/x", title, "/t", false);
+        let (_, env) = pr_create_command(None, "main", "feat/x", title, "/t", false);
         let out = Command::new("/bin/sh")
             .arg("-c")
             .arg("printf '%s' \"$OCTOPUSH_PR_TITLE\"")
@@ -13609,11 +13609,15 @@ mod open_pull_request_tests {
     }
 
     #[test]
-    fn pr_create_command_drafts_strips_origin_and_flattens_the_title() {
-        let (cmd, env) = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
+    fn pr_create_command_drafts_targets_a_repo_and_flattens_the_title() {
+        let (cmd, env) =
+            pr_create_command(Some("acme/app"), "release/1.0", "me:b", "Two\nlines", "/t", true);
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
         assert_eq!(get("OCTOPUSH_PR_BASE"), "release/1.0");
+        assert_eq!(get("OCTOPUSH_PR_HEAD"), "me:b");
+        assert_eq!(get("OCTOPUSH_PR_REPO"), "acme/app");
         assert_eq!(get("OCTOPUSH_PR_TITLE"), "Two lines");
+        assert!(cmd.contains(" --repo \"$OCTOPUSH_PR_REPO\""), "{cmd}");
         assert!(cmd.ends_with(" --draft"), "{cmd}");
     }
 
@@ -13622,9 +13626,101 @@ mod open_pull_request_tests {
         use crate::github::pr_head_is_valid;
         assert!(pr_head_is_valid("main", "feat/x"));
         assert!(!pr_head_is_valid("main", "main"));
-        assert!(!pr_head_is_valid("origin/main", "main"));
         assert!(!pr_head_is_valid("main", ""));
         assert!(!pr_head_is_valid("main", "HEAD"));
+    }
+
+    #[test]
+    fn pr_head_label_names_the_fork_owner_only_on_a_fork() {
+        use crate::github::pr_head_label;
+        assert_eq!(pr_head_label("feat/x", Some("me"), Some("acme")), "me:feat/x");
+        assert_eq!(pr_head_label("feat/x", Some("Acme"), Some("acme")), "feat/x");
+        assert_eq!(pr_head_label("feat/x", Some("me"), None), "me:feat/x");
+        assert_eq!(pr_head_label("feat/x", None, Some("acme")), "feat/x");
+    }
+
+    #[test]
+    fn gh_repo_arg_drops_the_host_only_for_github_com() {
+        use crate::github::gh_repo_arg;
+        assert_eq!(gh_repo_arg("github.com", "acme", "app"), "acme/app");
+        assert_eq!(gh_repo_arg("ssh.github.com:443", "acme", "app"), "acme/app");
+        assert_eq!(gh_repo_arg("ghe.corp.dev", "acme", "app"), "ghe.corp.dev/acme/app");
+    }
+
+    /// A repo with `origin` (the fork) and `upstream`, `feature` checked out
+    /// with one commit on top of `main`.
+    fn fork_repo(d: &std::path::Path) {
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["remote", "add", "origin", "git@github.com:me/app.git"]);
+        git(d, &["remote", "add", "upstream", "https://github.com/acme/app.git"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        std::fs::write(d.join("b.txt"), "two\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "Add b"]);
+    }
+
+    #[test]
+    fn pr_target_strips_any_remote_and_follows_gh_set_default() {
+        use crate::git_ops::{open_repo, pr_target, PrTarget};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        fork_repo(d);
+        git(d, &["branch", "release/1.0"]);
+        let repo = open_repo(d).unwrap();
+        let t = |base: &str| pr_target(&repo, base, "feature");
+        let on = |b: &str, r: &str| PrTarget {
+            base_branch: b.into(),
+            base_remote: Some(r.into()),
+            head_remote: Some("origin".into()),
+        };
+        assert_eq!(t("upstream/main"), on("main", "upstream"));
+        assert_eq!(t("origin/main"), on("main", "origin"));
+        // A bare name, or a local branch with a slash, stays whole on origin.
+        assert_eq!(t("main"), on("main", "origin"));
+        assert_eq!(t("release/1.0"), on("release/1.0", "origin"));
+        // `gh repo set-default` moves a bare base to its remote.
+        git(d, &["config", "remote.upstream.gh-resolved", "base"]);
+        let repo = open_repo(d).unwrap();
+        assert_eq!(pr_target(&repo, "main", "feature"), on("main", "upstream"));
+        // The head goes where the branch is pushed.
+        git(d, &["config", "branch.feature.remote", "upstream"]);
+        let repo = open_repo(d).unwrap();
+        assert_eq!(pr_target(&repo, "main", "feature").head_remote.as_deref(), Some("upstream"));
+        let url = crate::git_ops::remote_slug(&repo, "origin").unwrap();
+        assert_eq!((url.owner.as_str(), url.repo.as_str()), ("me", "app"));
+    }
+
+    #[test]
+    fn branch_pr_context_diffs_against_the_base_remote() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        fork_repo(d);
+        // upstream/main moves on; origin/main (the fork) doesn't.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "x\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream moves"]);
+        git(d, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(d, &["checkout", "-q", "feature"]);
+        git(d, &["merge", "-q", "--no-edit", "upstream/main"]);
+
+        // Against the fork's main the upstream change is part of the branch…
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(diff.contains("up.txt"), "{diff}");
+        // …against upstream (picked, or gh's default) it isn't.
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "upstream/main").unwrap();
+        assert!(diff.contains("b.txt") && !diff.contains("up.txt"), "{diff}");
+        git(d, &["config", "remote.upstream.gh-resolved", "base"]);
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(!diff.contains("up.txt"), "{diff}");
     }
 
     #[test]
