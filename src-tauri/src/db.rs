@@ -4577,6 +4577,46 @@ impl Db {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Runs that reached `completed`/`aborted` strictly AFTER `since` (an
+    /// RFC 3339 instant), across all workspaces, newest finish first, capped at
+    /// 50. Drives Mission Control's "While you were away" seed. `finished_at`
+    /// is always `Utc::now().to_rfc3339()`, so `since` is normalised to the
+    /// same UTC form and a string `>` is chronological. An unparseable `since`
+    /// yields nothing rather than everything.
+    pub fn list_runs_settled_since(&self, since: &str) -> AppResult<Vec<RunRow>> {
+        let Ok(since) = DateTime::parse_from_rfc3339(since) else {
+            return Ok(Vec::new());
+        };
+        let since = since.with_timezone(&Utc).to_rfc3339();
+        let mut stmt = self.conn.prepare(
+            "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+             FROM runs
+             WHERE status IN ('completed', 'aborted') AND finished_at IS NOT NULL AND finished_at > ?1
+             ORDER BY finished_at DESC LIMIT 50",
+        )?;
+        let rows = stmt.query_map(params![since], row_to_run)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Stamp `last_quit_at` (written as the app exits). The next launch shows
+    /// what settled after it.
+    pub fn mark_quit(&self, at: DateTime<Utc>) -> AppResult<()> {
+        self.meta_set("last_quit_at", &at.to_rfc3339())
+    }
+
+    /// When the user was last away from: the `last_quit_at` marker, or 24 h
+    /// before `now` when it's missing or unreadable (first launch with this
+    /// build, or a crash that skipped the quit hook).
+    pub fn away_since(&self, now: DateTime<Utc>) -> AppResult<String> {
+        if let Some(v) = self.meta_get("last_quit_at")? {
+            if DateTime::parse_from_rfc3339(&v).is_ok() {
+                return Ok(v);
+            }
+        }
+        Ok((now - chrono::Duration::hours(24)).to_rfc3339())
+    }
+
     // ── app_meta: tiny key/value store for app-global scalars ────────────────
 
     /// Read a scalar from `app_meta`; `None` if the key was never set.

@@ -19,6 +19,7 @@ vi.mock("../lib/ipc", async () => {
       stopStage: vi.fn(),
       updateRunStage: vi.fn(),
       rerunFromStage: vi.fn(),
+      listRunsSettledSince: vi.fn(),
     },
   };
 });
@@ -46,6 +47,7 @@ describe("runsStore", () => {
     useRunsStore.setState({
       runsByWs: {}, loadedByWs: {}, activeRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
       selectedRunIdByWs: {}, liveByStage: {}, settledAt: {}, statusSince: {},
+      awayRunIds: [], awayStatus: "idle",
     });
     vi.clearAllMocks();
   });
@@ -483,5 +485,112 @@ describe("runsStore", () => {
     await useRunsStore.getState().loadRuns("w1");
     expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
     expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
+
+  describe("loadSettledWhileAway", () => {
+    const OVERNIGHT: Run = {
+      ...RUN, id: "r9", workspaceId: "w9", status: "completed",
+      finishedAt: "2026-10-31T03:10:00+00:00",
+    };
+
+    it("seeds runs that settled while the app was closed onto the Settled band", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      const p = useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayStatus).toBe("loading");
+      await p;
+      const s = useRunsStore.getState();
+      expect(s.awayStatus).toBe("loaded");
+      expect(s.awayRunIds).toEqual(["r9"]);
+      expect(s.runsByWs.w9).toEqual([OVERNIGHT]);
+      // Stamped with the real finish time — no just-settled ceremony replay.
+      expect(s.settledAt.r9).toBe(Date.parse("2026-10-31T03:10:00+00:00"));
+      // The fleet chip's "✓ n done" counts settledAt keys.
+      expect(Object.keys(s.settledAt)).toEqual(["r9"]);
+    });
+
+    it("runs once per session, so a dismissed card never comes back", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().dismissSettled("r9");
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(ipc.listRunsSettledSince).toHaveBeenCalledTimes(1);
+      expect(useRunsStore.getState().settledAt.r9).toBeUndefined();
+    });
+
+    it("clearSettled drops the away runs too", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().clearSettled();
+      expect(useRunsStore.getState().settledAt).toEqual({});
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+    });
+
+    it("an empty answer or a failed fetch seeds nothing and still finishes loading", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+      expect(useRunsStore.getState().awayStatus).toBe("loaded");
+
+      useRunsStore.setState({ awayStatus: "idle" });
+      const err = vi.spyOn(console, "error").mockImplementation(() => {});
+      (ipc.listRunsSettledSince as any).mockRejectedValue(new Error("db"));
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().settledAt).toEqual({});
+      expect(useRunsStore.getState().awayStatus).toBe("loaded");
+      err.mockRestore();
+    });
+
+    it("stamps statusSince with the finish time so the band sorts by when runs finished", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().statusSince.r9).toBe(Date.parse("2026-10-31T03:10:00+00:00"));
+    });
+
+    it("does not count a run that already settled in front of this session", async () => {
+      useRunsStore.setState({ runsByWs: { w9: [OVERNIGHT] }, settledAt: { r9: 5 } });
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+      expect(useRunsStore.getState().settledAt.r9).toBe(5);
+    });
+
+    it("dismissSettled drops the run from awayRunIds", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().dismissSettled("r9");
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+    });
+
+    it("a re-run (same id) seen going active via applyStageUpdate leaves awayRunIds; its next settle is a session one", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      (ipc.getRun as any).mockResolvedValue({ run: null, stages: [] });
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().applyStageUpdate("r9", { ...OVERNIGHT, status: "running" });
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+      const before = Date.now();
+      useRunsStore.getState().applyStageUpdate("r9", { ...OVERNIGHT, status: "completed" });
+      const s = useRunsStore.getState();
+      expect(s.awayRunIds).toEqual([]);
+      expect(s.settledAt.r9).toBeGreaterThanOrEqual(before);
+    });
+
+    it("a re-run seen via loadRuns leaves awayRunIds too, untouched runs stay", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT, { ...OVERNIGHT, id: "r8" }]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayRunIds).toEqual(["r9", "r8"]);
+      (ipc.listRuns as any).mockResolvedValue([{ ...OVERNIGHT, status: "paused" }, { ...OVERNIGHT, id: "r8" }]);
+      (ipc.getRun as any).mockResolvedValue({ run: null, stages: [] });
+      await useRunsStore.getState().loadRuns("w9", { background: true });
+      expect(useRunsStore.getState().awayRunIds).toEqual(["r8"]);
+    });
+
+    it("never overwrites a run this session already holds as active", async () => {
+      // e.g. the user re-ran it before the fetch resolved.
+      useRunsStore.setState({ runsByWs: { w9: [{ ...OVERNIGHT, status: "running" }] } });
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().runsByWs.w9[0].status).toBe("running");
+      expect(useRunsStore.getState().settledAt.r9).toBeUndefined();
+    });
   });
 });

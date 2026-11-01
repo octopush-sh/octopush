@@ -71,6 +71,7 @@ Current anchors:
 | `settings-claude-code-card` · `settings-claude-cli-version` | Settings › Integrations: the Claude Code card · its installed-CLI version line | `settings/IntegrationsPane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
+| `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 
 A target only counts as found when it is visible; the tour waits up to 2s for it after
 opening the step's surface, then skips the step.

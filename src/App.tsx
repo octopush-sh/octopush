@@ -157,6 +157,9 @@ function App() {
   // runs in workspaces not opened this session. Live events keep it fresh after.
   useEffect(() => {
     void loadActiveRuns();
+    // Runs that settled while the app was closed join Mission Control's
+    // Settled band ("While you were away"), once per session.
+    void useRunsStore.getState().loadSettledWhileAway();
     // One-shot first-run invite eligibility (all-time backend count; the
     // persisted dismissed flag short-circuits inside the store).
     void useFirstRunStore.getState().checkEligibility();

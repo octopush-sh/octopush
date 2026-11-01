@@ -8,8 +8,9 @@ import { needsYou } from "../lib/runStatus";
  *  that may pulse): a run waiting on the director → brass `{n} needs you`,
  *  the chip's only pulse trigger; else a run running with nobody waiting →
  *  quiet hairline `{n} in flight`, no pulse (sage — nothing needs you *yet*);
- *  else runs settled this session (undismissed) → verdigris `✓ {n} done`, so
- *  the entry doesn't vanish the moment your background work finishes. Hidden
+ *  else runs settled this session or while the app was closed (undismissed) →
+ *  verdigris `✓ {n} done`, so the entry doesn't vanish the moment your
+ *  background work finishes. Hidden
  *  only when the board is truly empty. Clicking opens Mission Control (which
  *  replaced the old popover — one canonical surface for the fleet). */
 export function RunsTray({ onOpen }: { onOpen: () => void }) {

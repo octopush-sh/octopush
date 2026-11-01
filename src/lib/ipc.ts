@@ -1229,6 +1229,11 @@ export const ipc = {
 
   listActiveRuns: () => invoke<Run[]>("list_active_runs"),
 
+  /** Runs that settled after `since` — by default after the app was last quit
+   *  (falling back to 24 h ago). Seeds Mission Control's "While you were away". */
+  listRunsSettledSince: (since?: string) =>
+    invoke<Run[]>("list_runs_settled_since", { since: since ?? null }),
+
   resolveCheckpoint: (
     runId: string,
     action: CheckpointActionName,

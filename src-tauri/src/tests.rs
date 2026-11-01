@@ -409,6 +409,89 @@ mod workspace_tests {
     }
 
     #[test]
+    fn list_runs_settled_since_returns_runs_finished_after_the_marker() {
+        // "While you were away": only completed/aborted runs whose finish is
+        // strictly after `since`. A run that finished exactly at the quit
+        // instant was already seen by the session that quit.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let quit = "2026-10-30T22:00:00.500+00:00";
+        let finish = |status: &str, at: &str, ws: &str| {
+            let id = db.create_run(ws, &pipeline_id, "task", None, None, &[]).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE runs SET status = ?2, finished_at = ?3 WHERE id = ?1",
+                    rusqlite::params![id, status, at],
+                )
+                .unwrap();
+            id
+        };
+        let before = finish("completed", "2026-10-30T21:59:59.900+00:00", "ws1");
+        let at_quit = finish("completed", quit, "ws1");
+        let just_after = finish("aborted", "2026-10-30T22:00:00.500001+00:00", "ws2");
+        let overnight = finish("completed", "2026-10-31T03:10:00+00:00", "ws1");
+        let failed_after = finish("failed", "2026-10-31T03:00:00+00:00", "ws2");
+        let running = db.create_run("ws1", &pipeline_id, "live", None, None, &[]).unwrap();
+        db.set_run_status(&running, "running", false).unwrap();
+
+        let ids: Vec<String> = db
+            .list_runs_settled_since(quit)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids, vec![overnight.clone(), just_after.clone()], "newest finish first");
+        assert!(!ids.contains(&before) && !ids.contains(&at_quit), "boundary is exclusive");
+        assert!(!ids.contains(&failed_after) && !ids.contains(&running));
+
+        // The same instant in another offset is normalised to UTC.
+        let ids_z: Vec<String> = db
+            .list_runs_settled_since("2026-10-30T17:00:00.500-05:00")
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(ids_z, ids);
+        // Garbage yields nothing, never the whole history.
+        assert!(db.list_runs_settled_since("not a date").unwrap().is_empty());
+    }
+
+    #[test]
+    fn away_since_reads_the_quit_marker_or_falls_back_to_24h() {
+        let db = test_db();
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-31T08:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // Missing marker → 24 h before now.
+        assert_eq!(db.away_since(now).unwrap(), "2026-10-30T08:00:00+00:00");
+        // An unreadable marker also falls back.
+        db.meta_set("last_quit_at", "garbage").unwrap();
+        assert_eq!(db.away_since(now).unwrap(), "2026-10-30T08:00:00+00:00");
+        // A recorded quit wins.
+        let quit = now - chrono::Duration::hours(9);
+        db.mark_quit(quit).unwrap();
+        assert_eq!(db.away_since(now).unwrap(), quit.to_rfc3339());
+
+        // End to end: a run finished after the quit shows, one before doesn't.
+        setup_workspace(&db, "p1", "ws1");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let fresh = db.create_run("ws1", &pipeline_id, "fresh", None, None, &[]).unwrap();
+        db.set_run_status(&fresh, "completed", true).unwrap(); // finished "now" (real clock)
+        db.mark_quit(chrono::Utc::now() - chrono::Duration::minutes(5)).unwrap();
+        let since = db.away_since(chrono::Utc::now()).unwrap();
+        let ids: Vec<String> =
+            db.list_runs_settled_since(&since).unwrap().into_iter().map(|r| r.id).collect();
+        assert_eq!(ids, vec![fresh.clone()]);
+        db.mark_quit(chrono::Utc::now() + chrono::Duration::minutes(5)).unwrap();
+        let since = db.away_since(chrono::Utc::now()).unwrap();
+        assert!(db.list_runs_settled_since(&since).unwrap().is_empty());
+    }
+
+    #[test]
     fn db_opens_in_wal_with_normal_sync() {
         // WAL + synchronous=NORMAL keep writes fast (short mutex hold) without
         // corruption risk — matters under N concurrent runs.
