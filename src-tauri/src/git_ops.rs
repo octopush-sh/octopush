@@ -748,18 +748,79 @@ pub fn range_diff_text(path: &Path, from: &str, to: &str) -> AppResult<String> {
     diff_to_text(&diff)
 }
 
+/// Where a pull request from `head` onto a picked `base` goes, read from the
+/// repo's remotes — so the draft's diff and `gh pr create` agree, on a fork
+/// and after `gh repo set-default` too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrTarget {
+    /// The base branch on the base repo: `main`, never `upstream/main`.
+    pub base_branch: String,
+    /// The remote the base lives on: the one a qualified base names
+    /// (`upstream/main`), else gh's default (`remote.<r>.gh-resolved = base`,
+    /// what `gh repo set-default` writes), else `origin`. None with neither.
+    pub base_remote: Option<String>,
+    /// The remote `head` is pushed to: its upstream's, else `origin`.
+    pub head_remote: Option<String>,
+}
+
+pub fn pr_target(repo: &Repository, base: &str, head: &str) -> PrTarget {
+    let remotes: Vec<String> = repo
+        .remotes()
+        .map(|r| r.iter().flatten().map(String::from).collect())
+        .unwrap_or_default();
+    let config = repo.config().ok();
+    let get = |key: String| config.as_ref().and_then(|c| c.get_string(&key).ok());
+    let origin = remotes.iter().find(|r| *r == "origin").cloned();
+    // A qualified base names its remote; the longest match wins, and only a
+    // real remote-tracking ref counts (a local `upstream/x` branch stays whole).
+    let qualified = remotes
+        .iter()
+        .filter(|r| {
+            base.strip_prefix(r.as_str())
+                .and_then(|rest| rest.strip_prefix('/'))
+                .is_some_and(|b| !b.is_empty())
+                && repo.find_reference(&format!("refs/remotes/{base}")).is_ok()
+        })
+        .max_by_key(|r| r.len());
+    let (base_remote, base_branch) = match qualified {
+        Some(r) => (Some(r.clone()), base[r.len() + 1..].to_string()),
+        None => (
+            remotes
+                .iter()
+                .find(|r| get(format!("remote.{r}.gh-resolved")).as_deref() == Some("base"))
+                .cloned()
+                .or_else(|| origin.clone()),
+            base.to_string(),
+        ),
+    };
+    let head_remote = get(format!("branch.{head}.remote"))
+        .filter(|r| remotes.contains(r))
+        .or(origin);
+    PrTarget { base_branch, base_remote, head_remote }
+}
+
+/// A remote's parsed URL (host, owner, repo), for `gh --repo` and `owner:branch`.
+pub fn remote_slug(repo: &Repository, remote: &str) -> Option<crate::git_url::ParsedGitUrl> {
+    let r = repo.find_remote(remote).ok()?;
+    crate::git_url::parse_git_url(r.url()?)
+}
+
 /// What a pull request from HEAD onto `base` contains: the diff from their
 /// merge base to HEAD (`git diff base...HEAD`) and the subjects of the commits
 /// not on `base` (`git log base..HEAD`), newest first, at most 50. `base`
-/// resolves to its `origin/` ref first (what the PR is opened against), then
-/// to the name as given (a local branch, or an already-qualified remote ref).
+/// resolves to its ref on the PR's base remote first (`pr_target`: what the PR
+/// is opened against), then to the name as given (a local branch).
 pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<String>)> {
     let repo = open_repo(path)?;
     let head = repo
         .head()
         .and_then(|h| h.peel_to_commit())
         .map_err(|e| AppError::Other(format!("this branch has no commits yet: {e}")))?;
-    let base_commit = [format!("origin/{base}"), base.to_string()]
+    let target = pr_target(&repo, base, current_branch(&repo).as_deref().unwrap_or(""));
+    let mut refs: Vec<String> =
+        target.base_remote.iter().map(|r| format!("{r}/{}", target.base_branch)).collect();
+    refs.push(target.base_branch.clone());
+    let base_commit = refs
         .iter()
         .find_map(|r| repo.revparse_single(r).ok().and_then(|o| o.peel_to_commit().ok()))
         .ok_or_else(|| AppError::Other(format!("base branch '{base}' not found")))?;

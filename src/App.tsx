@@ -409,6 +409,9 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // Live for the shortcut table, which doesn't re-register on every status poll.
+  const gitStatusRef = useRef<GitStatus | null>(null);
+  gitStatusRef.current = gitStatus;
   // Per-workspace cache of the most recently fetched PR (or null when there
   // isn't one). Keyed by workspace id so switching back to a workspace
   // doesn't flicker until the next refresh; lives in prStore so a PR opened
@@ -947,6 +950,7 @@ function App() {
       openPrComposer: () => {
         if (activeWorkspaceId) usePrStore.getState().openComposer(activeWorkspaceId);
       },
+      activeBranch: () => gitStatusRef.current?.branch ?? null,
       openSearch: (mode) => {
         setSearchMode(mode);
         setShowSearch(true);

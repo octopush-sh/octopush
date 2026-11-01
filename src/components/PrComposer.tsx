@@ -18,6 +18,7 @@ import {
   PR_SYSTEM,
   buildPrPrompt,
   diffPaths,
+  bareBase,
   canOpenPrFrom,
   issueRef,
   parsePrDraft,
@@ -60,19 +61,31 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [unpushed, setUnpushed] = useState(false);
+  // Nothing to open: the branch has no diff and no commits against the base.
+  const [noChanges, setNoChanges] = useState(false);
   const draftGen = useRef(0);
+  // The human typed since the last draft: a base change then keeps their text.
+  const edited = useRef(false);
 
+  /** Reads the branch against `onto` and drafts from it — or, with
+   *  `keepText`, only checks there are changes and leaves the text alone. */
   const runDraft = useCallback(
-    async (onto: string) => {
+    async (onto: string, keepText = false) => {
       const gen = ++draftGen.current;
       setDrafting(true);
       setDraftNote(null);
+      setNoChanges(false);
       try {
         const ctx = await ipc.prDraftContext(workspacePath, onto);
         if (gen !== draftGen.current) return;
         setBranch(ctx.branch);
         if (!ctx.diff.trim() && ctx.commits.length === 0) {
+          setNoChanges(true);
           setDraftNote({ tone: "rouge", text: `This branch has no changes against ${onto} yet.` });
+          return;
+        }
+        if (keepText) {
+          setDraftNote({ tone: "mute", text: `Your edits are kept — draft again to write it against ${onto}.` });
           return;
         }
         const edits = await ipc.listFileEdits(workspace.id).catch(() => []);
@@ -100,6 +113,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
         const parsed = parsePrDraft(r.text, workspace.linkedIssueKey);
         setTitle(parsed.title);
         setBody(parsed.body);
+        edited.current = false;
         // Never `$0` and never a missing figure: an unknown cost says so.
         const cost =
           typeof r.costUsd === "number" && r.costUsd > 0
@@ -164,7 +178,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
       cancelled = true;
       draftGen.current++;
     };
-    // Preflight once per open; the draft re-runs only on request.
+    // Preflight once per open; the draft re-runs on request or a new base.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath]);
 
@@ -175,7 +189,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     try {
       const status = await ipc.getGitStatus(workspacePath);
       // Never push the base branch itself: a PR needs a branch other than its base.
-      if (!status.branch || status.branch === "HEAD" || status.branch === base.replace(/^origin\//, "")) {
+      if (!status.branch || status.branch === "HEAD" || status.branch === bareBase(base, branches)) {
         throw new Error(`Pick a base other than ${status.branch ?? "this branch"}.`);
       }
       if (!status.hasUpstream || status.ahead > 0) await ipc.pushBranch(workspacePath);
@@ -195,7 +209,15 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     }
   }
 
-  const canCreate = phase.kind === "ready" && !!base && title.trim().length > 0 && !creating && !drafting;
+  const canCreate =
+    phase.kind === "ready" && !!base && title.trim().length > 0 && !creating && !drafting && !noChanges;
+
+  function changeBase(next: string) {
+    if (next === base) return;
+    setBase(next);
+    setCreateError(null);
+    void runDraft(next, edited.current);
+  }
 
   return (
     <ModalShell onClose={onClose} closeOnBackdrop={false} ariaLabel="Open a pull request" panelClassName="w-full max-w-[680px]">
@@ -216,7 +238,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                 branches={branches.local}
                 remoteBranches={branches.remote}
                 value={base}
-                onSelect={setBase}
+                onSelect={changeBase}
               />
             </div>
           )}
@@ -253,7 +275,10 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                 <div className="flex items-center gap-2">
                   <input
                     value={title}
-                    onChange={(e) => setTitle(e.target.value)}
+                    onChange={(e) => {
+                      edited.current = true;
+                      setTitle(e.target.value);
+                    }}
                     disabled={drafting || creating}
                     placeholder="Name the change…"
                     aria-label="Pull request title"
@@ -272,7 +297,10 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                 </div>
                 <textarea
                   value={body}
-                  onChange={(e) => setBody(e.target.value)}
+                  onChange={(e) => {
+                    edited.current = true;
+                    setBody(e.target.value);
+                  }}
                   disabled={drafting || creating}
                   rows={14}
                   placeholder={drafting ? "Drafting from the diff…" : "Describe the change…"}

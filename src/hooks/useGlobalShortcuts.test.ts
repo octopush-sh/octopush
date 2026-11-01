@@ -12,10 +12,12 @@ interface Press {
   shift?: boolean;
   alt?: boolean;
   defaultPrevented?: boolean;
+  target?: EventTarget;
 }
 
 function press(p: Press) {
   const e = {
+    target: p.target ?? null,
     key: p.key,
     code: p.code ?? "",
     metaKey: p.meta ?? !p.ctrl,
@@ -44,6 +46,7 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     openCreator: vi.fn(),
     togglePalette: vi.fn(),
     openPrComposer: vi.fn(),
+    activeBranch: () => "feat/x",
     openSearch: vi.fn(),
     bumpLayout: vi.fn(),
     openSettings: vi.fn(),
@@ -158,6 +161,35 @@ describe("handleShortcut", () => {
     expect(c.openSettings).toHaveBeenCalledWith("general");
     handleShortcut(press({ key: "t", shift: true }), c);
     expect(c.openSettings).toHaveBeenCalledWith("usage");
+  });
+
+  it("leaves ⌘⇧P to a focused editor or terminal", () => {
+    for (const cls of ["cm-editor", "xterm"]) {
+      const host = document.createElement("div");
+      host.className = cls;
+      const inner = document.createElement("textarea");
+      host.appendChild(inner);
+      const c = ctx();
+      const e = press({ key: "P", shift: true, target: inner });
+      handleShortcut(e, c);
+      expect(c.openPrComposer).not.toHaveBeenCalled();
+      expect(e.preventDefault).not.toHaveBeenCalled();
+    }
+    const c = ctx();
+    handleShortcut(press({ key: "P", shift: true, target: document.createElement("div") }), c);
+    expect(c.openPrComposer).toHaveBeenCalledTimes(1);
+  });
+
+  it.each<[string, Partial<ShortcutContext>]>([
+    ["no active workspace", { activeWorkspaceId: null }],
+    ["an unknown branch", { activeBranch: () => null }],
+    ["a detached HEAD", { activeBranch: () => "HEAD" }],
+  ])("does nothing on ⌘⇧P with %s", (_label, over) => {
+    const c = ctx(over);
+    const e = press({ key: "P", shift: true });
+    handleShortcut(e, c);
+    expect(c.openPrComposer).not.toHaveBeenCalled();
+    expect(e.preventDefault).not.toHaveBeenCalled();
   });
 
   it("claims ⌘N even without a project, but opens the creator only with one", () => {
