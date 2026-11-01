@@ -75,6 +75,7 @@ Current anchors:
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` | Mission Control crew card: its task title · the workspace name in its meta row | `MissionControl.tsx` |
+| `mission-control-ask-toggle` · `mission-control-ask-accept` | Mission Control `?` card (an `ask_director` block): the questions disclosure · "Accept recommended" | `MissionControl.tsx` |
 
 A target only counts as found when it is visible; the tour waits up to 2s for it after
 opening the step's surface, then skips the step.

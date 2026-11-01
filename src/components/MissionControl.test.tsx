@@ -21,6 +21,7 @@ vi.mock("../lib/ipc", async (orig) => {
       ...actual.ipc,
       getRun: vi.fn().mockResolvedValue({ run: null, stages: [] }),
       abortRun: vi.fn().mockResolvedValue(undefined),
+      answerBlocker: vi.fn().mockResolvedValue(undefined),
     },
   };
 });
@@ -349,6 +350,78 @@ describe("MissionControl", () => {
     renderRoom();
     expect(screen.getByText(/asked you · waiting on your answer/)).toBeTruthy();
     expect(screen.queryByText(/holds the gate/)).toBeNull();
+  });
+
+  /** A paused run whose second stage asked the director two questions. */
+  function seedAsk() {
+    const run = mkRun("a", "paused");
+    const blocked: RunStage = {
+      ...mkStage("s2", "a", 1, "awaiting_checkpoint"),
+      startedAt: "t",
+      blockedQuestions: {
+        summary: "two decisions",
+        questions: [
+          { question: "Postgres or SQLite?", whyBlocked: "", recommendedDefault: "Postgres" },
+          { question: "Keep the old endpoint?", whyBlocked: "", recommendedDefault: "Yes, for one release" },
+        ],
+      },
+    };
+    useRunsStore.setState({
+      runsByWs: { "ws-a": [run] },
+      detailByRun: { a: { run, stages: [mkStage("s1", "a", 0, "done"), blocked] } },
+    });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-a", name: "Alpha" }] },
+    } as any);
+  }
+
+  it("an asked-you card expands inline to the questions and their recommended answers", () => {
+    seedAsk();
+    const onJumpToRun = vi.fn();
+    const { container } = renderRoom({ onJumpToRun });
+    const toggle = container.querySelector('[data-tour="mission-control-ask-toggle"]') as HTMLElement;
+    expect(toggle.textContent).toContain("2 questions · recommended answers");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(onJumpToRun).not.toHaveBeenCalled(); // expanding is not jumping
+    expect(screen.getByText("Postgres or SQLite?")).toBeTruthy();
+    expect(screen.getByText("Yes, for one release")).toBeTruthy();
+  });
+
+  it("Accept recommended answers every question with its default, from Mission Control, without jumping", () => {
+    seedAsk();
+    const onJumpToRun = vi.fn();
+    const { container } = renderRoom({ onJumpToRun });
+    fireEvent.click(container.querySelector('[data-tour="mission-control-ask-toggle"]')!);
+    fireEvent.click(screen.getByRole("button", { name: "Accept recommended" }));
+    expect(ipc.answerBlocker).toHaveBeenCalledWith(
+      "a",
+      "s2",
+      ["Postgres", "Yes, for one release"],
+      "mission_control",
+    );
+    expect(onJumpToRun).not.toHaveBeenCalled();
+  });
+
+  it("Answer… opens the full form (jumps to the run) instead of answering", () => {
+    seedAsk();
+    const onJumpToRun = vi.fn();
+    const { container } = renderRoom({ onJumpToRun });
+    fireEvent.click(container.querySelector('[data-tour="mission-control-ask-toggle"]')!);
+    fireEvent.click(screen.getByRole("button", { name: "Answer…" }));
+    expect(onJumpToRun).toHaveBeenCalledTimes(1);
+    expect(onJumpToRun).toHaveBeenCalledWith("ws-a");
+    expect(ipc.answerBlocker).not.toHaveBeenCalled();
+  });
+
+  it("a normal gate keeps its jump-only card — no inline answer", () => {
+    const run = mkRun("a", "paused");
+    const stages = [mkStage("s1", "a", 0, "done"), mkStage("s2", "a", 1, "awaiting_checkpoint")];
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages } } });
+    const { container } = renderRoom();
+    expect(container.querySelector('[data-tour="mission-control-ask-toggle"]')).toBeNull();
+    expect(screen.queryByRole("button", { name: "Accept recommended" })).toBeNull();
   });
 
   it("empty board offers the dispatch CTA (header icon + ceremonial CTA)", () => {

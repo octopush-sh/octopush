@@ -8,6 +8,7 @@ import {
   type RunDetail,
   type CheckpointActionName,
   type RunStagePatch,
+  type AnswerSource,
 } from "../lib/ipc";
 import { useUpgradeStore } from "./upgradeStore";
 import { isUpgradeRequired } from "../lib/upgradeError";
@@ -116,8 +117,8 @@ interface RunsState {
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
    *  injected as feedback. Refreshes the detail so the form gives way to the
-   *  re-running stage. */
-  answerBlocker: (runId: string, stageId: string, answers: string[]) => Promise<void>;
+   *  re-running stage. `source` names the answering surface for the journal. */
+  answerBlocker: (runId: string, stageId: string, answers: string[], source?: AnswerSource) => Promise<void>;
   abort: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
@@ -430,8 +431,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     await get().refreshDetail(runId);
   },
 
-  answerBlocker: async (runId, stageId, answers) => {
-    await ipc.answerBlocker(runId, stageId, answers);
+  answerBlocker: async (runId, stageId, answers, source) => {
+    await ipc.answerBlocker(runId, stageId, answers, source);
     await get().refreshDetail(runId);
   },
 

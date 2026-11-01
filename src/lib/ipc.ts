@@ -206,6 +206,10 @@ export interface BlockedAsk {
   questions: BlockedQuestion[];
 }
 
+/** The surface an `ask_director` answer came from, named in the run journal
+ *  ("…accepted the recommended defaults (from Mission Control)"). */
+export type AnswerSource = "mission_control";
+
 export interface RunStage {
   id: string;
   runId: string;
@@ -1252,9 +1256,11 @@ export const ipc = {
   /** Answer a stage that parked itself via the `ask_director` escape valve.
    *  `answers` is positional — one per question the stage asked; a missing or
    *  empty entry falls back to that question's recommended default. The
-   *  decisions become the stage's re-run feedback and the stage re-runs. */
-  answerBlocker: (runId: string, stageId: string, answers: string[]) =>
-    invoke<void>("answer_blocker", { runId, stageId, answers }),
+   *  decisions become the stage's re-run feedback and the stage re-runs.
+   *  `source` names the surface that answered, for the run journal; omitted =
+   *  the Direct answer form. */
+  answerBlocker: (runId: string, stageId: string, answers: string[], source?: AnswerSource) =>
+    invoke<void>("answer_blocker", { runId, stageId, answers, source: source ?? null }),
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),

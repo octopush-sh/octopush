@@ -4793,12 +4793,15 @@ mod orchestrator_tests {
         // Answer it → the stage resets to pending with the decision as feedback,
         // re-runs, and the run completes. blocked_questions is cleared.
         let status = orch
-            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["Use SQLite".into()] })
+            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["Use SQLite".into()], source: None })
             .await
             .unwrap();
         assert_eq!(status, RunStatus::Completed);
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(stages[0].status, "done");
+        // A custom answer is not "accepted the defaults" — no such notice.
+        let log = db.lock().list_stage_log(&stages[0].id).unwrap();
+        assert!(!log.iter().any(|e| e.contains("accepted the recommended defaults")), "{log:?}");
         assert!(stages[0].blocked_questions.is_none(), "cleared after answering");
         let artifact = stages[0].artifact.as_deref().unwrap();
         assert!(artifact.contains("Use SQLite"), "the director's answer reached the re-run: {artifact}");
@@ -4820,13 +4823,49 @@ mod orchestrator_tests {
             Box::new(BlockOnceRunner { asked: Default::default() }),
         );
         orch.run_to_pause(&run_id).await.unwrap();
-        // "Accept all defaults" sends each recommended_default verbatim.
-        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["Postgres".into()] })
-            .await
-            .unwrap();
+        // "Accept recommended" (here from Mission Control) sends each
+        // recommended_default verbatim.
+        orch.resolve_checkpoint(
+            &run_id,
+            CheckpointAction::AnswerBlocker {
+                answers: vec!["Postgres".into()],
+                source: Some("mission_control".into()),
+            },
+        )
+        .await
+        .unwrap();
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         let artifact = stages[0].artifact.as_deref().unwrap();
         assert!(artifact.contains("Director: Postgres"), "the default became the decision: {artifact}");
+        // The acceptance is the director's decision, logged in the journal with its surface.
+        let log = db.lock().list_stage_log(&stages[0].id).unwrap();
+        assert!(
+            log.iter().any(|e| e.contains("Director accepted the recommended defaults (from Mission Control)")),
+            "journal records the accept: {log:?}"
+        );
+    }
+
+    #[test]
+    fn answers_are_defaults_follows_the_feedback_fallback_rule() {
+        use crate::orchestrator::{accepted_defaults_notice, answers_are_defaults};
+        let ask = BlockedAsk {
+            summary: "s".into(),
+            questions: vec![
+                BlockedQuestion { question: "a?".into(), why_blocked: String::new(), recommended_default: "Postgres".into() },
+                BlockedQuestion { question: "b?".into(), why_blocked: String::new(), recommended_default: "yes".into() },
+            ],
+        };
+        assert!(answers_are_defaults(Some(&ask), &["Postgres".into(), " yes ".into()]));
+        // Missing / empty entries fall back to the default.
+        assert!(answers_are_defaults(Some(&ask), &["Postgres".into()]));
+        assert!(answers_are_defaults(Some(&ask), &["".into(), "".into()]));
+        assert!(!answers_are_defaults(Some(&ask), &["SQLite".into(), "yes".into()]));
+        assert!(!answers_are_defaults(None, &["x".into()]));
+        assert_eq!(
+            accepted_defaults_notice(Some("mission_control")),
+            "✓ Director accepted the recommended defaults (from Mission Control)"
+        );
+        assert_eq!(accepted_defaults_notice(None), "✓ Director accepted the recommended defaults");
     }
 
     /// Blocks once WITH a saved transcript; the second run records whether the
@@ -4896,7 +4935,7 @@ mod orchestrator_tests {
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert!(stages[0].blocked_transcript.is_some(), "transcript persisted while parked");
 
-        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()] })
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()], source: None })
             .await
             .unwrap();
         // The re-run received the transcript through its StageSpec…
@@ -5311,7 +5350,7 @@ mod orchestrator_tests {
         assert!(stages[0].blocked_questions.is_none(), "a normal gate has no questions");
         // Answering a stage that never asked is nonsense — refuse it.
         let err = orch
-            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec![] })
+            .resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec![], source: None })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not awaiting a director decision"), "{err}");

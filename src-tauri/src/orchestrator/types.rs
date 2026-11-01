@@ -380,8 +380,11 @@ pub enum CheckpointAction {
     /// the director's decisions (one per question, in order) become the stage's
     /// re-run feedback and the stage resets to pending. Reuses the reject-resume
     /// path — a blocked stage is just another `awaiting_checkpoint` pause.
+    /// `source` names the surface the answer came from (`"mission_control"`)
+    /// for the journal; `None` = the Direct answer form.
     AnswerBlocker {
         answers: Vec<String>,
+        source: Option<String>,
     },
     Abort,
 }
