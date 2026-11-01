@@ -17,6 +17,8 @@ export type NavigateDetail =
   /** Close everything a tour may have opened (Settings, palette, rooms). */
   | { kind: "close-overlays" }
   | { kind: "mode"; mode: WorkspaceMode }
+  /** Open one Run terminal of a workspace of the open project (the setup toast). */
+  | { kind: "terminal"; workspaceId: string; terminalId: string }
   | { kind: "palette" }
   | { kind: "mission-control" }
   | { kind: "logbook" };

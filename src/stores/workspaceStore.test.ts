@@ -359,6 +359,27 @@ describe("workspaceStore — create (project-aware, C3)", () => {
     expect(s.activeId).toBe(activeWs.id);
     expect(s.workspacesByProjectId["proj-2"].map((w) => w.id)).toEqual([created.id]);
   });
+
+  it("tracks a started setup terminal and keeps the setup fields off the stored row", async () => {
+    const { useTerminalsStore } = await import("./terminalsStore");
+    useTerminalsStore.setState({ setupByTerminal: {}, activeByWs: {} });
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const created = makeWorkspace("proj-1", "setup");
+    mockIpc.createWorkspace.mockResolvedValueOnce({ ...created, setupTerminalId: "term-setup", setupError: null });
+
+    const ws = await useWorkspaceStore
+      .getState()
+      .create("proj-1", "/repo", "setup", "", created.branch, "main", "npm install");
+
+    expect(ws).toEqual(created);
+    expect(useWorkspaceStore.getState().workspaces[0]).toEqual(created);
+    expect(useTerminalsStore.getState().setupByTerminal["term-setup"]).toEqual({
+      workspaceId: created.id,
+      status: "running",
+      exitCode: null,
+    });
+    expect(useTerminalsStore.getState().activeByWs[created.id]).toBe("term-setup");
+  });
 });
 
 describe("workspaceStore — pruneProject (C8)", () => {

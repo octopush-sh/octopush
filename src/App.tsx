@@ -84,6 +84,7 @@ import { type WorkspaceMode } from "./lib/modes";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
+import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
@@ -838,6 +839,7 @@ function App() {
           setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
           break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
+        // "terminal" is handled next to handleSelectWorkspace, below.
         case "palette": setShowPalette(true); break;
         case "mission-control": setMissionControlOpen(true); break;
         case "logbook": setLogbookOpen(true); break;
@@ -1593,28 +1595,35 @@ function App() {
   // dropping the user onto the empty "No workspaces here yet" screen.
   const handleSelectWorkspace = useCallback(
     (id: string) => {
-      const entry = Object.entries(workspacesByProjectId)
-        .flatMap(([pid, wss]) => wss.map((w) => ({ pid, w })))
-        .find((e) => e.w.id === id);
-      const targetProjectId = entry?.pid;
-
-      if (!targetProjectId || targetProjectId === project?.id) {
-        selectWorkspace(id);
-        return;
-      }
-
-      const targetPath = recentProjects.find((p) => p.id === targetProjectId)?.path;
-      if (!targetPath) {
+      const target = resolveWorkspaceTarget(id, workspacesByProjectId, project?.id, recentProjects);
+      if (target.kind === "here") {
         selectWorkspace(id);
         return;
       }
       // Remember the clicked workspace so loadWorkspaces() activates it after
       // the project switch, then switch projects.
-      rememberActiveForProject(targetProjectId, id);
-      openProject(targetPath);
+      rememberActiveForProject(target.projectId, id);
+      openProject(target.projectPath);
     },
     [workspacesByProjectId, project, selectWorkspace, recentProjects, rememberActiveForProject, openProject],
   );
+
+  // `octo:navigate` to one terminal (the setup-failure toast). The user has
+  // often switched project by then, so go through the rail's cross-project
+  // path. The active terminal and mode are keyed by workspace id and survive
+  // the project load (`loadTerminals` keeps an active id that still exists).
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const d = (e as CustomEvent<NavigateDetail>).detail;
+      if (d?.kind !== "terminal") return;
+      setSettingsTab(null);
+      setActiveTerminal(d.workspaceId, d.terminalId);
+      setModePerWorkspace((p) => ({ ...p, [d.workspaceId]: "run" }));
+      handleSelectWorkspace(d.workspaceId);
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [handleSelectWorkspace, setActiveTerminal]);
 
   // Jump from Mission Control to a run's workspace + its Direct surface.
   // (Mode is App-local state, so the room can't navigate on its own.)

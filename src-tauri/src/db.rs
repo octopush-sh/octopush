@@ -423,6 +423,12 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN tint TEXT",
         )?;
+        // The project's setup-script template (the wizard's last-used script),
+        // readable by the backend so a Routine's fresh worktree runs it too.
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -2228,6 +2234,27 @@ impl Db {
             .query_row(params![id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
             .optional()?;
         Ok(row)
+    }
+
+    /// The project's setup-script template ("" when none, or no such project).
+    pub fn get_project_setup_script(&self, id: &str) -> AppResult<String> {
+        let script: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT setup_script FROM projects WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(script.unwrap_or_default())
+    }
+
+    pub fn set_project_setup_script(&self, id: &str, script: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE projects SET setup_script = ?1 WHERE id = ?2",
+            params![script, id],
+        )?;
+        Ok(())
     }
 
     pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {

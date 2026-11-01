@@ -2,6 +2,8 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { roleForCommand, type SessionRole } from "../lib/sessionRole";
+import type { SetupRun } from "../lib/setupRun";
+import { navigate } from "../lib/tour/surfaces";
 import { useAttentionStore } from "./attentionStore";
 
 // ─── State shape ──────────────────────────────────────────────────
@@ -63,6 +65,9 @@ const restoredExpiryScheduled = new Set<string>();
 interface TerminalsStore {
   terminalsByWs: Record<string, TerminalState[]>;
   activeByWs: Record<string, string | null>;
+  /** Setup-script runs by terminal id (src/lib/setupRun.ts). Live state: after
+   *  a restart the replayed exit marker restores it, without a toast. */
+  setupByTerminal: Record<string, SetupRun>;
 
   // Selectors
   getTerminals: (workspaceId: string) => TerminalState[];
@@ -90,6 +95,12 @@ interface TerminalsStore {
   ) => void;
   /** Clear the transient `restored` badge for a given terminal. */
   clearRestored: (workspaceId: string, id: string) => void;
+  /** A workspace's setup script just started in terminal `id`; it becomes the
+   *  workspace's active session. */
+  trackSetup: (workspaceId: string, id: string) => void;
+  /** The setup runner in terminal `id` reported `code`. A run seen starting
+   *  that fails raises a toast that opens the terminal. */
+  reportSetupExit: (workspaceId: string, id: string, code: number) => void;
 }
 
 // ─── Store implementation ─────────────────────────────────────────
@@ -97,6 +108,7 @@ interface TerminalsStore {
 export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   terminalsByWs: {},
   activeByWs: {},
+  setupByTerminal: {},
 
   // ── Selectors ─────────────────────────────────────────────────
 
@@ -159,7 +171,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         // `restored` is set when the daemon has it but the store didn't — i.e.,
         // this is the first load of a surviving session after Octopush restart.
         // If it was already in the store as running, it's not a "new restore".
-        const restored = daemonRunning && !wasRunningInStore;
+        // A setup terminal the backend spawned this session is new, not a
+        // survivor — the store just hadn't listed it yet.
+        const restored = daemonRunning && !wasRunningInStore && !(r.id in s.setupByTerminal);
 
         const live = prevLiveById.get(r.id);
         return {
@@ -288,10 +302,14 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         remaining[idx]?.id ?? remaining[idx - 1]?.id ?? null;
     }
 
-    set((s) => ({
-      terminalsByWs: { ...s.terminalsByWs, [workspaceId]: remaining },
-      activeByWs: { ...s.activeByWs, [workspaceId]: nextActive },
-    }));
+    set((s) => {
+      const { [id]: _gone, ...setupByTerminal } = s.setupByTerminal;
+      return {
+        terminalsByWs: { ...s.terminalsByWs, [workspaceId]: remaining },
+        activeByWs: { ...s.activeByWs, [workspaceId]: nextActive },
+        setupByTerminal,
+      };
+    });
   },
 
   setActive: (workspaceId, id) =>
@@ -378,4 +396,36 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         },
       };
     }),
+
+  trackSetup: (workspaceId, id) =>
+    set((s) => ({
+      setupByTerminal: {
+        ...s.setupByTerminal,
+        [id]: { workspaceId, status: "running", exitCode: null },
+      },
+      activeByWs: { ...s.activeByWs, [workspaceId]: id },
+    })),
+
+  reportSetupExit: (workspaceId, id, code) => {
+    const wasRunning = get().setupByTerminal[id]?.status === "running";
+    set((s) => ({
+      setupByTerminal: {
+        ...s.setupByTerminal,
+        [id]: { workspaceId, status: code === 0 ? "ok" : "failed", exitCode: code },
+      },
+    }));
+    // Only a run this session saw start: a replayed marker after a restart
+    // restores the state quietly instead of re-announcing an old failure.
+    if (!wasRunning || code === 0) return;
+    pushToast({
+      level: "error",
+      title: "Setup failed",
+      body: `The setup script exited with ${code}. The workspace is ready; its dependencies may not be.`,
+      timeout: 10000,
+      action: {
+        label: "Open the setup terminal",
+        onClick: () => navigate({ kind: "terminal", workspaceId, terminalId: id }),
+      },
+    });
+  },
 }));

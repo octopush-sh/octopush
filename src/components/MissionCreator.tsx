@@ -248,8 +248,10 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     // missionsStore so the rail resolves this workspace's intent icon right
     // away instead of waiting for the next mount/focus refresh.
     useMissionsStore.getState().load(projectId).catch(() => {});
-    // Remember the script (possibly empty) as this project's template.
+    // Remember the script (possibly empty) as this project's template — here
+    // for the prefill, and in the backend for a Routine's fresh worktrees.
     useCompanionPrefs.getState().setSetupScriptForProject(projectId, setupScript);
+    ipc.setProjectSetupScript(projectId, setupScript).catch(() => {});
     if (linkIssueKeyOnCreate) {
       try {
         await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
@@ -531,12 +533,13 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
               How does it start?
             </h1>
             <p className="mt-3 max-w-[48ch] text-[13px] leading-[1.6] text-octo-sage">
-              These commands run automatically when the mission&apos;s worktree is created. Leave empty to skip.
+              These commands run in a setup terminal when the mission&apos;s worktree is created. The mission opens either way. Leave empty to skip.
             </p>
 
             <div className="mt-8 max-w-[640px]">
               <Field label="SETUP SCRIPT">
                 <textarea
+                  data-tour="mission-setup-script"
                   value={setupScript}
                   onChange={(e) => setSetupScript(e.target.value)}
                   placeholder="npm install"
@@ -547,11 +550,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
 
               <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
                 {branchCollides ? (
-                  // The branch already exists — creation reuses (or adopts) its
-                  // existing checkout, so we can't promise a fresh path here.
-                  <>Reuses the existing <span className="text-octo-sage">{branch}</span> branch — the setup script runs in its worktree.</>
+                  // The branch already exists — creation may reuse (or adopt) an
+                  // existing workspace or checkout, and those never re-run setup.
+                  <>Reuses the existing <span className="text-octo-sage">{branch}</span> branch. The setup script runs only if this makes a new worktree, never in a workspace it reuses.</>
                 ) : (
-                  <>Runs inside the new worktree at <span className="text-octo-sage">{worktreeDisplayPath(projectPath, branch)}</span>.</>
+                  <>Runs in a setup terminal inside the new worktree at <span className="text-octo-sage">{worktreeDisplayPath(projectPath, branch)}</span>.</>
                 )}
               </div>
             </div>

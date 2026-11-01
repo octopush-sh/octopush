@@ -20,6 +20,7 @@ import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
 import { isMac } from "../lib/platform";
 import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
+import { SETUP_EXIT_OSC, parseSetupExit } from "../lib/setupRun";
 import { Reveal } from "./primitives/Reveal";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
@@ -275,6 +276,17 @@ export function TerminalPane({
       // Announced, unlike the user's own Cmd-C: nothing was pressed in
       // Octopush, so the toast is how they learn their clipboard changed.
       copy: (text) => void copyToClipboard(text, "Copied from the terminal"),
+    });
+
+    // The setup runner's exit report (src/lib/setupRun.ts). Honoured from
+    // replayed history too: after a restart that is what restores the setup
+    // terminal's state (the store decides whether to announce it).
+    const setupOsc = term.parser.registerOscHandler(SETUP_EXIT_OSC, (data) => {
+      const code = parseSetupExit(data);
+      if (code !== null) {
+        useTerminalsStore.getState().reportSetupExit(workspaceIdRef.current, terminalId, code);
+      }
+      return true;
     });
 
     // Option+click, mouse-mode aware. xterm's alt-click-moves-cursor (on by
@@ -564,6 +576,7 @@ export function TerminalPane({
       resizeDisp.dispose();
       bellDisp.dispose();
       osc52.dispose();
+      setupOsc.dispose();
       ro.disconnect();
       unlistenData?.();
       unlistenExit?.();

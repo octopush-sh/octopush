@@ -459,6 +459,7 @@ import type {
   UsageReport,
   GatewayReconciliation,
   Workspace,
+  CreatedWorkspace,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
 } from "./types";
@@ -657,7 +658,10 @@ export const ipc = {
                     branch: string, fromBranch: string, setupScript: string,
                     intent: string | null, gitIsolation: string | null,
                     execIsolation: string | null) =>
-    invoke<Workspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation }),
+    invoke<CreatedWorkspace>("create_workspace", { projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation }),
+  /** Remember the project's setup-script template (read by Routines). */
+  setProjectSetupScript: (projectId: string, script: string) =>
+    invoke<void>("set_project_setup_script", { projectId, script }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────

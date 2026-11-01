@@ -1,6 +1,8 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
+import { useTerminalsStore } from "./terminalsStore";
+import { pushToast } from "../components/Toasts";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
 
 interface WorkspaceState {
@@ -180,7 +182,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript, intent = null, gitIsolation = null, execIsolation = null) => {
-    const ws = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    const { setupTerminalId, setupError, ...ws } = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    // A fresh worktree's setup script is already running in its `setup`
+    // terminal (backend-spawned); register it before the Run pane mounts so
+    // its exit is announced. It never blocks the workspace.
+    if (setupTerminalId) useTerminalsStore.getState().trackSetup(ws.id, setupTerminalId);
+    if (setupError) {
+      pushToast({ level: "error", title: "Setup didn't start", body: `The workspace is ready, but its setup script didn't run: ${setupError}` });
+    }
     // Only the currently-open project owns the flat `workspaces`/`activeId`.
     // Creating for any other project must not steal focus or corrupt that
     // list — it just lands in the per-project map for the rail (C3).

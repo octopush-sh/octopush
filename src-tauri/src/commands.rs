@@ -811,9 +811,67 @@ pub(crate) fn resolve_free_project_dir(
 
 // ─── Workspace commands ───────────────────────────────────────────
 
+/// `create_workspace`'s response: the workspace, plus its setup terminal when
+/// the setup script was started (only for a freshly created worktree).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreatedWorkspace {
+    #[serde(flatten)]
+    pub workspace: crate::db::WorkspaceRow,
+    /// The `setup` Run terminal running the setup script.
+    pub setup_terminal_id: Option<String>,
+    /// Why the setup script couldn't be started. The workspace itself is fine.
+    pub setup_error: Option<String>,
+}
+
+/// Start `script` in a new `setup` Run terminal in `ws`'s worktree. The PTY
+/// daemon owns it from here, so it keeps running whatever the UI does.
+fn start_setup_terminal(
+    app: &AppHandle,
+    state: &AppState,
+    ws: &crate::db::WorkspaceRow,
+    script: &str,
+) -> AppResult<String> {
+    use crate::workspace_setup as setup;
+    let cwd = ws
+        .worktree_path
+        .clone()
+        .ok_or_else(|| crate::error::AppError::Other("the workspace has no worktree".into()))?;
+    let runner = setup::ensure_runner(&setup::runner_dir())?;
+    let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
+    let env = std::collections::HashMap::from([(setup::SCRIPT_ENV.to_string(), script.to_string())]);
+    if let Err(e) = spawn_terminal_session(
+        app.clone(),
+        state,
+        terminal.id.clone(),
+        cwd,
+        terminal.label.clone(),
+        env,
+        Some(runner.to_string_lossy().into_owned()),
+    ) {
+        // A record without its session would open as a plain shell that never
+        // ran the script — drop it so nothing claims a setup ran.
+        let _ = state.db.lock().delete_terminal(&terminal.id);
+        return Err(e);
+    }
+    Ok(terminal.id)
+}
+
+/// Remember `script` as the project's setup-script template (the wizard's
+/// prefill, and what a Routine's fresh worktree runs).
+#[tauri::command]
+pub async fn set_project_setup_script(
+    state: State<'_, AppState>,
+    project_id: String,
+    script: String,
+) -> AppResult<()> {
+    state.db.lock().set_project_setup_script(&project_id, &script)
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
     project_path: String,
@@ -825,7 +883,7 @@ pub async fn create_workspace(
     intent: Option<String>,
     git_isolation: Option<String>,
     exec_isolation: Option<String>,
-) -> AppResult<crate::db::WorkspaceRow> {
+) -> AppResult<CreatedWorkspace> {
     // Validate the axes BEFORE anything is created on disk. workspace::create
     // commits a DB row + a git worktree; a bad intent/isolation caught only at
     // pairing time (after that) would strand an orphaned workspace with no
@@ -842,10 +900,10 @@ pub async fn create_workspace(
 
     // Single shared code path with octopush-mcp. We pass the Mutex (not a held
     // guard) so workspace::create locks only for its brief DB reads/writes and
-    // never across the worktree checkout. The UI doesn't need the outcome — the
-    // creator's inline "branch exists" hint already tells the user about reuse,
-    // and the store upserts by id so a reused row never duplicates in the rail.
-    let (ws, _outcome) = crate::workspace::create(
+    // never across the worktree checkout. The outcome decides whether the setup
+    // script runs (a fresh worktree only); the store upserts by id so a reused
+    // row never duplicates in the rail.
+    let (ws, outcome) = crate::workspace::create(
         &state.db,
         &project_id,
         project_path,
@@ -867,7 +925,21 @@ pub async fn create_workspace(
             db.update_mission_exec_isolation(&mission.id, exec_isolation)?;
         }
     }
-    Ok(ws)
+    // The setup script never blocks the workspace: a start failure is reported
+    // alongside it, and a failing script shows in its terminal.
+    let (setup_terminal_id, setup_error) =
+        if crate::workspace_setup::should_run(outcome, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &setup_script) {
+                Ok(id) => (Some(id), None),
+                Err(e) => {
+                    tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");
+                    (None, Some(e.to_string()))
+                }
+            }
+        } else {
+            (None, None)
+        };
+    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error })
 }
 
 // ─── Mission commands ─────────────────────────────────────────────
@@ -2811,7 +2883,28 @@ pub async fn spawn_or_attach_terminal(
     cwd: String,
     label: String,
 ) -> AppResult<SpawnOrAttachResult> {
-    use crate::pty_manager::{SpawnMode, SpawnOptions};
+    use crate::pty_manager::SpawnMode;
+
+    let mode = spawn_terminal_session(app, state.inner(), id, cwd, label, std::collections::HashMap::new(), None)?;
+    Ok(match mode {
+        SpawnMode::Spawned { pid } => SpawnOrAttachResult::Spawned { pid },
+        SpawnMode::Reattached => SpawnOrAttachResult::Reattached,
+    })
+}
+
+/// Spawn-or-attach the PTY for terminal record `id` (shared by the Run pane and
+/// the setup terminal). `shell` replaces the user's login shell — the setup
+/// terminal starts the setup runner there (`workspace_setup::RUNNER`).
+fn spawn_terminal_session(
+    app: AppHandle,
+    state: &AppState,
+    id: String,
+    cwd: String,
+    label: String,
+    env: std::collections::HashMap<String, String>,
+    shell: Option<String>,
+) -> AppResult<crate::pty_manager::SpawnMode> {
+    use crate::pty_manager::SpawnOptions;
 
     let db_for_hook = std::sync::Arc::clone(&state.db);
     // Logbook: resolve the terminal's workspace once, then beat coalesced PTY
@@ -2836,24 +2929,19 @@ pub async fn spawn_or_attach_terminal(
         }
     });
 
-    let mode = state.pty.lock().spawn_or_attach(
+    state.pty.lock().spawn_or_attach(
         app,
         SpawnOptions {
             id: id.clone(),
             session_name: label,
             cwd,
-            env: std::collections::HashMap::new(),
+            env,
             rows: 24,
             cols: 80,
-            shell: None,
+            shell,
             on_output: Some(scanner_hook),
         },
-    )?;
-
-    Ok(match mode {
-        SpawnMode::Spawned { pid } => SpawnOrAttachResult::Spawned { pid },
-        SpawnMode::Reattached => SpawnOrAttachResult::Reattached,
-    })
+    )
 }
 
 /// List all PTY sessions currently known to the daemon.
@@ -2895,6 +2983,15 @@ pub async fn list_terminals(
 #[tauri::command]
 pub async fn create_terminal(
     state: State<'_, AppState>,
+    workspace_id: String,
+    label: String,
+) -> AppResult<crate::db::TerminalRow> {
+    insert_terminal(state.inner(), workspace_id, label)
+}
+
+/// Add a terminal record at the end of the workspace's sessions.
+fn insert_terminal(
+    state: &AppState,
     workspace_id: String,
     label: String,
 ) -> AppResult<crate::db::TerminalRow> {
