@@ -13,6 +13,10 @@ export interface TerminalState {
   position: number;
   /** true once the frontend has spawned (or reattached) a PTY for this id */
   running: boolean;
+  /** true when the last spawn-or-attach for this id was rejected (no shell,
+   *  sandbox denial, daemon down). Cleared by the next successful spawn.
+   *  Absent is the same as false. */
+  failed?: boolean;
   /** true while a non-shell command is executing in this PTY (foreground
    *  process != shell). Distinct from `running` (= shell session alive);
    *  driven by the daemon's `pty://foreground` events. */
@@ -71,6 +75,9 @@ interface TerminalsStore {
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
   setActive: (workspaceId: string, id: string | null) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
+  /** Record that a terminal's PTY failed to start (or, with `false`, that
+   *  the failure was cleared). A failed session is never running. */
+  markFailed: (workspaceId: string, id: string, failed: boolean) => void;
   /** Set whether a command is currently executing in a terminal (foreground
    *  busy), from the daemon's `pty://foreground` events. `command` is the
    *  daemon's argv summary when it could resolve one; it updates the session's
@@ -133,7 +140,10 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       // Roles and running commands are live state, not DB state — a reload
       // must not reset a session's identity to "shell".
       const prevLiveById = new Map(
-        (prev ?? []).map((t) => [t.id, { role: t.role, command: t.command }]),
+        (prev ?? []).map((t) => [
+          t.id,
+          { role: t.role, command: t.command, failed: t.failed ?? false },
+        ]),
       );
 
       const terminals: TerminalState[] = records.map((r) => {
@@ -157,6 +167,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           label: r.label,
           position: r.position,
           running,
+          // A spawn failure is live state too; a session that is running
+          // after all is no longer failed.
+          failed: !running && (live?.failed ?? false),
           busy: false,
           restored,
           role: live?.role ?? ("shell" as SessionRole),
@@ -298,9 +311,28 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
               ? {
                   ...t,
                   running,
+                  // A live PTY clears a previous spawn failure.
+                  failed: running ? false : t.failed,
                   busy: running ? t.busy : false,
                   command: running ? t.command : null,
                 }
+              : t,
+          ),
+        },
+      };
+    }),
+
+  markFailed: (workspaceId, id, failed) =>
+    set((s) => {
+      const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+      return {
+        terminalsByWs: {
+          ...s.terminalsByWs,
+          [workspaceId]: prev.map((t) =>
+            t.id === id
+              ? failed
+                ? { ...t, failed: true, running: false, busy: false, command: null }
+                : { ...t, failed: false }
               : t,
           ),
         },

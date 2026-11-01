@@ -123,9 +123,16 @@ export function CompanionSession({ workspaceId }: Props) {
 
             <dt className="uppercase tracking-[0.12em] text-octo-mute">State</dt>
             <dd
-              className={`m-0 truncate ${session.busy ? "text-octo-brass" : session.running ? "text-octo-verdigris" : "text-octo-mute"}`}
+              data-testid="session-detail-state"
+              className={`m-0 truncate ${session.failed ? "text-octo-rouge" : session.busy ? "text-octo-brass" : session.running ? "text-octo-verdigris" : "text-octo-mute"}`}
             >
-              {session.busy ? "running" : session.running ? "shell idle" : "stopped"}
+              {session.failed
+                ? "failed"
+                : session.busy
+                  ? "running"
+                  : session.running
+                    ? "shell idle"
+                    : "stopped"}
             </dd>
 
             <dt className="uppercase tracking-[0.12em] text-octo-mute">Command</dt>

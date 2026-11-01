@@ -48,6 +48,7 @@ const xtermHoisted = vi.hoisted(() => ({
     attachCustomKeyEventHandler: ReturnType<typeof vi.fn>;
     input: ReturnType<typeof vi.fn>;
     write: ReturnType<typeof vi.fn>;
+    writeln: ReturnType<typeof vi.fn>;
     /** OSC handlers the component registered, by identifier (52 = clipboard). */
     oscHandlers: Record<number, (data: string) => boolean>;
     /** The `term.onData` callback — what a keystroke or mouse report invokes. */
@@ -491,6 +492,92 @@ describe("TerminalPane — spawn callback", () => {
     });
 
     expect(onSpawn).not.toHaveBeenCalled();
+  });
+});
+
+describe("TerminalPane — spawn failure", () => {
+  async function mountFailing(error: unknown) {
+    mockIpc.spawnOrAttachTerminal.mockRejectedValueOnce(error);
+    const onSpawn = vi.fn();
+    const onSpawnError = vi.fn();
+    const utils = render(
+      <TerminalPane
+        terminalId="t-fail"
+        workspaceId="ws-test"
+        workspacePath="/ws"
+        label="Main"
+        visible={true}
+        onSpawn={onSpawn}
+        onSpawnError={onSpawnError}
+      />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    return { ...utils, onSpawn, onSpawnError };
+  }
+
+  it("shows a designed error state instead of a raw error line in the terminal", async () => {
+    const { getByTestId, getByText, onSpawn, onSpawnError } = await mountFailing(
+      "other: daemon unavailable",
+    );
+    expect(getByTestId("terminal-spawn-failed")).toBeTruthy();
+    expect(getByText("Session didn't start")).toBeTruthy();
+    expect(getByText("The background terminal service isn't responding.")).toBeTruthy();
+    expect(getByText("Try the shell again")).toBeTruthy();
+    expect(onSpawnError).toHaveBeenCalledTimes(1);
+    expect(onSpawn).not.toHaveBeenCalled();
+    // Nothing is written into xterm itself.
+    expect(xtermHoisted.last!.writeln).not.toHaveBeenCalled();
+  });
+
+  it("names the real cause when the daemon answered with an OS error", async () => {
+    const { getByText, queryByText } = await mountFailing(
+      "other: daemon error: spawn: No such file or directory (os error 2)",
+    );
+    expect(getByText("The shell or the workspace folder couldn't be found.")).toBeTruthy();
+    expect(queryByText("The background terminal service isn't responding.")).toBeNull();
+  });
+
+  it("keeps the raw error behind a disclosure", async () => {
+    const { getByTestId } = await mountFailing(new Error("spawn /bin/zsh: ENOENT"));
+    const toggle = getByTestId("terminal-spawn-detail-toggle");
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    expect(getByTestId("terminal-spawn-detail").textContent).toBe("spawn /bin/zsh: ENOENT");
+    act(() => {
+      toggle.click();
+    });
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("tries the shell again and clears the error state once it starts", async () => {
+    const { getByText, queryByTestId, onSpawn } = await mountFailing("boom");
+    mockIpc.spawnOrAttachTerminal.mockResolvedValueOnce({ mode: "Spawned", pid: 7 });
+    await act(async () => {
+      getByText("Try the shell again").click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(mockIpc.spawnOrAttachTerminal).toHaveBeenCalledTimes(2);
+    expect(onSpawn).toHaveBeenCalledTimes(1);
+    expect(queryByTestId("terminal-spawn-failed")).toBeNull();
+  });
+
+  it("does not treat an unexpected resolved value as a failure", async () => {
+    mockIpc.spawnOrAttachTerminal.mockResolvedValueOnce(
+      null as unknown as { mode: "Spawned"; pid: number },
+    );
+    const onSpawn = vi.fn();
+    const { queryByTestId } = render(
+      <TerminalPane terminalId="t-null" workspaceId="ws" workspacePath="/ws" label="L" visible={true} onSpawn={onSpawn} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(onSpawn).toHaveBeenCalledTimes(1);
+    expect(queryByTestId("terminal-spawn-failed")).toBeNull();
   });
 });
 
