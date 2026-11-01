@@ -10,6 +10,7 @@ import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 import { ModalShell } from "./ModalShell";
 import { openWhatsNewForCurrentVersion, previewUnreleasedTips } from "../lib/whatsNewLaunch";
+import { tourId } from "../lib/tour/ids";
 
 interface Props {
   open: boolean;
@@ -114,12 +115,13 @@ export function CommandPalette({
             </Group>
 
             {/* Models */}
-            <Group heading="Models">
+            {/* The heading already says "Models", so rows carry the bare name. */}
+            <Group heading="Models" tour={tourId("palette-models")}>
               {models.map((m) => (
                 <Item
                   key={m.model.id}
                   glyph="◇"
-                  label={`Model: ${m.model.displayName}`}
+                  label={m.model.displayName}
                   detail={`${m.provider} · $${m.model.inputCostPerM}/M in`}
                   onSelect={() =>
                     run(async () => {
@@ -310,14 +312,17 @@ export function CommandPalette({
 
 function Group({
   heading,
+  tour,
   children,
 }: {
   heading: string;
+  tour?: string;
   children: React.ReactNode;
 }) {
   return (
     <Command.Group
       heading={heading}
+      data-tour={tour}
       className="px-1 pb-1 [&_[cmdk-group-heading]]:px-3 [&_[cmdk-group-heading]]:pb-1.5 [&_[cmdk-group-heading]]:pt-3 [&_[cmdk-group-heading]]:font-mono [&_[cmdk-group-heading]]:text-[8px] [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.3em] [&_[cmdk-group-heading]]:text-octo-brass"
     >
       {children}
@@ -358,9 +363,15 @@ function Item({
       >
         {glyph}
       </span>
-      <span className="flex-1 truncate">{label}</span>
+      {/* The label is what tells rows apart, so the detail gives way first
+          (shrink-[100] against the label's content-sized basis); both ellipsize
+          and keep their full text in a title. */}
+      <span className="min-w-0 flex-auto truncate" title={label}>{label}</span>
       {detail && (
-        <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute">
+        <span
+          className="min-w-0 shrink-[100] truncate font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute"
+          title={detail}
+        >
           {detail}
         </span>
       )}
