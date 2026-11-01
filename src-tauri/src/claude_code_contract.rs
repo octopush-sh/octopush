@@ -25,7 +25,8 @@ use std::path::{Path, PathBuf};
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
     build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
-    plan_windows_from_stream_event, usage_from_stream_event, CliAuth,
+    plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect, ReadEnd,
+    ReadLimits,
 };
 use crate::orchestrator::live::entries_from_stream_event;
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
@@ -419,6 +420,111 @@ fn stream_json_missing_fields_degrade_without_panicking() {
     // A truncated result line is an Err, never a panic.
     let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
     assert!(parse_cli_result(&line[..line.len() / 2], true, ArtifactKind::Note, "").is_err());
+}
+
+// ─── Settling after `result` (background work keeps `-p` open) ───────────
+
+/// Short limits so a settle is observable in a test; idle and cap far away.
+const TEST_LIMITS: ReadLimits = ReadLimits {
+    idle: std::time::Duration::from_secs(20),
+    cap: std::time::Duration::from_secs(60),
+    settle: std::time::Duration::from_millis(150),
+};
+
+/// Feed `stream` to the production read loop, bounded so a regression that
+/// waits for EOF fails instead of hanging. Returns the end and the number of
+/// JSON events handed to `on_event`.
+async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(stream: R, dialect: CliDialect) -> (ReadEnd, usize, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let mut seen = 0usize;
+    let end = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_stream(stream, dialect, TEST_LIMITS, |_| seen += 1),
+    )
+    .await
+    .expect("read_stream did not settle — it is waiting for the process to exit");
+    (end, seen, started.elapsed())
+}
+
+/// A recorded stream as stdout bytes, newline-terminated so its last line is
+/// complete even when more output (or none) follows on the same pipe.
+fn stdout_bytes(rec: &Rec, rel: &str) -> std::io::Cursor<Vec<u8>> {
+    let mut bytes = rec.text(rel).into_bytes();
+    if !bytes.ends_with(b"\n") {
+        bytes.push(b'\n');
+    }
+    std::io::Cursor::new(bytes)
+}
+
+#[tokio::test]
+async fn stream_json_result_then_an_open_process_settles_with_the_result_usage() {
+    use tokio::io::AsyncReadExt;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/simple.jsonl");
+        let events = rec.jsonl("stream-json/simple.jsonl");
+        // The recorded stream, then a stdout that stays open and silent —
+        // `claude -p` waiting on a background dev server.
+        let (_still_open, rx) = tokio::io::duplex(64);
+        let stream = stdout_bytes(&rec, "stream-json/simple.jsonl").chain(rx);
+        let (end, seen, took) = read_bounded(stream, CliDialect::Claude).await;
+        let ReadEnd::Settled(line, _) = end else {
+            panic!("[{fx}] expected the stage to settle after its result, got {end:?}");
+        };
+        assert_eq!(seen, events.len(), "[{fx}] every event still reaches the journal/usage handler");
+        assert!(took < std::time::Duration::from_secs(5), "[{fx}] settled after {took:?}");
+        let outcome = parse_cli_result(&line, true, ArtifactKind::Note, "")
+            .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the settled line: {e}"));
+        assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+        let r = result_event(&fx, &events);
+        assert_eq!(outcome.input_tokens, require_u64(&fx, r, "usage.input_tokens"), "[{fx}]");
+        assert_eq!(outcome.output_tokens, require_u64(&fx, r, "usage.output_tokens"), "[{fx}]");
+        assert!(outcome.cost_usd > 0.0, "[{fx}] total_cost_usd not carried");
+    }
+}
+
+#[tokio::test]
+async fn stream_json_output_after_result_does_not_hold_the_stage_open() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let rec = recordings().pop().unwrap();
+    let fx = rec.label("stream-json/simple.jsonl");
+    // A background server that keeps logging: each line would reset an idle
+    // timer, but the settle grace counts from the result.
+    let (mut server, rx) = tokio::io::duplex(1024);
+    let logger = tokio::spawn(async move {
+        while server.write_all(b"[vite] page reload src/App.tsx\n").await.is_ok() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    });
+    let stream = stdout_bytes(&rec, "stream-json/simple.jsonl").chain(rx);
+    let (end, _, took) = read_bounded(stream, CliDialect::Claude).await;
+    logger.abort();
+    assert!(matches!(end, ReadEnd::Settled(..)), "[{fx}] expected a settle, got {end:?}");
+    assert!(took < std::time::Duration::from_secs(5), "[{fx}] settled after {took:?}");
+}
+
+#[tokio::test]
+async fn stream_json_result_then_eof_is_a_clean_exit_not_a_settle() {
+    let rec = recordings().pop().unwrap();
+    let fx = rec.label("stream-json/simple.jsonl");
+    let stream = stdout_bytes(&rec, "stream-json/simple.jsonl");
+    let (end, _, _) = read_bounded(stream, CliDialect::Claude).await;
+    assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "[{fx}] got {end:?}");
+}
+
+#[test]
+fn claude_stage_env_ceils_background_waits_below_the_settle_grace() {
+    let env = CliDialect::Claude.stage_env();
+    let ceiling = env
+        .iter()
+        .find(|(k, _)| *k == "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| panic!("no background-wait ceiling in {env:?}"));
+    assert_eq!(ceiling, "25000");
+    assert_eq!(ReadLimits::STAGE.settle, std::time::Duration::from_secs(30));
+    // The CLI's own clean exit must come before the runner stops it.
+    let ceiling = std::time::Duration::from_millis(ceiling.parse().unwrap());
+    assert!(ceiling < ReadLimits::STAGE.settle, "{ceiling:?} ≥ {:?}", ReadLimits::STAGE.settle);
+    assert!(CliDialect::Codex.stage_env().is_empty());
 }
 
 // ─── `rate_limit_event` → Claude plan windows ────────────────────────────

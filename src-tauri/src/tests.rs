@@ -8269,6 +8269,62 @@ mod cli_runner_tests {
         assert!(started.elapsed() < grace, "no escalation past SIGINT");
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "interrupted\n");
     }
+
+    /// The settle path end to end: a stand-in for `claude -p` starts a
+    /// backgrounded `sleep 300` (a dev server), prints its `result` and stays
+    /// open. The read settles, and the group stop that follows takes the
+    /// grandchild down too, so no orphaned server keeps its port.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_settled_stage_stops_the_background_work_it_left_running() {
+        use crate::orchestrator::cli_runner::{read_stream, stop_cli_child, CliDialect, ReadEnd, ReadLimits};
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-claude.sh");
+        let pidfile = dir.path().join("grandchild.pid");
+        std::fs::write(
+            &script,
+            r#"sleep 300 &
+echo $! > "$1"
+echo '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+wait
+"#,
+        )
+        .unwrap();
+        let mut child = tokio::process::Command::new("sh")
+            .arg(&script)
+            .arg(&pidfile)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        let limits = ReadLimits {
+            idle: Duration::from_secs(20),
+            cap: Duration::from_secs(60),
+            settle: Duration::from_millis(200),
+        };
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_stream(stdout, CliDialect::Claude, limits, |_| {}),
+        )
+        .await
+        .expect("read_stream did not settle — it is waiting for the process to exit");
+        assert!(matches!(end, ReadEnd::Settled(..)), "expected a settle, got {end:?}");
+        let grandchild: libc::pid_t = wait_for_file(&pidfile).await.trim().parse().unwrap();
+
+        assert!(stop_cli_child(&mut child, Duration::from_millis(300)).await.is_some(), "the CLI was reaped");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // SAFETY: kill(pid, 0) performs no action — existence probe only.
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the background work must die with the stage");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[cfg(test)]
