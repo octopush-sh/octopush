@@ -1324,8 +1324,8 @@ function App() {
   const activeWsPrimaryMessages = useChatStore((s) =>
     activeWorkspaceId ? s.messagesByWs[activeWorkspaceId] : undefined,
   );
-  // Tick once per minute so "5M AGO" / "1H AGO" stay current without
-  // requiring a full re-render of the chat itself.
+  // Tick once per minute so the meta rolls over (today's "14:32" becomes
+  // "YESTERDAY" at midnight) without a full re-render of the chat itself.
   const [tickerNow, setTickerNow] = useState(() => new Date());
   useEffect(() => {
     const id = setInterval(() => setTickerNow(new Date()), 60_000);
