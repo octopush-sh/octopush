@@ -34,8 +34,8 @@ export function deriveChatTitle(messages: ChatMessage[]): string {
 /**
  * Format a relative timestamp for the meta line under a chat title.
  * The input is the most recent message's `createdAt` (ISO string from the
- * backend). Returns short shapes like `just now`, `5m ago`, `Yesterday`,
- * or a localized date when older than a week.
+ * backend). Returns short shapes like `14:32`, `YESTERDAY`, `3D AGO`, or a
+ * localized date when older than a week.
  */
 export function deriveChatMeta(messages: ChatMessage[], now: Date = new Date()): string {
   const last = messages[messages.length - 1];
@@ -43,21 +43,25 @@ export function deriveChatMeta(messages: ChatMessage[], now: Date = new Date()):
   return formatRelTime(last.createdAt, now);
 }
 
-/** Short uppercase relative time (`JUST NOW`, `5M AGO`, `YESTERDAY`, a date)
- *  from an ISO timestamp. Shared by the chat meta line and the thread list. */
+/** Short uppercase time of last activity from an ISO timestamp, for the chat
+ *  list's meta line: the clock time today (`14:32`), then `YESTERDAY`,
+ *  `3D AGO`, a date. Today's rows carry a precise time rather than a
+ *  relative bucket (`JUST NOW`, `5M AGO`) so rows active in the same stretch
+ *  still read apart. */
 export function formatRelTime(iso: string, now: Date = new Date()): string {
   const then = new Date(iso);
   if (Number.isNaN(then.getTime())) return "";
 
-  const diffMs = now.getTime() - then.getTime();
-  const diffSec = Math.max(0, Math.floor(diffMs / 1000));
-  const diffMin = Math.floor(diffSec / 60);
-  const diffHr = Math.floor(diffMin / 60);
-  const diffDay = Math.floor(diffHr / 24);
+  // Calendar days between the two local dates (not 24h periods), so 23:50
+  // yesterday reads YESTERDAY at 00:10 today.
+  const dayStart = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const diffDay = Math.max(0, Math.round((dayStart(now) - dayStart(then)) / 86_400_000));
 
-  if (diffSec < 45) return "JUST NOW";
-  if (diffMin < 60) return `${diffMin}M AGO`;
-  if (diffHr < 24) return `${diffHr}H AGO`;
+  if (diffDay === 0) {
+    return then
+      .toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+      .toUpperCase();
+  }
   if (diffDay === 1) return "YESTERDAY";
   if (diffDay < 7) return `${diffDay}D AGO`;
 

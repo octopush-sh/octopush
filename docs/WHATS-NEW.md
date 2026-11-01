@@ -77,6 +77,7 @@ Current anchors:
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
+| `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
