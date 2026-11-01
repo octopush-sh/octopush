@@ -914,6 +914,12 @@ test("octo-check: the installed copy runs only its profile's commands", async ()
   assert.equal(app("build").status, 64);
   assert.match(app("build").stderr, /typecheck \| test/);
   assert.match(bad("all").stderr, /unknown profile/);
+  // The web builder's agent can't reinstall node_modules (the symlink cleanup would break its checks).
+  assert.equal(web("site").status, 64, "site belongs to the web-audit profile only");
+  assert.equal(web("install").status, 64);
+  const audit = install("web-audit");
+  assert.equal(audit("build").status, 64);
+  assert.match(audit("build").stderr, /usage: octo-check site/);
   assert.equal(spawnSync("bash", [new URL("./agent-check.sh", import.meta.url).pathname, "all"], { encoding: "utf8" }).status, 64, "the repo copy refuses: not installed");
 });
 
@@ -999,7 +1005,8 @@ test("workflows: website code runs only as octo-sandbox, and the App key only ou
   const job = audit.slice(audit.indexOf("\n  audit:\n"), audit.indexOf("\n  file:\n"));
   assert.doesNotMatch(audit, /needs\.\w+\.outputs\.(read|token)/, "no token handed over as a job output (it would print in the public log)");
   assert.doesNotMatch(job, /npm run build|npm ci/, "the site is never installed or built as the runner user");
-  assert.match(job, /octo-check install\n\s*octo-check site/);
+  assert.match(job, /octo-check site/);
+  assert.doesNotMatch(job, /octo-check install\n/, "install and build run in one sandboxed call (symlinks are wiped after each)");
   assert.match(job, /skip-token-revoke: true/);
   assert.match(job, /Revoke the read token and prove it dead\n\s*if: always\(\)/);
   assert.match(job, /pgrep -u octo-sandbox/);

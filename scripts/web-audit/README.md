@@ -9,8 +9,8 @@ run against the built site. Runs nightly in `web-audit.yml`; no agent.
 1. The workflow copies these scripts aside, checks out octopush-web's `main`
    (what merging publishes) with a `contents: read` installation token of the
    "Octopush Cycle" GitHub App, revokes it and checks it is dead, then installs
-   and builds the site as the unprivileged `octo-sandbox` user (`octo-check
-   install`, `octo-check site` — the website's code never runs as the runner
+   and builds the site as the unprivileged `octo-sandbox` user (`octo-check site`,
+   profile `web-audit`: install without scripts and build in one call — the website's code never runs as the runner
    user, which holds the job's secrets and has sudo) and kills every sandbox
    process before going on. The audit runs as `octo-sandbox` too (Chromium
    executes the site's JavaScript), from these scripts and a browser installed
