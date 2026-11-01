@@ -132,6 +132,75 @@ describe("ReviewCanvas toolbar", () => {
     fireEvent.click(screen.getByRole("button", { name: /ignore whitespace/i }));
     expect(useReviewPrefs.getState().ignoreWhitespace).toBe(true);
   });
+
+  // Visual audit #358: on a narrow canvas the toolbar cut the AI button off at
+  // its edge. The secondary toggles are one ladder rung (shed by the
+  // `.octo-reviewbar` container query) and "More" grows in to replace them.
+  it("the secondary toggles are one shed rung; AI and Accept all are the floor", () => {
+    const { container } = renderCanvas();
+    expect(container.querySelector("header")).toHaveClass("octo-reviewbar");
+    const rung = screen.getByTestId("review-toolbar-secondary");
+    expect(rung).toHaveClass("octo-demote", "octo-demote-secondary");
+    for (const name of [/^inline$/i, /side.?by.?side/i, /ignore whitespace/i, /^tests$/i]) {
+      expect(rung).toContainElement(screen.getByRole("button", { name }));
+    }
+    for (const name of [/review with ai/i, /accept all changes/i, /diff view/i]) {
+      expect(rung).not.toContainElement(screen.getByRole("button", { name }));
+    }
+    expect(screen.getByRole("button", { name: /more view options/i }).parentElement).toHaveClass(
+      "octo-demote",
+      "octo-reviewbar-more",
+    );
+  });
+
+  it("More holds the shed controls: layout, whitespace and tests", () => {
+    renderCanvas();
+    const more = screen.getByRole("button", { name: /more view options/i });
+    fireEvent.click(more);
+    expect(more).toHaveAttribute("aria-expanded", "true");
+    const menu = screen.getByRole("menu", { name: /more view options/i });
+    expect(menu).toHaveClass("octo-menu-enter");
+
+    const inline = screen.getByRole("menuitemradio", { name: /inline diff/i });
+    expect(inline).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /side-by-side diff/i }));
+    expect(useReviewPrefs.getState().readingMode).toBe("sbs");
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.click(more);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: /ignore whitespace/i }));
+    expect(useReviewPrefs.getState().ignoreWhitespace).toBe(true);
+
+    fireEvent.click(more);
+    fireEvent.click(screen.getByRole("menuitem", { name: /set a test command/i }));
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByPlaceholderText("npm test")).toBeInTheDocument();
+  });
+
+  it("More closes on Escape and on an outside click, not on its own trigger", () => {
+    renderCanvas();
+    const more = screen.getByRole("button", { name: /more view options/i });
+    fireEvent.click(more);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.mouseDown(more);
+    fireEvent.click(more);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("the tests popover toggles from its button without the outside-click reopening it", () => {
+    renderCanvas();
+    const tests = screen.getByRole("button", { name: /^tests$/i });
+    fireEvent.mouseDown(tests);
+    fireEvent.click(tests);
+    expect(screen.getByPlaceholderText("npm test")).toBeInTheDocument();
+    fireEvent.mouseDown(tests);
+    fireEvent.click(tests);
+    expect(screen.queryByPlaceholderText("npm test")).toBeNull();
+  });
 });
 
 // ─── Hunk actions ──────────────────────────────────────────────────

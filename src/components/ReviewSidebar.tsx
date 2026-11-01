@@ -7,9 +7,14 @@
  * the user wants the canvas to themselves. The active panel keeps its own
  * eyebrow actions; the tab switcher + collapse control are injected into that
  * eyebrow via `headerLeading`, so there's a single top bar, never two.
+ *
+ * On a narrow Review area (below AUTO_COLLAPSE_BELOW) it starts collapsed
+ * whatever the stored preference, so the diff keeps its width; expanding it
+ * there lasts until the area changes width class and never overwrites the
+ * stored preference.
  */
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { PanelLeftClose, PanelLeftOpen, FileDiff, FolderTree } from "lucide-react";
 import { ChangesPanel } from "./ChangesPanel";
 import { CompanionFileTree } from "./CompanionFileTree";
@@ -30,6 +35,10 @@ export const SIDEBAR_MAX_WIDTH = 640;
 /** The canvas always keeps at least this much room, whatever the stored
  *  width — a wide sidebar on a narrow window must not crush the diff. */
 const MIN_CANVAS_WIDTH = 360;
+/** Below this Review-area width (sidebar + canvas) the sidebar collapses to
+ *  its icon strip by default: an expanded 280px tree would leave the diff and
+ *  its toolbar too little room to show their controls whole. */
+export const AUTO_COLLAPSE_BELOW = 760;
 
 function clampWidth(w: number): number {
   return Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, w));
@@ -119,6 +128,41 @@ export function ReviewSidebar({
       /* storage unavailable — keep the in-memory value */
     }
   }, []);
+
+  // ── Narrow Review area → collapsed by default ───────────────────
+  // Measured on the parent row (sidebar + canvas), which is sized by the
+  // layout around it, so expanding the sidebar can't feed back into the
+  // measurement. A 0 width means "not laid out" (ModeOverlay hides Review
+  // outside its mode; jsdom) and keeps the last known answer.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const [narrow, setNarrow] = useState(false);
+  const [openWhileNarrow, setOpenWhileNarrow] = useState(false);
+  useLayoutEffect(() => {
+    const parent = rootRef.current?.parentElement;
+    if (!parent) return;
+    const measure = () => {
+      const w = parent.clientWidth;
+      if (w > 0) setNarrow(w < AUTO_COLLAPSE_BELOW);
+    };
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(parent);
+    return () => ro.disconnect();
+  }, []);
+  // Crossing the threshold either way ends a "keep it open while narrow".
+  useEffect(() => setOpenWhileNarrow(false), [narrow]);
+
+  const effectiveCollapsed = narrow ? !openWhileNarrow : collapsed;
+  // While narrow, the user's choice is transient: it never overwrites the
+  // stored preference that applies once there is room again.
+  const setOpen = useCallback(
+    (open: boolean) => {
+      if (narrow) setOpenWhileNarrow(open);
+      else setCollapsedPersist(!open);
+    },
+    [narrow, setCollapsedPersist],
+  );
 
   // ── Width (drag the right edge; double-click resets) ────────────
   const [width, setWidth] = useState<number>(readStoredWidth);
@@ -210,15 +254,15 @@ export function ReviewSidebar({
     registerFocusCommit?.(() => {
       // ChangesPanel mounted & visible → focus immediately; childFocusRef is
       // only read in this branch, so it's always the live (non-stale) focuser.
-      if (tab === "changes" && !collapsed && childFocusRef.current) {
+      if (tab === "changes" && !effectiveCollapsed && childFocusRef.current) {
         childFocusRef.current();
       } else {
         pendingFocusRef.current = true;
         setTab("changes");
-        setCollapsedPersist(false);
+        setOpen(true);
       }
     });
-  }, [registerFocusCommit, tab, collapsed, setTab, setCollapsedPersist]);
+  }, [registerFocusCommit, tab, effectiveCollapsed, setTab, setOpen]);
 
   // ── Locate orchestration (the ⌖ Reveal / ⌘⇧E path) ──────────────
   // Same problem as the commit shortcut above, same shape: the tree is only
@@ -247,26 +291,31 @@ export function ReviewSidebar({
 
   useEffect(() => {
     fileTree.registerLocate?.((absPath: string) => {
-      if (tab === "files" && !collapsed && treeLocateRef.current) {
+      if (tab === "files" && !effectiveCollapsed && treeLocateRef.current) {
         treeLocateRef.current(absPath);
       } else {
         pendingLocateRef.current = absPath;
         setTab("files");
-        setCollapsedPersist(false);
+        setOpen(true);
       }
     });
     // `fileTree` is rebuilt each render by the parent's useMemo; only its
     // registrar identity matters here.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [fileTree.registerLocate, tab, collapsed, setTab, setCollapsedPersist]);
+  }, [fileTree.registerLocate, tab, effectiveCollapsed, setTab, setOpen]);
 
   // ── Collapsed strip — slim icons, mirrors the workspace rail ────
-  if (collapsed) {
+  if (effectiveCollapsed) {
     return (
-      <div className="flex w-[44px] shrink-0 flex-col items-center gap-1 border-r border-octo-hairline bg-octo-panel py-2 transition-all duration-[220ms]">
+      <div
+        ref={rootRef}
+        data-tour="review-sidebar"
+        data-testid="review-sidebar-strip"
+        className="flex w-[44px] shrink-0 flex-col items-center gap-1 border-r border-octo-hairline bg-octo-panel py-2 transition-all duration-[220ms]"
+      >
         <button
           type="button"
-          onClick={() => setCollapsedPersist(false)}
+          onClick={() => setOpen(true)}
           aria-label="Expand changes & files"
           title="Expand changes & files"
           className="flex h-7 w-7 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
@@ -276,7 +325,7 @@ export function ReviewSidebar({
         <div className="mt-1 h-px w-5 bg-octo-hairline" aria-hidden />
         <StripButton
           active={tab === "changes"}
-          onClick={() => { setTab("changes"); setCollapsedPersist(false); }}
+          onClick={() => { setTab("changes"); setOpen(true); }}
           label="Changes"
           badge={changedCount > 0 ? changedCount : undefined}
         >
@@ -284,7 +333,7 @@ export function ReviewSidebar({
         </StripButton>
         <StripButton
           active={tab === "files"}
-          onClick={() => { setTab("files"); setCollapsedPersist(false); }}
+          onClick={() => { setTab("files"); setOpen(true); }}
           label="Files"
         >
           <FolderTree size={15} />
@@ -302,7 +351,7 @@ export function ReviewSidebar({
     <div className="flex min-w-0 items-center gap-2">
       <button
         type="button"
-        onClick={() => setCollapsedPersist(true)}
+        onClick={() => setOpen(false)}
         aria-label="Collapse changes & files"
         title="Collapse changes & files"
         className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
@@ -330,6 +379,8 @@ export function ReviewSidebar({
 
   return (
     <div
+      ref={rootRef}
+      data-tour="review-sidebar"
       className={`relative flex shrink-0 flex-col border-r border-octo-hairline ${
         // Animate collapse/expand, never the live drag — a transition on
         // width would make the edge lag behind the cursor.

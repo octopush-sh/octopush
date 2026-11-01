@@ -510,6 +510,29 @@
   }
 }
 
+/* The Review canvas toolbar is a one-rung ladder too. The view toggle, AI and
+   Accept all are the floor; below 600px the secondary toggles (inline/split,
+   ±WS, tests) shed together and a "More" button grows in their place, opening
+   a menu with the same controls — so nothing is lost and nothing is clipped.
+   The header is the containing block of the menu and the tests popover (they
+   can't live inside a rung, whose `overflow: hidden` would clip them); the
+   z-index keeps them above the diff that follows it. */
+.octo-reviewbar { container-type: inline-size; container-name: octo-reviewbar; position: relative; z-index: 30; }
+.octo-demote.octo-reviewbar-more {
+  max-width: 0; opacity: 0; margin-right: -8px;
+  visibility: hidden; --demote-vis-delay: var(--dur-standard);
+}
+@container octo-reviewbar (max-width: 600px) {
+  .octo-demote-secondary {
+    max-width: 0; opacity: 0; margin-right: -8px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
+  .octo-demote.octo-reviewbar-more {
+    max-width: 40ch; opacity: 1; margin-right: 0;
+    visibility: visible; --demote-vis-delay: 0s;
+  }
+}
+
 .octo-status { display: inline-flex; align-items: center; }
 .octo-status-dot {
   flex: none; width: 6px; height: 6px; border-radius: 999px;

@@ -31,12 +31,17 @@ export function HunkRail({
         opacity: staged ? 0.55 : 1,
       }}
     >
-      <span className="flex-none whitespace-nowrap text-octo-mute">
+      {/* The range is the one elastic atom: on a narrow canvas it ellipsizes
+          (full text in its title) so the hunk actions always show whole. */}
+      <span
+        className="min-w-0 truncate whitespace-nowrap text-octo-mute"
+        title={`${range}${staged ? " · staged" : ""}`}
+      >
         {focused ? "⟶ " : ""}
         {range}
         {staged ? " · staged ✓" : ""}
       </span>
-      <span className="ml-auto flex items-center gap-2 whitespace-nowrap">
+      <span className="ml-auto flex shrink-0 items-center gap-2 whitespace-nowrap">
         {additions > 0 && (
           <span className="text-octo-verdigris">+{additions}</span>
         )}
