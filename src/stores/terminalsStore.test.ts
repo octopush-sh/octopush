@@ -472,6 +472,44 @@ describe("terminalsStore — markRunning", () => {
   });
 });
 
+describe("terminalsStore — markFailed", () => {
+  beforeEach(() => resetStore());
+
+  it("marks a session failed (never running) until a spawn succeeds", () => {
+    const ws = "ws-failed";
+    const t = { id: "t-fail", label: "Main", position: 0, running: true, busy: true, restored: false, role: "shell" as const, command: "ls" };
+    useTerminalsStore.setState({
+      terminalsByWs: { [ws]: [t] },
+      activeByWs: { [ws]: t.id },
+    });
+
+    useTerminalsStore.getState().markFailed(ws, t.id, true);
+    let s = useTerminalsStore.getState().getTerminals(ws)[0];
+    expect(s.failed).toBe(true);
+    expect(s.running).toBe(false);
+    expect(s.busy).toBe(false);
+    expect(s.command).toBeNull();
+
+    // "Try the shell again" succeeded → onSpawn → markRunning(true).
+    useTerminalsStore.getState().markRunning(ws, t.id, true);
+    s = useTerminalsStore.getState().getTerminals(ws)[0];
+    expect(s.failed).toBe(false);
+    expect(s.running).toBe(true);
+  });
+
+  it("keeps the failure across a workspace reload", async () => {
+    const ws = "ws-failed-reload";
+    const rec = makeRecord(ws, "Main", 0);
+    mockIpc.listTerminals.mockResolvedValue([rec]);
+    mockIpc.listPtySessions.mockResolvedValue([]);
+    await useTerminalsStore.getState().loadTerminals(ws);
+    useTerminalsStore.getState().markFailed(ws, rec.id, true);
+
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].failed).toBe(true);
+  });
+});
+
 describe("terminalsStore — workspace isolation", () => {
   beforeEach(() => resetStore());
 

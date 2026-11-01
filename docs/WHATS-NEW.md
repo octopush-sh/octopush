@@ -66,6 +66,7 @@ Current anchors:
 | `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
 | `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
+| `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` | Settings › Integrations: the Claude Code card · its installed-CLI version line | `settings/IntegrationsPane.tsx` |

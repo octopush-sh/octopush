@@ -1,4 +1,5 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useEffect, useRef, useCallback, useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -18,6 +19,8 @@ import { useTerminalsStore } from "../stores/terminalsStore";
 import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
 import { isMac } from "../lib/platform";
+import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
+import { Reveal } from "./primitives/Reveal";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
 // pane opens at ZOOM_DEFAULT and resets on remount.
@@ -45,6 +48,9 @@ interface Props {
   layoutVersion?: number;
   /** Called once the PTY session has been successfully spawned. */
   onSpawn?: () => void;
+  /** Called when spawn-or-attach is rejected (no shell, sandbox denial,
+   *  daemon down). The pane shows its own error state with a retry. */
+  onSpawnError?: () => void;
   /** Called when the PTY process exits. */
   onExit?: () => void;
   /**
@@ -69,10 +75,17 @@ export function TerminalPane({
   visible,
   layoutVersion,
   onSpawn,
+  onSpawnError,
   onExit,
   onReattach,
   onOpenFile,
 }: Props) {
+  // The raw error of the last rejected spawn, or null while the session is
+  // fine. Drives the "Session didn't start" state over the canvas.
+  const [spawnError, setSpawnError] = useState<string | null>(null);
+  const [detailOpen, setDetailOpen] = useState(false);
+  // Re-runs the spawn-or-attach of the mounted terminal ("Try the shell again").
+  const spawnRef = useRef<() => void>(() => {});
   // Ref so the link provider (registered once on mount) always reads the
   // latest callback without re-registering on every prop change.
   const onOpenFileRef = useRef(onOpenFile);
@@ -101,9 +114,11 @@ export function TerminalPane({
   const busyOffTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
+  const onSpawnErrorRef = useRef(onSpawnError);
   const onExitRef = useRef(onExit);
   const onReattachRef = useRef(onReattach);
   onSpawnRef.current = onSpawn;
+  onSpawnErrorRef.current = onSpawnError;
   onExitRef.current = onExit;
   onReattachRef.current = onReattach;
 
@@ -514,30 +529,36 @@ export function TerminalPane({
     // IPC round-trip completes (rare race with very fast daemon response).
     ptySessionIdRef.current = terminalId;
 
-    ipc
-      .spawnOrAttachTerminal(terminalId, workspacePath, label)
-      .then((result) => {
-        if (cancelled) return;
-        onSpawnRef.current?.();
-        // Note: onReattach is fired by the pty://reattached event listener above,
-        // which the backend emits synchronously before the first data chunk.
-        if (result.mode === "Reattached") {
-          // Reattach path: the pty://reattached event already fired (or will fire
-          // momentarily) so onReattach will be called there.  Nothing extra needed.
-        }
-        // Fit now that the PTY is alive.
-        requestAnimationFrame(() => {
-          if (!cancelled) syncSize();
-        });
-      })
-      .catch((err) => {
-        if (!cancelled) {
-          term.writeln(`\r\n\x1b[31m[failed to spawn PTY: ${String(err)}]\x1b[0m`);
-        }
-      });
+    // Success and rejection are handled side by side (not `.then().catch()`)
+    // so an exception in the success path can never be reported as a spawn
+    // failure. A rejection shows the designed error state over the canvas,
+    // never a raw error line inside the terminal.
+    const spawn = () => {
+      ipc.spawnOrAttachTerminal(terminalId, workspacePath, label).then(
+        () => {
+          if (cancelled) return;
+          setSpawnError(null);
+          // onReattach is fired by the pty://reattached event listener above,
+          // which the backend emits before the first data chunk.
+          onSpawnRef.current?.();
+          // Fit now that the PTY is alive.
+          requestAnimationFrame(() => {
+            if (!cancelled) syncSize();
+          });
+        },
+        (err: unknown) => {
+          if (cancelled) return;
+          setSpawnError(spawnErrorDetail(err));
+          onSpawnErrorRef.current?.();
+        },
+      );
+    };
+    spawnRef.current = spawn;
+    spawn();
 
     return () => {
       cancelled = true;
+      spawnRef.current = () => {};
       if (resizeTimer) clearTimeout(resizeTimer);
       dataDisp.dispose();
       resizeDisp.dispose();
@@ -600,16 +621,98 @@ export function TerminalPane({
     };
   }, [layoutVersion, visible, syncSize]);
 
+  const retrySpawn = useCallback(() => {
+    setSpawnError(null);
+    setDetailOpen(false);
+    spawnRef.current();
+  }, []);
+
   return (
     <div
       ref={wrapperRef}
-      className="h-full w-full overflow-hidden"
+      className="relative h-full w-full overflow-hidden"
       style={{ display: visible ? "block" : "none" }}
     >
       <div
         ref={containerRef}
         className="xterm-container h-full w-full"
       />
+      {spawnError !== null && (
+        <SpawnFailed
+          detail={spawnError}
+          detailOpen={detailOpen}
+          onToggleDetail={() => setDetailOpen((o) => !o)}
+          onRetry={retrySpawn}
+        />
+      )}
+    </div>
+  );
+}
+
+/** The Run canvas when a session's PTY was rejected: what happened, why, the
+ *  raw error one click away, and a way to try again. */
+function SpawnFailed({
+  detail,
+  detailOpen,
+  onToggleDetail,
+  onRetry,
+}: {
+  detail: string;
+  detailOpen: boolean;
+  onToggleDetail: () => void;
+  onRetry: () => void;
+}) {
+  return (
+    <div
+      role="alert"
+      data-testid="terminal-spawn-failed"
+      className="octo-fade-in absolute inset-0 flex flex-col items-center justify-center gap-4 bg-octo-bg px-8 text-center"
+    >
+      <div
+        data-tour="run-spawn-failed"
+        className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-rouge"
+      >
+        Session didn't start
+      </div>
+      <p className="max-w-md text-[13px] leading-[1.6] text-octo-sage">
+        {describeSpawnFailure(detail)}
+      </p>
+      <div className="flex w-full max-w-md flex-col items-center gap-2">
+        <button
+          type="button"
+          data-testid="terminal-spawn-detail-toggle"
+          aria-expanded={detailOpen}
+          onClick={onToggleDetail}
+          className="flex items-center gap-1 rounded px-1 font-mono text-[10px] uppercase tracking-[0.12em] text-octo-mute transition hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          <ChevronRight
+            size={11}
+            strokeWidth={1.75}
+            aria-hidden
+            style={{
+              transform: detailOpen ? "rotate(90deg)" : "none",
+              transition: "transform var(--dur-standard) var(--ease-octo)",
+            }}
+          />
+          Technical detail
+        </button>
+        <Reveal open={detailOpen} className="w-full">
+          <pre
+            data-testid="terminal-spawn-detail"
+            className="m-0 whitespace-pre-wrap break-words rounded-md border border-octo-hairline px-3 py-2 text-left font-mono text-[11px] leading-[1.5] text-octo-mute"
+          >
+            {detail}
+          </pre>
+        </Reveal>
+      </div>
+      <button
+        type="button"
+        data-tour="run-spawn-retry"
+        onClick={onRetry}
+        className="mt-2 rounded-lg border border-octo-hairline px-4 py-2 font-serif text-[13px] text-octo-sage transition hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        Try the shell again
+      </button>
     </div>
   );
 }

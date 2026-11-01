@@ -246,6 +246,7 @@ function App() {
   const loadTerminals = useTerminalsStore((s) => s.loadTerminals);
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const markRunning = useTerminalsStore((s) => s.markRunning);
+  const markFailed = useTerminalsStore((s) => s.markFailed);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
 
   // Flat list of every (workspace, terminal) pair so the Run panel can mount
@@ -2204,6 +2205,7 @@ function App() {
                         }
                         layoutVersion={layoutVersion}
                         onSpawn={() => markRunning(t.workspaceId, t.id, true)}
+                        onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
                         onExit={() => markRunning(t.workspaceId, t.id, false)}
                         onReattach={() => {
                           // Mark as running (it already was, but be explicit).

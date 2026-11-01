@@ -31,6 +31,7 @@ function seed(
     command?: string;
     running?: boolean;
     restored?: boolean;
+    failed?: boolean;
   }>,
   activeId?: string,
 ) {
@@ -41,6 +42,7 @@ function seed(
         label: s.label,
         position: i,
         running: s.running ?? true,
+        failed: s.failed ?? false,
         busy: s.busy ?? false,
         restored: s.restored ?? false,
         role: s.role ?? ("shell" as SessionRole),
@@ -89,6 +91,15 @@ describe("CompanionSession", () => {
     seed([{ id: "a", label: "main", running: false }]);
     rerender(<CompanionSession workspaceId={WS} />);
     expect(screen.getByText("stopped")).toBeTruthy();
+  });
+
+  it("reads failed in rouge when the session didn't start, never shell idle", () => {
+    seed([{ id: "a", label: "main", running: false, failed: true }]);
+    render(<CompanionSession workspaceId={WS} />);
+    const state = screen.getByTestId("session-detail-state");
+    expect(state.textContent).toBe("failed");
+    expect(state.className).toContain("text-octo-rouge");
+    expect(screen.queryByText("shell idle")).toBeNull();
   });
 
   it("keeps the restored badge", () => {
