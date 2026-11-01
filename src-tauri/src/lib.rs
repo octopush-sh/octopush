@@ -46,6 +46,7 @@ pub mod orchestrator;
 pub mod routines;
 pub mod git_lock;
 pub mod mcp_setup;
+pub mod readiness;
 
 #[cfg(test)]
 mod tests;
@@ -391,6 +392,7 @@ pub fn run() {
             commands::mcp_connection_status,
             commands::connect_claude_code,
             commands::claude_cli_version,
+            commands::readiness_check,
             // Role commands
             commands::list_roles,
             commands::save_role,

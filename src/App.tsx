@@ -2169,7 +2169,7 @@ function App() {
                 )}
                 {/* One-shot first-run invite — floats over the Talk canvas
                     (where every new user lands); eligibility gated inside. */}
-                {activeWorkspace && <FirstRunInvite onSendCrew={() => void handleSendFirstCrew()} />}
+                {activeWorkspace && <FirstRunInvite onSendCrew={() => void handleSendFirstCrew()} onOpenReadiness={() => setSettingsTab("general")} />}
               </ModeOverlay>
 
               {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs

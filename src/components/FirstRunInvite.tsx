@@ -1,5 +1,7 @@
-import { Users, X } from "lucide-react";
+import { useEffect } from "react";
+import { Users, X, XCircle } from "lucide-react";
 import { useFirstRunStore } from "../stores/firstRunStore";
+import { hasReadinessFailure, useReadinessStore } from "../stores/readinessStore";
 
 /** The one-shot first-run invite — the differentiator's minute-one moment.
  *  Floats over the Talk canvas (where every new user lands) and hands off to
@@ -9,14 +11,28 @@ import { useFirstRunStore } from "../stores/firstRunStore";
  *
  *  Beacon-legal: Talk has no brass live element, so the CTA may pulse
  *  (exactly one per attention scope). Rendered only while eligible — never
- *  ran a crew (all-time), not dismissed, not already used this session. */
-export function FirstRunInvite({ onSendCrew }: { onSendCrew: () => void }) {
+ *  ran a crew (all-time), not dismissed, not already used this session.
+ *
+ *  While shown it runs the readiness checks once; when one fails (no
+ *  `claude`, no `git`) it links to the Settings › General readiness card. */
+export function FirstRunInvite({ onSendCrew, onOpenReadiness }: {
+  onSendCrew: () => void;
+  onOpenReadiness: () => void;
+}) {
   const dismissed = useFirstRunStore((s) => s.dismissed);
   const usedThisSession = useFirstRunStore((s) => s.usedThisSession);
   const everRan = useFirstRunStore((s) => s.everRan);
   const dismiss = useFirstRunStore((s) => s.dismiss);
+  const checks = useReadinessStore((s) => s.checks);
+  const checkReadiness = useReadinessStore((s) => s.check);
 
-  if (dismissed || usedThisSession || everRan !== false) return null;
+  const eligible = !dismissed && !usedThisSession && everRan === false;
+  useEffect(() => {
+    if (eligible && useReadinessStore.getState().checks === null) void checkReadiness();
+  }, [eligible, checkReadiness]);
+
+  if (!eligible) return null;
+  const notReady = hasReadinessFailure(checks);
 
   return (
     <div className="octo-rise-in pointer-events-none absolute inset-x-0 bottom-36 z-30 flex justify-center px-6">
@@ -44,6 +60,21 @@ export function FirstRunInvite({ onSendCrew }: { onSendCrew: () => void }) {
           Five agents — plan, review, build, re-review, test — take on your task
           while you watch every move. You approve the gates; they do the work.
         </p>
+        {notReady && (
+          <div className="octo-pop-in mt-3 flex items-center gap-2 text-[12px] text-octo-sage">
+            <span className="text-octo-rouge" title="A readiness check failed">
+              <XCircle size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+            <span className="min-w-0 flex-1">This Mac isn't ready for a crew yet.</span>
+            <button
+              type="button"
+              onClick={onOpenReadiness}
+              className="shrink-0 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi"
+            >
+              See what's missing
+            </button>
+          </div>
+        )}
         <div className="mt-4 flex items-center justify-end gap-3">
           <button
             type="button"

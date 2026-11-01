@@ -1,4 +1,4 @@
-// Settings → General — application-wide behavior (attention chime, workspace
+// Settings → General — the crew readiness card, application-wide behavior (attention chime, workspace
 // defaults, the Talk turn limits — off by default — and future app-wide
 // preferences). Editor preferences live in their own pane.
 import { useEffect, useState } from "react";
@@ -9,6 +9,7 @@ import { ipc } from "../../lib/ipc";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
 import { PaneHeader, SectionLabel, SegmentedRow, Switch, ToggleRow } from "./shared";
+import { ReadinessCard } from "./ReadinessCard";
 import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
@@ -39,6 +40,8 @@ export function GeneralPane() {
       />
 
       <div className="max-w-[640px] space-y-8">
+        <ReadinessCard />
+
         <div className="space-y-4">
           <SectionLabel>Workspace defaults</SectionLabel>
           <SegmentedRow

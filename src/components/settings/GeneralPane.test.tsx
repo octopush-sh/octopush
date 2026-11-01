@@ -12,6 +12,7 @@ vi.mock("../../lib/ipc", () => ({
   ipc: {
     getSettings: (...args: unknown[]) => getSettings(...args),
     saveSettings: (...args: unknown[]) => saveSettings(...args),
+    readinessCheck: () => Promise.resolve([]),
   },
 }));
 
