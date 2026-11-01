@@ -2361,6 +2361,8 @@ fn dispatch_checkpoint(
 /// ignored, so the frontend's "Accept all defaults" just sends the defaults).
 /// The decisions become the stage's re-run feedback and the stage re-runs with
 /// them injected — reusing the checkpoint resume substrate wholesale.
+/// `source` names the surface that answered (`"mission_control"`) for the
+/// journal; absent = the Direct answer form.
 #[tauri::command]
 pub async fn answer_blocker(
     state: State<'_, AppState>,
@@ -2368,6 +2370,7 @@ pub async fn answer_blocker(
     run_id: String,
     stage_id: String,
     answers: Vec<String>,
+    source: Option<String>,
 ) -> AppResult<()> {
     // `stage_id` scopes the answer to the intended block (defensive: only one
     // stage is ever awaiting a decision at a time, but the frontend passes it
@@ -2383,7 +2386,7 @@ pub async fn answer_blocker(
     }
     // Thread the validated `stage_id` through so the resolution acts on exactly
     // the stage we just checked, not merely "the parked stage".
-    dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers })
+    dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers, source })
 }
 
 #[tauri::command]

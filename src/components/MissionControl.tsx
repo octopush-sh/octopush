@@ -5,10 +5,13 @@
 //
 // Deliberate non-goals (v1): no checkpoint resolution on-card (approving a gate
 // without the artifact/diff is rubber-stamping — the card jumps to the Direct
-// canvas instead), no launching, no history (HistorySheet owns the past).
+// canvas instead), no launching, no history (HistorySheet owns the past). The
+// one on-card decision is an `ask_director` question-block: the director can
+// read the questions and accept the crew's recommended defaults in place (the
+// acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
+import { ChevronRight, Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
@@ -20,6 +23,7 @@ import { lastActivity } from "../lib/liveLine";
 import { stageTitle } from "../lib/stageMeta";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 import { StageDots } from "./direct/StageDots";
+import { Reveal } from "./primitives/Reveal";
 
 interface Props {
   open: boolean;
@@ -495,6 +499,12 @@ function CrewCard({
       {/* Row 4 — the live slot: ticker / gate / halt / savings. */}
       <LiveSlot run={run} band={band} gate={gateStage} failed={failedStage} stalled={stalled} running={runningStage} />
 
+      {/* A question-block (not a gate) can be answered on-card with the crew's
+          own recommended defaults; anything else goes to the full form. */}
+      {glyph.word === "asked you" && askedStage && (
+        <AskPanel run={run} stage={askedStage} onAnswer={canJump ? jump : undefined} />
+      )}
+
       {/* Row 5 — ledger foot + actions. */}
       <CardFoot run={run} band={band} />
     </div>
@@ -577,6 +587,122 @@ function LiveSlot({
     <span className={`block h-4 truncate font-mono text-[10px] leading-4 ${cls}`} title={text || undefined}>
       {text}
     </span>
+  );
+}
+
+/** The `?` card's inline answer: a disclosure listing each question with the
+ *  crew's recommended answer, then "Accept recommended" (answers every question
+ *  with its default, logged in the journal as from Mission Control) and
+ *  "Answer…" (opens the full form on the Direct canvas). Never auto-accepts. */
+function AskPanel({
+  run,
+  stage,
+  onAnswer,
+}: {
+  run: Run;
+  stage: RunStage;
+  /** Jump to the full answer form; undefined when the workspace isn't loaded. */
+  onAnswer?: () => void;
+}) {
+  const answerBlocker = useRunsStore((s) => s.answerBlocker);
+  const [open, setOpen] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // State lags a fast double-click; the ref closes the gate synchronously.
+  const inFlight = useRef(false);
+  const questions = stage.blockedQuestions?.questions ?? [];
+  const panelId = `mc-ask-${stage.id}`;
+  // A blank default isn't a recommendation: only the full form can answer it.
+  const allHaveDefaults = questions.length > 0 && questions.every((q) => q.recommendedDefault.trim() !== "");
+
+  const accept = (e: React.MouseEvent) => {
+    e.stopPropagation(); // don't trigger the card's jump
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setSending(true);
+    setFailed(false);
+    void answerBlocker(run.id, stage.id, questions.map((q) => q.recommendedDefault), "mission_control")
+      .catch((err) => {
+        console.error(err);
+        setFailed(true);
+      })
+      .finally(() => {
+        inFlight.current = false;
+        setSending(false);
+      });
+  };
+
+  const count = questions.length === 1 ? "1 question" : `${questions.length} questions`;
+
+  return (
+    <div className="flex flex-col">
+      <button
+        type="button"
+        data-tour="mission-control-ask-toggle"
+        onClick={(e) => {
+          e.stopPropagation(); // don't trigger the card's jump
+          setOpen((v) => !v);
+        }}
+        aria-expanded={open}
+        aria-controls={panelId}
+        className="flex h-4 w-fit items-center gap-1.5 font-mono text-[10px] text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        <ChevronRight
+          size={11}
+          aria-hidden
+          className="transition-transform duration-[180ms]"
+          style={{ transform: open ? "rotate(90deg)" : "none" }}
+        />
+        {count} · recommended answers
+      </button>
+
+      <Reveal open={open}>
+        {/* Clicks inside the panel stay on the card (reading ≠ jumping). */}
+        <div id={panelId} onClick={(e) => e.stopPropagation()} className="flex cursor-default flex-col gap-2 pt-2">
+          {questions.map((q, i) => (
+            <div key={i} className="flex flex-col gap-0.5">
+              <span className="text-[12px] leading-4 text-octo-ivory">{q.question}</span>
+              <span className="font-mono text-[10px] leading-4 text-octo-sage">
+                <span className="text-octo-mute">recommended · </span>
+                {q.recommendedDefault || "no default given"}
+              </span>
+            </div>
+          ))}
+          <div className="flex items-center gap-2 pt-1">
+            {allHaveDefaults && (
+              <button
+                type="button"
+                data-tour="mission-control-ask-accept"
+                onClick={accept}
+                disabled={sending}
+                title="Answer every question with the crew's recommended default"
+                className="rounded-md border border-[var(--brass-dim)] px-2.5 py-1 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
+              >
+                {sending ? "Sending…" : "Accept recommended"}
+              </button>
+            )}
+            {onAnswer && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onAnswer();
+                }}
+                title="Open the full answer form"
+                className="rounded-md border border-octo-border-strong px-2.5 py-1 font-mono text-[11px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                Answer…
+              </button>
+            )}
+          </div>
+          {failed && (
+            <span role="alert" className="octo-fade-in font-mono text-[10px] leading-4 text-octo-rouge">
+              Couldn't send the answers · open the run to answer
+            </span>
+          )}
+        </div>
+      </Reveal>
+    </div>
   );
 }
 

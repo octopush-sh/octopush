@@ -131,6 +131,32 @@ pub(crate) fn format_blocker_feedback(
     s
 }
 
+/// True when every resolved answer (same positional / empty-falls-back rule as
+/// [`format_blocker_feedback`]) is the question's recommended default — the
+/// director accepted the crew's defaults. False when there are no questions,
+/// or when any default is blank (there was nothing to accept).
+pub(crate) fn answers_are_defaults(
+    ask: Option<&crate::orchestrator::types::BlockedAsk>,
+    answers: &[String],
+) -> bool {
+    let questions = ask.map(|a| a.questions.as_slice()).unwrap_or(&[]);
+    !questions.is_empty()
+        && questions.iter().enumerate().all(|(i, q)| {
+            let default = q.recommended_default.trim();
+            let answer = answers.get(i).map(|a| a.trim()).filter(|a| !a.is_empty()).unwrap_or(default);
+            !default.is_empty() && answer == default
+        })
+}
+
+/// The journal line for an accepted-defaults answer, naming the surface it
+/// came from when that isn't the Direct answer form.
+pub(crate) fn accepted_defaults_notice(source: Option<&str>) -> String {
+    match source {
+        Some("mission_control") => "✓ Director accepted the recommended defaults (from Mission Control)".into(),
+        _ => "✓ Director accepted the recommended defaults".into(),
+    }
+}
+
 /// RAII claim on a run's `active` slot (see [`Orchestrator::claim_active`]).
 /// Dropping releases the claim — including on an early `?` return — so a
 /// rejected guard check or a mid-work error can never leave a run stuck as
@@ -1980,7 +2006,7 @@ impl Orchestrator {
                 self.sync_run_history(run_id);
                 return Ok(None);
             }
-            CheckpointAction::AnswerBlocker { answers } => {
+            CheckpointAction::AnswerBlocker { answers, source } => {
                 // The director answered a stage that parked itself via
                 // `ask_director`. Only a stage actually blocked (awaiting a
                 // checkpoint WITH questions) can be answered — a normal gate is
@@ -2000,6 +2026,12 @@ impl Orchestrator {
                             // preserve_transcript: the answered re-run CONTINUES
                             // the asking conversation (D18).
                             self.archive_and_reset_stage(run_id, s, None, Some(&feedback), true)?;
+                            // Accepting the crew's own defaults is still the
+                            // director's decision (§3.1) — say so in the journal,
+                            // with the surface it came from, so it stays auditable.
+                            if answers_are_defaults(ask.as_ref(), &answers) {
+                                self.journal_notice(run_id, &s.id, &accepted_defaults_notice(source.as_deref()));
+                            }
                             // A blocked CLI stage with a session resumes it —
                             // the answers reach the SAME conversation via the
                             // resume nudge (the CLI counterpart of the API's
