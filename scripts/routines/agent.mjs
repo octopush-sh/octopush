@@ -72,13 +72,18 @@ export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
   return paths.flatMap((p) => [`Read(${p})`, `Edit(${p})`]);
 }
 
-/** The claude CLI arguments for a role (pure, tested). */
-export function claudeArgs(role, prompt, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd()) {
+/**
+ * The claude CLI arguments for a role (pure, tested). The prompt is not one of
+ * them: it goes in on stdin. A prompt carrying a large diff and a long PR
+ * thread passes Linux's 128 KiB limit on a single argument (E2BIG), and the
+ * agent then never starts.
+ */
+export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd()) {
   const r = ROLES[role];
   if (!r) throw new Error(`unknown role "${role}" (builder | reviewer | ideas)`);
   const settings = { permissions: { allow: r.allow(cwd), deny: denyRules(runnerTemp) } };
   return [
-    "-p", prompt,
+    "-p",
     "--model", process.env.OCTOPUSH_AGENT_MODEL || r.model,
     "--tools", r.tools.join(","),
     "--permission-mode", "dontAsk",
@@ -130,7 +135,12 @@ function main() {
   // Actions log (GitHub masks only the exact secret, not an encoded copy).
   const logFile = join(process.env.RUNNER_TEMP || env.TMPDIR, `agent-${role}-${process.pid}.log`);
   const fd = openSync(logFile, "w", 0o600);
-  const r = spawnSync("claude", claudeArgs(role, readFileSync(promptFile, "utf8")), { stdio: ["ignore", fd, fd], env });
+  const r = spawnSync("claude", claudeArgs(role), {
+    input: readFileSync(promptFile, "utf8"),
+    stdio: ["pipe", fd, fd],
+    env,
+    maxBuffer: 64 * 1024 * 1024,
+  });
   closeSync(fd);
   if (r.error) { console.error(`agent: ${r.error.message}`); return 2; }
   console.log(`agent ${role} exited ${r.status} (transcript kept on the runner, not printed)`);

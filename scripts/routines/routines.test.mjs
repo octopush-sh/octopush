@@ -471,7 +471,7 @@ test("agents: no GitHub token in their environment, dontAsk, system paths denied
   const env = agentEnv({ PATH: "/bin", HOME: "/home/runner", CLAUDE_CODE_OAUTH_TOKEN: "tok", GH_TOKEN: "gh", GITHUB_TOKEN: "gh2", OCTOPUSH_SECRETS: "x" });
   assert.deepEqual(Object.keys(env).sort(), ["CI", "CLAUDE_CODE_OAUTH_TOKEN", "HOME", "LANG", "PATH", "TMPDIR"]);
   assert.throws(() => agentEnv({ PATH: "/bin" }), /CLAUDE_CODE_OAUTH_TOKEN/);
-  const args = claudeArgs("builder", "do it", "/home/runner/work/_temp", "/home/runner/work/o/o");
+  const args = claudeArgs("builder", "/home/runner/work/_temp", "/home/runner/work/o/o");
   assert.equal(args[args.indexOf("--permission-mode") + 1], "dontAsk");
   const settings = JSON.parse(args[args.indexOf("--settings") + 1]);
   assert.ok(settings.permissions.deny.includes("Read(//proc/**)"));
@@ -480,7 +480,7 @@ test("agents: no GitHub token in their environment, dontAsk, system paths denied
   assert.deepEqual(settings.permissions.allow.filter((x) => x.startsWith("Bash")), ["Bash(octo-check:*)"], "the builder's only command");
   assert.ok(settings.permissions.allow.includes("Edit(//home/runner/work/o/o/**)"));
   assert.ok(settings.permissions.allow.every((x) => !/^(Read|Glob|Grep|Edit|Write)$/.test(x)), "no unscoped file tool: everything else is denied");
-  const rev = JSON.parse(claudeArgs("reviewer", "x", undefined, "/tmp/review/pr-3").find((a) => a.startsWith("{")));
+  const rev = JSON.parse(claudeArgs("reviewer", undefined, "/tmp/review/pr-3").find((a) => a.startsWith("{")));
   assert.deepEqual(rev.permissions.allow.filter((x) => x.startsWith("Edit")), ["Edit(//tmp/review/pr-3/.agent-out/**)"],
     "writes are Edit(...) rules — Claude Code has no Write(...) rule kind");
   assert.ok([...settings.permissions.allow, ...settings.permissions.deny].every((x) => !/^(Write|Grep|Glob)\(/.test(x)));
@@ -489,7 +489,10 @@ test("agents: no GitHub token in their environment, dontAsk, system paths denied
   assert.ok(denyRules(undefined).every((r) => !r.includes("undefined")));
   assert.ok(!args.includes("--bare"), "--bare refuses OAuth (the subscription token)");
   assert.equal(args[args.indexOf("--setting-sources") + 1], "", "no repo settings, so no repo hooks");
-  assert.throws(() => claudeArgs("admin", "x"), /unknown role/);
+  assert.throws(() => claudeArgs("admin"), /unknown role/);
+  // The prompt goes in on stdin, never as an argument (E2BIG past 128 KiB).
+  assert.equal(args[0], "-p");
+  assert.ok(args[1].startsWith("--"), "no positional prompt after -p");
 });
 
 test("ideas in Actions: filed in the app repo with an area label; agent text sanitized", () => {
