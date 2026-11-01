@@ -119,10 +119,16 @@ export function ageLabel(seenAt: string, nowMs: number): string {
   return `as of ${days} ${days === 1 ? "day" : "days"} ago`;
 }
 
-/** The newest `seenAt` across the windows (the line's age). */
-export function latestSeen(ws: PlanSnapshot[]): string | null {
+/** The oldest `seenAt` across the windows: a line that shows them together
+ *  is as old as its stalest figure. An unreadable time wins (its age reads
+ *  "unknown" rather than looking fresh). */
+export function oldestSeen(ws: PlanSnapshot[]): string | null {
   let best: string | null = null;
-  for (const w of ws) if (!best || Date.parse(w.seenAt) > Date.parse(best)) best = w.seenAt;
+  for (const w of ws) {
+    const t = Date.parse(w.seenAt);
+    if (Number.isNaN(t)) return w.seenAt;
+    if (best == null || t < Date.parse(best)) best = w.seenAt;
+  }
   return best;
 }
 
@@ -137,16 +143,29 @@ export function windowPhrase(w: PlanSnapshot, nowMs: number, withReset: boolean)
 }
 
 /** The Companion line: `Claude plan · 5h 62% · resets 19:40 · week 31%`.
- *  The age is rendered beside it. Only the 5-hour and weekly windows (or
- *  the worst one, when another window is the one near its limit). */
+ *  Its age (`lineAge`) is rendered beside it. */
 export function planLine(ws: PlanSnapshot[], nowMs: number): string {
+  const parts = lineWindows(ws, nowMs).map((w, i) => windowPhrase(w, nowMs, i === 0));
+  return ["Claude plan", ...parts].join(" · ");
+}
+
+/** The windows the Companion line shows: the 5-hour and weekly windows (or
+ *  the first one), plus the worst one when another window is the one near
+ *  its limit. */
+export function lineWindows(ws: PlanSnapshot[], nowMs: number): PlanSnapshot[] {
   const ordered = orderWindows(ws);
   const main = ordered.filter((w) => w.kind === "five_hour" || w.kind === "seven_day");
   const worst = worstWindow(ws, nowMs);
   const shown = main.length > 0 ? [...main] : ordered.slice(0, 1);
   if (worst && !shown.includes(worst) && windowTone(worst, nowMs) !== "calm") shown.push(worst);
-  const parts = shown.map((w, i) => windowPhrase(w, nowMs, i === 0));
-  return ["Claude plan", ...parts].join(" · ");
+  return shown;
+}
+
+/** The line's age: that of the oldest figure it shows, so a fresh 5-hour
+ *  reading never makes a days-old weekly one look current. */
+export function lineAge(ws: PlanSnapshot[], nowMs: number): string | null {
+  const seen = oldestSeen(lineWindows(ws, nowMs));
+  return seen == null ? null : ageLabel(seen, nowMs);
 }
 
 /** The calm warning near or at a limit; null while every window is calm. */

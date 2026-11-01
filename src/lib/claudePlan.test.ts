@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { PlanSnapshot } from "./ipc";
 import {
-  ageLabel, hasReset, latestSeen, orderWindows, pctLabel, planLine, planTone, planWarning, resetLabel,
+  ageLabel, hasReset, lineAge, oldestSeen, orderWindows, pctLabel, planLine, planTone, planWarning, resetLabel,
   runsClaudeCli, windowLabel, windowName, windowTone,
 } from "./claudePlan";
 
@@ -80,7 +80,20 @@ describe("claudePlan", () => {
     expect(ageLabel(new Date(NOW - 3 * 3_600_000).toISOString(), NOW)).toBe("as of 3 h ago");
     expect(ageLabel(new Date(NOW - 86_400_000).toISOString(), NOW)).toBe("as of 1 day ago");
     expect(ageLabel("garbage", NOW)).toBe("as of an unknown time");
-    expect(latestSeen([win({ seenAt: "2026-11-01T10:00:00Z" }), win({ seenAt: "2026-11-01T12:00:00Z" })])).toBe("2026-11-01T12:00:00Z");
+    expect(oldestSeen([win({ seenAt: "2026-11-01T12:00:00Z" }), win({ seenAt: "2026-11-01T10:00:00Z" })])).toBe("2026-11-01T10:00:00Z");
+    expect(oldestSeen([win({ seenAt: "2026-11-01T12:00:00Z" }), win({ seenAt: "garbage" })])).toBe("garbage");
+    expect(oldestSeen([])).toBeNull();
+  });
+
+  it("ages the line by the oldest figure it shows", () => {
+    // A threshold event refreshed only the 5-hour window; the weekly figure is days old.
+    const fresh = win({ seenAt: new Date(NOW - 10_000).toISOString() });
+    const staleWeek = win({ kind: "seven_day", utilization: 0.31, seenAt: new Date(NOW - 3 * 86_400_000).toISOString() });
+    expect(lineAge([fresh, staleWeek], NOW)).toBe("as of 3 days ago");
+    // A window the line does not show does not age it.
+    const staleOpus = win({ kind: "seven_day_opus", utilization: 0.2, seenAt: new Date(NOW - 3 * 86_400_000).toISOString() });
+    expect(lineAge([fresh, staleOpus], NOW)).toBe("as of just now");
+    expect(lineAge([], NOW)).toBeNull();
   });
 
   it("formats percentages and far-off resets", () => {

@@ -7,7 +7,7 @@ import { useEffect } from "react";
 import { useClaudePlanStore } from "../../stores/claudePlanStore";
 import { useNow } from "../ClaudePlanLine";
 import {
-  ageLabel, hasReset, orderWindows, pctLabel, planWarning, resetLabel, toneClass, toneColor, windowName, windowTone,
+  ageLabel, hasReset, orderWindows, pctLabel, planTone, planWarning, resetLabel, toneClass, toneColor, windowName, windowTone,
 } from "../../lib/claudePlan";
 import { SectionLabel } from "./shared";
 
@@ -58,7 +58,11 @@ export function ClaudePlanCard() {
           );
         })}
       </ul>
-      {warning && <p className="octo-fade-in mt-2 text-[12px] text-octo-sage">{warning}</p>}
+      {warning && (
+        <p className={`octo-fade-in mt-2 text-[12px] ${toneClass(planTone(windows, now))}`} data-testid="claude-plan-warning">
+          {warning}
+        </p>
+      )}
       <p className="mt-2 text-[11px] leading-[1.55] text-octo-mute">
         As your Claude Code stages last reported it while running on your Claude plan. It updates when the next one runs.
       </p>

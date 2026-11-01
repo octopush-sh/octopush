@@ -30,13 +30,18 @@ pub struct PlanSnapshot {
 
 /// Merge `incoming` into the stored window of the same kind: a field the new
 /// event left out (top-level `utilization` only appears past a threshold)
-/// keeps its last known value while the window has not reset.
+/// keeps its last known value while the window has not reset. So does
+/// `status`, which a window described only in passing leaves out — a
+/// `rejected` window stays rejected until it resets.
 fn merge(prev: Option<&PlanWindow>, incoming: &PlanWindow) -> PlanWindow {
     let mut w = incoming.clone();
     if let Some(p) = prev {
         let same_window = p.resets_at.is_some() && p.resets_at == w.resets_at;
         if w.utilization.is_none() && same_window {
             w.utilization = p.utilization;
+        }
+        if w.status.is_none() && same_window {
+            w.status = p.status.clone();
         }
         if w.resets_at.is_none() {
             w.resets_at = p.resets_at;
