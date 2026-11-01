@@ -357,6 +357,60 @@ describe("WorkspaceRail", () => {
     expect(row?.className).not.toMatch(/border/);
   });
 
+  it("middle-truncates mission names so names that differ only at the end stay apart", () => {
+    const workspaces = [
+      makeWorkspace({ id: "a", name: "Production deploy (octopush-api)" }),
+      makeWorkspace({ id: "b", name: "Production deploy (octopush-web)" }),
+    ];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    const { container } = render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+      />,
+    );
+    const tails = [...container.querySelectorAll(".octo-midtrunc-tail")].map((t) => t.textContent);
+    expect(tails).toEqual(["(octopush-api)", "(octopush-web)"]);
+    // The full name stays the tooltip.
+    expect(screen.getByTitle("Production deploy (octopush-api)")).toBeInTheDocument();
+    // Short names take the plain path — no split.
+    expect(container.querySelectorAll(".octo-midtrunc")).toHaveLength(2);
+  });
+
+  it("sheds the ahead/behind counts into the tooltip before a long name loses its tail", () => {
+    const workspaces = [
+      makeWorkspace({ id: "a", name: "refactor-the-entire-authentication-flow-9" }),
+      makeWorkspace({ id: "b", name: "Alpha" }),
+    ];
+    const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="z"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        gitSummaryByWs={{
+          a: { dirty: false, ahead: 3, behind: 1 } as never,
+          b: { dirty: false, ahead: 2, behind: 0 } as never,
+        }}
+      />,
+    );
+    const [long, short] = screen.getAllByTestId("rail-git-rung");
+    expect(long.className).toMatch(/octo-demote-shed/);
+    expect(
+      screen.getByTitle(
+        "refactor-the-entire-authentication-flow-9 · 3 commits ahead · 1 commit behind",
+      ),
+    ).toBeInTheDocument();
+    // A short name keeps its counts on the row and out of its tooltip.
+    expect(short.className).not.toMatch(/octo-demote-shed/);
+    expect(screen.getByTitle("Alpha")).toBeInTheDocument();
+  });
+
   it("hides the dirty glyph on the active row (the ContextHeader carries it there)", () => {
     const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
     const projects: ProjectGroup[] = [{ id: "proj-1", name: "Project", workspaces }];

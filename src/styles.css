@@ -490,6 +490,14 @@
    it mid-word with no ellipsis. */
 .octo-demote-base { display: inline-block; }
 
+/* A rung shed by STATE rather than by a container query — the workspace rail
+   is a fixed 280px, so what decides is the row's name length, not the band's
+   width (`shedsGitMeta` in WorkspaceRail.tsx). Same collapse, same motion. */
+.octo-demote.octo-demote-shed {
+  max-width: 0; opacity: 0; margin-right: -8px;
+  visibility: hidden; --demote-vis-delay: var(--dur-standard);
+}
+
 .octo-status { display: inline-flex; align-items: center; }
 .octo-status-dot {
   flex: none; width: 6px; height: 6px; border-radius: 999px;
