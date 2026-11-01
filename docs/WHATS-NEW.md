@@ -72,6 +72,7 @@ Current anchors:
 | `settings-readiness-card` · `settings-readiness-again` | Settings › General: the Readiness card · its "Check again" | `settings/ReadinessCard.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
+| `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` | Mission Control crew card: its task title · the workspace name in its meta row | `MissionControl.tsx` |
 
