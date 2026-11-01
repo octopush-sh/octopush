@@ -838,6 +838,12 @@ function App() {
           setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
           break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
+        case "terminal":
+          setSettingsTab(null);
+          selectWorkspace(d.workspaceId);
+          setActiveTerminal(d.workspaceId, d.terminalId);
+          setModePerWorkspace((p) => ({ ...p, [d.workspaceId]: "run" }));
+          break;
         case "palette": setShowPalette(true); break;
         case "mission-control": setMissionControlOpen(true); break;
         case "logbook": setLogbookOpen(true); break;
@@ -845,7 +851,7 @@ function App() {
     };
     window.addEventListener(NAVIGATE_EVENT, onNavigate);
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
-  }, [setMode]);
+  }, [setMode, selectWorkspace, setActiveTerminal]);
 
   // Cross-mode action (P9): take a chat tool's shell command to RUN mode.
   // Switches to the terminal and copies the command to the clipboard so the

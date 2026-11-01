@@ -6239,6 +6239,41 @@ mod orchestrator_tests {
         assert_eq!(stderr_tail("  \n"), "");
     }
 
+    /// A fresh routine worktree's setup script: exit 0 passes, anything else is
+    /// a legible `setup failed: …` skip, and a hung script is bounded.
+    #[tokio::test]
+    async fn routine_setup_script_runs_in_the_worktree_and_reports_failure() {
+        use crate::routines::{classify_setup_exit, run_setup_with_path, SkipReason};
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/usr/bin:/bin";
+        assert_eq!(run_setup_with_path("touch installed", dir.path(), Duration::from_secs(5), path).await, Ok(()));
+        assert!(dir.path().join("installed").exists(), "runs with cwd = the worktree");
+        let failed = run_setup_with_path("echo 'npm ERR! missing' >&2; exit 4", dir.path(), Duration::from_secs(5), path).await;
+        assert_eq!(failed, Err("exit 4 · npm ERR! missing".to_string()));
+        assert_eq!(
+            SkipReason::SetupFailed(failed.unwrap_err()).label(),
+            "setup failed: exit 4 · npm ERR! missing",
+        );
+        let hung = run_setup_with_path("sleep 5", dir.path(), Duration::from_millis(200), path).await;
+        assert_eq!(hung, Err("setup timed out after 0s".to_string()));
+        assert_eq!(classify_setup_exit(None, ""), Err("killed by a signal".to_string()));
+        assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
+    }
+
+    /// The project's setup-script template round-trips through the DB (the
+    /// wizard writes it; a fresh routine reads it).
+    #[test]
+    fn project_setup_script_template_round_trips() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-setup", "P", "/tmp/octo-setup-p").unwrap();
+        assert_eq!(db.get_project_setup_script("p-setup").unwrap(), "");
+        db.set_project_setup_script("p-setup", "npm install").unwrap();
+        assert_eq!(db.get_project_setup_script("p-setup").unwrap(), "npm install");
+        assert_eq!(db.get_project_setup_script("missing").unwrap(), "");
+    }
+
     /// The condition runs with the PATH it's given (the login-shell PATH in
     /// production), so a tool that lives only there resolves.
     #[cfg(unix)]

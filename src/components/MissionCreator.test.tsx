@@ -11,6 +11,7 @@ vi.mock("../lib/ipc", () => ({
   ipc: {
     updateWorkspaceLink: vi.fn().mockResolvedValue(undefined),
     createWorkspace: vi.fn(),
+    setProjectSetupScript: vi.fn().mockResolvedValue(undefined),
     listBranches: vi.fn(),
     listPrs: vi.fn(),
     ensurePrBranch: vi.fn(),
@@ -532,6 +533,34 @@ describe("MissionCreator", () => {
       fireEvent.click(screen.getByText("Begin the mission"));
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBe("");
+    });
+
+    it("also saves the template to the backend, where Routines read it", async () => {
+      const onCreated = vi.fn();
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "pnpm install" } });
+      fireEvent.click(screen.getByText("Begin the mission"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalledWith("proj-1", "pnpm install");
+    });
+
+    it("says where the script runs, and that a reused workspace never re-runs it", async () => {
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const taskInput = await gotoTask();
+      await screen.findByTitle(/^Base branch: main/);
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      expect(await screen.findByText(/Runs in a setup terminal inside the new worktree/)).toBeInTheDocument();
+      expect(screen.getByText(/These commands run in a setup terminal/)).toBeInTheDocument();
+
+      fireEvent.click(screen.getByText("Back"));
+      const branchInput = await screen.findByLabelText("Branch name");
+      fireEvent.change(branchInput, { target: { value: "release/1.0" } });
+      fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+      expect(await screen.findByText(/never in a workspace it reuses/)).toBeInTheDocument();
+      expect(screen.queryByText(/the setup script runs in its worktree/)).toBeNull();
     });
 
     it("does not save the script when creation fails", async () => {

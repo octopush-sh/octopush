@@ -52,9 +52,24 @@ function seed(sessions: Seed[], activeId?: string) {
 }
 
 beforeEach(() => {
-  useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
+  useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
   useAttentionStore.setState({ flagsByWs: {} });
   vi.clearAllMocks();
+});
+
+describe("SessionRail — setup terminal", () => {
+  it("says the setup is running, then marks a failure with its exit code", () => {
+    seed([{ id: "s", label: "setup" }, { id: "m", label: "main" }]);
+    useTerminalsStore.setState({ setupByTerminal: { s: { workspaceId: WS, status: "running", exitCode: null } } });
+    render(<SessionRail workspaceId={WS} />);
+    expect(screen.getByTestId("session-cell-s")).toHaveAttribute("aria-label", "setup — setup · running (⌘⌥1)");
+    expect(screen.queryByTestId("session-setup-failed-s")).toBeNull();
+
+    act(() => useTerminalsStore.getState().reportSetupExit(WS, "s", 1));
+    expect(screen.getByTestId("session-cell-s")).toHaveAttribute("aria-label", "setup — setup failed · exit 1 (⌘⌥1)");
+    expect(screen.getByTestId("session-setup-failed-s")).toHaveAttribute("title", "setup failed · exit 1");
+    expect(screen.queryByTestId("session-setup-failed-m")).toBeNull();
+  });
 });
 
 describe("SessionRail", () => {

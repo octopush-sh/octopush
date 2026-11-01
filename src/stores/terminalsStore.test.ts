@@ -58,7 +58,7 @@ const { useAttentionStore } = await import("./attentionStore");
 // ─── Helpers ──────────────────────────────────────────────────────
 
 function resetStore() {
-  useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
+  useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
   nextId = 0;
   vi.clearAllMocks();
   // Default: daemon has no live sessions (cold start).
@@ -66,6 +66,46 @@ function resetStore() {
 }
 
 // ─── Tests ────────────────────────────────────────────────────────
+
+describe("terminalsStore — setup runs", () => {
+  beforeEach(() => resetStore());
+
+  it("announces a failure of a run it saw start, with a way to the terminal", async () => {
+    const { NAVIGATE_EVENT } = await import("../lib/tour/surfaces");
+    const s = useTerminalsStore.getState();
+    s.trackSetup("ws-s", "t-setup");
+    expect(useTerminalsStore.getState().activeByWs["ws-s"]).toBe("t-setup");
+    s.reportSetupExit("ws-s", "t-setup", 1);
+    expect(useTerminalsStore.getState().setupByTerminal["t-setup"]).toEqual({
+      workspaceId: "ws-s",
+      status: "failed",
+      exitCode: 1,
+    });
+    expect(mockPushToast).toHaveBeenCalledTimes(1);
+    const toast = mockPushToast.mock.calls[0][0] as { title: string; action: { label: string; onClick: () => void } };
+    expect(toast.title).toBe("Setup failed");
+    expect(toast.action.label).toBe("Open the setup terminal");
+    const seen: unknown[] = [];
+    const onNav = (e: Event) => seen.push((e as CustomEvent).detail);
+    window.addEventListener(NAVIGATE_EVENT, onNav);
+    toast.action.onClick();
+    window.removeEventListener(NAVIGATE_EVENT, onNav);
+    expect(seen).toEqual([{ kind: "terminal", workspaceId: "ws-s", terminalId: "t-setup" }]);
+  });
+
+  it("stays quiet on success and on a replayed marker after a restart", () => {
+    const s = useTerminalsStore.getState();
+    s.trackSetup("ws-s", "t-ok");
+    s.reportSetupExit("ws-s", "t-ok", 0);
+    expect(useTerminalsStore.getState().setupByTerminal["t-ok"].status).toBe("ok");
+    // Unknown run (state lost on restart): restored silently.
+    s.reportSetupExit("ws-s", "t-old", 3);
+    expect(useTerminalsStore.getState().setupByTerminal["t-old"].status).toBe("failed");
+    // Seen again (a remount replays it): no second announcement.
+    s.reportSetupExit("ws-s", "t-old", 3);
+    expect(mockPushToast).not.toHaveBeenCalled();
+  });
+});
 
 describe("terminalsStore — loadTerminals", () => {
   beforeEach(() => resetStore());

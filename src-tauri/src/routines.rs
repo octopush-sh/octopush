@@ -30,6 +30,11 @@ const TICK_SECS: u64 = 30;
 /// 30s scheduler tick.
 const CONDITION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a fresh worktree's setup script (`npm install`, …) may run before
+/// the fire is skipped. Fires run detached, so this never stalls the tick; it
+/// stays under the 15-minute minimum window so fires can't overlap.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
 /// The schedule kinds. `interval`/`daily` are the original simple cadences;
 /// `recurring` is the flexible Days×Times model (spec = JSON, see `RecurringSpec`).
 pub const KIND_INTERVAL: &str = "interval";
@@ -58,6 +63,9 @@ pub enum SkipReason {
     /// gate, lease) — carries the refusal's first line so the toast/`last_outcome`
     /// name the real reason instead of a misleading "workspace busy".
     LaunchRefused(String),
+    /// A fresh worktree's setup script failed — the worktree is discarded and
+    /// no run is created.
+    SetupFailed(String),
 }
 
 impl SkipReason {
@@ -69,6 +77,7 @@ impl SkipReason {
             SkipReason::ConditionError(msg) => format!("condition error: {msg}"),
             SkipReason::WorkspaceUnavailable => "workspace unavailable".to_string(),
             SkipReason::LaunchRefused(msg) => msg.clone(),
+            SkipReason::SetupFailed(msg) => format!("setup failed: {msg}"),
         }
     }
 }
@@ -273,12 +282,47 @@ pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) ->
 /// Run `command` under `bash -c` with `PATH = path`. exit 0 ⇒ `Met`; exit 1 ⇒
 /// `NotMet`; any other exit, spawn failure or timeout ⇒ `Error` (with the last
 /// stderr lines, so the Routines list shows *why*).
+pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
+    match run_bounded("condition", command, cwd, timeout, path).await {
+        Ok((code, stderr)) => classify_condition_exit(code, &stderr),
+        Err(msg) => ConditionEval::Error(msg),
+    }
+}
+
+/// Run a project's setup script headless in a Routine's fresh worktree, before
+/// its crew launches: the same `bash -c` + login-shell PATH as a fire
+/// condition. `Err` carries why it failed, for `last_outcome`.
+pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration) -> Result<(), String> {
+    let path = condition_path().await;
+    run_setup_with_path(script, cwd, timeout, &path).await
+}
+
+/// See `run_setup`; `path` is the PATH the script runs with.
+pub async fn run_setup_with_path(script: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(), String> {
+    let (code, stderr) = run_bounded("setup", script, cwd, timeout, path).await?;
+    classify_setup_exit(code, &stderr)
+}
+
+/// exit 0 ⇒ `Ok`; anything else ⇒ `Err("exit N · <stderr tail>")`.
+pub fn classify_setup_exit(code: Option<i32>, stderr: &str) -> Result<(), String> {
+    let what = match code {
+        Some(0) => return Ok(()),
+        Some(n) => format!("exit {n}"),
+        None => "killed by a signal".to_string(),
+    };
+    let tail = stderr_tail(stderr);
+    Err(if tail.is_empty() { what } else { format!("{what} · {tail}") })
+}
+
+/// Run `command` under `bash -c` in `cwd` with `PATH = path`, bounded by
+/// `timeout`. `Ok((exit code, stderr))` when it finished; `Err` (naming `what`)
+/// on a spawn failure or a timeout.
 ///
 /// The child is launched as its OWN process-group/session leader (`setsid`), so
 /// on timeout the WHOLE group is killed — a pipeline like `gh … | grep -q .`
 /// leaves no orphaned `gh` reparented past the tick. `kill_on_drop` is the
 /// backstop.
-pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
+async fn run_bounded(what: &str, command: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(Option<i32>, String), String> {
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c")
         .arg(command)
@@ -301,7 +345,7 @@ pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Du
     }
     let mut child = match cmd.spawn() {
         Ok(child) => child,
-        Err(e) => return ConditionEval::Error(format!("could not launch condition: {e}")),
+        Err(e) => return Err(format!("could not launch {what}: {e}")),
     };
     // Drain stderr concurrently so a chatty command can't block on a full pipe.
     let stderr = child.stderr.take().map(|pipe| tokio::spawn(read_to_string_lossy(pipe)));
@@ -317,15 +361,15 @@ pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Du
                     .unwrap_or_default(),
                 None => String::new(),
             };
-            classify_condition_exit(status.code(), &err)
+            Ok((status.code(), err))
         }
-        Ok(Err(e)) => ConditionEval::Error(format!("condition wait failed: {e}")),
+        Ok(Err(e)) => Err(format!("{what} wait failed: {e}")),
         Err(_) => {
             // Timed out — kill the whole process group (not just `bash`), then
             // reap so no zombie lingers.
             kill_process_group(&mut child);
             let _ = child.wait().await;
-            ConditionEval::Error(format!("condition timed out after {}s", timeout.as_secs()))
+            Err(format!("{what} timed out after {}s", timeout.as_secs()))
         }
     }
 }
@@ -793,8 +837,9 @@ impl Orchestrator {
 
     /// Fresh mode: guard against stacking a worktree on the previous crew, THEN
     /// evaluate the condition at the project root (the fresh worktree doesn't
-    /// exist yet), THEN create the worktree (only now — a skip creates none) and
-    /// dispatch.
+    /// exist yet), THEN create the worktree (only now — a skip creates none),
+    /// run the project's setup script in it (a failure discards it and skips)
+    /// and dispatch.
     async fn fire_fresh(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
         // Runaway guard: don't stack a new worktree while this routine's previous
         // crew is still active.
@@ -825,9 +870,40 @@ impl Orchestrator {
             }
         }
 
-        // Create the fresh worktree only now (a skipped condition created none).
-        let workspace_id = self.create_fresh_routine_workspace(r, &project_path).await?;
-        self.dispatch_run(r, &workspace_id).await
+        // Create the fresh worktree only now (a skipped condition created none),
+        // then run the project's setup-script template in it before the crew.
+        let setup_script = self.db().lock().get_project_setup_script(&r.project_id)?;
+        let ws = self.create_fresh_routine_workspace(r, &project_path, &setup_script).await?;
+        if !setup_script.trim().is_empty() {
+            let result = match ws.worktree_path.as_deref() {
+                Some(wt) => run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT).await,
+                None => Err("the fresh workspace has no worktree".into()),
+            };
+            if let Err(msg) = result {
+                tracing::warn!(routine = %r.id, error = %msg, "routine setup script failed — skipping");
+                // A failed setup leaves no run behind — nor a worktree per window.
+                self.discard_fresh_workspace(&project_path, &ws);
+                return Ok(FireOutcome::Skipped(SkipReason::SetupFailed(msg)));
+            }
+        }
+        self.dispatch_run(r, &ws.id).await
+    }
+
+    /// Remove a fresh routine workspace that will never run: its worktree, its
+    /// branch (only when Octopush created it) and its row.
+    fn discard_fresh_workspace(&self, project_path: &str, ws: &crate::db::WorkspaceRow) {
+        let repo = Path::new(project_path);
+        if let Some(wt) = ws.worktree_path.as_deref() {
+            let _ = crate::git_ops::delete_worktree(repo, Path::new(wt));
+            if Path::new(wt).exists() {
+                let _ = std::fs::remove_dir_all(wt);
+            }
+        }
+        let created_branch = self.db().lock().is_branch_created_by_octopush(&ws.id).unwrap_or(false);
+        if created_branch {
+            let _ = crate::git_ops::delete_branch(repo, &ws.branch);
+        }
+        let _ = self.db().lock().delete_workspace(&ws.id);
     }
 
     /// Map a condition evaluation to an optional skip reason (`None` ⇒ Met, fire
@@ -924,8 +1000,14 @@ impl Orchestrator {
     /// idempotency-on-branch yields a genuinely clean tree each time. The git
     /// checkout runs on a blocking thread so a large-repo fire can't stall the
     /// async runtime (the DB mutex is not held across it).
-    async fn create_fresh_routine_workspace(&self, r: &RoutineRow, project_path: &str) -> crate::error::AppResult<String> {
+    async fn create_fresh_routine_workspace(
+        &self,
+        r: &RoutineRow,
+        project_path: &str,
+        setup_script: &str,
+    ) -> crate::error::AppResult<crate::db::WorkspaceRow> {
         let project_path = project_path.to_string();
+        let setup_script = setup_script.to_string();
         let stamp = Local::now().format("%Y%m%d-%H%M%S");
         let short = uuid::Uuid::new_v4().to_string();
         let short = short[..6].to_string();
@@ -951,13 +1033,13 @@ impl Orchestrator {
                 &task,
                 &branch,
                 &base,
-                "",
+                &setup_script,
             )
             .map(|(ws, _outcome)| ws)
         })
         .await
         .map_err(|e| crate::error::AppError::Other(format!("worktree task panicked: {e}")))?;
-        ws.map(|w| w.id)
+        ws
     }
 }
 

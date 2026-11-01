@@ -149,6 +149,14 @@ export interface Workspace {
   fromBranch: string | null;
 }
 
+/** `create_workspace`'s response: the workspace, plus its `setup` terminal when
+ *  the setup script was started (only for a freshly created worktree). */
+export interface CreatedWorkspace extends Workspace {
+  setupTerminalId: string | null;
+  /** Why the setup script couldn't be started; the workspace itself is fine. */
+  setupError: string | null;
+}
+
 // ─── Missions ─────────────────────────────────────────────────────
 
 /** A mission — the first-level unit of intent. The worktree is a property it

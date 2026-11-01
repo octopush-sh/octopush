@@ -312,6 +312,23 @@ describe("TerminalPane — OSC 52", () => {
     expect(writeText).not.toHaveBeenCalled();
   });
 
+  it("hands the setup runner's exit report (OSC 6973) to the terminals store", async () => {
+    const { useTerminalsStore } = await import("../stores/terminalsStore");
+    useTerminalsStore.setState({ setupByTerminal: {} });
+    const { term } = await mountForOsc("setup1");
+    const handler = term.oscHandlers[6973];
+    expect(handler).toBeTypeOf("function");
+    expect(handler("exit=2")).toBe(true);
+    expect(useTerminalsStore.getState().setupByTerminal["setup1"]).toEqual({
+      workspaceId: "ws",
+      status: "failed",
+      exitCode: 2,
+    });
+    // Anything else is consumed and ignored.
+    expect(handler("exit=nope")).toBe(true);
+    expect(useTerminalsStore.getState().setupByTerminal["setup1"].exitCode).toBe(2);
+  });
+
   it("ignores OSC 52 while the Octopush window is not focused", async () => {
     const { writeText, handler } = await mountForOsc("osc6");
     vi.spyOn(document, "hasFocus").mockReturnValue(false);

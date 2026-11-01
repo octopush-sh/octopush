@@ -4,6 +4,8 @@ import { useTerminalsStore } from "../../stores/terminalsStore";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { ROLE_WORD } from "../../lib/sessionRole";
+import { describeSetup } from "../../lib/setupRun";
+import { tourId } from "../../lib/tour/ids";
 
 interface Props {
   workspaceId: string;
@@ -37,7 +39,8 @@ export function SessionRail({ workspaceId }: Props) {
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
-  const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
+  const flag =useAttentionStore((s) => s.flagsByWs[workspaceId]);
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
 
@@ -144,11 +147,18 @@ export function SessionRail({ workspaceId }: Props) {
         // resolve the command (older daemon, unsupported OS) — falling through
         // to the role phrase would have the cell say "shell at the prompt"
         // while a build runs. Same wording as the switcher and the anchor.
-        const doing = t.busy ? (t.command ?? "running") : ROLE_WORD[t.role];
+        // A setup run speaks for its session until it succeeds; after that the
+        // session is an ordinary shell.
+        const setup = setupByTerminal[t.id];
+        const doing =
+          setup && setup.status !== "ok"
+            ? describeSetup(setup)
+            : t.busy ? (t.command ?? "running") : ROLE_WORD[t.role];
 
         return (
           <div
             key={t.id}
+            data-tour={setup ? tourId("run-setup-session") : undefined}
             role="presentation"
             className="octo-rise-in relative w-8"
             onMouseEnter={(e) => openFlyout(t.id, e.currentTarget)}
@@ -235,6 +245,15 @@ export function SessionRail({ workspaceId }: Props) {
                 data-testid={`session-bell-${t.id}`}
                 className="octo-pop-in pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-octo-brass"
                 title="This session rang while you were elsewhere"
+              />
+            )}
+
+            {/* A failed setup script: static rouge, the workspace still works. */}
+            {setup?.status === "failed" && (
+              <span
+                data-testid={`session-setup-failed-${t.id}`}
+                className="octo-pop-in pointer-events-none absolute bottom-0.5 right-0.5 h-1.5 w-1.5 rounded-full bg-octo-rouge"
+                title={describeSetup(setup)}
               />
             )}
 
