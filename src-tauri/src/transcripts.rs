@@ -10,7 +10,8 @@
 //! one `type: "assistant"` line per content block, each carrying the
 //! message's `model` and its full `usage` (`input_tokens`,
 //! `cache_read_input_tokens`, `cache_creation_input_tokens`,
-//! `output_tokens`). That is the same data an API provider returns, so the
+//! `output_tokens`, and `cache_creation.ephemeral_1h_input_tokens` — the
+//! 1-hour-TTL share of the writes, priced at the 1-hour rate). That is the same data an API provider returns, so the
 //! ingestor reads it and records RUN spend with the real model and the real
 //! cache split — one ledger row per API message.
 //!
@@ -173,6 +174,10 @@ pub struct TranscriptUsage {
     pub output_tokens: u64,
     pub cache_read_tokens: u64,
     pub cache_creation_tokens: u64,
+    /// The part of `cache_creation_tokens` written with a 1-hour TTL
+    /// (`usage.cache_creation.ephemeral_1h_input_tokens`); `0` without the
+    /// breakdown.
+    pub cache_creation_1h_tokens: u64,
 }
 
 /// What one ingestion pass did — for logs and tests.
@@ -205,6 +210,7 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
     let output_tokens = g("output_tokens");
     let cache_read_tokens = g("cache_read_input_tokens");
     let cache_creation_tokens = g("cache_creation_input_tokens");
+    let cache_creation_1h_tokens = crate::token_engine::one_hour_cache_writes(usage);
     if input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens == 0 {
         return None;
     }
@@ -245,6 +251,7 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
         output_tokens,
         cache_read_tokens,
         cache_creation_tokens,
+        cache_creation_1h_tokens,
     })
 }
 
@@ -522,7 +529,17 @@ impl TranscriptIngestor {
                     .or_insert_with(|| prices_for(&u.model))
                     .as_ref()
                     // One transcript line = one API request: per-request tiers.
-                    .map(|p| crate::token_engine::request_cost(&u.model, *p, u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_creation_tokens));
+                    .map(|p| {
+                        crate::token_engine::request_cost_split(
+                            &u.model,
+                            *p,
+                            u.input_tokens,
+                            u.output_tokens,
+                            u.cache_read_tokens,
+                            u.cache_creation_tokens,
+                            u.cache_creation_1h_tokens,
+                        )
+                    });
                 let cost = priced.unwrap_or(0.0);
                 // An unknown model is unpriced, not free.
                 let tokens = u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_creation_tokens;

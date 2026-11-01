@@ -182,9 +182,15 @@ mod db_tests {
             output_per_m: 25.0,
             cache_read_per_m: 0.5,
             cache_creation_per_m: 6.25,
+            cache_creation_1h_per_m: 10.0,
         };
         let c = p.cost(1_000_000, 1_000_000, 1_000_000, 1_000_000);
         assert!((c - (5.0 + 25.0 + 0.5 + 6.25)).abs() < 1e-9);
+        // 400K of the 1M writes were 1-hour: those at $10, the rest at $6.25.
+        let c = p.cost_split(0, 0, 0, 1_000_000, 400_000);
+        assert!((c - (0.6 * 6.25 + 0.4 * 10.0)).abs() < 1e-9, "{c}");
+        // A 1h count above the write total is clamped to it.
+        assert!((p.cost_split(0, 0, 0, 1_000_000, 5_000_000) - 10.0).abs() < 1e-9);
     }
 
     #[test]
@@ -8868,6 +8874,32 @@ mod live_tests {
         // Non-assistant events report nothing.
         let other = serde_json::json!({ "type": "user", "message": { "usage": { "input_tokens": 9 } } });
         assert!(usage_from_stream_event(&other).is_none());
+        // No TTL breakdown: no 1-hour writes.
+        assert_eq!(u1.cache_creation_1h_input_tokens, 0);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn cli_usage_reads_and_prices_one_hour_cache_writes() {
+        use crate::orchestrator::cli_runner::{usage_from_stream_event, CliUsage};
+        use crate::orchestrator::cost::{stage_cost, stage_cost_split};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let usage = serde_json::json!({ "input_tokens": 0, "output_tokens": 0, "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 1_000_000,
+            "cache_creation": { "ephemeral_5m_input_tokens": 400_000, "ephemeral_1h_input_tokens": 600_000 } });
+        let ev = serde_json::json!({ "type": "assistant", "message": { "id": "msg_1", "usage": usage } });
+        let (_, u) = usage_from_stream_event(&ev).unwrap();
+        assert_eq!((u.cache_creation_input_tokens, u.cache_creation_1h_input_tokens), (1_000_000, 600_000));
+        // The `result` event's usage deserializes the same breakdown.
+        let r: CliUsage = serde_json::from_value(usage).unwrap();
+        assert_eq!(r.cache_creation_1h_input_tokens, 600_000);
+        let plain: CliUsage = serde_json::from_value(serde_json::json!({ "cache_creation_input_tokens": 5 })).unwrap();
+        assert_eq!(plain.cache_creation_1h_input_tokens, 0);
+        // Fable 5.1: 0.4 × $12.50 + 0.6 × $20; without the split, all at $12.50.
+        let split = stage_cost_split("claude-fable-5-1", 0, 0, 0, 1_000_000, 600_000);
+        assert!((split - 17.0).abs() < 1e-9, "{split}");
+        assert!((stage_cost("claude-fable-5-1", 0, 0, 0, 1_000_000) - 12.50).abs() < 1e-9);
     }
 
     #[tokio::test]
@@ -11848,6 +11880,51 @@ mod transcript_tests {
         assert!(parse_transcript_line("not json", "f").is_none());
         assert!(parse_transcript_line(&line("assistant", "r", "<synthetic>", 1, 0, 0, 1, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
         assert!(parse_transcript_line(&line("assistant", "r", "m", 0, 0, 0, 0, "2026-09-18T20:50:46Z", "/w"), "f").is_none());
+        // No TTL breakdown: no 1-hour writes.
+        assert_eq!(u.cache_creation_1h_tokens, 0);
+    }
+
+    /// [`line`] with Claude Code's `usage.cache_creation` TTL breakdown.
+    fn line_1h(req: &str, model: &str, cc_5m: u64, cc_1h: u64, ts: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, model, 1, 0, cc_5m + cc_1h, 1, ts, cwd)).unwrap();
+        v["message"]["usage"]["cache_creation"] =
+            serde_json::json!({ "ephemeral_5m_input_tokens": cc_5m, "ephemeral_1h_input_tokens": cc_1h });
+        v.to_string()
+    }
+
+    #[test]
+    fn parses_the_one_hour_cache_write_breakdown() {
+        let u = parse_transcript_line(&line_1h("req_1", "claude-fable-5-1", 400, 600, "2026-10-31T10:00:00Z", "/w"), "f").unwrap();
+        assert_eq!((u.cache_creation_tokens, u.cache_creation_1h_tokens), (1_000, 600));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_one_hour_cache_writes_at_the_one_hour_rate() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/one-hour";
+        session_on(&db.lock(), "sess-1h", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Fable 5.1: 5-minute writes $12.50/M, 1-hour writes $20/M.
+        std::fs::write(
+            pdir.join("cc-sess.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line_1h("req_split", "claude-fable-5-1", 400_000, 600_000, "2026-10-30T10:00:00Z", cwd),
+                line("assistant", "req_plain", "claude-fable-5-1", 0, 0, 1_000_000, 0, "2026-10-30T10:01:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 2);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        // Split row: 0.4 × 12.50 + 0.6 × 20 + 1 in + 1 out; plain row: 12.50 (all 5-minute).
+        let expected = 5.0 + 12.0 + (10.0 + 50.0) / 1e6 + 12.50;
+        assert!((rep.totals.cost_usd - expected).abs() < 1e-6, "{} vs {expected}", rep.totals.cost_usd);
     }
 
     #[test]
@@ -12105,7 +12182,7 @@ mod thread_ledger_tests {
         // Another thread's spend never leaks in.
         engine.record_in_thread(ev("opus", 100, 50, 0, 9.0), "talk", Some("t-2"), Some("director")).unwrap();
 
-        let strong = ModelPrices { input_per_m: 15.0, output_per_m: 75.0, cache_read_per_m: 1.5, cache_creation_per_m: 18.75 };
+        let strong = ModelPrices { input_per_m: 15.0, output_per_m: 75.0, cache_read_per_m: 1.5, cache_creation_per_m: 18.75, cache_creation_1h_per_m: 30.0 };
         let c = db.lock().thread_cost("t-1", Some(&strong)).unwrap();
         assert_eq!(c.calls, 3);
         assert!((c.spent_usd - 0.65).abs() < 1e-9, "{}", c.spent_usd);
@@ -12140,7 +12217,7 @@ mod thread_ledger_tests {
         assert_eq!(db.lock().thread_cost("t-1", None).unwrap().spent_usd, 0.30);
 
         let price = |m: &str| -> Option<ModelPrices> {
-            (m == "mystery-model-9").then_some(ModelPrices { input_per_m: 1.0, output_per_m: 2.0, cache_read_per_m: 0.1, cache_creation_per_m: 1.25 })
+            (m == "mystery-model-9").then_some(ModelPrices { input_per_m: 1.0, output_per_m: 2.0, cache_read_per_m: 0.1, cache_creation_per_m: 1.25, cache_creation_1h_per_m: 1.25 })
         };
         assert_eq!(db.lock().reprice_unpriced(&price).unwrap(), 1);
         let c = db.lock().thread_cost("t-1", None).unwrap();
@@ -12372,7 +12449,38 @@ mod pricing_table_tests {
                 && near(p.output_per_m, output),
             "{model}: {p:?}"
         );
+        // 1-hour cache writes: 2× base input (pricing page, 2026-10-31).
+        assert!(near(p.cache_creation_1h_per_m, 2.0 * input), "{model} 1h write: {p:?}");
         assert!(p.cost(1, 1, 1, 1) > 0.0, "{model} priced to $0");
+    }
+
+    #[test]
+    fn one_hour_cache_writes_cost_twice_base_input() {
+        let fable = builtin_prices("claude-fable-5-1").unwrap();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(near(fable.cache_creation_1h_per_m, 20.0) && near(fable.cache_creation_per_m, 12.50));
+        // 1M writes, 600K of them 1-hour: 0.4 × $12.50 + 0.6 × $20.
+        assert!(near(fable.cost_split(0, 0, 0, 1_000_000, 600_000), 5.0 + 12.0));
+        // No breakdown: every write at the 5-minute rate, as before.
+        assert!(near(fable.cost_split(0, 0, 0, 1_000_000, 0), 12.50));
+        assert!(near(fable.cost(0, 0, 0, 1_000_000), 12.50));
+        // Non-Claude models have no 1-hour tier.
+        let gpt = builtin_prices("gpt-4o").unwrap();
+        assert!(near(gpt.cache_creation_1h_per_m, gpt.cache_creation_per_m));
+    }
+
+    #[test]
+    fn one_hour_cache_write_breakdown_is_read_and_clamped() {
+        use crate::token_engine::one_hour_cache_writes;
+        let with = serde_json::json!({ "cache_creation_input_tokens": 900,
+            "cache_creation": { "ephemeral_5m_input_tokens": 300, "ephemeral_1h_input_tokens": 600 } });
+        assert_eq!(one_hour_cache_writes(&with), 600);
+        let without = serde_json::json!({ "cache_creation_input_tokens": 900 });
+        assert_eq!(one_hour_cache_writes(&without), 0);
+        // A breakdown larger than the total never prices more than was written.
+        let bad = serde_json::json!({ "cache_creation_input_tokens": 100,
+            "cache_creation": { "ephemeral_1h_input_tokens": 600 } });
+        assert_eq!(one_hour_cache_writes(&bad), 100);
     }
 
     #[test]
@@ -12423,6 +12531,11 @@ mod pricing_table_tests {
         // Cache reads count toward the prompt size.
         let c = request_cost("us.anthropic.claude-haiku-5-5-v1:0", base, 1_000, 1_000_000, 150_000, 0);
         assert!(near(c, (1_000.0 * 0.50 + 1_000_000.0 * 2.50 + 150_000.0 * 0.05) / 1e6), "{c}");
+        // The long tier scales the 1-hour write column too (5 × $0.20), and
+        // 1-hour writes count toward the prompt size.
+        assert!(near(long.cache_creation_1h_per_m, 1.0));
+        let c = crate::token_engine::request_cost_split("claude-haiku-5-5", base, 0, 0, 0, 150_000, 150_000);
+        assert!(near(c, 150_000.0 * 1.0 / 1e6), "{c}");
         // Other models have no tier.
         let opus = builtin_prices("claude-opus-5-5").unwrap();
         assert_eq!(request_prices("claude-opus-5-5", opus, 900_000), opus);
@@ -12537,7 +12650,7 @@ mod pricing_table_tests {
         let _cfg = crate::provider_router::TestConfigDir::new();
         // Ollama is a `local` catalog provider priced at $0: free, not unknown.
         let p = prices_for("llama3.3").expect("local model is priced");
-        assert_eq!(p, ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 });
+        assert_eq!(p, ModelPrices::FREE);
         assert_eq!(ledger_cost_basis("llama3.3", 0.0, 1_000), "computed");
     }
 
@@ -12546,6 +12659,7 @@ mod pricing_table_tests {
         // Every builtin catalog model must price exactly like the table, so
         // the catalog-first and table paths never disagree.
         let providers = crate::provider_router::builtin_providers();
+        let router = crate::provider_router::ProviderRouter::from_map(providers.clone());
         for name in ["anthropic", "openai"] {
             for m in &providers[name].models {
                 let t = builtin_prices(&m.id).unwrap_or_else(|| panic!("{} missing from the table", m.id));
@@ -12554,6 +12668,13 @@ mod pricing_table_tests {
                 if m.cache_read_cost_per_m > 0.0 {
                     assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{}", m.id);
                     assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{}", m.id);
+                }
+                // 1-hour writes: 2× input, the same on the catalog-first path.
+                if m.id.starts_with("claude-") {
+                    let c = crate::token_engine::prices_in(Some(&router), &m.id)
+                        .unwrap_or_else(|| panic!("{} unpriced in the catalog", m.id));
+                    assert!((t.cache_creation_1h_per_m - 2.0 * t.input_per_m).abs() < 1e-9, "{}", m.id);
+                    assert!((c.cache_creation_1h_per_m - t.cache_creation_1h_per_m).abs() < 1e-9, "{}", m.id);
                 }
             }
         }
@@ -12636,7 +12757,7 @@ mod unpriced_ledger_tests {
         // Unknown model: $0 and tokens → unpriced.
         engine.record_in_thread(ev("claude-mythos-1", 50_000, 5_000, 0.0), "talk", Some("t-1"), Some("director")).unwrap();
 
-        let strong = ModelPrices { input_per_m: 4.0, output_per_m: 20.0, cache_read_per_m: 0.2, cache_creation_per_m: 5.0 };
+        let strong = ModelPrices { input_per_m: 4.0, output_per_m: 20.0, cache_read_per_m: 0.2, cache_creation_per_m: 5.0, cache_creation_1h_per_m: 8.0 };
         let c = db.lock().thread_cost("t-1", Some(&strong)).unwrap();
         assert_eq!(c.calls, 2);
         assert_eq!(c.unpriced_calls, 1);
@@ -12799,7 +12920,7 @@ mod unpriced_ledger_tests {
         db.insert_spend_event(&mk("mystery", "a")).unwrap();
         db.insert_spend_event(&mk("local-free", "b")).unwrap();
         let price = |m: &str| -> Option<ModelPrices> {
-            (m == "local-free").then_some(ModelPrices { input_per_m: 0.0, output_per_m: 0.0, cache_read_per_m: 0.0, cache_creation_per_m: 0.0 })
+            (m == "local-free").then_some(ModelPrices::FREE)
         };
         assert_eq!(db.reprice_unpriced(&price).unwrap(), 0);
         let rep = db
