@@ -3,7 +3,8 @@
 // coding agents, and the stdio MCP servers whose tools appear in chat.
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
-import type { McpStatus } from "../../lib/ipc";
+import type { ClaudeCliVersion, McpStatus } from "../../lib/ipc";
+import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, loadClaudeCliVersion } from "../../lib/claudeCli";
 import { pushToast } from "../Toasts";
 import { copyToClipboard } from "../../lib/clipboard";
 import { PaneHeader, SectionLabel } from "./shared";
@@ -38,6 +39,7 @@ export function IntegrationsPane({ onConfigSaved }: { onConfigSaved?: () => void
  */
 function ClaudeCodeCard() {
   const [status, setStatus] = useState<McpStatus | null>(null);
+  const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -47,6 +49,7 @@ function ClaudeCodeCard() {
     ipc.mcpConnectionStatus()
       .then((s) => alive && setStatus(s))
       .catch(() => alive && setStatus(null));
+    void loadClaudeCliVersion().then((v) => alive && setCli(v));
     return () => {
       alive = false;
     };
@@ -83,6 +86,7 @@ function ClaudeCodeCard() {
   }
 
   const registered = status?.registered ?? false;
+  const updateLabel = claudeUpdateLabel(cli);
 
   return (
     <div className="mt-8 max-w-[640px]">
@@ -93,6 +97,7 @@ function ClaudeCodeCard() {
       </p>
 
       <div
+        data-tour="settings-claude-code-card"
         className="rounded-lg px-4 py-4"
         style={{ border: "1px solid var(--color-octo-hairline)", background: "var(--color-octo-panel)" }}
       >
@@ -113,6 +118,26 @@ function ClaudeCodeCard() {
             </span>
           )}
         </div>
+
+        {/* Installed CLI version vs the tested floor — informational, never blocking. */}
+        {cli?.version && (
+          <div
+            data-tour="settings-claude-cli-version"
+            className="octo-fade-in mt-3 font-mono text-[11px] text-octo-mute"
+            title={`Octopush is tested with Claude Code ${cli.floor}`}
+          >
+            CLI <span className="octo-tabular text-octo-sage">{cli.version}</span>
+          </div>
+        )}
+        {updateLabel && (
+          <div
+            data-testid="claude-cli-update"
+            className="octo-rise-in mt-2 rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2"
+          >
+            <div className="font-mono text-[11px] text-octo-warning">{updateLabel}</div>
+            <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">{CLAUDE_UPDATE_REASON}</p>
+          </div>
+        )}
 
         <div className="mt-4 flex items-center gap-3">
           <button

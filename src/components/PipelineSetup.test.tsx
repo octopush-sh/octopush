@@ -24,11 +24,12 @@ vi.mock("../hooks/useEntitlement", () => ({
   useEntitlement: () => ({ usage: entitlementState.usage, hasFeature: () => false }),
 }));
 const estimateMock = vi.hoisted(() => vi.fn());
+const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
     ...actual,
-    ipc: { ...actual.ipc, estimateRunCost: estimateMock },
+    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock },
   };
 });
 
@@ -255,5 +256,51 @@ describe("PipelineSetup launcher prefill (R3)", () => {
     fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
     // default pipeline, no stale overrides
     expect(onBegin).toHaveBeenCalledWith("p1", "ghost pipeline run", [], null);
+  });
+});
+
+describe("PipelineSetup Claude Code version preflight", () => {
+  const cliPipe = (agentModel: string) => ({
+    pipeline: { id: "pc", name: "CLI crew", description: "d", isBuiltin: true, createdAt: "t" },
+    stages: [
+      { id: "c0", pipelineId: "pc", position: 0, role: "implement", agentModel, substrate: "cli", checkpoint: false,
+        loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25 },
+    ],
+  });
+
+  beforeEach(async () => {
+    const { resetClaudeCliVersionCache } = await import("../lib/claudeCli");
+    resetClaudeCliVersionCache();
+    cliVersionMock.mockReset();
+  });
+
+  it("warns on an old CLI but still lets the run begin", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-4-6")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-claude-cli-update");
+    expect(note.textContent).toContain("Update Claude Code (2.1.314 or newer recommended)");
+    expect(note.textContent).toContain("2.1.307");
+    expect(note.textContent).toContain("wrong token usage");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalledWith("pc", "build it", [], null);
+  });
+
+  it("stays quiet on a current CLI", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-4-6")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
+  });
+
+  it("does not probe for crews without a Claude Code CLI stage", async () => {
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await screen.findAllByText(/saves ~\$0\.35/);
+    expect(cliVersionMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
   });
 });

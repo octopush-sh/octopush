@@ -177,7 +177,7 @@ pub fn parse_env0(stdout: &[u8]) -> Vec<(String, String)> {
 /// ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN for a LiteLLM/Bedrock proxy. RUN-mode
 /// terminals work because the PTY runs a login shell that sources the rc files;
 /// the CLI stage must inherit the same environment.
-fn login_shell_env() -> &'static [(String, String)] {
+pub(crate) fn login_shell_env() -> &'static [(String, String)] {
     static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -192,7 +192,7 @@ fn login_shell_env() -> &'static [(String, String)] {
 }
 
 /// The effective PATH for spawning user CLIs: login-shell PATH ∪ inherited ∪ common dirs.
-fn resolved_cli_path() -> String {
+pub(crate) fn resolved_cli_path() -> String {
     let login_path = login_shell_env()
         .iter()
         .find(|(k, _)| k == "PATH")
@@ -945,6 +945,15 @@ impl AgentRunner for CliRunner {
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
         );
+        // Version preflight (Claude Code only): an old CLI is a warning in the
+        // journal, never a reason to stop the stage. Cached per app session.
+        if dialect == CliDialect::Claude {
+            if let Ok(info) = tokio::task::spawn_blocking(crate::agent_adapter::claude_cli_version).await {
+                if let Some(note) = info.update_notice() {
+                    emitter.notice(&note);
+                }
+            }
+        }
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
