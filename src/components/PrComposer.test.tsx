@@ -110,6 +110,15 @@ describe("PrComposer", () => {
     expect(body.value).toBe("edited");
   });
 
+  it("an unknown or zero draft cost reads 'unpriced', never $0 or nothing", async () => {
+    ready();
+    ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    renderComposer();
+    const note = await screen.findByText(/Drafted by claude-sonnet-4-6/);
+    expect(note.textContent).toMatch(/ · unpriced$/);
+    expect(note.textContent).not.toMatch(/\$/);
+  });
+
   it("a failed draft keeps the form usable and says why", async () => {
     ready();
     ipcMock.aiComplete.mockRejectedValue("budget exceeded");
@@ -130,7 +139,10 @@ describe("PrComposer", () => {
     expect(await screen.findByText(/pushed first/)).toBeTruthy();
     await waitFor(() => expect(ipcMock.aiComplete).toHaveBeenCalled());
     await screen.findByDisplayValue("Add CSV export");
-    fireEvent.click(screen.getByLabelText("Open as a draft"));
+    const toggle = screen.getByRole("switch", { name: "Open as a draft" });
+    expect(toggle.getAttribute("aria-checked")).toBe("false");
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
     fireEvent.click(screen.getByRole("button", { name: "Open the draft pull request" }));
     await waitFor(() => expect(onClose).toHaveBeenCalled());
     expect(ipcMock.pushBranch).toHaveBeenCalledWith("/w");

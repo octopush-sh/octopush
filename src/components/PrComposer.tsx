@@ -27,6 +27,7 @@ import { usePrStore } from "../stores/prStore";
 import { ModalShell } from "./ModalShell";
 import { BaseBranchPicker } from "./BaseBranchPicker";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { TogglePill } from "./controls/TogglePill";
 import { pushToast } from "./Toasts";
 
 const DRAFT_MODEL = "claude-sonnet-4-6";
@@ -97,7 +98,11 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
         const parsed = parsePrDraft(r.text, workspace.linkedIssueKey);
         setTitle(parsed.title);
         setBody(parsed.body);
-        const cost = r.costUsd > 0 ? ` · $${r.costUsd.toFixed(r.costUsd < 0.01 ? 4 : 2)}` : "";
+        // Never `$0` and never a missing figure: an unknown cost says so.
+        const cost =
+          typeof r.costUsd === "number" && r.costUsd > 0
+            ? ` · $${r.costUsd.toFixed(r.costUsd < 0.01 ? 4 : 2)}`
+            : " · unpriced";
         setDraftNote({
           tone: "mute",
           text: `Drafted by ${DRAFT_MODEL}${ctx.template ? " from the repo's template" : ""}${cost}`,
@@ -179,7 +184,9 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
           <h2 className="mt-1 font-serif text-[17px] leading-tight text-octo-ivory">Open a pull request</h2>
           {phase.kind === "ready" && (
             <div className="mt-2 flex flex-wrap items-center gap-2 font-mono text-[10px] text-octo-mute">
-              <GitBranch size={10} aria-hidden />
+              <span title="Branch" className="flex items-center">
+                <GitBranch size={10} aria-hidden />
+              </span>
               <span className="max-w-[28ch] truncate text-octo-sage" title={branch ?? undefined}>
                 {branch ?? workspace.branch}
               </span>
@@ -198,7 +205,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
           <FadeSwap swapKey={phase.kind}>
             {phase.kind === "checking" && (
               <div className="flex items-center gap-2 py-6 text-[12px] text-octo-sage">
-                <Loader2 size={12} className="animate-spin text-octo-brass" />
+                <Loader2 size={12} className="animate-spin text-octo-sage" />
                 Checking GitHub…
               </div>
             )}
@@ -237,8 +244,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                     disabled={!base || drafting || creating}
                     title="Draft the title and description again from the diff"
                     aria-label="Draft again"
-                    className="shrink-0 rounded p-1.5 text-octo-brass transition-colors hover:bg-[var(--brass-ghost)] disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-                    style={{ border: "1px solid var(--brass-dim)" }}
+                    className="shrink-0 rounded border border-octo-border-strong p-1.5 text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
                     {drafting ? <Loader2 size={12} className="animate-spin" /> : <Sparkles size={12} />}
                   </button>
@@ -253,16 +259,12 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                   className="w-full resize-y rounded-md border border-octo-border-strong bg-octo-onyx p-2.5 font-mono text-[12px] leading-[1.55] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
                 />
                 <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
-                  <label className="flex items-center gap-2 text-[11px] text-octo-sage">
-                    <input
-                      type="checkbox"
-                      checked={draft}
-                      disabled={creating}
-                      onChange={(e) => setDraft(e.target.checked)}
-                      className="accent-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-                    />
-                    Open as a draft
-                  </label>
+                  <TogglePill
+                    on={draft}
+                    onChange={(on) => !creating && setDraft(on)}
+                    label="Draft"
+                    ariaLabel="Open as a draft"
+                  />
                   {unpushed && (
                     <span className="font-mono text-[10px] text-octo-mute">Unpublished commits are pushed first.</span>
                   )}
