@@ -99,7 +99,9 @@ describe("CompanionRuns hub", () => {
     const runRow = screen.getByText("task rRun").closest("button")!;
     const runSlot = runRow.querySelector("span.w-2")!;
     expect(runSlot.textContent).toBe("●");
-    expect(runSlot.className).toContain("text-octo-brass");
+    // Running is a status, not the active thing — verdigris, never brass.
+    expect(runSlot.className).toContain("text-octo-verdigris");
+    expect(runSlot.className).not.toContain("text-octo-brass");
     // The glyph appears once: in the slot, not duplicated beside the word.
     expect((runRow.textContent!.match(/●/g) ?? []).length).toBe(1);
     expect(runRow.textContent).toContain("running");

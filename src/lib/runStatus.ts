@@ -35,9 +35,12 @@ export interface RunStatusMeta {
   className: string;
 }
 
+/** Run status glyph/word/colour. Running is verdigris, like the run-track
+ *  card's running stage: brass marks the active thing (the viewed row, the
+ *  one beacon), never a status. */
 export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
   switch (status) {
-    case "running": return { glyph: "●", word: "running", className: "text-octo-brass" };
+    case "running": return { glyph: "●", word: "running", className: "text-octo-verdigris" };
     case "paused": return { glyph: "◆", word: "paused", className: "text-octo-brass" };
     case "completed": return { glyph: "✓", word: "done", className: "text-octo-verdigris" };
     case "aborted": return { glyph: "■", word: "aborted", className: "text-octo-mute" };

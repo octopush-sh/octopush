@@ -131,6 +131,14 @@ describe("MissionControl", () => {
     expect(screen.getByText("task c")).toBeTruthy();
   });
 
+  it("draws an in-flight card's running dot in verdigris, not brass", () => {
+    useRunsStore.setState({ runsByWs: { "ws-b": [mkRun("b", "running")] } });
+    renderRoom();
+    const dot = screen.getByText("●");
+    expect(dot.className).toContain("text-octo-verdigris");
+    expect(dot.className).not.toContain("text-octo-brass");
+  });
+
   it("a terminal run NOT settled this session stays off the board", () => {
     useRunsStore.setState({
       runsByWs: { "ws-old": [mkRun("old", "completed")] }, // e.g. loaded history

@@ -46,4 +46,12 @@ describe("CompanionCurrentRun", () => {
     expect(screen.getByText("$0.42")).toBeInTheDocument(); // run cost
     expect(screen.getByText(/↑1\.0k ↓200/)).toBeInTheDocument(); // run tokens (shared fmtTokens)
   });
+
+  it("draws the running status tag in verdigris, not brass", () => {
+    setState({ run, stages: [stage({ id: "s1", position: 0, status: "running" })] });
+    render(<CompanionCurrentRun workspaceId="w1" />);
+    const tag = screen.getByTitle("running");
+    expect(tag.className).toContain("text-octo-verdigris");
+    expect(tag.className).not.toContain("text-octo-brass");
+  });
 });
