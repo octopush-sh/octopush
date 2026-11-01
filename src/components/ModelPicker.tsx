@@ -369,14 +369,14 @@ export function ModelPicker({
                       data-testid="model-picker-auto"
                       onClick={() => handleSelect(AUTO_MODEL)}
                       className={clsx(
-                        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
+                        "flex w-full flex-col gap-0.5 overflow-hidden px-3 py-1.5 text-left transition-colors",
                         isAuto
                           ? "border-l-2 bg-octo-brass/8 text-octo-brass"
                           : "border-l-2 border-transparent text-octo-ivory hover:bg-octo-onyx/60",
                       )}
                       style={isAuto ? { borderLeftColor: "var(--color-octo-brass)" } : undefined}
                     >
-                      <span className="flex w-full items-center gap-2">
+                      <span className="flex w-full min-w-0 items-center gap-2">
                         <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ backgroundColor: "var(--color-octo-brass)" }} />
                         <span className="min-w-0 flex-1 truncate text-[12px]">Auto</span>
                         <span className="shrink-0 font-mono text-[9px] text-octo-mute">
@@ -516,7 +516,7 @@ function ModelRow({
       aria-selected={isActive}
       onClick={onClick}
       className={clsx(
-        "flex w-full flex-col gap-0.5 px-3 py-1.5 text-left transition-colors",
+        "flex w-full flex-col gap-0.5 overflow-hidden px-3 py-1.5 text-left transition-colors",
         isActive
           ? "border-l-2 bg-octo-brass/8 text-octo-brass"
           : "border-l-2 border-transparent text-octo-ivory hover:bg-octo-onyx/60",
@@ -524,7 +524,7 @@ function ModelRow({
       style={isActive ? { borderLeftColor: "var(--color-octo-brass)" } : undefined}
     >
       {/* Line 1 — dot · name (truncates) · cost/ctx (right) */}
-      <span className="flex w-full items-center gap-2">
+      <span className="flex w-full min-w-0 items-center gap-2">
         <span
           aria-hidden
           className="h-1.5 w-1.5 shrink-0 rounded-full"
