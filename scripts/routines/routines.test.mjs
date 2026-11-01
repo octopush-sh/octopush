@@ -571,8 +571,9 @@ test("jobs: ready website/API ideas filed in the app repo aren't built here", ()
     { number: 1, labels: [{ name: "ready" }, { name: "area:app" }] },
     { number: 2, labels: [{ name: "ready" }, { name: "area:web" }] },
     { number: 3, labels: [{ name: "ready" }, { name: "area:api" }] },
+    { number: 4, labels: [{ name: "ready" }, { name: "area:app" }, { name: "area:web" }] },
   ]]]);
-  assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1]);
+  assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1, 4], "area:app wins over a secondary area:web");
 });
 
 test("answers: trailing punctuation is not a note", () => {

@@ -77,7 +77,10 @@ export function issueJobs(gh, repo, ids, now) {
   // In the app repo, website/API work waits for its own builder; in the web repo every issue is web work.
   const skip = repo === APP_REPO ? OTHER_AREA : [];
   return gh.list(`repos/${repo}/issues?labels=ready&state=open&sort=created&direction=asc`)
-    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l) || skip.includes(l)) && !claimed.has(i.number))
+    // An issue labelled area:app is app work even if it also touches the site
+    // (#298 and #300 carried area:web too and the builder skipped them).
+    .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
+    .filter((i) => labelsOf(i).includes("area:app") || !labelsOf(i).some((l) => skip.includes(l)))
     .filter((i) => !isFreshClaim(gh, repo, i, now));
 }
 
@@ -100,7 +103,8 @@ export function appWebIssueJobs(appGh, webGh, webIds, now) {
     for (const n of appRefs(`${p.title}\n${p.body}`)) claimed.add(n);
   }
   return appGh.list(`repos/${APP_REPO}/issues?labels=ready,${WEB_AREA}&state=open&sort=created&direction=asc`)
-    .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
+    // area:app + area:web is app work (the app builder takes it), never both builders.
+    .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).includes("area:app") && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
     .filter((i) => !isFreshClaim(appGh, APP_REPO, i, now));
 }
 
