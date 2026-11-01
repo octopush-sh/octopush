@@ -12,13 +12,8 @@ on:
   schedule:
     - cron: "47 1-23/2 * * *"
   workflow_dispatch:
-  # GitHub's scheduler delays or drops crons for hours on busy days, so the
-  # cycle also chains on events: an agent branch's CI finishing starts a
-  # review right away (the crons stay as a fallback).
-  workflow_run:
-    workflows: [CI]
-    types: [completed]
-    branches: ["agent/**"]
+  # Agent CI starts this workflow itself (ci.yml review-next): GitHub emits no
+  # workflow_run for runs dispatched with GITHUB_TOKEN.
 
 permissions:
   contents: write       # merge
@@ -40,14 +35,6 @@ jobs:
   review:
     # From workflow_run: only for a green CI on an agent branch (the queue
     # re-checks everything anyway; this just avoids empty runs).
-    # Builder CI is always dispatched by publish-build (never a pull_request
-    # run), from this repo: forks and human branches can't start a review.
-    if: >-
-      github.event_name != 'workflow_run' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'workflow_dispatch' &&
-       github.event.workflow_run.head_repository.full_name == github.repository &&
-       startsWith(github.event.workflow_run.head_branch, 'agent/'))
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -67,6 +54,12 @@ jobs:
         run: |
           set -euo pipefail
           node scripts/routines/automerge.mjs queue | head -n "$MAX_PRS" > "$RUNNER_TEMP/queue.tsv"
+          # Started by an agent branch's CI (ci.yml review-next), that CI run may
+          # not count as finished for a few seconds yet: look again once.
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ ! -s "$RUNNER_TEMP/queue.tsv" ]; then
+            sleep 60
+            node scripts/routines/automerge.mjs queue | head -n "$MAX_PRS" > "$RUNNER_TEMP/queue.tsv"
+          fi
           echo "count=$(wc -l < "$RUNNER_TEMP/queue.tsv" | tr -d ' ')" >> "$GITHUB_OUTPUT"
           cat "$RUNNER_TEMP/queue.tsv"
 
