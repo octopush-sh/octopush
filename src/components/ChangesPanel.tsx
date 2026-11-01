@@ -384,15 +384,17 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
 
   return (
     <aside className="flex h-full w-full flex-col overflow-hidden bg-octo-panel">
-      {/* Eyebrow row — aligned with canvas toolbar and FILES rail. */}
-      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-octo-hairline px-4">
+      {/* Eyebrow row — aligned with canvas toolbar and FILES rail. Clipped
+          to its own box (min-w-0 + overflow-hidden) so a narrow panel never
+          lets it paint into a neighbour's bar. */}
+      <header className="flex h-11 min-w-0 shrink-0 items-center gap-3 overflow-hidden border-b border-octo-hairline px-4">
         {headerLeading ?? (
           <span className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
             Changes
           </span>
         )}
         {(addCount > 0 || delCount > 0) && (
-          <span className="ml-auto font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+          <span className="ml-auto shrink-0 whitespace-nowrap font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
             <span className="text-octo-verdigris">+{addCount}</span>
             <span className="px-1 opacity-50">/</span>
             <span className="text-octo-rouge">−{delCount}</span>

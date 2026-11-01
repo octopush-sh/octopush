@@ -294,26 +294,36 @@ export function ReviewSidebar({
   }
 
   // ── Expanded — tab switcher + collapse injected into the panel eyebrow ──
+  // A narrow sidebar (the canvas keeps MIN_CANVAS_WIDTH, so the stored width
+  // can be squeezed well below SIDEBAR_MIN_WIDTH) must never push the switcher
+  // past its own edge into the canvas toolbar: every level is min-w-0 and the
+  // tab labels truncate, leaving the icons (with tooltips) as the floor.
   const headerLeading = (
-    <div className="flex items-center gap-2">
+    <div className="flex min-w-0 items-center gap-2">
       <button
         type="button"
         onClick={() => setCollapsedPersist(true)}
         aria-label="Collapse changes & files"
         title="Collapse changes & files"
-        className="flex h-6 w-6 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
         <PanelLeftClose size={14} />
       </button>
-      <div className="flex items-center overflow-hidden rounded-md border border-octo-hairline">
-        <TabButton active={tab === "changes"} onClick={() => setTab("changes")} badge={changedCount > 0 ? changedCount : undefined}>
-          <FileDiff size={12} />
-          Changes
-        </TabButton>
-        <TabButton active={tab === "files"} onClick={() => setTab("files")} borderLeft>
-          <FolderTree size={12} />
-          Files
-        </TabButton>
+      <div className="flex min-w-0 items-center overflow-hidden rounded-md border border-octo-hairline">
+        <TabButton
+          active={tab === "changes"}
+          onClick={() => setTab("changes")}
+          icon={<FileDiff size={12} />}
+          label="Changes"
+          badge={changedCount > 0 ? changedCount : undefined}
+        />
+        <TabButton
+          active={tab === "files"}
+          onClick={() => setTab("files")}
+          icon={<FolderTree size={12} />}
+          label="Files"
+          borderLeft
+        />
       </div>
     </div>
   );
@@ -375,13 +385,15 @@ export function ReviewSidebar({
 // ─── Controls ─────────────────────────────────────────────────────
 
 function TabButton({
-  children,
+  icon,
+  label,
   active,
   onClick,
   borderLeft,
   badge,
 }: {
-  children: React.ReactNode;
+  icon: React.ReactNode;
+  label: string;
   active: boolean;
   onClick: () => void;
   borderLeft?: boolean;
@@ -392,14 +404,16 @@ function TabButton({
       type="button"
       onClick={onClick}
       aria-pressed={active}
-      className={`flex items-center gap-1 whitespace-nowrap px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+      title={label}
+      className={`flex min-w-0 items-center gap-1 whitespace-nowrap px-2 py-1 font-mono text-[10px] uppercase tracking-[0.08em] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass [&>svg]:shrink-0 ${
         borderLeft ? "border-l border-octo-hairline " : ""
       }${active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
       style={active ? { background: "var(--brass-ghost)" } : undefined}
     >
-      {children}
+      {icon}
+      <span className="min-w-0 truncate">{label}</span>
       {badge != null && (
-        <span className="rounded-full bg-[var(--brass-ghost)] px-1 text-[9px] tabular-nums text-octo-brass">
+        <span className="shrink-0 rounded-full bg-[var(--brass-ghost)] px-1 text-[9px] tabular-nums text-octo-brass">
           {badge}
         </span>
       )}

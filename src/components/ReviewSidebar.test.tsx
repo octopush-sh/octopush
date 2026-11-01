@@ -69,6 +69,26 @@ describe("ReviewSidebar", () => {
     expect(localStorage.getItem("reviewSidebarTab")).toBe("files");
   });
 
+  it("the tab switcher shrinks inside a narrow sidebar instead of painting into the canvas", () => {
+    // Visual audit #316: at 1024px the sidebar is squeezed below its content
+    // width and the Changes|Files buttons drew over the canvas's Diff|Editor
+    // toggle. Every level must be shrinkable and the labels must truncate.
+    render(<ReviewSidebar changedCount={3} {...baseProps} />);
+    const changes = screen.getByRole("button", { name: /changes/i, pressed: true });
+    const files = screen.getByRole("button", { name: "Files" });
+    for (const btn of [changes, files]) {
+      expect(btn).toHaveClass("min-w-0", "[&>svg]:shrink-0");
+      expect(btn).toHaveAttribute("title");
+      const label = btn.querySelector("span.truncate");
+      expect(label).not.toBeNull();
+      expect(label).toHaveClass("min-w-0");
+    }
+    const group = changes.parentElement!;
+    expect(group).toHaveClass("min-w-0", "overflow-hidden");
+    expect(group.parentElement).toHaveClass("min-w-0");
+    expect(screen.getByRole("button", { name: /collapse changes & files/i })).toHaveClass("shrink-0");
+  });
+
   it("collapses to a slim strip and a strip icon re-expands to that tab", async () => {
     render(<ReviewSidebar changedCount={2} {...baseProps} />);
     await userEvent.click(screen.getByRole("button", { name: /collapse changes & files/i }));
