@@ -542,7 +542,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 
 ### Diff viewer (read & triage)
 - **Continuous hybrid diff** — files → sticky hunk rails → syntax-highlighted, word-diffed lines (not cards). _Support:_ `review/DiffView.tsx` → `FileDiffSection` → `HunkRail` + `DiffLines`; `lib/diffParser.ts::parseFullDiff`.
-- **Per-hunk rail** — Sticky brass-bordered bar: human range, `+adds`/`−dels`, focused state, Accept / Reject / Why? buttons. _Support:_ `review/HunkRail.tsx`.
+- **Per-hunk rail** — Sticky brass-bordered bar: human range (one nowrap line), `+adds`/`−dels`, focused state, Accept / Reject / Why? buttons. _Support:_ `review/HunkRail.tsx`.
 - **Accept hunk** — Stages just that hunk (`git apply --cached -p1`). _Support:_ `ipc.stageHunk` → `stage_hunk`.
 - **Reject hunk + undo** — Reverse-applies (`git apply --reverse`), shows a 6s undo bar; undo re-applies (`apply_hunk`). _Support:_ `ipc.revertHunk`/`applyHunk`; `friendly_git_error`.
 - **Accept all** — Stages every change (`git add -A`). _Support:_ `stage_all_changes`. _Entry:_ toolbar.
@@ -551,7 +551,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **Syntax highlighting in diff** — Per-line tokenization via the file's CodeMirror language + a class-only HighlightStyle; bounded memo cache. _Support:_ `lib/diffHighlight.ts`.
 - **Word-level diff** — LCS over tokenized runs between paired removed/added lines (cap 400 tokens). _Support:_ `lib/wordDiff.ts`.
 - **Per-row line-number gutters** — Old + new line numbers, `+`/`−`/space sign column. _Support:_ `DiffLines.tsx`.
-- **File header** — Change-type badge (NEW/DELETED/MODIFIED), path, hunk count, collapse chevron, "mark viewed". _Support:_ `FileDiffSection.tsx`.
+- **File header** — Change-type badge (NEW/DELETED/MODIFIED), path, hunk count, collapse chevron, "mark viewed". The path is the only elastic item: middle-truncated through `<MidTruncate>` with the file name pinned (`pathTail`) and the full path in its `title`; every other atom is `flex-none` + nowrap. The row is a query container (`.octo-filehead`) whose one demotion rung sheds the hunk count at ≤ 420px. _Support:_ `FileDiffSection.tsx`, `styles.css`.
 - **Collapse / "viewed"** — Collapse a file; marking viewed auto-collapses. _Support:_ `DiffView`.
 - **Keyboard triage** — `j`/`k`/↓/↑ move hunk focus, `]`/`[` jump file, `Space` fold, `a` accept hunk, `x` reject, `A` accept whole file, `v` viewed, `o` open in editor, `w` why, `/` focus filter, `c` focus commit, `?` toggle help. _Support:_ `review/useDiffKeyboard.ts`.
 - **Jump-to-change / flash** — Scrolls a section (and a specific new-line row) into view and flash-highlights; toasts "Not in the current diff" on miss. _Support:_ `lib/diffJump.ts`.

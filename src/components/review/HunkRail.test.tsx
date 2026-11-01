@@ -15,6 +15,10 @@ describe("HunkRail", () => {
     expect(queryByRole("button", { name: /accept/i })).toBeNull();
     expect(container.textContent?.toLowerCase()).toContain("staged");
   });
+  it("keeps the line range on one line, never squeezed", () => {
+    const { getByText } = render(<HunkRail {...base} onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
+    expect(getByText("lines 1–4")).toHaveClass("flex-none", "whitespace-nowrap");
+  });
   it("focused adds the bright rule data attr", () => {
     const { container } = render(<HunkRail {...base} focused onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
     expect(container.querySelector('[data-focused="true"]')).toBeTruthy();
