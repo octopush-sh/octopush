@@ -49,6 +49,11 @@ impl<'a> LiveEmitter<'a> {
     pub fn emit_raw_entry(&self, entry: serde_json::Value) {
         self.emit_entry(entry);
     }
+    /// The Claude plan windows a `rate_limit_event` reported — not a journal
+    /// entry: `PersistingSink` keeps them as the plan snapshot.
+    pub fn plan_windows(&self, windows: &[crate::orchestrator::cli_runner::PlanWindow]) {
+        self.events.emit(crate::claude_plan::PLAN_EVENT, json!({ "windows": windows }));
+    }
 }
 
 /// A descriptive one-line hint from a tool-call input object (path/command/…),

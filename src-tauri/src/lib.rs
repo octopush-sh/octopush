@@ -6,6 +6,7 @@ pub mod billing;
 pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
+pub mod claude_plan;
 mod commands;
 pub mod context_guard;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in
@@ -289,6 +290,7 @@ pub fn run() {
             commands::export_token_events_csv,
             // Usage breakdown
             commands::get_usage_breakdown,
+            commands::get_claude_plan,
             // Pricing refresh
             commands::refresh_pricing,
             commands::reprice_spend,

@@ -15,6 +15,7 @@ import type {
   Budget, BudgetPeriod, BudgetScope, GatewayReconciliation, SourceUsage, UsageBreakdown, UsageReport,
 } from "../../lib/types";
 import { GatewaySection } from "./GatewaySection";
+import { ClaudePlanCard } from "./ClaudePlanCard";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
@@ -565,6 +566,9 @@ export function UsagePane() {
           )}
 
         </div>
+
+          {/* ── Claude plan headroom (only once a Claude-plan stage reported) ── */}
+          <ClaudePlanCard />
 
           {/* ── Budgets ── */}
           <div className="mt-8 max-w-[860px]">

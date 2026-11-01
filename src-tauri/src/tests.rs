@@ -9389,6 +9389,68 @@ mod stage_log_tests {
     }
 
     #[test]
+    fn plan_windows_are_kept_as_the_claude_plan_snapshot_and_forwarded() {
+        let (db, rec, sink, _tmp) = harness();
+        let five = |util: Option<f64>, resets: i64, status: Option<&str>| crate::orchestrator::cli_runner::PlanWindow {
+            kind: "five_hour".into(),
+            utilization: util,
+            resets_at: Some(resets),
+            status: status.map(Into::into),
+            overage_status: None,
+            using_overage: false,
+        };
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        emitter.plan_windows(&[five(Some(0.62), 100, Some("allowed"))]);
+        // A later event of the same window without utilization keeps it…
+        emitter.plan_windows(&[five(None, 100, Some("allowed_warning"))]);
+        let snaps = crate::claude_plan::load(&db.lock()).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].window.utilization, Some(0.62));
+        assert_eq!(snaps[0].window.status.as_deref(), Some("allowed_warning"));
+        assert!(chrono::DateTime::parse_from_rfc3339(&snaps[0].seen_at).is_ok());
+        // A rejected window mentioned only in passing (no status) stays rejected…
+        emitter.plan_windows(&[five(Some(1.0), 100, Some("rejected"))]);
+        emitter.plan_windows(&[five(None, 100, None)]);
+        let snaps = crate::claude_plan::load(&db.lock()).unwrap();
+        assert_eq!(snaps[0].window.status.as_deref(), Some("rejected"));
+        assert_eq!(snaps[0].window.utilization, Some(1.0));
+        // …but nothing carries across a reset: the old window is not the new one.
+        emitter.plan_windows(&[five(None, 200, None)]);
+        let snaps = crate::claude_plan::load(&db.lock()).unwrap();
+        assert_eq!(snaps[0].window.utilization, None);
+        assert_eq!(snaps[0].window.status, None);
+        assert_eq!(snaps[0].window.resets_at, Some(200));
+        // Forwarded to the app, and never written to the stage journal.
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 5);
+        assert!(fwd.iter().all(|(e, _)| e == crate::claude_plan::PLAN_EVENT));
+        assert_eq!(fwd[0].1["windows"][0]["resetsAt"], 100);
+        assert!(db.lock().list_stage_log("s1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_snapshot_round_trips_an_unknown_window_kind() {
+        let (db, _rec, _sink, _tmp) = harness();
+        let w = crate::orchestrator::cli_runner::PlanWindow {
+            kind: "seven_day_fixture_tier".into(),
+            utilization: None,
+            resets_at: None,
+            status: Some("rejected".into()),
+            overage_status: Some("allowed".into()),
+            using_overage: true,
+        };
+        crate::claude_plan::record(&db.lock(), &[w.clone()], "2026-11-01T14:00:00Z").unwrap();
+        let snaps = crate::claude_plan::load(&db.lock()).unwrap();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].window, w);
+        assert_eq!(snaps[0].seen_at, "2026-11-01T14:00:00Z");
+        let v = serde_json::to_value(&snaps[0]).unwrap();
+        assert_eq!(v["kind"], "seven_day_fixture_tier", "flattened for the frontend: {v}");
+        assert_eq!(v["seenAt"], "2026-11-01T14:00:00Z");
+        assert_eq!(v["usingOverage"], true);
+    }
+
+    #[test]
     fn run_log_entry_is_persisted_and_forwarded() {
         let (db, rec, sink, _tmp) = harness();
         let entry = json!({ "kind": "text", "text": "hello" });
