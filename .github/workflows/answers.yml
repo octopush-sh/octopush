@@ -42,6 +42,9 @@ jobs:
           node-version: 22
       - name: Web token (website ideas and merges)
         id: web-token
+        # The web lane is optional: if the App isn't installed on octopush-web
+        # (or its key is missing), carry on with the app repo only.
+        continue-on-error: true
         uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.OCTOPUSH_APP_ID }}
@@ -52,8 +55,12 @@ jobs:
           permission-issues: write
           permission-pull-requests: write
           permission-actions: read
+      - name: Web lane offline?
+        if: steps.web-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — running app-repo only"
+
       - name: Apply
         env:
           OCTOPUSH_WEB_TOKEN: ${{ steps.web-token.outputs.token }}
-          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.web-token.outputs.app-slug }}[bot]
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.web-token.outputs.app-slug && format('{0}[bot]', steps.web-token.outputs.app-slug) || '' }}
         run: node scripts/routines/answers.mjs apply

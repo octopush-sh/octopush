@@ -49,6 +49,9 @@ jobs:
 
       - name: Web token (context — revoked before the agent)
         id: read-token
+        # The web lane is optional: if the App isn't installed on octopush-web
+        # (or its key is missing), carry on with the app repo only.
+        continue-on-error: true
         if: steps.check.outputs.go == '1'
         uses: actions/create-github-app-token@v3
         with:
@@ -61,12 +64,16 @@ jobs:
           permission-pull-requests: read
           permission-actions: read
 
+      - name: Web lane offline?
+        if: steps.read-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — running app-repo only"
+
       - name: Context and brief
         if: steps.check.outputs.go == '1'
         env:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
-          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug }}[bot]
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
         run: |
           set -euo pipefail
           cp -R scripts/routines "$RUNNER_TEMP/routines"
@@ -91,6 +98,9 @@ jobs:
 
       - name: Web token (file website ideas)
         id: post-token
+        # The web lane is optional: if the App isn't installed on octopush-web
+        # (or its key is missing), carry on with the app repo only.
+        continue-on-error: true
         if: steps.check.outputs.go == '1'
         uses: actions/create-github-app-token@v3
         with:
@@ -102,12 +112,16 @@ jobs:
           permission-pull-requests: read
           permission-actions: read
 
+      - name: Web lane offline?
+        if: steps.post-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — running app-repo only"
+
       - name: Post the digest
         if: steps.check.outputs.go == '1'
         env:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.post-token.outputs.token }}
-          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.post-token.outputs.app-slug }}[bot]
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.post-token.outputs.app-slug && format('{0}[bot]', steps.post-token.outputs.app-slug) || '' }}
           OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
         run: |
           set -euo pipefail
