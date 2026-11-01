@@ -40,13 +40,16 @@ export function SessionAnchor({ workspaceId, onOpen }: Props) {
       onClick={onOpen}
       data-testid="session-anchor"
       title={`${active.label} — ${doing}. Switch session (⌘⌥K)`}
-      className="flex max-w-full items-center gap-2 whitespace-nowrap rounded-md border border-transparent px-2 py-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute transition-colors duration-[180ms] hover:border-octo-hairline hover:bg-octo-panel hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      // `min-w-0` lets the band's flex tail shrink the anchor below its
+      // nowrap width, so the label truncates rather than spilling over the
+      // mode switcher; the icon and the shortcut chip keep their size.
+      className="flex min-w-0 max-w-full items-center gap-2 whitespace-nowrap rounded-md border border-transparent px-2 py-1 font-mono text-[10px] tracking-[0.1em] text-octo-mute transition-colors duration-[180ms] hover:border-octo-hairline hover:bg-octo-panel hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
     >
       <Icon
         size={13}
         strokeWidth={1.75}
         aria-hidden
-        className={active.busy ? "text-octo-brass" : "text-octo-verdigris"}
+        className={`shrink-0 ${active.busy ? "text-octo-brass" : "text-octo-verdigris"}`}
       />
       <span className="min-w-0 truncate normal-case tracking-[0.04em] text-octo-ivory">
         {active.label}
@@ -54,8 +57,8 @@ export function SessionAnchor({ workspaceId, onOpen }: Props) {
       {active.busy && active.command && (
         <span className="hidden min-w-0 truncate lg:inline">{active.command}</span>
       )}
-      {waiting && <span className="text-octo-brass">· waiting</span>}
-      <span className="rounded border border-octo-hairline px-1.5 py-px text-[9px] text-octo-mute">
+      {waiting && <span className="shrink-0 text-octo-brass">· waiting</span>}
+      <span className="shrink-0 rounded border border-octo-hairline px-1.5 py-px text-[9px] text-octo-mute">
         ⌘⌥K
       </span>
     </button>

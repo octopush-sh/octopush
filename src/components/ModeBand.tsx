@@ -24,19 +24,26 @@ interface Props {
  *  Layout is a 1fr/auto/1fr grid rather than a flex row with a spacer: the
  *  switcher is centred on the canvas — not on the leftover room beside the
  *  tail — and the equal side tracks keep it there however long the tail gets,
- *  while the tail truncates in its own cell instead of overlapping the pill. */
+ *  while the tail truncates in its own cell instead of overlapping the pill.
+ *
+ *  Two details make that truncation real. The side tracks are
+ *  `minmax(0,1fr)`, not bare `1fr` (whose `auto` minimum is the content's
+ *  width). And the tail cell stretches across its track and right-aligns its
+ *  content with flex, instead of `justify-self-end`: a self-aligned grid item
+ *  is sized to fit its content, never narrower than its min-content, so a
+ *  nowrap tail kept its full width and spilled left across the switcher. */
 export function ModeBand({ mode, onChange, workspaceId, meta }: Props) {
   return (
-    <div className="mb-3 grid grid-cols-[1fr_auto_1fr] items-center gap-3">
+    <div className="mb-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
       <span aria-hidden />
       <ModeSwitcher mode={mode} onChange={onChange} workspaceId={workspaceId} />
       {/* Keyed on the mode so the tail crossfades with the canvas instead of
           snapping to the new mode's numbers (motion rule S3). */}
-      <FadeSwap swapKey={mode} className="min-w-0 justify-self-end">
+      <FadeSwap swapKey={mode} className="flex min-w-0 justify-end">
         {typeof meta === "string" ? (
           <span
             title={meta}
-            className="block truncate font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute"
+            className="block min-w-0 truncate font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute"
           >
             {meta}
           </span>
