@@ -374,6 +374,8 @@ Four rules generalise:
 
 The dot-for-label swap at the last rung is §9's "a state shown by a dot does not also get a label" applied to width rather than to taste: both are mounted, and the ladder animates their widths so exactly one is visible.
 
+**Shedding controls into "More" (2026-11-01; born in the Review toolbar).** When the shed atoms are *controls* rather than meta, a tooltip can't hold them — so the rung that sheds them is paired with an inverse rung: a `MoreHorizontal` button that grows in (same animated width) only once they are gone, opening a `.octo-menu-enter` menu with the same controls. The Review toolbar (`.octo-reviewbar`) sheds Inline/Side-by-side, ±WS and Tests together at ≤ 600px; its floor is Diff/Editor, AI and Accept all. Popovers belonging to shed controls anchor to the band, never to the rung, whose `overflow: hidden` would clip them.
+
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
 - **S1 — Fixed-slot live text.** Text that changes while something runs lives in a fixed-height truncating slot that exists in every state — content changes never resize the container.

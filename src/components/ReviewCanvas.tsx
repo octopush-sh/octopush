@@ -6,7 +6,7 @@
  * canvas-level "Why?" agent-origin drawer.
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import {
   Play,
   Loader2,
@@ -20,6 +20,8 @@ import {
   X,
   Code,
   BookOpen,
+  MoreHorizontal,
+  Check,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { ipc } from "../lib/ipc";
@@ -39,6 +41,13 @@ import { TestDrawer } from "./review/TestDrawer";
 // ─── Types ─────────────────────────────────────────────────────────
 
 export type ReviewViewMode = "diff" | "editor";
+
+/** The toolbar content width at or below which "More" replaces the secondary
+ *  toggles. Mirrors `@container octo-reviewbar (max-width: 600px)` in styles.css. */
+export const REVIEWBAR_MORE_BELOW = 600;
+
+/** The More menu's focusable items (plain, radio and checkbox). */
+const MORE_ITEM = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
 
 /** The three Markdown layouts, in the order the toolbar shows them and ⌥⌘M
  *  cycles them. Icon-only with tooltips, like the reading-mode pair beside it. */
@@ -150,6 +159,18 @@ export function ReviewCanvas({
   const [testRunning, setTestRunning] = useState(false);
   const [testResult, setTestResult] = useState<TestRunResult | null>(null);
   const testsPopoverRef = useRef<HTMLDivElement>(null);
+  // The narrow toolbar's overflow menu ("More") — holds the secondary toggles
+  // the toolbar's ladder sheds below 600px (`.octo-reviewbar` in styles.css).
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement>(null);
+  const toolbarRef = useRef<HTMLElement>(null);
+  // Closing More from inside it (a pick, Escape) hands focus back to its
+  // trigger, like the other menus. An outside click or a resize doesn't.
+  const closeMore = useCallback(() => {
+    setMoreOpen(false);
+    moreTriggerRef.current?.focus();
+  }, []);
   // Last value persisted to the backend — guards against the Enter handler and
   // the input's blur-on-unmount both firing setWorkspaceTestCommand.
   const savedCmdRef = useRef<string | null>(null);
@@ -191,13 +212,14 @@ export function ReviewCanvas({
       // it for the same reason as ⌥⌘M — this canvas stays mounted under
       // ModeOverlay, and Escape from TALK must not reach invisible drawers.
       if (!active || e.key !== "Escape" || whyFile) return;
+      if (moreOpen) { closeMore(); return; }
       if (testsOpen) { setTestsOpen(false); return; }
       if (aiOpen) { setAiOpen(false); return; }
       setTestResult(null);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, whyFile, testsOpen, aiOpen]);
+  }, [active, whyFile, moreOpen, testsOpen, aiOpen, closeMore]);
 
   // Auto-clear the reject-undo bar after 6s — but keep the error message
   // visible until the user dismisses it (don't let a failed undo vanish).
@@ -214,17 +236,57 @@ export function ReviewCanvas({
     if ((gitStatus?.changedFiles.length ?? 0) === 0) setAiOpen(false);
   }, [gitStatus]);
 
-  // Dismiss the test-command popover on an outside click.
+  // Dismiss the test-command popover and the overflow menu on an outside
+  // click. Their triggers count as inside: each toggles on its own click, and
+  // closing here first would make that click reopen it.
   useEffect(() => {
-    if (!testsOpen) return;
+    if (!testsOpen && !moreOpen) return;
     const onDown = (e: MouseEvent) => {
-      if (testsPopoverRef.current && !testsPopoverRef.current.contains(e.target as Node)) {
+      const target = e.target as Element;
+      if (testsOpen && !testsPopoverRef.current?.contains(target) && !target.closest?.("[data-tests-trigger]")) {
         setTestsOpen(false);
+      }
+      if (moreOpen && !moreMenuRef.current?.contains(target) && !target.closest?.("[data-more-trigger]")) {
+        setMoreOpen(false);
       }
     };
     window.addEventListener("mousedown", onDown);
     return () => window.removeEventListener("mousedown", onDown);
-  }, [testsOpen]);
+  }, [testsOpen, moreOpen]);
+
+  // More's trigger only exists on a narrow toolbar, and its items depend on
+  // the view mode: close the menu when either changes, so it never outlives
+  // a trigger the ladder has hidden or shows controls for the other view.
+  useEffect(() => setMoreOpen(false), [viewMode]);
+  useEffect(() => {
+    const bar = toolbarRef.current;
+    if (!moreOpen || !bar || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > REVIEWBAR_MORE_BELOW) setMoreOpen(false);
+    });
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [moreOpen]);
+  // Opening More focuses its first item, as `useMenuChrome` does for the rail
+  // menus, so ↑/↓ (`onMoreKeyDown`) work straight away from the keyboard.
+  useLayoutEffect(() => {
+    if (moreOpen) moreMenuRef.current?.querySelector<HTMLElement>(MORE_ITEM)?.focus();
+  }, [moreOpen]);
+  const onMoreKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Tab") { setMoreOpen(false); return; }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const items = Array.from(e.currentTarget.querySelectorAll<HTMLElement>(MORE_ITEM));
+    if (items.length === 0) return;
+    const idx = items.indexOf(document.activeElement as HTMLElement);
+    const next =
+      e.key === "Home" ? 0
+      : e.key === "End" ? items.length - 1
+      : e.key === "ArrowDown" ? (idx + 1) % items.length
+      : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  };
 
   const saveTestCommand = useCallback(async () => {
     const cmd = testCommand.trim();
@@ -299,12 +361,16 @@ export function ReviewCanvas({
   const fileCount = gitStatus?.changedFiles.length ?? 0;
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    // `isolate` keeps the toolbar's z-index local to this canvas, so it never
+    // competes with the ContextHeader (`.octo-header`) and its popovers.
+    <div className="isolate flex h-full min-h-0 flex-col overflow-hidden">
       {/* ── Toolbar ───────────────────────────────────────────────
           One tidy row that never wraps: every control is shrink-0 +
           whitespace-nowrap, and seldom-needed bits (the test command)
-          live behind a compact popover instead of an always-on field. */}
-      <header className="flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
+          live behind a compact popover instead of an always-on field.
+          On a narrow canvas the secondary toggles shed into "More"
+          (`.octo-reviewbar` ladder) so AI and Accept all stay whole. */}
+      <header ref={toolbarRef} className="octo-reviewbar flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
         <div className="ml-auto flex items-center gap-2">
           {/* View toggle — Diff / Editor */}
           <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-octo-hairline">
@@ -358,6 +424,8 @@ export function ReviewCanvas({
             </div>
           )}
 
+          {/* Secondary toggles — the rung the narrow toolbar sheds. */}
+          <div className="octo-demote octo-demote-secondary" data-testid="review-toolbar-secondary">
           {/* Reading mode + whitespace — only meaningful in Diff view.
               Icon-only with tooltips so the row stays compact. */}
           {viewMode === "diff" && (
@@ -403,21 +471,89 @@ export function ReviewCanvas({
           )}
 
           {/* Test runner — compact icon button + popover */}
-          <div className="relative shrink-0" ref={testsPopoverRef}>
+          <button
+            onClick={() => setTestsOpen((v) => !v)}
+            data-tests-trigger
+            aria-label="Tests"
+            aria-expanded={testsOpen}
+            title={testCommand ? `Run tests · ${testCommand}` : "Set a test command"}
+            className={`flex shrink-0 items-center gap-1 rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              testsOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+            }`}
+            style={testsOpen ? { background: "var(--brass-ghost)" } : undefined}
+          >
+            {testRunning ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+          </button>
+          </div>
+
+          {/* More — grows in only once the rung above has shed. */}
+          <div className="octo-demote octo-reviewbar-more">
             <button
-              onClick={() => setTestsOpen((v) => !v)}
-              aria-label="Tests"
-              aria-expanded={testsOpen}
-              title={testCommand ? `Run tests · ${testCommand}` : "Set a test command"}
-              className={`flex items-center gap-1 rounded-md border border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
-                testsOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+              ref={moreTriggerRef}
+              onClick={() => setMoreOpen((v) => !v)}
+              data-more-trigger
+              data-tour="review-toolbar-more"
+              aria-label="More view options"
+              aria-haspopup="menu"
+              aria-expanded={moreOpen}
+              title="Diff layout, whitespace and tests"
+              className={`flex shrink-0 items-center rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                moreOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
-              style={testsOpen ? { background: "var(--brass-ghost)" } : undefined}
+              style={moreOpen ? { background: "var(--brass-ghost)" } : undefined}
             >
-              {testRunning ? <Loader2 size={13} className="animate-spin" /> : <FlaskConical size={13} />}
+              {testRunning ? <Loader2 size={13} className="animate-spin" /> : <MoreHorizontal size={13} />}
             </button>
+          </div>
+
+          {moreOpen && (
+            <div
+              ref={moreMenuRef}
+              role="menu"
+              aria-label="More view options"
+              onKeyDown={onMoreKeyDown}
+              className="octo-menu-enter absolute right-3 top-[calc(100%+6px)] z-30 w-56 rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
+            >
+              {viewMode === "diff" && (
+                <>
+                  <MoreItem
+                    role="menuitemradio"
+                    checked={readingMode === "inline"}
+                    Icon={AlignJustify}
+                    label="Inline diff"
+                    onSelect={() => { setReadingMode("inline"); closeMore(); }}
+                  />
+                  <MoreItem
+                    role="menuitemradio"
+                    checked={readingMode === "sbs"}
+                    Icon={Columns2}
+                    label="Side-by-side diff"
+                    onSelect={() => { setReadingMode("sbs"); closeMore(); }}
+                  />
+                  <div className="my-1 h-px bg-octo-hairline" aria-hidden />
+                  <MoreItem
+                    role="menuitemcheckbox"
+                    checked={ignoreWhitespace}
+                    label="Ignore whitespace"
+                    onSelect={() => { setIgnoreWhitespace(!ignoreWhitespace); closeMore(); }}
+                  />
+                  <div className="my-1 h-px bg-octo-hairline" aria-hidden />
+                </>
+              )}
+              <MoreItem
+                role="menuitem"
+                Icon={FlaskConical}
+                label={testCommand ? `Tests · ${testCommand}` : "Set a test command"}
+                onSelect={() => { setMoreOpen(false); setTestsOpen(true); }}
+              />
+            </div>
+          )}
+
             {testsOpen && (
-              <div className="octo-menu-enter absolute right-0 top-[calc(100%+6px)] z-30 w-64 rounded-md border border-octo-hairline bg-octo-panel p-2 shadow-2xl">
+              <div
+                ref={testsPopoverRef}
+                className="octo-menu-enter absolute right-3 top-[calc(100%+6px)] z-30 w-64 rounded-md border border-octo-hairline bg-octo-panel p-2 shadow-2xl"
+              >
                 <div className="mb-1.5 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
                   Test command
                 </div>
@@ -447,7 +583,6 @@ export function ReviewCanvas({
                 </div>
               </div>
             )}
-          </div>
 
           {/* AI review + Accept all — diff view, with changes to act on */}
           {viewMode === "diff" && fileCount > 0 && (
@@ -594,6 +729,40 @@ export function ReviewCanvas({
         </div>
       )}
     </div>
+  );
+}
+
+// ─── More menu item ────────────────────────────────────────────────
+
+function MoreItem({
+  role,
+  checked,
+  Icon,
+  label,
+  onSelect,
+}: {
+  role: "menuitem" | "menuitemradio" | "menuitemcheckbox";
+  checked?: boolean;
+  Icon?: LucideIcon;
+  label: string;
+  onSelect: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      role={role}
+      aria-checked={role === "menuitem" ? undefined : !!checked}
+      onClick={onSelect}
+      title={label}
+      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[12px] transition-colors hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass ${
+        checked ? "text-octo-brass" : "text-octo-sage hover:text-octo-ivory"
+      }`}
+    >
+      <span className="flex w-3.5 shrink-0 justify-center">
+        {Icon ? <Icon size={13} /> : checked ? <Check size={13} /> : null}
+      </span>
+      <span className="min-w-0 truncate">{label}</span>
+    </button>
   );
 }
 

@@ -15,9 +15,15 @@ describe("HunkRail", () => {
     expect(queryByRole("button", { name: /accept/i })).toBeNull();
     expect(container.textContent?.toLowerCase()).toContain("staged");
   });
-  it("keeps the line range on one line, never squeezed", () => {
-    const { getByText } = render(<HunkRail {...base} onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
-    expect(getByText("lines 1–4")).toHaveClass("flex-none", "whitespace-nowrap");
+  it("keeps the line range on one line; on a narrow rail it ellipsizes, not the actions", () => {
+    // Visual audit #358: a narrow canvas cut the actions to "Reje". The range
+    // is the elastic atom (full text in its title); the actions never shrink.
+    const { getByText, getByRole } = render(<HunkRail {...base} onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
+    const range = getByText("lines 1–4");
+    expect(range).toHaveClass("whitespace-nowrap", "min-w-0", "truncate");
+    expect(range).toHaveAttribute("title", "lines 1–4");
+    const actions = getByRole("button", { name: /reject hunk/i }).parentElement!;
+    expect(actions).toHaveClass("shrink-0", "whitespace-nowrap");
   });
   it("focused adds the bright rule data attr", () => {
     const { container } = render(<HunkRail {...base} focused onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);

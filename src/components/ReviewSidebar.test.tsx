@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, act, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
@@ -160,6 +160,88 @@ describe("ReviewSidebar", () => {
 
     await screen.findByTestId("files-tree");
     await waitFor(() => expect(treeLocateSpy).toHaveBeenCalledWith("/repo/src/lib/modeMeta.ts"));
+  });
+
+  // Visual audit #358: at 1280×800 the Review area is ~720px, and a 280px tree
+  // beside the diff left neither toolbar room for its controls.
+  describe("narrow Review area", () => {
+    let areaWidth = 0;
+    let observers: Array<() => void> = [];
+    const OriginalRO = globalThis.ResizeObserver;
+
+    beforeEach(() => {
+      observers = [];
+      globalThis.ResizeObserver = class {
+        cb: () => void;
+        constructor(cb: () => void) { this.cb = cb; }
+        observe() { observers.push(this.cb); }
+        unobserve() {}
+        disconnect() {}
+      } as unknown as typeof ResizeObserver;
+    });
+    afterEach(() => {
+      globalThis.ResizeObserver = OriginalRO;
+    });
+
+    function renderInArea(width: number, props: Partial<React.ComponentProps<typeof ReviewSidebar>> = {}) {
+      areaWidth = width;
+      const area = document.createElement("div");
+      Object.defineProperty(area, "clientWidth", { get: () => areaWidth });
+      document.body.appendChild(area);
+      return render(<ReviewSidebar changedCount={2} {...baseProps} {...props} />, { container: area });
+    }
+    const resizeArea = (width: number) =>
+      act(() => {
+        areaWidth = width;
+        observers.forEach((cb) => cb());
+      });
+
+    it("starts collapsed below 760px even when the stored preference is expanded", () => {
+      localStorage.setItem("reviewSidebarCollapsed", "0");
+      renderInArea(720);
+      expect(screen.getByTestId("review-sidebar-strip")).toBeInTheDocument();
+      expect(screen.queryByTestId("changes-panel")).not.toBeInTheDocument();
+    });
+
+    it("stays expanded at 760px and wider", () => {
+      renderInArea(760);
+      expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+    });
+
+    it("an unmeasured (hidden) area keeps the stored preference", () => {
+      renderInArea(0);
+      expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+    });
+
+    it("collapses when the area narrows and restores the preference when it widens", () => {
+      renderInArea(1000);
+      expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+      resizeArea(700);
+      expect(screen.getByTestId("review-sidebar-strip")).toBeInTheDocument();
+      resizeArea(1000);
+      expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+    });
+
+    it("expanding while narrow is transient: it never overwrites the stored preference", async () => {
+      localStorage.setItem("reviewSidebarCollapsed", "1");
+      renderInArea(700);
+      await userEvent.click(screen.getByRole("button", { name: /expand changes & files/i }));
+      expect(screen.getByTestId("changes-panel")).toBeInTheDocument();
+      expect(localStorage.getItem("reviewSidebarCollapsed")).toBe("1");
+
+      await userEvent.click(screen.getByRole("button", { name: /collapse changes & files/i }));
+      expect(screen.getByTestId("review-sidebar-strip")).toBeInTheDocument();
+      expect(localStorage.getItem("reviewSidebarCollapsed")).toBe("1");
+    });
+
+    it("the focus-commit shortcut still reveals Changes on a narrow area", async () => {
+      let focusCommit: (() => void) | undefined;
+      renderInArea(700, { registerFocusCommit: (fn) => { focusCommit = fn; } });
+      expect(screen.getByTestId("review-sidebar-strip")).toBeInTheDocument();
+      act(() => focusCommit?.());
+      expect(await screen.findByTestId("changes-panel")).toBeInTheDocument();
+      expect(changesFocusSpy).toHaveBeenCalled();
+    });
   });
 
   describe("resize", () => {
