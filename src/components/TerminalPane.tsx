@@ -290,7 +290,8 @@ export function TerminalPane({
 
     // The setup runner's exit report (src/lib/setupRun.ts). Honoured from
     // replayed history too: after a restart that is what restores the setup
-    // terminal's state (the store decides whether to announce it).
+    // terminal's state. The store ignores it outside setup terminals and
+    // decides whether to announce it.
     const setupOsc = term.parser.registerOscHandler(SETUP_EXIT_OSC, (data) => {
       const code = parseSetupExit(data);
       if (code !== null) {

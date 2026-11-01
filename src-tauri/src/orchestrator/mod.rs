@@ -2424,6 +2424,11 @@ impl Orchestrator {
         &self.db
     }
 
+    /// The event sink — for the routine scheduler's fire-phase events.
+    pub(crate) fn events(&self) -> &Arc<dyn EventSink> {
+        &self.events
+    }
+
     /// Remember that the next park of this (detached) run was the director's
     /// own pause request — the bridge reads this to emit the checkpoint with
     /// reason "director" (never ping the user for their own hand).

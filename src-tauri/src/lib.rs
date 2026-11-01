@@ -600,6 +600,9 @@ pub fn run() {
         // The app is really going away: stamp `last_quit_at` so the next launch
         // can show the runs that settled while it was closed.
         tauri::RunEvent::Exit => {
+            // A Routine's setup script or condition still running would
+            // otherwise outlive the app (with its whole process group).
+            routines::kill_live_groups();
             if let Err(e) = app.state::<AppState>().db.lock().mark_quit(chrono::Utc::now()) {
                 tracing::warn!(error = %e, "failed to record last_quit_at");
             }

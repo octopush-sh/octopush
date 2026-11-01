@@ -13,6 +13,7 @@ import { BRANCH_NAME_MAX, branchFromTask, shortenSlug, uniqueBranch, worktreeSlu
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
+import { pushToast } from "./Toasts";
 
 interface Props {
   projectId: string;
@@ -250,8 +251,28 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     useMissionsStore.getState().load(projectId).catch(() => {});
     // Remember the script (possibly empty) as this project's template — here
     // for the prefill, and in the backend for a Routine's fresh worktrees.
+    // Step 3 says so; a change is confirmed, and a failed write is reported.
+    const previousTemplate = useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "";
     useCompanionPrefs.getState().setSetupScriptForProject(projectId, setupScript);
-    ipc.setProjectSetupScript(projectId, setupScript).catch(() => {});
+    ipc
+      .setProjectSetupScript(projectId, setupScript)
+      .then(() => {
+        if (setupScript.trim() === previousTemplate.trim()) return;
+        pushToast({
+          level: "info",
+          title: setupScript.trim() ? "Setup script saved for this project" : "Setup script cleared for this project",
+          body: setupScript.trim()
+            ? "New missions start from it, and a Routine's fresh workspace runs it before its crew."
+            : "New missions start with no setup script, and a Routine's fresh workspace runs none.",
+        });
+      })
+      .catch((e) =>
+        pushToast({
+          level: "error",
+          title: "Couldn't save the project's setup script",
+          body: `The mission was created, but a Routine's fresh workspace keeps the previous script: ${String(e).split("\n")[0]}`,
+        }),
+      );
     if (linkIssueKeyOnCreate) {
       try {
         await ipc.updateWorkspaceLink(newWs.id, linkIssueKeyOnCreate);
@@ -556,6 +577,12 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                 ) : (
                   <>Runs in a setup terminal inside the new worktree at <span className="text-octo-sage">{worktreeDisplayPath(projectPath, branch)}</span>.</>
                 )}
+              </div>
+              <div
+                data-tour="mission-setup-template"
+                className="mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-mute"
+              >
+                Saved as this project&apos;s setup script: new missions start from it, and a Routine&apos;s fresh workspace runs it before its crew.
               </div>
             </div>
 
