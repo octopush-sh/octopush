@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useClaudePlanStore } from "../stores/claudePlanStore";
-import { lineAge, planLine, planTone, planWarning, toneClass } from "../lib/claudePlan";
+import { currentWindows, lineAge, planLine, planTone, planWarning, toneClass } from "../lib/claudePlan";
 
 /** Re-render on a slow clock so the snapshot's age and "reset since" stay true. */
 export function useNow(intervalMs: number): number {
@@ -17,17 +17,18 @@ export function useNow(intervalMs: number): number {
  * `Claude plan · 5h 62% · resets 19:40 · week 31%` and its age. Sage, amber
  * at ≥ 80%, rouge when a window is used up, with one calm sentence when it
  * matters. Renders nothing until a Claude-plan stage has reported, so an
- * API-key user never sees it. `reloadKey` re-reads the snapshot when it
+ * API-key user never sees it, nor a week-old snapshot (`currentWindows`). `reloadKey` re-reads the snapshot when it
  * changes (a detached run's worker writes it without an app event).
  */
 export function ClaudePlanLine({ reloadKey }: { reloadKey?: unknown }) {
-  const windows = useClaudePlanStore((s) => s.windows);
+  const stored = useClaudePlanStore((s) => s.windows);
   const load = useClaudePlanStore((s) => s.load);
   const now = useNow(30_000);
   useEffect(() => {
     void load();
   }, [load, reloadKey]);
 
+  const windows = currentWindows(stored, now);
   if (windows.length === 0) return null;
   const tone = planTone(windows, now);
   const warning = planWarning(windows, now);

@@ -138,6 +138,43 @@ describe("ClaudePlanCard", () => {
     expect(screen.getByTestId("claude-plan-warning").className).toContain("text-octo-rouge");
   });
 
+  it("hides a snapshot that is a week stale, as after a move to an API key", async () => {
+    const old = new Date(Date.now() - 9 * 86_400_000).toISOString();
+    const gone = Math.floor(Date.now() / 1000) - 8 * 86400;
+    getClaudePlan.mockResolvedValue([win({ seenAt: old, resetsAt: gone }), win({ kind: "seven_day", seenAt: old, resetsAt: gone })]);
+    const card = await act(async () => render(<ClaudePlanCard />));
+    const line = await act(async () => render(<ClaudePlanLine />));
+    expect(getClaudePlan).toHaveBeenCalled();
+    expect(card.container).toBeEmptyDOMElement();
+    expect(line.container).toBeEmptyDOMElement();
+  });
+
+  it("loads once on mount and refreshes only on plan://updated", async () => {
+    vi.useFakeTimers();
+    try {
+      getClaudePlan.mockResolvedValue([win({})]);
+      await act(async () => render(<ClaudePlanCard />));
+      const calls = getClaudePlan.mock.calls.length;
+      await act(async () => vi.advanceTimersByTime(5 * 60_000));
+      expect(getClaudePlan.mock.calls.length).toBe(calls);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("names rows in the body face and draws the bar with tokens", async () => {
+    getClaudePlan.mockResolvedValue([win({}), win({ kind: "overage", utilization: null, status: "rejected" })]);
+    render(<ClaudePlanCard />);
+    const list = await screen.findByTestId("usage-claude-plan");
+    const name = list.querySelector("li span")!;
+    expect(name.className).not.toContain("font-serif");
+    const track = list.querySelector("li > div + div")!;
+    expect(track.className).toContain("bg-octo-hairline");
+    expect(track.getAttribute("style")).toBeNull();
+    expect(track.firstElementChild!.className).toContain("ease-[var(--ease-octo)]");
+    expect(list.querySelectorAll("li")[1].textContent).toMatch(/^Extra usageunavailable/);
+  });
+
   it("colours its near-limit warning with the warning token", async () => {
     getClaudePlan.mockResolvedValue([win({ utilization: 0.9 })]);
     render(<ClaudePlanCard />);

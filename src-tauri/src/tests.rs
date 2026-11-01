@@ -6261,6 +6261,47 @@ mod orchestrator_tests {
         assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
     }
 
+    /// A failed setup only discards a worktree the fire just created — never an
+    /// adopted, reused or restored checkout.
+    #[test]
+    fn routine_setup_failure_discards_only_a_created_worktree() {
+        use crate::routines::discards_on_setup_failure;
+        use crate::workspace::CreateOutcome;
+        assert!(discards_on_setup_failure(CreateOutcome::Created));
+        assert!(!discards_on_setup_failure(CreateOutcome::Adopted));
+        assert!(!discards_on_setup_failure(CreateOutcome::Existed));
+        assert!(!discards_on_setup_failure(CreateOutcome::Restored));
+    }
+
+    /// The run-now toast picks its wording by the skip token, not the label.
+    #[test]
+    fn routine_skip_view_carries_a_machine_token() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let view = FireOutcome::Skipped(SkipReason::SetupFailed("exit 1".into())).view();
+        assert_eq!(view.skip, Some("setup_failed"));
+        assert_eq!(view.reason.as_deref(), Some("setup failed: exit 1"));
+        assert_eq!(FireOutcome::Dispatched.view().skip, None);
+        let json = serde_json::to_value(FireOutcome::Skipped(SkipReason::Busy).view()).unwrap();
+        assert_eq!(json["skip"], "busy");
+    }
+
+    /// Dropping a setup script mid-run (a cancelled fire) kills its whole
+    /// process group, not just `bash`: the backgrounded child never creates
+    /// its marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_setup_dropped_mid_run_kills_the_process_group() {
+        use crate::routines::run_setup_with_path;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived.marker");
+        let script = format!("(sleep 0.5 && touch '{}') & sleep 30", marker.display());
+        let fire = run_setup_with_path(&script, dir.path(), Duration::from_secs(60), "/usr/bin:/bin");
+        assert!(tokio::time::timeout(Duration::from_millis(150), fire).await.is_err(), "still running");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "the backgrounded child must die with the group");
+    }
+
     /// The project's setup-script template round-trips through the DB (the
     /// wizard writes it; a fresh routine reads it).
     #[test]
@@ -6371,15 +6412,21 @@ mod orchestrator_tests {
         let past = "2000-01-01T00:00:00+00:00";
         db.lock().insert_routine("r-cond", &input, Some(past), true).unwrap();
 
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
-            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            sink.clone(),
             Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
         ));
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0);
 
         let outcome = orch.run_routine_now("r-cond").await.unwrap();
         assert_eq!(outcome, FireOutcome::Skipped(SkipReason::ConditionNotMet));
+        // "Run now" saw the condition phase start.
+        assert!(
+            sink.events.lock().iter().any(|e| e == crate::routines::ROUTINE_PHASE_EVENT),
+            "the fire reports its phase",
+        );
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "a skipped condition creates no run");
 
         let r = db.lock().get_routine("r-cond").unwrap().unwrap();
@@ -8131,6 +8178,96 @@ mod cli_runner_tests {
         assert!(outcome.error.as_deref().unwrap_or_default().contains("error_max_turns"));
         assert_eq!(outcome.cost_usd, 1.25);
         assert_eq!(outcome.input_tokens, 10);
+    }
+
+    /// Spawn `sh <script> <arg>` the way the CLI stage spawns `claude`: in
+    /// its own process group.
+    #[cfg(unix)]
+    fn spawn_fake_cli(script: &std::path::Path, arg: &std::path::Path) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .arg(script)
+            .arg(arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Wait until the fake CLI has written `path` (it's ready to be stopped).
+    #[cfg(unix)]
+    async fn wait_for_file(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if s.ends_with('\n') {
+                    return s;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "fake CLI never wrote {}", path.display());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A stop ends the CLI AND what it started: a backgrounded `sleep 300`
+    /// (standing in for a dev server) is gone too. With the old
+    /// `child.kill()` only the script died and the sleep kept running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cli_child_kills_the_whole_process_group() {
+        use crate::orchestrator::cli_runner::stop_cli_child;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-cli.sh");
+        let pidfile = dir.path().join("grandchild.pid");
+        std::fs::write(&script, "sleep 300 &\necho $! > \"$1\"\nwait\n").unwrap();
+        let mut child = spawn_fake_cli(&script, &pidfile);
+        let grandchild: libc::pid_t = wait_for_file(&pidfile).await.trim().parse().unwrap();
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        let status = stop_cli_child(&mut child, grace).await;
+        assert!(status.is_some(), "the CLI was reaped");
+        assert!(started.elapsed() < grace * 2 + Duration::from_secs(3), "bounded by the grace periods");
+
+        // The orphaned sleep is reaped by init right after the group kill;
+        // poll briefly so a not-yet-reaped zombie doesn't flake the test.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // SAFETY: kill(pid, 0) performs no action — existence probe only.
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the grandchild must die with the group");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A CLI that handles SIGINT and exits cleanly is not escalated: it exits
+    /// 0 from its own trap, well inside the first grace period.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cli_child_lets_a_clean_sigint_exit_stand() {
+        use crate::orchestrator::cli_runner::stop_cli_child;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-cli.sh");
+        let marker = dir.path().join("state");
+        std::fs::write(
+            &script,
+            "trap 'echo interrupted > \"$1\"; exit 0' INT\n\
+             echo ready > \"$1\"\n\
+             while :; do sleep 0.1; done\n",
+        )
+        .unwrap();
+        let mut child = spawn_fake_cli(&script, &marker);
+        assert_eq!(wait_for_file(&marker).await, "ready\n");
+
+        let grace = Duration::from_secs(3);
+        let started = Instant::now();
+        let status = stop_cli_child(&mut child, grace).await.expect("reaped");
+        assert!(status.success(), "exited 0 from its trap, not killed: {status:?}");
+        assert!(started.elapsed() < grace, "no escalation past SIGINT");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "interrupted\n");
     }
 }
 
@@ -13442,7 +13579,7 @@ mod open_pull_request_tests {
     #[test]
     fn pr_create_command_passes_every_value_through_the_environment() {
         let title = "Fix it's \"quoting\" $(rm -rf ~) a\\'; open -a Calculator #";
-        let (cmd, env) = pr_create_command("main", "feat/x", title, "/tmp/b.md", false);
+        let (cmd, env) = pr_create_command(None, "main", "feat/x", title, "/tmp/b.md", false);
         // The command is constant: nothing from the user is spliced into it.
         assert_eq!(
             cmd,
@@ -13461,7 +13598,7 @@ mod open_pull_request_tests {
         // `printf` stands in for gh: the shell must hand the title over as one
         // unchanged argument, metacharacters and all.
         let title = "a\\'; echo PWNED # $(id) `id`";
-        let (_, env) = pr_create_command("main", "feat/x", title, "/t", false);
+        let (_, env) = pr_create_command(None, "main", "feat/x", title, "/t", false);
         let out = Command::new("/bin/sh")
             .arg("-c")
             .arg("printf '%s' \"$OCTOPUSH_PR_TITLE\"")
@@ -13472,11 +13609,15 @@ mod open_pull_request_tests {
     }
 
     #[test]
-    fn pr_create_command_drafts_strips_origin_and_flattens_the_title() {
-        let (cmd, env) = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
+    fn pr_create_command_drafts_targets_a_repo_and_flattens_the_title() {
+        let (cmd, env) =
+            pr_create_command(Some("acme/app"), "release/1.0", "me:b", "Two\nlines", "/t", true);
         let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
         assert_eq!(get("OCTOPUSH_PR_BASE"), "release/1.0");
+        assert_eq!(get("OCTOPUSH_PR_HEAD"), "me:b");
+        assert_eq!(get("OCTOPUSH_PR_REPO"), "acme/app");
         assert_eq!(get("OCTOPUSH_PR_TITLE"), "Two lines");
+        assert!(cmd.contains(" --repo \"$OCTOPUSH_PR_REPO\""), "{cmd}");
         assert!(cmd.ends_with(" --draft"), "{cmd}");
     }
 
@@ -13485,9 +13626,101 @@ mod open_pull_request_tests {
         use crate::github::pr_head_is_valid;
         assert!(pr_head_is_valid("main", "feat/x"));
         assert!(!pr_head_is_valid("main", "main"));
-        assert!(!pr_head_is_valid("origin/main", "main"));
         assert!(!pr_head_is_valid("main", ""));
         assert!(!pr_head_is_valid("main", "HEAD"));
+    }
+
+    #[test]
+    fn pr_head_label_names_the_fork_owner_only_on_a_fork() {
+        use crate::github::pr_head_label;
+        assert_eq!(pr_head_label("feat/x", Some("me"), Some("acme")), "me:feat/x");
+        assert_eq!(pr_head_label("feat/x", Some("Acme"), Some("acme")), "feat/x");
+        assert_eq!(pr_head_label("feat/x", Some("me"), None), "me:feat/x");
+        assert_eq!(pr_head_label("feat/x", None, Some("acme")), "feat/x");
+    }
+
+    #[test]
+    fn gh_repo_arg_drops_the_host_only_for_github_com() {
+        use crate::github::gh_repo_arg;
+        assert_eq!(gh_repo_arg("github.com", "acme", "app"), "acme/app");
+        assert_eq!(gh_repo_arg("ssh.github.com:443", "acme", "app"), "acme/app");
+        assert_eq!(gh_repo_arg("ghe.corp.dev", "acme", "app"), "ghe.corp.dev/acme/app");
+    }
+
+    /// A repo with `origin` (the fork) and `upstream`, `feature` checked out
+    /// with one commit on top of `main`.
+    fn fork_repo(d: &std::path::Path) {
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["remote", "add", "origin", "git@github.com:me/app.git"]);
+        git(d, &["remote", "add", "upstream", "https://github.com/acme/app.git"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        std::fs::write(d.join("b.txt"), "two\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "Add b"]);
+    }
+
+    #[test]
+    fn pr_target_strips_any_remote_and_follows_gh_set_default() {
+        use crate::git_ops::{open_repo, pr_target, PrTarget};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        fork_repo(d);
+        git(d, &["branch", "release/1.0"]);
+        let repo = open_repo(d).unwrap();
+        let t = |base: &str| pr_target(&repo, base, "feature");
+        let on = |b: &str, r: &str| PrTarget {
+            base_branch: b.into(),
+            base_remote: Some(r.into()),
+            head_remote: Some("origin".into()),
+        };
+        assert_eq!(t("upstream/main"), on("main", "upstream"));
+        assert_eq!(t("origin/main"), on("main", "origin"));
+        // A bare name, or a local branch with a slash, stays whole on origin.
+        assert_eq!(t("main"), on("main", "origin"));
+        assert_eq!(t("release/1.0"), on("release/1.0", "origin"));
+        // `gh repo set-default` moves a bare base to its remote.
+        git(d, &["config", "remote.upstream.gh-resolved", "base"]);
+        let repo = open_repo(d).unwrap();
+        assert_eq!(pr_target(&repo, "main", "feature"), on("main", "upstream"));
+        // The head goes where the branch is pushed.
+        git(d, &["config", "branch.feature.remote", "upstream"]);
+        let repo = open_repo(d).unwrap();
+        assert_eq!(pr_target(&repo, "main", "feature").head_remote.as_deref(), Some("upstream"));
+        let url = crate::git_ops::remote_slug(&repo, "origin").unwrap();
+        assert_eq!((url.owner.as_str(), url.repo.as_str()), ("me", "app"));
+    }
+
+    #[test]
+    fn branch_pr_context_diffs_against_the_base_remote() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        fork_repo(d);
+        // upstream/main moves on; origin/main (the fork) doesn't.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "x\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream moves"]);
+        git(d, &["update-ref", "refs/remotes/upstream/main", "HEAD"]);
+        git(d, &["reset", "-q", "--hard", "HEAD~1"]);
+        git(d, &["checkout", "-q", "feature"]);
+        git(d, &["merge", "-q", "--no-edit", "upstream/main"]);
+
+        // Against the fork's main the upstream change is part of the branch…
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(diff.contains("up.txt"), "{diff}");
+        // …against upstream (picked, or gh's default) it isn't.
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "upstream/main").unwrap();
+        assert!(diff.contains("b.txt") && !diff.contains("up.txt"), "{diff}");
+        git(d, &["config", "remote.upstream.gh-resolved", "base"]);
+        let (diff, _) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(!diff.contains("up.txt"), "{diff}");
     }
 
     #[test]

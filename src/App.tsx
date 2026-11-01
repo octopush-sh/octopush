@@ -83,6 +83,7 @@ import type { ModelWithProvider } from "./lib/types";
 import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
+import { useGlobalShortcuts, type ShortcutContext } from "./hooks/useGlobalShortcuts";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -408,6 +409,9 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // Live for the shortcut table, which doesn't re-register on every status poll.
+  const gitStatusRef = useRef<GitStatus | null>(null);
+  gitStatusRef.current = gitStatus;
   // Per-workspace cache of the most recently fetched PR (or null when there
   // isn't one). Keyed by workspace id so switching back to a workspace
   // doesn't flicker until the next refresh; lives in prStore so a PR opened
@@ -925,192 +929,52 @@ function App() {
     [activeWorkspaceId],
   );
 
-  // ── Keyboard shortcuts (spec §3.6) ──
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      // Something closer to the event already handled this key. CodeMirror calls
-      // preventDefault on a key its keymap consumed but never stopPropagation,
-      // so without this an editor binding and an app-level shortcut both fire:
-      // ⌘⇧L in a code editor multiplied the selection AND opened the Logbook.
-      if (e.defaultPrevented) return;
-
-      const mod = e.metaKey || e.ctrlKey;
-
-      // ⌘1..⌘9 → switch workspace N. `!e.altKey` so ⌘⌥N (jump to the Nth
-      // terminal session, below) is never eaten here on a layout where Option
-      // leaves `e.key` as the digit.
-      if (mod && !e.altKey && !e.shiftKey && /^[1-9]$/.test(e.key)) {
-        const idx = parseInt(e.key, 10) - 1;
-        const ws = workspaces[idx];
-        if (ws) {
-          e.preventDefault();
-          selectWorkspace(ws.id);
-        }
-        return;
-      }
-
-      // ⌘⇧1/2/3 → switch mode
-      if (mod && e.shiftKey && ["1", "2", "3", "!", "@", "#"].includes(e.key)) {
-        const key = e.key === "!" ? "1" : e.key === "@" ? "2" : e.key === "#" ? "3" : e.key;
-        const mode: WorkspaceMode | null =
-          key === "1" ? "talk" : key === "2" ? "run" : key === "3" ? "review" : null;
-        if (mode) {
-          e.preventDefault();
-          setMode(mode);
-        }
-        return;
-      }
-
-      // ⌘⇧D → switch to Direct mode
-      if (mod && e.shiftKey && (e.key === "D" || e.key === "d")) {
-        e.preventDefault();
-        setMode("direct");
-        return;
-      }
-
-      // ⌘⇧M → Mission Control (the fleet cockpit)
-      if (mod && e.shiftKey && (e.key === "M" || e.key === "m")) {
-        e.preventDefault();
-        setMissionControlOpen((v) => !v);
-        return;
-      }
-
-      // ⌘⇧L → Logbook Room (cross-mission rollup)
-      if (mod && e.shiftKey && (e.key === "L" || e.key === "l")) {
-        e.preventDefault();
-        setLogbookOpen((v) => !v);
-        return;
-      }
-
-      // ⌘⇧E → point the Review file tree at the file open in the editor.
-      // Review-only: outside it there is no tree listening. Both the mode and
-      // the open path are read LIVE — this listener is registered with a dep
-      // array that carries neither, so anything closed over here would be the
-      // value from whenever it last re-registered.
-      if (mod && e.shiftKey && (e.key === "E" || e.key === "e")) {
-        e.preventDefault();
-        if (focusGlobal.mode === "review" && activeWorkspaceId) {
-          const openPath = useEditorStore.getState().getActivePath(activeWorkspaceId);
-          if (openPath) locateInTreeFn.current?.(openPath);
-        }
-        return;
-      }
-
-      // ⌘N → new workspace
-      if (mod && !e.shiftKey && e.key === "n") {
-        e.preventDefault();
-        if (project) setShowCreator(true);
-        return;
-      }
-
-      // ⌘K → command palette. `!e.altKey` keeps ⌘⌥K (session switcher) out.
-      if (mod && !e.altKey && !e.shiftKey && e.key === "k") {
-        e.preventDefault();
-        setShowPalette((v) => !v);
-        return;
-      }
-
-      // ⌘⇧P → "Open a pull request" composer for the active workspace.
-      if (mod && e.shiftKey && !e.altKey && (e.key === "P" || e.key === "p")) {
-        e.preventDefault();
+  // ── Keyboard shortcuts (spec §3.6; the table is in hooks/useGlobalShortcuts) ──
+  // The getters read live state at key time: the mode, the open path and the
+  // terminal list are not in the deps, so a closed-over value would be stale.
+  const shortcutCtx = useMemo<ShortcutContext>(
+    () => ({
+      mode: () => focusGlobal.mode,
+      workspaceIds: workspaces.map((w) => w.id),
+      activeWorkspaceId,
+      hasProject: !!project,
+      selectWorkspace,
+      setMode,
+      toggleMissionControl: () => setMissionControlOpen((v) => !v),
+      toggleLogbook: () => setLogbookOpen((v) => !v),
+      activeEditorPath: () =>
+        activeWorkspaceId ? useEditorStore.getState().getActivePath(activeWorkspaceId) : null,
+      revealInTree: (path) => locateInTreeFn.current?.(path),
+      openCreator: () => setShowCreator(true),
+      togglePalette: () => setShowPalette((v) => !v),
+      openPrComposer: () => {
         if (activeWorkspaceId) usePrStore.getState().openComposer(activeWorkspaceId);
-        return;
-      }
-
-      // ⌘P → file finder (workspace-wide fuzzy file search)
-      if (mod && !e.shiftKey && e.key === "p") {
-        e.preventDefault();
-        setSearchMode("files");
+      },
+      activeBranch: () => gitStatusRef.current?.branch ?? null,
+      openSearch: (mode) => {
+        setSearchMode(mode);
         setShowSearch(true);
-        return;
-      }
-
-      // ⌘⇧F → workspace-wide text search
-      if (mod && e.shiftKey && (e.key === "f" || e.key === "F")) {
-        e.preventDefault();
-        setSearchMode("text");
-        setShowSearch(true);
-        return;
-      }
-
-      // ⌘\ → toggle companion (no-op for now; pending true companion visibility state)
-      if (mod && e.key === "\\") {
-        e.preventDefault();
-        bumpLayout();
-        return;
-      }
-
-      // ⌘, → Settings (General tab)
-      if (mod && e.key === ",") {
-        e.preventDefault();
-        setSettingsTab("general");
-        return;
-      }
-
-      // ⌘⇧T → Settings · Usage
-      if (mod && e.shiftKey && (e.key === "T" || e.key === "t")) {
-        e.preventDefault();
-        setSettingsTab("usage");
-        return;
-      }
-
-      // ⌘⌥K → the session switcher. Run mode only, as the palette lists
-      // terminals and nothing else — in Talk it would silently switch a
-      // surface the user isn't looking at.
-      // `e.code` as well as `e.key`: on some layouts Option remaps the printed
-      // character, and the shortcut should follow the physical key.
-      if (mod && e.altKey && !e.shiftKey && (e.key === "k" || e.key === "K" || e.code === "KeyK")) {
-        if (!activeWorkspaceId || focusGlobal.mode !== "run") return;
-        e.preventDefault();
-        // Toggle, like ⌘K does — pressing it again closes rather than
-        // stacking a second dialog under the same fingers. When some OTHER
-        // dialog owns the screen (Settings, the command palette) the switcher
-        // stays shut rather than opening underneath it: `isModalOpen()` is
-        // true for our own shell too, hence the open/closed split.
-        setSessionSwitcherOpen((v) => (v ? false : !isModalOpen()));
-        return;
-      }
-
-      // ⌘⌥← / ⌘⌥→ → previous / next session, wrapping. The keyboard path that
-      // doesn't need you to know which number a session holds. Run mode only,
-      // for the same reason.
-      if (mod && e.altKey && !e.shiftKey && (e.key === "ArrowLeft" || e.key === "ArrowRight")) {
-        if (!activeWorkspaceId || focusGlobal.mode !== "run") return;
-        const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
-        if (list.length < 2) return;
-        e.preventDefault();
-        const current = useTerminalsStore.getState().getActiveId(activeWorkspaceId);
-        const at = list.findIndex((t) => t.id === current);
-        const step = e.key === "ArrowRight" ? 1 : -1;
-        const next = list[(at + step + list.length) % list.length];
-        if (next) setActiveTerminal(activeWorkspaceId, next.id);
-        return;
-      }
-
-      // ⌘⌥1..9 → jump to the Nth terminal session (must check altKey to avoid
-      // colliding with ⌘1..9 workspace shortcuts above). Run mode only, like
-      // its siblings above.
-      // `e.code` first: on macOS Option rewrites the printed character even
-      // with Cmd held (⌥1 → "¡"), so matching on `e.key` alone made this
-      // shortcut dead on the platform it ships to.
-      const digit = /^Digit([1-9])$/.exec(e.code ?? "")?.[1] ?? (/^[1-9]$/.test(e.key) ? e.key : null);
-      if (mod && e.altKey && !e.shiftKey && digit) {
-        if (focusGlobal.mode !== "run") return;
-        e.preventDefault();
-        if (activeWorkspaceId) {
-          const list = useTerminalsStore.getState().getTerminals(activeWorkspaceId);
-          const idx = parseInt(digit, 10) - 1;
-          const target = list[idx];
-          if (target) {
-            setActiveTerminal(activeWorkspaceId, target.id);
-          }
-        }
-        return;
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [workspaces, selectWorkspace, setMode, project, bumpLayout, activeWorkspaceId, setActiveTerminal]);
+      },
+      bumpLayout,
+      openSettings: (tab) => setSettingsTab(tab),
+      // Toggle, like ⌘K does. When some OTHER dialog owns the screen
+      // (Settings, the command palette) the switcher stays shut rather than
+      // opening underneath it: `isModalOpen()` is true for our own shell
+      // too, hence the open/closed split.
+      toggleSessionSwitcher: () => setSessionSwitcherOpen((v) => (v ? false : !isModalOpen())),
+      terminalIds: () =>
+        activeWorkspaceId
+          ? useTerminalsStore.getState().getTerminals(activeWorkspaceId).map((t) => t.id)
+          : [],
+      activeTerminalId: () =>
+        activeWorkspaceId ? useTerminalsStore.getState().getActiveId(activeWorkspaceId) : null,
+      setActiveTerminal: (id) => {
+        if (activeWorkspaceId) setActiveTerminal(activeWorkspaceId, id);
+      },
+    }),
+    [workspaces, selectWorkspace, setMode, project, bumpLayout, activeWorkspaceId, setActiveTerminal],
+  );
+  useGlobalShortcuts(shortcutCtx);
 
   // ── Computed values ──
   const activeWorkspace = workspaces.find((w) => w.id === activeWorkspaceId) ?? null;

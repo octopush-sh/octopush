@@ -88,7 +88,7 @@ describe("prDraft", () => {
   });
 });
 
-import { canOpenPrFrom, prBaseFor } from "./prDraft";
+import { bareBase, canOpenPrFrom, prBaseFor } from "./prDraft";
 
 describe("PR base and head", () => {
   it("only feature branches open a PR", () => {
@@ -107,5 +107,18 @@ describe("PR base and head", () => {
     expect(prBaseFor("feat/x", "origin/feat/x", { repoDefault: "main" })).toBe("main");
     expect(prBaseFor("main", null, { repoDefault: "main" })).toBeNull();
     expect(prBaseFor("feat/x", null, { repoDefault: null })).toBeNull();
+    // Any remote, not just origin.
+    expect(
+      prBaseFor("feat/x", "upstream/feat/x", { repoDefault: "main", remote: ["upstream/feat/x"] }),
+    ).toBe("main");
+  });
+
+  it("bareBase strips any listed remote but keeps a local branch whole", () => {
+    const list = { remote: ["origin/main", "upstream/main", "upstream/release/1.0"] };
+    expect(bareBase("upstream/main", list)).toBe("main");
+    expect(bareBase("upstream/release/1.0", list)).toBe("release/1.0");
+    expect(bareBase("origin/main", list)).toBe("main");
+    expect(bareBase("release/1.0", list)).toBe("release/1.0");
+    expect(bareBase("origin/dev")).toBe("dev");
   });
 });

@@ -1031,6 +1031,51 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     ReadEnd::Eof(result_line, tail)
 }
 
+/// How long each polite signal in `stop_cli_child` gets before it escalates.
+pub(crate) const STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stop a CLI stage's child and everything it started (it runs in its own
+/// process group, see the spawn). SIGINT first — Claude Code ends the turn
+/// cleanly; then SIGTERM — it terminates the process trees of its running Bash
+/// commands and runs SessionEnd hooks; each gets `grace` to exit. Last, the
+/// whole group gets SIGKILL: the escalation when the CLI ignored both, and a
+/// sweep of any dev server, watch build or test runner left behind when it
+/// did exit. Returns the child's exit status when it could be reaped.
+pub(crate) async fn stop_cli_child(
+    child: &mut tokio::process::Child,
+    grace: std::time::Duration,
+) -> Option<std::process::ExitStatus> {
+    #[cfg(unix)]
+    if let Some(pid) = child.id() {
+        let pid = pid as libc::pid_t;
+        let mut status = None;
+        for sig in [libc::SIGINT, libc::SIGTERM] {
+            // SAFETY: plain syscall on a pid that is still ours — `id()` is
+            // Some only while the child is unreaped, so it can't be reused.
+            unsafe {
+                libc::kill(pid, sig);
+            }
+            if let Ok(Ok(s)) = tokio::time::timeout(grace, child.wait()).await {
+                status = Some(s);
+                break;
+            }
+        }
+        // SAFETY: kill(-pid, SIGKILL) signals the group `process_group(0)`
+        // created for this child. Once the leader is reaped the id stays
+        // reserved while any member of its group lives; with none left the
+        // call is a harmless ESRCH.
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+        }
+        if status.is_none() {
+            status = child.wait().await.ok();
+        }
+        return status;
+    }
+    let _ = child.kill().await;
+    child.wait().await.ok()
+}
+
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
 pub struct CliRunner;
 
@@ -1163,6 +1208,11 @@ impl AgentRunner for CliRunner {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        // Own process group, so a stop reaches the dev servers, watch builds
+        // and test runners the stage started (`sandbox-exec` execs into the
+        // CLI, so the group covers the sandboxed case too).
+        #[cfg(unix)]
+        command.process_group(0);
         // Created before the spawn so the journal can name the substrate the
         // moment it launches — the model id silently selects the dialect (B6),
         // and a stage quietly running `codex` instead of `claude` is exactly
@@ -1284,9 +1334,9 @@ impl AgentRunner for CliRunner {
         let read_loop = read_stream(stdout, dialect, ReadLimits::STAGE, on_event);
 
         // Race the child's output against the director's stop signal: poll the
-        // cancel flag every ~500ms and, when set, kill the child and fail the
-        // stage with the director message (zero usage — the burned spend is
-        // unknowable mid-flight). An idle timeout fires when NO output arrives
+        // cancel flag every ~500ms and, when set, stop the child's process
+        // group (`stop_cli_child`) and fail the stage with the director message
+        // and the usage streamed so far. An idle timeout fires when NO output arrives
         // for IDLE_TIMEOUT_SECS; an absolute cap fires after ABS_CAP_SECS total.
         let cancel = std::sync::Arc::clone(&ctx.cancel);
         let cancel_watch = async move {
@@ -1300,7 +1350,7 @@ impl AgentRunner for CliRunner {
         let read_end = tokio::select! {
             end = read_loop => end,
             _ = cancel_watch => {
-                let _ = child.kill().await;
+                stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
                 let u = sum_usage(&streamed_usage.lock());
@@ -1330,6 +1380,7 @@ impl AgentRunner for CliRunner {
             CliDialect::Codex => false,
         };
         if let (Some(kind), false) = (timeout_kind, has_terminal) {
+            stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
             let u = sum_usage(&streamed_usage.lock());
             return Ok(failed_stage_with_usage(
@@ -1343,14 +1394,14 @@ impl AgentRunner for CliRunner {
         let salvaged = timeout_kind.is_some() || settled;
 
         // When we salvaged a result from a slow-EOF idle/cap or a settle, the
-        // child may still be lingering — kill it instead of blocking on
-        // wait(), and trust the result event's own is_error (same rationale
-        // as the existing wait-hiccup comment). Otherwise (clean EOF) wait
-        // normally.
+        // child may still be lingering — stop its whole process group (so the
+        // dev servers it started go too) instead of blocking on wait(), and
+        // trust the result event's own is_error (same rationale as the
+        // existing wait-hiccup comment). Otherwise (clean EOF) wait normally.
         let exit_success = if salvaged {
-            let _ = child.kill().await;
+            stop_cli_child(&mut child, STOP_GRACE).await;
             if settled {
-                emitter.notice("stage finished · stopped claude, which was still waiting on background work");
+                emitter.notice("stage finished · stopped background work it left running");
             }
             true
         } else {

@@ -6,7 +6,7 @@ import { CalendarClock, Loader2, Pencil, Play, Plus, Power, Trash2 } from "lucid
 import { PaneHeader, SectionLabel } from "./shared";
 import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
-import { useRoutinesStore } from "../../stores/routinesStore";
+import { describeRoutinePhase, useRoutinesStore } from "../../stores/routinesStore";
 import { useProjectStore } from "../../stores/projectStore";
 import { usePipelineStore } from "../../stores/pipelineStore";
 import { useEntitlementStore } from "../../stores/entitlementStore";
@@ -49,6 +49,7 @@ export function RoutinesPane() {
   const remove = useRoutinesStore((s) => s.remove);
   const runNow = useRoutinesStore((s) => s.runNow);
   const runningNow = useRoutinesStore((s) => s.runningNow);
+  const phaseById = useRoutinesStore((s) => s.phaseById);
   const [editing, setEditing] = useState<Routine | "new" | null>(null);
 
   const recent = useProjectStore((s) => s.recent);
@@ -151,8 +152,20 @@ export function RoutinesPane() {
                         {r.fireCondition && <span title="This routine fires only when its condition command exits 0.">· conditional</span>}
                         {r.enabled && entitled && <span>· next {untilLabel(r.nextDueAt)}</span>}
                       </div>
-                      {lastCheckLabel(r) && (
-                        <div className="mt-0.5 font-mono text-[10px] text-octo-mute">{lastCheckLabel(r)}</div>
+                      {runningNow.includes(r.id) && phaseById[r.id] ? (
+                        // An in-flight "Run now" says what it is waiting on (a
+                        // fresh routine's setup script can take minutes).
+                        <div
+                          key={phaseById[r.id]}
+                          data-tour="routines-run-now-phase"
+                          className="octo-fade-in mt-0.5 font-mono text-[10px] text-octo-sage"
+                        >
+                          {describeRoutinePhase(phaseById[r.id])}
+                        </div>
+                      ) : (
+                        lastCheckLabel(r) && (
+                          <div className="mt-0.5 font-mono text-[10px] text-octo-mute">{lastCheckLabel(r)}</div>
+                        )
                       )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
@@ -161,7 +174,13 @@ export function RoutinesPane() {
                       {entitled && (
                         <>
                           <IconButton
-                            title={runningNow.includes(r.id) ? "Running…" : "Run now"}
+                            title={
+                              runningNow.includes(r.id)
+                                ? phaseById[r.id]
+                                  ? `Running — ${describeRoutinePhase(phaseById[r.id])}`
+                                  : "Running…"
+                                : "Run now"
+                            }
                             onClick={() => void runNow(r.id)}
                             disabled={runningNow.includes(r.id)}
                           >

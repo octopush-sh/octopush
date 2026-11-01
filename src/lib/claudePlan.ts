@@ -30,12 +30,32 @@ export const NEAR_LIMIT = 0.8;
 /** calm (sage) · near (amber) · limited (rouge). */
 export type PlanTone = "calm" | "near" | "limited";
 
-const ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"];
+const ORDER = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage"];
+
+/** The plan's extra usage (`rateLimitType: "overage"`): not a usage window
+ *  of the plan itself, and "rejected" may only mean it is turned off. */
+export const OVERAGE = "overage";
+
+/** A snapshot older than the longest window (a week) whose reset has passed,
+ *  or that never said when it resets, no longer describes the plan: someone
+ *  who moved to an API key would otherwise see it forever. */
+export const STALE_MS = 7 * 86_400_000;
+
+/** The windows still worth showing: drops the stale ones (`STALE_MS`). A
+ *  window with an unreadable `seenAt` stays — its age reads "unknown". */
+export function currentWindows(ws: PlanSnapshot[], nowMs: number): PlanSnapshot[] {
+  return ws.filter((w) => {
+    const seen = Date.parse(w.seenAt);
+    if (Number.isNaN(seen) || nowMs - seen <= STALE_MS) return true;
+    return !(w.resetsAt == null || hasReset(w, nowMs));
+  });
+}
 
 /** Short label for the one-line meta: `5h`, `week`, `week opus`, … */
 export function windowLabel(kind: string): string {
   if (kind === "five_hour") return "5h";
   if (kind === "seven_day") return "week";
+  if (kind === OVERAGE) return "extra usage";
   if (kind.startsWith("seven_day_")) return `week ${kind.slice("seven_day_".length).replace(/_/g, " ")}`;
   return kind.replace(/_/g, " ");
 }
@@ -44,6 +64,7 @@ export function windowLabel(kind: string): string {
 export function windowName(kind: string): string {
   if (kind === "five_hour") return "5-hour window";
   if (kind === "seven_day") return "weekly window";
+  if (kind === OVERAGE) return "extra usage";
   if (kind.startsWith("seven_day_")) {
     const model = kind.slice("seven_day_".length).replace(/_/g, " ");
     return `weekly ${model.charAt(0).toUpperCase()}${model.slice(1)} window`;
@@ -134,12 +155,18 @@ export function oldestSeen(ws: PlanSnapshot[]): string | null {
   return best;
 }
 
+/** What a `rejected` window without a figure reads: `limit reached`, or
+ *  `unavailable` for extra usage (it may simply be turned off). */
+export function rejectedLabel(kind: string): string {
+  return kind === OVERAGE ? "unavailable" : "limit reached";
+}
+
 /** One window in the meta line: `5h 62% · resets 19:40`, `week 31%`, or
  *  `5h reset since` once its reset time has passed. */
 export function windowPhrase(w: PlanSnapshot, nowMs: number, withReset: boolean): string {
   const label = windowLabel(w.kind);
   if (hasReset(w, nowMs)) return `${label} reset since`;
-  const used = w.status === "rejected" && w.utilization == null ? "limit reached" : pctLabel(w.utilization);
+  const used = w.status === "rejected" && w.utilization == null ? rejectedLabel(w.kind) : pctLabel(w.utilization);
   const reset = withReset && w.resetsAt != null ? ` · resets ${resetLabel(w.resetsAt, nowMs)}` : "";
   return `${label} ${used}${reset}`;
 }
@@ -177,6 +204,7 @@ export function planWarning(ws: PlanSnapshot[], nowMs: number): string | null {
   const tone = windowTone(w, nowMs);
   if (tone === "calm") return null;
   const reset = w.resetsAt != null ? ` — it resets at ${resetLabel(w.resetsAt, nowMs)}` : "";
+  if (tone === "limited" && w.kind === OVERAGE) return `Extra usage on your Claude plan isn't available right now${reset}.`;
   if (tone === "limited") return `Your Claude plan's ${windowName(w.kind)} is used up${reset}.`;
   const at = w.utilization != null ? `at ${pctLabel(w.utilization)}` : "near its limit";
   return `Your Claude plan's ${windowName(w.kind)} is ${at}${reset}.`;
