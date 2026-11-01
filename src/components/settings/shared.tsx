@@ -79,25 +79,35 @@ export function ToggleRow({
           </div>
         )}
       </div>
-      <Switch checked={checked} onChange={onChange} testId={testId} disabled={disabled} />
+      <Switch
+        checked={checked}
+        onChange={onChange}
+        testId={testId}
+        disabled={disabled}
+        ariaLabel={label}
+        title={title}
+      />
     </label>
   );
 }
 
 /** The settings switch on its own — for a row that needs more than a label
- *  beside it (a control that reveals under the switch). Inside a `<label>`
- *  the label text toggles it; elsewhere pass `ariaLabel`. */
+ *  beside it (a control that reveals under the switch). The switch has no
+ *  text of its own, so `ariaLabel` (the setting's title) is required: it names
+ *  the switch and is its tooltip unless `title` says something more specific. */
 export function Switch({
   checked,
   onChange,
   testId,
   ariaLabel,
+  title,
   disabled = false,
 }: {
   checked: boolean;
   onChange: (v: boolean) => void;
   testId?: string;
-  ariaLabel?: string;
+  ariaLabel: string;
+  title?: string;
   disabled?: boolean;
 }) {
   return (
@@ -106,6 +116,7 @@ export function Switch({
       role="switch"
       aria-checked={checked}
       aria-label={ariaLabel}
+      title={title ?? ariaLabel}
       data-testid={testId}
       disabled={disabled}
       onClick={() => onChange(!checked)}
