@@ -73,6 +73,7 @@ Current anchors:
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
+| `mission-control-card-task` · `mission-control-card-workspace` | Mission Control crew card: its task title · the workspace name in its meta row | `MissionControl.tsx` |
 
 A target only counts as found when it is visible; the tour waits up to 2s for it after
 opening the step's surface, then skips the step.

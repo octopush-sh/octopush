@@ -434,10 +434,23 @@ function CrewCard({
       style={{ animationDelay: `${Math.min(index, 8) * 45}ms` }}
       className={`octo-rise-in group relative flex flex-col gap-1.5 rounded-lg border bg-octo-panel px-4 py-3 text-left transition duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${canJump ? "cursor-pointer" : ""} ${skin} ${ink}`}
     >
-      {/* Row 1 — status glyph · word · time-in-state. */}
+      {/* Row 1 — status glyph · word · workspace · time-in-state. The status
+          word never truncates; the workspace name gives way first. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
         <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`}>{glyph.label}</span>
-        <span className="truncate uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
+        <span className="shrink-0 uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
+        {wsName && (
+          <>
+            <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+            <span
+              data-tour="mission-control-card-workspace"
+              className="min-w-0 truncate text-octo-mute"
+              title={`Workspace: ${wsName}`}
+            >
+              {wsName}
+            </span>
+          </>
+        )}
         {run.detached && run.status === "running" && (
           <span
             title="Working detached — this crew keeps going even if you quit Octopush"
@@ -454,7 +467,9 @@ function CrewCard({
         </span>
       </span>
 
-      {/* Row 2 — mission: intent glyph + workspace name. */}
+      {/* Row 2 — the title: intent glyph + the run's task. The task is what
+          tells crews apart (many runs share one workspace), so it carries the
+          serif; the full task is on the tooltip. */}
       <span className="flex h-5 items-center gap-1.5">
         {missionIntent &&
           (() => {
@@ -465,23 +480,22 @@ function CrewCard({
               </span>
             );
           })()}
-        <span className="min-w-0 truncate font-serif text-[15px] text-octo-ivory" title={wsName ?? undefined}>
-          {wsName ?? "workspace"}
+        <span
+          data-tour="mission-control-card-task"
+          className="min-w-0 truncate font-serif text-[15px] text-octo-ivory"
+          title={run.task}
+        >
+          {run.task}
         </span>
       </span>
 
-      {/* Row 3 — the brief. */}
-      <span className="block h-4 truncate text-[12px] leading-4 text-octo-sage" title={run.task}>
-        {run.task}
-      </span>
-
-      {/* Row 4 — micro-track: the run's shape at a glance. */}
+      {/* Row 3 — micro-track: the run's shape at a glance. */}
       <MicroTrack stages={stages} />
 
-      {/* Row 5 — the live slot: ticker / gate / halt / savings. */}
+      {/* Row 4 — the live slot: ticker / gate / halt / savings. */}
       <LiveSlot run={run} band={band} gate={gateStage} failed={failedStage} stalled={stalled} running={runningStage} />
 
-      {/* Row 6 — ledger foot + actions. */}
+      {/* Row 5 — ledger foot + actions. */}
       <CardFoot run={run} band={band} />
     </div>
   );
