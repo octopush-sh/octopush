@@ -191,6 +191,45 @@ describe("ReviewCanvas toolbar", () => {
     expect(screen.queryByRole("menu")).toBeNull();
   });
 
+  // Review of #383: More is a `role="menu"`, so it must behave like one from
+  // the keyboard — first item focused on open, ↑/↓ between items, focus back
+  // on the trigger when it closes.
+  it("More opens from the keyboard like a menu: focus, arrows, focus returns", () => {
+    renderCanvas();
+    const more = screen.getByRole("button", { name: /more view options/i });
+    more.focus();
+    fireEvent.click(more); // Enter/Space on a focused button arrive as a click
+    const menu = screen.getByRole("menu", { name: /more view options/i });
+    const inline = screen.getByRole("menuitemradio", { name: /inline diff/i });
+    const sbs = screen.getByRole("menuitemradio", { name: /side-by-side diff/i });
+    const tests = screen.getByRole("menuitem", { name: /set a test command/i });
+    expect(inline).toHaveFocus();
+
+    fireEvent.keyDown(menu, { key: "ArrowDown" });
+    expect(sbs).toHaveFocus();
+    fireEvent.keyDown(menu, { key: "ArrowUp" });
+    fireEvent.keyDown(menu, { key: "ArrowUp" });
+    expect(tests).toHaveFocus();
+    fireEvent.keyDown(menu, { key: "Home" });
+    expect(inline).toHaveFocus();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(more).toHaveFocus();
+
+    fireEvent.click(more);
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "ArrowDown" });
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /side-by-side diff/i }));
+    expect(useReviewPrefs.getState().readingMode).toBe("sbs");
+    expect(more).toHaveFocus();
+  });
+
+  it("More and Tests sit on the control edge token", () => {
+    renderCanvas();
+    expect(screen.getByRole("button", { name: /more view options/i })).toHaveClass("border-octo-border-strong");
+    expect(screen.getByRole("button", { name: /^tests$/i })).toHaveClass("border-octo-border-strong");
+  });
+
   // Review of #383: the toolbar's z-index escaped the canvas and competed
   // with the ContextHeader's (20), so its provenance popover painted under it.
   it("the canvas root is its own stacking context, so the toolbar's z-index stays local", () => {

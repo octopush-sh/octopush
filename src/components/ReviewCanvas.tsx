@@ -6,7 +6,7 @@
  * canvas-level "Why?" agent-origin drawer.
  */
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react";
+import { useState, useEffect, useLayoutEffect, useCallback, useMemo, useRef } from "react";
 import {
   Play,
   Loader2,
@@ -45,6 +45,9 @@ export type ReviewViewMode = "diff" | "editor";
 /** The toolbar content width at or below which "More" replaces the secondary
  *  toggles. Mirrors `@container octo-reviewbar (max-width: 600px)` in styles.css. */
 export const REVIEWBAR_MORE_BELOW = 600;
+
+/** The More menu's focusable items (plain, radio and checkbox). */
+const MORE_ITEM = '[role="menuitem"], [role="menuitemradio"], [role="menuitemcheckbox"]';
 
 /** The three Markdown layouts, in the order the toolbar shows them and ⌥⌘M
  *  cycles them. Icon-only with tooltips, like the reading-mode pair beside it. */
@@ -160,7 +163,14 @@ export function ReviewCanvas({
   // the toolbar's ladder sheds below 600px (`.octo-reviewbar` in styles.css).
   const [moreOpen, setMoreOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
+  const moreTriggerRef = useRef<HTMLButtonElement>(null);
   const toolbarRef = useRef<HTMLElement>(null);
+  // Closing More from inside it (a pick, Escape) hands focus back to its
+  // trigger, like the other menus. An outside click or a resize doesn't.
+  const closeMore = useCallback(() => {
+    setMoreOpen(false);
+    moreTriggerRef.current?.focus();
+  }, []);
   // Last value persisted to the backend — guards against the Enter handler and
   // the input's blur-on-unmount both firing setWorkspaceTestCommand.
   const savedCmdRef = useRef<string | null>(null);
@@ -202,14 +212,14 @@ export function ReviewCanvas({
       // it for the same reason as ⌥⌘M — this canvas stays mounted under
       // ModeOverlay, and Escape from TALK must not reach invisible drawers.
       if (!active || e.key !== "Escape" || whyFile) return;
-      if (moreOpen) { setMoreOpen(false); return; }
+      if (moreOpen) { closeMore(); return; }
       if (testsOpen) { setTestsOpen(false); return; }
       if (aiOpen) { setAiOpen(false); return; }
       setTestResult(null);
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, whyFile, moreOpen, testsOpen, aiOpen]);
+  }, [active, whyFile, moreOpen, testsOpen, aiOpen, closeMore]);
 
   // Auto-clear the reject-undo bar after 6s — but keep the error message
   // visible until the user dismisses it (don't let a failed undo vanish).
@@ -258,6 +268,25 @@ export function ReviewCanvas({
     ro.observe(bar);
     return () => ro.disconnect();
   }, [moreOpen]);
+  // Opening More focuses its first item, as `useMenuChrome` does for the rail
+  // menus, so ↑/↓ (`onMoreKeyDown`) work straight away from the keyboard.
+  useLayoutEffect(() => {
+    if (moreOpen) moreMenuRef.current?.querySelector<HTMLElement>(MORE_ITEM)?.focus();
+  }, [moreOpen]);
+  const onMoreKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === "Tab") { setMoreOpen(false); return; }
+    if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) return;
+    e.preventDefault();
+    const items = Array.from(e.currentTarget.querySelectorAll<HTMLElement>(MORE_ITEM));
+    if (items.length === 0) return;
+    const idx = items.indexOf(document.activeElement as HTMLElement);
+    const next =
+      e.key === "Home" ? 0
+      : e.key === "End" ? items.length - 1
+      : e.key === "ArrowDown" ? (idx + 1) % items.length
+      : (idx - 1 + items.length) % items.length;
+    items[next]?.focus();
+  };
 
   const saveTestCommand = useCallback(async () => {
     const cmd = testCommand.trim();
@@ -448,7 +477,7 @@ export function ReviewCanvas({
             aria-label="Tests"
             aria-expanded={testsOpen}
             title={testCommand ? `Run tests · ${testCommand}` : "Set a test command"}
-            className={`flex shrink-0 items-center gap-1 rounded-md border border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+            className={`flex shrink-0 items-center gap-1 rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
               testsOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
             }`}
             style={testsOpen ? { background: "var(--brass-ghost)" } : undefined}
@@ -460,6 +489,7 @@ export function ReviewCanvas({
           {/* More — grows in only once the rung above has shed. */}
           <div className="octo-demote octo-reviewbar-more">
             <button
+              ref={moreTriggerRef}
               onClick={() => setMoreOpen((v) => !v)}
               data-more-trigger
               data-tour="review-toolbar-more"
@@ -467,7 +497,7 @@ export function ReviewCanvas({
               aria-haspopup="menu"
               aria-expanded={moreOpen}
               title="Diff layout, whitespace and tests"
-              className={`flex shrink-0 items-center rounded-md border border-octo-hairline px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+              className={`flex shrink-0 items-center rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
                 moreOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={moreOpen ? { background: "var(--brass-ghost)" } : undefined}
@@ -481,6 +511,7 @@ export function ReviewCanvas({
               ref={moreMenuRef}
               role="menu"
               aria-label="More view options"
+              onKeyDown={onMoreKeyDown}
               className="octo-menu-enter absolute right-3 top-[calc(100%+6px)] z-30 w-56 rounded-md border border-octo-hairline bg-octo-panel py-1 shadow-2xl"
             >
               {viewMode === "diff" && (
@@ -490,21 +521,21 @@ export function ReviewCanvas({
                     checked={readingMode === "inline"}
                     Icon={AlignJustify}
                     label="Inline diff"
-                    onSelect={() => { setReadingMode("inline"); setMoreOpen(false); }}
+                    onSelect={() => { setReadingMode("inline"); closeMore(); }}
                   />
                   <MoreItem
                     role="menuitemradio"
                     checked={readingMode === "sbs"}
                     Icon={Columns2}
                     label="Side-by-side diff"
-                    onSelect={() => { setReadingMode("sbs"); setMoreOpen(false); }}
+                    onSelect={() => { setReadingMode("sbs"); closeMore(); }}
                   />
                   <div className="my-1 h-px bg-octo-hairline" aria-hidden />
                   <MoreItem
                     role="menuitemcheckbox"
                     checked={ignoreWhitespace}
                     label="Ignore whitespace"
-                    onSelect={() => { setIgnoreWhitespace(!ignoreWhitespace); setMoreOpen(false); }}
+                    onSelect={() => { setIgnoreWhitespace(!ignoreWhitespace); closeMore(); }}
                   />
                   <div className="my-1 h-px bg-octo-hairline" aria-hidden />
                 </>
