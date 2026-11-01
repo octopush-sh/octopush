@@ -62,6 +62,13 @@ impl ReadinessCheck {
         let fix = "It didn't answer in time. Run it yourself to see why, then check again.";
         Self { timed_out: true, ..Self::not_ok(id, label, CheckStatus::Warn, "No answer in 3 s", fix, Some(command)) }
     }
+
+    /// The check itself broke (its thread panicked) — says nothing about
+    /// this Mac, so no timeout claim and no command to run.
+    fn failed_to_run(id: &str, label: &str) -> Self {
+        let fix = "Octopush couldn't run this check. Check again; if it keeps failing, please report it.";
+        Self::not_ok(id, label, CheckStatus::Warn, "Check failed to run", fix, None)
+    }
 }
 
 /// What running one probe command produced.
@@ -76,8 +83,20 @@ pub enum Probe {
 /// Run `cmd` (None = not found on the PATH) to completion within `timeout`;
 /// stdout and stderr are joined. A command that outlives it is killed.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
+    probe_with(cmd, timeout, true)
+}
+
+/// Like [`run_probe`], but only the exit status counts: stdout and stderr go
+/// to `/dev/null`, so nothing the command prints is ever read (`output` is
+/// always empty).
+pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
+    probe_with(cmd, timeout, false)
+}
+
+fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
-    let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() else {
+    let io = || if capture { Stdio::piped() } else { Stdio::null() };
+    let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(io()).stderr(io()).spawn() else {
         return Probe::Missing;
     };
     let deadline = Instant::now() + timeout;
@@ -151,15 +170,24 @@ pub fn git_check(probe: Probe) -> ReadinessCheck {
     }
 }
 
-/// `gh auth status`.
+/// The gh probe. `gh auth token` only looks up the stored credential (config
+/// file or keychain) and never contacts GitHub, unlike `gh auth status`, which
+/// validates the token online. It runs under [`run_status_probe`], so the
+/// token it prints goes to `/dev/null` and Octopush never reads it.
+pub const GH_PROBE_ARGS: [&str; 4] = ["auth", "token", "--hostname", "github.com"];
+pub const GH_PROBE: &str = "gh auth token --hostname github.com";
+
+/// `gh` has a github.com credential on this Mac (exit status of
+/// [`GH_PROBE`]). It isn't validated online, so the value says "Token found",
+/// not "Signed in".
 pub fn gh_check(probe: Probe) -> ReadinessCheck {
     const ID: &str = "gh";
     const LABEL: &str = "GitHub CLI";
     let warn = |value, fix, command| ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, value, fix, Some(command));
     match probe {
         Probe::Missing => warn("Not found", "Crews open pull requests with gh. Install it to ship a run.", "brew install gh"),
-        Probe::TimedOut => ReadinessCheck::timed_out(ID, LABEL, "gh auth status"),
-        Probe::Exited { success: true, .. } => ReadinessCheck::ok(ID, LABEL, "Signed in"),
+        Probe::TimedOut => ReadinessCheck::timed_out(ID, LABEL, GH_PROBE),
+        Probe::Exited { success: true, .. } => ReadinessCheck::ok(ID, LABEL, "Token found"),
         Probe::Exited { success: false, .. } => {
             warn("Not signed in", "Sign gh in so a crew can open its pull request.", "gh auth login")
         }
@@ -191,20 +219,29 @@ pub fn loopback_addr(base_url: &str) -> Option<String> {
     matches!(host, "localhost" | "127.0.0.1" | "[::1]").then(|| format!("{host}:{port}"))
 }
 
-/// Whether something accepts connections at a loopback `host:port`.
+/// Whether something accepts connections at a loopback `host:port`. All of
+/// the addresses it resolves to (`localhost` → `::1` and `127.0.0.1`) share
+/// one `timeout`, so the whole check never takes longer than that.
 pub fn ollama_check(addr: &str, timeout: Duration) -> ReadinessCheck {
-    let reachable = addr
-        .to_socket_addrs()
-        .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-        .unwrap_or_default()
-        .iter()
-        .any(|a| TcpStream::connect_timeout(a, timeout).is_ok());
+    let addrs = addr.to_socket_addrs().map(|addrs| addrs.collect::<Vec<SocketAddr>>()).unwrap_or_default();
+    let reachable = connect_any(&addrs, timeout, |a, left| TcpStream::connect_timeout(a, left).is_ok());
     if reachable {
         ReadinessCheck::ok("ollama", "Ollama", addr)
     } else {
         let fix = "Start Ollama, or turn its provider off in Settings › Models.";
         ReadinessCheck::not_ok("ollama", "Ollama", CheckStatus::Warn, "Not running", fix, Some("ollama serve"))
     }
+}
+
+/// Try each address in turn until one `connect`s, giving each only what's
+/// left of the one `timeout`. Out of time = not reachable (and
+/// `connect_timeout` rejects a zero duration anyway).
+pub fn connect_any(addrs: &[SocketAddr], timeout: Duration, mut connect: impl FnMut(&SocketAddr, Duration) -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    addrs.iter().any(|a| {
+        let left = deadline.saturating_duration_since(Instant::now());
+        !left.is_zero() && connect(a, left)
+    })
 }
 
 /// A command for `name` resolved on the login-shell PATH the CLI stages use.
@@ -235,10 +272,17 @@ pub fn run_all() -> Vec<ReadinessCheck> {
         claude_check(run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT), TESTED_CLAUDE_FLOOR)
     });
     let git = std::thread::spawn(|| git_check(run_probe(local_command("git", &["--version"]), CHECK_TIMEOUT)));
-    let gh = std::thread::spawn(|| gh_check(run_probe(local_command("gh", &["auth", "status"]), CHECK_TIMEOUT)));
+    let gh = std::thread::spawn(|| {
+        let cmd = local_command("gh", &GH_PROBE_ARGS).map(|mut c| {
+            // Keep gh from reaching out on its own (release/extension update checks, prompts).
+            c.env("GH_NO_UPDATE_NOTIFIER", "1").env("GH_NO_EXTENSION_UPDATE_NOTIFIER", "1").env("GH_PROMPT_DISABLED", "1");
+            c
+        });
+        gh_check(run_status_probe(cmd, CHECK_TIMEOUT))
+    });
     let ollama = std::thread::spawn(|| enabled_ollama_addr().map(|a| ollama_check(&a, CHECK_TIMEOUT)));
 
-    let lost = |id: &str, label: &str| ReadinessCheck::timed_out(id, label, id);
+    let lost = ReadinessCheck::failed_to_run;
     let mut checks = vec![
         claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
         auth_check(crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty())),
@@ -311,16 +355,41 @@ mod tests {
     }
 
     #[test]
-    fn gh_signed_in_signed_out_missing_and_timeout() {
-        let ok = gh_check(probe("echo 'Logged in to github.com' >&2"));
-        assert_eq!((ok.status, ok.value.as_str()), (CheckStatus::Ok, "Signed in"));
+    fn status_probe_never_reads_output() {
+        let quiet = run_status_probe(sh("echo gho_secret; echo err >&2"), Duration::from_secs(5));
+        assert_eq!(quiet, Probe::Exited { success: true, output: String::new() });
+        assert!(matches!(run_status_probe(sh("exit 1"), Duration::from_secs(5)), Probe::Exited { success: false, .. }));
+        assert_eq!(run_status_probe(None, CHECK_TIMEOUT), Probe::Missing);
+        assert_eq!(run_status_probe(sh("sleep 5"), Duration::from_millis(100)), Probe::TimedOut);
+    }
 
-        let out = gh_check(probe("echo 'You are not logged into any GitHub hosts' >&2; exit 1"));
+    #[test]
+    fn gh_probe_is_the_local_token_lookup() {
+        assert_eq!(GH_PROBE, format!("gh {}", GH_PROBE_ARGS.join(" ")));
+        assert!(!GH_PROBE.contains("status"), "gh auth status validates the token online");
+    }
+
+    #[test]
+    fn gh_token_found_signed_out_missing_and_timeout() {
+        let ok = gh_check(run_status_probe(sh("echo gho_secret"), Duration::from_secs(5)));
+        assert_eq!((ok.status, ok.value.as_str()), (CheckStatus::Ok, "Token found"));
+
+        let out = gh_check(run_status_probe(sh("echo 'no oauth token found' >&2; exit 1"), Duration::from_secs(5)));
         assert_eq!((out.status, out.command.as_deref()), (CheckStatus::Warn, Some("gh auth login")));
 
         let missing = gh_check(Probe::Missing);
         assert_eq!((missing.status, missing.command.as_deref()), (CheckStatus::Warn, Some("brew install gh")));
-        assert!(gh_check(Probe::TimedOut).timed_out);
+        let hung = gh_check(Probe::TimedOut);
+        assert!(hung.timed_out);
+        assert_eq!(hung.command.as_deref(), Some(GH_PROBE));
+    }
+
+    #[test]
+    fn a_check_that_failed_to_run_claims_no_timeout() {
+        let lost = ReadinessCheck::failed_to_run("git", "git");
+        assert_eq!((lost.status, lost.value.as_str(), lost.timed_out), (CheckStatus::Warn, "Check failed to run", false));
+        assert_eq!(lost.command, None);
+        assert!(!lost.fix.as_deref().unwrap_or_default().contains("3 s"));
     }
 
     #[test]
@@ -350,5 +419,32 @@ mod tests {
         drop(listener);
         let down = ollama_check(&addr, Duration::from_millis(500));
         assert_eq!((down.status, down.command.as_deref()), (CheckStatus::Warn, Some("ollama serve")));
+    }
+
+    #[test]
+    fn ollama_addresses_share_one_deadline() {
+        // `localhost` → `::1` and `127.0.0.1`, both filtered: each attempt
+        // hangs for the time it's given, and the second gets only what's left.
+        let addrs: Vec<SocketAddr> = vec!["[::1]:11434".parse().unwrap(), "127.0.0.1:11434".parse().unwrap()];
+        let mut given = Vec::new();
+        let started = Instant::now();
+        let reachable = connect_any(&addrs, Duration::from_millis(500), |_, left| {
+            given.push(left);
+            std::thread::sleep(left);
+            false
+        });
+        assert!(!reachable);
+        assert!(started.elapsed() < Duration::from_millis(900), "all addresses share one timeout");
+        assert!(given.len() <= 2 && given.iter().all(|d| *d <= Duration::from_millis(500)));
+        if let Some(second) = given.get(1) {
+            assert!(*second < Duration::from_millis(250), "the second address got a fresh timeout");
+        }
+
+        // The first address that answers wins.
+        let mut tried = 0;
+        assert!(connect_any(&addrs, CHECK_TIMEOUT, |_, _| {
+            tried += 1;
+            tried == 2
+        }));
     }
 }

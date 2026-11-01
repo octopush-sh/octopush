@@ -79,7 +79,7 @@ describe("ReadinessCard", () => {
         status: "warn",
         value: "No answer in 3 s",
         fix: "It didn't answer in time.",
-        command: "gh auth status",
+        command: "gh auth token --hostname github.com",
         timedOut: true,
       }),
     ]);
@@ -89,7 +89,26 @@ describe("ReadinessCard", () => {
     expect(word).toHaveClass("text-octo-warning");
     expect(word.className).not.toMatch(/brass/);
     expect(within(r).getByTitle("GitHub CLI: Timed out")).toBeInTheDocument();
-    expect(within(r).getByText("gh auth status")).toBeInTheDocument();
+    expect(within(r).getByText("gh auth token --hostname github.com")).toBeInTheDocument();
+  });
+
+  it("shows a rouge error line when the checks can't run", async () => {
+    readinessCheck.mockRejectedValue("readiness task failed: boom");
+    render(<ReadinessCard />);
+    const line = await screen.findByText("Couldn't run the checks: readiness task failed: boom");
+    expect(line).toHaveClass("text-octo-rouge");
+    expect(screen.queryByTestId("readiness-loading")).toBeNull();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
+  });
+
+  it("Check again clears the error after a later success", async () => {
+    readinessCheck.mockRejectedValueOnce("readiness task failed: boom");
+    readinessCheck.mockResolvedValueOnce([row({ id: "git", label: "git", value: "2.39.3" })]);
+    render(<ReadinessCard />);
+    await screen.findByText(/Couldn't run the checks/);
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await screen.findByTestId("readiness-row-git");
+    expect(screen.queryByText(/Couldn't run the checks/)).toBeNull();
   });
 
   it("Check again re-runs the checks", async () => {
