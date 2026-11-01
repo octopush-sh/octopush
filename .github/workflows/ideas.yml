@@ -64,6 +64,10 @@ jobs:
           permission-pull-requests: read
           permission-actions: read
 
+      - name: Web lane offline?
+        if: steps.read-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — running app-repo only"
+
       - name: Context and brief
         if: steps.check.outputs.go == '1'
         env:
@@ -107,6 +111,10 @@ jobs:
           permission-issues: write
           permission-pull-requests: read
           permission-actions: read
+
+      - name: Web lane offline?
+        if: steps.post-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — running app-repo only"
 
       - name: Post the digest
         if: steps.check.outputs.go == '1'
