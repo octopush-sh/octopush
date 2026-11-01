@@ -156,6 +156,22 @@ describe("terminalsStore — loadTerminals", () => {
     expect(t1.restored).toBe(false);
   });
 
+  it("a setup terminal spawned this session is running but not restored", async () => {
+    const ws = "ws-setup-new";
+    const rec = makeRecord(ws, "setup", 0);
+    useTerminalsStore.getState().trackSetup(ws, rec.id);
+    mockIpc.listTerminals.mockResolvedValueOnce([rec]);
+    mockIpc.listPtySessions.mockResolvedValueOnce([
+      { id: rec.id, running: true, startedAt: Date.now() },
+    ]);
+
+    await useTerminalsStore.getState().loadTerminals(ws);
+
+    const [t] = useTerminalsStore.getState().getTerminals(ws);
+    expect(t.running).toBe(true);
+    expect(t.restored).toBe(false);
+  });
+
   it("does not overwrite an already-selected active id on reload", async () => {
     const ws = "ws-reload";
     const records = [makeRecord(ws, "Main", 0), makeRecord(ws, "Secondary", 1)];

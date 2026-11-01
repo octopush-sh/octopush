@@ -171,7 +171,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         // `restored` is set when the daemon has it but the store didn't — i.e.,
         // this is the first load of a surviving session after Octopush restart.
         // If it was already in the store as running, it's not a "new restore".
-        const restored = daemonRunning && !wasRunningInStore;
+        // A setup terminal the backend spawned this session is new, not a
+        // survivor — the store just hadn't listed it yet.
+        const restored = daemonRunning && !wasRunningInStore && !(r.id in s.setupByTerminal);
 
         const live = prevLiveById.get(r.id);
         return {
