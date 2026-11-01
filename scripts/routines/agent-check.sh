@@ -51,7 +51,9 @@ case "$PROFILE" in
     routes='shadow=$(cd dist 2>/dev/null && ls -d download* api update 2>/dev/null); if [ -n "$shadow" ]; then echo "octo-check: the build has $shadow in dist/ — it would shadow the /download, /api or /update routes in vercel.json (human-only)" >&2; exit 1; fi'
     case "${1:-}" in
       install) cmd=(npm ci --no-audit --no-fund --ignore-scripts) ;;
-      site) cmd=(npm run --silent build) ;;
+      # install + build in ONE call: after every call the sandbox's symlinks are
+      # deleted, node_modules/.bin included, so a separate build couldn't find astro.
+      site) cmd=(bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent build') ;;
       build) cmd=(bash -c "npm run --silent build && { $routes; }") ;;
       routes) cmd=(bash -c "$routes") ;;
       check) cmd=(npm run --silent check) ;;

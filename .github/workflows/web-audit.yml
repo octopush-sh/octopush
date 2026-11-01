@@ -118,8 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"
-          octo-check install
-          octo-check site
+          octo-check site   # install (no scripts) + build, in one sandboxed call
 
       - name: Nothing of the site's code is still running
         if: always()
