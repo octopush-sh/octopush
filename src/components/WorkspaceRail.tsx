@@ -34,6 +34,7 @@ import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore"
 import { useMissionsStore } from "../stores/missionsStore";
 import { ProjectMark } from "./icons/ProjectMark";
 import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
+import { MidTruncate } from "./primitives/MidTruncate";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
 
 /**
@@ -617,6 +618,63 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
 
 // ───────────────────────────── expanded: row ─────────────────────────────
 
+/** Characters a row's name keeps pinned at its end. Mission names that differ
+ *  only at the end — `Production deploy (octopush-api)` / `(octopush-web)`,
+ *  `…-flow-8` / `…-flow-9` — stay distinguishable (design-system E1). */
+export const RAIL_NAME_TAIL = 14;
+
+/** The width a row's name and meta share at the 280px rail: the row minus its
+ *  padding (14 + 12), the 20px monogram and the two 8px gaps. */
+const ROW_TEXT_PX = 218;
+/** 13px system sans, rounded up on purpose: an over-estimate only sheds the
+ *  ahead/behind rung a little early (it survives in the name's tooltip); an
+ *  under-estimate is still caught by the name's middle truncation. */
+const NAME_PX_PER_CHAR = 7;
+/** 10px JetBrains Mono. */
+const META_PX_PER_CHAR = 6;
+const META_GAP_PX = 8;
+const META_ICON_PX = 11;
+
+export interface RowMeta {
+  ticketKey?: string | null;
+  ahead?: number;
+  behind?: number;
+  hasOpenPr?: boolean;
+  /** The dirty glyph is shown (not on the active row). */
+  dirty?: boolean;
+  dot?: boolean;
+}
+
+/** The row's demotion ladder (design-system E2), decided per row because the
+ *  rail has a fixed width — what varies is the name, not the band. One rung:
+ *  the ahead/behind counts shed before the name loses its tail, and move into
+ *  the name's tooltip. Floor: the ticket key, PR, dirty and attention marks. */
+export function shedsGitMeta(name: string, meta: RowMeta): boolean {
+  const counts = [meta.ahead, meta.behind].filter((n): n is number => !!n);
+  if (counts.length === 0) return false;
+  const atoms: number[] = [];
+  if (meta.ticketKey) atoms.push(meta.ticketKey.length * META_PX_PER_CHAR);
+  if (meta.hasOpenPr) atoms.push(META_ICON_PX);
+  if (meta.dirty) atoms.push(META_ICON_PX);
+  if (meta.dot) atoms.push(5);
+  const floor = atoms.reduce((sum, w) => sum + w + META_GAP_PX, 0);
+  // Each count: a 10px arrow, a 2px gap and its digits.
+  const rung = counts.reduce(
+    (sum, n) => sum + 12 + String(n).length * META_PX_PER_CHAR + META_GAP_PX,
+    0,
+  );
+  return name.length * NAME_PX_PER_CHAR > ROW_TEXT_PX - floor - rung;
+}
+
+function gitCountsLabel(ahead?: number, behind?: number): string {
+  return [
+    ahead ? `${ahead} commit${ahead === 1 ? "" : "s"} ahead` : null,
+    behind ? `${behind} commit${behind === 1 ? "" : "s"} behind` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+}
+
 interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
@@ -700,6 +758,15 @@ function WorkspaceRow({
       : "";
   const hint = shortcut ? ` (${shortcut})` : "";
   const hit = matchRange(name, q);
+  const shedGit = shedsGitMeta(name, {
+    ticketKey,
+    ahead,
+    behind,
+    hasOpenPr,
+    dirty: dirty && !active,
+    dot: attention === "dot",
+  });
+  const shedSuffix = shedGit ? ` · ${gitCountsLabel(ahead, behind)}` : "";
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
     e.preventDefault();
@@ -736,45 +803,60 @@ function WorkspaceRow({
         {mono?.glyph || "?"}
       </button>
 
-      {/* Name — a real button (keyboard-operable) that truncates with the full
-          name, state and jump key as its tooltip. No aria-label: its accessible
-          name is the visible text, so the monogram stays the single
-          name-labelled control. */}
+      {/* Name — a real button (keyboard-operable) that MIDDLE-truncates, so
+          the head and the distinguishing tail both stay visible, with the full
+          name, any shed git counts, state and jump key as its tooltip. No
+          aria-label: its accessible name is the visible text, so the monogram
+          stays the single name-labelled control. */}
       <button
         type="button"
         onClick={onSelect}
-        title={`${name}${stateSuffix}${hint}`}
-        className={`min-w-0 flex-1 truncate text-left text-[13px] transition-colors duration-[180ms] focus-visible:outline-none ${
+        title={`${name}${shedSuffix}${stateSuffix}${hint}`}
+        className={`flex min-w-0 flex-1 text-left text-[13px] transition-colors duration-[180ms] focus-visible:outline-none ${
           active ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
         }`}
       >
-        {hit ? <HighlightedLabel label={name} match={hit} className={HIT_WASH} testId="rail-hit" /> : name}
+        {hit ? (
+          <span className="truncate">
+            <HighlightedLabel label={name} match={hit} className={HIT_WASH} testId="rail-hit" />
+          </span>
+        ) : (
+          <MidTruncate text={name} tail={RAIL_NAME_TAIL} />
+        )}
       </button>
 
       {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·
-          dirty · attention. Brass appears here only as the attention dot. */}
+          dirty · attention. Brass appears here only as the attention dot. The
+          ahead/behind pair is the row's one demotion rung (`shedsGitMeta`). */}
       <div className="octo-tabular flex shrink-0 items-center gap-2 font-mono text-[10px] leading-none text-octo-mute">
         {ticketKey && (
           <span className="octo-pop-in text-octo-sage" title={`Linked issue ${ticketKey}`}>
             {ticketKey}
           </span>
         )}
-        {!!ahead && (
+        {(!!ahead || !!behind) && (
           <span
-            className="octo-pop-in flex items-center gap-[2px]"
-            title={`${ahead} commit${ahead === 1 ? "" : "s"} ahead`}
+            data-testid="rail-git-rung"
+            className={`octo-demote ${shedGit ? "octo-demote-shed" : ""}`}
           >
-            <ArrowUp size={10} aria-hidden />
-            {ahead}
-          </span>
-        )}
-        {!!behind && (
-          <span
-            className="octo-pop-in flex items-center gap-[2px]"
-            title={`${behind} commit${behind === 1 ? "" : "s"} behind`}
-          >
-            <ArrowDown size={10} aria-hidden />
-            {behind}
+            {!!ahead && (
+              <span
+                className="octo-pop-in flex items-center gap-[2px]"
+                title={`${ahead} commit${ahead === 1 ? "" : "s"} ahead`}
+              >
+                <ArrowUp size={10} aria-hidden />
+                {ahead}
+              </span>
+            )}
+            {!!behind && (
+              <span
+                className="octo-pop-in flex items-center gap-[2px]"
+                title={`${behind} commit${behind === 1 ? "" : "s"} behind`}
+              >
+                <ArrowDown size={10} aria-hidden />
+                {behind}
+              </span>
+            )}
           </span>
         )}
         {hasOpenPr && (
