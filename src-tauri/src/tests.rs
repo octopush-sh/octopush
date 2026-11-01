@@ -13390,6 +13390,7 @@ mod open_pull_request_tests {
         assert!(!pr_head_is_valid("main", "main"));
         assert!(!pr_head_is_valid("origin/main", "main"));
         assert!(!pr_head_is_valid("main", ""));
+        assert!(!pr_head_is_valid("main", "HEAD"));
     }
 
     #[test]

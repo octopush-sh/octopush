@@ -134,10 +134,18 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
         if (cancelled) return;
         const head = status?.branch ?? null;
         const onto = prBaseFor(head, workspace.fromBranch, list);
-        if (!canOpenPrFrom(head, list) || !onto) {
+        if (!canOpenPrFrom(head, list)) {
           return setPhase({
             kind: "error",
-            message: "Pull requests open from a feature branch — this workspace is on the repository's default branch.",
+            message: head && head !== "HEAD"
+              ? "Pull requests open from a feature branch — this workspace is on the repository's default branch."
+              : "This workspace isn't on a named branch, so there's nothing to open a pull request from.",
+          });
+        }
+        if (!onto) {
+          return setPhase({
+            kind: "error",
+            message: "Couldn't tell this repository's default branch. Set origin/HEAD (git remote set-head origin --auto) and try again.",
           });
         }
         setBranches(list);
@@ -167,7 +175,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     try {
       const status = await ipc.getGitStatus(workspacePath);
       // Never push the base branch itself: a PR needs a branch other than its base.
-      if (!status.branch || status.branch === base.replace(/^origin\//, "")) {
+      if (!status.branch || status.branch === "HEAD" || status.branch === base.replace(/^origin\//, "")) {
         throw new Error(`Pick a base other than ${status.branch ?? "this branch"}.`);
       }
       if (!status.hasUpstream || status.ahead > 0) await ipc.pushBranch(workspacePath);

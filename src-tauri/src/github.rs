@@ -236,7 +236,8 @@ pub fn pr_create_command(
 /// branch onto itself (that would only push the base branch).
 pub fn pr_head_is_valid(base: &str, head: &str) -> bool {
     let base = base.strip_prefix("origin/").unwrap_or(base);
-    !head.trim().is_empty() && head != base
+    // A detached HEAD reports itself as "HEAD": not a branch to open from.
+    !head.trim().is_empty() && head != "HEAD" && head != base
 }
 
 /// Read the new PR's URL from `gh pr create`'s stdout (its last URL line,
