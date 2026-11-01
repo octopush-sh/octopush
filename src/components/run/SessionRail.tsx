@@ -40,7 +40,7 @@ export function SessionRail({ workspaceId }: Props) {
   const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
-  const flag =useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
 
