@@ -3568,6 +3568,13 @@ pub async fn get_usage_breakdown(
     state.db.lock().usage_breakdown(&router, &start_iso, &end_iso)
 }
 
+/// The Claude plan windows CLI stages last reported (`claude_plan`); empty
+/// until a subscription-authenticated stage streamed a `rate_limit_event`.
+#[tauri::command]
+pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate::claude_plan::PlanSnapshot>> {
+    crate::claude_plan::load(&state.db.lock())
+}
+
 // ─── Pricing refresh from LiteLLM ────────────────────────────────
 
 /// Shape of a single entry in the LiteLLM pricing dataset.

@@ -24,7 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
-    build_cli_args, build_cli_args_resume, is_result_event, parse_cli_result, usage_from_stream_event,
+    build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
+    plan_windows_from_stream_event, usage_from_stream_event, CliAuth,
 };
 use crate::orchestrator::live::entries_from_stream_event;
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
@@ -418,6 +419,130 @@ fn stream_json_missing_fields_degrade_without_panicking() {
     // A truncated result line is an Err, never a panic.
     let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
     assert!(parse_cli_result(&line[..line.len() / 2], true, ArtifactKind::Note, "").is_err());
+}
+
+// ─── `rate_limit_event` → Claude plan windows ────────────────────────────
+
+const SUBSCRIBER_REL: &str = "stream-json/subscriber-rate-limit.jsonl";
+
+#[test]
+fn rate_limit_event_reduced_to_its_type_yields_no_plan_windows() {
+    // The real recordings ran on an API key; their rate-limit events are
+    // type-only and must not invent a plan.
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            assert!(!of_type(&events, "rate_limit_event").is_empty(), "[{fx}] expected a rate_limit_event");
+            for e in &events {
+                assert!(plan_windows_from_stream_event(e).is_empty(), "[{fx}] plan windows from {e}");
+            }
+        }
+    }
+}
+
+#[test]
+fn rate_limit_event_with_unified_windows_reports_both_windows() {
+    // Synthetic fixture (see the README) — pinned to the recording that has it.
+    let rec = recording("2.1.314");
+    let fx = rec.label(SUBSCRIBER_REL);
+    let events = rec.jsonl(SUBSCRIBER_REL);
+    let init = events.iter().find(|e| e["subtype"] == "init").unwrap();
+    assert_eq!(cli_auth_from_init(init), Some(CliAuth::Subscription), "[{fx}] apiKeySource none ⇒ a Claude plan");
+    let rl = of_type(&events, "rate_limit_event");
+    for f in ["status", "resetsAt", "rateLimitType"] {
+        require(&fx, rl[0], &format!("rate_limit_info.{f}"));
+    }
+    let w = plan_windows_from_stream_event(rl[0]);
+    assert_eq!(w.len(), 2, "[{fx}] {w:?}");
+    assert_eq!(w[0].kind, "five_hour");
+    assert_eq!(w[0].utilization, Some(0.62), "[{fx}] utilization from unifiedWindows");
+    assert_eq!(w[0].resets_at, Some(1793551200));
+    assert_eq!(w[0].status.as_deref(), Some("allowed"));
+    assert_eq!(w[0].overage_status.as_deref(), Some("rejected"));
+    assert!(!w[0].using_overage);
+    assert_eq!(w[1].kind, "seven_day");
+    assert_eq!(w[1].utilization, Some(0.31));
+    assert_eq!(w[1].resets_at, Some(1793988000));
+    assert_eq!(w[1].status.as_deref(), Some("allowed"), "[{fx}] nothing is limited ⇒ every window is allowed");
+}
+
+#[test]
+fn rate_limit_event_without_unified_windows_uses_top_level_utilization() {
+    let rec = recording("2.1.314");
+    let fx = rec.label(SUBSCRIBER_REL);
+    let events = rec.jsonl(SUBSCRIBER_REL);
+    let rl = of_type(&events, "rate_limit_event");
+    let w = plan_windows_from_stream_event(rl[1]);
+    assert_eq!(w.len(), 1, "[{fx}] {w:?}");
+    assert_eq!((w[0].kind.as_str(), w[0].utilization), ("five_hour", Some(0.84)));
+    assert_eq!(w[0].status.as_deref(), Some("allowed_warning"));
+
+    // Neither top-level nor unified utilization: the window is still kept.
+    let w = plan_windows_from_stream_event(rl[2]);
+    assert_eq!(w.len(), 1, "[{fx}] {w:?}");
+    assert_eq!(w[0].kind, "seven_day_fixture_tier", "[{fx}] an unknown rateLimitType is kept as-is");
+    assert_eq!(w[0].utilization, None);
+    assert_eq!(w[0].status.as_deref(), Some("rejected"));
+    assert!(w[0].using_overage);
+}
+
+#[test]
+fn rate_limit_event_missing_fields_degrade_without_panicking() {
+    let rec = recording("2.1.314");
+    let events = rec.jsonl(SUBSCRIBER_REL);
+    let full = of_type(&events, "rate_limit_event")[0].clone();
+
+    let mut no_info = full.clone();
+    no_info.as_object_mut().unwrap().remove("rate_limit_info");
+    assert!(plan_windows_from_stream_event(&no_info).is_empty());
+
+    // Only unifiedWindows: both windows, no status (the subject is unknown
+    // and nothing says it is allowed).
+    let mut only_unified = full.clone();
+    let info = only_unified["rate_limit_info"].as_object_mut().unwrap();
+    for k in ["status", "rateLimitType", "resetsAt"] {
+        info.remove(k);
+    }
+    let w = plan_windows_from_stream_event(&only_unified);
+    assert_eq!(w.iter().map(|x| x.kind.as_str()).collect::<Vec<_>>(), ["five_hour", "seven_day"]);
+    assert!(w.iter().all(|x| x.status.is_none()));
+
+    // A rejected subject window: the other unified windows get no status.
+    let mut rejected = full.clone();
+    rejected["rate_limit_info"]["status"] = Value::from("rejected");
+    let w = plan_windows_from_stream_event(&rejected);
+    assert_eq!(w[0].status.as_deref(), Some("rejected"));
+    assert_eq!(w[1].status, None);
+
+    // resetsAt in milliseconds reads as the same second.
+    let mut ms = full.clone();
+    ms["rate_limit_info"]["resetsAt"] = Value::from(1_793_551_200_000_i64);
+    ms["rate_limit_info"].as_object_mut().unwrap().remove("unifiedWindows");
+    assert_eq!(plan_windows_from_stream_event(&ms)[0].resets_at, Some(1793551200));
+
+    // A non-object rate_limit_info or window is ignored.
+    let mut junk = full.clone();
+    junk["rate_limit_info"]["unifiedWindows"]["five_hour"] = Value::from(7);
+    junk["rate_limit_info"].as_object_mut().unwrap().remove("rateLimitType");
+    assert_eq!(plan_windows_from_stream_event(&junk).len(), 1);
+    junk["rate_limit_info"] = Value::from("x");
+    assert!(plan_windows_from_stream_event(&junk).is_empty());
+}
+
+#[test]
+fn init_api_key_source_classifies_the_session() {
+    let rec = recordings().pop().unwrap();
+    let fx = rec.label("stream-json/simple.jsonl");
+    let mut init = rec.jsonl("stream-json/simple.jsonl").into_iter().find(|e| e["subtype"] == "init").unwrap();
+    // The scrubber drops `apiKeySource` from the recordings: unknown, not a guess.
+    assert_eq!(cli_auth_from_init(&init), None, "[{fx}]");
+    init["apiKeySource"] = Value::from("ANTHROPIC_API_KEY");
+    assert_eq!(cli_auth_from_init(&init), Some(CliAuth::ApiKey));
+    init["apiKeySource"] = Value::from("none");
+    assert_eq!(cli_auth_from_init(&init), Some(CliAuth::Subscription));
+    init["subtype"] = Value::from("status");
+    assert_eq!(cli_auth_from_init(&init), None, "only system/init classifies");
 }
 
 // ─── Transcript JSONL ─────────────────────────────────────────────────────

@@ -100,6 +100,112 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
     ))
 }
 
+// ─── Claude plan windows (`rate_limit_event`) ────────────────────────────
+//
+// A subscription-authenticated (`claude login`, Pro/Max) CLI streams
+// `rate_limit_event` lines whose `rate_limit_info` describes the plan's
+// rolling windows. Every field is optional: older CLIs send no
+// `unifiedWindows`, top-level `utilization` only appears once a threshold is
+// crossed, and `rateLimitType` grows new values — an unknown one is kept
+// verbatim, never dropped. `utilization` is a fraction (0.62 = 62%).
+
+/// One plan window as a `rate_limit_event` reported it.
+#[derive(serde::Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanWindow {
+    /// `five_hour` · `seven_day` · `seven_day_opus` · `seven_day_sonnet` · …
+    pub kind: String,
+    /// Fraction of the window used, when the CLI said.
+    pub utilization: Option<f64>,
+    /// When the window resets, epoch seconds.
+    pub resets_at: Option<i64>,
+    /// `allowed` · `allowed_warning` · `rejected` · …; `None` when the event
+    /// only described this window in passing (another window was the subject).
+    pub status: Option<String>,
+    pub overage_status: Option<String>,
+    pub using_overage: bool,
+}
+
+/// Epoch seconds from a number that may be seconds or milliseconds.
+fn epoch_secs(v: Option<&Value>) -> Option<i64> {
+    let n = v?.as_f64()?;
+    let secs = if n > 1e12 { n / 1000.0 } else { n };
+    Some(secs as i64)
+}
+
+/// The plan windows a `rate_limit_event` carries — empty for any other
+/// event, and for a rate-limit event without `rate_limit_info` (what an
+/// API-key session and the recorded fixtures send). The event's subject
+/// window (`rateLimitType`) comes first and carries the status; windows
+/// listed only in `unifiedWindows` get the status too when it is `allowed`
+/// (nothing is limited), otherwise none.
+pub(crate) fn plan_windows_from_stream_event(v: &Value) -> Vec<PlanWindow> {
+    if v.get("type").and_then(Value::as_str) != Some("rate_limit_event") {
+        return vec![];
+    }
+    let Some(info) = v.get("rate_limit_info").filter(|i| i.is_object()) else {
+        return vec![];
+    };
+    let s = |k: &str| info.get(k).and_then(Value::as_str).map(str::to_string);
+    let status = s("status");
+    let overage_status = s("overageStatus");
+    let using_overage = info.get("isUsingOverage").and_then(Value::as_bool).unwrap_or(false);
+    let unified = info.get("unifiedWindows").and_then(Value::as_object);
+    let mut out: Vec<PlanWindow> = Vec::new();
+    if let Some(kind) = s("rateLimitType") {
+        let listed = unified.and_then(|u| u.get(&kind));
+        out.push(PlanWindow {
+            utilization: info
+                .get("utilization")
+                .and_then(Value::as_f64)
+                .or_else(|| listed.and_then(|w| w.get("utilization")).and_then(Value::as_f64)),
+            resets_at: epoch_secs(info.get("resetsAt"))
+                .or_else(|| epoch_secs(listed.and_then(|w| w.get("resetsAt")))),
+            status: status.clone(),
+            overage_status: overage_status.clone(),
+            using_overage,
+            kind,
+        });
+    }
+    for (kind, w) in unified.into_iter().flatten() {
+        if out.iter().any(|p| p.kind == *kind) || !w.is_object() {
+            continue;
+        }
+        out.push(PlanWindow {
+            kind: kind.clone(),
+            utilization: w.get("utilization").and_then(Value::as_f64),
+            resets_at: epoch_secs(w.get("resetsAt")),
+            status: status.clone().filter(|st| st == "allowed"),
+            overage_status: overage_status.clone(),
+            using_overage,
+        });
+    }
+    out
+}
+
+/// How a Claude CLI session is authenticated, from its `system/init` event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CliAuth {
+    /// `claude login` with a Claude plan (`apiKeySource: "none"`).
+    Subscription,
+    /// An API key (`ANTHROPIC_API_KEY`, a helper, a proxy token…).
+    ApiKey,
+}
+
+/// The session's auth from a `system/init` event; `None` for other events
+/// and for an init that doesn't say (older CLIs).
+pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    match v.get("apiKeySource").and_then(Value::as_str)? {
+        "none" => Some(CliAuth::Subscription),
+        _ => Some(CliAuth::ApiKey),
+    }
+}
+
 /// Merge PATH-like dir lists into one, de-duplicating while preserving
 /// first-seen order and dropping empty segments.
 pub fn merge_path_dirs(parts: &[&str]) -> String {
@@ -1021,6 +1127,9 @@ impl AgentRunner for CliRunner {
             let mut codex_json_lines: u32 = 0;
             let mut codex_journaled = false;
             let mut codex_schema_warned = false;
+            // From `system/init`: an API-key session's rate-limit events are
+            // not plan windows and never reach the plan snapshot.
+            let mut auth: Option<CliAuth> = None;
             loop {
                 let elapsed = started.elapsed().as_secs();
                 if elapsed >= ABS_CAP_SECS {
@@ -1070,6 +1179,16 @@ impl AgentRunner for CliRunner {
                         }
                         for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
                             emitter.emit_raw_entry(entry);
+                        }
+                        if let Some(a) = cli_auth_from_init(&value) {
+                            auth = Some(a);
+                        }
+                        if auth != Some(CliAuth::ApiKey) {
+                            let windows = plan_windows_from_stream_event(&value);
+                            if !windows.is_empty() {
+                                // `PersistingSink` keeps the snapshot.
+                                emitter.plan_windows(&windows);
+                            }
                         }
                     }
                     CliDialect::Codex => {

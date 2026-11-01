@@ -3,6 +3,8 @@ import { useRunsStore } from "../stores/runsStore";
 import { runStatusMeta } from "../lib/runStatus";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { StageDots } from "./direct/StageDots";
+import { ClaudePlanLine } from "./ClaudePlanLine";
+import { runsClaudeCli } from "../lib/claudePlan";
 
 interface Props {
   workspaceId: string;
@@ -62,6 +64,9 @@ export function CompanionCurrentRun({ workspaceId }: Props) {
           <span className="octo-tabular" title="input / output tokens">↑{fmtTokens(tokIn)} ↓{fmtTokens(tokOut)}</span>
         )}
       </div>
+
+      {/* The Claude plan's headroom, when this run has Claude Code stages. */}
+      {runsClaudeCli(stages) && <ClaudePlanLine reloadKey={run.costUsd} />}
     </div>
   );
 }

@@ -6,6 +6,8 @@ vi.mock("../stores/runsStore", () => ({
   useRunsStore: (sel: any) => sel(h.state),
 }));
 
+vi.mock("./ClaudePlanLine", () => ({ ClaudePlanLine: () => <div data-testid="plan-line" /> }));
+
 const { CompanionCurrentRun } = await import("./CompanionCurrentRun");
 
 const run = { id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running", costUsd: 0.42, baselineUsd: 1, referenceModel: null, linkedIssueKey: null, createdAt: "t", finishedAt: null, budgetUsd: null, detached: false };
@@ -45,6 +47,16 @@ describe("CompanionCurrentRun", () => {
     expect(screen.getByText("Build it")).toBeInTheDocument(); // the running stage spotlighted
     expect(screen.getByText("$0.42")).toBeInTheDocument(); // run cost
     expect(screen.getByText(/↑1\.0k ↓200/)).toBeInTheDocument(); // run tokens (shared fmtTokens)
+  });
+
+  it("shows the Claude plan line only for a run with Claude Code stages", () => {
+    setState({ run, stages: [stage({ id: "s1", position: 0, status: "running" })] });
+    const { unmount } = render(<CompanionCurrentRun workspaceId="w1" />);
+    expect(screen.queryByTestId("plan-line")).toBeNull();
+    unmount();
+    setState({ run, stages: [{ ...stage({ id: "s1", position: 0, status: "running" }), substrate: "cli", agentModel: "claude-sonnet-4-5" }] });
+    render(<CompanionCurrentRun workspaceId="w1" />);
+    expect(screen.getByTestId("plan-line")).toBeInTheDocument();
   });
 
   it("draws the running status tag in verdigris, not brass", () => {

@@ -888,6 +888,10 @@ export const ipc = {
   getUsageBreakdown: (startIso: string, endIso: string) =>
     invoke<UsageBreakdown>("get_usage_breakdown", { startIso, endIso }),
 
+  /** The Claude plan windows CLI stages last reported (empty until a
+   *  subscription-authenticated stage streamed one). */
+  getClaudePlan: () => invoke<PlanSnapshot[]>("get_claude_plan"),
+
   /** The Usage page's report over a range, optionally one surface. Day
    *  buckets follow `utcOffsetMinutes` (the viewer's local offset). */
   getUsageReport: (startIso: string, endIso: string, surface: string | null, utcOffsetMinutes: number) =>
@@ -1468,6 +1472,20 @@ export interface SubagentTypeMeta {
   tools: string[] | null;
   /** The frontmatter `model` as written (an id or an alias like "haiku"). */
   model: string | null;
+}
+
+/** One Claude plan window as a CLI stage last saw it (`claude_plan.rs`).
+ *  `utilization` is a fraction; `resetsAt` epoch seconds; `seenAt` RFC3339. */
+export interface PlanSnapshot {
+  /** `five_hour` · `seven_day` · `seven_day_opus` · … (unknown kinds kept). */
+  kind: string;
+  utilization: number | null;
+  resetsAt: number | null;
+  /** `allowed` · `allowed_warning` · `rejected` · …; null when unknown. */
+  status: string | null;
+  overageStatus: string | null;
+  usingOverage: boolean;
+  seenAt: string;
 }
 
 export const RUN_EVENTS = {
