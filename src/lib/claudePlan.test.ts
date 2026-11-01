@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
 import type { PlanSnapshot } from "./ipc";
 import {
-  ageLabel, hasReset, lineAge, oldestSeen, orderWindows, pctLabel, planLine, planTone, planWarning, resetLabel,
+  ageLabel, currentWindows, hasReset, lineAge, oldestSeen, orderWindows, pctLabel, planLine, planTone, planWarning, resetLabel,
   runsClaudeCli, windowLabel, windowName, windowTone,
 } from "./claudePlan";
 
@@ -27,6 +27,27 @@ describe("claudePlan", () => {
     expect(windowLabel("some_new_window")).toBe("some new window");
     expect(windowName("five_hour")).toBe("5-hour window");
     expect(windowName("seven_day_sonnet")).toBe("weekly Sonnet window");
+  });
+
+  it("calls the overage window extra usage, and never says it is used up", () => {
+    expect(windowName("overage")).toBe("extra usage");
+    expect(windowLabel("overage")).toBe("extra usage");
+    const off = win({ kind: "overage", utilization: null, status: "rejected", resetsAt: null });
+    expect(planWarning([off], NOW)).toBe("Extra usage on your Claude plan isn't available right now.");
+    expect(planLine([off], NOW)).toBe("Claude plan · extra usage unavailable");
+    expect(planWarning([win({ kind: "overage", utilization: 0.9 })], NOW)).toMatch(/^Your Claude plan's extra usage is at 90%/);
+  });
+
+  it("drops a snapshot once it is a week stale", () => {
+    const old = new Date(NOW - 9 * 86_400_000).toISOString();
+    const reset = win({ seenAt: old, resetsAt: inSecs(-8 * 86400) });
+    const noReset = win({ kind: "seven_day", seenAt: old, resetsAt: null });
+    const stillOpen = win({ kind: "seven_day_opus", seenAt: old, resetsAt: inSecs(3600) });
+    const recentReset = win({ kind: "seven_day_sonnet", seenAt: new Date(NOW - 2 * 86_400_000).toISOString(), resetsAt: inSecs(-60) });
+    const unreadable = win({ kind: "mystery", seenAt: "garbage", resetsAt: inSecs(-60) });
+    expect(currentWindows([reset, noReset, stillOpen, recentReset, unreadable], NOW).map((w) => w.kind)).toEqual([
+      "seven_day_opus", "seven_day_sonnet", "mystery",
+    ]);
   });
 
   it("orders known windows first, unknown after", () => {
