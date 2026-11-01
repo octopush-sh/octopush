@@ -639,12 +639,15 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
 }
 
 /** The header's "While you were away" figures over the launch-seeded settled
- *  cards still on the board, or null when there are none. A run with no
- *  baseline can't be priced, so it stays out of the saving; when none can be
- *  priced the line reads "unpriced", never "$0.00". */
+ *  cards still on the board, or null when there are none. Only a settled
+ *  status counts — a seeded run re-run this session is no longer "away". A
+ *  run with no baseline can't be priced, so it stays out of the saving; when
+ *  none can be priced the line reads "unpriced", never "$0.00". */
 export function awayLine(settled: Run[], awayRunIds: string[]): { count: number; saved: string } | null {
   const ids = new Set(awayRunIds);
-  const away = settled.filter((r) => ids.has(r.id));
+  const away = settled.filter(
+    (r) => ids.has(r.id) && (r.status === "completed" || r.status === "aborted"),
+  );
   if (away.length === 0) return null;
   const priced = away.filter((r) => r.baselineUsd > 0);
   if (priced.length === 0) return { count: away.length, saved: "unpriced" };

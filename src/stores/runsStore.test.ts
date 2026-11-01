@@ -540,6 +540,50 @@ describe("runsStore", () => {
       err.mockRestore();
     });
 
+    it("stamps statusSince with the finish time so the band sorts by when runs finished", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().statusSince.r9).toBe(Date.parse("2026-10-31T03:10:00+00:00"));
+    });
+
+    it("does not count a run that already settled in front of this session", async () => {
+      useRunsStore.setState({ runsByWs: { w9: [OVERNIGHT] }, settledAt: { r9: 5 } });
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+      expect(useRunsStore.getState().settledAt.r9).toBe(5);
+    });
+
+    it("dismissSettled drops the run from awayRunIds", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().dismissSettled("r9");
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+    });
+
+    it("a re-run (same id) seen going active via applyStageUpdate leaves awayRunIds; its next settle is a session one", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT]);
+      (ipc.getRun as any).mockResolvedValue({ run: null, stages: [] });
+      await useRunsStore.getState().loadSettledWhileAway();
+      useRunsStore.getState().applyStageUpdate("r9", { ...OVERNIGHT, status: "running" });
+      expect(useRunsStore.getState().awayRunIds).toEqual([]);
+      const before = Date.now();
+      useRunsStore.getState().applyStageUpdate("r9", { ...OVERNIGHT, status: "completed" });
+      const s = useRunsStore.getState();
+      expect(s.awayRunIds).toEqual([]);
+      expect(s.settledAt.r9).toBeGreaterThanOrEqual(before);
+    });
+
+    it("a re-run seen via loadRuns leaves awayRunIds too, untouched runs stay", async () => {
+      (ipc.listRunsSettledSince as any).mockResolvedValue([OVERNIGHT, { ...OVERNIGHT, id: "r8" }]);
+      await useRunsStore.getState().loadSettledWhileAway();
+      expect(useRunsStore.getState().awayRunIds).toEqual(["r9", "r8"]);
+      (ipc.listRuns as any).mockResolvedValue([{ ...OVERNIGHT, status: "paused" }, { ...OVERNIGHT, id: "r8" }]);
+      (ipc.getRun as any).mockResolvedValue({ run: null, stages: [] });
+      await useRunsStore.getState().loadRuns("w9", { background: true });
+      expect(useRunsStore.getState().awayRunIds).toEqual(["r8"]);
+    });
+
     it("never overwrites a run this session already holds as active", async () => {
       // e.g. the user re-ran it before the fetch resolved.
       useRunsStore.setState({ runsByWs: { w9: [{ ...OVERNIGHT, status: "running" }] } });

@@ -9,7 +9,7 @@
  * 6. Empty board → "The floor is quiet." + dispatch CTA
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, act } from "@testing-library/react";
 import type { Run, RunStage, RunStatus } from "../lib/ipc";
 
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
@@ -25,7 +25,7 @@ vi.mock("../lib/ipc", async (orig) => {
   };
 });
 
-const { MissionControl } = await import("./MissionControl");
+const { MissionControl, awayLine } = await import("./MissionControl");
 const { useRunsStore } = await import("../stores/runsStore");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useAttentionStore } = await import("../stores/attentionStore");
@@ -225,6 +225,33 @@ describe("MissionControl", () => {
     });
     const second = renderRoom();
     expect(second.container.querySelector('[data-tour="mission-control-away"]')).toBeNull();
+  });
+
+  it("a re-run away card leaves the away line and later settles as an ordinary session settle", () => {
+    useRunsStore.setState({
+      runsByWs: { "ws-x": [mkRun("x", "completed")] },
+      settledAt: { x: 1 },
+      awayRunIds: ["x"],
+      awayStatus: "loaded",
+    });
+    const { container } = renderRoom();
+    expect(container.querySelector('[data-tour="mission-control-away"]')).not.toBeNull();
+
+    // A re-run keeps the run id: completed → running through a store path.
+    act(() => useRunsStore.getState().applyStageUpdate("x", mkRun("x", "running")));
+    expect(useRunsStore.getState().awayRunIds).toEqual([]);
+    expect(container.querySelector('[data-tour="mission-control-away"]')).toBeNull();
+
+    const before = Date.now();
+    act(() => useRunsStore.getState().applyStageUpdate("x", mkRun("x", "completed")));
+    expect(container.querySelector('[data-tour="mission-control-away"]')).toBeNull();
+    expect(useRunsStore.getState().settledAt.x).toBeGreaterThanOrEqual(before);
+    expect(screen.getByText("task x")).toBeTruthy(); // still on the Settled band
+  });
+
+  it("awayLine counts only away runs that are still settled", () => {
+    expect(awayLine([mkRun("x", "running"), mkRun("y", "paused")], ["x", "y"])).toBeNull();
+    expect(awayLine([mkRun("x", "running"), mkRun("y", "completed")], ["x", "y"])?.count).toBe(1);
   });
 
   it("reads 'unpriced' — never $0.00 — when no away run can be priced", () => {

@@ -160,15 +160,28 @@ function replaceRunInList(list: Run[], run: Run): Run[] {
  *  for an observed status change: stamps time-in-state, and parks an
  *  active→terminal run on the Settled band. First sight of a row (no previous
  *  status) stamps nothing — time-in-state falls back to `createdAt`, and a run
- *  never seen active doesn't belong on the board. */
+ *  never seen active doesn't belong on the board. A terminal run seen going
+ *  live again (a re-run keeps its id) leaves `awayRunIds`: it is no longer a
+ *  run that settled while the app was closed, and its next settle is an
+ *  ordinary session one. */
+type TrackAcc = {
+  statusSince?: Record<string, number>;
+  settledAt?: Record<string, number>;
+  awayRunIds?: string[];
+};
+
 function trackTransition(
-  s: Pick<RunsState, "runsByWs" | "statusSince" | "settledAt">,
-  acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> },
+  s: Pick<RunsState, "runsByWs" | "statusSince" | "settledAt" | "awayRunIds">,
+  acc: TrackAcc,
   run: Run,
 ): void {
   const prev = (s.runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id)?.status;
   if (prev === undefined || prev === run.status) return;
   acc.statusSince = { ...(acc.statusSince ?? s.statusSince), [run.id]: Date.now() };
+  if (TERMINAL.has(prev) && !TERMINAL.has(run.status)) {
+    const away = acc.awayRunIds ?? s.awayRunIds;
+    if (away.includes(run.id)) acc.awayRunIds = away.filter((id) => id !== run.id);
+  }
   const wasActive = prev === "running" || prev === "paused";
   if (wasActive && TERMINAL.has(run.status)) {
     acc.settledAt = { ...(acc.settledAt ?? s.settledAt), [run.id]: Date.now() };
@@ -236,7 +249,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     const runs = await ipc.listRuns(workspaceId);
     let nextActive: string | null = null;
     set((s) => {
-      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      const acc: TrackAcc = {};
       for (const run of runs) trackTransition(s, acc, run);
       if (opts?.background) {
         // Sticky active: keep the user's canvas exactly where it is. Only
@@ -274,7 +287,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     set((s) => {
       const runsByWs = { ...s.runsByWs };
       const activeRunIdByWs = { ...s.activeRunIdByWs };
-      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      const acc: TrackAcc = {};
       for (const run of active) {
         trackTransition(s, acc, run);
         runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
@@ -298,20 +311,24 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     set((s) => {
       const runsByWs = { ...s.runsByWs };
       const settledAt = { ...s.settledAt };
+      const statusSince = { ...s.statusSince };
       const awayRunIds: string[] = [];
       for (const run of settled) {
         if (!TERMINAL.has(run.status)) continue;
         // Keep a fresher row this session already holds (e.g. a re-run).
         const held = (runsByWs[run.workspaceId] ?? EMPTY_RUNS).find((r) => r.id === run.id);
         if (held && !TERMINAL.has(held.status)) continue;
+        // Already settled in front of this session — not an away run.
+        if (run.id in s.settledAt) continue;
         if (!held) runsByWs[run.workspaceId] = replaceRunInList(runsByWs[run.workspaceId] ?? [], run);
         // Stamp with the real finish time — hours ago, so the just-settled
-        // ceremony never replays for these.
+        // ceremony never replays for these, and the band sorts by finish.
         const at = Date.parse(run.finishedAt ?? "");
-        settledAt[run.id] = s.settledAt[run.id] ?? (Number.isNaN(at) ? 0 : at);
+        settledAt[run.id] = Number.isNaN(at) ? 0 : at;
+        if (!Number.isNaN(at)) statusSince[run.id] = s.statusSince[run.id] ?? at;
         awayRunIds.push(run.id);
       }
-      return { runsByWs, settledAt, awayRunIds, awayStatus: "loaded" };
+      return { runsByWs, settledAt, statusSince, awayRunIds, awayStatus: "loaded" };
     });
   },
 
@@ -326,7 +343,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       set((s) => {
         const next: any = { detailByRun: { ...s.detailByRun, [runId]: detail } };
         if (detail.run) {
-          const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+          const acc: TrackAcc = {};
           trackTransition(s, acc, detail.run);
           Object.assign(next, acc);
           const wsId = detail.run.workspaceId;
@@ -484,7 +501,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       if (!(runId in s.settledAt)) return {};
       const next = { ...s.settledAt };
       delete next[runId];
-      return { settledAt: next };
+      return { settledAt: next, awayRunIds: s.awayRunIds.filter((id) => id !== runId) };
     }),
 
   clearSettled: () => set({ settledAt: {}, awayRunIds: [] }),
@@ -500,7 +517,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
         detailByRun: { ...s.detailByRun, [runId]: detail },
         runsByWs: { ...s.runsByWs, [run.workspaceId]: replaceRunInList(wsList, run) },
       };
-      const acc: { statusSince?: Record<string, number>; settledAt?: Record<string, number> } = {};
+      const acc: TrackAcc = {};
       trackTransition(s, acc, run);
       Object.assign(next, acc);
       return next;
