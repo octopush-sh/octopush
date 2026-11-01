@@ -3,7 +3,7 @@
 #
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all     (profile app)
 #   agent-check.sh build | check | consistency | routes | all            (profile web: octopush-web)
-#   agent-check.sh install | site                                        (web: used by web-audit.yml)
+#   agent-check.sh site                                                 (profile web-audit: web-audit.yml only)
 #
 # agent-sandbox-setup.sh installs it as root-owned /usr/local/bin/octo-check
 # (with the checkout's path and the check profile baked in); the agent may run
@@ -21,7 +21,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SANDBOX_USER=octo-sandbox   # fixed: nothing the caller sets may change who runs the checks
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # replaced with the checkout path when installed
 NODE_DIR=""                                     # replaced with node's directory when installed
-PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web)
+PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web | web-audit)
 
 # Only the installed copy works: agent-sandbox-setup.sh bakes NODE_DIR in. (The
 # agent's environment is rebuilt from scratch, so GITHUB_ACTIONS isn't there.)
@@ -50,16 +50,21 @@ case "$PROFILE" in
     # dynamic route that happens to generate one).
     routes='shadow=$(cd dist 2>/dev/null && ls -d download* api update 2>/dev/null); if [ -n "$shadow" ]; then echo "octo-check: the build has $shadow in dist/ — it would shadow the /download, /api or /update routes in vercel.json (human-only)" >&2; exit 1; fi'
     case "${1:-}" in
-      install) cmd=(npm ci --no-audit --no-fund --ignore-scripts) ;;
-      # install + build in ONE call: after every call the sandbox's symlinks are
-      # deleted, node_modules/.bin included, so a separate build couldn't find astro.
-      site) cmd=(bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent build') ;;
       build) cmd=(bash -c "npm run --silent build && { $routes; }") ;;
       routes) cmd=(bash -c "$routes") ;;
       check) cmd=(npm run --silent check) ;;
       consistency) cmd=(npm run --silent consistency) ;;
       all) cmd=(bash -c "npm run --silent build && { $routes; } && npm run --silent check && npm run --silent consistency") ;;
       *) echo "usage: octo-check build | check | consistency | routes | all" >&2; exit 64 ;;
+    esac ;;
+  web-audit)
+    case "${1:-}" in
+      # Install + build in ONE call: after every call the sandbox's symlinks are
+      # deleted, node_modules/.bin included, so a separate build couldn't find
+      # astro. Its own profile, so the web builder's agent can't wipe the
+      # runner-installed node_modules with it.
+      site) cmd=(bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent build') ;;
+      *) echo "usage: octo-check site" >&2; exit 64 ;;
     esac ;;
   *) echo "octo-check: unknown profile $PROFILE" >&2; exit 64 ;;
 esac

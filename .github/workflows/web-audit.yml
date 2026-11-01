@@ -114,7 +114,7 @@ jobs:
 
       - name: Build the site as octo-sandbox (no token, no sudo, another user)
         env:
-          OCTO_CHECK_PROFILE: web
+          OCTO_CHECK_PROFILE: web-audit
         run: |
           set -euo pipefail
           OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/site" bash "$RUNNER_TEMP/scripts/routines/agent-sandbox-setup.sh"

@@ -14,7 +14,7 @@ ROOT="${OCTOPUSH_CHECKOUT:?OCTOPUSH_CHECKOUT is required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
 # Which checks octo-check runs: app (this repo) or web (octopush-web). Baked in below.
 PROFILE="${OCTO_CHECK_PROFILE:-app}"
-[[ "$PROFILE" == app || "$PROFILE" == web ]] || { echo "agent-sandbox-setup: OCTO_CHECK_PROFILE is app or web" >&2; exit 64; }
+[[ "$PROFILE" == app || "$PROFILE" == web || "$PROFILE" == web-audit ]] || { echo "agent-sandbox-setup: OCTO_CHECK_PROFILE is app, web or web-audit" >&2; exit 64; }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || { echo "agent-sandbox-setup: GitHub Actions only" >&2; exit 64; }
 

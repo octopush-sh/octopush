@@ -914,6 +914,12 @@ test("octo-check: the installed copy runs only its profile's commands", async ()
   assert.equal(app("build").status, 64);
   assert.match(app("build").stderr, /typecheck \| test/);
   assert.match(bad("all").stderr, /unknown profile/);
+  // The web builder's agent can't reinstall node_modules (the symlink cleanup would break its checks).
+  assert.equal(web("site").status, 64, "site belongs to the web-audit profile only");
+  assert.equal(web("install").status, 64);
+  const audit = install("web-audit");
+  assert.equal(audit("build").status, 64);
+  assert.match(audit("build").stderr, /usage: octo-check site/);
   assert.equal(spawnSync("bash", [new URL("./agent-check.sh", import.meta.url).pathname, "all"], { encoding: "utf8" }).status, 64, "the repo copy refuses: not installed");
 });
 
