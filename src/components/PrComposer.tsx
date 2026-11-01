@@ -18,8 +18,10 @@ import {
   PR_SYSTEM,
   buildPrPrompt,
   diffPaths,
+  canOpenPrFrom,
   issueRef,
   parsePrDraft,
+  prBaseFor,
   provenanceSummary,
   provenanceTurns,
 } from "../lib/prDraft";
@@ -126,11 +128,18 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
         if (!readiness.githubRemote) return setPhase({ kind: "no-remote" });
         if (!readiness.ghAuthenticated) return setPhase({ kind: "no-auth" });
         const [list, status] = await Promise.all([
-          ipc.listBranches(workspacePath).catch(() => ({ local: [], remote: [] })),
+          ipc.listBranches(workspacePath).catch((): BranchList => ({ local: [], remote: [], repoDefault: null })),
           ipc.getGitStatus(workspacePath).catch(() => null),
         ]);
         if (cancelled) return;
-        const onto = workspace.fromBranch || list.local[0] || "main";
+        const head = status?.branch ?? null;
+        const onto = prBaseFor(head, workspace.fromBranch, list);
+        if (!canOpenPrFrom(head, list) || !onto) {
+          return setPhase({
+            kind: "error",
+            message: "Pull requests open from a feature branch — this workspace is on the repository's default branch.",
+          });
+        }
         setBranches(list);
         setBase(onto);
         setUnpushed(!!status && (!status.hasUpstream || status.ahead > 0));
@@ -157,6 +166,10 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     setCreateError(null);
     try {
       const status = await ipc.getGitStatus(workspacePath);
+      // Never push the base branch itself: a PR needs a branch other than its base.
+      if (!status.branch || status.branch === base.replace(/^origin\//, "")) {
+        throw new Error(`Pick a base other than ${status.branch ?? "this branch"}.`);
+      }
       if (!status.hasUpstream || status.ahead > 0) await ipc.pushBranch(workspacePath);
       const pr = await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft);
       usePrStore.getState().setPr(workspace.id, pr);

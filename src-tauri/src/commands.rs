@@ -1026,6 +1026,9 @@ pub async fn logbook_summary(
 pub struct BranchList {
     pub local: Vec<String>,
     pub remote: Vec<String>,
+    /// The repo's real default branch (`origin/HEAD`, else main/master) — not
+    /// the checked-out one, which `local[0]` is.
+    pub repo_default: Option<String>,
 }
 
 #[tauri::command]
@@ -1035,6 +1038,7 @@ pub async fn list_branches(path: String) -> AppResult<BranchList> {
     Ok(BranchList {
         local: crate::git_ops::list_branches(p)?,
         remote: crate::git_ops::list_remote_branches(p)?,
+        repo_default: crate::git_ops::repo_default_branch(p),
     })
 }
 
@@ -4794,8 +4798,8 @@ pub async fn pr_draft_context(
 
 /// Open a pull request from the current branch onto `base` with `gh pr
 /// create` in the login shell. The body is written to a temp file and passed
-/// with `--body-file`, so no user text is shell-interpolated beyond the
-/// single-quoted title and branch names. Never pushes — the caller publishes
+/// with `--body-file`; base, head and title reach `gh` through environment
+/// variables, so no user text is ever shell-interpolated. Never pushes — the caller publishes
 /// the branch first.
 #[tauri::command]
 pub async fn create_pull_request(
@@ -4814,6 +4818,11 @@ pub async fn create_pull_request(
         crate::git_ops::current_branch(&repo)
             .ok_or_else(|| AppError::Other("not on a named branch".into()))?
     };
+    if !crate::github::pr_head_is_valid(&base, &branch) {
+        return Err(AppError::Other(format!(
+            "A pull request needs a branch other than its base ({branch})."
+        )));
+    }
     let mut body_file = tempfile::Builder::new()
         .prefix("octopush-pr-body-")
         .suffix(".md")
@@ -4821,7 +4830,7 @@ pub async fn create_pull_request(
         .map_err(|e| AppError::Other(format!("couldn't write the PR body: {e}")))?;
     std::io::Write::write_all(&mut body_file, body.as_bytes())
         .map_err(|e| AppError::Other(format!("couldn't write the PR body: {e}")))?;
-    let cmd = crate::github::pr_create_command(
+    let (cmd, cmd_env) = crate::github::pr_create_command(
         &base,
         &branch,
         &title,
@@ -4832,6 +4841,7 @@ pub async fn create_pull_request(
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let output = tokio::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
+        .envs(cmd_env)
         .current_dir(&path)
         .output()
         .await

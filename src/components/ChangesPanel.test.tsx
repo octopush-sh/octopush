@@ -363,7 +363,7 @@ describe("ChangesPanel — Open a pull request", () => {
   beforeEach(() => {
     usePrStore.setState({ byWorkspace: {}, composerFor: null });
     ipcMock.getGitStatus.mockResolvedValue(FEATURE);
-    ipcMock.listBranches.mockResolvedValue({ local: ["main", "feat/csv"], remote: [] });
+    ipcMock.listBranches.mockResolvedValue({ local: ["main", "feat/csv"], remote: [], repoDefault: "main" });
   });
 
   it("offers the composer for a published branch with no PR", async () => {
@@ -372,6 +372,15 @@ describe("ChangesPanel — Open a pull request", () => {
     render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
     await userEvent.click(await screen.findByRole("button", { name: "Open a pull request" }));
     expect(usePrStore.getState().composerFor).toBe("ws-1");
+  });
+
+  it("offers it from a worktree, where the checked-out branch is listed first", async () => {
+    // list_branches puts HEAD first; only repoDefault says what the default is.
+    usePrStore.getState().setPr("ws-1", null);
+    ipcMock.listBranches.mockResolvedValue({ local: ["feat/csv", "main"], remote: [], repoDefault: "main" });
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: true });
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    expect(await screen.findByRole("button", { name: "Open a pull request" })).toBeInTheDocument();
   });
 
   it("shows gh guidance instead when the CLI isn't signed in", async () => {

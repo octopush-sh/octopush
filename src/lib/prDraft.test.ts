@@ -87,3 +87,25 @@ describe("prDraft", () => {
     expect(buildPrPrompt({ diff: "d", commits: [], template: null })).toMatch(/no agent edits were tracked/);
   });
 });
+
+import { canOpenPrFrom, prBaseFor } from "./prDraft";
+
+describe("PR base and head", () => {
+  it("only feature branches open a PR", () => {
+    expect(canOpenPrFrom("feat/x", { repoDefault: "main" })).toBe(true);
+    expect(canOpenPrFrom("main", { repoDefault: "main" })).toBe(false);
+    expect(canOpenPrFrom("HEAD", { repoDefault: "main" })).toBe(false);
+    expect(canOpenPrFrom(null, { repoDefault: "main" })).toBe(false);
+    expect(canOpenPrFrom("feat/x", { repoDefault: null })).toBe(true);
+  });
+
+  it("the base is the workspace's own, else the repo default, never the head", () => {
+    expect(prBaseFor("feat/x", "release/1", { repoDefault: "main" })).toBe("release/1");
+    expect(prBaseFor("feat/x", null, { repoDefault: "main" })).toBe("main");
+    // An old workspace whose base is its own branch falls back to the default.
+    expect(prBaseFor("feat/x", "feat/x", { repoDefault: "main" })).toBe("main");
+    expect(prBaseFor("feat/x", "origin/feat/x", { repoDefault: "main" })).toBe("main");
+    expect(prBaseFor("main", null, { repoDefault: "main" })).toBeNull();
+    expect(prBaseFor("feat/x", null, { repoDefault: null })).toBeNull();
+  });
+});

@@ -200,28 +200,43 @@ pub struct PrDraftContext {
     pub template: Option<String>,
 }
 
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-/// The login-shell command that opens a pull request. Every user value is
-/// single-quoted (`'\''` escaping, as for push/pull) and the body never
-/// touches the shell at all — it goes through `--body-file`. A remote base
-/// picked as `origin/main` is opened against `main`; a title is one line.
-pub fn pr_create_command(base: &str, head: &str, title: &str, body_file: &str, draft: bool) -> String {
+/// The login-shell command that opens a pull request, plus the environment
+/// it reads its values from. No user value is ever spliced into the command:
+/// base, head, title and body file travel as environment variables and the
+/// command only says `"$VAR"`, which bash, zsh and fish all expand as one
+/// argument (fish treats `\'` inside single quotes as an escape, so
+/// single-quoting is not safe there). The body goes through `--body-file`. A
+/// remote base picked as `origin/main` is opened against `main`; a title is
+/// one line.
+pub fn pr_create_command(
+    base: &str,
+    head: &str,
+    title: &str,
+    body_file: &str,
+    draft: bool,
+) -> (String, Vec<(&'static str, String)>) {
     let base = base.strip_prefix("origin/").unwrap_or(base);
     let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut cmd = format!(
-        "gh pr create --base {} --head {} --title {} --body-file {}",
-        shell_quote(base),
-        shell_quote(head),
-        shell_quote(&title),
-        shell_quote(body_file),
+    let mut cmd = String::from(
+        "gh pr create --base \"$OCTOPUSH_PR_BASE\" --head \"$OCTOPUSH_PR_HEAD\" --title \"$OCTOPUSH_PR_TITLE\" --body-file \"$OCTOPUSH_PR_BODY_FILE\"",
     );
     if draft {
         cmd.push_str(" --draft");
     }
-    cmd
+    let env = vec![
+        ("OCTOPUSH_PR_BASE", base.to_string()),
+        ("OCTOPUSH_PR_HEAD", head.to_string()),
+        ("OCTOPUSH_PR_TITLE", title),
+        ("OCTOPUSH_PR_BODY_FILE", body_file.to_string()),
+    ];
+    (cmd, env)
+}
+
+/// Whether opening a PR from `head` onto `base` makes sense: never from a
+/// branch onto itself (that would only push the base branch).
+pub fn pr_head_is_valid(base: &str, head: &str) -> bool {
+    let base = base.strip_prefix("origin/").unwrap_or(base);
+    !head.trim().is_empty() && head != base
 }
 
 /// Read the new PR's URL from `gh pr create`'s stdout (its last URL line,

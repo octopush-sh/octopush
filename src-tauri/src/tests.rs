@@ -13343,22 +13343,53 @@ mod open_pull_request_tests {
     }
 
     #[test]
-    fn pr_create_command_quotes_every_value_and_uses_a_body_file() {
-        let cmd = pr_create_command("main", "feat/x", "Fix it's \"quoting\" $(rm -rf ~)", "/tmp/b.md", false);
+    fn pr_create_command_passes_every_value_through_the_environment() {
+        let title = "Fix it's \"quoting\" $(rm -rf ~) a\\'; open -a Calculator #";
+        let (cmd, env) = pr_create_command("main", "feat/x", title, "/tmp/b.md", false);
+        // The command is constant: nothing from the user is spliced into it.
         assert_eq!(
             cmd,
-            "gh pr create --base 'main' --head 'feat/x' --title 'Fix it'\\''s \"quoting\" $(rm -rf ~)' --body-file '/tmp/b.md'"
+            "gh pr create --base \"$OCTOPUSH_PR_BASE\" --head \"$OCTOPUSH_PR_HEAD\" --title \"$OCTOPUSH_PR_TITLE\" --body-file \"$OCTOPUSH_PR_BODY_FILE\""
         );
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("OCTOPUSH_PR_BASE"), "main");
+        assert_eq!(get("OCTOPUSH_PR_HEAD"), "feat/x");
+        assert_eq!(get("OCTOPUSH_PR_TITLE"), title);
+        assert_eq!(get("OCTOPUSH_PR_BODY_FILE"), "/tmp/b.md");
         assert!(!cmd.contains("--draft"));
-        assert!(!cmd.contains("--body "), "the body never goes through the shell");
+    }
+
+    #[test]
+    fn pr_create_command_reaches_gh_verbatim_through_a_real_shell() {
+        // `printf` stands in for gh: the shell must hand the title over as one
+        // unchanged argument, metacharacters and all.
+        let title = "a\\'; echo PWNED # $(id) `id`";
+        let (_, env) = pr_create_command("main", "feat/x", title, "/t", false);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$OCTOPUSH_PR_TITLE\"")
+            .envs(env)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), title);
     }
 
     #[test]
     fn pr_create_command_drafts_strips_origin_and_flattens_the_title() {
-        let cmd = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
-        assert!(cmd.contains("--base 'release/1.0'"), "{cmd}");
-        assert!(cmd.contains("--title 'Two lines'"), "{cmd}");
+        let (cmd, env) = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("OCTOPUSH_PR_BASE"), "release/1.0");
+        assert_eq!(get("OCTOPUSH_PR_TITLE"), "Two lines");
         assert!(cmd.ends_with(" --draft"), "{cmd}");
+    }
+
+    #[test]
+    fn a_pr_never_goes_from_a_branch_onto_itself() {
+        use crate::github::pr_head_is_valid;
+        assert!(pr_head_is_valid("main", "feat/x"));
+        assert!(!pr_head_is_valid("main", "main"));
+        assert!(!pr_head_is_valid("origin/main", "main"));
+        assert!(!pr_head_is_valid("main", ""));
     }
 
     #[test]
@@ -13385,6 +13416,26 @@ mod open_pull_request_tests {
         assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root one"));
         std::fs::write(dir.path().join(".github/pull_request_template.md"), "## Summary\n").unwrap();
         assert_eq!(find_pr_template(dir.path()).as_deref(), Some("## Summary"));
+    }
+
+    #[test]
+    fn repo_default_branch_is_origin_head_not_the_checked_out_branch() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "trunk"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        // No origin/HEAD and no main/master: unknown, never the current branch.
+        assert_eq!(crate::git_ops::repo_default_branch(d), None);
+        git(d, &["branch", "main"]);
+        assert_eq!(crate::git_ops::repo_default_branch(d).as_deref(), Some("main"));
+        git(d, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(d, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
+        assert_eq!(crate::git_ops::repo_default_branch(d).as_deref(), Some("trunk"));
     }
 
     #[test]

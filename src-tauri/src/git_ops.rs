@@ -177,6 +177,26 @@ pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
     Ok(result)
 }
 
+/// The repository's real default branch — what pull requests target — as
+/// opposed to `default_branch`, which is only the checked-out HEAD. Read from
+/// `origin/HEAD`; without one, a local or origin `main`, then `master`.
+/// `None` when none of these exist.
+pub fn repo_default_branch(path: &Path) -> Option<String> {
+    let repo = open_repo(path).ok()?;
+    if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD") {
+        if let Some(name) = r.symbolic_target().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
+            return Some(name.to_string());
+        }
+    }
+    ["main", "master"]
+        .iter()
+        .find(|n| {
+            repo.find_branch(n, git2::BranchType::Local).is_ok()
+                || repo.find_reference(&format!("refs/remotes/origin/{n}")).is_ok()
+        })
+        .map(|n| n.to_string())
+}
+
 /// Local branch names: the repo's default (HEAD) branch first, the rest
 /// alphabetical (case-insensitive). Used by the workspace creator's base picker.
 pub fn list_branches(path: &Path) -> AppResult<Vec<String>> {

@@ -52,7 +52,7 @@ const status = (over: Partial<{ hasUpstream: boolean; ahead: number }> = {}) => 
 
 function ready() {
   ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: true });
-  ipcMock.listBranches.mockResolvedValue({ local: ["main", "feat/csv"], remote: ["origin/main"] });
+  ipcMock.listBranches.mockResolvedValue({ local: ["main", "feat/csv"], remote: ["origin/main"], repoDefault: "main" });
   ipcMock.getGitStatus.mockResolvedValue(status());
   ipcMock.prDraftContext.mockResolvedValue({
     branch: "feat/csv",
@@ -173,5 +173,18 @@ describe("PrComposer", () => {
     await screen.findByText(/no GitHub remote/);
     fireEvent.keyDown(window, { key: "Escape" });
     expect(onClose).toHaveBeenCalled();
+  });
+});
+
+describe("PrComposer — never from the default branch", () => {
+  it("refuses on the default branch and pushes nothing", async () => {
+    ready();
+    ipcMock.getGitStatus.mockResolvedValue({ ...status({ ahead: 3 }), branch: "main" });
+    ipcMock.listBranches.mockResolvedValue({ local: ["main"], remote: ["origin/main"], repoDefault: "main" });
+    renderComposer();
+    expect(await screen.findByText(/open from a feature branch/)).toBeInTheDocument();
+    expect(ipcMock.prDraftContext).not.toHaveBeenCalled();
+    expect(ipcMock.pushBranch).not.toHaveBeenCalled();
+    expect(ipcMock.createPullRequest).not.toHaveBeenCalled();
   });
 });

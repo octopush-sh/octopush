@@ -25,6 +25,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
+import { canOpenPrFrom } from "../lib/prDraft";
 import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
@@ -138,7 +139,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     void Promise.all([ipc.githubShipReadiness(projectPath), ipc.listBranches(projectPath)])
       .then(([r, b]) => {
         if (cancelled) return;
-        if (!r.githubRemote || b.local[0] === publishedBranch) setPrOffer(null);
+        if (!r.githubRemote || !canOpenPrFrom(publishedBranch, b)) setPrOffer(null);
         else setPrOffer(r.ghAuthenticated ? "open" : "no-auth");
       })
       .catch(() => {

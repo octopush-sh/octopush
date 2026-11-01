@@ -1,4 +1,4 @@
-import type { FileEdit } from "./types";
+import type { BranchList, FileEdit } from "./types";
 
 export const PR_SYSTEM = `You write GitHub pull request descriptions from a branch's diff. Output ONLY: the PR title on the first line (<=72 characters, imperative, no trailing period), a blank line, then the Markdown body. If a pull request template is given, fill in that template — keep its headings and checklists, answer each section, leave a checklist item unchecked when the input doesn't show it was done. Otherwise use the sections "## Summary", "## Changes", "## How it was built" and "## Testing". Report provenance and test results only from the input; never invent them. No backticks around the whole output, no "Here is", no closing notes.`;
 
@@ -98,4 +98,27 @@ export function parsePrDraft(text: string, issueKey?: string | null): { title: s
 
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+const bare = (b: string) => b.replace(/^origin\//, "");
+
+/** Whether `head` can open a pull request: a named branch that isn't the
+ *  repository's default branch (`list.repoDefault`; `list.local[0]` is only the
+ *  checked-out branch). */
+export function canOpenPrFrom(head: string | null | undefined, list: Pick<BranchList, "repoDefault">): boolean {
+  if (!head || head === "HEAD") return false;
+  return !list.repoDefault || head !== list.repoDefault;
+}
+
+/** The base a PR from `head` targets: the workspace's own base, else the repo's
+ *  default — never `head` itself (that would only push the base branch). */
+export function prBaseFor(
+  head: string | null | undefined,
+  fromBranch: string | null | undefined,
+  list: Pick<BranchList, "repoDefault">,
+): string | null {
+  for (const b of [fromBranch, list.repoDefault]) {
+    if (b && bare(b) !== head) return b;
+  }
+  return null;
 }

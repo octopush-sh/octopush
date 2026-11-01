@@ -374,6 +374,8 @@ export interface GitStatus {
 export interface BranchList {
   local: string[];
   remote: string[];
+  /** The repo's real default branch (origin/HEAD, else main/master); `local[0]` is only the checked-out one. */
+  repoDefault?: string | null;
 }
 
 export interface FileChange {
