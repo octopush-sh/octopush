@@ -80,6 +80,20 @@ describe("SessionAnchor", () => {
     expect(screen.getByTestId("session-anchor").textContent).not.toContain("waiting");
   });
 
+  it("shrinks in the band by truncating its label, not by overflowing", () => {
+    // Regression (visual audit #315): without `min-w-0` a nowrap flex button
+    // can't shrink below its content, so it spilled over the mode switcher.
+    seed([{ id: "a", label: "a-very-long-session-label" }]);
+    render(<SessionAnchor workspaceId={WS} onOpen={() => {}} />);
+
+    const anchor = screen.getByTestId("session-anchor");
+    expect(anchor.className).toContain("min-w-0");
+    const label = screen.getByText("a-very-long-session-label");
+    expect(label.className).toContain("min-w-0");
+    expect(label.className).toContain("truncate");
+    expect(screen.getByText("⌘⌥K").className).toContain("shrink-0");
+  });
+
   it("opens the switcher on click", () => {
     const onOpen = vi.fn();
     seed([{ id: "a", label: "main" }]);

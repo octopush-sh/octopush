@@ -29,8 +29,27 @@ describe("ModeBand", () => {
       <ModeBand mode="review" onChange={vi.fn()} meta="7 files changed · +214 −61" />,
     );
     const band = container.firstElementChild as HTMLElement;
-    expect(band.className).toContain("grid-cols-[1fr_auto_1fr]");
+    expect(band.className).toContain("grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]");
     expect(band.children).toHaveLength(3);
     expect(band.children[1]).toContainElement(screen.getByRole("button", { name: /review/i }));
+  });
+
+  it("keeps the tail inside its track so it cannot overlap the switcher", () => {
+    // Regression (visual audit #315): a bare `1fr` track has a content-sized
+    // minimum, and a `justify-self-end` cell is sized to its content, so a
+    // long nowrap tail kept its full width and was drawn over the pill.
+    const { container } = render(
+      <ModeBand mode="direct" onChange={vi.fn()} meta="3k / 200k context" />,
+    );
+    const band = container.firstElementChild as HTMLElement;
+    expect(band.className).not.toMatch(/grid-cols-\[1fr|_1fr\]/);
+    const tailCell = band.children[2] as HTMLElement;
+    expect(tailCell.className).not.toContain("justify-self-");
+    expect(tailCell.className).toMatch(/(^|\s)flex(\s|$)/);
+    expect(tailCell.className).toContain("min-w-0");
+    expect(tailCell.className).toContain("justify-end");
+    const tail = screen.getByText("3k / 200k context");
+    expect(tail.className).toContain("min-w-0");
+    expect(tail.className).toContain("truncate");
   });
 });
