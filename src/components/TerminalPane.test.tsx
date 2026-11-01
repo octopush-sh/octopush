@@ -137,6 +137,12 @@ function emitEvent<T>(event: string, payload: T) {
   (eventListeners[event] ?? []).forEach((cb) => cb({ payload }));
 }
 
+/** Emits inside act(): the first `pty://data` chunk updates the pane's state
+ *  (it retires the "Starting shell" line). */
+function emitData(payload: { sessionId: string; bytes: number[]; replay?: boolean }) {
+  act(() => emitEvent("pty://data", payload));
+}
+
 // ─── Mock IPC ─────────────────────────────────────────────────────
 
 // Phase 3: TerminalPane uses spawnOrAttachTerminal instead of createSession.
@@ -250,7 +256,7 @@ describe("TerminalPane — OSC 52", () => {
 
   it("copies a program's payload as UTF-8 from live output, consumes the sequence, and says so", async () => {
     const { writeText, handler } = await mountForOsc("osc1");
-    emitEvent("pty://data", { sessionId: "osc1", bytes: [0x41] }); // live output
+    emitData({ sessionId: "osc1", bytes: [0x41] }); // live output
     expect(handler(osc52("información — Móvil ✓"))).toBe(true);
     expect(writeText).toHaveBeenCalledWith("información — Móvil ✓");
     // Nothing was pressed in Octopush, so the copy is announced.
@@ -270,8 +276,8 @@ describe("TerminalPane — OSC 52", () => {
 
     // The backend tags the replay; a live chunk queued behind it carries no
     // callback and never holds the gate by itself.
-    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x1b, 0x5d], replay: true });
-    emitEvent("pty://data", { sessionId: "osc2", bytes: [0x41] });
+    emitData({ sessionId: "osc2", bytes: [0x1b, 0x5d], replay: true });
+    emitData({ sessionId: "osc2", bytes: [0x41] });
     expect(pending).toHaveLength(1);
 
     // xterm is inside the replayed chunk → this OSC 52 is history → ignored.
@@ -290,10 +296,10 @@ describe("TerminalPane — OSC 52", () => {
     term.write.mockImplementation((_data: unknown, cb?: () => void) => {
       if (cb) pending.push(cb);
     });
-    emitEvent("pty://data", { sessionId: "osc3", bytes: [0x41], replay: true });
+    emitData({ sessionId: "osc3", bytes: [0x41], replay: true });
     expect(handler(osc52("one"))).toBe(true);
     pending.shift()!();
-    emitEvent("pty://data", { sessionId: "osc3", bytes: [0x42], replay: true });
+    emitData({ sessionId: "osc3", bytes: [0x42], replay: true });
     expect(handler(osc52("two"))).toBe(true);
     expect(writeText).not.toHaveBeenCalled();
   });
@@ -595,6 +601,66 @@ describe("TerminalPane — spawn failure", () => {
     });
     expect(onSpawn).toHaveBeenCalledTimes(1);
     expect(queryByTestId("terminal-spawn-failed")).toBeNull();
+  });
+});
+
+describe("TerminalPane — starting line", () => {
+  it("names the workspace in the prompt's slot until the PTY's first output", async () => {
+    let resolveSpawn!: (v: { mode: "Spawned"; pid: number }) => void;
+    mockIpc.spawnOrAttachTerminal.mockReturnValueOnce(
+      new Promise<{ mode: "Spawned"; pid: number }>((res) => {
+        resolveSpawn = res;
+      }),
+    );
+    const { getByTestId, getByText } = render(
+      <TerminalPane
+        terminalId="t-start"
+        workspaceId="ws"
+        workspacePath="/repos/octopush/.worktrees/x"
+        workspaceName="run-history-sync"
+        label="Main"
+        visible={true}
+      />,
+    );
+    // Spawn still in flight: never a blank pane.
+    expect(getByText("Starting shell in run-history-sync…")).toBeTruthy();
+    expect(getByTestId("terminal-starting").dataset.state).toBe("shown");
+
+    // Attached but nothing drawn yet: the line stays.
+    await act(async () => {
+      resolveSpawn({ mode: "Spawned", pid: 1 });
+      await Promise.resolve();
+    });
+    expect(getByTestId("terminal-starting").dataset.state).toBe("shown");
+
+    // The prompt arrives: the line gives way to it.
+    emitData({ sessionId: "t-start", bytes: [0x24, 0x20] });
+    const line = getByTestId("terminal-starting");
+    expect(line.dataset.state).toBe("hidden");
+    expect(line.getAttribute("aria-hidden")).toBe("true");
+  });
+
+  it("ignores output from other sessions and falls back to the folder name", async () => {
+    const { getByTestId, getByText } = render(
+      <TerminalPane terminalId="t-start2" workspaceId="ws" workspacePath="/repos/my-app/" label="Main" visible={true} />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    expect(getByText("Starting shell in my-app…")).toBeTruthy();
+    emitData({ sessionId: "someone-else", bytes: [0x41] });
+    expect(getByTestId("terminal-starting").dataset.state).toBe("shown");
+  });
+
+  it("gives way to the error state when the spawn is rejected", async () => {
+    mockIpc.spawnOrAttachTerminal.mockRejectedValueOnce("boom");
+    const { queryByTestId, getByTestId } = render(
+      <TerminalPane terminalId="t-start3" workspaceId="ws" workspacePath="/ws" label="Main" visible={true} />,
+    );
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(getByTestId("terminal-spawn-failed")).toBeTruthy();
+    expect(queryByTestId("terminal-starting")).toBeNull();
   });
 });
 

@@ -2214,6 +2214,7 @@ function App() {
                         terminalId={t.id}
                         workspaceId={t.workspaceId}
                         workspacePath={wsPath}
+                        workspaceName={ws?.name}
                         label={t.label}
                         visible={
                           activeMode === "run" &&

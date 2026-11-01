@@ -22,6 +22,7 @@ import { isMac } from "../lib/platform";
 import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
 import { SETUP_EXIT_OSC, parseSetupExit } from "../lib/setupRun";
 import { Reveal } from "./primitives/Reveal";
+import { OctoMark } from "./icons/OctoMark";
 
 // Terminal zoom bounds. The font size is session-local (not persisted): each
 // pane opens at ZOOM_DEFAULT and resets on remount.
@@ -42,6 +43,9 @@ interface Props {
   workspaceId: string;
   /** Filesystem path of the workspace root, used when spawning the PTY. */
   workspacePath: string;
+  /** Workspace name for the "Starting shell in …" line; falls back to the
+   *  last segment of `workspacePath`. */
+  workspaceName?: string;
   /** Human label shown in the session name. */
   label: string;
   visible: boolean;
@@ -72,6 +76,7 @@ export function TerminalPane({
   terminalId,
   workspaceId,
   workspacePath,
+  workspaceName,
   label,
   visible,
   layoutVersion,
@@ -85,6 +90,11 @@ export function TerminalPane({
   // fine. Drives the "Session didn't start" state over the canvas.
   const [spawnError, setSpawnError] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
+  // False until the PTY's first output (the prompt, or replayed scrollback)
+  // reaches xterm. Until then the canvas shows "Starting shell in …" in the
+  // prompt's slot instead of a blank pane.
+  const [hasOutput, setHasOutput] = useState(false);
+  const hasOutputRef = useRef(false);
   // Re-runs the spawn-or-attach of the mounted terminal ("Try the shell again").
   const spawnRef = useRef<() => void>(() => {});
   // Ref so the link provider (registered once on mount) always reads the
@@ -405,8 +415,15 @@ export function TerminalPane({
     let unlistenExit: UnlistenFn | undefined;
     let unlistenReattached: UnlistenFn | undefined;
 
+    const markOutput = () => {
+      if (hasOutputRef.current) return;
+      hasOutputRef.current = true;
+      setHasOutput(true);
+    };
+
     listen<PtyDataEvent>("pty://data", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      markOutput();
       // `replay` marks scrollback the daemon is showing again after a
       // reattach; the OSC 52 gate must not act on it.
       osc52.write(new Uint8Array(ev.payload.bytes), ev.payload.replay === true);
@@ -467,6 +484,7 @@ export function TerminalPane({
 
     listen<PtyExitEvent>("pty://exit", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      markOutput();
       term.writeln("\r\n\x1b[2;37m[session exited]\x1b[0m");
       onExitRef.current?.();
     }).then((u) => {
@@ -650,6 +668,12 @@ export function TerminalPane({
         ref={containerRef}
         className="xterm-container h-full w-full"
       />
+      {spawnError === null && (
+        <StartingShell
+          name={workspaceName || workspacePath.split(/[\\/]/).filter(Boolean).pop() || label}
+          shown={!hasOutput}
+        />
+      )}
       {spawnError !== null && (
         <SpawnFailed
           detail={spawnError}
@@ -658,6 +682,30 @@ export function TerminalPane({
           onRetry={retrySpawn}
         />
       )}
+    </div>
+  );
+}
+
+/** The prompt's slot before the PTY has drawn anything: a quiet mono line so
+ *  the canvas never reads as a terminal that didn't start. It sits on the
+ *  canvas background where xterm draws its first row, so when output arrives
+ *  it fades out over the prompt (a crossfade, never an abrupt swap). */
+function StartingShell({ name, shown }: { name: string; shown: boolean }) {
+  return (
+    <div
+      role="status"
+      aria-hidden={!shown}
+      data-testid="terminal-starting"
+      data-tour="run-starting"
+      data-state={shown ? "shown" : "hidden"}
+      className="octo-fade-in pointer-events-none absolute left-0 top-0 flex items-center gap-2 bg-octo-bg p-2 font-mono text-[12px] text-octo-mute"
+      style={{
+        opacity: shown ? 1 : 0,
+        transition: "opacity var(--dur-quick) var(--ease-octo)",
+      }}
+    >
+      <OctoMark size={14} state={shown ? "working" : "static"} />
+      <span>Starting shell in {name}…</span>
     </div>
   );
 }
