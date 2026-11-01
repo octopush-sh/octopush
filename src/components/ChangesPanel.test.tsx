@@ -147,6 +147,14 @@ describe("ChangesPanel G4", () => {
     expect(screen.getByTestId("history-modal")).toHaveTextContent("/repo");
   });
 
+  it("the eyebrow is clipped to its own box so a narrow host can't spill it", async () => {
+    // Visual audit #316: an injected header must never paint into the canvas.
+    render(<ChangesPanel projectPath="/repo" headerLeading={<div data-testid="leading" />} />);
+    const eyebrow = (await screen.findByTestId("leading")).parentElement!;
+    expect(eyebrow.tagName).toBe("HEADER");
+    expect(eyebrow).toHaveClass("min-w-0", "overflow-hidden");
+  });
+
   it("never renders an ahead/behind badge in the header (it lives in the companion now)", async () => {
     ipcMock.getGitStatus.mockResolvedValue({
       branch: "main", ahead: 3, behind: 1, hasUpstream: true,

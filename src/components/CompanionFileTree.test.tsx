@@ -76,6 +76,21 @@ describe("CompanionFileTree", () => {
     await waitFor(() => expect(screen.getByText(/Files/i)).toBeInTheDocument());
   });
 
+  it("the eyebrow is clipped to its own box so a narrow host can't spill it", async () => {
+    // Visual audit #316: the injected Changes|Files switcher drew over the
+    // Review canvas toolbar when the sidebar was squeezed.
+    render(
+      <CompanionFileTree
+        rootPath={ROOT}
+        rootLabel="my-project"
+        changedPaths={CHANGED}
+        headerLeading={<div data-testid="leading" />}
+      />,
+    );
+    const eyebrow = (await screen.findByTestId("leading")).parentElement!;
+    expect(eyebrow).toHaveClass("min-w-0", "overflow-hidden");
+  });
+
   it("never truncates deep names — the tree scrolls horizontally instead", async () => {
     render(<CompanionFileTree rootPath={ROOT} rootLabel="my-project" changedPaths={CHANGED} />);
     const label = await screen.findByText("pom.xml");

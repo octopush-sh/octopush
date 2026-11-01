@@ -691,8 +691,10 @@ export function CompanionFileTree({
   return (
     <section className="flex h-full min-h-0 flex-col">
       {/* Eyebrow — same height & padding as the canvas toolbar and the
-          left rail's CHANGES eyebrow so the three top bars form one row. */}
-      <div className="flex h-11 shrink-0 items-center justify-between gap-3 border-b border-octo-hairline px-3">
+          left rail's CHANGES eyebrow so the three top bars form one row.
+          min-w-0 + overflow-hidden: however narrow the host panel, the
+          eyebrow never paints past its own edge into a neighbour's bar. */}
+      <div className="flex h-11 min-w-0 shrink-0 items-center justify-between gap-3 overflow-hidden border-b border-octo-hairline px-3">
         {headerLeading ?? (
           <h3 className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Files</h3>
         )}
