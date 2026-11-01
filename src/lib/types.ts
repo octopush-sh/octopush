@@ -421,6 +421,16 @@ export interface GhIssue {
   url: string;
 }
 
+/** What the PR composer drafts from (`pr_draft_context`): the branch's diff
+ *  against the base (`git diff base...HEAD`), its commit subjects (newest
+ *  first) and the repo's pull-request template, if it has one. */
+export interface PrDraftContext {
+  branch: string;
+  diff: string;
+  commits: string[];
+  template: string | null;
+}
+
 /** Preflight for "Ship it": github.com origin + authenticated gh. */
 export interface ShipReadiness {
   githubRemote: boolean;

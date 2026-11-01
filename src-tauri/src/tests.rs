@@ -13330,3 +13330,88 @@ mod updater_channel_tests {
         assert_eq!(manifest_date(&serde_json::json!({})), None);
     }
 }
+
+#[cfg(test)]
+mod open_pull_request_tests {
+    use crate::github::{find_pr_template, pr_create_command, pr_from_create_output, PrState};
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn pr_create_command_quotes_every_value_and_uses_a_body_file() {
+        let cmd = pr_create_command("main", "feat/x", "Fix it's \"quoting\" $(rm -rf ~)", "/tmp/b.md", false);
+        assert_eq!(
+            cmd,
+            "gh pr create --base 'main' --head 'feat/x' --title 'Fix it'\\''s \"quoting\" $(rm -rf ~)' --body-file '/tmp/b.md'"
+        );
+        assert!(!cmd.contains("--draft"));
+        assert!(!cmd.contains("--body "), "the body never goes through the shell");
+    }
+
+    #[test]
+    fn pr_create_command_drafts_strips_origin_and_flattens_the_title() {
+        let cmd = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
+        assert!(cmd.contains("--base 'release/1.0'"), "{cmd}");
+        assert!(cmd.contains("--title 'Two lines'"), "{cmd}");
+        assert!(cmd.ends_with(" --draft"), "{cmd}");
+    }
+
+    #[test]
+    fn pr_from_create_output_reads_the_url_line() {
+        let out = "Warning: 1 uncommitted change\nhttps://github.com/o/r/pull/42\n";
+        let pr = pr_from_create_output(out, "Add a thing", true).expect("a PR");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+        assert_eq!(pr.state, PrState::Draft);
+        assert!(pr.is_draft);
+        assert_eq!(pr_from_create_output(out, "t", false).unwrap().state, PrState::Open);
+        assert!(pr_from_create_output("no url here\nhttps://github.com/o/r\n", "t", false).is_none());
+    }
+
+    #[test]
+    fn find_pr_template_follows_githubs_lookup_order() {
+        let dir = tempdir().unwrap();
+        assert_eq!(find_pr_template(dir.path()), None);
+        std::fs::write(dir.path().join("PULL_REQUEST_TEMPLATE.md"), "root one").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root one"));
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        // A blank template is skipped, not used.
+        std::fs::write(dir.path().join(".github/pull_request_template.md"), "  \n").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root one"));
+        std::fs::write(dir.path().join(".github/pull_request_template.md"), "## Summary\n").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("## Summary"));
+    }
+
+    #[test]
+    fn branch_pr_context_diffs_from_the_merge_base() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        std::fs::write(d.join("b.txt"), "two\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "Add b"]);
+        // main moves on after the branch point; its change is not in the PR.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "x\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "feature"]);
+
+        let (diff, commits) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(diff.contains("b.txt"), "{diff}");
+        assert!(!diff.contains("main-only.txt"), "{diff}");
+        assert_eq!(commits, vec!["Add b".to_string()]);
+        assert!(crate::git_ops::branch_pr_context(d, "nope").is_err());
+    }
+}

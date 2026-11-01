@@ -12,6 +12,7 @@ const { ipcMock, pushToast } = vi.hoisted(() => ({
     aiComplete: vi.fn(), fetchChanges: vi.fn(), pull: vi.fn(),
     resolveConflictTake: vi.fn(), markConflictResolved: vi.fn(),
     continueOperation: vi.fn(), abortOperation: vi.fn(),
+    githubShipReadiness: vi.fn(), listBranches: vi.fn(), findPrForBranch: vi.fn(),
   },
   pushToast: vi.fn(),
 }));
@@ -34,6 +35,7 @@ vi.mock("./HistoryModal", () => ({
 }));
 
 import { ChangesPanel } from "./ChangesPanel";
+import { usePrStore } from "../stores/prStore";
 
 const STATUS = {
   branch: "main", ahead: 0, behind: 0, hasUpstream: true,
@@ -350,5 +352,66 @@ describe("ChangesPanel G7 conflicts", () => {
     await screen.findByText(/2 conflicts · merge/i);
     await userEvent.click(screen.getAllByRole("button", { name: /open in editor/i })[0]);
     expect(onFileClick).toHaveBeenCalledWith("src/a.ts");
+  });
+});
+
+// ─── Open a pull request (#300) ───────────────────────────────────
+
+describe("ChangesPanel — Open a pull request", () => {
+  const FEATURE = { ...STATUS, branch: "feat/csv" };
+
+  beforeEach(() => {
+    usePrStore.setState({ byWorkspace: {}, composerFor: null });
+    ipcMock.getGitStatus.mockResolvedValue(FEATURE);
+    ipcMock.listBranches.mockResolvedValue({ local: ["main", "feat/csv"], remote: [] });
+  });
+
+  it("offers the composer for a published branch with no PR", async () => {
+    usePrStore.getState().setPr("ws-1", null);
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: true });
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await userEvent.click(await screen.findByRole("button", { name: "Open a pull request" }));
+    expect(usePrStore.getState().composerFor).toBe("ws-1");
+  });
+
+  it("shows gh guidance instead when the CLI isn't signed in", async () => {
+    usePrStore.getState().setPr("ws-1", null);
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: false });
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    expect(await screen.findByText(/to open a pull request from here/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Open a pull request" })).not.toBeInTheDocument();
+  });
+
+  it("stays hidden on the default branch, off GitHub, or while the PR is unknown", async () => {
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: true });
+    const { unmount } = render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await screen.findByRole("button", { name: /fetch/i });
+    expect(ipcMock.githubShipReadiness).not.toHaveBeenCalled(); // PR unknown → no offer
+    unmount();
+
+    usePrStore.getState().setPr("ws-1", null);
+    ipcMock.getGitStatus.mockResolvedValue({ ...STATUS, branch: "main" });
+    const second = render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await waitFor(() => expect(ipcMock.listBranches).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Open a pull request" })).not.toBeInTheDocument();
+    second.unmount();
+
+    ipcMock.getGitStatus.mockResolvedValue(FEATURE);
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: false, ghAuthenticated: false });
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await waitFor(() => expect(ipcMock.githubShipReadiness).toHaveBeenCalledTimes(2));
+    expect(screen.queryByRole("button", { name: "Open a pull request" })).not.toBeInTheDocument();
+  });
+
+  it("looks the PR up right after publishing", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...FEATURE, ahead: 1 });
+    ipcMock.pushBranch.mockResolvedValue("done");
+    ipcMock.findPrForBranch.mockResolvedValue(null);
+    ipcMock.githubShipReadiness.mockResolvedValue({ githubRemote: true, ghAuthenticated: true });
+    render(<ChangesPanel projectPath="/repo" workspaceId="ws-1" />);
+    await userEvent.click(await screen.findByRole("button", { name: /push to origin/i }));
+    await waitFor(() => expect(ipcMock.findPrForBranch).toHaveBeenCalledWith("/repo"));
+    expect(await screen.findByRole("button", { name: "Open a pull request" })).toBeInTheDocument();
+    expect(usePrStore.getState().byWorkspace["ws-1"]).toBeNull();
   });
 });

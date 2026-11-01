@@ -372,6 +372,8 @@ pub fn run() {
             commands::list_prs,
             commands::list_github_issues,
             commands::github_ship_readiness,
+            commands::pr_draft_context,
+            commands::create_pull_request,
             commands::ensure_pr_branch,
             // Workspace-wide file & text search
             commands::list_workspace_files,

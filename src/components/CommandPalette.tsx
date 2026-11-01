@@ -17,6 +17,8 @@ interface Props {
   onClose: () => void;
   onNewSession: () => void;
   onToggleTokens: () => void;
+  /** Opens the PR composer for the active workspace; absent without one. */
+  onOpenPullRequest?: () => void;
 }
 
 export function CommandPalette({
@@ -24,6 +26,7 @@ export function CommandPalette({
   onClose,
   onNewSession,
   onToggleTokens,
+  onOpenPullRequest,
 }: Props) {
   const { sessions, activeId, select, kill } = useSessionStore();
   const refresh = useSessionStore((s) => s.refresh);
@@ -157,6 +160,14 @@ export function CommandPalette({
 
             {/* Actions */}
             <Group heading="Actions">
+              {onOpenPullRequest && (
+                <Item
+                  glyph="↗"
+                  label="Open a pull request"
+                  shortcut="⌘⇧P"
+                  onSelect={() => run(onOpenPullRequest)}
+                />
+              )}
               <Item
                 glyph="↺"
                 label="Check for updates"
