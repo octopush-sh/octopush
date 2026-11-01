@@ -198,7 +198,7 @@ Terminal navigation lives on the **canvas**, not in the Companion: collapsing th
 - **prefersReducedMotion()** — Shared JS guard for reduced-motion. _Support:_ `src/lib/motion.ts`.
 
 ### Notable implementation details
-- `activeMode` is derived from `modePerWorkspace[activeWorkspaceId] || "talk"`. All four mode canvases stay mounted as opacity-gated `ModeOverlay`s (no unmount on switch). A single `window` `keydown` listener in `App.tsx` owns every global shortcut (see Appendix C).
+- `activeMode` is derived from `modePerWorkspace[activeWorkspaceId] || "talk"`. All four mode canvases stay mounted as opacity-gated `ModeOverlay`s (no unmount on switch). A single `window` `keydown` listener (`src/hooks/useGlobalShortcuts.ts`, called from `App.tsx`) owns every global shortcut (see Appendix C).
 - **Attention model** — `attentionStore.ping(wsId, kind)` flags a workspace ("chat"→Talk, "terminal"→Run) and chimes; App mirrors `{workspaceId, mode}` into `src/lib/focus.ts` and clears a flag only when the user is on the matching mode of the flagged workspace.
 - **PTY survival architecture** — `allTerminalRefs` flattens `terminalsByWs` so every `TerminalPane` mounts at once (only the active one visible), keeping PTYs + scrollback alive across project switches. A module-level `terminalInitInFlight` Set guards against double-creation of the auto-"Main" terminal.
 - **Git/PR refresh cadence** — Git status refreshes on workspace/mode change, on window focus, and on a 3s interval only in run/review (skipped while hidden); the diff is built only in Review. On window focus the app also **refreshes every externally-authored surface** — `octopush-mcp` is a separate process writing to the same SQLite store and cannot emit Tauri events, so on return from another app it re-lists **workspaces** (`loadAllWorkspaces` — rail), **pipelines** (`pipelineStore.load` — the ensemble picker), and the **active workspace's runs** (`runsStore.loadRuns` — incl. MCP-staged drafts). Background refetches never clobber UI state: `loadRuns(…, { background: true })` is **sticky-active** — the viewed canvas is never reassigned under the user (a newly staged draft surfaces in the RUNS list, never by stealing the launcher/view; only a vanished/terminal active is replaced, and then only by an *executing* run), the launcher repairs its pipeline selection against the new list and **resets position-keyed model overrides if the selected pipeline was restructured externally** (they would otherwise retarget onto the wrong stage), and run rows are keyed by id; no new timers. Open-PR is fetched per workspace-switch then every 60s. Token usage refreshes every 30s and on chat-turn completion.
@@ -1128,7 +1128,7 @@ Database at `~/Library/Application Support/octopush/octopush.db`; all schema + m
 
 ## Appendix C — Keyboard shortcuts
 
-Global shortcuts are owned by a single `keydown` listener in `src/App.tsx`. (The Settings → Shortcuts pane documents a curated subset.)
+Global shortcuts are owned by a single `keydown` listener (`useGlobalShortcuts`, called from `src/App.tsx`) that walks the declarative `GLOBAL_SHORTCUTS` table in `src/hooks/useGlobalShortcuts.ts`: the first chord that matches claims the key, a Run-only entry does nothing outside Run (and doesn't `preventDefault`), and a key an inner handler already `preventDefault`ed is ignored. A test checks every table entry's key caps against this appendix. (The Settings → Shortcuts pane documents a curated subset.)
 
 | Shortcut | Action |
 |---|---|
