@@ -89,4 +89,24 @@ describe("RunFlow — depth of field & the single beacon", () => {
     const titles = Array.from(container.querySelectorAll('[title*="Escalated"]'));
     expect(titles).toHaveLength(1);
   });
+
+  // #312: a flex <button> card must hand its width to its rows in WebKit too,
+  // so the truncating rows are `w-full min-w-0` and the card clips.
+  it("clips long stage titles and models against the card", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    const cards = Array.from(container.querySelectorAll("button.flex-col"));
+    expect(cards).toHaveLength(3);
+    for (const card of cards) {
+      expect(card).toHaveClass("overflow-hidden");
+      for (const truncating of Array.from(card.querySelectorAll(".truncate"))) {
+        let row = truncating.parentElement!;
+        while (row !== card) {
+          if (row.classList.contains("flex")) expect(row).toHaveClass("w-full", "min-w-0");
+          row = row.parentElement!;
+        }
+      }
+    }
+  });
 });

@@ -12,7 +12,11 @@ interface Props {
 /** A compact, always-readable pipeline ticket in the launcher's selector rail.
  *  The name never collapses (fixed min-width, graceful truncate); the shape line
  *  hints at the flow; an `&` brass seal marks an Octopush original. The full
- *  description lives by the selected pipeline's flow, not crammed in here. */
+ *  description lives by the selected pipeline's flow, not crammed in here.
+ *  Every row is `w-full min-w-0` and the card clips (`overflow-hidden`): some
+ *  WebKit builds don't hand a flex `<button>`'s width down to its rows, so a
+ *  long name would otherwise run over the next ticket (#312). The focus ring
+ *  is the button's own box-shadow, which the clip doesn't touch. */
 export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) {
   const { name, isBuiltin } = pipeline.pipeline;
   const stages = [...pipeline.stages].sort((a, b) => a.position - b.position);
@@ -24,13 +28,13 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
         onClick={onSelect}
         aria-pressed={selected}
         title={name}
-        className={`flex w-[184px] flex-col gap-2 rounded-md border px-3.5 py-3 text-left transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+        className={`flex w-[184px] flex-col gap-2 overflow-hidden rounded-md border px-3.5 py-3 text-left transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
           selected
             ? "border-octo-brass bg-[var(--brass-ghost)]"
             : "border-octo-hairline bg-octo-panel-2 hover:border-[var(--brass-dim)]"
         }`}
       >
-        <div className="flex items-center gap-1.5">
+        <div className="flex w-full min-w-0 items-center gap-1.5">
           {isBuiltin && (
             <span className="font-serif text-[13px] leading-none text-octo-brass" title="An Octopush original">
               &amp;
@@ -40,7 +44,7 @@ export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) 
         </div>
         {/* Shape line — the universal micro-track in its neutral tone; the dot
             run clips while the stage count always stays legible. */}
-        <div className="flex items-center gap-1 font-mono text-[10px] text-octo-mute">
+        <div className="flex w-full min-w-0 items-center gap-1 font-mono text-[10px] text-octo-mute">
           <StageDots
             tone="shape"
             stages={stages.map((s) => ({ status: "pending", checkpoint: s.checkpoint }))}

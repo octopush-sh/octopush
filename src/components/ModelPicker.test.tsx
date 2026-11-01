@@ -123,6 +123,22 @@ describe("ModelPicker", () => {
     expect(onSelect).toHaveBeenCalledWith("gpt-4o");
   });
 
+  // #312: the row is a flex-col <button>; its name line must clip against it
+  // in WebKit too, so the line is `w-full min-w-0` and the row clips.
+  it("clips a long model name against its row", async () => {
+    listProvidersMock.mockResolvedValue(twoProviders);
+    render(<ModelPicker activeModel="claude-opus-4-6" onSelectModel={vi.fn()} />);
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole("button", { name: /Opus 4\.6/i }));
+    const names = screen.getAllByText("GPT-4o");
+    expect(names.length).toBeGreaterThan(0);
+    for (const name of names) {
+      expect(name).toHaveClass("min-w-0", "truncate");
+      expect(name.parentElement).toHaveClass("w-full", "min-w-0");
+      expect(name.closest('[role="option"]')).toHaveClass("overflow-hidden");
+    }
+  });
+
   it("closes dropdown when clicking outside", async () => {
     listProvidersMock.mockResolvedValue(twoProviders);
     render(
@@ -328,6 +344,9 @@ describe("ModelPicker — Auto (economy director)", () => {
     });
     const auto = screen.getByTestId("model-picker-auto");
     expect(auto.textContent).toContain("director on Opus 4.6");
+    // #312: the name line clips against the row in WebKit too.
+    expect(auto).toHaveClass("overflow-hidden");
+    expect(screen.getByText("Auto", { selector: ".truncate" }).parentElement).toHaveClass("w-full", "min-w-0");
     fireEvent.click(auto);
     expect(onSelect).toHaveBeenCalledWith("auto");
   });
