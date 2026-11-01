@@ -102,6 +102,13 @@ describe("claudePlan", () => {
     expect(resetLabel(inSecs(3 * 86400), NOW)).toMatch(/\S+ \d{2}:\d{2}/);
   });
 
+  it("writes a reset just after midnight as 00:xx, never 24:xx", () => {
+    const reset = new Date(2026, 10, 2, 0, 20);
+    const now = reset.getTime() - 3600_000;
+    const label = resetLabel(reset.getTime() / 1000, now);
+    expect(label).toMatch(/^00\D20$/);
+  });
+
   it("knows which runs can report plan windows", () => {
     expect(runsClaudeCli([{ substrate: "api", agentModel: "claude-sonnet-4-5" }])).toBe(false);
     expect(runsClaudeCli([{ substrate: "cli", agentModel: "gpt-5-codex" }])).toBe(false);

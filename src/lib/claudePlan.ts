@@ -99,10 +99,12 @@ export function pctLabel(u: number | null): string {
   return u == null ? "—" : `${Math.round(u * 100)}%`;
 }
 
-/** Reset time in the viewer's clock: `19:40` within a day, else `Tue 19:40`. */
+/** Reset time in the viewer's clock: `19:40` within a day, else `Tue 19:40`.
+ *  `hourCycle: "h23"`, not `hour12: false`: the latter resolves to `h24` in
+ *  12-hour locales and writes 00:20 as `24:20`. */
 export function resetLabel(epochSecs: number, nowMs: number): string {
   const d = new Date(epochSecs * 1000);
-  const hm = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false });
+  const hm = d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
   if (epochSecs * 1000 - nowMs < 86_400_000) return hm;
   return `${d.toLocaleDateString(undefined, { weekday: "short" })} ${hm}`;
 }
