@@ -106,10 +106,26 @@ function git(gitDir, args, opts = {}) {
   return execFileSync("git", [...SAFE, `--git-dir=${gitDir}`, `--work-tree=${process.cwd()}`, ...args], { encoding: "utf8", ...opts });
 }
 
+/**
+ * Changed paths with their porcelain status (`XY`). With `-z`, a rename or
+ * copy is followed by its original path as a separate entry; that one is kept
+ * too (as a deletion), so the old name is staged as removed.
+ */
+export function parsePorcelain(out) {
+  const parts = out.split("\0");
+  const entries = [];
+  for (let i = 0; i < parts.length; i++) {
+    const l = parts[i];
+    if (!l) continue;
+    const xy = l.slice(0, 2);
+    entries.push({ xy, path: l.slice(3) });
+    if (/[RC]/.test(xy) && parts[i + 1]) entries.push({ xy: " D", path: parts[++i] });
+  }
+  return entries;
+}
+
 function changedPaths(gitDir) {
-  return git(gitDir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"])
-    .split("\0").filter(Boolean)
-    .map((l) => l.slice(3));
+  return parsePorcelain(git(gitDir, ["status", "--porcelain=v1", "-z", "--untracked-files=all"]));
 }
 
 function park(gh, repo, kind, n, reason) {
@@ -151,15 +167,21 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   const r = parsed.result;
   if (r.action === "stop") { park(jobGh, jobRepo, kind, n, r.reason); console.log(`parked #${n}`); return 0; }
 
-  // Every check runs on ALL changed paths first; caches are dropped only after.
-  const all = changedPaths(gitDir);
+  // The path checks run on ALL changed paths first; caches are dropped only
+  // after (the secret scan reads only what will be committed).
+  const entries = changedPaths(gitDir);
+  const all = entries.map((e) => e.path);
   if (!all.length) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
   const bad = forbiddenPaths(all, repo);
   if (bad.length) { park(jobGh, jobRepo, kind, n, `It changed paths agents may not touch: ${bad.join(", ")}.`); return 1; }
   // A committed symlink could point the reviewer (or anyone) at /proc or runner files.
   const links = all.filter((p) => { try { return lstatSync(p).isSymbolicLink(); } catch { return false; } });
   if (links.length) { park(jobGh, jobRepo, kind, n, `It created symlinks, which agents may not commit: ${links.join(", ")}.`); return 1; }
-  const paths = all.filter((p) => !CACHE.some((re) => re.test(p)));
+  // A cache file is never added, but removing one that is already committed
+  // (a report a past round shipped) must still reach the branch.
+  const paths = entries
+    .filter((e) => e.xy.includes("D") || !CACHE.some((re) => re.test(e.path)))
+    .map((e) => e.path);
   if (!paths.length) { park(jobGh, jobRepo, kind, n, "It changed only cache files."); return 1; }
   const contents = paths.filter((p) => existsSync(p)).map((p) => { try { return readFileSync(p, "utf8"); } catch { return ""; } });
   if (leaks([...contents, r.title ?? "", r.summary ?? ""], [...secrets, token])) {

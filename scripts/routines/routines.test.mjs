@@ -516,7 +516,10 @@ test("hardening: nested agent docs and .gitattributes are human-only; markers mu
 });
 
 test("publishing: human-only paths, caches, closing references", async () => {
-  const { defuseClosing, CACHE } = await import("./publish-build.mjs");
+  const { defuseClosing, CACHE, parsePorcelain } = await import("./publish-build.mjs");
+  assert.deepEqual(parsePorcelain("R  new.ts\0old.ts\0 D gone.json\0?? a b.ts\0"), [
+    { xy: "R ", path: "new.ts" }, { xy: " D", path: "old.ts" }, { xy: " D", path: "gone.json" }, { xy: "??", path: "a b.ts" },
+  ]);
   assert.deepEqual(forbiddenPaths(["scripts/routines/gh.mjs", "package.json", "src/a.ts", "src/x/.git/hooks/pre-commit"]),
     ["scripts/routines/gh.mjs", "package.json", "src/x/.git/hooks/pre-commit"]);
   assert.ok(CACHE.some((re) => re.test("node_modules/.vite/vitest/results.json")));
@@ -591,7 +594,7 @@ test("answers: trailing punctuation is not a note", () => {
 test("publish-build end to end: a real git repo, a fake GitHub — PR opened, CI dispatched, guards applied", async () => {
   const { publish } = await import("./publish-build.mjs");
   const { execFileSync } = await import("node:child_process");
-  const { mkdirSync, symlinkSync } = await import("node:fs");
+  const { mkdirSync, symlinkSync, rmSync } = await import("node:fs");
   const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
   const setup = () => {
     const root = mkdtempSync(join(tmpdir(), "pub-"));
@@ -603,14 +606,18 @@ test("publish-build end to end: a real git repo, a fake GitHub — PR opened, CI
   };
   const run = async (prep, result, kind = "issue") => {
     const t = setup();
-    prep(t.work);
+    prep(t.work, t.gitDir);
     mkdirSync(join(t.work, ".agent-out"));
     writeFileSync(join(t.work, ".agent-out", "result.json"), JSON.stringify(result));
     const f = fakeGh([[/pulls\?state=open/, []]]);
     const cwd = process.cwd(); process.chdir(t.work);
     try {
       const code = await publish({ kind, n: 7, existingBranch: kind === "pr" ? "agent/x" : undefined, repo: "o/r", gitDir: t.gitDir, token: "gh-token", secrets: ["sk-very-secret-1"], gh: f.gh, pushUrl: t.bare });
-      return { code, writes: f.writes, branches: execFileSync("git", ["--git-dir", t.bare, "branch", "--list"], { encoding: "utf8" }) };
+      return {
+        code, writes: f.writes,
+        branches: execFileSync("git", ["--git-dir", t.bare, "branch", "--list"], { encoding: "utf8" }),
+        tree: (b) => execFileSync("git", ["--git-dir", t.bare, "ls-tree", "-r", "--name-only", b], { encoding: "utf8" }).split("\n"),
+      };
     } finally { process.chdir(cwd); }
   };
   const ok = await run((w) => { mkdirSync(join(w, "src")); writeFileSync(join(w, "src", "a.ts"), "export const a = 1;\n"); mkdirSync(join(w, "coverage")); writeFileSync(join(w, "coverage", "x.json"), "{}"); writeFileSync(join(w, "src", "*"), "odd name"); },
@@ -633,6 +640,20 @@ test("publish-build end to end: a real git repo, a fake GitHub — PR opened, CI
   const leak = await run((w) => { mkdirSync(join(w, "src")); writeFileSync(join(w, "src", "a.ts"), "const t = 'sk-very-secret-1';"); }, { action: "pr", title: "T", summary: "S" });
   assert.equal(leak.code, 1);
   assert.doesNotMatch(leak.branches, /agent\//);
+
+  // A report a past round committed is removed when the agent deletes it (#383).
+  const gw = (w, d, ...a) => sh(w, `--git-dir=${d}`, `--work-tree=${w}`, ...a);
+  const report = await run((w, d) => {
+    writeFileSync(join(w, "vitest-report.tmp.json"), "{}"); gw(w, d, "add", "."); gw(w, d, "commit", "-qm", "oops");
+    rmSync(join(w, "vitest-report.tmp.json"));
+    mkdirSync(join(w, "src")); writeFileSync(join(w, "src", "b.ts"), "export const b = 1;\n");
+    writeFileSync(join(w, "vitest-report.json"), "{}"); // a fresh one is still never added
+  }, { action: "pr", title: "Add b", summary: "S" });
+  assert.equal(report.code, 0);
+  const tree = report.tree("agent/issue-7-add-b");
+  assert.ok(tree.includes("src/b.ts"));
+  assert.ok(!tree.includes("vitest-report.tmp.json"), "the committed report is deleted");
+  assert.ok(!tree.includes("vitest-report.json"), "a new report is not added");
 
   const none = await run(() => {}, { action: "pr", title: "T", summary: "S" });
   assert.equal(none.code, 1, "no changes → parked, not a crash");
