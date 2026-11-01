@@ -12,8 +12,8 @@
  */
 
 import { describe, it, expect, vi, beforeEach, type MockedFunction } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { ReviewCanvas } from "./ReviewCanvas";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { ReviewCanvas, REVIEWBAR_MORE_BELOW } from "./ReviewCanvas";
 import { ipc } from "../lib/ipc";
 import { useReviewPrefs } from "../stores/reviewPrefsStore";
 import { useEditorStore } from "../stores/editorStore";
@@ -188,6 +188,47 @@ describe("ReviewCanvas toolbar", () => {
     fireEvent.click(more);
     expect(screen.getByRole("menu")).toBeInTheDocument();
     fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  // Review of #383: the toolbar's z-index escaped the canvas and competed
+  // with the ContextHeader's (20), so its provenance popover painted under it.
+  it("the canvas root is its own stacking context, so the toolbar's z-index stays local", () => {
+    const { container } = renderCanvas();
+    expect(container.firstElementChild).toHaveClass("isolate");
+    expect(container.firstElementChild).toContainElement(container.querySelector("header.octo-reviewbar"));
+  });
+
+  it("More closes when the toolbar widens past the rung, since its trigger sheds", () => {
+    const OriginalRO = globalThis.ResizeObserver;
+    let notify: ((width: number) => void) | null = null;
+    globalThis.ResizeObserver = class {
+      cb: ResizeObserverCallback;
+      constructor(cb: ResizeObserverCallback) { this.cb = cb; }
+      observe() {
+        notify = (width) =>
+          this.cb([{ contentRect: { width } } as ResizeObserverEntry], this as unknown as ResizeObserver);
+      }
+      unobserve() {}
+      disconnect() {}
+    } as unknown as typeof ResizeObserver;
+    try {
+      renderCanvas();
+      fireEvent.click(screen.getByRole("button", { name: /more view options/i }));
+      act(() => notify?.(REVIEWBAR_MORE_BELOW));
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+      act(() => notify?.(REVIEWBAR_MORE_BELOW + 1));
+      expect(screen.queryByRole("menu")).toBeNull();
+    } finally {
+      globalThis.ResizeObserver = OriginalRO;
+    }
+  });
+
+  it("More closes when the view switches to the editor", () => {
+    renderCanvas();
+    fireEvent.click(screen.getByRole("button", { name: /more view options/i }));
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /editor view/i }));
     expect(screen.queryByRole("menu")).toBeNull();
   });
 

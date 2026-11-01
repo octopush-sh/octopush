@@ -42,6 +42,10 @@ import { TestDrawer } from "./review/TestDrawer";
 
 export type ReviewViewMode = "diff" | "editor";
 
+/** The toolbar content width at or below which "More" replaces the secondary
+ *  toggles. Mirrors `@container octo-reviewbar (max-width: 600px)` in styles.css. */
+export const REVIEWBAR_MORE_BELOW = 600;
+
 /** The three Markdown layouts, in the order the toolbar shows them and ⌥⌘M
  *  cycles them. Icon-only with tooltips, like the reading-mode pair beside it. */
 const MD_VIEWS: { value: MdView; Icon: LucideIcon; label: string; title: string }[] = [
@@ -156,6 +160,7 @@ export function ReviewCanvas({
   // the toolbar's ladder sheds below 600px (`.octo-reviewbar` in styles.css).
   const [moreOpen, setMoreOpen] = useState(false);
   const moreMenuRef = useRef<HTMLDivElement>(null);
+  const toolbarRef = useRef<HTMLElement>(null);
   // Last value persisted to the backend — guards against the Enter handler and
   // the input's blur-on-unmount both firing setWorkspaceTestCommand.
   const savedCmdRef = useRef<string | null>(null);
@@ -239,6 +244,21 @@ export function ReviewCanvas({
     return () => window.removeEventListener("mousedown", onDown);
   }, [testsOpen, moreOpen]);
 
+  // More's trigger only exists on a narrow toolbar, and its items depend on
+  // the view mode: close the menu when either changes, so it never outlives
+  // a trigger the ladder has hidden or shows controls for the other view.
+  useEffect(() => setMoreOpen(false), [viewMode]);
+  useEffect(() => {
+    const bar = toolbarRef.current;
+    if (!moreOpen || !bar || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver((entries) => {
+      const w = entries[0]?.contentRect.width ?? 0;
+      if (w > REVIEWBAR_MORE_BELOW) setMoreOpen(false);
+    });
+    ro.observe(bar);
+    return () => ro.disconnect();
+  }, [moreOpen]);
+
   const saveTestCommand = useCallback(async () => {
     const cmd = testCommand.trim();
     if (!cmd || savedCmdRef.current === cmd) return;
@@ -312,14 +332,16 @@ export function ReviewCanvas({
   const fileCount = gitStatus?.changedFiles.length ?? 0;
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-hidden">
+    // `isolate` keeps the toolbar's z-index local to this canvas, so it never
+    // competes with the ContextHeader (`.octo-header`) and its popovers.
+    <div className="isolate flex h-full min-h-0 flex-col overflow-hidden">
       {/* ── Toolbar ───────────────────────────────────────────────
           One tidy row that never wraps: every control is shrink-0 +
           whitespace-nowrap, and seldom-needed bits (the test command)
           live behind a compact popover instead of an always-on field.
           On a narrow canvas the secondary toggles shed into "More"
           (`.octo-reviewbar` ladder) so AI and Accept all stay whole. */}
-      <header className="octo-reviewbar flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
+      <header ref={toolbarRef} className="octo-reviewbar flex h-11 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel px-3">
         <div className="ml-auto flex items-center gap-2">
           {/* View toggle — Diff / Editor */}
           <div className="flex shrink-0 items-center overflow-hidden rounded-md border border-octo-hairline">

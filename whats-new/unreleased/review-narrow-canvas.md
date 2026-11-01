@@ -1,15 +1,13 @@
 ---
-title: Review keeps its controls whole on a narrow window
+title: Review keeps its controls whole when space is tight
 kind: improvement
 area: app
 highlight: true
 steps:
   - open: mode/review
     target: review-sidebar
-    caption: On a narrow window the file list folds to an icon strip so the diff keeps its width. Expand it whenever you need it.
-  - target: review-toolbar-more
-    caption: When the toolbar runs out of room, diff layout, whitespace and tests move into this menu.
+    caption: When the Review area is narrow, the file list folds to an icon strip so the diff keeps its width. Expand it whenever you need it.
 ---
-On a narrow window, Review now folds the Changes and Files list to its icon strip, and moves the diff
-layout, whitespace and test controls into a **More** menu. The AI and Accept all buttons and every
-hunk's Accept and Reject actions stay fully visible.
+When the Review area is under 760px wide, the Changes and Files list folds to its icon strip.
+When the diff canvas itself is under 600px, the layout, whitespace and test controls move into a
+**More** menu. AI, Accept all and each hunk's Accept and Reject always stay fully visible.

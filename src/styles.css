@@ -515,8 +515,13 @@
    ±WS, tests) shed together and a "More" button grows in their place, opening
    a menu with the same controls — so nothing is lost and nothing is clipped.
    The header is the containing block of the menu and the tests popover (they
-   can't live inside a rung, whose `overflow: hidden` would clip them); the
-   z-index keeps them above the diff that follows it. */
+   can't live inside a rung, whose `overflow: hidden` would clip them). Its
+   z-index lifts them above what follows it in the canvas — the diff and the
+   AI review drawer (z-20) — and only there: the ReviewCanvas root is
+   `isolate`, a stacking context of its own, so this 30 is never compared
+   with `.octo-header`'s 20 and the ContextHeader's popovers still paint over
+   the whole canvas. The menu closes when the toolbar widens past 600px
+   (REVIEWBAR_MORE_BELOW in ReviewCanvas.tsx), since its trigger sheds there. */
 .octo-reviewbar { container-type: inline-size; container-name: octo-reviewbar; position: relative; z-index: 30; }
 .octo-demote.octo-reviewbar-more {
   max-width: 0; opacity: 0; margin-right: -8px;

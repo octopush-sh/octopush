@@ -68,7 +68,7 @@ Current anchors:
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
-| `review-toolbar-more` | Review: "More view options" (only on a narrow canvas) | `ReviewCanvas.tsx` |
+| `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
 | `review-sidebar` | Review: the Changes/Files navigator (expanded, or its icon strip) | `ReviewSidebar.tsx` |
 | `review-open-pr` | Review: "Open a pull request" (published branch, no PR yet, `gh` signed in) | `ChangesPanel.tsx` |
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |
