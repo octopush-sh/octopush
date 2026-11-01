@@ -21,6 +21,11 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 const IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes of silence
 /// Absolute backstop: even a trickle of output can't run forever.
 const ABS_CAP_SECS: u64 = 3600; // 60 minutes total
+/// Claude Code only: how long the process may stay open after its terminal
+/// `result` event. Recent CLIs keep `-p` alive to wait for background work
+/// the turn started (a dev server, a watch build); the stage's hand-off is the
+/// `result`, so the runner stops the CLI once this grace runs out.
+const SETTLE_AFTER_RESULT_SECS: u64 = 30;
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -610,6 +615,19 @@ impl CliDialect {
         }
     }
 
+    /// Extra environment for the stage's CLI process. Claude: bound its own
+    /// waits on subagents and Monitor the same way as the settle grace after
+    /// its `result` ([`SETTLE_AFTER_RESULT_SECS`]).
+    pub fn stage_env(&self) -> Vec<(&'static str, String)> {
+        match self {
+            CliDialect::Claude => vec![(
+                "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
+                (SETTLE_AFTER_RESULT_SECS * 1000).to_string(),
+            )],
+            CliDialect::Codex => Vec::new(),
+        }
+    }
+
     fn not_found_message(&self) -> String {
         match self {
             CliDialect::Claude => "Claude Code CLI (`claude`) was not found. Octopush searched your PATH, \
@@ -909,10 +927,108 @@ pub(crate) fn build_codex_outcome(
 }
 
 /// How the stdout read loop ended — drives the post-loop handling.
-enum ReadEnd {
+#[derive(Debug)]
+pub(crate) enum ReadEnd {
     Eof(Option<String>, std::collections::VecDeque<String>),
     Idle(Option<String>, std::collections::VecDeque<String>),
     AbsCap(Option<String>, std::collections::VecDeque<String>),
+    /// Claude emitted its `result` line and the process was still open
+    /// [`ReadLimits::settle`] later (waiting on background work).
+    Settled(String, std::collections::VecDeque<String>),
+}
+
+/// Timing limits for [`read_stream`]: the consts above for a stage, short
+/// ones in tests.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ReadLimits {
+    pub idle: std::time::Duration,
+    pub cap: std::time::Duration,
+    pub settle: std::time::Duration,
+}
+
+impl ReadLimits {
+    pub(crate) const STAGE: ReadLimits = ReadLimits {
+        idle: std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+        cap: std::time::Duration::from_secs(ABS_CAP_SECS),
+        settle: std::time::Duration::from_secs(SETTLE_AFTER_RESULT_SECS),
+    };
+}
+
+/// Read the CLI's stdout line by line until EOF, an idle stall, the absolute
+/// cap, or (Claude) the settle grace after the `result` event. `on_event`
+/// gets every JSON line (journal, usage, plan windows). We read RAW BYTES and
+/// decode lossily — a chatty proxy can emit non-UTF-8 on stdout, and a
+/// UTF-8-only line reader would abort the whole stream on the first bad byte
+/// (losing the result event). Non-JSON lines (debug logs) are skipped, and a
+/// bounded tail of recent lines is kept for diagnostics when no result event
+/// ever arrives.
+pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
+    stdout: R,
+    dialect: CliDialect,
+    limits: ReadLimits,
+    mut on_event: impl FnMut(&Value),
+) -> ReadEnd {
+    let mut reader = tokio::io::BufReader::new(stdout);
+    let mut result_line: Option<String> = None;
+    // When the `result` line arrived — starts the settle grace. Not reset by
+    // later lines: a background server that keeps logging must not hold the
+    // stage open.
+    let mut result_at: Option<std::time::Instant> = None;
+    let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let mut raw: Vec<u8> = Vec::new();
+    let started = std::time::Instant::now();
+    let settled = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() >= limits.settle);
+    loop {
+        if settled(result_at) {
+            if let Some(line) = result_line.take() {
+                return ReadEnd::Settled(line, tail);
+            }
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= limits.cap {
+            return ReadEnd::AbsCap(result_line, tail);
+        }
+        raw.clear();
+        let mut wait = limits.idle.min(limits.cap - elapsed);
+        if let Some(at) = result_at {
+            wait = wait.min(limits.settle.saturating_sub(at.elapsed()));
+        }
+        let read = tokio::time::timeout(wait, reader.read_until(b'\n', &mut raw)).await;
+        match read {
+            Err(_) => {
+                // Timed out after `wait`: the settle grace ran out, the
+                // absolute cap was reached, or it's a genuine idle stall.
+                if settled(result_at) {
+                    continue;
+                }
+                if started.elapsed() >= limits.cap {
+                    return ReadEnd::AbsCap(result_line, tail);
+                }
+                return ReadEnd::Idle(result_line, tail);
+            }
+            Ok(Ok(0)) => break,  // EOF
+            Ok(Ok(_)) => {}
+            Ok(Err(_)) => break, // read error
+        }
+        let line = String::from_utf8_lossy(&raw);
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if tail.len() >= 20 {
+            tail.pop_front();
+        }
+        tail.push_back(trimmed.to_string());
+        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if dialect == CliDialect::Claude && is_result_event(&value) {
+            result_line = Some(trimmed.to_string());
+            result_at.get_or_insert_with(std::time::Instant::now);
+        }
+        on_event(&value);
+    }
+    ReadEnd::Eof(result_line, tail)
 }
 
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
@@ -1038,6 +1154,9 @@ impl AgentRunner for CliRunner {
                 }
             }
         }
+        for (k, v) in dialect.stage_env() {
+            command.env(k, v);
+        }
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())
@@ -1090,13 +1209,8 @@ impl AgentRunner for CliRunner {
             buf
         });
 
-        // Stream stdout line-by-line: emit live progress per NDJSON event and
-        // keep the final `result` event. Non-JSON lines (debug logs) are skipped,
-        // so a noisy stdout can't break result parsing. We read RAW BYTES and
-        // decode lossily — a chatty proxy can emit non-UTF-8 on stdout, and a
-        // UTF-8-only line reader would abort the whole stream on the first bad
-        // byte (losing the result event). A bounded tail of recent lines is kept
-        // for diagnostics when no result event ever arrives.
+        // Stream stdout line-by-line (`read_stream`): emit live progress per
+        // NDJSON event and keep the final `result` event.
         // Running usage estimate from streamed assistant events, readable from
         // the cancel branch too — a stop/timeout used to record ZERO usage
         // ("unknowable mid-flight"), silently understating real spend against
@@ -1112,110 +1226,62 @@ impl AgentRunner for CliRunner {
         let codex_accum: std::sync::Arc<parking_lot::Mutex<CodexAccum>> =
             std::sync::Arc::new(parking_lot::Mutex::new(CodexAccum::default()));
         let codex_in_loop = std::sync::Arc::clone(&codex_accum);
-        let read_loop = async {
-            let mut reader = tokio::io::BufReader::new(stdout);
-            let mut result_line: Option<String> = None;
-            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
-            let mut raw: Vec<u8> = Vec::new();
-            let started = std::time::Instant::now();
-            // Codex stream-schema tripwire: the codex CLI's JSON contract has
-            // drifted across versions and `codex_fold_event` skips unknown
-            // events — parsing many JSON lines while journaling NONE of them
-            // means the installed CLI speaks a schema we don't, and the live
-            // pane would sit silently empty until the stage settles. Say so
-            // once instead.
-            let mut codex_json_lines: u32 = 0;
-            let mut codex_journaled = false;
-            let mut codex_schema_warned = false;
-            // From `system/init`: an API-key session's rate-limit events are
-            // not plan windows and never reach the plan snapshot.
-            let mut auth: Option<CliAuth> = None;
-            loop {
-                let elapsed = started.elapsed().as_secs();
-                if elapsed >= ABS_CAP_SECS {
-                    return ReadEnd::AbsCap(result_line, tail);
+        // Codex stream-schema tripwire: the codex CLI's JSON contract has
+        // drifted across versions and `codex_fold_event` skips unknown
+        // events — parsing many JSON lines while journaling NONE of them
+        // means the installed CLI speaks a schema we don't, and the live
+        // pane would sit silently empty until the stage settles. Say so
+        // once instead.
+        let mut codex_json_lines: u32 = 0;
+        let mut codex_journaled = false;
+        let mut codex_schema_warned = false;
+        // From `system/init`: an API-key session's rate-limit events are
+        // not plan windows and never reach the plan snapshot.
+        let mut auth: Option<CliAuth> = None;
+        let on_event = |value: &Value| match dialect {
+            CliDialect::Claude => {
+                if let Some((id, u)) = usage_from_stream_event(value) {
+                    let mut map = usage_in_loop.lock();
+                    let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                    map.insert(key, u);
                 }
-                raw.clear();
-                let wait = IDLE_TIMEOUT_SECS.min(ABS_CAP_SECS - elapsed);
-                let read = tokio::time::timeout(
-                    std::time::Duration::from_secs(wait),
-                    reader.read_until(b'\n', &mut raw),
-                )
-                .await;
-                match read {
-                    Err(_) => {
-                        // Timed out after `wait`. If we reached the absolute cap,
-                        // report that; otherwise it's a genuine idle stall.
-                        if started.elapsed().as_secs() >= ABS_CAP_SECS {
-                            return ReadEnd::AbsCap(result_line, tail);
-                        }
-                        return ReadEnd::Idle(result_line, tail);
-                    }
-                    Ok(Ok(0)) => break,  // EOF
-                    Ok(Ok(_)) => {}
-                    Ok(Err(_)) => break, // read error
+                for entry in crate::orchestrator::live::entries_from_stream_event(value) {
+                    emitter.emit_raw_entry(entry);
                 }
-                let line = String::from_utf8_lossy(&raw);
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
+                if let Some(a) = cli_auth_from_init(value) {
+                    auth = Some(a);
                 }
-                if tail.len() >= 20 {
-                    tail.pop_front();
-                }
-                tail.push_back(trimmed.to_string());
-                let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-                    continue;
-                };
-                match dialect {
-                    CliDialect::Claude => {
-                        if is_result_event(&value) {
-                            result_line = Some(trimmed.to_string());
-                        }
-                        if let Some((id, u)) = usage_from_stream_event(&value) {
-                            let mut map = usage_in_loop.lock();
-                            let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
-                            map.insert(key, u);
-                        }
-                        for entry in crate::orchestrator::live::entries_from_stream_event(&value) {
-                            emitter.emit_raw_entry(entry);
-                        }
-                        if let Some(a) = cli_auth_from_init(&value) {
-                            auth = Some(a);
-                        }
-                        if auth != Some(CliAuth::ApiKey) {
-                            let windows = plan_windows_from_stream_event(&value);
-                            if !windows.is_empty() {
-                                // `PersistingSink` keeps the snapshot.
-                                emitter.plan_windows(&windows);
-                            }
-                        }
-                    }
-                    CliDialect::Codex => {
-                        codex_json_lines += 1;
-                        let entries = codex_fold_event(&mut codex_in_loop.lock(), &value);
-                        codex_journaled |= !entries.is_empty();
-                        for entry in entries {
-                            emitter.emit_raw_entry(entry);
-                        }
-                        if let Some((id, u)) = codex_usage_from_event(&value) {
-                            let mut map = usage_in_loop.lock();
-                            let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
-                            map.insert(key, u);
-                        }
-                        if !codex_journaled && !codex_schema_warned && codex_json_lines >= 10 {
-                            codex_schema_warned = true;
-                            emitter.notice(
-                                "codex is streaming events this version of Octopush doesn't \
-                                 recognize — the live journal may stay quiet until the stage \
-                                 finishes (the work itself is unaffected)",
-                            );
-                        }
+                if auth != Some(CliAuth::ApiKey) {
+                    let windows = plan_windows_from_stream_event(value);
+                    if !windows.is_empty() {
+                        // `PersistingSink` keeps the snapshot.
+                        emitter.plan_windows(&windows);
                     }
                 }
             }
-            ReadEnd::Eof(result_line, tail)
+            CliDialect::Codex => {
+                codex_json_lines += 1;
+                let entries = codex_fold_event(&mut codex_in_loop.lock(), value);
+                codex_journaled |= !entries.is_empty();
+                for entry in entries {
+                    emitter.emit_raw_entry(entry);
+                }
+                if let Some((id, u)) = codex_usage_from_event(value) {
+                    let mut map = usage_in_loop.lock();
+                    let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                    map.insert(key, u);
+                }
+                if !codex_journaled && !codex_schema_warned && codex_json_lines >= 10 {
+                    codex_schema_warned = true;
+                    emitter.notice(
+                        "codex is streaming events this version of Octopush doesn't \
+                         recognize — the live journal may stay quiet until the stage \
+                         finishes (the work itself is unaffected)",
+                    );
+                }
+            }
         };
+        let read_loop = read_stream(stdout, dialect, ReadLimits::STAGE, on_event);
 
         // Race the child's output against the director's stop signal: poll the
         // cancel flag every ~500ms and, when set, kill the child and fail the
@@ -1246,10 +1312,11 @@ impl AgentRunner for CliRunner {
             }
         };
         let bin = dialect.binary();
-        let (result_line, tail, timeout_kind) = match read_end {
-            ReadEnd::Eof(r, t) => (r, t, None),
-            ReadEnd::Idle(r, t) => (r, t, Some("timed out — no output for 5 minutes")),
-            ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap")),
+        let (result_line, tail, timeout_kind, settled) = match read_end {
+            ReadEnd::Eof(r, t) => (r, t, None, false),
+            ReadEnd::Idle(r, t) => (r, t, Some("timed out — no output for 5 minutes"), false),
+            ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap"), false),
+            ReadEnd::Settled(r, t) => (Some(r), t, None, true),
         };
         // Is there a salvageable terminal state? Claude: a captured `result`
         // line (authoritative — the CLI declared itself finished). Codex has
@@ -1271,14 +1338,20 @@ impl AgentRunner for CliRunner {
                 u,
             ));
         }
-        let salvaged = timeout_kind.is_some();
+        // Settled: the CLI declared itself finished and then stayed open on
+        // background work it started — the `result` is the hand-off.
+        let salvaged = timeout_kind.is_some() || settled;
 
-        // When we salvaged a result from a slow-EOF idle/cap, the child may still
-        // be lingering — kill it instead of blocking on wait(), and trust the
-        // result event's own is_error (same rationale as the existing wait-hiccup
-        // comment). Otherwise (clean EOF) wait normally.
+        // When we salvaged a result from a slow-EOF idle/cap or a settle, the
+        // child may still be lingering — kill it instead of blocking on
+        // wait(), and trust the result event's own is_error (same rationale
+        // as the existing wait-hiccup comment). Otherwise (clean EOF) wait
+        // normally.
         let exit_success = if salvaged {
             let _ = child.kill().await;
+            if settled {
+                emitter.notice("stage finished · stopped claude, which was still waiting on background work");
+            }
             true
         } else {
             child.wait().await.map(|s| s.success()).unwrap_or(true)
