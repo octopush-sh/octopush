@@ -26,6 +26,8 @@ export interface ShortcutContext {
   revealInTree: (path: string) => void;
   openCreator: () => void;
   togglePalette: () => void;
+  /** ⌘⇧P: the "Open a pull request" composer for the active workspace. */
+  openPrComposer: () => void;
   openSearch: (mode: "files" | "text") => void;
   bumpLayout: () => void;
   openSettings: (tab: "general" | "usage") => void;
@@ -152,6 +154,15 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     alt: false,
     keys: ["k"],
     run: (_e, c) => (c.togglePalette(), true),
+  },
+  {
+    id: "open-pull-request",
+    chords: ["⌘⇧P"],
+    scope: "global",
+    shift: true,
+    alt: false,
+    keys: ["p", "P"],
+    run: (_e, c) => (c.openPrComposer(), true),
   },
   {
     id: "file-finder",

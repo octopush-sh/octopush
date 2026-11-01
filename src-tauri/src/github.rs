@@ -164,6 +164,100 @@ pub fn issues_from_json(raw: &str) -> Result<Vec<GhIssue>, serde_json::Error> {
         .collect())
 }
 
+/// Where GitHub looks for a repo's pull-request template, in its lookup order
+/// (the file name is case-insensitive on GitHub; these are the two spellings
+/// people actually commit).
+pub const PR_TEMPLATE_PATHS: &[&str] = &[
+    ".github/pull_request_template.md",
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    "pull_request_template.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "docs/pull_request_template.md",
+    "docs/PULL_REQUEST_TEMPLATE.md",
+];
+
+/// Templates longer than this are cut — the draft prompt has a budget too.
+const PR_TEMPLATE_MAX_CHARS: usize = 8_000;
+
+/// The repo's pull-request template under `root`, if it has a non-empty one.
+pub fn find_pr_template(root: &std::path::Path) -> Option<String> {
+    PR_TEMPLATE_PATHS.iter().find_map(|rel| {
+        let text = std::fs::read_to_string(root.join(rel)).ok()?;
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.chars().take(PR_TEMPLATE_MAX_CHARS).collect())
+    })
+}
+
+/// What the PR composer drafts from: the branch's diff against the base
+/// (`git diff base...HEAD`, capped by the caller's prompt), its commit
+/// subjects (newest first) and the repo's PR template, if any.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrDraftContext {
+    pub branch: String,
+    pub diff: String,
+    pub commits: Vec<String>,
+    pub template: Option<String>,
+}
+
+/// The login-shell command that opens a pull request, plus the environment
+/// it reads its values from. No user value is ever spliced into the command:
+/// base, head, title and body file travel as environment variables and the
+/// command only says `"$VAR"`, which bash, zsh and fish all expand as one
+/// argument (fish treats `\'` inside single quotes as an escape, so
+/// single-quoting is not safe there). The body goes through `--body-file`. A
+/// remote base picked as `origin/main` is opened against `main`; a title is
+/// one line.
+pub fn pr_create_command(
+    base: &str,
+    head: &str,
+    title: &str,
+    body_file: &str,
+    draft: bool,
+) -> (String, Vec<(&'static str, String)>) {
+    let base = base.strip_prefix("origin/").unwrap_or(base);
+    let title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut cmd = String::from(
+        "gh pr create --base \"$OCTOPUSH_PR_BASE\" --head \"$OCTOPUSH_PR_HEAD\" --title \"$OCTOPUSH_PR_TITLE\" --body-file \"$OCTOPUSH_PR_BODY_FILE\"",
+    );
+    if draft {
+        cmd.push_str(" --draft");
+    }
+    let env = vec![
+        ("OCTOPUSH_PR_BASE", base.to_string()),
+        ("OCTOPUSH_PR_HEAD", head.to_string()),
+        ("OCTOPUSH_PR_TITLE", title),
+        ("OCTOPUSH_PR_BODY_FILE", body_file.to_string()),
+    ];
+    (cmd, env)
+}
+
+/// Whether opening a PR from `head` onto `base` makes sense: never from a
+/// branch onto itself (that would only push the base branch).
+pub fn pr_head_is_valid(base: &str, head: &str) -> bool {
+    let base = base.strip_prefix("origin/").unwrap_or(base);
+    // A detached HEAD reports itself as "HEAD": not a branch to open from.
+    !head.trim().is_empty() && head != "HEAD" && head != base
+}
+
+/// Read the new PR's URL from `gh pr create`'s stdout (its last URL line,
+/// `https://github.com/<o>/<r>/pull/<n>`). `None` when no such line exists.
+pub fn pr_from_create_output(stdout: &str, title: &str, draft: bool) -> Option<Pr> {
+    let url = stdout
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|l| l.starts_with("https://") && l.contains("/pull/"))?;
+    let number = url.rsplit("/pull/").next()?.trim_end_matches('/').parse::<u64>().ok()?;
+    Some(Pr {
+        number,
+        title: title.split_whitespace().collect::<Vec<_>>().join(" "),
+        url: url.to_string(),
+        is_draft: draft,
+        state: if draft { PrState::Draft } else { PrState::Open },
+    })
+}
+
 /// Readiness preflight for the "Ship it" flow — the `pull_request` stage
 /// needs BOTH a github.com remote and an authenticated `gh`; failing that
 /// mid-run (after the crew already built) is a terrible way to find out.

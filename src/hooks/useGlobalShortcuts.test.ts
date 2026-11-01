@@ -43,6 +43,7 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     revealInTree: vi.fn(),
     openCreator: vi.fn(),
     togglePalette: vi.fn(),
+    openPrComposer: vi.fn(),
     openSearch: vi.fn(),
     bumpLayout: vi.fn(),
     openSettings: vi.fn(),
@@ -145,6 +146,10 @@ describe("handleShortcut", () => {
     expect(c.togglePalette).toHaveBeenCalled();
     handleShortcut(press({ key: "p" }), c);
     expect(c.openSearch).toHaveBeenCalledWith("files");
+    expect(c.openPrComposer).not.toHaveBeenCalled();
+    handleShortcut(press({ key: "P", shift: true }), c);
+    expect(c.openPrComposer).toHaveBeenCalledTimes(1);
+    expect(c.openSearch).toHaveBeenCalledTimes(1);
     handleShortcut(press({ key: "f", shift: true }), c);
     expect(c.openSearch).toHaveBeenCalledWith("text");
     handleShortcut(press({ key: "\\" }), c);

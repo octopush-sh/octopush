@@ -61,44 +61,42 @@ describe("deriveChatTitle", () => {
 });
 
 describe("deriveChatMeta", () => {
-  const now = new Date("2026-05-18T15:00:00Z");
+  // Local-time dates, so the calendar-day logic doesn't depend on the TZ the
+  // tests run in.
+  const local = (d: number, h: number, m = 0, mo = 4) => new Date(2026, mo, d, h, m);
+  const now = local(18, 15);
+  const at = (d: Date) => [msg("user", "hi", d.toISOString())];
+  const clock = (d: Date) =>
+    d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }).toUpperCase();
 
   it("returns NEW when there are no messages", () => {
     expect(deriveChatMeta([], now)).toBe("NEW");
   });
 
-  it("returns JUST NOW for very recent messages", () => {
-    expect(deriveChatMeta([msg("user", "hi", "2026-05-18T14:59:50Z")], now)).toBe(
-      "JUST NOW",
+  it("returns the clock time for messages from today, not JUST NOW", () => {
+    const tenSecondsAgo = new Date(now.getTime() - 10_000);
+    expect(deriveChatMeta(at(tenSecondsAgo), now)).toBe(clock(tenSecondsAgo));
+    expect(deriveChatMeta(at(tenSecondsAgo), now)).not.toBe("JUST NOW");
+    expect(deriveChatMeta(at(local(18, 9, 5)), now)).toBe(clock(local(18, 9, 5)));
+  });
+
+  it("tells apart two rows active minutes apart today", () => {
+    expect(deriveChatMeta(at(local(18, 14, 32)), now)).not.toBe(
+      deriveChatMeta(at(local(18, 14, 41)), now),
     );
   });
 
-  it("returns minutes for messages under an hour", () => {
-    expect(deriveChatMeta([msg("user", "hi", "2026-05-18T14:55:00Z")], now)).toBe(
-      "5M AGO",
-    );
-  });
-
-  it("returns hours for messages within today", () => {
-    expect(deriveChatMeta([msg("user", "hi", "2026-05-18T12:00:00Z")], now)).toBe(
-      "3H AGO",
-    );
-  });
-
-  it("returns YESTERDAY for a message ~24h ago", () => {
-    expect(deriveChatMeta([msg("user", "hi", "2026-05-17T14:00:00Z")], now)).toBe(
-      "YESTERDAY",
-    );
+  it("returns YESTERDAY for the previous calendar day, even under 24h ago", () => {
+    expect(deriveChatMeta(at(local(17, 14)), now)).toBe("YESTERDAY");
+    expect(deriveChatMeta(at(local(17, 23, 50)), local(18, 0, 10))).toBe("YESTERDAY");
   });
 
   it("returns days for messages within a week", () => {
-    expect(deriveChatMeta([msg("user", "hi", "2026-05-15T15:00:00Z")], now)).toBe(
-      "3D AGO",
-    );
+    expect(deriveChatMeta(at(local(15, 15)), now)).toBe("3D AGO");
   });
 
   it("falls back to a locale date older than a week", () => {
-    const out = deriveChatMeta([msg("user", "hi", "2026-04-15T15:00:00Z")], now);
+    const out = deriveChatMeta(at(local(15, 15, 0, 3)), now);
     // Format depends on Intl locale, but should not contain "AGO".
     expect(out).not.toContain("AGO");
     expect(out.length).toBeGreaterThan(0);

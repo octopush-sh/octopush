@@ -104,7 +104,12 @@ export function CompanionHistory({
         </div>
       )}
 
-      <ul ref={listRef} onKeyDown={onRowKeyDown} className="space-y-1 px-2 py-2">
+      <ul
+        ref={listRef}
+        onKeyDown={onRowKeyDown}
+        data-tour="companion-chats-list"
+        className="space-y-1 px-2 py-2"
+      >
         {chats.length === 0 && (
           <li className="px-2 py-3 text-center">
             <div className="text-[11px] leading-relaxed text-octo-mute">No conversations yet.</div>
@@ -154,6 +159,8 @@ export function CompanionHistory({
                   <button
                     type="button"
                     data-row-select
+                    aria-current={active ? "true" : undefined}
+                    title={c.title}
                     onClick={() => onSelectChat(c.id)}
                     className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-2 py-1.5 text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                   >
@@ -169,7 +176,13 @@ export function CompanionHistory({
                       <Pin size={10} className="shrink-0 text-octo-brass" aria-label="Pinned" />
                     )}
                     <span className="min-w-0 flex-1">
-                      <span className="block truncate font-serif text-[12px] leading-tight text-octo-ivory">
+                      {/* Two lines, not one: similar titles usually part ways
+                          past the first ~35 characters. The full title is the
+                          row's tooltip. */}
+                      <span
+                        data-testid="chat-row-title"
+                        className="line-clamp-2 break-words font-serif text-[12px] leading-tight text-octo-ivory"
+                      >
                         {c.title}
                       </span>
                       <span className="mt-0.5 block font-mono text-[8px] uppercase tracking-[0.15em] text-octo-mute">

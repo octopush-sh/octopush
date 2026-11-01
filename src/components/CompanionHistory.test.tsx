@@ -92,6 +92,30 @@ describe("CompanionHistory — rendering & actions", () => {
     expect(props.onRenameChat).toHaveBeenCalledWith("c1", "Renamed");
   });
 
+  it("marks only the active chat as current and gives every row its full title as a tooltip", () => {
+    const long = "Small Change Ship — why does the build break on CI but not locally why does";
+    renderHistory({
+      chats: [
+        { id: "a", title: `${long} the build break`, meta: "14:32" },
+        { id: "b", title: `${long} the deploy stall`, meta: "14:41" },
+      ],
+      activeChatId: "b",
+    });
+    const rows = Array.from(document.querySelectorAll("[data-row-select]"));
+    expect(rows.map((r) => r.getAttribute("aria-current"))).toEqual([null, "true"]);
+    expect(rows.map((r) => r.getAttribute("title"))).toEqual([
+      `${long} the build break`,
+      `${long} the deploy stall`,
+    ]);
+  });
+
+  it("lets a long title wrap to two lines instead of cutting it to one", () => {
+    renderHistory();
+    const title = screen.getAllByTestId("chat-row-title")[0];
+    expect(title.className).toContain("line-clamp-2");
+    expect(title.className).not.toMatch(/\btruncate\b/);
+  });
+
   it("hides delete buttons when onDeleteChat is not provided", () => {
     renderHistory({ onDeleteChat: undefined });
     expect(screen.queryByRole("button", { name: "Delete conversation" })).toBeNull();

@@ -1098,6 +1098,9 @@ pub async fn logbook_summary(
 pub struct BranchList {
     pub local: Vec<String>,
     pub remote: Vec<String>,
+    /// The repo's real default branch (`origin/HEAD`, else main/master) — not
+    /// the checked-out one, which `local[0]` is.
+    pub repo_default: Option<String>,
 }
 
 #[tauri::command]
@@ -1107,6 +1110,7 @@ pub async fn list_branches(path: String) -> AppResult<BranchList> {
     Ok(BranchList {
         local: crate::git_ops::list_branches(p)?,
         remote: crate::git_ops::list_remote_branches(p)?,
+        repo_default: crate::git_ops::repo_default_branch(p),
     })
 }
 
@@ -4871,6 +4875,90 @@ pub async fn github_ship_readiness(path: String) -> AppResult<crate::github::Shi
     };
 
     Ok(crate::github::ShipReadiness { github_remote, gh_authenticated })
+}
+
+/// Everything the PR composer drafts from: the branch's diff and commits
+/// against `base`, plus the repo's pull-request template. Read-only.
+#[tauri::command]
+pub async fn pr_draft_context(
+    workspace_path: String,
+    base: String,
+) -> AppResult<crate::github::PrDraftContext> {
+    let path = expand_tilde(&workspace_path);
+    let root = std::path::Path::new(&path);
+    let branch = {
+        let repo = crate::git_ops::open_repo(root)?;
+        crate::git_ops::current_branch(&repo)
+            .ok_or_else(|| AppError::Other("not on a named branch".into()))?
+    };
+    let (diff, commits) = crate::git_ops::branch_pr_context(root, &base)?;
+    Ok(crate::github::PrDraftContext {
+        branch,
+        diff,
+        commits,
+        template: crate::github::find_pr_template(root),
+    })
+}
+
+/// Open a pull request from the current branch onto `base` with `gh pr
+/// create` in the login shell. The body is written to a temp file and passed
+/// with `--body-file`; base, head and title reach `gh` through environment
+/// variables, so no user text is ever shell-interpolated. Never pushes — the caller publishes
+/// the branch first.
+#[tauri::command]
+pub async fn create_pull_request(
+    workspace_path: String,
+    base: String,
+    title: String,
+    body: String,
+    draft: bool,
+) -> AppResult<crate::github::Pr> {
+    let path = expand_tilde(&workspace_path);
+    if title.trim().is_empty() {
+        return Err(AppError::Other("A pull request needs a title.".into()));
+    }
+    let branch = {
+        let repo = crate::git_ops::open_repo(std::path::Path::new(&path))?;
+        crate::git_ops::current_branch(&repo)
+            .ok_or_else(|| AppError::Other("not on a named branch".into()))?
+    };
+    if !crate::github::pr_head_is_valid(&base, &branch) {
+        return Err(AppError::Other(format!(
+            "A pull request needs a branch other than its base ({branch})."
+        )));
+    }
+    let mut body_file = tempfile::Builder::new()
+        .prefix("octopush-pr-body-")
+        .suffix(".md")
+        .tempfile()
+        .map_err(|e| AppError::Other(format!("couldn't write the PR body: {e}")))?;
+    std::io::Write::write_all(&mut body_file, body.as_bytes())
+        .map_err(|e| AppError::Other(format!("couldn't write the PR body: {e}")))?;
+    let (cmd, cmd_env) = crate::github::pr_create_command(
+        &base,
+        &branch,
+        &title,
+        &body_file.path().to_string_lossy(),
+        draft,
+    );
+
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .envs(cmd_env)
+        .current_dir(&path)
+        .output()
+        .await
+        .map_err(|e| AppError::Other(format!("GitHub CLI not available: {e}")))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.trim().chars().take(300).collect();
+        return Err(AppError::Other(format!("gh pr create failed: {snippet}")));
+    }
+    crate::github::pr_from_create_output(&stdout, &title, draft).ok_or_else(|| {
+        AppError::Other("gh pr create finished but printed no pull request URL".into())
+    })
 }
 
 /// Make a PR's head ref available as a local branch so it can serve as a

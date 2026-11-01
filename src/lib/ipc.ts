@@ -437,6 +437,7 @@ import type {
   Pr,
   PrInfo,
   ShipReadiness,
+  PrDraftContext,
   PerfStats,
   ProjectInfo,
   ProviderConfig,
@@ -1132,6 +1133,13 @@ export const ipc = {
   /** Preflight for "Ship it": github.com origin + authenticated gh. */
   githubShipReadiness: (path: string) =>
     invoke<ShipReadiness>("github_ship_readiness", { path }),
+  /** The branch's diff + commits against `base` and the repo's PR template. */
+  prDraftContext: (workspacePath: string, base: string) =>
+    invoke<PrDraftContext>("pr_draft_context", { workspacePath, base }),
+  /** `gh pr create` from the current branch (body passed via a file). The
+   *  branch must already be published. Resolves to the new PR. */
+  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean) =>
+    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft }),
 
   /** Fetch a PR's head ref as a local branch (no-op if it already exists),
    *  so it can serve as the base of a new workspace. */
