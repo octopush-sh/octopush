@@ -512,13 +512,18 @@ async fn stream_json_result_then_eof_is_a_clean_exit_not_a_settle() {
 }
 
 #[test]
-fn claude_stage_env_bounds_background_waits_like_the_settle_grace() {
+fn claude_stage_env_ceils_background_waits_below_the_settle_grace() {
     let env = CliDialect::Claude.stage_env();
-    assert!(
-        env.iter().any(|(k, v)| *k == "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS" && v == "30000"),
-        "{env:?}"
-    );
+    let ceiling = env
+        .iter()
+        .find(|(k, _)| *k == "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| panic!("no background-wait ceiling in {env:?}"));
+    assert_eq!(ceiling, "25000");
     assert_eq!(ReadLimits::STAGE.settle, std::time::Duration::from_secs(30));
+    // The CLI's own clean exit must come before the runner stops it.
+    let ceiling = std::time::Duration::from_millis(ceiling.parse().unwrap());
+    assert!(ceiling < ReadLimits::STAGE.settle, "{ceiling:?} ≥ {:?}", ReadLimits::STAGE.settle);
     assert!(CliDialect::Codex.stage_env().is_empty());
 }
 

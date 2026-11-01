@@ -26,6 +26,10 @@ const ABS_CAP_SECS: u64 = 3600; // 60 minutes total
 /// the turn started (a dev server, a watch build); the stage's hand-off is the
 /// `result`, so the runner stops the CLI once this grace runs out.
 const SETTLE_AFTER_RESULT_SECS: u64 = 30;
+/// Claude Code only: the CLI's own ceiling on waiting for subagents and
+/// Monitor after its turn (`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS`). Below
+/// [`SETTLE_AFTER_RESULT_SECS`], so the CLI's own clean exit comes first.
+pub(crate) const BG_WAIT_CEILING_MS: u64 = 25_000;
 
 #[derive(Deserialize, Debug, Default)]
 struct CliResult {
@@ -616,13 +620,14 @@ impl CliDialect {
     }
 
     /// Extra environment for the stage's CLI process. Claude: bound its own
-    /// waits on subagents and Monitor the same way as the settle grace after
-    /// its `result` ([`SETTLE_AFTER_RESULT_SECS`]).
+    /// waits on subagents and Monitor to [`BG_WAIT_CEILING_MS`], below the
+    /// settle grace after its `result` ([`SETTLE_AFTER_RESULT_SECS`]), so the
+    /// CLI's own clean exit (EOF) comes before the runner stops it.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![(
                 "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
-                (SETTLE_AFTER_RESULT_SECS * 1000).to_string(),
+                BG_WAIT_CEILING_MS.to_string(),
             )],
             CliDialect::Codex => Vec::new(),
         }
