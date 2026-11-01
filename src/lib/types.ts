@@ -382,6 +382,8 @@ export interface GitStatus {
 export interface BranchList {
   local: string[];
   remote: string[];
+  /** The repo's real default branch (origin/HEAD, else main/master); `local[0]` is only the checked-out one. */
+  repoDefault?: string | null;
 }
 
 export interface FileChange {
@@ -427,6 +429,16 @@ export interface GhIssue {
   title: string;
   body: string;
   url: string;
+}
+
+/** What the PR composer drafts from (`pr_draft_context`): the branch's diff
+ *  against the base (`git diff base...HEAD`), its commit subjects (newest
+ *  first) and the repo's pull-request template, if it has one. */
+export interface PrDraftContext {
+  branch: string;
+  diff: string;
+  commits: string[];
+  template: string | null;
 }
 
 /** Preflight for "Ship it": github.com origin + authenticated gh. */

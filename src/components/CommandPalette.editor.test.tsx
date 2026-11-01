@@ -118,3 +118,30 @@ describe("CommandPalette · Editor group", () => {
     expect(useEditorPrefs.getState().lineNumbers).toBe(false);
   });
 });
+
+describe("CommandPalette · Open a pull request", () => {
+  it("is absent without an active workspace", async () => {
+    await renderPalette();
+    expect(screen.queryByText("Open a pull request")).not.toBeInTheDocument();
+  });
+
+  it("opens the composer and closes the palette", async () => {
+    const onClose = vi.fn();
+    const onOpenPullRequest = vi.fn();
+    await act(async () => {
+      render(
+        <CommandPalette
+          open
+          onClose={onClose}
+          onNewSession={vi.fn()}
+          onToggleTokens={vi.fn()}
+          onOpenPullRequest={onOpenPullRequest}
+        />,
+      );
+    });
+    expect(screen.getByText("⌘⇧P")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("Open a pull request"));
+    expect(onOpenPullRequest).toHaveBeenCalledOnce();
+    expect(onClose).toHaveBeenCalled();
+  });
+});

@@ -38,6 +38,8 @@ import { useWorkspacePrefs } from "./stores/workspacePrefsStore";
 import { CanvasSplit } from "./components/CanvasSplit";
 import { useEditorStore } from "./stores/editorStore";
 import { useAttentionStore } from "./stores/attentionStore";
+import { usePrStore } from "./stores/prStore";
+import { PrComposer } from "./components/PrComposer";
 import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { SessionRail } from "./components/run/SessionRail";
@@ -88,7 +90,7 @@ import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
-import type { GitStatus, Pr, TintName, Issue, ProjectInfo } from "./lib/types";
+import type { GitStatus, TintName, Issue, ProjectInfo } from "./lib/types";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
 import { revealDiffTarget, stripDiffPrefix } from "./lib/diffJump";
@@ -406,10 +408,12 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
-  // Per-workspace cache of the most recently fetched open PR (or null when
-  // there isn't one). Keyed by workspace id so switching back to a
-  // workspace doesn't flicker until the next refresh.
-  const [openPrByWs, setOpenPrByWs] = useState<Record<string, Pr | null>>({});
+  // Per-workspace cache of the most recently fetched PR (or null when there
+  // isn't one). Keyed by workspace id so switching back to a workspace
+  // doesn't flicker until the next refresh; lives in prStore so a PR opened
+  // from Review shows on the chip at once.
+  const openPrByWs = usePrStore((s) => s.byWorkspace);
+  const prComposerFor = usePrStore((s) => s.composerFor);
 
   // Layout version (forces TerminalPane fit-resize when sidebar/companion toggle)
   const layoutVersionRef = useRef(0);
@@ -773,9 +777,7 @@ function App() {
       ipc
         .findPrForBranch(path)
         .then((pr) => {
-          if (!cancelled) {
-            setOpenPrByWs((prev) => ({ ...prev, [ws.id]: pr }));
-          }
+          if (!cancelled) usePrStore.getState().setPr(ws.id, pr);
         })
         .catch(() => {
           // Network / auth errors are non-fatal — just leave the chip hidden.
@@ -1005,6 +1007,13 @@ function App() {
       if (mod && !e.altKey && !e.shiftKey && e.key === "k") {
         e.preventDefault();
         setShowPalette((v) => !v);
+        return;
+      }
+
+      // ⌘⇧P → "Open a pull request" composer for the active workspace.
+      if (mod && e.shiftKey && !e.altKey && (e.key === "P" || e.key === "p")) {
+        e.preventDefault();
+        if (activeWorkspaceId) usePrStore.getState().openComposer(activeWorkspaceId);
         return;
       }
 
@@ -2505,7 +2514,24 @@ function App() {
           setShowCreator(true);
         }}
         onToggleTokens={() => setSettingsTab("usage")}
+        onOpenPullRequest={
+          activeWorkspaceId ? () => usePrStore.getState().openComposer(activeWorkspaceId) : undefined
+        }
       />
+
+      {(() => {
+        const ws = prComposerFor ? workspaces.find((w) => w.id === prComposerFor) : undefined;
+        const path = ws?.worktreePath ?? project?.path;
+        if (!ws || !path) return null;
+        return (
+          <PrComposer
+            key={ws.id}
+            workspace={ws}
+            workspacePath={path}
+            onClose={() => usePrStore.getState().closeComposer()}
+          />
+        );
+      })()}
 
       {activeWorkspace && (
         <WorkspaceSearchPalette

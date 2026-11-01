@@ -177,6 +177,26 @@ pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
     Ok(result)
 }
 
+/// The repository's real default branch — what pull requests target — as
+/// opposed to `default_branch`, which is only the checked-out HEAD. Read from
+/// `origin/HEAD`; without one, a local or origin `main`, then `master`.
+/// `None` when none of these exist.
+pub fn repo_default_branch(path: &Path) -> Option<String> {
+    let repo = open_repo(path).ok()?;
+    if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD") {
+        if let Some(name) = r.symbolic_target().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
+            return Some(name.to_string());
+        }
+    }
+    ["main", "master"]
+        .iter()
+        .find(|n| {
+            repo.find_branch(n, git2::BranchType::Local).is_ok()
+                || repo.find_reference(&format!("refs/remotes/origin/{n}")).is_ok()
+        })
+        .map(|n| n.to_string())
+}
+
 /// Local branch names: the repo's default (HEAD) branch first, the rest
 /// alphabetical (case-insensitive). Used by the workspace creator's base picker.
 pub fn list_branches(path: &Path) -> AppResult<Vec<String>> {
@@ -726,6 +746,44 @@ pub fn range_diff_text(path: &Path, from: &str, to: &str) -> AppResult<String> {
         .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
         .map_err(|e| AppError::Other(format!("range diff: {e}")))?;
     diff_to_text(&diff)
+}
+
+/// What a pull request from HEAD onto `base` contains: the diff from their
+/// merge base to HEAD (`git diff base...HEAD`) and the subjects of the commits
+/// not on `base` (`git log base..HEAD`), newest first, at most 50. `base`
+/// resolves to its `origin/` ref first (what the PR is opened against), then
+/// to the name as given (a local branch, or an already-qualified remote ref).
+pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<String>)> {
+    let repo = open_repo(path)?;
+    let head = repo
+        .head()
+        .and_then(|h| h.peel_to_commit())
+        .map_err(|e| AppError::Other(format!("this branch has no commits yet: {e}")))?;
+    let base_commit = [format!("origin/{base}"), base.to_string()]
+        .iter()
+        .find_map(|r| repo.revparse_single(r).ok().and_then(|o| o.peel_to_commit().ok()))
+        .ok_or_else(|| AppError::Other(format!("base branch '{base}' not found")))?;
+    let merge_base = repo
+        .merge_base(base_commit.id(), head.id())
+        .and_then(|oid| repo.find_commit(oid))
+        .map_err(|e| AppError::Other(format!("no common history with '{base}': {e}")))?;
+    let from_tree = merge_base.tree().map_err(|e| AppError::Other(format!("tree: {e}")))?;
+    let to_tree = head.tree().map_err(|e| AppError::Other(format!("tree: {e}")))?;
+    let diff = repo
+        .diff_tree_to_tree(Some(&from_tree), Some(&to_tree), None)
+        .map_err(|e| AppError::Other(format!("branch diff: {e}")))?;
+    let text = diff_to_text(&diff)?;
+
+    let mut walk = repo.revwalk().map_err(|e| AppError::Other(format!("revwalk: {e}")))?;
+    walk.push(head.id()).map_err(|e| AppError::Other(format!("revwalk: {e}")))?;
+    walk.hide(base_commit.id()).map_err(|e| AppError::Other(format!("revwalk: {e}")))?;
+    let subjects = walk
+        .filter_map(|o| o.ok())
+        .take(50)
+        .filter_map(|oid| repo.find_commit(oid).ok())
+        .map(|c| c.summary().unwrap_or("").to_string())
+        .collect();
+    Ok((text, subjects))
 }
 
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.

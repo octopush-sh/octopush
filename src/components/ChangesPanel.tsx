@@ -25,6 +25,7 @@ import {
   Sparkles,
 } from "lucide-react";
 import { ipc } from "../lib/ipc";
+import { canOpenPrFrom } from "../lib/prDraft";
 import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
@@ -37,6 +38,7 @@ import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useAiReview } from "../stores/aiReviewStore";
+import { usePrStore } from "../stores/prStore";
 
 interface Props {
   projectPath: string;
@@ -120,6 +122,33 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     const id = setInterval(refresh, POLL_MS);
     return () => clearInterval(id);
   }, [refresh]);
+
+  // "Open a pull request" — offered once the branch is published, a lookup
+  // found no PR for it, it isn't the repo's default branch, and the repo is
+  // on GitHub. A missing or signed-out `gh` shows the guidance instead.
+  const knownPr = usePrStore((s) => (workspaceId ? s.byWorkspace[workspaceId] : undefined));
+  const [prOffer, setPrOffer] = useState<"open" | "no-auth" | null>(null);
+  const publishedBranch = gitStatus?.hasUpstream ? gitStatus.branch : null;
+  const noPr = knownPr === null;
+  useEffect(() => {
+    if (!workspaceId || !publishedBranch || !noPr) {
+      setPrOffer(null);
+      return;
+    }
+    let cancelled = false;
+    void Promise.all([ipc.githubShipReadiness(projectPath), ipc.listBranches(projectPath)])
+      .then(([r, b]) => {
+        if (cancelled) return;
+        if (!r.githubRemote || !canOpenPrFrom(publishedBranch, b)) setPrOffer(null);
+        else setPrOffer(r.ghAuthenticated ? "open" : "no-auth");
+      })
+      .catch(() => {
+        if (!cancelled) setPrOffer(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [projectPath, workspaceId, publishedBranch, noPr]);
 
   const files = gitStatus?.changedFiles ?? [];
   const staged = files.filter((f) => f.staged);
@@ -265,6 +294,14 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       });
       await refresh();
       onChange?.();
+      // Look the PR up now rather than at the next 60s poll, so the
+      // "Open a pull request" offer appears right after publishing.
+      if (workspaceId) {
+        void ipc
+          .findPrForBranch(projectPath)
+          .then((pr) => usePrStore.getState().setPr(workspaceId, pr))
+          .catch(() => {});
+      }
     } catch (e) {
       pushToast({ level: "error", title: "Push failed", body: String(e) });
     } finally {
@@ -661,6 +698,24 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
             <span className="ml-1 text-octo-brass">· {ahead} ahead</span>
           )}
         </button>
+
+        {prOffer === "open" && workspaceId && (
+          <button
+            type="button"
+            data-tour="review-open-pr"
+            onClick={() => usePrStore.getState().openComposer(workspaceId)}
+            title="Draft a title and description from the diff, then open the PR on GitHub (⌘⇧P)"
+            className="octo-rise-in flex w-full items-center justify-center rounded-md px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            style={{ border: "1px solid var(--brass-dim)" }}
+          >
+            Open a pull request
+          </button>
+        )}
+        {prOffer === "no-auth" && (
+          <p className="octo-rise-in text-center font-mono text-[10px] leading-[1.5] text-octo-mute">
+            Run <span className="text-octo-ivory">gh auth login</span> in a terminal to open a pull request from here.
+          </p>
+        )}
       </div>
 
       {discardTarget && (

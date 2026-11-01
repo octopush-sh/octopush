@@ -13427,3 +13427,140 @@ mod updater_channel_tests {
         assert_eq!(manifest_date(&serde_json::json!({})), None);
     }
 }
+
+#[cfg(test)]
+mod open_pull_request_tests {
+    use crate::github::{find_pr_template, pr_create_command, pr_from_create_output, PrState};
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    #[test]
+    fn pr_create_command_passes_every_value_through_the_environment() {
+        let title = "Fix it's \"quoting\" $(rm -rf ~) a\\'; open -a Calculator #";
+        let (cmd, env) = pr_create_command("main", "feat/x", title, "/tmp/b.md", false);
+        // The command is constant: nothing from the user is spliced into it.
+        assert_eq!(
+            cmd,
+            "gh pr create --base \"$OCTOPUSH_PR_BASE\" --head \"$OCTOPUSH_PR_HEAD\" --title \"$OCTOPUSH_PR_TITLE\" --body-file \"$OCTOPUSH_PR_BODY_FILE\""
+        );
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("OCTOPUSH_PR_BASE"), "main");
+        assert_eq!(get("OCTOPUSH_PR_HEAD"), "feat/x");
+        assert_eq!(get("OCTOPUSH_PR_TITLE"), title);
+        assert_eq!(get("OCTOPUSH_PR_BODY_FILE"), "/tmp/b.md");
+        assert!(!cmd.contains("--draft"));
+    }
+
+    #[test]
+    fn pr_create_command_reaches_gh_verbatim_through_a_real_shell() {
+        // `printf` stands in for gh: the shell must hand the title over as one
+        // unchanged argument, metacharacters and all.
+        let title = "a\\'; echo PWNED # $(id) `id`";
+        let (_, env) = pr_create_command("main", "feat/x", title, "/t", false);
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("printf '%s' \"$OCTOPUSH_PR_TITLE\"")
+            .envs(env)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), title);
+    }
+
+    #[test]
+    fn pr_create_command_drafts_strips_origin_and_flattens_the_title() {
+        let (cmd, env) = pr_create_command("origin/release/1.0", "b", "Two\nlines", "/t", true);
+        let get = |k: &str| env.iter().find(|(n, _)| *n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(get("OCTOPUSH_PR_BASE"), "release/1.0");
+        assert_eq!(get("OCTOPUSH_PR_TITLE"), "Two lines");
+        assert!(cmd.ends_with(" --draft"), "{cmd}");
+    }
+
+    #[test]
+    fn a_pr_never_goes_from_a_branch_onto_itself() {
+        use crate::github::pr_head_is_valid;
+        assert!(pr_head_is_valid("main", "feat/x"));
+        assert!(!pr_head_is_valid("main", "main"));
+        assert!(!pr_head_is_valid("origin/main", "main"));
+        assert!(!pr_head_is_valid("main", ""));
+        assert!(!pr_head_is_valid("main", "HEAD"));
+    }
+
+    #[test]
+    fn pr_from_create_output_reads_the_url_line() {
+        let out = "Warning: 1 uncommitted change\nhttps://github.com/o/r/pull/42\n";
+        let pr = pr_from_create_output(out, "Add a thing", true).expect("a PR");
+        assert_eq!(pr.number, 42);
+        assert_eq!(pr.url, "https://github.com/o/r/pull/42");
+        assert_eq!(pr.state, PrState::Draft);
+        assert!(pr.is_draft);
+        assert_eq!(pr_from_create_output(out, "t", false).unwrap().state, PrState::Open);
+        assert!(pr_from_create_output("no url here\nhttps://github.com/o/r\n", "t", false).is_none());
+    }
+
+    #[test]
+    fn find_pr_template_follows_githubs_lookup_order() {
+        let dir = tempdir().unwrap();
+        assert_eq!(find_pr_template(dir.path()), None);
+        std::fs::write(dir.path().join("PULL_REQUEST_TEMPLATE.md"), "root one").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root one"));
+        std::fs::create_dir_all(dir.path().join(".github")).unwrap();
+        // A blank template is skipped, not used.
+        std::fs::write(dir.path().join(".github/pull_request_template.md"), "  \n").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("root one"));
+        std::fs::write(dir.path().join(".github/pull_request_template.md"), "## Summary\n").unwrap();
+        assert_eq!(find_pr_template(dir.path()).as_deref(), Some("## Summary"));
+    }
+
+    #[test]
+    fn repo_default_branch_is_origin_head_not_the_checked_out_branch() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "trunk"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        // No origin/HEAD and no main/master: unknown, never the current branch.
+        assert_eq!(crate::git_ops::repo_default_branch(d), None);
+        git(d, &["branch", "main"]);
+        assert_eq!(crate::git_ops::repo_default_branch(d).as_deref(), Some("main"));
+        git(d, &["update-ref", "refs/remotes/origin/trunk", "HEAD"]);
+        git(d, &["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/trunk"]);
+        assert_eq!(crate::git_ops::repo_default_branch(d).as_deref(), Some("trunk"));
+    }
+
+    #[test]
+    fn branch_pr_context_diffs_from_the_merge_base() {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t.dev"]);
+        git(d, &["config", "user.name", "T"]);
+        std::fs::write(d.join("a.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "first"]);
+        git(d, &["checkout", "-qb", "feature"]);
+        std::fs::write(d.join("b.txt"), "two\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "Add b"]);
+        // main moves on after the branch point; its change is not in the PR.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "x\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "feature"]);
+
+        let (diff, commits) = crate::git_ops::branch_pr_context(d, "main").unwrap();
+        assert!(diff.contains("b.txt"), "{diff}");
+        assert!(!diff.contains("main-only.txt"), "{diff}");
+        assert_eq!(commits, vec!["Add b".to_string()]);
+        assert!(crate::git_ops::branch_pr_context(d, "nope").is_err());
+    }
+}
