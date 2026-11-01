@@ -4861,6 +4861,16 @@ mod orchestrator_tests {
         assert!(answers_are_defaults(Some(&ask), &["".into(), "".into()]));
         assert!(!answers_are_defaults(Some(&ask), &["SQLite".into(), "yes".into()]));
         assert!(!answers_are_defaults(None, &["x".into()]));
+        // A blank default is no recommendation: echoing it back isn't "accepting defaults".
+        let blank = BlockedAsk {
+            summary: "s".into(),
+            questions: vec![
+                BlockedQuestion { question: "a?".into(), why_blocked: String::new(), recommended_default: "Postgres".into() },
+                BlockedQuestion { question: "b?".into(), why_blocked: String::new(), recommended_default: "  ".into() },
+            ],
+        };
+        assert!(!answers_are_defaults(Some(&blank), &["Postgres".into(), "".into()]));
+        assert!(!answers_are_defaults(Some(&blank), &["Postgres".into(), "custom".into()]));
         assert_eq!(
             accepted_defaults_notice(Some("mission_control")),
             "✓ Director accepted the recommended defaults (from Mission Control)"

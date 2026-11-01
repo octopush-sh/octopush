@@ -607,16 +607,29 @@ function AskPanel({
   const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const [open, setOpen] = useState(false);
   const [sending, setSending] = useState(false);
+  const [failed, setFailed] = useState(false);
+  // State lags a fast double-click; the ref closes the gate synchronously.
+  const inFlight = useRef(false);
   const questions = stage.blockedQuestions?.questions ?? [];
   const panelId = `mc-ask-${stage.id}`;
+  // A blank default isn't a recommendation: only the full form can answer it.
+  const allHaveDefaults = questions.length > 0 && questions.every((q) => q.recommendedDefault.trim() !== "");
 
   const accept = (e: React.MouseEvent) => {
     e.stopPropagation(); // don't trigger the card's jump
-    if (sending) return;
+    if (inFlight.current) return;
+    inFlight.current = true;
     setSending(true);
+    setFailed(false);
     void answerBlocker(run.id, stage.id, questions.map((q) => q.recommendedDefault), "mission_control")
-      .catch(console.error)
-      .finally(() => setSending(false));
+      .catch((err) => {
+        console.error(err);
+        setFailed(true);
+      })
+      .finally(() => {
+        inFlight.current = false;
+        setSending(false);
+      });
   };
 
   const count = questions.length === 1 ? "1 question" : `${questions.length} questions`;
@@ -656,16 +669,18 @@ function AskPanel({
             </div>
           ))}
           <div className="flex items-center gap-2 pt-1">
-            <button
-              type="button"
-              data-tour="mission-control-ask-accept"
-              onClick={accept}
-              disabled={sending}
-              title="Answer every question with the crew's recommended default"
-              className="rounded-md border border-[var(--brass-dim)] px-2.5 py-1 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
-            >
-              {sending ? "Sending…" : "Accept recommended"}
-            </button>
+            {allHaveDefaults && (
+              <button
+                type="button"
+                data-tour="mission-control-ask-accept"
+                onClick={accept}
+                disabled={sending}
+                title="Answer every question with the crew's recommended default"
+                className="rounded-md border border-[var(--brass-dim)] px-2.5 py-1 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50"
+              >
+                {sending ? "Sending…" : "Accept recommended"}
+              </button>
+            )}
             {onAnswer && (
               <button
                 type="button"
@@ -674,12 +689,17 @@ function AskPanel({
                   onAnswer();
                 }}
                 title="Open the full answer form"
-                className="rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-[11px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                className="rounded-md border border-octo-border-strong px-2.5 py-1 font-mono text-[11px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               >
                 Answer…
               </button>
             )}
           </div>
+          {failed && (
+            <span role="alert" className="octo-fade-in font-mono text-[10px] leading-4 text-octo-rouge">
+              Couldn't send the answers · open the run to answer
+            </span>
+          )}
         </div>
       </Reveal>
     </div>

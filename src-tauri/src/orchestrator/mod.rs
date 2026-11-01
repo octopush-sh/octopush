@@ -133,7 +133,8 @@ pub(crate) fn format_blocker_feedback(
 
 /// True when every resolved answer (same positional / empty-falls-back rule as
 /// [`format_blocker_feedback`]) is the question's recommended default — the
-/// director accepted the crew's defaults. False when there are no questions.
+/// director accepted the crew's defaults. False when there are no questions,
+/// or when any default is blank (there was nothing to accept).
 pub(crate) fn answers_are_defaults(
     ask: Option<&crate::orchestrator::types::BlockedAsk>,
     answers: &[String],
@@ -143,7 +144,7 @@ pub(crate) fn answers_are_defaults(
         && questions.iter().enumerate().all(|(i, q)| {
             let default = q.recommended_default.trim();
             let answer = answers.get(i).map(|a| a.trim()).filter(|a| !a.is_empty()).unwrap_or(default);
-            answer == default
+            !default.is_empty() && answer == default
         })
 }
 

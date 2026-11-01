@@ -353,7 +353,7 @@ describe("MissionControl", () => {
   });
 
   /** A paused run whose second stage asked the director two questions. */
-  function seedAsk() {
+  function seedAsk(secondDefault = "Yes, for one release") {
     const run = mkRun("a", "paused");
     const blocked: RunStage = {
       ...mkStage("s2", "a", 1, "awaiting_checkpoint"),
@@ -362,7 +362,7 @@ describe("MissionControl", () => {
         summary: "two decisions",
         questions: [
           { question: "Postgres or SQLite?", whyBlocked: "", recommendedDefault: "Postgres" },
-          { question: "Keep the old endpoint?", whyBlocked: "", recommendedDefault: "Yes, for one release" },
+          { question: "Keep the old endpoint?", whyBlocked: "", recommendedDefault: secondDefault },
         ],
       },
     };
@@ -402,6 +402,49 @@ describe("MissionControl", () => {
       "mission_control",
     );
     expect(onJumpToRun).not.toHaveBeenCalled();
+  });
+
+  it("Accept reads Sending… and is disabled while in flight; a second click doesn't answer twice", async () => {
+    seedAsk();
+    let settle!: () => void;
+    vi.mocked(ipc.answerBlocker).mockReturnValueOnce(new Promise<void>((r) => (settle = r)));
+    const { container } = renderRoom();
+    fireEvent.click(container.querySelector('[data-tour="mission-control-ask-toggle"]')!);
+    const accept = container.querySelector('[data-tour="mission-control-ask-accept"]') as HTMLButtonElement;
+    fireEvent.click(accept);
+    fireEvent.click(accept);
+    expect(accept.textContent).toBe("Sending…");
+    expect(accept.disabled).toBe(true);
+    expect(ipc.answerBlocker).toHaveBeenCalledTimes(1);
+    await act(async () => settle());
+    expect(ipc.answerBlocker).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("a failed Accept says so on the card instead of failing silently", async () => {
+    seedAsk();
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    vi.mocked(ipc.answerBlocker).mockRejectedValueOnce(new Error("no pending block"));
+    const { container } = renderRoom();
+    fireEvent.click(container.querySelector('[data-tour="mission-control-ask-toggle"]')!);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Accept recommended" }));
+    });
+    const alert = screen.getByRole("alert");
+    expect(alert.textContent).toBe("Couldn't send the answers · open the run to answer");
+    expect(alert.className).toContain("text-octo-rouge");
+    expect(screen.getByRole("button", { name: "Accept recommended" })).toBeTruthy(); // can retry
+    quiet.mockRestore();
+  });
+
+  it("a question with a blank default leaves only Answer… — nothing to accept", () => {
+    seedAsk("");
+    const { container } = renderRoom({ onJumpToRun: vi.fn() });
+    fireEvent.click(container.querySelector('[data-tour="mission-control-ask-toggle"]')!);
+    expect(screen.getByText("no default given")).toBeTruthy();
+    expect(container.querySelector('[data-tour="mission-control-ask-accept"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Answer…" })).toBeTruthy();
+    expect(ipc.answerBlocker).not.toHaveBeenCalled();
   });
 
   it("Answer… opens the full form (jumps to the run) instead of answering", () => {
