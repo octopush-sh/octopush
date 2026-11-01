@@ -709,7 +709,7 @@ function SpawnFailed({
         type="button"
         data-tour="run-spawn-retry"
         onClick={onRetry}
-        className="mt-2 rounded-lg border border-octo-hairline px-4 py-2 font-serif text-[13px] text-octo-sage transition hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        className="mt-2 rounded-lg border border-octo-border-strong px-4 py-2 font-serif text-[13px] text-octo-sage transition hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
         Try the shell again
       </button>

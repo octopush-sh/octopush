@@ -19,40 +19,36 @@ describe("describeSpawnFailure", () => {
     );
   });
 
-  // Fixtures below are the exact strings `pty_client.rs` / `pty_daemon.rs` produce.
+  // Fixtures below are the exact strings that reach JS over IPC: every error on
+  // this path is an `AppError::Other`, serialised as `other: <message>`.
   it("describes an error the daemon reported by its actual cause, not as service down", () => {
-    expect(describeSpawnFailure("daemon error: No such file or directory (os error 2)")).toMatch(
-      /couldn't be found/,
+    expect(
+      describeSpawnFailure("other: daemon error: spawn: No such file or directory (os error 2)"),
+    ).toMatch(/couldn't be found/);
+    expect(
+      describeSpawnFailure("other: daemon error: spawn: Operation not permitted (os error 1)"),
+    ).toMatch(/denied permission/);
+    expect(describeSpawnFailure("other: daemon error: spawn: Broken pipe (os error 32)")).toBe(
+      "The terminal couldn't start a shell for this workspace.",
     );
-    expect(describeSpawnFailure("daemon error: Operation not permitted (os error 1)")).toMatch(
-      /denied permission/,
-    );
-    expect(describeSpawnFailure("daemon error: unknown terminal")).toBe(
+    expect(describeSpawnFailure("other: daemon error: terminal t-1 already exists")).toBe(
       "The terminal couldn't start a shell for this workspace.",
     );
   });
 
   it("says the service isn't responding only when it couldn't be reached", () => {
     for (const msg of [
-      "daemon unavailable",
-      "write to daemon: Broken pipe (os error 32)",
-      "daemon response timeout",
-      "daemon connection is broken",
-      "connect to daemon: Connection refused (os error 61)",
-      "reconnect to daemon: No such file or directory (os error 2)",
-      "daemon error: daemon connection closed",
+      "other: daemon unavailable",
+      "other: write to daemon: Broken pipe (os error 32)",
+      "other: daemon response timeout",
+      "other: daemon connection is broken",
+      "other: daemon error: daemon connection closed",
     ]) {
       expect(describeSpawnFailure(msg)).toBe("The background terminal service isn't responding.");
     }
   });
 
-  it("says the service couldn't be started when the daemon binary is missing or won't launch", () => {
-    for (const msg of [
-      "octopush-pty-server binary not found next to executable or in $PATH",
-      "PTY daemon failed to start within 2.5s",
-      "failed to spawn daemon: Permission denied (os error 13)",
-    ]) {
-      expect(describeSpawnFailure(msg)).toBe("The background terminal service couldn't be started.");
-    }
+  it("never says the service couldn't be started: that case only reaches JS as unreachable", () => {
+    expect(describeSpawnFailure("other: daemon unavailable")).not.toMatch(/couldn't be started/);
   });
 });

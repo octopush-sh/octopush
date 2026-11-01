@@ -17,29 +17,28 @@ export function spawnErrorDetail(err: unknown): string {
   }
 }
 
-/** `pty_client.rs` wraps every error the daemon itself returns in this
- *  prefix: the service answered, so the rest names the real cause. */
-const DAEMON_REPORTED = "daemon error:";
+/** Every error on the spawn path is an `AppError::Other`, which reaches JS as
+ *  its `Display` string, `other: <message>` (`error.rs`). */
+const APP_ERROR_PREFIX = /^other:\s*/;
 
-/** `pty_daemon.rs` couldn't find or launch the daemon binary. */
-const SERVICE_NOT_STARTED =
-  /octopush-pty-server binary not found|pty daemon failed to start|failed to spawn daemon/;
+/** `pty_client.rs` wraps every error the daemon itself returns as
+ *  `daemon error: <msg>`, so JS receives `other: daemon error: spawn: …`.
+ *  The service answered, so the rest names the real cause. */
+const DAEMON_REPORTED = /^daemon error:\s*/;
 
-/** The app couldn't reach the daemon (`pty_client.rs`), or the socket failed. */
+/** The app couldn't reach the daemon (`pty_client.rs`), or the socket failed.
+ *  A daemon that fails to start is only logged; JS then sees one of these. */
 const SERVICE_UNREACHABLE =
   /daemon unavailable|write to daemon|daemon response timeout|(re)?connect to daemon|daemon connection (is broken|closed)|connection refused|econnrefused|broken pipe/;
 
 /** One sentence on why the session didn't start. */
 export function describeSpawnFailure(detail: string): string {
-  const d = detail.toLowerCase().trim();
-  if (d.startsWith(DAEMON_REPORTED)) {
-    const cause = d.slice(DAEMON_REPORTED.length).trim();
+  const d = detail.toLowerCase().trim().replace(APP_ERROR_PREFIX, "");
+  if (DAEMON_REPORTED.test(d)) {
+    const cause = d.replace(DAEMON_REPORTED, "");
     // The app's reader synthesises this one when the socket hits EOF.
     if (/^daemon connection closed/.test(cause)) return serviceUnreachable();
     return describeShellCause(cause);
-  }
-  if (SERVICE_NOT_STARTED.test(d)) {
-    return "The background terminal service couldn't be started.";
   }
   if (SERVICE_UNREACHABLE.test(d)) return serviceUnreachable();
   return describeShellCause(d);
