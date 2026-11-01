@@ -498,6 +498,18 @@
   visibility: hidden; --demote-vis-delay: var(--dur-standard);
 }
 
+/* The Review file header is its own, one-rung ladder: the path is the only
+   elastic atom (middle-truncated, full string in its title), everything else
+   is `flex: none` and nowrap. When the canvas column gets narrow the hunk
+   count goes first — each hunk still has its own rail just below. */
+.octo-filehead { container-type: inline-size; container-name: octo-filehead; }
+@container octo-filehead (max-width: 420px) {
+  .octo-demote-hunks {
+    max-width: 0; opacity: 0; margin-right: -8px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
+}
+
 .octo-status { display: inline-flex; align-items: center; }
 .octo-status-dot {
   flex: none; width: 6px; height: 6px; border-radius: 999px;

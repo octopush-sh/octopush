@@ -1,6 +1,7 @@
 import { ChevronRight } from "lucide-react";
 import { HunkRail } from "./HunkRail";
 import { DiffLines } from "./DiffLines";
+import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import type { DiffFile } from "../../lib/diffParser";
 
@@ -48,20 +49,26 @@ export function FileDiffSection({
   return (
     <div className="scroll-mt-4" id={id}>
       {/* ── File header row ─────────────────────────────────────────── */}
-      <div className="flex items-center gap-2 border-b border-octo-hairline pb-1.5">
+      {/* The path is the only elastic item (middle-truncated, tail pinned);
+          every other atom is flex-none + nowrap, and the hunk count is the
+          first to go when the column narrows (`.octo-filehead`, styles.css). */}
+      <div className="octo-filehead flex items-center gap-2 border-b border-octo-hairline pb-1.5">
         <span
-          className={`font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
+          className={`flex-none whitespace-nowrap font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
         >
           {typeLabel}
         </span>
-        <span className="text-octo-hairline">·</span>
-        <span className="font-mono text-[12.5px] text-octo-ivory">
-          {file.filePath}
+        <span className="flex-none text-octo-hairline">·</span>
+        <span
+          title={file.filePath}
+          className="flex min-w-0 font-mono text-[12.5px] text-octo-ivory"
+        >
+          <MidTruncate text={file.filePath} tail={pathTail(file.filePath)} />
         </span>
         <button
           onClick={onToggleCollapsed}
           aria-label={collapsed ? "Expand file" : "Collapse file"}
-          className="text-octo-mute transition-colors hover:text-octo-sage focus-visible:ring-1 focus-visible:ring-octo-brass"
+          className="flex-none text-octo-mute transition-colors hover:text-octo-sage focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           <ChevronRight
             size={11}
@@ -71,12 +78,12 @@ export function FileDiffSection({
             }}
           />
         </button>
-        <span className="font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
+        <span className="octo-demote octo-demote-hunks font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
           {file.hunks.length} hunk{file.hunks.length !== 1 ? "s" : ""}
         </span>
         <button
           onClick={onToggleViewed}
-          className={`ml-auto rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] focus-visible:ring-1 focus-visible:ring-octo-brass ${
+          className={`ml-auto flex-none whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] focus-visible:ring-1 focus-visible:ring-octo-brass ${
             viewed
               ? "text-octo-verdigris"
               : "text-octo-mute hover:text-octo-sage"
@@ -117,6 +124,13 @@ export function FileDiffSection({
       </div>
     </div>
   );
+}
+
+/** How much of a path <MidTruncate> pins: at least the file name and the
+ *  slash before it, so the elision only ever eats directories. */
+export function pathTail(path: string): number {
+  const base = path.length - path.lastIndexOf("/");
+  return Math.max(12, base);
 }
 
 /** Convert a raw @@ header into a human-readable line range string. */

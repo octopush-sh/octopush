@@ -31,12 +31,12 @@ export function HunkRail({
         opacity: staged ? 0.55 : 1,
       }}
     >
-      <span className="text-octo-mute">
+      <span className="flex-none whitespace-nowrap text-octo-mute">
         {focused ? "⟶ " : ""}
         {range}
         {staged ? " · staged ✓" : ""}
       </span>
-      <span className="ml-auto flex items-center gap-2">
+      <span className="ml-auto flex items-center gap-2 whitespace-nowrap">
         {additions > 0 && (
           <span className="text-octo-verdigris">+{additions}</span>
         )}
