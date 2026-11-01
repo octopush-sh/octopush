@@ -8097,6 +8097,96 @@ mod cli_runner_tests {
         assert_eq!(outcome.cost_usd, 1.25);
         assert_eq!(outcome.input_tokens, 10);
     }
+
+    /// Spawn `sh <script> <arg>` the way the CLI stage spawns `claude`: in
+    /// its own process group.
+    #[cfg(unix)]
+    fn spawn_fake_cli(script: &std::path::Path, arg: &std::path::Path) -> tokio::process::Child {
+        tokio::process::Command::new("sh")
+            .arg(script)
+            .arg(arg)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap()
+    }
+
+    /// Wait until the fake CLI has written `path` (it's ready to be stopped).
+    #[cfg(unix)]
+    async fn wait_for_file(path: &std::path::Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path) {
+                if s.ends_with('\n') {
+                    return s;
+                }
+            }
+            assert!(std::time::Instant::now() < deadline, "fake CLI never wrote {}", path.display());
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A stop ends the CLI AND what it started: a backgrounded `sleep 300`
+    /// (standing in for a dev server) is gone too. With the old
+    /// `child.kill()` only the script died and the sleep kept running.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cli_child_kills_the_whole_process_group() {
+        use crate::orchestrator::cli_runner::stop_cli_child;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-cli.sh");
+        let pidfile = dir.path().join("grandchild.pid");
+        std::fs::write(&script, "sleep 300 &\necho $! > \"$1\"\nwait\n").unwrap();
+        let mut child = spawn_fake_cli(&script, &pidfile);
+        let grandchild: libc::pid_t = wait_for_file(&pidfile).await.trim().parse().unwrap();
+
+        let grace = Duration::from_millis(300);
+        let started = Instant::now();
+        let status = stop_cli_child(&mut child, grace).await;
+        assert!(status.is_some(), "the CLI was reaped");
+        assert!(started.elapsed() < grace * 2 + Duration::from_secs(3), "bounded by the grace periods");
+
+        // The orphaned sleep is reaped by init right after the group kill;
+        // poll briefly so a not-yet-reaped zombie doesn't flake the test.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // SAFETY: kill(pid, 0) performs no action — existence probe only.
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the grandchild must die with the group");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// A CLI that handles SIGINT and exits cleanly is not escalated: it exits
+    /// 0 from its own trap, well inside the first grace period.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_cli_child_lets_a_clean_sigint_exit_stand() {
+        use crate::orchestrator::cli_runner::stop_cli_child;
+        use std::time::{Duration, Instant};
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("fake-cli.sh");
+        let marker = dir.path().join("state");
+        std::fs::write(
+            &script,
+            "trap 'echo interrupted > \"$1\"; exit 0' INT\n\
+             echo ready > \"$1\"\n\
+             while :; do sleep 0.1; done\n",
+        )
+        .unwrap();
+        let mut child = spawn_fake_cli(&script, &marker);
+        assert_eq!(wait_for_file(&marker).await, "ready\n");
+
+        let grace = Duration::from_secs(3);
+        let started = Instant::now();
+        let status = stop_cli_child(&mut child, grace).await.expect("reaped");
+        assert!(status.success(), "exited 0 from its trap, not killed: {status:?}");
+        assert!(started.elapsed() < grace, "no escalation past SIGINT");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "interrupted\n");
+    }
 }
 
 #[cfg(test)]
