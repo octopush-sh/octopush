@@ -13,8 +13,7 @@ import { hasReadinessFailure, useReadinessStore } from "../stores/readinessStore
  *  (exactly one per attention scope). Rendered only while eligible — never
  *  ran a crew (all-time), not dismissed, not already used this session.
  *
- *  While shown it runs the readiness checks once; when one fails (no
- *  `claude`, no `git`) it links to the Settings › General readiness card. */
+ *  While shown it runs the readiness checks once; a failure links to the card. */
 export function FirstRunInvite({ onSendCrew, onOpenReadiness }: {
   onSendCrew: () => void;
   onOpenReadiness: () => void;

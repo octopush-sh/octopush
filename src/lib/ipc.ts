@@ -1397,7 +1397,7 @@ export interface ReadinessCheck {
   id: "claude" | "auth" | "git" | "gh" | "ollama";
   label: string;
   status: "ok" | "warn" | "fail";
-  /** The live value: a version, "Signed in", "No answer in 3 s"… */
+  /** The live value: a version, "Token found", "No answer in 3 s"… */
   value: string;
   fix: string | null;
   /** A copyable command that fixes it, when there is one. */

@@ -57,15 +57,7 @@ describe("FirstRunInvite", () => {
 
   it("links to the readiness card when a check fails", async () => {
     vi.mocked(ipc.readinessCheck).mockResolvedValue([
-      {
-        id: "claude",
-        label: "Claude Code",
-        status: "fail",
-        value: "Not found",
-        fix: "Install Claude Code, then check again.",
-        command: "npm i -g @anthropic-ai/claude-code",
-        timedOut: false,
-      },
+      { id: "claude", label: "Claude Code", status: "fail", value: "Not found", fix: "Install it.", command: null, timedOut: false },
     ]);
     const onOpenReadiness = vi.fn();
     render(<FirstRunInvite onSendCrew={vi.fn()} onOpenReadiness={onOpenReadiness} />);
@@ -77,15 +69,7 @@ describe("FirstRunInvite", () => {
 
   it("shows no readiness link when nothing fails", async () => {
     vi.mocked(ipc.readinessCheck).mockResolvedValue([
-      {
-        id: "gh",
-        label: "GitHub CLI",
-        status: "warn",
-        value: "Not signed in",
-        fix: "Sign gh in so a crew can open its pull request.",
-        command: "gh auth login",
-        timedOut: false,
-      },
+      { id: "gh", label: "GitHub CLI", status: "warn", value: "Not signed in", fix: "Sign in.", command: null, timedOut: false },
     ]);
     render(<FirstRunInvite onSendCrew={vi.fn()} onOpenReadiness={vi.fn()} />);
     await waitFor(() => expect(useReadinessStore.getState().checks).not.toBeNull());

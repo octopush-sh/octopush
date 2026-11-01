@@ -36,7 +36,7 @@ describe("ReadinessCard", () => {
     expect(screen.getByTestId("readiness-loading")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
 
-    resolve([row({ id: "git", label: "git", value: "2.39.3" })]);
+    resolve([row({ id: "git", value: "2.39.3" })]);
     await waitFor(() => expect(screen.queryByTestId("readiness-loading")).toBeNull());
     expect(readinessCheck).toHaveBeenCalledTimes(1);
   });
@@ -53,35 +53,21 @@ describe("ReadinessCard", () => {
   });
 
   it("renders a failing row with its fix and a copyable command", async () => {
-    readinessCheck.mockResolvedValue([
-      row({
-        id: "claude",
-        label: "Claude Code",
-        status: "fail",
-        value: "Not found",
-        fix: "Install Claude Code, then check again.",
-        command: "npm i -g @anthropic-ai/claude-code",
-      }),
-    ]);
+    const command = "npm i -g @anthropic-ai/claude-code";
+    const fix = "Install Claude Code, then check again.";
+    readinessCheck.mockResolvedValue([row({ id: "claude", status: "fail", value: "Not found", fix, command })]);
     render(<ReadinessCard />);
     const r = await screen.findByTestId("readiness-row-claude");
     expect(within(r).getByText("Failed")).toHaveClass("text-octo-rouge");
-    expect(within(r).getByText("Install Claude Code, then check again.")).toBeInTheDocument();
-    fireEvent.click(within(r).getByRole("button", { name: "Copy npm i -g @anthropic-ai/claude-code" }));
-    expect(copyToClipboard).toHaveBeenCalledWith("npm i -g @anthropic-ai/claude-code");
+    expect(within(r).getByText(fix)).toBeInTheDocument();
+    fireEvent.click(within(r).getByRole("button", { name: `Copy ${command}` }));
+    expect(copyToClipboard).toHaveBeenCalledWith(command);
   });
 
   it("marks a timed-out check in amber, never brass", async () => {
+    const command = "gh auth token --hostname github.com";
     readinessCheck.mockResolvedValue([
-      row({
-        id: "gh",
-        label: "GitHub CLI",
-        status: "warn",
-        value: "No answer in 3 s",
-        fix: "It didn't answer in time.",
-        command: "gh auth token --hostname github.com",
-        timedOut: true,
-      }),
+      row({ id: "gh", label: "GitHub CLI", status: "warn", value: "No answer in 3 s", fix: "It didn't answer in time.", command, timedOut: true }),
     ]);
     render(<ReadinessCard />);
     const r = await screen.findByTestId("readiness-row-gh");
@@ -89,33 +75,20 @@ describe("ReadinessCard", () => {
     expect(word).toHaveClass("text-octo-warning");
     expect(word.className).not.toMatch(/brass/);
     expect(within(r).getByTitle("GitHub CLI: Timed out")).toBeInTheDocument();
-    expect(within(r).getByText("gh auth token --hostname github.com")).toBeInTheDocument();
+    expect(within(r).getByText(command)).toBeInTheDocument();
   });
 
-  it("shows a rouge error line when the checks can't run", async () => {
-    readinessCheck.mockRejectedValue("readiness task failed: boom");
+  it("shows a rouge error line when the checks can't run, and Check again re-runs them and clears it", async () => {
+    readinessCheck.mockRejectedValueOnce("readiness task failed: boom");
+    readinessCheck.mockResolvedValueOnce([row({ id: "git", value: "2.39.3" })]);
     render(<ReadinessCard />);
     const line = await screen.findByText("Couldn't run the checks: readiness task failed: boom");
     expect(line).toHaveClass("text-octo-rouge");
     expect(screen.queryByTestId("readiness-loading")).toBeNull();
-    expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
-  });
 
-  it("Check again clears the error after a later success", async () => {
-    readinessCheck.mockRejectedValueOnce("readiness task failed: boom");
-    readinessCheck.mockResolvedValueOnce([row({ id: "git", label: "git", value: "2.39.3" })]);
-    render(<ReadinessCard />);
-    await screen.findByText(/Couldn't run the checks/);
     fireEvent.click(screen.getByRole("button", { name: "Check again" }));
     await screen.findByTestId("readiness-row-git");
+    expect(readinessCheck).toHaveBeenCalledTimes(2);
     expect(screen.queryByText(/Couldn't run the checks/)).toBeNull();
-  });
-
-  it("Check again re-runs the checks", async () => {
-    readinessCheck.mockResolvedValue([row({ id: "git", value: "2.39.3" })]);
-    render(<ReadinessCard />);
-    await screen.findByTestId("readiness-row-git");
-    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
-    await waitFor(() => expect(readinessCheck).toHaveBeenCalledTimes(2));
   });
 });

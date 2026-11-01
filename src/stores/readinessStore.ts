@@ -1,10 +1,8 @@
 import { create } from "zustand";
 import { ipc, type ReadinessCheck } from "../lib/ipc";
 
-/** "Is this Mac ready for a crew?" — the Settings › General readiness card
- *  and the first-run invite share one result. Checks are local commands
- *  (`readiness_check`), each bounded at 3 s on the Rust side; never cached
- *  there, so `check()` always re-probes. */
+/** One shared result for the Settings › General readiness card and the
+ *  first-run invite. `readiness_check` never caches, so `check()` re-probes. */
 interface ReadinessState {
   /** null = not checked yet this session. */
   checks: ReadinessCheck[] | null;

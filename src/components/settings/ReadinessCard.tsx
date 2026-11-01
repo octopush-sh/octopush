@@ -1,7 +1,5 @@
 // Settings › General — "Is this Mac ready for a crew?". One row per local
-// check (claude + version vs the tested floor, auth mode, git, gh, Ollama
-// when its provider is on), run once when the pane opens and on "Check
-// again". A failing row carries a one-line fix and a copyable command.
+// check, run when the pane opens and on "Check again".
 import { useEffect, useState } from "react";
 import { AlertTriangle, CheckCircle, Clock, Copy, Loader2, XCircle } from "lucide-react";
 import type { ReadinessCheck } from "../../lib/ipc";
