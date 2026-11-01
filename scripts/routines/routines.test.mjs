@@ -572,8 +572,9 @@ test("jobs: ready website/API ideas filed in the app repo aren't built here", ()
     { number: 2, labels: [{ name: "ready" }, { name: "area:web" }] },
     { number: 3, labels: [{ name: "ready" }, { name: "area:api" }] },
     { number: 4, labels: [{ name: "ready" }, { name: "area:app" }, { name: "area:web" }] },
+    { number: 5, labels: [{ name: "ready" }, { name: "area:app" }, { name: "area:api" }] },
   ]]]);
-  assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1, 4], "area:app wins over a secondary area:web");
+  assert.deepEqual(issueJobs(gh, APP_REPO, a, now).map((i) => i.number), [1, 4], "area:app wins over a secondary area:web; area:api still waits");
 });
 
 test("answers: trailing punctuation is not a note", () => {
@@ -706,8 +707,9 @@ test("web jobs: web PR fixes first, then web `ready` issues, then app-repo `area
     { number: 40, labels: [{ name: "ready" }, { name: "area:web" }] },
     { number: 41, labels: [{ name: "ready" }, { name: "area:web" }] },
     { number: 42, labels: [{ name: "ready" }, { name: "area:web" }, { name: "needs-owner" }] },
+    { number: 43, labels: [{ name: "ready" }, { name: "area:web" }, { name: "area:app" }] },
   ]);
-  assert.deepEqual(appWebIssueJobs(gh, gh, wIds, now).map((i) => i.number), [41]);
+  assert.deepEqual(appWebIssueJobs(gh, gh, wIds, now).map((i) => i.number), [41], "area:app + area:web is the app builder's");
   assert.deepEqual(nextWebJob(gh, gh, wIds, now), { kind: "app-issue", n: 41, title: undefined, url: undefined });
   // An outsider's PR naming the issue claims nothing.
   gh = routes([wpr(3, { user: { login: "stranger" }, body: "Closes octopush-sh/octopush#41" })], [], [{ number: 41, labels: [{ name: "ready" }, { name: "area:web" }] }]);

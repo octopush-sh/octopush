@@ -28,7 +28,8 @@ export const MAX_FIX_ROUNDS = 3;
 const UPDATE_MARK = "<!-- octopush-build:update -->";
 const PARKED = ["needs-owner", "proposal", "later"];
 /** Ideas for the website/API live here too (area:web|api) but this repo's builder can't build them. */
-const OTHER_AREA = ["area:web", "area:api"];
+const OTHER_AREA = ["area:web", "area:api"]; // skipped here, unless area:app + area:web (app work)
+const APP_AREA = "area:app";
 /** App-repo issues the web builder takes (VISION.md §8: website work queued in the hub). */
 export const WEB_AREA = "area:web";
 
@@ -80,7 +81,9 @@ export function issueJobs(gh, repo, ids, now) {
     // An issue labelled area:app is app work even if it also touches the site
     // (#298 and #300 carried area:web too and the builder skipped them).
     .filter((i) => !i.pull_request && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
-    .filter((i) => labelsOf(i).includes("area:app") || !labelsOf(i).some((l) => skip.includes(l)))
+    // ...but area:api still waits: nothing builds the API half, and shipping UI for a
+    // missing endpoint is worse than waiting.
+    .filter((i) => !labelsOf(i).some((l) => skip.includes(l) && (l !== WEB_AREA || !labelsOf(i).includes(APP_AREA))))
     .filter((i) => !isFreshClaim(gh, repo, i, now));
 }
 
@@ -104,7 +107,7 @@ export function appWebIssueJobs(appGh, webGh, webIds, now) {
   }
   return appGh.list(`repos/${APP_REPO}/issues?labels=ready,${WEB_AREA}&state=open&sort=created&direction=asc`)
     // area:app + area:web is app work (the app builder takes it), never both builders.
-    .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).includes("area:app") && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
+    .filter((i) => !i.pull_request && labelsOf(i).includes(WEB_AREA) && !labelsOf(i).includes(APP_AREA) && !labelsOf(i).some((l) => PARKED.includes(l)) && !claimed.has(i.number))
     .filter((i) => !isFreshClaim(appGh, APP_REPO, i, now));
 }
 
