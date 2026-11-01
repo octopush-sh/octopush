@@ -6261,6 +6261,47 @@ mod orchestrator_tests {
         assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
     }
 
+    /// A failed setup only discards a worktree the fire just created — never an
+    /// adopted, reused or restored checkout.
+    #[test]
+    fn routine_setup_failure_discards_only_a_created_worktree() {
+        use crate::routines::discards_on_setup_failure;
+        use crate::workspace::CreateOutcome;
+        assert!(discards_on_setup_failure(CreateOutcome::Created));
+        assert!(!discards_on_setup_failure(CreateOutcome::Adopted));
+        assert!(!discards_on_setup_failure(CreateOutcome::Existed));
+        assert!(!discards_on_setup_failure(CreateOutcome::Restored));
+    }
+
+    /// The run-now toast picks its wording by the skip token, not the label.
+    #[test]
+    fn routine_skip_view_carries_a_machine_token() {
+        use crate::routines::{FireOutcome, SkipReason};
+        let view = FireOutcome::Skipped(SkipReason::SetupFailed("exit 1".into())).view();
+        assert_eq!(view.skip, Some("setup_failed"));
+        assert_eq!(view.reason.as_deref(), Some("setup failed: exit 1"));
+        assert_eq!(FireOutcome::Dispatched.view().skip, None);
+        let json = serde_json::to_value(FireOutcome::Skipped(SkipReason::Busy).view()).unwrap();
+        assert_eq!(json["skip"], "busy");
+    }
+
+    /// Dropping a setup script mid-run (a cancelled fire) kills its whole
+    /// process group, not just `bash`: the backgrounded child never creates
+    /// its marker.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn routine_setup_dropped_mid_run_kills_the_process_group() {
+        use crate::routines::run_setup_with_path;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("survived.marker");
+        let script = format!("(sleep 0.5 && touch '{}') & sleep 30", marker.display());
+        let fire = run_setup_with_path(&script, dir.path(), Duration::from_secs(60), "/usr/bin:/bin");
+        assert!(tokio::time::timeout(Duration::from_millis(150), fire).await.is_err(), "still running");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(!marker.exists(), "the backgrounded child must die with the group");
+    }
+
     /// The project's setup-script template round-trips through the DB (the
     /// wizard writes it; a fresh routine reads it).
     #[test]
@@ -6371,15 +6412,21 @@ mod orchestrator_tests {
         let past = "2000-01-01T00:00:00+00:00";
         db.lock().insert_routine("r-cond", &input, Some(past), true).unwrap();
 
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
         let orch = Arc::new(Orchestrator::new_with_runner(
             Arc::clone(&db),
-            Arc::new(CollectingSink { events: Mutex::new(vec![]) }),
+            sink.clone(),
             Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
         ));
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0);
 
         let outcome = orch.run_routine_now("r-cond").await.unwrap();
         assert_eq!(outcome, FireOutcome::Skipped(SkipReason::ConditionNotMet));
+        // "Run now" saw the condition phase start.
+        assert!(
+            sink.events.lock().iter().any(|e| e == crate::routines::ROUTINE_PHASE_EVENT),
+            "the fire reports its phase",
+        );
         assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "a skipped condition creates no run");
 
         let r = db.lock().get_routine("r-cond").unwrap().unwrap();

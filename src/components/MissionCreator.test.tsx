@@ -18,6 +18,9 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
+const { mockPushToast } = vi.hoisted(() => ({ mockPushToast: vi.fn() }));
+vi.mock("./Toasts", () => ({ pushToast: mockPushToast }));
+
 // Mock workspaceStore
 vi.mock("../stores/workspaceStore", () => {
   const mockLoad = vi.fn().mockResolvedValue(undefined);
@@ -545,6 +548,49 @@ describe("MissionCreator", () => {
       fireEvent.click(screen.getByText("Begin the mission"));
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalledWith("proj-1", "pnpm install");
+      // A changed template is confirmed to the user.
+      await waitFor(() =>
+        expect(mockPushToast).toHaveBeenCalledWith(
+          expect.objectContaining({ level: "info", title: "Setup script saved for this project" }),
+        ),
+      );
+    });
+
+    it("says the script becomes the project's template", async () => {
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      expect(await screen.findByText(/Saved as this project's setup script/)).toBeInTheDocument();
+    });
+
+    it("stays quiet when the template didn't change", async () => {
+      useCompanionPrefs.setState({ setupScriptByProject: { "proj-1": "npm ci" } });
+      const onCreated = vi.fn();
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      fireEvent.click(await screen.findByText("Begin the mission"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      await waitFor(() => expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalled());
+      await Promise.resolve();
+      expect(mockPushToast).not.toHaveBeenCalled();
+    });
+
+    it("toasts when the template can't be saved", async () => {
+      vi.mocked(ipcModule.ipc.setProjectSetupScript).mockRejectedValueOnce(new Error("database is locked"));
+      const onCreated = vi.fn();
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      const textarea = (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+      fireEvent.change(textarea, { target: { value: "make setup" } });
+      fireEvent.click(screen.getByText("Begin the mission"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      await waitFor(() =>
+        expect(mockPushToast).toHaveBeenCalledWith(
+          expect.objectContaining({ level: "error", title: "Couldn't save the project's setup script" }),
+        ),
+      );
     });
 
     it("says where the script runs, and that a reused workspace never re-runs it", async () => {

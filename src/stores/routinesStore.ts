@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { ipc, type Routine, type RoutineInput } from "../lib/ipc";
+import { ipc, type Routine, type RoutineInput, type RoutinePhase } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { isUpgradeRequired } from "../lib/upgradeError";
 import { useUpgradeStore } from "./upgradeStore";
@@ -13,6 +13,9 @@ interface RoutinesState {
   /** Routine ids with an in-flight `runNow` — the button disables + spins while
    *  a fire is running (its condition eval can take up to 30s). */
   runningNow: string[];
+  /** The phase each in-flight `runNow` reported last (a fresh routine's setup
+   *  script can take up to 10 minutes). */
+  phaseById: Record<string, RoutinePhase>;
   load: () => Promise<void>;
   create: (input: RoutineInput) => Promise<boolean>;
   update: (id: string, input: RoutineInput) => Promise<boolean>;
@@ -33,11 +36,26 @@ function handleError(e: unknown, fallbackTitle: string): boolean {
   return false;
 }
 
+/** What an in-flight "Run now" is waiting on, as one mono line. */
+export function describeRoutinePhase(phase: RoutinePhase): string {
+  switch (phase) {
+    case "condition":
+      return "checking its condition…";
+    case "workspace":
+      return "making a fresh workspace…";
+    case "setup":
+      return "running the setup script…";
+    case "launching":
+      return "launching the crew…";
+  }
+}
+
 export const useRoutinesStore = create<RoutinesState>((set, get) => ({
   routines: [],
   loaded: false,
   loading: false,
   runningNow: [],
+  phaseById: {},
 
   load: async () => {
     set({ loading: true });
@@ -99,10 +117,29 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
     // condition eval can take up to 30s) — no duplicate concurrent fires.
     if (get().runningNow.includes(id)) return;
     set({ runningNow: [...get().runningNow, id] });
+    // Follow the fire's phases so the row can say what it is waiting on
+    // (listening before the fire starts, so its first phase isn't missed).
+    const unlisten = await ipc
+      .onRoutinePhase((ev) => {
+        if (ev.routineId !== id || !get().runningNow.includes(id)) return;
+        set({ phaseById: { ...get().phaseById, [id]: ev.phase } });
+      })
+      .catch(() => null);
     try {
       const outcome = await ipc.runRoutineNow(id);
       if (outcome.outcome === "dispatched") {
         pushToast({ level: "success", title: "Routine dispatched", body: "The crew is on it — follow along in Mission Control." });
+      } else if (outcome.skip === "setup_failed") {
+        // A real failure, not an empty window: its own toast.
+        const detail = outcome.reason?.replace(/^setup failed:\s*/, "");
+        pushToast({
+          level: "error",
+          title: "Setup failed",
+          body: detail
+            ? `The project's setup script failed in the fresh workspace, so no crew ran (${detail}).`
+            : "The project's setup script failed in the fresh workspace, so no crew ran.",
+          timeout: 10000,
+        });
       } else {
         // Honest skip: show exactly why (condition not met/error, workspace
         // busy/unavailable, launch refused) so "Run now" is a real test.
@@ -118,7 +155,9 @@ export const useRoutinesStore = create<RoutinesState>((set, get) => ({
     } catch (e) {
       handleError(e, "Couldn't run the routine");
     } finally {
-      set({ runningNow: get().runningNow.filter((x) => x !== id) });
+      unlisten?.();
+      const { [id]: _done, ...phaseById } = get().phaseById;
+      set({ runningNow: get().runningNow.filter((x) => x !== id), phaseById });
     }
   },
 }));

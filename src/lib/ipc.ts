@@ -133,6 +133,22 @@ export interface RoutineInput {
 export interface FireOutcomeView {
   outcome: "dispatched" | "skipped";
   reason?: string;
+  /** The skip's machine token (`SkipReason::token`), present only for a skip. */
+  skip?:
+    | "busy"
+    | "condition_not_met"
+    | "condition_error"
+    | "workspace_unavailable"
+    | "launch_refused"
+    | "setup_failed";
+}
+
+/** The phase a routine fire is in (`routine://phase`, `routines::PHASE_*`). */
+export type RoutinePhase = "condition" | "workspace" | "setup" | "launching";
+
+export interface RoutinePhaseEvent {
+  routineId: string;
+  phase: RoutinePhase;
 }
 /** A builder-authored stage (position = array index, after topological sort). */
 export interface StageDraft {
@@ -1216,6 +1232,9 @@ export const ipc = {
     invoke<void>("set_routine_enabled", { routineId, enabled }),
   runRoutineNow: (routineId: string) =>
     invoke<FireOutcomeView>("run_routine_now", { routineId }),
+  /** A routine fire moved to a new phase (condition, fresh workspace, setup, launch). */
+  onRoutinePhase: (handler: (ev: RoutinePhaseEvent) => void) =>
+    listen<RoutinePhaseEvent>("routine://phase", (ev) => handler(ev.payload)),
   /** Next `count` fire times (RFC3339 UTC) for a schedule — the editor preview.
    *  Read-only; an invalid spec returns []. */
   previewRoutineSchedule: (kind: string, spec: string, count: number) =>

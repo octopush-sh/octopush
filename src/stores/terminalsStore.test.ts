@@ -59,6 +59,7 @@ const { useAttentionStore } = await import("./attentionStore");
 
 function resetStore() {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
+  localStorage.removeItem("octopush.setupTerminals");
   nextId = 0;
   vi.clearAllMocks();
   // Default: daemon has no live sessions (cold start).
@@ -98,12 +99,31 @@ describe("terminalsStore — setup runs", () => {
     s.trackSetup("ws-s", "t-ok");
     s.reportSetupExit("ws-s", "t-ok", 0);
     expect(useTerminalsStore.getState().setupByTerminal["t-ok"].status).toBe("ok");
-    // Unknown run (state lost on restart): restored silently.
+    // A setup terminal from before a restart (live state lost, the record
+    // kept): restored silently.
+    s.trackSetup("ws-s", "t-old");
+    useTerminalsStore.setState({ setupByTerminal: {} });
     s.reportSetupExit("ws-s", "t-old", 3);
     expect(useTerminalsStore.getState().setupByTerminal["t-old"].status).toBe("failed");
     // Seen again (a remount replays it): no second announcement.
     s.reportSetupExit("ws-s", "t-old", 3);
     expect(mockPushToast).not.toHaveBeenCalled();
+  });
+
+  it("ignores the marker in a terminal that never ran a setup script", () => {
+    const s = useTerminalsStore.getState();
+    s.reportSetupExit("ws-s", "t-plain", 1);
+    expect(useTerminalsStore.getState().setupByTerminal["t-plain"]).toBeUndefined();
+    expect(mockPushToast).not.toHaveBeenCalled();
+  });
+
+  it("forgets a setup terminal once it is closed", async () => {
+    const s = useTerminalsStore.getState();
+    s.trackSetup("ws-s", "t-gone");
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await s.deleteTerminal("ws-s", "t-gone");
+    s.reportSetupExit("ws-s", "t-gone", 1);
+    expect(useTerminalsStore.getState().setupByTerminal["t-gone"]).toBeUndefined();
   });
 });
 

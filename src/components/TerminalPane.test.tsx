@@ -321,6 +321,7 @@ describe("TerminalPane — OSC 52", () => {
   it("hands the setup runner's exit report (OSC 6973) to the terminals store", async () => {
     const { useTerminalsStore } = await import("../stores/terminalsStore");
     useTerminalsStore.setState({ setupByTerminal: {} });
+    useTerminalsStore.getState().trackSetup("ws", "setup1");
     const { term } = await mountForOsc("setup1");
     const handler = term.oscHandlers[6973];
     expect(handler).toBeTypeOf("function");
@@ -333,6 +334,14 @@ describe("TerminalPane — OSC 52", () => {
     // Anything else is consumed and ignored.
     expect(handler("exit=nope")).toBe(true);
     expect(useTerminalsStore.getState().setupByTerminal["setup1"].exitCode).toBe(2);
+  });
+
+  it("ignores the setup exit marker in an ordinary terminal", async () => {
+    const { useTerminalsStore } = await import("../stores/terminalsStore");
+    useTerminalsStore.setState({ setupByTerminal: {} });
+    const { term } = await mountForOsc("plain1");
+    expect(term.oscHandlers[6973]("exit=1")).toBe(true);
+    expect(useTerminalsStore.getState().setupByTerminal["plain1"]).toBeUndefined();
   });
 
   it("ignores OSC 52 while the Octopush window is not focused", async () => {

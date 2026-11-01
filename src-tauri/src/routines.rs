@@ -80,6 +80,19 @@ impl SkipReason {
             SkipReason::SetupFailed(msg) => format!("setup failed: {msg}"),
         }
     }
+
+    /// A stable machine token for the frontend (the run-now toast picks its
+    /// wording by it, never by parsing `label`).
+    pub fn token(&self) -> &'static str {
+        match self {
+            SkipReason::Busy => "busy",
+            SkipReason::ConditionNotMet => "condition_not_met",
+            SkipReason::ConditionError(_) => "condition_error",
+            SkipReason::WorkspaceUnavailable => "workspace_unavailable",
+            SkipReason::LaunchRefused(_) => "launch_refused",
+            SkipReason::SetupFailed(_) => "setup_failed",
+        }
+    }
 }
 
 /// Whether a routine fire actually dispatched a run (vs. skipped the window).
@@ -101,16 +114,18 @@ impl FireOutcome {
     }
 
     /// The flattened, serde-friendly shape the frontend renders:
-    /// `{ outcome: "dispatched" | "skipped", reason?: <human string> }`.
+    /// `{ outcome: "dispatched" | "skipped", reason?: <human string>, skip?: <token> }`.
     pub fn view(&self) -> FireOutcomeView {
         match self {
             FireOutcome::Dispatched => FireOutcomeView {
                 outcome: "dispatched",
                 reason: None,
+                skip: None,
             },
             FireOutcome::Skipped(reason) => FireOutcomeView {
                 outcome: "skipped",
                 reason: Some(reason.label()),
+                skip: Some(reason.token()),
             },
         }
     }
@@ -126,7 +141,20 @@ pub struct FireOutcomeView {
     /// The human skip reason, present only for a skip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// The skip's machine token (`SkipReason::token`), present only for a skip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip: Option<&'static str>,
 }
+
+/// Frontend event a fire emits as it moves through its phases
+/// (`{ routineId, phase }`), so "Run now" can say what it is waiting on.
+pub const ROUTINE_PHASE_EVENT: &str = "routine://phase";
+
+/// The phases a fire reports, in order (a phase that doesn't apply is skipped).
+pub const PHASE_CONDITION: &str = "condition";
+pub const PHASE_WORKSPACE: &str = "workspace";
+pub const PHASE_SETUP: &str = "setup";
+pub const PHASE_LAUNCHING: &str = "launching";
 
 /// The outcome of resolving + guarding a fixed routine's workspace: ready to
 /// fire (with its id + worktree path), or a reason to skip this window.
@@ -303,6 +331,13 @@ pub async fn run_setup_with_path(script: &str, cwd: &Path, timeout: Duration, pa
     classify_setup_exit(code, &stderr)
 }
 
+/// Whether a fresh routine workspace whose setup failed may be removed: only
+/// a worktree `workspace::create` just made. An adopted, reused or restored
+/// one is an existing checkout, and its files are never deleted.
+pub fn discards_on_setup_failure(outcome: crate::workspace::CreateOutcome) -> bool {
+    outcome == crate::workspace::CreateOutcome::Created
+}
+
 /// exit 0 ⇒ `Ok`; anything else ⇒ `Err("exit N · <stderr tail>")`.
 pub fn classify_setup_exit(code: Option<i32>, stderr: &str) -> Result<(), String> {
     let what = match code {
@@ -347,10 +382,14 @@ async fn run_bounded(what: &str, command: &str, cwd: &Path, timeout: Duration, p
         Ok(child) => child,
         Err(e) => return Err(format!("could not launch {what}: {e}")),
     };
+    // Until the child is reaped, a dropped future (or the app quitting) kills
+    // its whole group — `kill_on_drop` alone would kill only `bash`.
+    let mut group = GroupGuard::new(child.id());
     // Drain stderr concurrently so a chatty command can't block on a full pipe.
     let stderr = child.stderr.take().map(|pipe| tokio::spawn(read_to_string_lossy(pipe)));
     match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) => {
+            group.disarm();
             // A backgrounded grandchild may still hold stderr open — never wait
             // on it past a moment.
             let err = match stderr {
@@ -369,7 +408,72 @@ async fn run_bounded(what: &str, command: &str, cwd: &Path, timeout: Duration, p
             // reap so no zombie lingers.
             kill_process_group(&mut child);
             let _ = child.wait().await;
+            group.disarm();
             Err(format!("{what} timed out after {}s", timeout.as_secs()))
+        }
+    }
+}
+
+/// The process groups of the conditions and setup scripts running right now.
+/// The process can exit on quit without dropping their futures, so
+/// `kill_live_groups` (on `RunEvent::Exit`) kills them explicitly.
+static LIVE_GROUPS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+/// SIGKILL every live condition / setup process group (the app is quitting).
+pub fn kill_live_groups() {
+    let groups = std::mem::take(&mut *LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()));
+    for pid in groups {
+        kill_group(pid);
+    }
+}
+
+#[cfg(unix)]
+fn kill_group(pid: i32) {
+    // SAFETY: kill(-pid, SIGKILL) signals the group `setsid` created for a
+    // child that has not been reaped yet (the guard disarms on reap).
+    unsafe {
+        libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: i32) {}
+
+/// Registers a `setsid` child's process group in `LIVE_GROUPS` and kills the
+/// group when dropped still armed. `disarm` once the child is reaped, so a
+/// recycled pid is never signalled.
+struct GroupGuard {
+    pid: Option<i32>,
+}
+
+impl GroupGuard {
+    fn new(pid: Option<u32>) -> Self {
+        let pid = pid.map(|p| p as i32);
+        if let Some(p) = pid {
+            LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+        }
+        Self { pid }
+    }
+
+    /// Unregister without killing; the pid when it was still registered.
+    fn release(&mut self) -> Option<i32> {
+        let pid = self.pid.take()?;
+        let mut live = LIVE_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+        let pos = live.iter().position(|&p| p == pid)?;
+        live.swap_remove(pos);
+        Some(pid)
+    }
+
+    fn disarm(&mut self) {
+        self.release();
+    }
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        // Not in the list any more ⇒ `kill_live_groups` already killed it.
+        if let Some(pid) = self.release() {
+            kill_group(pid);
         }
     }
 }
@@ -823,6 +927,7 @@ impl Orchestrator {
         // worktree path can't host a condition ⇒ fail-safe ConditionError.
         // `fire_condition` is already trimmed/None (the DB normalizes on write).
         if let Some(command) = r.fire_condition.as_deref() {
+            self.emit_phase(r, PHASE_CONDITION);
             let eval = match &worktree {
                 Some(path) => evaluate_condition(command, Path::new(path), CONDITION_TIMEOUT).await,
                 None => ConditionEval::Error("routine's fixed workspace has no worktree".into()),
@@ -864,6 +969,7 @@ impl Orchestrator {
         // Condition gate — cwd = the project root (the fresh worktree doesn't
         // exist yet). `fire_condition` is already trimmed/None (DB-normalized).
         if let Some(command) = r.fire_condition.as_deref() {
+            self.emit_phase(r, PHASE_CONDITION);
             let eval = evaluate_condition(command, Path::new(&project_path), CONDITION_TIMEOUT).await;
             if let Some(skip) = self.condition_skip(r, eval) {
                 return Ok(FireOutcome::Skipped(skip));
@@ -873,8 +979,10 @@ impl Orchestrator {
         // Create the fresh worktree only now (a skipped condition created none),
         // then run the project's setup-script template in it before the crew.
         let setup_script = self.db().lock().get_project_setup_script(&r.project_id)?;
-        let ws = self.create_fresh_routine_workspace(r, &project_path, &setup_script).await?;
+        self.emit_phase(r, PHASE_WORKSPACE);
+        let (ws, outcome) = self.create_fresh_routine_workspace(r, &project_path, &setup_script).await?;
         if !setup_script.trim().is_empty() {
+            self.emit_phase(r, PHASE_SETUP);
             let result = match ws.worktree_path.as_deref() {
                 Some(wt) => run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT).await,
                 None => Err("the fresh workspace has no worktree".into()),
@@ -882,15 +990,29 @@ impl Orchestrator {
             if let Err(msg) = result {
                 tracing::warn!(routine = %r.id, error = %msg, "routine setup script failed — skipping");
                 // A failed setup leaves no run behind — nor a worktree per window.
-                self.discard_fresh_workspace(&project_path, &ws);
+                // Only a worktree this fire created is removed: an adopted or
+                // reused checkout is somebody's, never wiped.
+                if discards_on_setup_failure(outcome) {
+                    self.discard_fresh_workspace(&project_path, &ws);
+                }
                 return Ok(FireOutcome::Skipped(SkipReason::SetupFailed(msg)));
             }
         }
         self.dispatch_run(r, &ws.id).await
     }
 
+    /// Tell the frontend which phase this fire is in (`ROUTINE_PHASE_EVENT`).
+    fn emit_phase(&self, r: &RoutineRow, phase: &str) {
+        crate::orchestrator::events::EventSink::emit(
+            &**self.events(),
+            ROUTINE_PHASE_EVENT,
+            serde_json::json!({ "routineId": r.id, "phase": phase }),
+        );
+    }
+
     /// Remove a fresh routine workspace that will never run: its worktree, its
-    /// branch (only when Octopush created it) and its row.
+    /// branch (only when Octopush created it) and its row. Callers check
+    /// `discards_on_setup_failure` first.
     fn discard_fresh_workspace(&self, project_path: &str, ws: &crate::db::WorkspaceRow) {
         let repo = Path::new(project_path);
         if let Some(wt) = ws.worktree_path.as_deref() {
@@ -923,6 +1045,7 @@ impl Orchestrator {
     /// shared guarded path (quota / parallel / lease / detached). A launch
     /// refusal deletes the never-started draft and skips.
     async fn dispatch_run(self: &Arc<Self>, r: &RoutineRow, workspace_id: &str) -> crate::error::AppResult<FireOutcome> {
+        self.emit_phase(r, PHASE_LAUNCHING);
         let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
         let run_id = self.db().lock().create_run(
             workspace_id,
@@ -999,13 +1122,14 @@ impl Orchestrator {
     /// prefix + a timestamp + a short id) so `workspace::create`'s
     /// idempotency-on-branch yields a genuinely clean tree each time. The git
     /// checkout runs on a blocking thread so a large-repo fire can't stall the
-    /// async runtime (the DB mutex is not held across it).
+    /// async runtime (the DB mutex is not held across it). Returns the
+    /// `CreateOutcome` too: only a `Created` worktree may be discarded.
     async fn create_fresh_routine_workspace(
         &self,
         r: &RoutineRow,
         project_path: &str,
         setup_script: &str,
-    ) -> crate::error::AppResult<crate::db::WorkspaceRow> {
+    ) -> crate::error::AppResult<(crate::db::WorkspaceRow, crate::workspace::CreateOutcome)> {
         let project_path = project_path.to_string();
         let setup_script = setup_script.to_string();
         let stamp = Local::now().format("%Y%m%d-%H%M%S");
@@ -1035,7 +1159,6 @@ impl Orchestrator {
                 &base,
                 &setup_script,
             )
-            .map(|(ws, _outcome)| ws)
         })
         .await
         .map_err(|e| crate::error::AppError::Other(format!("worktree task panicked: {e}")))?;

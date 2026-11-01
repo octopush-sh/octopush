@@ -60,6 +60,29 @@ const bumpLoadGen = (workspaceId: string) =>
 // workspace is re-loaded while a timer is already pending.
 const restoredExpiryScheduled = new Set<string>();
 
+// The terminals `trackSetup` has ever registered, kept across restarts so a
+// replayed exit marker still restores a setup terminal's state. Only these
+// honour the marker: any other program printing it changes nothing.
+const SETUP_TERMINALS_KEY = "octopush.setupTerminals";
+const SETUP_TERMINALS_MAX = 200;
+
+function loadSetupTerminals(): string[] {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(SETUP_TERMINALS_KEY) ?? "[]");
+    return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveSetupTerminals(ids: string[]) {
+  try {
+    localStorage.setItem(SETUP_TERMINALS_KEY, JSON.stringify(ids.slice(-SETUP_TERMINALS_MAX)));
+  } catch (err) {
+    console.error("Failed to persist setup terminals:", err);
+  }
+}
+
 // ─── Store interface ──────────────────────────────────────────────
 
 interface TerminalsStore {
@@ -302,6 +325,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         remaining[idx]?.id ?? remaining[idx - 1]?.id ?? null;
     }
 
+    const knownSetup = loadSetupTerminals();
+    if (knownSetup.includes(id)) saveSetupTerminals(knownSetup.filter((x) => x !== id));
+
     set((s) => {
       const { [id]: _gone, ...setupByTerminal } = s.setupByTerminal;
       return {
@@ -397,16 +423,22 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       };
     }),
 
-  trackSetup: (workspaceId, id) =>
+  trackSetup: (workspaceId, id) => {
+    const known = loadSetupTerminals();
+    if (!known.includes(id)) saveSetupTerminals([...known, id]);
     set((s) => ({
       setupByTerminal: {
         ...s.setupByTerminal,
         [id]: { workspaceId, status: "running", exitCode: null },
       },
       activeByWs: { ...s.activeByWs, [workspaceId]: id },
-    })),
+    }));
+  },
 
   reportSetupExit: (workspaceId, id, code) => {
+    // Only a setup terminal: the same bytes printed in any other terminal
+    // are just output.
+    if (!(id in get().setupByTerminal) && !loadSetupTerminals().includes(id)) return;
     const wasRunning = get().setupByTerminal[id]?.status === "running";
     set((s) => ({
       setupByTerminal: {
