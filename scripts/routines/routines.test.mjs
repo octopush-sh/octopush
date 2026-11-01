@@ -521,6 +521,9 @@ test("publishing: human-only paths, caches, closing references", async () => {
     ["scripts/routines/gh.mjs", "package.json", "src/x/.git/hooks/pre-commit"]);
   assert.ok(CACHE.some((re) => re.test("node_modules/.vite/vitest/results.json")));
   assert.ok(CACHE.some((re) => re.test("tsconfig.tsbuildinfo")));
+  // Test reports a run leaves behind are never committed (#383).
+  for (const f of ["vitest-report.tmp.json", "vitest-report.json", "src/x.tmp.json", "junit.xml"]) assert.ok(CACHE.some((re) => re.test(f)), f);
+  for (const f of ["package.json", "src/lib/report.json", "tsconfig.json"]) assert.ok(!CACHE.some((re) => re.test(f)), f);
   assert.equal(defuseClosing("Fixes #12 and closes: #3, see #4"), "Fixes issue 12 and closes: issue 3, see #4");
 });
 

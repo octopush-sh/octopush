@@ -34,7 +34,12 @@ export const REF_DIR = ".agent-ref";
 /** Paths an agent's change may not touch: every human-only path of the repo, plus the agent's own output, references and git. */
 const forbiddenFor = (repo) => [...humanOnlyFor(repo), /^\.agent-out\//, /^\.agent-ref\//, /(^|\/)\.git(\/|$)/];
 /** Caches the checks leave behind — never committed. */
-export const CACHE = [/(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/, /^dist\//, /(^|\/)\.astro\//];
+// Build and test output, never committed: caches, and the JSON reports a test
+// run leaves behind (#383 shipped a 2,500-test Vitest dump with runner paths).
+export const CACHE = [
+  /(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/, /^dist\//, /(^|\/)\.astro\//,
+  /(^|\/)vitest-report[^/]*\.json$/, /(^|\/)[^/]*\.tmp\.json$/, /(^|\/)junit[^/]*\.xml$/,
+];
 export const KINDS = ["issue", "pr", "app-issue"];
 /** Marks a builder fix round on a PR (jobs.mjs counts them). */
 export const UPDATE_MARK = "<!-- octopush-build:update -->";
