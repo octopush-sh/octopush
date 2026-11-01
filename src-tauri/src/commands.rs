@@ -6050,6 +6050,15 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
         .map_err(|e| AppError::Other(format!("version task failed: {e}")))
 }
 
+/// Settings › General readiness card: local checks (claude, auth mode, git,
+/// gh, Ollama), each bounded at 3 s, re-probed on every call.
+#[tauri::command]
+pub async fn readiness_check() -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
+    tokio::task::spawn_blocking(crate::readiness::run_all)
+        .await
+        .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))
+}
+
 /// One-click: register the bundled `octopush-mcp` server with Claude Code at
 /// user scope. Returns a structured result (with a manual fallback command) so
 /// the UI can guide the user when the CLI isn't found.
