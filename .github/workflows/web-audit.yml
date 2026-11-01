@@ -98,10 +98,19 @@ jobs:
           GH_TOKEN: ${{ steps.read-token.outputs.token }}
         run: |
           set -uo pipefail
-          gh api -X DELETE installation/token >/dev/null 2>&1
-          if gh api repos/octopush-sh/octopush-web --silent >/dev/null 2>&1; then
-            echo "::error::the read token still works after revoking it — not building the site"; exit 1
-          fi
+          gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::the revoke call failed; checking whether the token is dead anyway"
+          # Dead means GitHub answers 401 (revocation takes a few seconds to
+          # propagate). 200 = still live; anything else (network error = 000,
+          # 5xx, 403/404) proves nothing, so keep looking; give up closed.
+          for _ in $(seq 1 12); do
+            code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 \
+              -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+              https://api.github.com/repos/octopush-sh/octopush-web) || code=000
+            if [ "$code" = 401 ]; then echo "read token revoked"; exit 0; fi
+            echo "check $code — token not yet proven dead"
+            sleep 5
+          done
+          echo "::error::the read token was not proven dead (401) a minute after revoking it — not building the site"; exit 1
 
       - name: Build the site as octo-sandbox (no token, no sudo, another user)
         env:
