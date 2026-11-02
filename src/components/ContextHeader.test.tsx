@@ -7,6 +7,15 @@ import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { ipc } from "../lib/ipc";
 import type { Pr, Workspace } from "../lib/types";
 
+/** The real stylesheet. Vitest blanks every CSS module (`?raw` included), so
+ *  read the file itself (Vitest runs from the repo root; jsdom's `URL` can't
+ *  carry a file: URL). The app ships no @types/node, hence the expect-error. */
+async function readStylesCss(): Promise<string> {
+  // @ts-expect-error node:fs is untyped in this project
+  const fs = await import("node:fs");
+  return fs.readFileSync("src/styles.css", "utf8");
+}
+
 // Stub ipc so getIssue + openFileInSystem resolve without hitting Tauri
 vi.mock("../lib/ipc", () => ({
   ipc: {
@@ -139,6 +148,77 @@ describe("ContextHeader", () => {
       expect(chip).toHaveAttribute("title", LONG);
     });
 
+    it("grows the chip's wrappers so the MidTruncate box gets a definite width", () => {
+      // Regression (#400): sized from its own text, WebKit hard-cut the branch
+      // with no ellipsis and ~130px of the band still empty. The rail's shape:
+      // `flex-1 min-w-0` all the way down to the box that elides.
+      render(<ContextHeader {...baseProps} workspaceName="X" branch={LONG} gitStatus={null} />);
+      const chip = screen.getByRole("button", { name: `Branch ${LONG}` });
+      const prov = chip.closest(".octo-prov")!;
+      for (const el of [prov, chip]) {
+        expect(el).toHaveClass("flex-1", "min-w-0", "pointer-events-none");
+      }
+      // The grown boxes draw nothing of their own…
+      expect(chip.className).not.toMatch(/hover:|ring/);
+      expect(prov.className).not.toMatch(/hover:|ring/);
+      // …the wash, hover colour and focus ring sit on the text-sized box.
+      const box = chip.querySelector(".octo-midtrunc")!;
+      expect(box.parentElement).toBe(chip);
+      expect(box).toHaveClass(
+        "pointer-events-auto",
+        "hover:bg-[var(--brass-ghost)]",
+        "hover:text-octo-sage",
+        "group-focus-visible:ring-1",
+      );
+      expect(chip).toHaveClass("group");
+      // The branch glyph lives inside that box, so the wash covers it too.
+      expect(box.querySelector(".octo-midtrunc-lead svg")).toBeTruthy();
+      // The popover opts back into the pointer, so its copy button works.
+      expect(prov.querySelector(".octo-prov-pop")).toHaveClass("pointer-events-auto");
+    });
+
+    it("never puts a percentage max-width in the chip's width chain (E1, trap 2)", async () => {
+      render(
+        <ContextHeader
+          {...baseProps}
+          workspaceName="X"
+          branch={LONG}
+          gitStatus={null}
+          workspace={makeWorkspace({ branch: LONG, fromBranch: "develop" })}
+        />,
+      );
+      const chip = screen.getByRole("button", { name: `Branch ${LONG}` });
+      const box = chip.querySelector(".octo-midtrunc")!;
+      const chain: Element[] = [
+        ...Array.from(box.querySelectorAll("*")).filter((el) => !(el instanceof SVGElement)),
+      ];
+      for (let el: Element | null = box; el && !el.classList.contains("octo-header"); el = el.parentElement) {
+        chain.push(el);
+      }
+      for (const el of chain) {
+        expect(el.className).not.toMatch(/max-w-(full|\[[^\]]*%[^\]]*\]|\d+\/\d+)/);
+        expect((el as HTMLElement).style.maxWidth).not.toMatch(/%/);
+      }
+      // …and none in the stylesheet rules behind those classes.
+      const css = (await readStylesCss()).replace(/\/\*[\s\S]*?\*\//g, "");
+      const chainSelectors = [
+        "octo-prov",
+        "octo-midtrunc",
+        "octo-midtrunc-whole",
+        "octo-midtrunc-head",
+        "octo-midtrunc-tail",
+        "octo-midtrunc-lead",
+      ];
+      for (const name of chainSelectors) {
+        const rule = new RegExp(`\\.${name}(?![\\w-])[^{]*\\{([^}]*)\\}`, "g");
+        const bodies = Array.from(css.matchAll(rule), (m) => m[1]);
+        expect(bodies.length, name).toBeGreaterThan(0);
+        for (const body of bodies) {
+          expect(body, name).not.toMatch(/max-width\s*:[^;]*%/);
+        }
+      }
+    });
+
     it("never lets the branch displace the name line", () => {
       render(
         <ContextHeader
@@ -235,7 +315,7 @@ describe("ContextHeader", () => {
 
 
   describe("base branch provenance", () => {
-    it("appends a mute 'from {base}' segment next to the branch when present", () => {
+    it("puts a mute 'from {base}' segment at the eyebrow's right end when present", () => {
       renderHeader({
         workspace: makeWorkspace({ branch: "feat-x", fromBranch: "develop" }),
       });
@@ -245,6 +325,25 @@ describe("ContextHeader", () => {
         "title",
         "Base branch this workspace was created from",
       );
+      // Outside the grown branch box, as the eyebrow's last atom — so the
+      // chip keeps all the width it was given.
+      const prov = document.querySelector(".octo-prov")!;
+      expect(prov.contains(seg)).toBe(false);
+      expect(seg.parentElement?.lastElementChild).toBe(seg);
+      expect(prov.nextElementSibling).toBe(seg);
+    });
+
+    it("keeps the branch chip a named, described button with a hidden glyph", () => {
+      renderHeader({
+        workspace: makeWorkspace({ branch: "feat-x", fromBranch: "develop" }),
+      });
+      const chip = screen.getByRole("button", { name: "Branch feat-x" });
+      expect(chip).toHaveAttribute("aria-describedby", "octo-branch-provenance");
+      expect(screen.getByRole("tooltip", { hidden: true })).toHaveAttribute(
+        "id",
+        "octo-branch-provenance",
+      );
+      expect(chip.querySelector(".octo-midtrunc-lead")).toHaveAttribute("aria-hidden");
     });
 
     it("omits the segment when fromBranch is null", () => {

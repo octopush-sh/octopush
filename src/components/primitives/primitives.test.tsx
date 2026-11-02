@@ -98,6 +98,31 @@ describe("MidTruncate", () => {
     expect(container.textContent).toBe(text);
   });
 
+  it("draws an optional lead glyph inside the box, on both paths", () => {
+    // Inside, so a wash or ring on the box covers glyph and text as one chip.
+    for (const text of ["main", "a".repeat(40) + "-tail-marker"]) {
+      const { container, unmount } = render(
+        <MidTruncate text={text} lead={<svg data-testid="lead" />} />,
+      );
+      const box = container.firstElementChild!;
+      const lead = box.querySelector(".octo-midtrunc-lead");
+      expect(lead).toBeTruthy();
+      expect(lead).toHaveAttribute("aria-hidden");
+      expect(box.firstElementChild).toBe(lead);
+      expect(lead!.querySelector("[data-testid='lead']")).toBeTruthy();
+      expect(box.textContent).toBe(text);
+      unmount();
+    }
+  });
+
+  it("renders no lead slot when none is given, so other uses don't change", () => {
+    const short = render(<MidTruncate text="main" />);
+    expect(short.container.querySelector(".octo-midtrunc-lead")).toBeNull();
+    short.unmount();
+    const long = render(<MidTruncate text={"x".repeat(40)} />);
+    expect(long.container.querySelector(".octo-midtrunc-lead")).toBeNull();
+  });
+
   it("honours a custom tail length", () => {
     const { container } = render(<MidTruncate text="0123456789abcdef" tail={4} />);
     expect(container.querySelector(".octo-midtrunc-tail")).toHaveTextContent("cdef");

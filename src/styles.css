@@ -421,6 +421,10 @@
 .octo-midtrunc       { display: inline-flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
 .octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .octo-midtrunc-tail  { flex: none; white-space: nowrap; }
+/* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
+   it as a flex item in the split box, `vertical-align` as inline content in
+   the whole one — each property is ignored by the box it doesn't apply to. */
+.octo-midtrunc-lead  { display: inline-flex; flex: none; align-self: center; vertical-align: middle; margin-right: 6px; }
 
 /* ── The demotion ladder (ContextHeader) ─────────────────────────
    Truncation alone can't save a band that mixes elastic text with atoms that
@@ -567,6 +571,15 @@
    it wherever the ladder happened to leave the chip, and <main> clips with
    `overflow-hidden`, so a panel that reached past the header's edge would be
    cut in half. */
+/* The chip's width chain (ContextHeader, design-system E1): `.octo-prov` and
+   the branch button are `flex-1 min-w-0`, so they take whatever the eyebrow
+   leaves and the `.octo-midtrunc` box inside them has a DEFINITE width to
+   elide into — the shape the rail already uses. Sized from its own text
+   instead, WebKit hard-cut the branch with no ellipsis and 130px to spare.
+   Both grown boxes are `pointer-events: none` and carry no wash or ring: the
+   MidTruncate box (and the popover) opt back in, so blank space beside the
+   name does nothing and the wash stays the size of the text. No percentage
+   `max-width` anywhere in this chain (E1, trap 2). */
 .octo-prov { display: inline-flex; min-width: 0; }
 .octo-prov-pop {
   position: absolute; top: calc(100% + 6px); left: 0; z-index: 30;
