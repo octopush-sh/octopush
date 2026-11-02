@@ -104,12 +104,23 @@ No tag was pushed. Closing this PR; the next run starts over (\`bash scripts/rou
 }
 
 wait_for_ci() {
-  local sha="$1" waited=0 ci
+  local sha="$1" waited=0 ci starved retries=0
   while :; do
     ci="$(ci_status_for "$REPO" "$sha" || echo error)"
     case "$ci" in
       success) echo "CI green on $sha"; return 0 ;;
-      failure) fail "CI failed on the release PR (head $sha)" ;;
+      failure)
+        # A job GitHub never gave a runner (macOS capacity) is not a test
+        # failure: re-run it, a few times, instead of abandoning the release.
+        starved="$(ci_starved_run_for "$REPO" "$sha" || true)"
+        if [[ -n "$starved" && "$retries" -lt "${CI_STARVED_RETRIES:-3}" ]]; then
+          retries=$((retries + 1))
+          echo "CI run $starved only had cancelled jobs (no runner) — re-running them ($retries)"
+          gh api -X POST "repos/$REPO/actions/runs/$starved/rerun-failed-jobs" >/dev/null || fail "could not re-run CI run $starved"
+          sleep "$CI_POLL"; continue
+        else
+          fail "CI failed on the release PR (head $sha)"
+        fi ;;
       pending|none|error) ;;
       *) fail "unexpected CI status '$ci'" ;;
     esac
