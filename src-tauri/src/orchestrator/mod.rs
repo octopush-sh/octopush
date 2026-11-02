@@ -658,6 +658,15 @@ impl Orchestrator {
             Some(s) => s,
             None => return Ok(false),
         };
+        // A budget stop is a park, not a weak-tier failure: a strong-tier
+        // retry would spend past the budget that just stopped it.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_budget_stop)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -828,6 +837,15 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            // Recorded from the stage row by whichever action set
+            // resume_pending (Resume or an answered block) — not read from
+            // the iteration history, whose latest entry need not be this
+            // session's (a blocked attempt is never archived).
+            resume_prior_cost_usd: if stage.resume_pending {
+                self.db.lock().get_stage_resume_prior_cost(&stage.id)?
+            } else {
+                0.0
+            },
             blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
             role_prompt: role_def.prompt_body,
@@ -1109,6 +1127,18 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A Claude Code budget stop parks with the budget gate's own
+                // notice; its session (persisted above) lets Resume continue.
+                if crate::orchestrator::cli_runner::is_budget_stop(&err) {
+                    let fresh_run = self.db.lock().get_run(&run.id)?;
+                    if let Some(r) = fresh_run {
+                        self.journal_notice(&run.id, &stage.id, &format!(
+                            "budget reached — ${:.2} of ${:.2} spent",
+                            r.cost_usd,
+                            r.budget_usd.unwrap_or(0.0)
+                        ));
+                    }
+                }
                 // An unfinished failure (turn cap, budget stop, cancel) carries
                 // its conversation — persist it so a director Resume CONTINUES
                 // the work instead of starting over (the API-substrate analogue
@@ -2049,6 +2079,9 @@ impl Orchestrator {
                                 );
                             if can_resume {
                                 self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                                // A blocked stage is never archived (no artifact
+                                // or error), so its spend is recorded from the row.
+                                self.db.lock().set_stage_resume_prior_cost(&s.id, s.cost_usd)?;
                             }
                             self.recompute_run_cost(run_id)?;
                         }
@@ -2184,6 +2217,12 @@ impl Orchestrator {
                                     crate::orchestrator::cli_runner::CliDialect::Claude
                                 );
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
+                        // The session's spend so far, taken from THIS row: the
+                        // resumed run's budget cap sits on top of it.
+                        self.db.lock().set_stage_resume_prior_cost(
+                            &s.id,
+                            if can_resume { s.cost_usd } else { 0.0 },
+                        )?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
                     }

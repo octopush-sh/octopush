@@ -363,9 +363,47 @@ pub fn detect_trailing_question(text: &str) -> Option<crate::orchestrator::types
     })
 }
 
+/// The `result` subtype Claude Code reports when `--max-budget-usd` stopped
+/// the run. It still carries `total_cost_usd` and `session_id`.
+pub const BUDGET_STOP_SUBTYPE: &str = "error_max_budget_usd";
+
+/// True when a stage error is a Claude Code budget stop (see
+/// [`parse_cli_result`]): the drive must not escalate it — a strong-tier
+/// retry would spend past the budget that just stopped it.
+pub fn is_budget_stop(error: &str) -> bool {
+    error.contains(BUDGET_STOP_SUBTYPE)
+}
+
+/// The `--max-budget-usd` cap for a Claude stage: the stage's share of the
+/// run's remaining budget (`spend_limit`, absent when unmetered — no budget,
+/// or the director's conscious override), plus, for a `--resume`d stage, the
+/// session's prior reported total — a resumed run reports the conversation's
+/// whole total, so the cap must sit on top of what was already spent.
+/// Only the headroom is rounded DOWN to cents (never above it, at least one
+/// cent) before the prior total is added, so a resumed cap always sits at
+/// least a cent above what the session already reported — flooring the sum
+/// could land under it and stop the resumed run straight away.
+pub fn cli_budget_cap(spend_limit: Option<f64>, resumed_prior_cost_usd: f64) -> Option<f64> {
+    spend_limit
+        .filter(|l| *l > 0.0)
+        .map(|l| ((l * 100.0).floor() / 100.0).max(0.01) + resumed_prior_cost_usd.max(0.0))
+}
+
+/// `--max-budget-usd <cap>` with the cap (already floored by
+/// [`cli_budget_cap`]) printed to the nearest cent. Empty without a cap.
+pub fn max_budget_args(cap: Option<f64>) -> Vec<String> {
+    match cap {
+        Some(c) => vec!["--max-budget-usd".to_string(), format!("{c:.2}")],
+        None => Vec::new(),
+    }
+}
+
 /// Parse the headless `claude` `type:"result"` NDJSON event into a `StageOutcome`.
 /// A non-zero exit OR `is_error: true` produces a Failed outcome. `stderr_text`
 /// is appended to the failure message when the result itself gives no detail.
+/// A [`BUDGET_STOP_SUBTYPE`] result is a budget stop, not a crash: it keeps
+/// its spend and session (Resume continues it) and its error says so —
+/// [`is_budget_stop`] tells the drive not to escalate it.
 /// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
@@ -381,6 +419,12 @@ pub fn parse_cli_result(
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
         let error = match (bad_subtype, parsed.result.is_empty()) {
+            (Some(BUDGET_STOP_SUBTYPE), _) => format!(
+                "budget reached mid-stage — Claude Code stopped at the run's remaining budget \
+                 ({BUDGET_STOP_SUBTYPE}, ${:.2} reported) — resume to continue within what is left of the budget, \
+                 accept the partial work, or re-run",
+                parsed.total_cost_usd
+            ),
             (Some(st), true) => format!(
                 "claude stopped early ({st}) — review the work journal, then resume or re-run"
             ),
@@ -1119,7 +1163,7 @@ impl AgentRunner for CliRunner {
             .as_deref()
             .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only));
         let resuming = resume_args.is_some();
-        let (args, user) = match resume_args {
+        let (mut args, user) = match resume_args {
             Some(argv) => (
                 argv,
                 // An answered question-block resumes with the director's
@@ -1143,6 +1187,18 @@ impl AgentRunner for CliRunner {
                 ),
             ),
         };
+        // Claude Code meters its own spend: cap the stage at its share of the
+        // run's remaining budget so one long stage can't run far past it (the
+        // API substrate stops at the same headroom in `run_agentic_loop`).
+        // Codex has no such flag and keeps the between-stage gate.
+        let budget_cap = match dialect {
+            CliDialect::Claude => cli_budget_cap(
+                ctx.spend_limit,
+                if resuming { stage.resume_prior_cost_usd } else { 0.0 },
+            ),
+            CliDialect::Codex => None,
+        };
+        args.extend(max_budget_args(budget_cap));
 
         let path_env = resolved_cli_path();
         let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
@@ -1247,6 +1303,12 @@ impl AgentRunner for CliRunner {
             stage.agent_model,
             if resuming { " · resuming session" } else { "" },
         ));
+        if let Some(cap) = max_budget_args(budget_cap).get(1) {
+            emitter.notice(&format!(
+                "budget cap · ${cap} for this stage — Claude Code stops at it, measured by its own \
+                 estimated API-equivalent cost, which can differ from your actual bill"
+            ));
+        }
 
         if let Some(mut stdin) = child.stdin.take() {
             let _ = stdin.write_all(user.as_bytes()).await;

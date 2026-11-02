@@ -4631,6 +4631,26 @@ mod orchestrator_tests {
     }
 
     #[test]
+    fn try_escalate_refuses_a_budget_stopped_stage() {
+        // #362: escalating on a budget stop would spend more past the budget.
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let out = crate::orchestrator::cli_runner::parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":1.0}"#,
+            true,
+            crate::orchestrator::types::ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        db.lock().fail_run_stage(&stage.id, out.error.as_deref().unwrap()).unwrap();
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "a budget stop parks, it never escalates");
+        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!reloaded.escalated);
+        assert_eq!(reloaded.status, "failed", "it stays parked for the director's decision");
+    }
+
+    #[test]
     fn try_escalate_refuses_a_stage_that_already_escalated() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
         let id = db.lock().list_run_stages(&run).unwrap().remove(0).id;
@@ -8263,6 +8283,143 @@ mod orchestrator_tests {
             .unwrap_err();
         assert!(err.to_string().contains("already started"), "err={err}");
     }
+
+    /// The first run ends the way `first` says (with session `sess-b` and
+    /// `first_cost`); every later run succeeds. Records every built `StageSpec`.
+    struct FirstRunThenDoneRunner {
+        first: fn() -> (StageStatus, Option<String>, Option<BlockedAsk>),
+        first_cost: f64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for FirstRunThenDoneRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first_run = self.seen.lock().is_empty();
+            self.seen.lock().push(stage.clone());
+            let (status, error, blocked) =
+                if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
+            Ok(StageOutcome {
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: if first_run { self.first_cost } else { 0.01 },
+                status,
+                tool_calls: vec![],
+                error,
+                verdict: None,
+                session_id: Some("sess-b".into()),
+                blocked,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// One Claude CLI stage under a $0.10 budget, driven by `runner`.
+    fn budgeted_cli_run(runner: FirstRunThenDoneRunner) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Budgeted", "d", false).unwrap();
+        // claude-family model id → Claude dialect → sessions are resumable.
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        db.lock().set_run_budget(&run_id, Some(0.10)).unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink, Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn resuming_a_budget_stopped_stage_carries_its_spend_into_the_cap() {
+        // #362: Claude stops a stage at its budget cap; Resume must hand the
+        // resumed run the session's prior spend so its cap sits on top of it.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Failed,
+                    Some(format!(
+                        "budget reached mid-stage — ({}, $0.08 reported)",
+                        crate::orchestrator::cli_runner::BUDGET_STOP_SUBTYPE
+                    )),
+                    None,
+                )
+            },
+            first_cost: 0.08,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(
+            log.iter().any(|e| e.contains("budget reached — $0.08 of $0.10 spent")),
+            "expected the budget gate's notice in stage_log, got: {log:?}"
+        );
+
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "the stage ran again after Resume");
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        let archived = db.lock().list_stage_iterations(&stage.id).unwrap();
+        assert_eq!(seen[1].resume_prior_cost_usd, archived.last().unwrap().cost_usd);
+        assert_eq!(seen[1].resume_prior_cost_usd, 0.08);
+    }
+
+    #[tokio::test]
+    async fn answering_a_blocked_cli_stage_carries_its_spend_not_an_older_attempts() {
+        // A blocked stage has no artifact or error, so answering it archives
+        // nothing: the prior spend must come from the row, never from an
+        // older iteration (another session's attempt).
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Done,
+                    None,
+                    Some(BlockedAsk {
+                        summary: "which db?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "SQLite or Postgres?".into(),
+                            why_blocked: "both fit".into(),
+                            recommended_default: "SQLite".into(),
+                        }],
+                    }),
+                )
+            },
+            first_cost: 0.03,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "awaiting_checkpoint");
+        // An older, archived attempt of another session.
+        let mut older = stage.clone();
+        older.cost_usd = 0.5;
+        older.error = Some("old failure".into());
+        db.lock().archive_stage_attempt(&older, None).unwrap();
+
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()], source: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "the answered stage ran again");
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(seen[1].resume_prior_cost_usd, 0.03);
+    }
 }
 
 #[cfg(test)]
@@ -8278,11 +8435,32 @@ mod cli_runner_tests {
     }"#;
 
     const ERRORED: &str = r#"{
-        "type":"result","subtype":"error_max_budget_usd","is_error":true,
-        "result":"Budget exceeded.","total_cost_usd":5.0,
+        "type":"result","subtype":"error_during_execution","is_error":true,
+        "result":"Something broke.","total_cost_usd":5.0,
         "usage":{"input_tokens":10,"output_tokens":0,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
     }"#;
+
+    const BUDGET_STOPPED: &str = r#"{
+        "type":"result","subtype":"error_max_budget_usd","is_error":true,
+        "result":"Budget exceeded.","total_cost_usd":1.27,"session_id":"sess-b",
+        "usage":{"input_tokens":10,"output_tokens":4,
+                 "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+    }"#;
+
+    #[test]
+    fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
+        use crate::orchestrator::cli_runner::is_budget_stop;
+        let outcome = parse_cli_result(BUDGET_STOPPED, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed, "the run pauses at a decision");
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.starts_with("budget reached mid-stage"), "{err}");
+        assert!(is_budget_stop(err), "{err}");
+        assert!((outcome.cost_usd - 1.27).abs() < 1e-9, "the spend stays on the meter");
+        assert_eq!(outcome.session_id.as_deref(), Some("sess-b"), "Resume continues the session");
+        let other = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_budget_stop(other.error.as_deref().unwrap()));
+    }
 
     #[test]
     fn parses_success_into_done_outcome() {
@@ -8301,7 +8479,7 @@ mod cli_runner_tests {
     fn is_error_flag_yields_failed_outcome() {
         let outcome = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
+        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_during_execution): Something broke."));
     }
 
     #[test]
@@ -8535,6 +8713,29 @@ mod cli_args_tests {
             let v: serde_json::Value = serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON");
             assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
         }
+    }
+
+    #[test]
+    fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
+        use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
+        // #362: a run budget's remaining headroom caps the Claude stage.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(1.239), 0.0)), vec!["--max-budget-usd", "1.23"]);
+        // No budget, or the director's conscious override (no headroom) ⇒ no flag.
+        assert!(max_budget_args(cli_budget_cap(None, 0.0)).is_empty());
+        assert!(max_budget_args(cli_budget_cap(None, 3.0)).is_empty(), "a resume never invents a cap");
+        // A resumed session reports its whole total, so its prior spend rides on top.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(0.5), 2.25)), vec!["--max-budget-usd", "2.75"]);
+        // A sliver of headroom still caps at one cent, never at $0.00.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(0.004), 0.0)), vec!["--max-budget-usd", "0.01"]);
+        // A resumed cap sits strictly above what the session already reported:
+        // a $1.23 cap stopped at $1.235, leaving $0.004 — flooring the sum
+        // (1.239 → 1.23) would stop the resumed run at once, on every Resume.
+        let args = max_budget_args(cli_budget_cap(Some(0.004), 1.235));
+        let cap: f64 = args[1].parse().unwrap();
+        assert!(cap > 1.235, "resumed cap {cap} must exceed the prior $1.235");
+        // Only the headroom is floored; the prior total is not rounded away.
+        let cap: f64 = max_budget_args(cli_budget_cap(Some(0.019), 2.0))[1].parse().unwrap();
+        assert!((cap - 2.01).abs() < 1e-9, "{cap}");
     }
 
     #[test]

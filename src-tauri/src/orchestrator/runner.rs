@@ -40,9 +40,9 @@ pub struct StageContext {
     pub skills: Vec<crate::skills::Skill>,
     /// Remaining run-budget headroom (USD) when this stage started, when the
     /// run has a budget. The API substrate stops opening new tool turns once
-    /// the stage's own spend crosses it (see `run_agentic_loop`); the CLI
-    /// substrate cannot be metered mid-flight and relies on the between-stage
-    /// gate plus `--max-turns`.
+    /// the stage's own spend crosses it (see `run_agentic_loop`); a Claude CLI
+    /// stage passes it as `--max-budget-usd` (see `cli_budget_cap`); Codex
+    /// relies on the between-stage gate.
     pub spend_limit: Option<f64>,
     /// Completed upstream stages this stage may consult via the `ask_stage`
     /// tool (API substrate): archived artifact + journal digest + the model
