@@ -593,7 +593,7 @@ export function ReviewCanvas({
                 aria-label="Review with AI"
                 aria-pressed={aiOpen}
                 title="Review this change with AI"
-                className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-octo-border-strong px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
                   aiOpen ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                 }`}
                 style={aiOpen ? { background: "var(--brass-ghost)" } : undefined}
@@ -601,7 +601,7 @@ export function ReviewCanvas({
                 <Sparkles size={12} />
                 AI
                 {aiFindingCount != null && aiFindingCount > 0 && (
-                  <span className="rounded-full bg-octo-hairline px-1 text-[9px] tabular-nums">
+                  <span className="rounded-full bg-octo-hairline px-1 text-[9px] octo-tabular">
                     {aiFindingCount}
                   </span>
                 )}

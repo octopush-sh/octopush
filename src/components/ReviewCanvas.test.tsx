@@ -157,7 +157,8 @@ describe("ReviewCanvas toolbar", () => {
   it("Accept all is the only brass action; AI and More are mute ghosts until open", () => {
     renderCanvas();
     const ai = screen.getByRole("button", { name: /review with ai/i });
-    expect(ai).toHaveClass("border-octo-hairline", "text-octo-mute");
+    expect(ai).toHaveClass("border-octo-border-strong", "text-octo-mute");
+    expect(ai).not.toHaveClass("border-octo-hairline");
     expect(ai).not.toHaveClass("text-octo-brass");
     expect(ai.style.borderColor).toBe("");
     const more = screen.getByRole("button", { name: /more view options/i });

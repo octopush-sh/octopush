@@ -69,7 +69,7 @@ export function HunkRail({
             <button
               onClick={onAccept}
               aria-label="Accept hunk"
-              className="rounded border border-octo-hairline px-2 py-0.5 text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass"
+              className="rounded border border-octo-border-strong px-2 py-0.5 text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
               <CheckCircle size={11} className="inline" /> Accept
             </button>

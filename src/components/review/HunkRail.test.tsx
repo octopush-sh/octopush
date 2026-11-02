@@ -28,7 +28,8 @@ describe("HunkRail", () => {
   it("Accept is a ghost button that only turns brass on hover (#398)", () => {
     const { getByRole } = render(<HunkRail {...base} onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
     const accept = getByRole("button", { name: /accept hunk/i });
-    expect(accept).toHaveClass("border-octo-hairline", "text-octo-sage", "hover:text-octo-brass");
+    expect(accept).toHaveClass("border-octo-border-strong", "text-octo-sage", "hover:text-octo-brass");
+    expect(accept).not.toHaveClass("border-octo-hairline");
     expect(accept).not.toHaveClass("text-octo-brass");
     expect(accept.style.background).toBe("");
   });
