@@ -1,5 +1,5 @@
 import type { Extension } from "@codemirror/state";
-import { StreamLanguage } from "@codemirror/language";
+import { StreamLanguage, type Language } from "@codemirror/language";
 import { javascript } from "@codemirror/lang-javascript";
 import { rust } from "@codemirror/lang-rust";
 import { python } from "@codemirror/lang-python";
@@ -40,19 +40,46 @@ export function languageSupport(lang: LangId): Extension {
     case "css":        return css();
     case "xml":        return xml();
     case "yaml":       return yaml();
-    case "shell":      return StreamLanguage.define(shell);
-    case "toml":       return StreamLanguage.define(toml);
-    case "go":         return StreamLanguage.define(go);
-    case "sql":        return StreamLanguage.define(standardSQL);
-    case "dockerfile": return StreamLanguage.define(dockerFile);
-    case "properties": return StreamLanguage.define(properties);
-    case "ruby":       return StreamLanguage.define(ruby);
-    case "swift":      return StreamLanguage.define(swift);
-    case "c":          return StreamLanguage.define(c);
-    case "cpp":        return StreamLanguage.define(cpp);
-    case "csharp":     return StreamLanguage.define(csharp);
-    case "kotlin":     return StreamLanguage.define(kotlin);
-    case "lua":        return StreamLanguage.define(lua);
-    default:           return [];
+    default:           return languageFor(lang) ?? [];
   }
+}
+
+/** Memoised parsers — constructed once per LangId. */
+const languages = new Map<LangId, Language | null>();
+
+/**
+ * The bare `Language` (parser only) for a `LangId` — the same set the editor
+ * highlights, so the Review diff can't fall behind it. Unknown → null.
+ */
+export function languageFor(lang: LangId): Language | null {
+  if (languages.has(lang)) return languages.get(lang)!;
+  let l: Language | null;
+  switch (lang) {
+    case "javascript": l = javascript({ typescript: true, jsx: true }).language; break;
+    case "rust":       l = rust().language; break;
+    case "python":     l = python().language; break;
+    case "java":       l = java().language; break;
+    case "json":       l = json().language; break;
+    case "markdown":   l = markdown().language; break;
+    case "html":       l = html().language; break;
+    case "css":        l = css().language; break;
+    case "xml":        l = xml().language; break;
+    case "yaml":       l = yaml().language; break;
+    case "shell":      l = StreamLanguage.define(shell); break;
+    case "toml":       l = StreamLanguage.define(toml); break;
+    case "go":         l = StreamLanguage.define(go); break;
+    case "sql":        l = StreamLanguage.define(standardSQL); break;
+    case "dockerfile": l = StreamLanguage.define(dockerFile); break;
+    case "properties": l = StreamLanguage.define(properties); break;
+    case "ruby":       l = StreamLanguage.define(ruby); break;
+    case "swift":      l = StreamLanguage.define(swift); break;
+    case "c":          l = StreamLanguage.define(c); break;
+    case "cpp":        l = StreamLanguage.define(cpp); break;
+    case "csharp":     l = StreamLanguage.define(csharp); break;
+    case "kotlin":     l = StreamLanguage.define(kotlin); break;
+    case "lua":        l = StreamLanguage.define(lua); break;
+    default:           l = null;
+  }
+  languages.set(lang, l);
+  return l;
 }

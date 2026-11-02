@@ -137,6 +137,7 @@ export function DiffView(props: Props) {
           <FileDiffSection
             key={file.filePath}
             file={file}
+            workspacePath={props.workspacePath}
             focusedHunk={cur?.fileIdx === fi ? cur.hunkIdx : -1}
             viewed={!!viewed[file.filePath]}
             collapsed={!!collapsed[file.filePath]}

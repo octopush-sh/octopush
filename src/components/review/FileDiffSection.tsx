@@ -1,12 +1,21 @@
+import { useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { HunkRail } from "./HunkRail";
 import { DiffLines } from "./DiffLines";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
+import { ipc } from "../../lib/ipc";
+import { highlightFile } from "../../lib/diffSyntax";
 import type { DiffFile } from "../../lib/diffParser";
+
+/** Larger files are highlighted hunk by hunk, without the rest of the file. */
+const MAX_CONTEXT_BYTES = 1_000_000;
 
 interface Props {
   file: DiffFile;
+  /** Lets the section read the file on disk, so hunks are highlighted in the
+   *  context of the whole file. Without it each hunk is its own context. */
+  workspacePath?: string;
   focusedHunk: number;
   viewed: boolean;
   collapsed: boolean;
@@ -21,6 +30,7 @@ interface Props {
 
 export function FileDiffSection({
   file,
+  workspacePath,
   focusedHunk,
   viewed,
   collapsed,
@@ -32,6 +42,20 @@ export function FileDiffSection({
   onToggleCollapsed,
 }: Props) {
   const mode = useReviewPrefs((s) => s.readingMode);
+
+  // The file as on disk (the diff's new side), read once the section is open.
+  // New and deleted files need no read: their one hunk is the whole file.
+  const [disk, setDisk] = useState<{ file: DiffFile; text: string } | null>(null);
+  useEffect(() => {
+    if (!workspacePath || collapsed || file.changeType !== "modified" || file.hunks.length === 0) return;
+    let live = true;
+    ipc.readFileChecked(`${workspacePath}/${file.filePath}`, MAX_CONTEXT_BYTES)
+      .then((r) => { if (live && r.kind === "text") setDisk({ file, text: r.content }); })
+      .catch(() => {});
+    return () => { live = false; };
+  }, [workspacePath, file, collapsed]);
+  const newContent = disk?.file === file ? disk.text : null;
+  const tokens = useMemo(() => highlightFile(file, newContent), [file, newContent]);
 
   const typeLabel =
     file.changeType === "new"
@@ -115,7 +139,7 @@ export function FileDiffSection({
       >
         <div className="min-h-0 overflow-hidden">
           {file.hunks.map((hunk, i) => (
-            <div key={i} className="mt-3">
+            <div key={i} data-tour="review-diff-hunk" className="mt-3">
               {/* staged is always false here: the Review diff source is the
                   index→workdir (unstaged) diff, so an accepted hunk leaves this
                   view on refetch rather than dimming in place. Per-hunk staged
@@ -131,7 +155,7 @@ export function FileDiffSection({
                 onReject={() => onReject(i)}
                 onWhy={() => onWhy(i)}
               />
-              <DiffLines rows={hunk.rows} filePath={file.filePath} mode={mode} />
+              <DiffLines rows={hunk.rows} filePath={file.filePath} mode={mode} tokens={tokens[i]} />
             </div>
           ))}
         </div>
