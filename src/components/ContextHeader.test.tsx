@@ -139,14 +139,17 @@ describe("ContextHeader", () => {
       expect(chip).toHaveAttribute("title", LONG);
     });
 
-    it("grows the chip up to the status atom instead of sizing it to its content", () => {
+    it("gives the chip a growing container to ellipsize against", () => {
       render(<ContextHeader {...baseProps} workspaceName="X" branch={LONG} gitStatus={null} />);
       const chip = screen.getByRole("button", { name: `Branch ${LONG}` });
       // Regression (#400): shrink-to-fit, WebKit sized the chip below its
       // text with ~130px of band to spare, hard-cutting the head and dropping
-      // the tail. Both the chip and its wrapper must take the free width.
-      expect(chip).toHaveClass("flex-1", "min-w-0");
-      expect(chip.closest(".octo-prov")).toHaveClass("flex-1", "min-w-0");
+      // the tail. The plain line around the chip takes the free width; the
+      // chip shrinks against it.
+      const prov = chip.closest(".octo-prov")!;
+      expect(prov.parentElement).toHaveClass("flex-1", "min-w-0");
+      expect(prov).toHaveClass("min-w-0");
+      expect(chip).toHaveClass("min-w-0", "max-w-full");
     });
 
     it("never lets the branch displace the name line", () => {
@@ -161,6 +164,29 @@ describe("ContextHeader", () => {
       // The name owns its own row, so it is present and titled whatever the
       // branch does beside it.
       expect(screen.getByText("a-workspace")).toHaveAttribute("title", "a-workspace");
+    });
+  });
+
+  describe("short branch names", () => {
+    it("keeps the chip's wash, ring and hover target sized to its text", () => {
+      renderHeader({ workspace: makeWorkspace({ branch: "main", fromBranch: "develop" }) });
+      const chip = screen.getByRole("button", { name: "Branch main" });
+      const prov = chip.closest(".octo-prov")!;
+      // Neither the washed/ringed button nor the popover's hover target may
+      // grow, or `main` paints a brass bar across empty eyebrow.
+      expect(chip).not.toHaveClass("flex-1");
+      expect(prov).not.toHaveClass("flex-1");
+      const grower = prov.parentElement!;
+      expect(grower).toHaveClass("flex-1");
+      expect(grower.closest(".octo-prov")).toBeNull();
+      expect(chip.contains(grower)).toBe(false);
+    });
+
+    it("keeps `from <base>` right after the chip", () => {
+      renderHeader({ workspace: makeWorkspace({ branch: "main", fromBranch: "develop" }) });
+      const prov = screen.getByRole("button", { name: "Branch main" }).closest(".octo-prov")!;
+      expect(prov.nextElementSibling).toHaveTextContent("from develop");
+      expect(prov.parentElement!.lastElementChild).toBe(prov.nextElementSibling);
     });
   });
 

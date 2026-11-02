@@ -231,72 +231,77 @@ export function ContextHeader({
               Tab) away. The panel anchors to the header rather than to the
               chip, so the ladder can move the chip freely without ever pushing
               the panel past the canvas (see `.octo-prov` in styles.css).
-              The chip and its button both GROW up to the status atom, like
-              the rail's name button: a shrink-to-fit chip is sized from an
-              intrinsic width WebKit underestimates, so with room to spare
-              the head was hard-cut and the tail lost. Grown, the chip has a
-              definite width and the head ellipsizes only when it must. */}
-          <span className="octo-prov min-w-0 flex-1">
-            <button
-              type="button"
-              title={branch}
-              aria-label={`Branch ${branch}`}
-              aria-describedby="octo-branch-provenance"
-              className="-mx-1 flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-            >
-              <GitBranch size={11} className="flex-none" aria-hidden />
-              <MidTruncate text={branch} tail={12} className="text-[10px]" />
-            </button>
+              The plain line holding the chip and `from <base>` GROWS up to
+              the working-tree group on the right: a shrink-to-fit chain is
+              sized from an intrinsic width WebKit underestimates, so with
+              room to spare the head was hard-cut and the tail lost. The line
+              gives the chip a definite container to ellipsize against. The
+              chip itself and its `.octo-prov` hover target stay sized to the
+              text (capped by the line), so the wash, the focus ring and the
+              popover trigger never stretch over empty eyebrow. */}
+          <span className="flex min-w-0 flex-1 items-center gap-2">
+            <span className="octo-prov min-w-0">
+              <button
+                type="button"
+                title={branch}
+                aria-label={`Branch ${branch}`}
+                aria-describedby="octo-branch-provenance"
+                className="-mx-1 flex min-w-0 max-w-full items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <GitBranch size={11} className="flex-none" aria-hidden />
+                <MidTruncate text={branch} tail={12} className="text-[10px]" />
+              </button>
 
-            <span
-              id="octo-branch-provenance"
-              role="tooltip"
-              className="octo-prov-pop"
-            >
-              <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1.5">
-                <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                  Branch
-                </dt>
-                <dd className="flex items-start gap-1.5 font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
-                  <span className="octo-selectable break-words">{branch}</span>
-                  <button
-                    type="button"
-                    aria-label="Copy branch name"
-                    title="Copy branch name"
-                    onClick={() => {
-                      void copyToClipboard(branch, "Branch name copied");
-                    }}
-                    className="mt-px flex flex-none items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-                  >
-                    <Copy size={11} />
-                  </button>
-                </dd>
-                {base && (
-                  <>
-                    <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
-                      Base
-                    </dt>
-                    <dd className="font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
-                      <span className="octo-selectable break-words">{base}</span>
-                    </dd>
-                  </>
-                )}
-                {/* Deliberately no working-tree row: the count is permanently
-                    visible in the tail a few inches away, and a panel that
-                    repeats what the band already states earns nothing. This
-                    holds only what the ladder SHEDS. */}
-              </dl>
+              <span
+                id="octo-branch-provenance"
+                role="tooltip"
+                className="octo-prov-pop"
+              >
+                <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1.5">
+                  <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                    Branch
+                  </dt>
+                  <dd className="flex items-start gap-1.5 font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
+                    <span className="octo-selectable break-words">{branch}</span>
+                    <button
+                      type="button"
+                      aria-label="Copy branch name"
+                      title="Copy branch name"
+                      onClick={() => {
+                        void copyToClipboard(branch, "Branch name copied");
+                      }}
+                      className="mt-px flex flex-none items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                    >
+                      <Copy size={11} />
+                    </button>
+                  </dd>
+                  {base && (
+                    <>
+                      <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+                        Base
+                      </dt>
+                      <dd className="font-mono text-[11px] normal-case tracking-normal text-octo-ivory">
+                        <span className="octo-selectable break-words">{base}</span>
+                      </dd>
+                    </>
+                  )}
+                  {/* Deliberately no working-tree row: the count is permanently
+                      visible in the tail a few inches away, and a panel that
+                      repeats what the band already states earns nothing. This
+                      holds only what the ladder SHEDS. */}
+                </dl>
+              </span>
             </span>
+
+            {base && (
+              <span
+                className="octo-demote octo-demote-base normal-case tracking-normal text-[10px] opacity-70"
+                title="Base branch this workspace was created from"
+              >
+                from {base}
+              </span>
+            )}
           </span>
-
-          {base && (
-            <span
-              className="octo-demote octo-demote-base normal-case tracking-normal text-[10px] opacity-70"
-              title="Base branch this workspace was created from"
-            >
-              from {base}
-            </span>
-          )}
         </div>
 
         {/* Name — the one thing you are looking at. Owns the full width in
