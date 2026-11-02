@@ -13350,6 +13350,44 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn dotted_claude_gateway_ids_price_as_their_base_model() {
+        use crate::token_engine::normalize_model_id as n;
+        for (raw, base) in [
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("anthropic/claude-sonnet-5.5", "claude-sonnet-5-5"),
+            ("claude-opus-5.5-20261001", "claude-opus-5-5"),
+            ("bedrock/us.anthropic.claude-haiku-4.5-v1:0", "claude-haiku-4-5"),
+            ("claude-fable-5.1[1m]", "claude-fable-5-1"),
+            ("claude-3.5-haiku", "claude-3-5-haiku"),
+        ] {
+            assert_eq!(n(raw), base, "{raw}");
+            assert_eq!(builtin_prices(raw), builtin_prices(base), "{raw}");
+            assert!(builtin_prices(raw).is_some(), "{raw}");
+        }
+        // Non-Claude dotted ids stay exact (and unpriced when unknown).
+        assert_eq!(n("qwen2.5-coder"), "qwen2.5-coder");
+        assert_eq!(n("openai/gpt-4.1"), "gpt-4.1");
+        assert!(builtin_prices("gpt-4.1").is_none());
+        // A dot that isn't between digits is left alone.
+        assert_eq!(n("claude-opus.next"), "claude-opus.next");
+
+        // Catalog overrides apply to the dotted alias too.
+        use crate::provider_router::{builtin_providers, ProviderRouter};
+        use crate::token_engine::prices_in;
+        let mut map = builtin_providers();
+        let mut gw = map["anthropic"].clone();
+        gw.name = "corp-gateway".into();
+        for m in &mut gw.models {
+            m.input_cost_per_m = 1.0;
+        }
+        map.insert("corp-gateway".into(), gw);
+        let router = ProviderRouter::from_map(map);
+        let (p, m) = router.find_model("anthropic/claude-opus-5.5").unwrap();
+        assert_eq!((p.name.as_str(), m.id.as_str()), ("corp-gateway", "claude-opus-5-5"));
+        assert_eq!(prices_in(Some(&router), "anthropic/claude-opus-5.5").unwrap().input_per_m, 1.0);
+    }
+
+    #[test]
     fn haiku_5_5_long_prompt_tier_applies_per_request() {
         use crate::token_engine::{request_cost, request_prices};
         let base = builtin_prices("claude-haiku-5-5").unwrap();
