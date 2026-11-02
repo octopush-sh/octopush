@@ -92,13 +92,14 @@ jobs:
             # that needs another PR's change found it missing: #385). Only a
             # clean merge is kept; on a conflict the agent is told, and stops.
             merged_main=""; conflicts=""
-            if git -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
+            if git -c core.hooksPath=/dev/null -c core.fsmonitor=false -c user.name="github-actions[bot]" \
                  -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-                 merge --quiet --no-edit --no-verify origin/main >/dev/null 2>&1; then
+                 merge --quiet --no-edit --no-verify origin/main >"$RUNNER_TEMP/merge-main.log" 2>&1; then
               if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then merged_main=yes; fi
             else
-              conflicts="$(git diff --name-only --diff-filter=U | head -n 20)"
-              git merge --abort
+              conflicts="$(git diff --name-only --diff-filter=U | awk 'NR<=20')"
+              [ -n "$conflicts" ] || { echo "::warning::merging main failed without a conflict:"; cat "$RUNNER_TEMP/merge-main.log"; }
+              git merge --abort 2>/dev/null || git reset --quiet --hard "origin/$BRANCH"
             fi
           fi
           {
