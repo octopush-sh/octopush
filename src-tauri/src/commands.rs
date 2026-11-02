@@ -2631,25 +2631,40 @@ pub async fn estimate_run_cost(
     stage_overrides: Option<Vec<(i64, String)>>,
 ) -> AppResult<serde_json::Value> {
     let overrides = stage_overrides.unwrap_or_default();
-    // Gather the stages' models and token estimates under the DB lock, then
-    // price them without it.
-    let plan: Vec<(String, u64, u64)> = {
+    // Gather each stage's model, this Mac's token history for its
+    // (role, effort) and the role's prior under the DB lock, then price
+    // them without it.
+    let plan: Vec<crate::orchestrator::cost::StagePlan> = {
         let db = state.db.lock();
         let stages = db.get_pipeline_stages(&pipeline_id)?;
         let mut plan = Vec::with_capacity(stages.len());
         for s in &stages {
-            // Token estimates come from the role's definition in the DB; fall back to
-            // (4000, 1000) when the role is absent (custom/deleted roles).
+            // The cold-start prior comes from the role's definition in the DB;
+            // fall back to (4000, 1000) when the role is absent (custom/deleted roles).
             let (tok_in, tok_out) = db
                 .get_role(&s.role)?
-                .map(|r| (r.token_est_in as u64, r.token_est_out as u64))
+                .map(|r| (r.token_est_in.max(0) as u64, r.token_est_out.max(0) as u64))
                 .unwrap_or((4_000, 1_000));
             let model = overrides
                 .iter()
                 .find(|(pos, _)| *pos == s.position)
                 .map(|(_, m)| m.clone())
                 .unwrap_or_else(|| s.agent_model.clone());
-            plan.push((model, tok_in, tok_out));
+            // Effort is ignored on the CLI substrate, so it keys as none there.
+            let effort = if s.substrate == "cli" { None } else { s.effort.as_ref().map(|e| e.as_str().to_string()) };
+            let samples = db.stage_token_samples(
+                &s.role,
+                effort.as_deref(),
+                crate::orchestrator::cost::MAX_HISTORY_SAMPLES,
+            )?;
+            plan.push(crate::orchestrator::cost::StagePlan {
+                position: s.position,
+                role: s.role.clone(),
+                effort,
+                model,
+                samples,
+                prior: crate::orchestrator::cost::TokenSample { input: tok_in, output: tok_out, ..Default::default() },
+            });
         }
         plan
     };

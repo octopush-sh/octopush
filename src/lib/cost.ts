@@ -1,4 +1,5 @@
 import type { ChatMessage, ModelInfo } from "./types";
+import type { RunEstimate, StageEstimate } from "./ipc";
 
 /**
  * Heuristic ratio: assume the assistant's reply consumes ~30% of the input
@@ -103,4 +104,65 @@ export function modelCostCell(
 export function budgetUnenforceableNote(unpricedStages: number): string {
   if (unpricedStages <= 0) return "";
   return `budget not enforceable: ${unpricedStages === 1 ? "1 stage" : `${unpricedStages} stages`} unpriced`;
+}
+
+/** "$0.40"; a positive amount under a cent reads "<$0.01", never "$0.00". */
+export function formatEstimateUsd(n: number): string {
+  if (n > 0 && n < 0.005) return "<$0.01";
+  return `$${n.toFixed(2)}`;
+}
+
+/** True when the estimate has stages and none of them is priced. */
+function nothingPriced(e: RunEstimate): boolean {
+  return (e.perStage?.length ?? 0) > 0 && e.perStage!.every((s) => s.lowUsd == null);
+}
+
+/** A low–high pair: "$0.40–$1.10", or one figure when both round alike. */
+function rangeText(low: number, high: number): string {
+  const lo = formatEstimateUsd(low);
+  const hi = formatEstimateUsd(high);
+  return lo === hi ? `~${lo}` : `${lo}–${hi}`;
+}
+
+/**
+ * The launcher's estimate figure: "$0.40–$1.10" (p25–p75), "~$0.43" from a
+ * single-figure estimate, or "unpriced" when no stage model has a price —
+ * an unknown cost is never shown as $0.
+ */
+export function estimateRangeText(e: RunEstimate): string {
+  if (nothingPriced(e)) return "unpriced";
+  if (e.lowUsd == null || e.highUsd == null) return `~${formatEstimateUsd(e.estimateUsd)}`;
+  return rangeText(e.lowUsd, e.highUsd);
+}
+
+/** "saves ~62% vs all-premium", or "" when there is nothing to save. */
+export function estimateSavingsText(e: RunEstimate): string {
+  if (e.baselineUsd <= 0) return "";
+  const pct = Math.round((Math.max(0, e.baselineUsd - e.estimateUsd) / e.baselineUsd) * 100);
+  return pct > 0 ? `saves ~${pct}% vs all-premium` : "";
+}
+
+function stageLine(s: StageEstimate): string {
+  const head = [s.role, s.model, s.effort].filter(Boolean).join(" · ");
+  if (s.lowUsd == null || s.highUsd == null) return `${head}  unpriced`;
+  const basis = s.rough ? "rough" : `${s.samples} past run${s.samples === 1 ? "" : "s"}`;
+  return `${head}  ${rangeText(s.lowUsd, s.highUsd)}  (${basis})`;
+}
+
+/**
+ * The hover breakdown: one line per stage, then where the figures come
+ * from. "" when the estimate carries no per-stage rows.
+ */
+export function estimateBreakdownTitle(e: RunEstimate): string {
+  if (!e.perStage || e.perStage.length === 0) return "";
+  const lines = e.perStage.map(stageLine);
+  lines.push("");
+  lines.push("Tokens from this Mac's recent completed runs of each role and effort, priced at the chosen model.");
+  if (e.perStage.some((s) => s.rough && s.lowUsd != null)) {
+    lines.push("Rough: fewer than 3 past runs, so a built-in guess for the role.");
+  }
+  if (e.perStage.some((s) => s.lowUsd == null)) {
+    lines.push("Unpriced stages are not counted. Add a price in Settings › Models.");
+  }
+  return lines.join("\n");
 }

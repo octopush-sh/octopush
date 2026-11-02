@@ -5677,6 +5677,41 @@ impl Db {
         Ok(())
     }
 
+    /// Tokens of the `limit` most recent stages of `role` at `effort` in
+    /// completed runs, each summed over every attempt the ledger recorded
+    /// (loop-backs and re-runs included — that is what the stage cost).
+    /// Effort only applies off the CLI substrate, so a CLI stage counts as no
+    /// effort. Read-only; feeds the pre-run estimate.
+    pub fn stage_token_samples(
+        &self,
+        role: &str,
+        effort: Option<&str>,
+        limit: usize,
+    ) -> AppResult<Vec<crate::orchestrator::cost::TokenSample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT SUM(se.input_tokens), SUM(se.output_tokens),
+                    SUM(se.cache_read_tokens), SUM(se.cache_creation_tokens)
+             FROM spend_events se
+             JOIN run_stages s ON s.id = se.source_id
+             JOIN runs r ON r.id = s.run_id
+             WHERE se.surface = 'direct' AND r.status = 'completed' AND s.role = ?1
+               AND (CASE WHEN s.substrate = 'cli' THEN NULL ELSE s.effort END) IS ?2
+             GROUP BY s.id
+             HAVING SUM(se.input_tokens + se.output_tokens + se.cache_read_tokens + se.cache_creation_tokens) > 0
+             ORDER BY MAX(se.ts_utc) DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![role, effort, limit as i64], |r| {
+            Ok(crate::orchestrator::cost::TokenSample {
+                input: r.get::<_, i64>(0)?.max(0) as u64,
+                output: r.get::<_, i64>(1)?.max(0) as u64,
+                cache_read: r.get::<_, i64>(2)?.max(0) as u64,
+                cache_creation: r.get::<_, i64>(3)?.max(0) as u64,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Resolve a stage's workspace/project/model and append a `direct` spend
     /// event. `finished_at`-derived idempotency key = one row per completion.
     #[allow(clippy::too_many_arguments)]

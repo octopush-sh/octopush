@@ -163,13 +163,58 @@ describe("PipelineSetup designed states", () => {
     expect(screen.queryByText("II")).not.toBeInTheDocument();
   });
 
-  it("leads the estimate with savings", async () => {
+  it("shows the p25–p75 range, then the savings, with a per-stage breakdown on hover", async () => {
+    estimateMock.mockResolvedValue({
+      estimateUsd: 0.7, baselineUsd: 1.84, lowUsd: 0.4, highUsd: 1.1, confidence: "history", unpricedStages: 0,
+      perStage: [
+        { position: 0, role: "plan", effort: "medium", model: "claude-haiku-4-5", lowUsd: 0.05, highUsd: 0.1, samples: 6, rough: false },
+        { position: 1, role: "implement", effort: null, model: "claude-sonnet-4-6", lowUsd: 0.35, highUsd: 1.0, samples: 4, rough: false },
+      ],
+    });
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
-    const saves = (await screen.findAllByText(/saves ~\$0\.35/)).pop()!;
-    const spent = screen.getAllByText(/runs at/).pop()!;
-    // savings (verdigris serif) leads; the spent figure follows it
-    expect(saves.compareDocumentPosition(spent) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const range = await screen.findByTestId("estimate-range");
+    expect(range.textContent).toBe("est. $0.40–$1.10");
+    const saves = screen.getByTestId("estimate-savings");
+    expect(saves.textContent).toBe("· saves ~62% vs all-premium");
     expect(saves.className).toContain("text-octo-verdigris");
+    // the range leads; the savings follow it
+    expect(range.compareDocumentPosition(saves) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const title = range.getAttribute("title") ?? "";
+    expect(title).toContain("plan · claude-haiku-4-5 · medium  $0.05–$0.10  (6 past runs)");
+    expect(title).toContain("implement · claude-sonnet-4-6  $0.35–$1.00  (4 past runs)");
+    expect(screen.queryByTestId("estimate-rough")).not.toBeInTheDocument();
+  });
+
+  it("labels a cold-start estimate rough", async () => {
+    estimateMock.mockResolvedValue({
+      estimateUsd: 0.2, baselineUsd: 0.2, lowUsd: 0.1, highUsd: 0.3, confidence: "rough",
+      perStage: [{ position: 0, role: "plan", effort: null, model: "m", lowUsd: 0.1, highUsd: 0.3, samples: 0, rough: true }],
+    });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect((await screen.findByTestId("estimate-rough")).textContent).toBe("· rough");
+    // nothing to save against the same model: no savings fragment
+    expect(screen.queryByTestId("estimate-savings")).not.toBeInTheDocument();
+  });
+
+  it("reads 'unpriced', never $0, when no stage model has a price", async () => {
+    estimateMock.mockResolvedValue({
+      estimateUsd: 0, baselineUsd: 0, lowUsd: 0, highUsd: 0, confidence: "rough",
+      unpricedModels: ["claude-mythos-1"], unpricedStages: 2,
+      perStage: [
+        { position: 0, role: "plan", effort: null, model: "claude-mythos-1", lowUsd: null, highUsd: null, samples: 0, rough: true },
+        { position: 1, role: "implement", effort: null, model: "claude-mythos-1", lowUsd: null, highUsd: null, samples: 0, rough: true },
+      ],
+    });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect((await screen.findByTestId("estimate-range")).textContent).toBe("est. unpriced");
+    expect(screen.queryByText(/\$0\.00/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("estimate-rough")).not.toBeInTheDocument();
+  });
+
+  it("still renders a single-figure estimate without the range fields", async () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect((await screen.findByTestId("estimate-range")).textContent).toBe("est. ~$0.05");
+    expect(screen.getByTestId("estimate-savings").textContent).toBe("· saves ~88% vs all-premium");
   });
 
   it("names unpriced stage models and, with a budget, says it cannot be enforced", async () => {
@@ -187,7 +232,7 @@ describe("PipelineSetup designed states", () => {
 
   it("shows no unpriced note when every stage is priced", async () => {
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
-    await screen.findAllByText(/saves ~\$0\.35/);
+    await screen.findByTestId("estimate-range");
     expect(screen.queryByTestId("estimate-unpriced")).not.toBeInTheDocument();
   });
 
@@ -299,7 +344,7 @@ describe("PipelineSetup Claude Code version preflight", () => {
     storeState.pipelines = [cliPipe("gpt-5-codex")];
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
-    await screen.findAllByText(/saves ~\$0\.35/);
+    await screen.findByTestId("estimate-range");
     expect(cliVersionMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
   });

@@ -1340,7 +1340,7 @@ export const ipc = {
     invoke<StageIteration[]>("list_stage_iterations", { stageId }),
 
   estimateRunCost: (pipelineId: string, stageOverrides?: [number, string][]) =>
-    invoke<{ estimateUsd: number; baselineUsd: number; unpricedModels?: string[]; unpricedStages?: number }>("estimate_run_cost", {
+    invoke<RunEstimate>("estimate_run_cost", {
       pipelineId,
       stageOverrides: stageOverrides ?? null,
     }),
@@ -1470,6 +1470,33 @@ export interface McpStatus {
   claudeFound: boolean;
   registered: boolean;
   manualCommand: string;
+}
+
+/** One stage of a pre-run estimate. `lowUsd`/`highUsd` are null when its
+ *  model is unpriced. `rough` = the role's built-in prior, not this Mac's runs. */
+export interface StageEstimate {
+  position: number;
+  role: string;
+  effort: string | null;
+  model: string;
+  lowUsd: number | null;
+  highUsd: number | null;
+  samples: number;
+  rough: boolean;
+}
+
+/** `estimate_run_cost`: this Mac's past token use per (role, effort),
+ *  re-priced at the chosen models. The range fields are optional so an older
+ *  shape (demo fixtures) still renders a single figure. */
+export interface RunEstimate {
+  estimateUsd: number;
+  baselineUsd: number;
+  lowUsd?: number;
+  highUsd?: number;
+  unpricedModels?: string[];
+  unpricedStages?: number;
+  perStage?: StageEstimate[];
+  confidence?: "history" | "rough";
 }
 
 /** The installed Claude Code CLI's version against the tested floor. */
