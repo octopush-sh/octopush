@@ -479,7 +479,7 @@ impl DenylistVerifier {
     }
 }
 
-// MIRRORS rustls-platform-verifier 0.6.2, `src/verification/apple.rs`
+// MIRRORS rustls-platform-verifier 0.7.1, `src/verification/apple.rs`
 // (`Verifier::verify_certificate` and its error mapping), minus `extra_roots`
 // (unused here) and the test-only root override. Re-diff against that file on
 // every rustls-platform-verifier bump: a change upstream (policy, date, OCSP,
@@ -528,7 +528,9 @@ fn evaluate_on_macos(
         })
         .collect::<Result<Vec<_>, _>>()?;
     let name = server_name.to_str();
-    let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(name.as_ref()));
+    // As upstream since 0.7: a trailing `.` label is trimmed before the policy.
+    let name = name.strip_suffix('.').unwrap_or(&name);
+    let policy = SecPolicy::create_ssl(SslProtocolSide::SERVER, Some(name));
     let mut trust = SecTrust::create_with_certificates(&certs, &[policy])
         .map_err(|e| TlsError::General(e.to_string()))?;
     let secs = now
@@ -1149,6 +1151,9 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
 
         let built = evaluate_on_macos(&leaf, &intermediates, &name, &[], now).expect("SecTrust accepts");
         assert!(built.len() >= 3, "leaf, intermediate and anchor, got {}", built.len());
+        // A fully qualified name (trailing `.`) matches too, as upstream 0.7 does.
+        let fqdn = ServerName::try_from("letsencrypt.org.").unwrap();
+        evaluate_on_macos(&leaf, &intermediates, &fqdn, &[], now).expect("SecTrust accepts the FQDN form");
         assert_eq!(built[0], leaf.as_ref());
         assert_eq!(built[1], intermediates[0].as_ref());
 

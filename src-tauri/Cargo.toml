@@ -82,7 +82,7 @@ reqwest = { version = "0.13", default-features = false, features = [
     "query",
 ] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rustls-platform-verifier = "0.6"
+rustls-platform-verifier = "0.7"
 futures-util = "0.3"
 async-trait = "0.1"
 tempfile = "3"
