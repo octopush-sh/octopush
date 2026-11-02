@@ -2835,6 +2835,116 @@ mod cost_tests {
 }
 
 #[cfg(test)]
+mod run_estimate_tests {
+    use crate::orchestrator::cost::{estimate_run, percentile, StagePlan, TokenSample};
+    use crate::token_engine::ModelPrices;
+
+    fn prices(input_per_m: f64, output_per_m: f64) -> ModelPrices {
+        ModelPrices { input_per_m, output_per_m, cache_read_per_m: 0.0, cache_creation_per_m: 0.0, cache_creation_1h_per_m: 0.0 }
+    }
+
+    fn sample(input_m: u64) -> TokenSample {
+        TokenSample { input: input_m * 1_000_000, ..Default::default() }
+    }
+
+    fn stage(model: &str, samples: Vec<TokenSample>) -> StagePlan {
+        StagePlan {
+            position: 0,
+            role: "implement".into(),
+            effort: None,
+            model: model.into(),
+            samples,
+            prior: TokenSample { input: 1_000_000, output: 100_000, ..Default::default() },
+        }
+    }
+
+    /// cheap = $1/M in, $10/M out; premium = $5/M in, $25/M out; ollama = free.
+    fn price(m: &str) -> Option<ModelPrices> {
+        match m {
+            "cheap" => Some(prices(1.0, 10.0)),
+            "premium" => Some(prices(5.0, 25.0)),
+            "ollama" => Some(ModelPrices::FREE),
+            _ => None,
+        }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-9
+    }
+
+    #[test]
+    fn percentile_interpolates_between_ranks() {
+        let v = [1.0, 2.0, 3.0, 4.0, 5.0];
+        assert!(close(percentile(&v, 0.25), 2.0));
+        assert!(close(percentile(&v, 0.5), 3.0));
+        assert!(close(percentile(&v, 0.75), 4.0));
+        // Four values: p25 sits a quarter of the way from 1 to 2.
+        assert!(close(percentile(&[1.0, 2.0, 3.0, 4.0], 0.25), 1.75));
+        assert!(close(percentile(&[7.0], 0.75), 7.0));
+        assert!(close(percentile(&[], 0.5), 0.0));
+    }
+
+    #[test]
+    fn history_range_is_p25_to_p75_repriced_at_the_chosen_model() {
+        // Unordered on purpose: the estimator sorts.
+        let s = vec![sample(5), sample(1), sample(3), sample(2), sample(4)];
+        let e = estimate_run(&[stage("cheap", s.clone())], &price, price("premium"));
+        assert!(close(e.low_usd, 2.0) && close(e.high_usd, 4.0), "{e:?}");
+        assert!(close(e.estimate_usd, 3.0));
+        // Baseline: the median tokens (3M input) at the premium input price.
+        assert!(close(e.baseline_usd, 15.0), "{}", e.baseline_usd);
+        assert_eq!(e.confidence, "history");
+        assert_eq!(e.per_stage[0].samples, 5);
+        assert!(!e.per_stage[0].rough);
+        // Swapping the model re-prices the same tokens, not the old dollars.
+        let swapped = estimate_run(&[stage("premium", s)], &price, price("premium"));
+        assert!(close(swapped.low_usd, 10.0) && close(swapped.high_usd, 20.0), "{swapped:?}");
+    }
+
+    #[test]
+    fn cold_start_uses_the_role_prior_and_says_rough() {
+        // Two samples is below the minimum: they are ignored.
+        let e = estimate_run(&[stage("cheap", vec![sample(50), sample(60)])], &price, price("premium"));
+        // Prior 1M in + 100k out at cheap = $2; the high end is 3× that.
+        assert!(close(e.low_usd, 2.0) && close(e.high_usd, 6.0), "{e:?}");
+        assert_eq!(e.confidence, "rough");
+        assert!(e.per_stage[0].rough);
+        assert_eq!(e.per_stage[0].samples, 0);
+    }
+
+    #[test]
+    fn unpriced_stage_is_unknown_never_zero_and_out_of_savings() {
+        let history = vec![sample(1), sample(2), sample(3)];
+        let mut second = stage("mystery-1", history.clone());
+        second.position = 1;
+        let e = estimate_run(&[stage("cheap", history), second], &price, price("premium"));
+        assert_eq!(e.unpriced_stages, 1);
+        assert_eq!(e.unpriced_models, vec!["mystery-1".to_string()]);
+        assert_eq!(e.per_stage[1].low_usd, None);
+        assert_eq!(e.per_stage[1].high_usd, None);
+        // Only the priced stage counts toward the range and the baseline.
+        assert!(close(e.low_usd, 1.5) && close(e.high_usd, 2.5), "{e:?}");
+        assert!(close(e.baseline_usd, 10.0), "{}", e.baseline_usd);
+        // A rough unpriced stage does not make the priced figure rough.
+        assert_eq!(e.confidence, "history");
+    }
+
+    #[test]
+    fn free_model_costs_zero_and_saves_nothing() {
+        let e = estimate_run(&[stage("ollama", vec![sample(1), sample(2), sample(3)])], &price, price("premium"));
+        assert_eq!(e.unpriced_stages, 0);
+        assert_eq!(e.per_stage[0].high_usd, Some(0.0));
+        assert!(close(e.baseline_usd, 0.0), "a free stage has nothing to save against");
+    }
+
+    #[test]
+    fn no_priced_reference_means_baseline_equals_estimate() {
+        let e = estimate_run(&[stage("cheap", vec![sample(1), sample(2), sample(3)])], &price, None);
+        assert!(close(e.baseline_usd, e.estimate_usd));
+    }
+}
+
+#[cfg(test)]
 mod runner_helpers_tests {
     use crate::orchestrator::runner::user_input_for;
     use crate::orchestrator::types::{ArtifactKind, InputSection, StageInput};
@@ -3656,6 +3766,44 @@ mod run_crud_tests {
         // An unpriced (or free) attempt: tokens at $0 — nothing to save against.
         db.retire_stage_cost(&run, 0.0, 90_000, 9_000).unwrap();
         assert_eq!(db.get_retired_cost(&run).unwrap(), (0.5, 100, 40));
+    }
+
+    #[test]
+    fn stage_token_samples_reads_completed_runs_by_role_and_effort() {
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        // One run per (status, implement effort, implement substrate, implement tokens).
+        let mk = |status: &str, effort: Option<&str>, substrate: &str, tokens: i64| {
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            let st = db.list_run_stages(&run).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE run_stages SET effort = ?2, substrate = ?3 WHERE id = ?1",
+                    rusqlite::params![st[1].id, effort, substrate],
+                )
+                .unwrap();
+            db.complete_run_stage(&st[0].id, "done", 999, 9, 0, 0, 0.1, None).unwrap();
+            db.complete_run_stage(&st[1].id, "done", tokens, tokens / 10, 7, 3, 0.1, None).unwrap();
+            db.set_run_status(&run, status, true).unwrap();
+        };
+        mk("completed", None, "api", 1_000);
+        mk("completed", None, "api", 2_000);
+        mk("aborted", None, "api", 50_000); // not a completed run
+        mk("completed", Some("high"), "api", 8_000); // another effort
+        mk("completed", Some("high"), "cli", 3_000); // effort is ignored on cli
+
+        let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
+        none.sort();
+        assert_eq!(none, vec![1_000, 2_000, 3_000]);
+        let high = db.stage_token_samples("implement", Some("high"), 20).unwrap();
+        assert_eq!(high.len(), 1);
+        assert_eq!((high[0].input, high[0].output, high[0].cache_read, high[0].cache_creation), (8_000, 800, 7, 3));
+        assert_eq!(db.stage_token_samples("plan", None, 20).unwrap().len(), 4);
+        assert_eq!(db.stage_token_samples("implement", None, 2).unwrap().len(), 2, "limit caps the samples");
+        assert!(db.stage_token_samples("test", None, 20).unwrap().is_empty());
     }
 
     #[test]

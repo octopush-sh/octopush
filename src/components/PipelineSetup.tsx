@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type PipelineWithStages } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RunEstimate } from "../lib/ipc";
 import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
-import { savingsVsBaseline } from "../lib/runStatus";
 import { beaconAnchor } from "../lib/beacon";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
@@ -15,7 +14,13 @@ import { CircleDot } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
 import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
-import { budgetUnenforceableNote, unpricedTitle } from "../lib/cost";
+import {
+  budgetUnenforceableNote,
+  estimateBreakdownTitle,
+  estimateRangeText,
+  estimateSavingsText,
+  unpricedTitle,
+} from "../lib/cost";
 
 /** Builtin pipelines a mission's intent should default-select in the launcher
  *  (a `perf` mission lands on the Perf probe crew). */
@@ -74,7 +79,9 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const [overrides, setOverrides] = useState<Record<number, string>>({});
   const [budgetText, setBudgetText] = useState("");
   const [showIssuePicker, setShowIssuePicker] = useState(false);
-  const [estimate, setEstimate] = useState<{ estimateUsd: number; baselineUsd: number; unpricedModels?: string[]; unpricedStages?: number } | null>(null);
+  const [estimate, setEstimate] = useState<RunEstimate | null>(null);
+  const [estimateFailed, setEstimateFailed] = useState(false);
+  const estimatedFor = useRef<string | null>(null);
 
   // The active mission's intent — a `perf` mission default-selects Perf probe.
   const missionIntent = useMissionsStore((s) =>
@@ -122,13 +129,22 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   }, [loaded, pendingPrefill]);
   useEffect(() => {
     if (!selectedId) return;
-    setEstimate(null);
+    // A different crew clears the figure; a model change on the same crew
+    // keeps it until the re-estimate lands, so the line updates in place.
+    if (estimatedFor.current !== selectedId) setEstimate(null);
+    estimatedFor.current = selectedId;
+    setEstimateFailed(false);
     const tuples: [number, string][] = Object.entries(overrides)
       .map(([pos, model]) => [Number(pos), model] as [number, string]);
     let cancelled = false;
     ipc.estimateRunCost(selectedId, tuples.length > 0 ? tuples : undefined)
       .then((e) => { if (!cancelled) setEstimate(e); })
-      .catch(() => {});
+      // The kept figure priced the previous models — never leave it standing.
+      .catch(() => {
+        if (cancelled) return;
+        setEstimate(null);
+        setEstimateFailed(true);
+      });
     return () => { cancelled = true; };
   }, [selectedId, overrides]);
 
@@ -163,9 +179,9 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   }, [usesClaudeCode]);
   const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
 
-  const { saved, pct: savedPct } = estimate
-    ? savingsVsBaseline(estimate.estimateUsd, estimate.baselineUsd)
-    : { saved: 0, pct: 0 };
+  const estimateRange = estimate ? estimateRangeText(estimate) : "";
+  const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
+  const estimateBreakdown = estimate ? estimateBreakdownTitle(estimate) : "";
 
   const overrideTuples = (): [number, string][] =>
     selected
@@ -349,11 +365,33 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
               <div className="flex h-5 min-w-0 items-center gap-2 font-mono text-[11px]">
                 {estimate ? (
                   <>
-                    <span className="octo-tabular text-octo-verdigris">est. saves ~${saved.toFixed(2)}</span>
-                    <span className="octo-tabular text-octo-mute">· {savedPct}% under all-premium</span>
-                    <span className="octo-tabular text-octo-mute">
-                      · runs at <span className="text-octo-brass">~${estimate.estimateUsd.toFixed(2)}</span>
+                    {/* p25–p75 from this Mac's runs, re-priced at the chosen
+                        models; the per-stage breakdown is the tooltip. */}
+                    <span
+                      data-tour="direct-launcher-estimate"
+                      data-testid="estimate-range"
+                      className="octo-tabular cursor-default text-octo-mute"
+                      title={estimateBreakdown || undefined}
+                    >
+                      est.{" "}
+                      <span className={estimateRange === "unpriced" ? "text-octo-mute" : "text-octo-brass"}>
+                        {estimateRange}
+                      </span>
                     </span>
+                    {estimate.confidence === "rough" && estimateRange !== "unpriced" && (
+                      <span
+                        className="octo-tabular text-octo-mute"
+                        title="Fewer than 3 past runs of a stage's role and effort on this Mac — its figure is a built-in guess."
+                        data-testid="estimate-rough"
+                      >
+                        · rough
+                      </span>
+                    )}
+                    {estimateSavings && (
+                      <span className="octo-tabular text-octo-verdigris" data-testid="estimate-savings">
+                        · {estimateSavings}
+                      </span>
+                    )}
                     {(estimate.unpricedModels?.length ?? 0) > 0 && (
                       <span
                         className="octo-tabular truncate text-octo-mute"
@@ -373,6 +411,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                       </span>
                     )}
                   </>
+                ) : estimateFailed ? (
+                  <span className="text-octo-mute" data-testid="estimate-unavailable">est. unavailable</span>
                 ) : (
                   <span className="text-octo-mute">estimating…</span>
                 )}
