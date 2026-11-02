@@ -46,6 +46,24 @@ describe("classifyClick", () => {
     });
   }
 
+  // An identifier node whose text happens to equal its node name is still a
+  // name: parser code declares types called `Identifier` or `Definition`.
+  const namedLikeNodes: [LangId, string, string, number][] = [
+    ["java", "class Definition { }", "Definition", 0],
+    ["java", "class A { int Identifier = 0; int f() { return Identifier; } }", "Identifier", 1],
+    ["java", "class A { TypeName t; }", "TypeName", 0],
+    ["rust", "struct TypeIdentifier;", "TypeIdentifier", 0],
+    ["rust", "fn f() { let Identifier = 1; Identifier; }", "Identifier", 1],
+    ["javascript", "const VariableName = 1; VariableName;", "VariableName", 1],
+    ["javascript", "const VariableDefinition = 1;", "VariableDefinition", 0],
+    ["python", "VariableName = 1\nprint(VariableName)\n", "VariableName", 1],
+  ];
+  for (const [lang, doc, word, nth] of namedLikeNodes) {
+    it(`${lang}: \`${word}\` named like its own node is an identifier`, () => {
+      expect(classifyClick(stateFor(lang, doc), lang, rangeOf(doc, word, nth))).toBe("identifier");
+    });
+  }
+
   it("has no opinion where the language has no Lezer grammar", () => {
     const doc = "const limit = 5";
     expect(hasDefinitionTree("go")).toBe(false);

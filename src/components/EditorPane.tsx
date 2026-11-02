@@ -20,7 +20,7 @@ import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./edit
 import {
   findDefinitions,
   DEFINITION_SCORE,
-  NEVER_SEARCHED_WORDS,
+  isReservedWord,
   scoreOptionsFor,
 } from "./editor/symbolIndex";
 import { classifyClick, classifySite } from "./editor/definitionTree";
@@ -297,22 +297,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // whenever the newer request answered without searching.
       setDefinitionSearching(null);
 
-      // A keyword or a type keyword is part of the language: nothing in the
-      // workspace declares `static` or `int`, and a literal hunt for the word
-      // only finds the lines that use it. The syntax tree answers where the
-      // language has one; elsewhere, the narrow reserved-word set does — never
-      // the ambient-noise pool, which would refuse `get`, `type` and `use`.
       const lang = activeFile?.lang;
-      const click = classifyClick(view.state, lang, req);
-      if (click === "keyword" || (click === "unknown" && NEVER_SEARCHED_WORDS.has(req.name))) {
-        pushToast({
-          level: "info",
-          title: "No definition found in this workspace",
-          body: `${req.name} is part of the language.`,
-        });
-        return;
-      }
-
       const doc = view.state.doc.toString();
       // The tree vetoes line-heuristic candidates it knows are not
       // declarations (a JavaScript `run = 5` re-assigns, it doesn't declare).
@@ -322,12 +307,18 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // Skip the occurrence that was clicked: standing on a use of `foo` must
       // not "jump" to that same use and look like nothing happened.
       const elsewhere = sites.filter((d) => d.from !== req.from);
+      // Go's `x := …` declares by definition, and Go has no tree to say so.
+      const shortVarDecl = (site: { to: number }) =>
+        lang === "go" && /^\s*:=/.test(doc.slice(site.to, site.to + 16));
       // A lone candidate that is only a bare `foo = …` binding (and that no
       // tree confirmed) is not worth a jump without asking: the real
       // declaration may well be in another file, so let the workspace rank it.
       const lone = elsewhere.length === 1 ? elsewhere[0] : null;
       const loneIsWeak =
-        !!lone && lone.verdict !== "declaration" && lone.score < DEFINITION_SCORE.signature;
+        !!lone &&
+        lone.verdict !== "declaration" &&
+        !shortVarDecl(lone) &&
+        lone.score < DEFINITION_SCORE.signature;
       if (elsewhere.length > 0 && !loneIsWeak) {
         const site = elsewhere[0];
         view.dispatch({
@@ -342,14 +333,31 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // file. Escalating to a workspace search here would drop the reader into
       // an unrelated same-named declaration somewhere else — or, worse, report
       // that nothing declares `parse` while they sit on `function parse`. Only
-      // the two confident tiers short-circuit; a bare `foo = …` binding is weak
-      // enough that the real declaration may well be in another file.
+      // the two confident tiers (and Go's `:=`) short-circuit; a bare `foo = …`
+      // binding is weak enough that the real declaration may well be in
+      // another file.
       const clicked = sites.find((d) => d.from === req.from);
-      if (clicked && clicked.score >= DEFINITION_SCORE.signature) {
+      if (clicked && (clicked.score >= DEFINITION_SCORE.signature || shortVarDecl(clicked))) {
         pushToast({
           level: "info",
           title: "Already at the definition",
           body: `${req.name} is declared here.`,
+        });
+        return;
+      }
+
+      // A keyword or a type keyword is part of the language: nothing in the
+      // workspace declares `static` or `int`, and a literal hunt for the word
+      // only finds the lines that use it. Checked only once the open file had
+      // its say, and per language: `val` and `self` are keywords in Kotlin and
+      // Rust but ordinary names in Go and C. The syntax tree answers where
+      // the language has one; elsewhere, the active language's reserved words.
+      const click = classifyClick(view.state, lang, req);
+      if (click === "keyword" || (click === "unknown" && isReservedWord(lang, req.name))) {
+        pushToast({
+          level: "info",
+          title: "No definition found in this workspace",
+          body: `${req.name} is part of the language.`,
         });
         return;
       }

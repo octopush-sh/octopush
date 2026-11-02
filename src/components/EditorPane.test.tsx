@@ -76,6 +76,8 @@ vi.mock("@codemirror/language", () => ({
   bracketMatching: vi.fn(() => ({})),
   foldGutter: vi.fn(() => ({})),
   indentUnit: { of: vi.fn(() => ({})) },
+  // Go, C and Kotlin files highlight through a stream parser.
+  StreamLanguage: { define: vi.fn(() => ({})) },
 }));
 
 vi.mock("./editor/multiCursor", () => ({
@@ -215,6 +217,8 @@ const mockStore = {
     | { workspaceId: string; path: string; kind: "changed" | "deleted" }
     | null,
   pendingReveal: null as { path: string; line: number } | null,
+  /** The active file's language (go-to-definition reads it). */
+  activeLang: "javascript",
 };
 
 const buildEditorState = () => ({
@@ -222,7 +226,7 @@ const buildEditorState = () => ({
       wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
     getFiles: (wsId: string) =>
       wsId === "ws-active"
-        ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
+        ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: mockStore.activeLang, kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
         : wsId === "ws-binary"
         ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048, version: 0, diskStale: false }]
         : [],
@@ -260,6 +264,7 @@ beforeEach(() => {
   classifySiteMock.mockImplementation(() => "unknown");
   mockStore.saveConflict = null;
   mockStore.pendingReveal = null;
+  mockStore.activeLang = "javascript";
   mockBlameState.enabled = false;
   mockBlameState.linesByPath = {};
   mockBlameLoad.mockResolvedValue(undefined);
@@ -660,12 +665,83 @@ describe("EditorPane · go to definition", () => {
   });
 
   it("never searches the workspace for a modifier or a type keyword", async () => {
-    // Without a tree (a stream-mode language), the reserved-word set decides.
+    // Without a tree verdict, the active language's reserved words decide.
+    mockStore.activeLang = "java";
     const onRequest = definitionHandler();
     for (const name of ["const", "static", "int", "void"]) {
       onRequest({ name, from: 0, to: name.length }, navView());
     }
     await waitFor(() => expect(pushToastMock).toHaveBeenCalledTimes(4));
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("reserves a word only in the languages that reserve it", async () => {
+    // `val` is a Kotlin keyword and an ordinary Go name.
+    mockStore.activeLang = "kotlin";
+    let onRequest = definitionHandler();
+    onRequest({ name: "val", from: 0, to: 3 }, navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ body: "val is part of the language." }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    mockStore.activeLang = "go";
+    onRequest = definitionHandler();
+    onRequest({ name: "val", from: 0, to: 3 }, navView());
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "val", true, true),
+    );
+  });
+
+  it("jumps in-file to a name another language reserves", async () => {
+    // The reserved-word screen runs after the open file had its say: C's
+    // `struct foo *self` declares `self`, whatever Rust thinks of the word.
+    mockStore.activeLang = "c";
+    const doc = ["struct foo *self = get();", "self->x = 1;"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("self");
+    onRequest({ name: "self", from, to: from + 4 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+      anchor: doc.indexOf("self"),
+      head: doc.indexOf("self") + 4,
+    });
+    expect(pushToastMock).not.toHaveBeenCalled();
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("jumps to a lone Go `x := …`, which declares by definition", async () => {
+    mockStore.activeLang = "go";
+    const doc = ["\tval := m[k]", "\tresp := http.Get(u)", "\treturn resp, val"].join("\n");
+    const onRequest = definitionHandler();
+    for (const name of ["resp", "val"]) {
+      const view = navView(doc);
+      const from = doc.lastIndexOf(name);
+      onRequest({ name, from, to: from + name.length }, view);
+      await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+      expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+        anchor: doc.indexOf(name),
+        head: doc.indexOf(name) + name.length,
+      });
+    }
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("is already at the definition on a Go `x := …`", async () => {
+    mockStore.activeLang = "go";
+    const doc = ["\tresp := http.Get(u)", "\treturn resp"].join("\n");
+    const onRequest = definitionHandler();
+    const from = doc.indexOf("resp");
+    onRequest({ name: "resp", from, to: from + 4 }, navView(doc));
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Already at the definition" }),
+      ),
+    );
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
   });
 

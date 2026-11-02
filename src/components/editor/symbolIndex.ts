@@ -261,28 +261,102 @@ const STATEMENT_WORDS = new Set([
   "assert", "import", "package", "include", "require", "else", "case",
 ]);
 
+const words = (list: string) => list.trim().split(/\s+/);
+
+const C_RESERVED = words(`
+  auto break case char const continue default do double else enum extern float
+  for goto if inline int long register restrict return short signed sizeof
+  static struct switch typedef union unsigned void volatile while
+`);
+
 /**
- * Keywords, type keywords and literals that no workspace declares, so they
- * never start a workspace-wide search. Only words reserved in the C family
- * (and the primitive types those languages share): an ordinary identifier
- * such as `get`, `type`, `use`, `new` or `default` must still search, because
- * real code declares functions with those names.
+ * Per language: the keywords, primitive types and literals that no workspace
+ * declares. Each list holds only what is reserved in THAT language — `val`,
+ * `self` and `fn` are keywords in Kotlin, Python and Rust but ordinary names
+ * in Go and C. Words a language reserves but still lets code use as a member
+ * name stay out (`new`, `delete` and `default` in JavaScript: `map.delete(k)`).
  */
-export const NEVER_SEARCHED_WORDS = new Set([
-  ...NEVER_DEFINED_WORDS,
-  "const", "static", "final", "public", "private", "protected", "abstract",
-  "return", "class", "struct", "enum", "interface", "function", "func", "fn",
-  "def", "let", "var", "val", "void", "int", "uint", "long", "short", "byte",
-  "char", "float", "double", "boolean", "bool", "true", "false", "null", "nil",
-  "undefined", "True", "False", "None", "import", "export", "package",
-  "extends", "implements", "throws", "throw", "try", "finally", "break",
-  "continue", "goto", "typeof", "instanceof", "sizeof", "this", "self",
-  "super", "async", "await", "yield", "readonly", "volatile", "transient",
-  "synchronized", "native", "extern", "unsigned", "signed", "union",
-  "typedef", "namespace", "impl", "trait", "pub", "mut", "elif", "lambda",
-  "usize", "isize", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64",
-  "f32", "f64",
-]);
+const RESERVED_WORDS: Partial<Record<string, ReadonlySet<string>>> = {
+  javascript: new Set(words(`
+    break case catch class const continue debugger do else enum export extends
+    false finally for function if implements import in instanceof interface let
+    null package private protected public return static super switch this throw
+    true try typeof var void while with yield await undefined
+  `)),
+  java: new Set(words(`
+    abstract assert boolean break byte case catch char class const continue
+    default do double else enum extends final finally float for goto if
+    implements import instanceof int interface long native new package private
+    protected public return short static strictfp super switch synchronized this
+    throw throws transient try void volatile while true false null
+  `)),
+  rust: new Set(words(`
+    as async await break const continue crate dyn else enum extern false fn for
+    if impl in let loop match mod move mut pub ref return self Self static struct
+    super trait true type unsafe use where while
+    bool char str i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize f32 f64
+  `)),
+  python: new Set(words(`
+    False None True and as assert async await break class continue def del elif
+    else except finally for from global if import in is lambda nonlocal not or
+    pass raise return try while with yield
+  `)),
+  go: new Set(words(`
+    break case chan const continue default defer else fallthrough for func go
+    goto if import interface map package range return select struct switch type
+    var true false nil iota bool byte rune int int8 int16 int32 int64 uint uint8
+    uint16 uint32 uint64 uintptr float32 float64 complex64 complex128 string
+  `)),
+  c: new Set(C_RESERVED),
+  cpp: new Set([
+    ...C_RESERVED,
+    ...words(`
+      alignas alignof asm bool catch class constexpr consteval constinit
+      const_cast decltype delete dynamic_cast explicit export false friend
+      mutable namespace new noexcept nullptr operator private protected public
+      reinterpret_cast static_assert static_cast template this thread_local throw
+      true try typeid typename using virtual wchar_t
+    `),
+  ]),
+  csharp: new Set(words(`
+    abstract as base bool break byte case catch char checked class const continue
+    decimal default delegate do double else enum event explicit extern false
+    finally fixed float for foreach goto if implicit in int interface internal is
+    lock long namespace new null object operator out override params private
+    protected public readonly ref return sbyte sealed short sizeof stackalloc
+    static string struct switch this throw true try typeof uint ulong unchecked
+    unsafe ushort using virtual void volatile while
+  `)),
+  kotlin: new Set(words(`
+    as break class continue do else false for fun if in interface is null object
+    package return super this throw true try typealias typeof val var when while
+  `)),
+  swift: new Set(words(`
+    associatedtype class deinit enum extension fileprivate func import inout
+    internal let operator private protocol public rethrows static struct
+    subscript typealias var break case continue default defer do else
+    fallthrough for guard if in repeat return switch where while as catch false
+    is nil super self Self throw throws true try
+  `)),
+  ruby: new Set(words(`
+    alias and begin break case class def do else elsif end ensure false for if
+    in module next nil not or redo rescue retry return self super then true undef
+    unless until when while yield
+  `)),
+  lua: new Set(words(`
+    and break do else elseif end false for function goto if in local nil not or
+    repeat return then true until while
+  `)),
+};
+
+/**
+ * Is `name` part of the language `lang`, so that it never starts a
+ * workspace-wide search? Languages without a list fall back to the statement
+ * heads in `NEVER_DEFINED_WORDS`.
+ */
+export function isReservedWord(lang: string | undefined, name: string): boolean {
+  return (RESERVED_WORDS[lang ?? ""] ?? NEVER_DEFINED_WORDS).has(name);
+}
 
 /** Options for scoring a line of a known language. */
 export interface ScoreOptions {
@@ -391,6 +465,8 @@ function typedDeclaration(prefix: string, suffix: string): boolean {
   while (i < tokens.length && MODIFIERS.has(tokens[i])) i++;
   const modified = i > 0;
   let rest = tokens.slice(i);
+  // `export default App;` re-exports a name declared elsewhere.
+  if (rest.length === 0 && tokens.every((t) => t === "export" || t === "default")) return false;
   // C names a tagged type with its keyword: `struct Node *next;`.
   if (rest.length === 2 && TAG_KEYWORDS.has(rest[0])) rest = rest.slice(1);
   if (rest.length > 1) return false;

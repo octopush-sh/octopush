@@ -12,7 +12,7 @@ import {
   isParameterList,
   wordOccurrences,
   NON_SYMBOL_WORDS,
-  NEVER_SEARCHED_WORDS,
+  isReservedWord,
   scoreOptionsFor,
 } from "./symbolIndex";
 
@@ -427,6 +427,11 @@ describe("modifiers and keywords that name something else declare nothing", () =
     { lang: "Python", line: "print total", name: "total" },
     { lang: "TS", line: "export default build();", name: "build" },
     { lang: "TS", line: "export default defineConfig({", name: "defineConfig" },
+    // A re-export names a declaration elsewhere; in the workspace tier (no
+    // tree) it used to tie with `function App()` and open a picker.
+    { lang: "TS", line: "export default App;", name: "App" },
+    { lang: "TS", line: "export default App", name: "App" },
+    { lang: "TS", line: "export App;", name: "App" },
     { lang: "Java", line: "    else retry = false;", name: "retry" },
   ];
   for (const { lang, line, name } of refusals) {
@@ -492,14 +497,37 @@ describe("long lines", () => {
   });
 });
 
-describe("NEVER_SEARCHED_WORDS", () => {
-  it("holds modifiers and type keywords, but never ordinary names", () => {
-    for (const w of ["const", "static", "int", "void", "if", "public", "impl"]) {
-      expect(NEVER_SEARCHED_WORDS.has(w)).toBe(true);
+describe("isReservedWord", () => {
+  it("holds a language's modifiers and type keywords", () => {
+    for (const w of ["const", "static", "int", "void", "if", "public"]) {
+      expect(isReservedWord("java", w)).toBe(true);
     }
+    for (const w of ["impl", "fn", "self", "mut", "u32"]) expect(isReservedWord("rust", w)).toBe(true);
+    for (const w of ["val", "fun"]) expect(isReservedWord("kotlin", w)).toBe(true);
+    for (const w of ["def", "lambda", "None"]) expect(isReservedWord("python", w)).toBe(true);
+  });
+
+  it("never holds ordinary names", () => {
     for (const w of ["get", "type", "use", "record", "new", "default", "String", "Integer"]) {
-      expect(NEVER_SEARCHED_WORDS.has(w)).toBe(false);
+      expect(isReservedWord("javascript", w)).toBe(false);
     }
+  });
+
+  it("only reserves a word in the languages that reserve it", () => {
+    // Ordinary names in Go and C, keywords elsewhere.
+    for (const w of ["val", "self", "fn", "def", "let", "mut", "pub", "impl", "trait", "this", "class"]) {
+      expect(isReservedWord("go", w)).toBe(false);
+      expect(isReservedWord("c", w)).toBe(false);
+    }
+    expect(isReservedWord("python", "self")).toBe(false);
+    expect(isReservedWord("go", "func")).toBe(true);
+    expect(isReservedWord("c", "struct")).toBe(true);
+  });
+
+  it("falls back to statement heads for a language without a list", () => {
+    expect(isReservedWord("shell", "if")).toBe(true);
+    expect(isReservedWord(undefined, "while")).toBe(true);
+    expect(isReservedWord("shell", "static")).toBe(false);
   });
 });
 

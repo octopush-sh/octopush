@@ -115,6 +115,18 @@ describe("rankDefinitionHits", () => {
     ).toEqual([14]);
   });
 
+  it("jumps to a default-exported component, not its re-export", () => {
+    // `export default App;` tied with `function App()` and opened a picker.
+    const hits = [
+      hit("src/App.tsx", 4, "function App() {"),
+      hit("src/App.tsx", 40, "export default App;"),
+      hit("src/main.tsx", 2, 'import App from "./App";'),
+    ];
+    const ranked = rankDefinitionHits(hits, "App", { fromFile: "src/main.tsx" });
+    expect(ranked.map((c) => c.line)).toEqual([4]);
+    expect(chooseDefinition(ranked).kind).toBe("jump");
+  });
+
   it("reads Go declarations name-first, by the hit's extension", () => {
     const hits = [hit("pkg/limits.go", 3, "const limit Duration = 5")];
     expect(rankDefinitionHits(hits, "Duration")).toEqual([]);

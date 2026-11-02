@@ -33,6 +33,16 @@ const PARSE_BUDGET_MS = 50;
  *  that get a node of their own instead. */
 const TYPE_KEYWORD_NODES = new Set(["PrimitiveType"]);
 
+/** The grammars' identifier nodes. One of these can share its text with its
+ *  node name — a Java class called `Definition`, a Rust type called
+ *  `TypeIdentifier` — and is still a name, never a keyword. */
+const IDENTIFIER_NODES = new Set([
+  "Identifier", "Definition", "TypeName", "TypeIdentifier", "FieldIdentifier",
+  "BoundIdentifier", "ScopeIdentifier", "VariableName", "VariableDefinition",
+  "PropertyName", "PropertyDefinition", "PrivatePropertyName",
+  "PrivatePropertyDefinition", "TypeDefinition", "LabelName", "Label",
+]);
+
 /** Rust's primitive types are plain `TypeIdentifier`s in its grammar. */
 const RUST_PRIMITIVES = new Set([
   "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
@@ -64,10 +74,11 @@ export function classifyClick(
   if (!hasDefinitionTree(lang)) return "unknown";
   const node = nodeAt(treeFor(state, range.to), range.from, range.to);
   if (!node) return "unknown";
-  if (node.name === range.name || TYPE_KEYWORD_NODES.has(node.name)) return "keyword";
   if (lang === "rust" && node.name === "TypeIdentifier" && RUST_PRIMITIVES.has(range.name)) {
     return "keyword";
   }
+  if (IDENTIFIER_NODES.has(node.name)) return "identifier";
+  if (node.name === range.name || TYPE_KEYWORD_NODES.has(node.name)) return "keyword";
   return "identifier";
 }
 
