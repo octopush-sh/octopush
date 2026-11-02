@@ -88,14 +88,36 @@ jobs:
             [[ "$BRANCH" =~ ^agent/[A-Za-z0-9._/-]+$ ]] || { echo "unexpected branch name"; exit 1; }
             git fetch --quiet origin "refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
             git checkout --quiet -B "$BRANCH" "origin/$BRANCH"
+            # Bring main in first, so the fix round works on today's code (a fix
+            # that needs another PR's change found it missing: #385). Only a
+            # clean merge is kept; on a conflict the agent is told, and stops.
+            merged_main=""; conflicts=""
+            if git -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
+                 -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+                 merge --quiet --no-edit --no-verify origin/main >/dev/null 2>&1; then
+              if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$BRANCH")" ]; then merged_main=yes; fi
+            else
+              conflicts="$(git diff --name-only --diff-filter=U | head -n 20)"
+              git merge --abort
+            fi
           fi
           {
             cat "$R/briefs/builder.md"
             echo
             node "$R/read.mjs" "$KIND" "$NUM"
+            if [ "$KIND" = pr ] && [ -n "$merged_main" ]; then
+              echo; echo "## This branch now includes main"
+              echo "Before this run, main was merged into the branch cleanly (a commit of its own). Build on it; don't undo it."
+            fi
+            if [ "$KIND" = pr ] && [ -n "$conflicts" ]; then
+              echo; echo "## This branch conflicts with main"
+              echo "Merging main into it conflicts in these files, so this checkout is the branch WITHOUT main:"
+              printf '%s\n' "$conflicts" | sed 's/^/- /'
+              echo "If the fix needs code that is only on main, stop and say so (the PM resolves the conflict). Otherwise fix what the review asks."
+            fi
             if [ "$KIND" = pr ]; then
               echo; echo "## Failing CI checks on the PR's head (if any)"
-              sha="$(git rev-parse HEAD)"
+              sha="$(git rev-parse "origin/$BRANCH")"   # the PR's head, not the merge with main
               gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
                 --jq '.check_runs[] | select(.conclusion == "failure") | .id' |
               while read -r id; do
