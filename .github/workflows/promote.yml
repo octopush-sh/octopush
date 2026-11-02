@@ -133,3 +133,87 @@ jobs:
           done
           echo "::error::releases/latest/download/latest.json still does not report $VERSION"
           exit 1
+
+  web-version:
+    # The website's truth rule: octopush.sh shows the stable version. Open the
+    # octopush-web PR that bumps src/data/release.ts and adds the changelog
+    # entries (scripts/web-version.mjs); the owner merges it from the digest.
+    # No agent runs here. A failure never undoes the promotion above.
+    needs: promote
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read   # this repo's releases
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Web token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Open the web version PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WEB_TOKEN: ${{ steps.token.outputs.token }}
+          VERSION: ${{ github.event.inputs.version }}
+          WEB: octopush-sh/octopush-web
+        run: |
+          set -euo pipefail
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
+          web="$RUNNER_TEMP/web"
+          # The token reaches git through the environment, never argv; only git gets it.
+          auth="$(printf 'x-access-token:%s' "$WEB_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          withtoken() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" "$@"; }
+          webapi() { GH_TOKEN="$WEB_TOKEN" gh api "$@"; }
+          withtoken git clone --quiet --depth 1 "https://github.com/$WEB.git" "$web"
+          env -u WEB_TOKEN node scripts/web-version.mjs "$web" "$VERSION"
+          branch="release/v$VERSION"
+          new=""
+          if git -C "$web" diff --quiet; then
+            echo "the landing already shows $VERSION"
+          else
+            git -C "$web" -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet --no-verify -am "release: landing v$VERSION and its changelog entries"
+            withtoken git -C "$web" push --quiet --force origin "HEAD:refs/heads/$branch"
+            new="$(webapi "repos/$WEB/pulls?state=open&head=octopush-sh:$branch" --jq '.[0].number // empty')"
+            if [ -z "$new" ]; then
+              new="$(webapi -X POST "repos/$WEB/pulls" -f title="release: landing v$VERSION + changelog" \
+                -f head="$branch" -f base=main -f body="(filled in below)" --jq .number)"
+            fi
+            webapi -X PATCH "repos/$WEB/pulls/$new" -f body="v$VERSION was promoted to stable, so the landing's \`VERSION\` and the changelog follow it. The entries are written from the release notes by \`scripts/web-version.mjs\` in the app repo, run by promote.yml. Reply \`merge web#$new\` in the digest to publish it." >/dev/null
+            echo "web#$new is the version PR"
+            echo "Web version PR: https://github.com/$WEB/pull/$new" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          # An older release PR still open is superseded: its version is no longer stable.
+          webapi "repos/$WEB/pulls?state=open&per_page=100" \
+            --jq ".[] | select(.head.repo.full_name == \"$WEB\" and (.head.ref | test(\"^release/v[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\"))) | \"\\(.number) \\(.head.ref)\"" |
+          while read -r n ref; do
+            [ "$n" = "$new" ] && continue
+            [ "$ref" = "$branch" ] && continue
+            note="Superseded: v$VERSION is now stable${new:+ (web#$new)}."
+            webapi -X POST "repos/$WEB/issues/$n/comments" -f body="$note" >/dev/null
+            webapi -X PATCH "repos/$WEB/pulls/$n" -f state=closed >/dev/null
+            echo "closed web#$n ($ref)"
+          done
+
+      - name: Revoke the web token
+        if: always() && steps.token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning::could not revoke the web token (it expires within the hour)"
