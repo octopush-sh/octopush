@@ -842,11 +842,13 @@ function App() {
         case "settings": setSettingsTab(d.tab); break;
         case "close-settings": setSettingsTab(null); break;
         case "close-overlays":
-          setSettingsTab(null); setShowPalette(false); setMissionControlOpen(false); setLogbookOpen(false);
+          setSettingsTab(null); setShowPalette(false); setShowSearch(false);
+          setMissionControlOpen(false); setLogbookOpen(false);
           break;
         case "mode": setSettingsTab(null); setMode(d.mode); break;
         // "terminal" is handled next to handleSelectWorkspace, below.
         case "palette": setShowPalette(true); break;
+        case "file-finder": setSearchMode("files"); setShowSearch(true); break;
         case "mission-control": setMissionControlOpen(true); break;
         case "logbook": setLogbookOpen(true); break;
       }
@@ -1279,9 +1281,10 @@ function App() {
    *              the matching diff row when it's visible, falling back to
    *              the file header. In editor view the cursor lands on that
    *              line (EditorPane consumes the store's pending reveal).
+   * @param col   Optional 1-based column on `line` (editor view only).
    */
   const navigateToFile = useCallback(
-    (path: string, view: ReviewViewMode = "editor", line?: number | null) => {
+    (path: string, view: ReviewViewMode = "editor", line?: number | null, col?: number) => {
       if (!activeWorkspace) return;
       const rootPath = activeWorkspace.worktreePath || project!.path;
       // AI findings (and other callers) may pass a git `a/`/`b/`-prefixed path;
@@ -1296,7 +1299,7 @@ function App() {
       setReviewViewMode(view);
 
       if (view === "editor") {
-        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile, line ?? undefined).catch((e) =>
+        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile, line ?? undefined, col).catch((e) =>
           pushToast({
             level: "error",
             title: "Could not open file",
@@ -2404,8 +2407,8 @@ function App() {
           initialMode={searchMode}
           workspacePath={activeWorkspace.worktreePath || project!.path}
           onClose={() => setShowSearch(false)}
-          onOpenFile={(relativePath, line) =>
-            navigateToFile(relativePath, "editor", line)
+          onOpenFile={(relativePath, line, col) =>
+            navigateToFile(relativePath, "editor", line, col)
           }
         />
       )}

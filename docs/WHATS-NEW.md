@@ -87,6 +87,8 @@ Current anchors:
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
+| `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
+| `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
@@ -101,7 +103,7 @@ opening the step's surface, then skips the step.
 
 `open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
 `settings/account`, `settings/privacy`, `mode/run`, `mode/direct`, `mode/review`,
-`palette`). Each entry is a function that navigates the real app there. The tour runner and
+`palette`, `file-finder`). Each entry is a function that navigates the real app there. The tour runner and
 the clip recorder both call it, so a demo never depends on clicking through menus.
 
 ## 4. Scenarios

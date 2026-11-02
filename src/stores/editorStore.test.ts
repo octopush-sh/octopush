@@ -267,6 +267,18 @@ describe("editorStore.openFile — open at line (pending reveal)", () => {
     expect(readFileChecked).toHaveBeenCalledTimes(1); // no re-read
   });
 
+  it("carries a column into the reveal when one is given", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42, 7);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/a.ts", line: 42, col: 7,
+    });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 3, 2);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/a.ts", line: 3, col: 2,
+    });
+  });
+
   it("a plain open clears any stale pending reveal for the workspace", async () => {
     readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
     await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42);

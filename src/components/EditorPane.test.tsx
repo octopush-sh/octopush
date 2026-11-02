@@ -12,7 +12,7 @@ vi.mock("@codemirror/view", () => {
       doc: {
         toString: () => "",
         lines: 100,
-        line: (n: number) => ({ from: n * 10 }),
+        line: (n: number) => ({ from: n * 10, length: 9 }),
       },
       selection: { main: { head: 0 } },
     };
@@ -204,7 +204,7 @@ const mockStore = {
   saveConflict: null as
     | { workspaceId: string; path: string; kind: "changed" | "deleted" }
     | null,
-  pendingReveal: null as { path: string; line: number } | null,
+  pendingReveal: null as { path: string; line: number; col?: number } | null,
 };
 
 const buildEditorState = () => ({
@@ -413,6 +413,22 @@ describe("EditorPane — open at line (pending reveal)", () => {
     );
     expect(revealCall).toBeTruthy();
     expect(mockClearPendingReveal).toHaveBeenCalledWith("ws-active");
+  });
+
+  it("puts the cursor on the requested column, clamped to the line's end", () => {
+    const anchors = (reveal: { path: string; line: number; col?: number }) => {
+      mockStore.pendingReveal = reveal;
+      const { unmount } = render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+      const view = hoisted.lastView! as unknown as { dispatch: ReturnType<typeof vi.fn> };
+      const out = view.dispatch.mock.calls
+        .map((c) => (c[0] as { selection?: { anchor: number } })?.selection?.anchor)
+        .filter((a) => a !== undefined);
+      unmount();
+      return out;
+    };
+    // Line 5 starts at 50 and is 9 characters long in the mock.
+    expect(anchors({ path: "/repo/file.ts", line: 5, col: 4 })).toContain(53);
+    expect(anchors({ path: "/repo/file.ts", line: 5, col: 99 })).toContain(59);
   });
 
   it("releases a held reveal as soon as the column comes back", async () => {
