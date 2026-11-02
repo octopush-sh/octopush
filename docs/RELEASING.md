@@ -73,6 +73,13 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   now reports the version. Answering `promote <version>` in the daily ideas digest
   (VISION.md §9) dispatches exactly this workflow.
 
+  Its second job, `web-version`, then opens an octopush-web PR (`release/v<version>`)
+  that sets `src/data/release.ts` `VERSION` to the new stable and adds a changelog
+  entry for every release since the landing's last version, written from the
+  release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
+  older `release/v*` PR still open is closed as superseded. The owner merges it
+  (`merge web#N`); until then the website's consistency gate fails for web builds.
+
   **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
   Repo → Settings → Environments → New environment `stable` → *Required reviewers*:
   you (leave "prevent self-review" off so your own dispatch works); and Settings →
