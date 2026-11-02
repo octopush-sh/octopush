@@ -9809,6 +9809,67 @@ mod live_tests {
     }
 
     #[test]
+    fn entries_from_stream_event_journals_api_retries() {
+        let retry = json!({"type":"system","subtype":"api_retry","attempt":2,"max_retries":10,
+            "retry_delay_ms":4200,"error_status":529,"error":"overloaded"});
+        assert_eq!(
+            entries_from_stream_event(&retry),
+            vec![json!({"kind":"notice","text":"retrying · overloaded · attempt 2/10 · in 5s"})]
+        );
+        // An unknown cause prints as-is; missing fields drop their segment.
+        let odd = json!({"type":"system","subtype":"api_retry","attempt":1,"error":"quota_fixture_cause"});
+        assert_eq!(entries_from_stream_event(&odd)[0]["text"], "retrying · quota_fixture_cause · attempt 1");
+        let bare = json!({"type":"system","subtype":"api_retry"});
+        assert_eq!(entries_from_stream_event(&bare)[0]["text"], "retrying");
+        // Other system subtypes stay silent.
+        assert!(entries_from_stream_event(&json!({"type":"system","subtype":"status"})).is_empty());
+    }
+
+    #[test]
+    fn entries_from_stream_event_journals_init_load_errors() {
+        let init = json!({"type":"system","subtype":"init","session_id":"s",
+            "mcp_server_errors":[
+                {"name":"linear","message":"spawn linear-mcp ENOENT\nat …"},
+                {"name":"bare"}
+            ],
+            "plugin_errors":[{"plugin":"lint-kit","type":"manifest_invalid","message":"plugin.json: missing name"}]});
+        let texts: Vec<String> = entries_from_stream_event(&init)
+            .iter()
+            .inspect(|e| assert_eq!(e["kind"], "notice"))
+            .map(|e| e["text"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, [
+            "MCP server 'linear' skipped: spawn linear-mcp ENOENT",
+            "MCP server 'bare' skipped",
+            "plugin 'lint-kit' failed to load: plugin.json: missing name",
+        ]);
+        // Empty or malformed lists journal nothing.
+        let quiet = json!({"type":"system","subtype":"init","mcp_server_errors":[],"plugin_errors":"x"});
+        assert!(entries_from_stream_event(&quiet).is_empty());
+    }
+
+    #[test]
+    fn retry_throttle_collapses_one_cause_per_interval() {
+        use crate::orchestrator::live::{RetryThrottle, RETRY_NOTICE_INTERVAL};
+        let retry = |e: &str| json!({"type":"system","subtype":"api_retry","error":e});
+        let t0 = std::time::Instant::now();
+        let mut th = RetryThrottle::default();
+        assert!(th.allow(&retry("overloaded"), t0));
+        assert!(!th.allow(&retry("overloaded"), t0 + std::time::Duration::from_secs(3)));
+        // A system event in between doesn't end the streak.
+        assert!(th.allow(&json!({"type":"system","subtype":"status"}), t0));
+        assert!(!th.allow(&retry("overloaded"), t0 + std::time::Duration::from_secs(9)));
+        // A new cause shows at once; the old cause again after the interval.
+        assert!(th.allow(&retry("rate_limit"), t0 + std::time::Duration::from_secs(9)));
+        assert!(th.allow(&retry("overloaded"), t0 + std::time::Duration::from_secs(9)));
+        let later = t0 + std::time::Duration::from_secs(9) + RETRY_NOTICE_INTERVAL;
+        assert!(th.allow(&retry("overloaded"), later));
+        // The model answering ends the streak: the next retry shows.
+        assert!(th.allow(&json!({"type":"assistant","message":{"content":[]}}), later));
+        assert!(th.allow(&retry("overloaded"), later));
+    }
+
+    #[test]
     fn entries_from_stream_event_keeps_claude_code_subagent_hierarchy() {
         // The parent spawns a sub-agent: the Agent tool_use carries its id and
         // shows the description (not the prompt) as the hint.
