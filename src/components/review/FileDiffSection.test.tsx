@@ -1,5 +1,5 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { act, render, waitFor } from "@testing-library/react";
 import { FileDiffSection, pathTail } from "./FileDiffSection";
 import { parseFullDiff, type DiffFile } from "../../lib/diffParser";
 
@@ -13,6 +13,7 @@ const file: DiffFile = {
 };
 
 describe("FileDiffSection", () => {
+  beforeEach(() => { readFileChecked.mockReset(); });
   it("shows the file header with type + path", () => {
     const { getByText } = render(<FileDiffSection file={file} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
@@ -70,5 +71,64 @@ describe("FileDiffSection", () => {
         expect(row.querySelector(".tok-cmt")?.textContent).toContain("@param");
       }
     });
+  });
+
+  const javaDisk = ["class A {", "  /**", "   * Adds.", "   * @param x the x", "   */", "  int add(int x) { return x; }", "}", ""].join("\n");
+  const javaFile = () => parseFullDiff([
+    "diff --git a/A.java b/A.java", "--- a/A.java", "+++ b/A.java",
+    "@@ -4,2 +4,2 @@", "-   * @param x an x", "+   * @param x the x", "    */", "",
+  ].join("\n"))[0];
+  const renderJava = (jf: DiffFile, opts: { workspacePath?: string; collapsed?: boolean } = { workspacePath: "/w" }) =>
+    render(<FileDiffSection file={jf} workspacePath={opts.workspacePath} focusedHunk={-1} viewed={false} collapsed={opts.collapsed ?? false}
+      onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+  const rowTexts = (c: HTMLElement) => Array.from(c.querySelectorAll("[data-diff-row] code")).map((n) => n.textContent);
+  // Whole-file tokens: both changed rows sit inside the Javadoc. The hunk's
+  // own context has no `/**`, so its fallback tokens are not comments.
+  const javadocRows = (c: HTMLElement) =>
+    Array.from(c.querySelectorAll("[data-diff-row]")).slice(0, 2)
+      .every((r) => r.querySelector(".tok-cmt")?.textContent?.includes("@param") ?? false);
+  const exactRows = ["   * @param x an x", "   * @param x the x", "   */"];
+
+  it("falls back to hunk context when the read rejects, rows intact", async () => {
+    readFileChecked.mockRejectedValue(new Error("gone"));
+    const { container } = renderJava(javaFile());
+    await act(async () => { await Promise.resolve(); });
+    expect(readFileChecked).toHaveBeenCalledTimes(1);
+    expect(rowTexts(container)).toEqual(exactRows);
+    expect(javadocRows(container)).toBe(false);
+  });
+  it.each([
+    [{ kind: "tooLarge", size: 2_000_000 }],
+    [{ kind: "binary", size: 10, mtime: 0 }],
+  ])("falls back to hunk context when the read resolves %o", async (result) => {
+    readFileChecked.mockResolvedValue(result);
+    const { container } = renderJava(javaFile());
+    await act(async () => { await Promise.resolve(); });
+    expect(readFileChecked).toHaveBeenCalledTimes(1);
+    expect(rowTexts(container)).toEqual(exactRows);
+    expect(javadocRows(container)).toBe(false);
+  });
+  it("shows hunk-context tokens while the read is pending, then whole-file tokens", async () => {
+    let resolve!: (v: unknown) => void;
+    readFileChecked.mockReturnValue(new Promise((r) => { resolve = r; }));
+    const { container } = renderJava(javaFile());
+    expect(rowTexts(container)).toEqual(exactRows);
+    expect(javadocRows(container)).toBe(false);
+    await act(async () => { resolve({ kind: "text", content: javaDisk, size: javaDisk.length, mtime: 0 }); });
+    await waitFor(() => expect(javadocRows(container)).toBe(true));
+    expect(rowTexts(container)).toEqual(exactRows);
+  });
+  it("does not read the file while collapsed", () => {
+    renderJava(javaFile(), { workspacePath: "/w", collapsed: true });
+    expect(readFileChecked).not.toHaveBeenCalled();
+  });
+  it("does not read the file without a workspace path", () => {
+    const { container } = renderJava(javaFile(), {});
+    expect(readFileChecked).not.toHaveBeenCalled();
+    expect(rowTexts(container)).toEqual(exactRows);
+  });
+  it.each(["new", "deleted"] as const)("does not read the file for a %s file", (changeType) => {
+    renderJava({ ...javaFile(), changeType });
+    expect(readFileChecked).not.toHaveBeenCalled();
   });
 });
