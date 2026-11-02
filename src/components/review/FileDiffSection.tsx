@@ -10,7 +10,7 @@ interface Props {
   focusedHunk: number;
   viewed: boolean;
   collapsed: boolean;
-  /** The agent changed this file after it was marked viewed (cleared on re-mark). */
+  /** This file changed after it was marked viewed (cleared on re-mark). */
   changedSinceViewed?: boolean;
   onAccept: (hunkIdx: number) => void;
   onReject: (hunkIdx: number) => void;
@@ -88,7 +88,7 @@ export function FileDiffSection({
         {changedSinceViewed && (
           <span
             data-tour="review-file-changed"
-            title="The agent changed this file after you marked it viewed"
+            title="This file changed after you marked it viewed"
             className="octo-pop-in ml-auto flex-none whitespace-nowrap rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-verdigris"
           >
             changed since viewed

@@ -55,7 +55,9 @@ describe("DiffView", () => {
       expect(queryByText("✓ viewed")).toBeNull();
       expect(getByText("mark viewed")).toBeTruthy();
       expect(collapsedOf(container, "src/a.ts")).toBe("false");
-      expect(getByText("changed since viewed")).toBeTruthy();
+      expect(getByText("changed since viewed").getAttribute("title")).toBe(
+        "This file changed after you marked it viewed",
+      );
       expect(onViewedChange).toHaveBeenLastCalledWith("src/a.ts", false);
 
       // Re-marking clears the chip.
