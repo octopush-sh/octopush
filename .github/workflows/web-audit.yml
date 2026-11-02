@@ -180,7 +180,7 @@ jobs:
 
       - name: Keep the findings and screenshots
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: web-audit
           path: ${{ runner.temp }}/web-audit
@@ -202,7 +202,7 @@ jobs:
         with:
           node-version: 22
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: web-audit
           path: ${{ runner.temp }}/web-audit
