@@ -269,7 +269,7 @@ function LogbookTable({ rows }: { rows: LogbookMissionRow[] }) {
 function Upsell({ onUpgrade }: { onUpgrade: () => void }) {
   return (
     <div className="mx-auto mt-16 flex max-w-[440px] flex-col items-center gap-4 text-center octo-fade-in">
-      <span className="flex h-11 w-11 items-center justify-center rounded-full border border-octo-hairline text-octo-brass">
+      <span className="flex h-11 w-11 items-center justify-center rounded-full border border-octo-hairline text-octo-mute">
         <Lock size={18} aria-hidden />
       </span>
       <span className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-brass">
@@ -286,9 +286,10 @@ function Upsell({ onUpgrade }: { onUpgrade: () => void }) {
       <button
         type="button"
         onClick={onUpgrade}
-        className="mt-2 rounded-lg bg-octo-brass px-4 py-2 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi"
+        data-tour="logbook-upsell-cta"
+        className="mt-2 rounded-lg border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
-        Upgrade to Pro
+        Open the full logbook with Pro
       </button>
     </div>
   );

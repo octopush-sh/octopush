@@ -102,9 +102,10 @@ export function RoutinesPane() {
             <button
               type="button"
               onClick={() => void openUpgrade()}
-              className="shrink-0 rounded-md border border-octo-brass px-4 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]"
+              data-tour="routines-upsell-cta"
+              className="shrink-0 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
-              Upgrade to Pro
+              Put your crews on a schedule with Pro
             </button>
           </div>
         )}
