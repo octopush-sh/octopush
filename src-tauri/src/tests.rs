@@ -4631,6 +4631,26 @@ mod orchestrator_tests {
     }
 
     #[test]
+    fn try_escalate_refuses_a_budget_stopped_stage() {
+        // #362: escalating on a budget stop would spend more past the budget.
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let out = crate::orchestrator::cli_runner::parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_budget_usd","is_error":true,"total_cost_usd":1.0}"#,
+            true,
+            crate::orchestrator::types::ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        db.lock().fail_run_stage(&stage.id, out.error.as_deref().unwrap()).unwrap();
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "a budget stop parks, it never escalates");
+        let reloaded = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!reloaded.escalated);
+        assert_eq!(reloaded.status, "failed", "it stays parked for the director's decision");
+    }
+
+    #[test]
     fn try_escalate_refuses_a_stage_that_already_escalated() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
         let id = db.lock().list_run_stages(&run).unwrap().remove(0).id;
@@ -8278,11 +8298,32 @@ mod cli_runner_tests {
     }"#;
 
     const ERRORED: &str = r#"{
-        "type":"result","subtype":"error_max_budget_usd","is_error":true,
-        "result":"Budget exceeded.","total_cost_usd":5.0,
+        "type":"result","subtype":"error_during_execution","is_error":true,
+        "result":"Something broke.","total_cost_usd":5.0,
         "usage":{"input_tokens":10,"output_tokens":0,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
     }"#;
+
+    const BUDGET_STOPPED: &str = r#"{
+        "type":"result","subtype":"error_max_budget_usd","is_error":true,
+        "result":"Budget exceeded.","total_cost_usd":1.27,"session_id":"sess-b",
+        "usage":{"input_tokens":10,"output_tokens":4,
+                 "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
+    }"#;
+
+    #[test]
+    fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
+        use crate::orchestrator::cli_runner::is_budget_stop;
+        let outcome = parse_cli_result(BUDGET_STOPPED, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed, "the run pauses at a decision");
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.starts_with("budget reached mid-stage"), "{err}");
+        assert!(is_budget_stop(err), "{err}");
+        assert!((outcome.cost_usd - 1.27).abs() < 1e-9, "the spend stays on the meter");
+        assert_eq!(outcome.session_id.as_deref(), Some("sess-b"), "Resume continues the session");
+        let other = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_budget_stop(other.error.as_deref().unwrap()));
+    }
 
     #[test]
     fn parses_success_into_done_outcome() {
@@ -8301,7 +8342,7 @@ mod cli_runner_tests {
     fn is_error_flag_yields_failed_outcome() {
         let outcome = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
-        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_max_budget_usd): Budget exceeded."));
+        assert_eq!(outcome.error.as_deref(), Some("claude stopped early (error_during_execution): Something broke."));
     }
 
     #[test]
@@ -8535,6 +8576,20 @@ mod cli_args_tests {
             let v: serde_json::Value = serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON");
             assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
         }
+    }
+
+    #[test]
+    fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
+        use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
+        // #362: a run budget's remaining headroom caps the Claude stage.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(1.239), 0.0)), vec!["--max-budget-usd", "1.23"]);
+        // No budget, or the director's conscious override (no headroom) ⇒ no flag.
+        assert!(max_budget_args(cli_budget_cap(None, 0.0)).is_empty());
+        assert!(max_budget_args(cli_budget_cap(None, 3.0)).is_empty(), "a resume never invents a cap");
+        // A resumed session reports its whole total, so its prior spend rides on top.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(0.5), 2.25)), vec!["--max-budget-usd", "2.75"]);
+        // A sliver of headroom still caps at one cent, never at $0.00.
+        assert_eq!(max_budget_args(cli_budget_cap(Some(0.004), 0.0)), vec!["--max-budget-usd", "0.01"]);
     }
 
     #[test]

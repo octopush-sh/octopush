@@ -7,6 +7,14 @@ describe("haltCause", () => {
     expect(c.title).toContain("turn limit");
     expect(c.title).toContain("25");
   });
+  it("explains a budget stop as a budget stop, not a crash", () => {
+    const c = haltCause(
+      "budget reached mid-stage — Claude Code stopped at the run's remaining budget (error_max_budget_usd, $1.27 reported) — resume…",
+      25,
+    );
+    expect(c.title).toBe("Claude stopped at the run's budget");
+    expect(c.remedy).toMatch(/Resum/);
+  });
   it("explains an idle timeout", () => {
     expect(haltCause("claude timed out — no output for 5 minutes", 25).title).toMatch(/no output/i);
   });

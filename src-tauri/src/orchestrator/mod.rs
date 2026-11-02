@@ -658,6 +658,15 @@ impl Orchestrator {
             Some(s) => s,
             None => return Ok(false),
         };
+        // A budget stop is a park, not a weak-tier failure: a strong-tier
+        // retry would spend past the budget that just stopped it.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_budget_stop)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -828,6 +837,18 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            // Resume archived the attempt it continues just before resetting
+            // the row, so the latest iteration holds the session's spend.
+            resume_prior_cost_usd: if stage.resume_pending {
+                self.db
+                    .lock()
+                    .list_stage_iterations(&stage.id)?
+                    .last()
+                    .map(|i| i.cost_usd)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            },
             blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
             role_prompt: role_def.prompt_body,
@@ -1109,6 +1130,18 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A Claude Code budget stop parks with the budget gate's own
+                // notice; its session (persisted above) lets Resume continue.
+                if crate::orchestrator::cli_runner::is_budget_stop(&err) {
+                    let fresh_run = self.db.lock().get_run(&run.id)?;
+                    if let Some(r) = fresh_run {
+                        self.journal_notice(&run.id, &stage.id, &format!(
+                            "budget reached — ${:.2} of ${:.2} spent",
+                            r.cost_usd,
+                            r.budget_usd.unwrap_or(0.0)
+                        ));
+                    }
+                }
                 // An unfinished failure (turn cap, budget stop, cancel) carries
                 // its conversation — persist it so a director Resume CONTINUES
                 // the work instead of starting over (the API-substrate analogue

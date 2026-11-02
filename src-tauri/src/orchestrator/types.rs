@@ -296,6 +296,11 @@ pub struct StageSpec {
     pub instructions: Option<String>,
     /// CLI session to `--resume` on this run (set only by a Resume action).
     pub resume_session: Option<String>,
+    /// What the session being resumed had already reported spending (its last
+    /// archived attempt's cost; `0.0` for a fresh run). A resumed Claude run
+    /// reports the conversation's whole total, so its `--max-budget-usd` cap
+    /// adds this on top of the remaining headroom.
+    pub resume_prior_cost_usd: f64,
     /// Serialized [`BlockedTranscript`](crate::orchestrator::agentic::BlockedTranscript)
     /// of an answered `ask_director` block: the API runner continues that
     /// conversation (answer as tool_result) instead of re-running the stage
