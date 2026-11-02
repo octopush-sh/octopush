@@ -145,6 +145,24 @@ test("check: CI pending on main → exit 1", () => {
   rmSync(fx.dir, { recursive: true, force: true });
 });
 
+test("check: main's CI still running waits for it; one that lost its runner is re-run", () => {
+  const fx = fixture();
+  const gh = join(fx.bin, "gh");
+  // CI reads for main: pending, then failed with only cancelled jobs (no
+  // runner), then green after the re-run.
+  writeFileSync(gh, GH_STUB.replace(
+    '*"actions/runs?head_sha="*) echo "${STUB_CI:-success}" ;;',
+    `*"actions/runs?head_sha="*'.conclusion == "failure"'*) echo 555 ;;
+  *"actions/runs/555/jobs"*) echo 555 ;;
+  *"actions/runs?head_sha="*) n=$(cat "$STUB_LOG.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB_LOG.n"; case "$n" in 0) echo pending ;; 1) echo failure ;; *) echo success ;; esac ;;`,
+  ));
+  const r = routine(fx, "check", { OCTOPUSH_RELEASE_MAIN_CI_WAIT: "30" });
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /re-running it \(1\)/);
+  assert.ok(r.calls.some((c) => /actions\/runs\/555\/rerun-failed-jobs/.test(c)), r.calls.join("\n"));
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
 test("check: a release run in progress → exit 1", () => {
   const fx = fixture();
   const r = routine(fx, "check", { STUB_RELEASE_BUSY: "1" });
