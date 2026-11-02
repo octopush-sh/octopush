@@ -16,6 +16,12 @@ describe("FileDiffSection", () => {
     expect(getByText("MODIFIED")).toBeTruthy();
     expect(getByText("src/a.ts")).toBeTruthy();
   });
+  it("sets MODIFIED in mute, like the hunk count — status is never brass (#398)", () => {
+    const { getByText } = render(<FileDiffSection file={file} focusedHunk={-1} viewed={false} collapsed={false}
+      onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+    expect(getByText("MODIFIED")).toHaveClass("font-mono", "text-octo-mute");
+    expect(getByText("MODIFIED")).not.toHaveClass("text-octo-brass");
+  });
   it("middle-truncates a long path with the file name pinned and the full path in its title", () => {
     const long = { ...file, filePath: "src-tauri/src/very/deep/module/sync.rs" };
     const { container, getByTitle } = render(<FileDiffSection file={long} focusedHunk={-1} viewed={false} collapsed={false}

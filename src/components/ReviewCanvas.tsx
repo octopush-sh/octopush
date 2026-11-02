@@ -478,7 +478,7 @@ export function ReviewCanvas({
             aria-expanded={testsOpen}
             title={testCommand ? `Run tests · ${testCommand}` : "Set a test command"}
             className={`flex shrink-0 items-center gap-1 rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
-              testsOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+              testsOpen ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
             }`}
             style={testsOpen ? { background: "var(--brass-ghost)" } : undefined}
           >
@@ -498,7 +498,7 @@ export function ReviewCanvas({
               aria-expanded={moreOpen}
               title="Diff layout, whitespace and tests"
               className={`flex shrink-0 items-center rounded-md border border-octo-border-strong px-2 py-1 transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
-                moreOpen || testRunning ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                moreOpen ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
               }`}
               style={moreOpen ? { background: "var(--brass-ghost)" } : undefined}
             >
@@ -593,16 +593,15 @@ export function ReviewCanvas({
                 aria-label="Review with AI"
                 aria-pressed={aiOpen}
                 title="Review this change with AI"
-                className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass"
-                style={{
-                  background: aiOpen ? "var(--brass-ghost)" : "transparent",
-                  border: "1px solid var(--brass-dim)",
-                }}
+                className={`flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md border border-octo-border-strong px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  aiOpen ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
+                }`}
+                style={aiOpen ? { background: "var(--brass-ghost)" } : undefined}
               >
                 <Sparkles size={12} />
                 AI
                 {aiFindingCount != null && aiFindingCount > 0 && (
-                  <span className="rounded-full bg-[var(--brass-ghost)] px-1 text-[9px] tabular-nums text-octo-brass">
+                  <span className="rounded-full bg-octo-hairline px-1 text-[9px] octo-tabular">
                     {aiFindingCount}
                   </span>
                 )}
@@ -610,6 +609,7 @@ export function ReviewCanvas({
 
               <button
                 onClick={handleAcceptAll}
+                data-tour="review-accept-all"
                 aria-label="Accept all changes"
                 className="flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1 font-mono text-[10px] uppercase tracking-[0.18em] text-octo-brass transition-colors focus-visible:ring-1 focus-visible:ring-octo-brass"
                 style={{

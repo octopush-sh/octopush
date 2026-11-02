@@ -492,10 +492,10 @@ function StripButton({
       aria-pressed={active}
       aria-label={label}
       title={label}
-      className={`relative flex h-7 w-7 items-center justify-center rounded-md border transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
-        active ? "text-octo-brass" : "border-transparent text-octo-mute hover:text-octo-sage"
+      className={`relative flex h-7 w-7 items-center justify-center rounded-md transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+        active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
       }`}
-      style={active ? { background: "var(--brass-ghost)", borderColor: "var(--brass-dim)" } : undefined}
+      style={active ? { background: "var(--brass-ghost)" } : undefined}
     >
       {children}
       {badge != null && (

@@ -153,6 +153,21 @@ describe("ReviewCanvas toolbar", () => {
     );
   });
 
+  // Visual review #398: brass is for the one primary action and active states.
+  it("Accept all is the only brass action; AI and More are mute ghosts until open", () => {
+    renderCanvas();
+    const ai = screen.getByRole("button", { name: /review with ai/i });
+    expect(ai).toHaveClass("border-octo-border-strong", "text-octo-mute");
+    expect(ai).not.toHaveClass("border-octo-hairline");
+    expect(ai).not.toHaveClass("text-octo-brass");
+    expect(ai.style.borderColor).toBe("");
+    const more = screen.getByRole("button", { name: /more view options/i });
+    expect(more).toHaveClass("text-octo-mute");
+    expect(screen.getByRole("button", { name: /accept all changes/i })).toHaveClass("text-octo-brass");
+    fireEvent.click(ai);
+    expect(ai).toHaveClass("text-octo-brass");
+  });
+
   it("More holds the shed controls: layout, whitespace and tests", () => {
     renderCanvas();
     const more = screen.getByRole("button", { name: /more view options/i });

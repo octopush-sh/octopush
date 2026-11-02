@@ -25,6 +25,14 @@ describe("HunkRail", () => {
     const actions = getByRole("button", { name: /reject hunk/i }).parentElement!;
     expect(actions).toHaveClass("shrink-0", "whitespace-nowrap");
   });
+  it("Accept is a ghost button that only turns brass on hover (#398)", () => {
+    const { getByRole } = render(<HunkRail {...base} onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
+    const accept = getByRole("button", { name: /accept hunk/i });
+    expect(accept).toHaveClass("border-octo-border-strong", "text-octo-sage", "hover:text-octo-brass");
+    expect(accept).not.toHaveClass("border-octo-hairline");
+    expect(accept).not.toHaveClass("text-octo-brass");
+    expect(accept.style.background).toBe("");
+  });
   it("focused adds the bright rule data attr", () => {
     const { container } = render(<HunkRail {...base} focused onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} />);
     expect(container.querySelector('[data-focused="true"]')).toBeTruthy();

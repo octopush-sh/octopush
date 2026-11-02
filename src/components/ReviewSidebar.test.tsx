@@ -103,6 +103,17 @@ describe("ReviewSidebar", () => {
     expect(localStorage.getItem("reviewSidebarCollapsed")).toBe("0");
   });
 
+  it("the active strip icon is a brass wash, not a brass outline (#398)", async () => {
+    render(<ReviewSidebar changedCount={2} {...baseProps} />);
+    await userEvent.click(screen.getByRole("button", { name: /collapse changes & files/i }));
+    const active = screen
+      .getByTestId("review-sidebar-strip")
+      .querySelector<HTMLElement>('button[aria-pressed="true"]')!;
+    expect(active).toHaveClass("text-octo-brass");
+    expect(active).not.toHaveClass("border");
+    expect(active.style.borderColor).toBe("");
+  });
+
   it("the focus-commit shortcut reveals the Changes tab and focuses the commit box", async () => {
     let focusCommit: (() => void) | undefined;
     render(
