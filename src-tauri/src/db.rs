@@ -779,6 +779,11 @@ impl Db {
         // D18: the ask_director conversation transcript, so an answered block
         // CONTINUES its conversation instead of re-running from scratch.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_transcript TEXT")?;
+        // #362: the spend the session had already reported when a Resume (or
+        // an answered block) set resume_pending — the resumed Claude run
+        // reports the conversation's whole total, so its budget cap sits on
+        // top. 0 for every pre-existing row.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_prior_cost_usd REAL NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -6109,6 +6114,26 @@ impl Db {
             params![stage_id, pending as i64],
         )?;
         Ok(())
+    }
+
+    /// Record the spend the session had reported when `resume_pending` was
+    /// set (read back by [`Self::get_stage_resume_prior_cost`]).
+    pub fn set_stage_resume_prior_cost(&self, stage_id: &str, cost_usd: f64) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_prior_cost_usd = ?2 WHERE id = ?1",
+            params![stage_id, cost_usd],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_resume_prior_cost(&self, stage_id: &str) -> AppResult<f64> {
+        self.conn
+            .query_row(
+                "SELECT resume_prior_cost_usd FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
     }
 
     /// Override a stage's tool-turn budget (used by Resume/Re-run with N turns).

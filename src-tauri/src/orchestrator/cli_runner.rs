@@ -379,20 +379,21 @@ pub fn is_budget_stop(error: &str) -> bool {
 /// or the director's conscious override), plus, for a `--resume`d stage, the
 /// session's prior reported total — a resumed run reports the conversation's
 /// whole total, so the cap must sit on top of what was already spent.
+/// Only the headroom is rounded DOWN to cents (never above it, at least one
+/// cent) before the prior total is added, so a resumed cap always sits at
+/// least a cent above what the session already reported — flooring the sum
+/// could land under it and stop the resumed run straight away.
 pub fn cli_budget_cap(spend_limit: Option<f64>, resumed_prior_cost_usd: f64) -> Option<f64> {
     spend_limit
         .filter(|l| *l > 0.0)
-        .map(|l| l + resumed_prior_cost_usd.max(0.0))
+        .map(|l| ((l * 100.0).floor() / 100.0).max(0.01) + resumed_prior_cost_usd.max(0.0))
 }
 
-/// `--max-budget-usd <cap>` with the cap rounded DOWN to cents (never above
-/// the headroom), and at least one cent. Empty without a cap.
+/// `--max-budget-usd <cap>` with the cap (already floored by
+/// [`cli_budget_cap`]) printed to the nearest cent. Empty without a cap.
 pub fn max_budget_args(cap: Option<f64>) -> Vec<String> {
     match cap {
-        Some(c) => {
-            let cents = ((c * 100.0).floor() / 100.0).max(0.01);
-            vec!["--max-budget-usd".to_string(), format!("{cents:.2}")]
-        }
+        Some(c) => vec!["--max-budget-usd".to_string(), format!("{c:.2}")],
         None => Vec::new(),
     }
 }
@@ -420,7 +421,7 @@ pub fn parse_cli_result(
         let error = match (bad_subtype, parsed.result.is_empty()) {
             (Some(BUDGET_STOP_SUBTYPE), _) => format!(
                 "budget reached mid-stage — Claude Code stopped at the run's remaining budget \
-                 ({BUDGET_STOP_SUBTYPE}, ${:.2} reported) — resume to continue past the budget, \
+                 ({BUDGET_STOP_SUBTYPE}, ${:.2} reported) — resume to continue within what is left of the budget, \
                  accept the partial work, or re-run",
                 parsed.total_cost_usd
             ),

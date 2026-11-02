@@ -837,15 +837,12 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
-            // Resume archived the attempt it continues just before resetting
-            // the row, so the latest iteration holds the session's spend.
+            // Recorded from the stage row by whichever action set
+            // resume_pending (Resume or an answered block) — not read from
+            // the iteration history, whose latest entry need not be this
+            // session's (a blocked attempt is never archived).
             resume_prior_cost_usd: if stage.resume_pending {
-                self.db
-                    .lock()
-                    .list_stage_iterations(&stage.id)?
-                    .last()
-                    .map(|i| i.cost_usd)
-                    .unwrap_or(0.0)
+                self.db.lock().get_stage_resume_prior_cost(&stage.id)?
             } else {
                 0.0
             },
@@ -2082,6 +2079,9 @@ impl Orchestrator {
                                 );
                             if can_resume {
                                 self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                                // A blocked stage is never archived (no artifact
+                                // or error), so its spend is recorded from the row.
+                                self.db.lock().set_stage_resume_prior_cost(&s.id, s.cost_usd)?;
                             }
                             self.recompute_run_cost(run_id)?;
                         }
@@ -2217,6 +2217,12 @@ impl Orchestrator {
                                     crate::orchestrator::cli_runner::CliDialect::Claude
                                 );
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
+                        // The session's spend so far, taken from THIS row: the
+                        // resumed run's budget cap sits on top of it.
+                        self.db.lock().set_stage_resume_prior_cost(
+                            &s.id,
+                            if can_resume { s.cost_usd } else { 0.0 },
+                        )?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
                     }

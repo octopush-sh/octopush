@@ -17,7 +17,7 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
     return {
       title: "Claude stopped at the run's budget",
       remedy:
-        "The partial work is still in the worktree. Resuming continues the same session past the budget, after you approve the budget gate. You can also accept the partial work or discard the changes.",
+        "The partial work is still in the worktree. Resuming continues the same session within whatever budget is left; if the budget is used up, the run asks you before it continues. You can also accept the partial work or discard the changes.",
     };
   }
   if (raw.includes("error_during_execution")) {
