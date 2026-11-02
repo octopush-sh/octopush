@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const PIPE = { pipeline: { id: "p1", name: "Feature Factory", description: "d", isBuiltin: true, createdAt: "t" },
   stages: [
@@ -18,7 +18,11 @@ const storeState = vi.hoisted(() => ({
 vi.mock("../stores/pipelineStore", () => ({
   usePipelineStore: (sel: any) => sel(storeState),
 }));
-vi.mock("./ModelPicker", () => ({ ModelPicker: () => <div /> }));
+vi.mock("./ModelPicker", () => ({
+  ModelPicker: ({ activeModel, onSelectModel }: { activeModel: string; onSelectModel: (m: string) => void }) => (
+    <button onClick={() => onSelectModel("m2")}>model:{activeModel}</button>
+  ),
+}));
 const entitlementState = vi.hoisted(() => ({ usage: { used: 4, limit: 25 } as { used: number; limit: number | null } | null }));
 vi.mock("../hooks/useEntitlement", () => ({
   useEntitlement: () => ({ usage: entitlementState.usage, hasFeature: () => false }),
@@ -234,6 +238,60 @@ describe("PipelineSetup designed states", () => {
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     await screen.findByTestId("estimate-range");
     expect(screen.queryByTestId("estimate-unpriced")).not.toBeInTheDocument();
+  });
+
+  describe("re-estimating", () => {
+    const FIRST = { estimateUsd: 0.7, baselineUsd: 1.84, lowUsd: 0.4, highUsd: 1.1, confidence: "history" };
+    const SECOND = { estimateUsd: 0.2, baselineUsd: 1.84, lowUsd: 0.1, highUsd: 0.3, confidence: "history" };
+    const overrideFirstStage = () => {
+      fireEvent.click(screen.getByRole("button", { name: "Edit the crew" }));
+      fireEvent.click(screen.getAllByText("model:m")[0]);
+    };
+    const deferred = () => {
+      let resolve!: (v: unknown) => void;
+      let reject!: (e: unknown) => void;
+      const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+      return { promise, resolve, reject };
+    };
+
+    it("keeps the previous range on a model change, then replaces it", async () => {
+      estimateMock.mockResolvedValueOnce(FIRST);
+      const next = deferred();
+      estimateMock.mockReturnValueOnce(next.promise);
+      render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+      expect((await screen.findByTestId("estimate-range")).textContent).toBe("est. $0.40–$1.10");
+      overrideFirstStage();
+      expect(estimateMock).toHaveBeenLastCalledWith("p1", [[0, "m2"]]);
+      expect(screen.getByTestId("estimate-range").textContent).toBe("est. $0.40–$1.10");
+      expect(screen.queryByText("estimating…")).not.toBeInTheDocument();
+      next.resolve(SECOND);
+      await waitFor(() => expect(screen.getByTestId("estimate-range").textContent).toBe("est. $0.10–$0.30"));
+    });
+
+    it("drops the stale range when the re-estimate fails", async () => {
+      estimateMock.mockResolvedValueOnce(FIRST);
+      const next = deferred();
+      estimateMock.mockReturnValueOnce(next.promise);
+      render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+      await screen.findByTestId("estimate-range");
+      overrideFirstStage();
+      next.reject(new Error("db busy"));
+      expect((await screen.findByTestId("estimate-unavailable")).textContent).toBe("est. unavailable");
+      expect(screen.queryByTestId("estimate-range")).not.toBeInTheDocument();
+      expect(screen.queryByText(/\$0\.40/)).not.toBeInTheDocument();
+    });
+
+    it("clears to 'estimating…' when the crew changes", async () => {
+      storeState.pipelines = [PIPE, PERF];
+      estimateMock.mockResolvedValueOnce(FIRST);
+      estimateMock.mockReturnValueOnce(new Promise(() => {})); // never resolves
+      render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+      await screen.findByTestId("estimate-range");
+      fireEvent.click(screen.getByText("Perf probe"));
+      expect(estimateMock).toHaveBeenLastCalledWith("pperf", undefined);
+      expect(screen.getByText("estimating…")).toBeInTheDocument();
+      expect(screen.queryByTestId("estimate-range")).not.toBeInTheDocument();
+    });
   });
 
   it("the beacon lands on Begin only when ready (Law 2)", () => {

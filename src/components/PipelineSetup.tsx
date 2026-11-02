@@ -80,6 +80,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const [budgetText, setBudgetText] = useState("");
   const [showIssuePicker, setShowIssuePicker] = useState(false);
   const [estimate, setEstimate] = useState<RunEstimate | null>(null);
+  const [estimateFailed, setEstimateFailed] = useState(false);
   const estimatedFor = useRef<string | null>(null);
 
   // The active mission's intent — a `perf` mission default-selects Perf probe.
@@ -132,12 +133,18 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     // keeps it until the re-estimate lands, so the line updates in place.
     if (estimatedFor.current !== selectedId) setEstimate(null);
     estimatedFor.current = selectedId;
+    setEstimateFailed(false);
     const tuples: [number, string][] = Object.entries(overrides)
       .map(([pos, model]) => [Number(pos), model] as [number, string]);
     let cancelled = false;
     ipc.estimateRunCost(selectedId, tuples.length > 0 ? tuples : undefined)
       .then((e) => { if (!cancelled) setEstimate(e); })
-      .catch(() => {});
+      // The kept figure priced the previous models — never leave it standing.
+      .catch(() => {
+        if (cancelled) return;
+        setEstimate(null);
+        setEstimateFailed(true);
+      });
     return () => { cancelled = true; };
   }, [selectedId, overrides]);
 
@@ -374,7 +381,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                     {estimate.confidence === "rough" && estimateRange !== "unpriced" && (
                       <span
                         className="octo-tabular text-octo-mute"
-                        title="Fewer than 3 past runs of a stage's role on this Mac — its figure is a built-in guess."
+                        title="Fewer than 3 past runs of a stage's role and effort on this Mac — its figure is a built-in guess."
                         data-testid="estimate-rough"
                       >
                         · rough
@@ -404,6 +411,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                       </span>
                     )}
                   </>
+                ) : estimateFailed ? (
+                  <span className="text-octo-mute" data-testid="estimate-unavailable">est. unavailable</span>
                 ) : (
                   <span className="text-octo-mute">estimating…</span>
                 )}
