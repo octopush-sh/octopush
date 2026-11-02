@@ -21,6 +21,7 @@ REPO="${OCTOPUSH_ROUTINE_REPO:-$(cd "$ROOT" && this_repo)}"
 OWNER="${REPO%%/*}"
 CI_TIMEOUT="${OCTOPUSH_RELEASE_CI_TIMEOUT:-2700}"   # seconds (45 min)
 CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
+CI_STARVED_RETRIES="${OCTOPUSH_RELEASE_CI_STARVED_RETRIES:-3}"   # re-runs of a CI that only lost its runner
 # In GitHub Actions (nightly-release.yml) pushes made with GITHUB_TOKEN start no
 # workflows: OCTOPUSH_DISPATCH=1 dispatches CI on the release branch and the
 # release build on the new tag explicitly.
@@ -113,10 +114,11 @@ wait_for_ci() {
         # A job GitHub never gave a runner (macOS capacity) is not a test
         # failure: re-run it, a few times, instead of abandoning the release.
         starved="$(ci_starved_run_for "$REPO" "$sha" || true)"
-        if [[ -n "$starved" && "$retries" -lt "${CI_STARVED_RETRIES:-3}" ]]; then
+        if [[ -n "$starved" && "$retries" -lt "$CI_STARVED_RETRIES" ]]; then
           retries=$((retries + 1))
           echo "CI run $starved only had cancelled jobs (no runner) — re-running them ($retries)"
           gh api -X POST "repos/$REPO/actions/runs/$starved/rerun-failed-jobs" >/dev/null || fail "could not re-run CI run $starved"
+          waited=0   # each re-run gets the full CI timeout
           sleep "$CI_POLL"; continue
         else
           fail "CI failed on the release PR (head $sha)"
