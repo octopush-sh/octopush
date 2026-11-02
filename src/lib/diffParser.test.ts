@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseFullDiff, parseDiffForFile } from "./diffParser";
+import { parseFullDiff, parseDiffForFile, hunkFingerprint } from "./diffParser";
 
 // A minimal two-file unified diff fixture.
 const SAMPLE_DIFF = `diff --git a/src/foo.ts b/src/foo.ts
@@ -86,6 +86,18 @@ describe("parseFullDiff rows", () => {
   it("row text drops the +/-/space sign", () => {
     expect(hunk.rows[1].text.startsWith("-")).toBe(false);
     expect(hunk.rows[1].text).toContain("Hi ");
+  });
+});
+
+describe("hunkFingerprint", () => {
+  const hunk = parseFullDiff(DIFF)[0].hunks[0];
+  it("ignores line numbers but not content or kind", () => {
+    const shifted = { ...hunk, header: "@@ -9,3 +9,3 @@", rows: hunk.rows.map(r => ({ ...r, oldLine: 99, newLine: 99 })) };
+    expect(hunkFingerprint(shifted)).toBe(hunkFingerprint(hunk));
+    const edited = { ...hunk, rows: hunk.rows.map((r, i) => (i === 2 ? { ...r, text: r.text + "!" } : r)) };
+    expect(hunkFingerprint(edited)).not.toBe(hunkFingerprint(hunk));
+    const flipped = { ...hunk, rows: hunk.rows.map((r, i) => (i === 2 ? { ...r, kind: "del" as const } : r)) };
+    expect(hunkFingerprint(flipped)).not.toBe(hunkFingerprint(hunk));
   });
 });
 
