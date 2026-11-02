@@ -100,12 +100,14 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
 
 ## Nightly beta (the release routine)
 
-`scripts/routines/release-beta.sh` runs as an Octopush Routine on the owner's Mac
-every day at 05:00 ([`ROUTINES.md`](ROUTINES.md)):
+`scripts/routines/release-beta.sh` runs in GitHub Actions, in `nightly-release.yml`
+twice a day ([`ROUTINES.md`](ROUTINES.md)):
 
 - **`check`** fires only when `origin/main` has commits since the latest `v*` tag
   that aren't just a release bump, CI is green on main's head, and no `release`
-  workflow run is in progress.
+  workflow run is in progress. In Actions it waits up to 30 min for main's CI
+  to finish, and it re-runs a CI run whose only problem was a job GitHub never
+  gave a runner (macOS capacity), up to 3 times. Off Actions it doesn't wait.
 - **`run`** computes the next patch version, and in a temporary worktree of
   `origin/main`: creates `release/v<next>`, runs `npm ci`, `node
   scripts/whats-new.mjs collect <next> --since v<prev>`, `npm run clips:record --
@@ -113,7 +115,7 @@ every day at 05:00 ([`ROUTINES.md`](ROUTINES.md)):
   bumps `package.json`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json` and the
   `octopush` entry of `src-tauri/Cargo.lock` (`node scripts/release-lib.mjs bump`),
   commits `chore: release v<next>`, pushes, opens a PR labelled `release`, waits
-  for CI (≤ 45 min), merges it (merge commit, pinned to the head sha), and pushes
+  for CI (≤ 45 min; a run that only lost its runner is re-run), merges it (merge commit, pinned to the head sha), and pushes
   the annotated tag `v<next>` on the merge commit. `release.yml` then publishes the beta.
 - On any failure it stops, leaves no tag behind, and comments on and closes the
   PR. Re-running is safe: an open PR is reused, and a release that merged but

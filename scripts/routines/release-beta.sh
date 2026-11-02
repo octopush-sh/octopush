@@ -24,8 +24,10 @@ CI_POLL="${OCTOPUSH_RELEASE_CI_POLL:-30}"           # seconds
 CI_STARVED_RETRIES="${OCTOPUSH_RELEASE_CI_STARVED_RETRIES:-3}"   # re-runs of a CI that only lost its runner
 # How long the check waits for main's CI to settle (default the smaller of the
 # CI timeout and 30 min): a merge minutes before the release window must not
-# cost the day's beta.
-MAIN_CI_WAIT="${OCTOPUSH_RELEASE_MAIN_CI_WAIT:-$(( CI_TIMEOUT < 1800 ? CI_TIMEOUT : 1800 ))}"
+# cost the day's beta. One deadline covers the waiting and any re-runs.
+# Only in Actions: as a Mac Routine fire condition the check must stay quick.
+if [[ "${GITHUB_ACTIONS:-}" == true ]]; then main_wait_default=$(( CI_TIMEOUT < 1800 ? CI_TIMEOUT : 1800 )); else main_wait_default=0; fi
+MAIN_CI_WAIT="${OCTOPUSH_RELEASE_MAIN_CI_WAIT:-$main_wait_default}"
 # In GitHub Actions (nightly-release.yml) pushes made with GITHUB_TOKEN start no
 # workflows: OCTOPUSH_DISPATCH=1 dispatches CI on the release branch and the
 # release build on the new tag explicitly.
@@ -76,7 +78,7 @@ main_ci_settled() {
       failure)
         starved="$(ci_starved_run_for "$REPO" "$sha" || true)"
         if [[ -n "$starved" && "$retries" -lt "$CI_STARVED_RETRIES" ]]; then
-          retries=$((retries + 1)); start=$SECONDS
+          retries=$((retries + 1))
           echo "main's CI run $starved only lost its runner — re-running it ($retries)" >&2
           gh api -X POST "repos/$REPO/actions/runs/$starved/rerun-failed-jobs" >/dev/null || { echo failure; return 0; }
         else
