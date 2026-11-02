@@ -206,7 +206,8 @@ fn ancestors_within(workspace: &str, path: &str) -> Vec<String> {
 /// on the host: the effective hooks dir (and `<common>/hooks`), `info/`, the
 /// shared and per-worktree config, every worktree's `commondir`/`gitdir`/
 /// `config.worktree` (a main checkout could otherwise repoint a sibling
-/// worktree), submodule git dirs under `modules/`, the workspace's own `.git`
+/// worktree), submodule git dirs under every `modules/` (shared, own and each
+/// sibling worktree's), the workspace's own `.git`
 /// entry and any nested `.git` in it (replacing one would redirect git to a
 /// planted config). A hook planted there would run unsandboxed on the user's
 /// next commit or `git status`. Applies to main checkouts too. Pure.
@@ -248,6 +249,9 @@ fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
                 "^{}/worktrees/[^/]+/(commondir|gitdir|config\\.worktree|config\\.worktree\\.lock)$",
                 regex_escape(c)
             ),
+            // `modules/` is per worktree, so a sibling's submodule git dirs sit
+            // under `<common>/worktrees/<name>/modules`, inside a main checkout.
+            format!("^{}/worktrees/[^/]+/modules(/|$)", regex_escape(c)),
             format!("^{}/.+/\\.git(/|$)", regex_escape(ws)),
         ],
     };
@@ -596,6 +600,17 @@ mod tests {
         // A linked worktree's submodules live under its own git dir.
         assert!(l.deny_subpaths.contains(&"/repo/.git/modules".to_string()));
         assert!(l.deny_subpaths.contains(&"/repo/.git/worktrees/wt/modules".to_string()));
+        // From a main checkout, a sibling worktree's submodule git dirs.
+        for d in [
+            "/ws/.git/worktrees/sib/modules",
+            "/ws/.git/worktrees/sib/modules/m/config",
+            "/ws/.git/worktrees/sib/modules/m/hooks/pre-commit",
+        ] {
+            assert!(regex_denies(&r, d), "{d} must be denied");
+        }
+        assert!(regex_denies(&l, "/repo/.git/worktrees/other/modules/m/config"));
+        assert!(!regex_denies(&r, "/ws/.git/worktrees/sib/modules2"));
+        assert!(!regex_denies(&r, "/ws/.git/worktrees/sib/index"));
         // A submodule's `.git` pointer (or an embedded `.git` dir) in the tree.
         for d in ["/wt/sub/.git", "/wt/a/b/.git/hooks/pre-commit", "/wt/a/.git/config"] {
             assert!(regex_denies(&l, d), "{d} must be denied");
@@ -816,6 +831,10 @@ mod tests {
         assert!(!run(&main, "echo /evil > .git/worktrees/wt/commondir"), "sibling commondir is denied");
         assert!(!run(&main, "echo /evil > .git/worktrees/wt/gitdir"), "sibling gitdir is denied");
         assert!(!run(&main, "mkdir -p .git/modules/m/hooks"), "submodule git dirs are denied");
+        assert!(
+            !run(&main, "mkdir -p .git/worktrees/wt/modules/m/hooks"),
+            "a sibling worktree's submodule git dirs are denied"
+        );
         // A configured hooks dir inside the workspace (husky) is denied too.
         assert!(git(&main, &["config", "core.hooksPath", ".husky/_"]));
         std::fs::create_dir_all(wt.join(".husky")).unwrap();
