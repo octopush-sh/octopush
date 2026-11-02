@@ -29,6 +29,21 @@ this_repo() {
 # GNU `date` disagree on relative dates).
 days_ago_iso() { node -e "console.log(new Date(Date.now()-$1*864e5).toISOString().replace(/\.\d+Z$/,'Z'))"; }
 
+# The newest CI run for a sha whose failure is only runner starvation: it
+# failed, and every job that didn't succeed or skip was cancelled (GitHub's
+# "job was not acquired by Runner" when macOS capacity runs out). Prints the
+# run id, or nothing.
+ci_starved_run_for() {
+  local id
+  id="$(gh api "repos/$1/actions/runs?head_sha=$2&per_page=50" --jq '
+    [.workflow_runs[] | select(.name == "CI" and .status == "completed" and .conclusion == "failure")]
+    | sort_by(.created_at) | last | .id // empty')" || return 1
+  [[ -n "$id" ]] || return 0
+  gh api "repos/$1/actions/runs/$id/jobs?per_page=100" --jq '
+    [.jobs[] | select((.conclusion // "") | IN("success", "skipped") | not)] as $bad
+    | if ($bad | length) > 0 and all($bad[]; .conclusion == "cancelled") then "'"$id"'" else empty end'
+}
+
 # success | pending | failure | none — latest "CI" workflow run for a commit.
 ci_status_for() {
   gh api "repos/$1/actions/runs?head_sha=$2&per_page=50" --jq '
