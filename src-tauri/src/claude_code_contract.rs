@@ -28,7 +28,7 @@ use crate::orchestrator::cli_runner::{
     plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect, ReadEnd,
     ReadLimits,
 };
-use crate::orchestrator::live::entries_from_stream_event;
+use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
 // ─── Fixture helpers ──────────────────────────────────────────────────────
@@ -634,6 +634,87 @@ fn rate_limit_event_missing_fields_degrade_without_panicking() {
     assert_eq!(plan_windows_from_stream_event(&junk).len(), 1);
     junk["rate_limit_info"] = Value::from("x");
     assert!(plan_windows_from_stream_event(&junk).is_empty());
+}
+
+// ─── `system/api_retry` and `system/init` load errors → journal notices ──
+
+const API_RETRY_REL: &str = "stream-json/api-retry.jsonl";
+const LOAD_ERRORS_REL: &str = "stream-json/init-with-load-errors.jsonl";
+
+fn notice_texts(entries: &[Value]) -> Vec<String> {
+    kind_entries(entries, "notice").iter().map(|e| e["text"].as_str().unwrap().to_string()).collect()
+}
+
+#[test]
+fn real_recordings_system_events_journal_no_notices() {
+    // `status`, `thinking_tokens`, `task_summary`, … and an error-free init
+    // stay silent.
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl", "stream-json/error-unknown-model.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let (entries, _, _) = replay(&fx, &events);
+            assert!(notice_texts(&entries).is_empty(), "[{fx}] {entries:?}");
+        }
+    }
+}
+
+#[test]
+fn api_retry_events_journal_a_throttled_retry_notice() {
+    // Synthetic fixture (see the README) — pinned to the recording that has it.
+    let rec = recording("2.1.314");
+    let fx = rec.label(API_RETRY_REL);
+    let events = rec.jsonl(API_RETRY_REL);
+    check_stream_shape(&fx, &events);
+    let retries: Vec<&Value> = events.iter().filter(|e| e["subtype"] == "api_retry").collect();
+    for r in &retries {
+        for f in ["attempt", "max_retries", "retry_delay_ms"] {
+            require_u64(&fx, r, f);
+        }
+        require_str(&fx, r, "error");
+    }
+    let (entries, _, outcome) = replay(&fx, &events);
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+    assert_eq!(notice_texts(&entries), [
+        "retrying · overloaded · attempt 1/10 · in 1s",
+        "retrying · overloaded · attempt 2/10 · in 2s",
+        "retrying · rate_limit · attempt 3/10 · in 30s",
+        "retrying · fixture_unknown_cause · attempt 4/10 · in 2s",
+    ], "[{fx}]");
+
+    // As the runner journals them, arriving within one second: the second
+    // `overloaded` retry collapses into the first.
+    let mut th = RetryThrottle::default();
+    let t0 = std::time::Instant::now();
+    let shown: Vec<String> = events
+        .iter()
+        .enumerate()
+        .filter(|(i, e)| th.allow(e, t0 + std::time::Duration::from_millis(*i as u64 * 100)))
+        .flat_map(|(_, e)| entries_from_stream_event(e))
+        .filter(|e| e["kind"] == "notice")
+        .map(|e| e["text"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(shown.len(), 3, "[{fx}] {shown:?}");
+    assert!(shown[0].contains("attempt 1/10") && shown[1].contains("rate_limit"), "[{fx}] {shown:?}");
+}
+
+#[test]
+fn init_load_errors_journal_one_notice_each() {
+    let rec = recording("2.1.314");
+    let fx = rec.label(LOAD_ERRORS_REL);
+    let events = rec.jsonl(LOAD_ERRORS_REL);
+    check_stream_shape(&fx, &events);
+    let init = events.iter().find(|e| e["subtype"] == "init").unwrap();
+    require_str(&fx, init, "mcp_server_errors.0.name");
+    require_str(&fx, init, "plugin_errors.0.plugin");
+    let (entries, _, _) = replay(&fx, &events);
+    assert_eq!(notice_texts(&entries), [
+        "MCP server 'fixture-missing' skipped: spawn fixture-missing-mcp ENOENT",
+        "MCP server 'fixture-badconfig' skipped: invalid config: \"command\" is required",
+        "plugin 'fixture-plugin' failed to load: plugin.json: missing \"name\"",
+    ], "[{fx}]");
+    // The init's other readers are unaffected.
+    assert_eq!(cli_auth_from_init(init), Some(CliAuth::ApiKey), "[{fx}]");
 }
 
 #[test]

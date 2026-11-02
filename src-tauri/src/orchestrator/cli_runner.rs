@@ -1355,6 +1355,8 @@ impl AgentRunner for CliRunner {
         // From `system/init`: an API-key session's rate-limit events are
         // not plan windows and never reach the plan snapshot.
         let mut auth: Option<CliAuth> = None;
+        // A retry storm journals one line per cause per 10 s, not one per attempt.
+        let mut retry_throttle = crate::orchestrator::live::RetryThrottle::default();
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
                 if let Some((id, u)) = usage_from_stream_event(value) {
@@ -1362,8 +1364,10 @@ impl AgentRunner for CliRunner {
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
                     map.insert(key, u);
                 }
-                for entry in crate::orchestrator::live::entries_from_stream_event(value) {
-                    emitter.emit_raw_entry(entry);
+                if retry_throttle.allow(value, std::time::Instant::now()) {
+                    for entry in crate::orchestrator::live::entries_from_stream_event(value) {
+                        emitter.emit_raw_entry(entry);
+                    }
                 }
                 if let Some(a) = cli_auth_from_init(value) {
                     auth = Some(a);

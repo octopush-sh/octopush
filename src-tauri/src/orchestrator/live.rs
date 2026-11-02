@@ -100,9 +100,107 @@ fn is_cli_subagent_tool(name: &str) -> bool {
     name == "Agent" || name == "Task"
 }
 
+/// First line of an upstream message, capped to 200 chars.
+fn one_line(s: &str) -> String {
+    s.trim().lines().next().unwrap_or("").trim().chars().take(200).collect()
+}
+
+/// The first non-empty string among `keys` of `v`.
+fn first_str<'v>(v: &'v Value, keys: &[&str]) -> Option<&'v str> {
+    keys.iter().find_map(|k| v.get(*k).and_then(Value::as_str)).map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// `system/api_retry` → "retrying · {error} · attempt {n}/{max} · in {s}s".
+/// Missing fields drop their segment; an unknown `error` prints as-is.
+fn api_retry_notice(v: &Value) -> String {
+    let mut parts = vec!["retrying".to_string()];
+    if let Some(e) = first_str(v, &["error"]) {
+        parts.push(one_line(e));
+    }
+    if let Some(n) = v.get("attempt").and_then(Value::as_u64) {
+        match v.get("max_retries").and_then(Value::as_u64) {
+            Some(max) => parts.push(format!("attempt {n}/{max}")),
+            None => parts.push(format!("attempt {n}")),
+        }
+    }
+    if let Some(ms) = v.get("retry_delay_ms").and_then(Value::as_u64) {
+        parts.push(format!("in {}s", ms.div_ceil(1000)));
+    }
+    parts.join(" · ")
+}
+
+/// `system/init` → one notice per `mcp_server_errors[]` / `plugin_errors[]`
+/// entry. A host that captures stderr gets no other warning that a stage
+/// runs without those tools.
+fn init_error_notices(v: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    let list = |key: &str| v.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+    for e in list("mcp_server_errors") {
+        let name = first_str(&e, &["name", "server", "server_name"]).unwrap_or("?");
+        let msg = first_str(&e, &["message", "error"]).or_else(|| e.as_str()).map(one_line);
+        out.push(match msg {
+            Some(m) => format!("MCP server '{name}' skipped: {m}"),
+            None => format!("MCP server '{name}' skipped"),
+        });
+    }
+    for e in list("plugin_errors") {
+        let name = first_str(&e, &["plugin", "name"]).unwrap_or("?");
+        let msg = first_str(&e, &["message", "error", "type"]).or_else(|| e.as_str()).map(one_line);
+        out.push(match msg {
+            Some(m) => format!("plugin '{name}' failed to load: {m}"),
+            None => format!("plugin '{name}' failed to load"),
+        });
+    }
+    out
+}
+
+/// The cause of a `system/api_retry` event (its `error`, "" when absent);
+/// `None` for any other event.
+pub fn api_retry_cause(v: &Value) -> Option<String> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("api_retry")
+    {
+        return None;
+    }
+    Some(first_str(v, &["error"]).unwrap_or("").to_string())
+}
+
+/// How long consecutive retries for one cause share a single notice.
+pub const RETRY_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Throttles `api_retry` notices: a retry for the same cause as the last one
+/// shown, within `RETRY_NOTICE_INTERVAL`, is not journaled again. Any
+/// non-`system` event (the model answered, the run ended) ends the streak.
+#[derive(Default)]
+pub struct RetryThrottle {
+    last: Option<(String, std::time::Instant)>,
+}
+
+impl RetryThrottle {
+    /// Should this event's entries be journaled? Always true except for a
+    /// throttled retry.
+    pub fn allow(&mut self, v: &Value, now: std::time::Instant) -> bool {
+        let Some(cause) = api_retry_cause(v) else {
+            if v.get("type").and_then(Value::as_str) != Some("system") {
+                self.last = None;
+            }
+            return true;
+        };
+        if let Some((last, at)) = &self.last {
+            if *last == cause && now.duration_since(*at) < RETRY_NOTICE_INTERVAL {
+                return false;
+            }
+        }
+        self.last = Some((cause, now));
+        true
+    }
+}
+
 /// Map ONE claude `--output-format stream-json` event to zero or more entries
 /// (as the JSON values `LiveEmitter` would emit). `assistant` → text + tool
-/// entries; `user` tool_result → tool_result entries; everything else → none.
+/// entries; `user` tool_result → tool_result entries; `system/api_retry` →
+/// a retry notice; `system/init` → a notice per MCP server / plugin that
+/// failed to load; everything else → none.
 ///
 /// Sub-agent hierarchy: an event that belongs to a Claude Code sub-agent
 /// carries a top-level `parent_tool_use_id` (the `Agent`/`Task` block that
@@ -119,6 +217,21 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
         .and_then(Value::as_str)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    if kind == Some("system") {
+        let notices = match v.get("subtype").and_then(Value::as_str) {
+            Some("api_retry") => vec![api_retry_notice(v)],
+            Some("init") => init_error_notices(v),
+            _ => Vec::new(),
+        };
+        for text in notices {
+            let mut entry = json!({ "kind": "notice", "text": text });
+            if let Some(p) = &parent {
+                entry["parent"] = json!(p);
+            }
+            out.push(entry);
+        }
+        return out;
+    }
     let content = v.get("message").and_then(|m| m.get("content")).and_then(Value::as_array);
     let Some(content) = content else { return out };
     match kind {
