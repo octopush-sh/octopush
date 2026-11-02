@@ -37,12 +37,13 @@ export function FileDiffSection({
         ? "DELETED"
         : "MODIFIED";
 
+  // A status, never brass: MODIFIED sits in mute like the hunk count.
   const typeColor =
     file.changeType === "new"
       ? "text-octo-verdigris"
       : file.changeType === "deleted"
         ? "text-octo-rouge"
-        : "text-octo-brass";
+        : "text-octo-mute";
 
   const id = `review-file-${encodeURIComponent(file.filePath)}`;
 

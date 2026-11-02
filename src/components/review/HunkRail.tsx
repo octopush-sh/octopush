@@ -64,14 +64,12 @@ export function HunkRail({
             >
               <XCircle size={11} className="inline" /> Reject
             </button>
+            {/* Ghost: the toolbar's Accept all is the one brass action;
+                a hunk's Accept only warms to brass on hover. */}
             <button
               onClick={onAccept}
               aria-label="Accept hunk"
-              className="rounded px-2 py-0.5 text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass"
-              style={{
-                background: "var(--brass-ghost)",
-                border: "1px solid var(--brass-dim)",
-              }}
+              className="rounded border border-octo-hairline px-2 py-0.5 text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
               <CheckCircle size={11} className="inline" /> Accept
             </button>
