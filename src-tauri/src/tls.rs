@@ -480,7 +480,8 @@ impl DenylistVerifier {
 }
 
 // MIRRORS rustls-platform-verifier 0.7.1, `src/verification/apple.rs`
-// (`Verifier::verify_certificate` and its error mapping), minus `extra_roots`
+// (`Verifier::verify_certificate` and its error mapping, here
+// `trust_evaluation_error`), minus `extra_roots`
 // (unused here) and the test-only root override. Re-diff against that file on
 // every rustls-platform-verifier bump: a change upstream (policy, date, OCSP,
 // error mapping) is not picked up automatically, because this function
@@ -509,16 +510,6 @@ fn evaluate_on_macos(
     /// Seconds between the UNIX epoch and Apple's (2001-01-01T00:00:00Z),
     /// i.e. `kCFAbsoluteTimeIntervalSince1970`.
     const APPLE_EPOCH_OFFSET: u64 = 978_307_200;
-    // OSStatus codes, as in security-framework-sys `base.rs`.
-    const ERR_SEC_HOST_NAME_MISMATCH: isize = -67602;
-    const ERR_SEC_CREATE_CHAIN_FAILED: isize = -25318;
-    const ERR_SEC_CERTIFICATE_REVOKED: isize = -67820;
-
-    let invalid = |reason: String| {
-        TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::from(Box::<
-            dyn std::error::Error + Send + Sync,
-        >::from(reason)))))
-    };
 
     let certs = std::iter::once(end_entity.as_ref())
         .chain(intermediates.iter().map(|c| c.as_ref()))
@@ -539,23 +530,75 @@ fn evaluate_on_macos(
         .ok_or(TlsError::FailedToGetCurrentTime)?;
     trust
         .set_trust_verify_date(&CFDate::new(secs as f64))
-        .map_err(|e| invalid(e.to_string()))?;
+        .map_err(|e| invalid_certificate(e.to_string()))?;
     if !ocsp_response.is_empty() {
         trust
             .set_trust_ocsp_response(std::iter::once(ocsp_response))
-            .map_err(|e| invalid(e.to_string()))?;
+            .map_err(|e| invalid_certificate(e.to_string()))?;
     }
     if let Err(e) = trust.evaluate_with_error() {
-        let code = e.code();
-        return Err(match code {
-            ERR_SEC_HOST_NAME_MISMATCH => TlsError::InvalidCertificate(CertificateError::NotValidForName),
-            ERR_SEC_CREATE_CHAIN_FAILED => TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
-            ERR_SEC_CERTIFICATE_REVOKED => TlsError::InvalidCertificate(CertificateError::Revoked),
-            _ => invalid(format!("{e}: {code}")),
-        });
+        return Err(trust_evaluation_error(e.code(), &e));
     }
     Ok(evaluated_chain(&trust))
 }
+
+// OSStatus codes, as in security-framework-sys `base.rs` (not a direct
+// dependency, so the values are copied rather than imported).
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_HOST_NAME_MISMATCH: isize = -67602;
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_CREATE_CHAIN_FAILED: isize = -25318;
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_INVALID_EXTENDED_KEY_USAGE: isize = -67609;
+#[cfg(any(target_os = "macos", test))]
+const ERR_SEC_CERTIFICATE_REVOKED: isize = -67820;
+
+/// The rustls error for a failed `SecTrust` evaluation with OSStatus `code`;
+/// `detail` is the OS error, quoted for codes upstream does not map. Part of
+/// the `evaluate_on_macos` mirror (upstream `apple.rs`'s error mapping), split
+/// out so it can be tested on every platform.
+#[cfg(any(target_os = "macos", test))]
+fn trust_evaluation_error(code: isize, detail: &dyn fmt::Display) -> TlsError {
+    match code {
+        ERR_SEC_HOST_NAME_MISMATCH => TlsError::InvalidCertificate(CertificateError::NotValidForName),
+        ERR_SEC_CREATE_CHAIN_FAILED => TlsError::InvalidCertificate(CertificateError::UnknownIssuer),
+        ERR_SEC_INVALID_EXTENDED_KEY_USAGE => {
+            TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::new(EkuError))))
+        }
+        ERR_SEC_CERTIFICATE_REVOKED => TlsError::InvalidCertificate(CertificateError::Revoked),
+        _ => invalid_certificate(format!("{detail}: {code}")),
+    }
+}
+
+/// `InvalidCertificate(Other(..))` carrying a plain message.
+#[cfg(any(target_os = "macos", test))]
+fn invalid_certificate(reason: String) -> TlsError {
+    TlsError::InvalidCertificate(CertificateError::Other(OtherError(Arc::from(Box::<
+        dyn std::error::Error + Send + Sync,
+    >::from(reason)))))
+}
+
+/// A certificate whose extended key usage does not allow TLS server
+/// authentication. Upstream's `EkuError` is crate-private, so this is ours.
+#[cfg(any(target_os = "macos", test))]
+pub struct EkuError;
+
+#[cfg(any(target_os = "macos", test))]
+impl fmt::Debug for EkuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl fmt::Display for EkuError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("certificate had invalid extended key usage")
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::error::Error for EkuError {}
 
 /// `SecTrustCopyCertificateChain` needs macOS 12 (security-framework's
 /// `macos-12` feature); the index API it deprecates works on every release.
@@ -1180,6 +1223,34 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         assert!(v.os_eval);
         assert!(verify(&v, LEAF_UNDER_LOOKALIKE, &[]).is_err());
         assert!(verify(&v, RSA_V3, &[]).is_err());
+    }
+
+    #[test]
+    fn sectrust_error_codes_map_as_upstream() {
+        let detail = "SecTrust said no";
+        let mapped = |code| trust_evaluation_error(code, &detail);
+        assert_eq!(mapped(-67602), TlsError::InvalidCertificate(CertificateError::NotValidForName));
+        assert_eq!(mapped(-25318), TlsError::InvalidCertificate(CertificateError::UnknownIssuer));
+        assert_eq!(mapped(-67820), TlsError::InvalidCertificate(CertificateError::Revoked));
+
+        // errSecInvalidExtendedKeyUsage: a typed EKU error, not the generic text.
+        let TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) = mapped(-67609) else {
+            panic!("expected InvalidCertificate(Other(..))");
+        };
+        assert!(inner.downcast_ref::<EkuError>().is_some());
+        assert_eq!(inner.to_string(), "certificate had invalid extended key usage");
+        // Not a denylist refusal: retries and the error text treat it as ordinary.
+        let eku = std::io::Error::new(std::io::ErrorKind::InvalidData, mapped(-67609));
+        assert!(!is_permanent_tls_failure(&eku));
+        let why = tls_failure(&eku).unwrap();
+        assert!(why.contains("certificate had invalid extended key usage"), "{why}");
+
+        // Anything else keeps the OS message and its code.
+        let TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner))) = mapped(-67818) else {
+            panic!("expected InvalidCertificate(Other(..))");
+        };
+        assert!(inner.downcast_ref::<EkuError>().is_none());
+        assert_eq!(inner.to_string(), "SecTrust said no: -67818");
     }
 
     #[test]
