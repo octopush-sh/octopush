@@ -10,6 +10,8 @@ interface Props {
   focusedHunk: number;
   viewed: boolean;
   collapsed: boolean;
+  /** The agent changed this file after it was marked viewed (cleared on re-mark). */
+  changedSinceViewed?: boolean;
   onAccept: (hunkIdx: number) => void;
   onReject: (hunkIdx: number) => void;
   onWhy: (hunkIdx: number) => void;
@@ -22,6 +24,7 @@ export function FileDiffSection({
   focusedHunk,
   viewed,
   collapsed,
+  changedSinceViewed = false,
   onAccept,
   onReject,
   onWhy,
@@ -82,9 +85,19 @@ export function FileDiffSection({
         <span className="octo-demote octo-demote-hunks font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute">
           {file.hunks.length} hunk{file.hunks.length !== 1 ? "s" : ""}
         </span>
+        {changedSinceViewed && (
+          <span
+            data-tour="review-file-changed"
+            title="The agent changed this file after you marked it viewed"
+            className="octo-pop-in ml-auto flex-none whitespace-nowrap rounded border border-octo-hairline px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] text-octo-verdigris"
+          >
+            changed since viewed
+          </span>
+        )}
         <button
+          data-tour="review-file-viewed"
           onClick={onToggleViewed}
-          className={`ml-auto flex-none whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] focus-visible:ring-1 focus-visible:ring-octo-brass ${
+          className={`${changedSinceViewed ? "" : "ml-auto "}flex-none whitespace-nowrap rounded px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.12em] focus-visible:ring-1 focus-visible:ring-octo-brass ${
             viewed
               ? "text-octo-verdigris"
               : "text-octo-mute hover:text-octo-sage"

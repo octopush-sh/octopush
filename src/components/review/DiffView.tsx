@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { FileDiffSection } from "./FileDiffSection";
 import { EmptyDiffState } from "./EmptyDiffState";
 import { useDiffKeyboard, type FlatHunk } from "./useDiffKeyboard";
-import type { DiffFile } from "../../lib/diffParser";
+import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
 
 export interface DiffAnchor { filePath: string; startLine: number; endLine: number; }
 
@@ -28,9 +28,21 @@ export function DiffView(props: Props) {
   const { files, stagedCount = 0, active = true } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const [focused, setFocused] = useState(0);
-  const [viewed, setViewed] = useState<Record<string, boolean>>({});
+  // A viewed file maps to the fingerprints of the hunks it had when marked, so
+  // a later agent edit (a hunk we haven't seen) can drop the mark.
+  const [viewed, setViewed] = useState<Record<string, string[]>>({});
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const [changed, setChanged] = useState<Record<string, boolean>>({});
   const [help, setHelp] = useState(false);
+
+  // Marks belong to one workspace: the same path elsewhere starts unviewed.
+  const [scope, setScope] = useState(props.workspacePath);
+  if (scope !== props.workspacePath) {
+    setScope(props.workspacePath);
+    setViewed({});
+    setCollapsed({});
+    setChanged({});
+  }
 
   // anchor: null until G5 anchor-selection task wires setAnchor.
   // Declared with setter so TypeScript does not warn about unused state.
@@ -50,10 +62,37 @@ export function DiffView(props: Props) {
   const cur = flat[focused];
   const curFile = cur ? files[cur.fileIdx] : undefined;
 
-  const toggleViewed = (path: string) => {
+  // After a refetch, a viewed file with a hunk it didn't have when marked was
+  // changed again: unmark it and open it so the new hunks can't slip past.
+  // Accepting or rejecting a hunk only removes fingerprints, so it keeps the mark.
+  const onViewedChange = props.onViewedChange;
+  useEffect(() => {
+    const stale = files
+      .filter((f) => viewed[f.filePath] && f.hunks.some((h) => !viewed[f.filePath].includes(hunkFingerprint(h))))
+      .map((f) => f.filePath);
+    if (stale.length === 0) return;
+    const drop = (m: Record<string, string[]>) => {
+      const next = { ...m };
+      for (const p of stale) delete next[p];
+      return next;
+    };
+    setViewed(drop);
+    setCollapsed((m) => ({ ...m, ...Object.fromEntries(stale.map((p) => [p, false])) }));
+    setChanged((m) => ({ ...m, ...Object.fromEntries(stale.map((p) => [p, true])) }));
+    stale.forEach((p) => onViewedChange?.(p, false));
+  }, [files, viewed, onViewedChange]);
+
+  const toggleViewed = (file: DiffFile) => {
+    const path = file.filePath;
     const v = !viewed[path];
-    setViewed((m) => ({ ...m, [path]: v }));
+    setViewed((m) => {
+      const next = { ...m };
+      if (v) next[path] = file.hunks.map(hunkFingerprint);
+      else delete next[path];
+      return next;
+    });
     setCollapsed((m) => ({ ...m, [path]: v }));
+    setChanged((m) => ({ ...m, [path]: false }));
     props.onViewedChange?.(path, v);
   };
 
@@ -67,7 +106,7 @@ export function DiffView(props: Props) {
       accept: () => cur && props.onAccept(files[cur.fileIdx].filePath, cur.hunkIdx),
       reject: () => cur && props.onReject(files[cur.fileIdx].filePath, cur.hunkIdx),
       acceptFile: () => curFile && curFile.hunks.forEach((_, hi) => props.onAccept(curFile.filePath, hi)),
-      toggleViewed: () => curFile && toggleViewed(curFile.filePath),
+      toggleViewed: () => curFile && toggleViewed(curFile),
       open: () => cur && props.onOpen(files[cur.fileIdx].filePath, firstChangedLine(files[cur.fileIdx], cur.hunkIdx)),
       why: () => cur && props.onWhy(files[cur.fileIdx].filePath, cur.hunkIdx),
       toggleCollapse: () => curFile && setCollapsed((m) => ({ ...m, [curFile.filePath]: !m[curFile.filePath] })),
@@ -101,10 +140,11 @@ export function DiffView(props: Props) {
             focusedHunk={cur?.fileIdx === fi ? cur.hunkIdx : -1}
             viewed={!!viewed[file.filePath]}
             collapsed={!!collapsed[file.filePath]}
+            changedSinceViewed={!!changed[file.filePath] && !viewed[file.filePath]}
             onAccept={(hi) => props.onAccept(file.filePath, hi)}
             onReject={(hi) => props.onReject(file.filePath, hi)}
             onWhy={(hi) => props.onWhy(file.filePath, hi)}
-            onToggleViewed={() => toggleViewed(file.filePath)}
+            onToggleViewed={() => toggleViewed(file)}
             onToggleCollapsed={() => setCollapsed((m) => ({ ...m, [file.filePath]: !m[file.filePath] }))}
           />
         ))}

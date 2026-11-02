@@ -102,6 +102,23 @@ export function parseFullDiff(diff: string): DiffFile[] {
   });
 }
 
+/**
+ * A short content hash of one hunk's rows (kind + text, no line numbers), so a
+ * hunk keeps its fingerprint when an accept/reject elsewhere in the file only
+ * shifts its @@ header. FNV-1a, 32-bit, hex.
+ */
+export function hunkFingerprint(hunk: DiffHunk): string {
+  let h = 0x811c9dc5;
+  for (const row of hunk.rows) {
+    const s = `${row.kind[0]}${row.text}\n`;
+    for (let i = 0; i < s.length; i++) {
+      h ^= s.charCodeAt(i);
+      h = Math.imul(h, 0x01000193);
+    }
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
+}
+
 // ─── Row helpers ──────────────────────────────────────────────────
 
 function parseHunkHeader(header: string): { oldStart: number; newStart: number } {
