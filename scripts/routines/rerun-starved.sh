@@ -6,7 +6,7 @@
 #
 #   rerun-starved.sh            open PRs' heads and main's head, this repo
 #
-# At most one re-run per run attempt chain: a run already on attempt 3 is left
+# At most two re-runs per run (it stops at attempt 3); after that it is left
 # for a person. Exit 0 always unless gh itself fails (2).
 set -euo pipefail
 . "$(dirname "$0")/lib.sh"
@@ -22,8 +22,10 @@ while read -r sha; do
   [[ -n "$id" ]] || continue
   attempt="$(gh api "repos/$REPO/actions/runs/$id" --jq .run_attempt)" || continue
   if [[ "$attempt" -ge "$MAX_ATTEMPTS" ]]; then echo "CI run $id (${sha:0:7}) starved $attempt times — leaving it"; continue; fi
-  if gh api -X POST "repos/$REPO/actions/runs/$id/rerun-failed-jobs" >/dev/null; then
+  if err="$(gh api -X POST "repos/$REPO/actions/runs/$id/rerun-failed-jobs" 2>&1 >/dev/null </dev/null)"; then
     echo "re-ran CI run $id (${sha:0:7}, attempt $attempt): its jobs never got a runner"; n=$((n + 1))
+  else
+    echo "could not re-run CI run $id: $err"
   fi
 done <<< "$shas"
 echo "$n starved CI run(s) re-run"
