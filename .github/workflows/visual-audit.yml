@@ -110,8 +110,10 @@ jobs:
     # tools, no GitHub access (agent.mjs); its findings are validated and filed
     # as `proposal` issues — never straight to the builder.
     needs: audit
-    # When the audit itself worked (0 clean, 1 findings) — even if filing failed.
-    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (needs.audit.outputs.rc == '0' || needs.audit.outputs.rc == '1') }}
+    # When the audit itself worked (0 clean, 1 findings) and its screenshots
+    # were kept — even if filing failed. A job cancelled after the audit step
+    # (timeout, lost runner) leaves no artifact to review.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && needs.audit.result != 'cancelled' && (needs.audit.outputs.rc == '0' || needs.audit.outputs.rc == '1') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
