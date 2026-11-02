@@ -47,6 +47,16 @@ jobs:
         with:
           node-version: 22
 
+      - name: Re-run CI that only lost its runner
+        # A job GitHub never gave a macOS runner is not red CI: re-run it so
+        # the PR isn't sent to a fix round or skipped by the review.
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+          OCTOPUSH_ROUTINES_KEEP_PATH: "1"
+        run: bash scripts/routines/rerun-starved.sh
+
       - name: Queue
         id: queue
         env:
