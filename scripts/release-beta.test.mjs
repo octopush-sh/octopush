@@ -245,6 +245,25 @@ test("run: CI fails on the PR → exit 2, no tag, PR commented and closed", () =
   rmSync(fx.dir, { recursive: true, force: true });
 });
 
+test("run: a PR CI that only lost its runner is re-run, then the release goes on", () => {
+  const fx = fixture();
+  // CI reads: main green (check), the PR's run failed with only cancelled jobs
+  // (no macOS runner), then green after the re-run.
+  const gh = join(fx.bin, "gh");
+  writeFileSync(gh, GH_STUB.replace(
+    '*"actions/runs?head_sha="*) echo "${STUB_CI:-success}" ;;',
+    `*"actions/runs?head_sha="*'.conclusion == "failure"'*) echo 777 ;;
+  *"actions/runs/777/jobs"*) echo 777 ;;
+  *"actions/runs?head_sha="*) n=$(cat "$STUB_LOG.n" 2>/dev/null || echo 0); echo $((n + 1)) > "$STUB_LOG.n"; if [ "$n" = 1 ]; then echo failure; else echo success; fi ;;`,
+  ));
+  const r = routine(fx, "run");
+  assert.equal(r.code, 0, r.out);
+  assert.match(r.out, /re-running them \(1\)/);
+  assert.ok(r.calls.some((c) => /-X POST repos\/octo\/app\/actions\/runs\/777\/rerun-failed-jobs/.test(c)), r.calls.join("\n"));
+  assert.match(originTags(fx), /v0\.4\.90/);
+  rmSync(fx.dir, { recursive: true, force: true });
+});
+
 test("run: re-run after a merged-but-untagged release only tags", () => {
   const fx = fixture();
   // Simulate: the merge landed, the tag push never happened.
