@@ -1,7 +1,10 @@
-import { describe, it, expect } from "vitest";
-import { render } from "@testing-library/react";
+import { describe, it, expect, vi } from "vitest";
+import { render, waitFor } from "@testing-library/react";
 import { FileDiffSection, pathTail } from "./FileDiffSection";
-import type { DiffFile } from "../../lib/diffParser";
+import { parseFullDiff, type DiffFile } from "../../lib/diffParser";
+
+const { readFileChecked } = vi.hoisted(() => ({ readFileChecked: vi.fn() }));
+vi.mock("../../lib/ipc", () => ({ ipc: { readFileChecked } }));
 
 const file: DiffFile = {
   filePath: "src/a.ts", changeType: "modified", fileHeader: "",
@@ -50,5 +53,22 @@ describe("FileDiffSection", () => {
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
     // grid-rows 0fr collapse: the content wrapper has grid-template-rows 0fr — assert the collapse container exists with the collapsed style
     expect(container.querySelector('[data-collapsed="true"]')).toBeTruthy();
+  });
+  it("reads the file on disk so a hunk inside a Javadoc is coloured as comment", async () => {
+    const java = ["class A {", "  /**", "   * Adds.", "   * @param x the x", "   */", "  int add(int x) { return x; }", "}", ""].join("\n");
+    readFileChecked.mockResolvedValue({ kind: "text", content: java, size: java.length, mtime: 0 });
+    const [jf] = parseFullDiff([
+      "diff --git a/A.java b/A.java", "--- a/A.java", "+++ b/A.java",
+      "@@ -4,2 +4,2 @@", "-   * @param x an x", "+   * @param x the x", "    */", "",
+    ].join("\n"));
+    const { container } = render(<FileDiffSection file={jf} workspacePath="/w" focusedHunk={-1} viewed={false} collapsed={false}
+      onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+    expect(readFileChecked).toHaveBeenCalledWith("/w/A.java", expect.any(Number));
+    await waitFor(() => {
+      const rows = container.querySelectorAll('[data-diff-row]');
+      for (const row of Array.from(rows).slice(0, 2)) {
+        expect(row.querySelector(".tok-cmt")?.textContent).toContain("@param");
+      }
+    });
   });
 });
