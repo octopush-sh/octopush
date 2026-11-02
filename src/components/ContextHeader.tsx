@@ -117,7 +117,9 @@ interface Props {
  *
  * Two mechanics keep it honest at any canvas width (design-system §6):
  *   · the branch is MIDDLE-truncated (<MidTruncate>) so its head and its
- *     disambiguating tail both survive, with the full string in a popover;
+ *     disambiguating tail both survive, with the full string in a popover.
+ *     Its wrappers are `flex-1 min-w-0`, so the box elides into a definite
+ *     width (the rest of the eyebrow) rather than its own text's width;
  *   · the demotion ladder (`.octo-demote*`, `.octo-status-*`) sheds meta in a
  *     fixed order as the header narrows, animating each step's width rather
  *     than unmounting it. The active key and the name line never demote.
@@ -228,25 +230,37 @@ export function ContextHeader({
           <Sep />
 
           {/* Branch — middle-truncated chip, full provenance one hover (or one
-              Tab) away. The panel anchors to the header rather than to the
-              chip, so the ladder can move the chip freely without ever pushing
-              the panel past the canvas (see `.octo-prov` in styles.css). */}
-          <span className="octo-prov min-w-0">
+              Tab) away. `.octo-prov` and the button grow (`flex-1 min-w-0`)
+              into whatever the eyebrow leaves, which gives the MidTruncate box
+              a DEFINITE width to elide into — the rail's shape. Sized from its
+              own text instead, WebKit hard-cut the branch with room to spare.
+              The grown boxes ignore the pointer and draw nothing; the wash,
+              hover colour and focus ring live on the MidTruncate box, so they
+              stay the size of the text. The panel anchors to the header rather
+              than to the chip, so the ladder can move the chip freely without
+              ever pushing the panel past the canvas (see `.octo-prov` in
+              styles.css). */}
+          <span className="octo-prov pointer-events-none min-w-0 flex-1">
             <button
               type="button"
               title={branch}
               aria-label={`Branch ${branch}`}
               aria-describedby="octo-branch-provenance"
-              className="-mx-1 flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              data-tour="header-branch"
+              className="group pointer-events-none flex min-w-0 flex-1 items-center normal-case tracking-normal text-octo-mute focus-visible:outline-none"
             >
-              <GitBranch size={11} className="flex-none" aria-hidden />
-              <MidTruncate text={branch} tail={12} className="text-[10px]" />
+              <MidTruncate
+                text={branch}
+                tail={12}
+                lead={<GitBranch size={11} />}
+                className="pointer-events-auto -mx-1 rounded px-1 py-0.5 text-[10px] transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage group-focus-visible:ring-1 group-focus-visible:ring-octo-brass"
+              />
             </button>
 
             <span
               id="octo-branch-provenance"
               role="tooltip"
-              className="octo-prov-pop"
+              className="octo-prov-pop pointer-events-auto"
             >
               <dl className="grid grid-cols-[auto_1fr] items-baseline gap-x-3 gap-y-1.5">
                 <dt className="font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
@@ -284,6 +298,8 @@ export function ContextHeader({
             </span>
           </span>
 
+          {/* The base sits at the eyebrow's right end, outside the grown
+              branch box — so it never steals the chip's definite width. */}
           {base && (
             <span
               className="octo-demote octo-demote-base normal-case tracking-normal text-[10px] opacity-70"
