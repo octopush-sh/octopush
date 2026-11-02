@@ -79,6 +79,8 @@ shows. Without it, the notes fall back to the generic `Octopush <version>` text.
   release notes' Features / Improvements / Fixes (`scripts/web-version.mjs`). An
   older `release/v*` PR still open is closed as superseded. The owner merges it
   (`merge web#N`); until then the website's consistency gate fails for web builds.
+  If only `web-version` failed, use **Re-run failed jobs**: re-running all jobs stops at
+  promote's "not a prerelease" check, because the version is already stable.
 
   **Owner-only is enforced, once set up:** the job runs in the `stable` environment.
   Repo → Settings → Environments → New environment `stable` → *Required reviewers*:

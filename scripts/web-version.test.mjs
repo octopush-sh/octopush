@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { currentVersion, bumpReleaseTs, versionsBetween, changelogEntry, insertEntries, apply } from "./web-version.mjs";
+import { currentVersion, bumpReleaseTs, versionsBetween, changelogEntry, insertEntries, apply, plain } from "./web-version.mjs";
 
 const BODY = `## Octopush 0.4.93
 
@@ -28,7 +28,7 @@ test("an entry keeps Features/Improvements/Fixes bullets, in the changelog's sty
   const e = changelogEntry("0.4.93", BODY);
   assert.match(e, /^## v0\.4\.93\n\n\*\*Accept a crew's recommended answers\.\*\* Its card lists the questions\./);
   assert.match(e, /\*\*A terminal that fails to start says why\.\*\* The canvas says so\./);
-  assert.doesNotMatch(e, /area:app|Universal binary|<img|\{x\}/);
+  assert.doesNotMatch(e, /area:app|Universal binary|<img/);
   assert.match(e, /&lt;img/);
   assert.equal(changelogEntry("0.4.94", "### Maintenance\n\nbumps"), null);
 });
@@ -66,4 +66,12 @@ test("apply edits a web checkout: newest entry first, every release since the la
   assert.ok(log.indexOf("## v0.4.95") < log.indexOf("## v0.4.93"));
   assert.ok(!log.includes("## v0.4.94"), "a maintenance-only beta in between gets no entry");
   assert.throws(() => apply(dir, "0.4.99", releases), /no release v0\.4\.99/);
+});
+
+test("release-note text: no italics, no links, no raw HTML; code spans and bold untouched", () => {
+  assert.equal(plain("reads *failed* instead of *shell idle*"), "reads failed instead of shell idle");
+  assert.equal(plain("an _old_ name, snake_case_name stays"), "an old name, snake_case_name stays");
+  assert.equal(plain("see [the docs](javascript:alert(1)) and ![x](y.png)"), "see the docs and x");
+  assert.equal(plain("`a<b` and <b>"), "`a<b` and &lt;b&gt;");
+  assert.equal(plain("**Bold** stays, 2 * 3 * 4 too"), "**Bold** stays, 2 * 3 * 4 too");
 });

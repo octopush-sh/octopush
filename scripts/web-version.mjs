@@ -40,8 +40,19 @@ export function versionsBetween(tags, from, to) {
     .sort(cmp);
 }
 
-// Markdown the changelog page must not render as HTML or MDX.
-const plain = (s) => s.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\{/g, "&#123;").replace(/\}/g, "&#125;");
+// Release-note text made safe for the changelog page: no raw HTML (escaped
+// outside code spans), no links (their text is kept), and no single-asterisk
+// or underscore emphasis, which would render in italics (retired site-wide).
+export function plain(s) {
+  return String(s).split(/(`[^`]*`)/).map((part, i) => {
+    if (i % 2) return part; // a code span renders its text literally
+    return part
+      .replace(/!?\[([^\]]*)\]\((?:[^()]|\([^()]*\))*\)/g, "$1")
+      .replace(/(^|[^*\w])\*(?=[^\s*])([^*\n]*?[^\s*])\*(?!\*)/g, "$1$2")
+      .replace(/(^|[^_\w])_(?=\S)([^_\n]*?\S)_(?!\w)/g, "$1$2")
+      .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  }).join("");
+}
 
 /**
  * One changelog entry from a release body: the bullets of its Features,
@@ -92,8 +103,10 @@ function main() {
   const [webDir, version] = process.argv.slice(2);
   if (!webDir || !SEMVER.test(version ?? "")) { console.error("usage: web-version.mjs <web-checkout> <X.Y.Z>"); return 64; }
   const repo = process.env.OCTOPUSH_APP_REPO || "octopush-sh/octopush";
-  const releases = JSON.parse(execFileSync("gh", ["api", "--paginate", "--slurp", `repos/${repo}/releases?per_page=100`], { encoding: "utf8" })).flat()
-    .filter((r) => !r.draft);
+  // Only the fields used: the full objects (assets included) outgrow any buffer.
+  const out = execFileSync("gh", ["api", "--paginate", `repos/${repo}/releases?per_page=100`, "--jq", ".[] | select(.draft | not) | {tag_name, body}"],
+    { encoding: "utf8", maxBuffer: 64 << 20 });
+  const releases = out.split("\n").filter(Boolean).map((l) => JSON.parse(l));
   const r = apply(webDir, version, releases);
   if (!r) { console.log(`the landing is already at ${version} or newer`); return 0; }
   console.log(`landing ${r.from} → ${version}; changelog entries: ${r.versions.join(", ")}`);

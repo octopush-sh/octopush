@@ -161,6 +161,7 @@ jobs:
           private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
           owner: octopush-sh
           repositories: octopush-web
+          skip-token-revoke: true   # revoked explicitly below
           permission-contents: write
           permission-pull-requests: write
 
@@ -174,37 +175,42 @@ jobs:
           set -euo pipefail
           [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::bad version"; exit 1; }
           web="$RUNNER_TEMP/web"
-          # The token reaches git through the environment, never argv.
+          # The token reaches git through the environment, never argv; only git gets it.
           auth="$(printf 'x-access-token:%s' "$WEB_TOKEN" | base64 -w0)"
-          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
-          git clone --quiet --depth 1 "https://github.com/$WEB.git" "$web"
-          node scripts/web-version.mjs "$web" "$VERSION"
-          cd "$web"
-          if git diff --quiet; then echo "the landing already shows $VERSION"; exit 0; fi
+          echo "::add-mask::$auth"
+          withtoken() { GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth" "$@"; }
+          webapi() { GH_TOKEN="$WEB_TOKEN" gh api "$@"; }
+          withtoken git clone --quiet --depth 1 "https://github.com/$WEB.git" "$web"
+          env -u WEB_TOKEN node scripts/web-version.mjs "$web" "$VERSION"
           branch="release/v$VERSION"
-          git -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
-            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
-            commit --quiet --no-verify -am "release: landing v$VERSION and its changelog entries"
-          git push --quiet --force origin "HEAD:refs/heads/$branch"
-          body="v$VERSION was promoted to stable, so the landing's \`VERSION\` and the changelog follow it (written from the release notes by \`scripts/web-version.mjs\` in the app repo, run by promote.yml). Reply \`merge web#N\` in the digest to publish it."
-          existing="$(GH_TOKEN="$WEB_TOKEN" gh api "repos/$WEB/pulls?state=open&head=octopush-sh:$branch" --jq '.[0].number // empty')"
-          if [ -n "$existing" ]; then
-            new="$existing"; echo "updated web#$new"
+          new=""
+          if git -C "$web" diff --quiet; then
+            echo "the landing already shows $VERSION"
           else
-            new="$(GH_TOKEN="$WEB_TOKEN" gh api -X POST "repos/$WEB/pulls" -f title="release: landing v$VERSION + changelog" \
-              -f head="$branch" -f base=main -f body="$body" --jq .number)"
-            echo "opened web#$new"
+            git -C "$web" -c core.hooksPath=/dev/null -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit --quiet --no-verify -am "release: landing v$VERSION and its changelog entries"
+            withtoken git -C "$web" push --quiet --force origin "HEAD:refs/heads/$branch"
+            new="$(webapi "repos/$WEB/pulls?state=open&head=octopush-sh:$branch" --jq '.[0].number // empty')"
+            if [ -z "$new" ]; then
+              new="$(webapi -X POST "repos/$WEB/pulls" -f title="release: landing v$VERSION + changelog" \
+                -f head="$branch" -f base=main -f body="(filled in below)" --jq .number)"
+            fi
+            webapi -X PATCH "repos/$WEB/pulls/$new" -f body="v$VERSION was promoted to stable, so the landing's \`VERSION\` and the changelog follow it. The entries are written from the release notes by \`scripts/web-version.mjs\` in the app repo, run by promote.yml. Reply \`merge web#$new\` in the digest to publish it." >/dev/null
+            echo "web#$new is the version PR"
+            echo "Web version PR: https://github.com/$WEB/pull/$new" >> "$GITHUB_STEP_SUMMARY"
           fi
           # An older release PR still open is superseded: its version is no longer stable.
-          GH_TOKEN="$WEB_TOKEN" gh api "repos/$WEB/pulls?state=open&per_page=100" \
-            --jq '.[] | select(.head.ref | test("^release/v[0-9]+\\.[0-9]+\\.[0-9]+$")) | "\(.number) \(.head.ref)"' |
+          webapi "repos/$WEB/pulls?state=open&per_page=100" \
+            --jq ".[] | select(.head.repo.full_name == \"$WEB\" and (.head.ref | test(\"^release/v[0-9]+\\\\.[0-9]+\\\\.[0-9]+$\"))) | \"\\(.number) \\(.head.ref)\"" |
           while read -r n ref; do
             [ "$n" = "$new" ] && continue
-            GH_TOKEN="$WEB_TOKEN" gh api -X POST "repos/$WEB/issues/$n/comments" -f body="Superseded by web#$new (v$VERSION is now stable)." >/dev/null
-            GH_TOKEN="$WEB_TOKEN" gh api -X PATCH "repos/$WEB/pulls/$n" -f state=closed >/dev/null
+            [ "$ref" = "$branch" ] && continue
+            note="Superseded: v$VERSION is now stable${new:+ (web#$new)}."
+            webapi -X POST "repos/$WEB/issues/$n/comments" -f body="$note" >/dev/null
+            webapi -X PATCH "repos/$WEB/pulls/$n" -f state=closed >/dev/null
             echo "closed web#$n ($ref)"
           done
-          echo "Web version PR: https://github.com/$WEB/pull/$new" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Revoke the web token
         if: always() && steps.token.outputs.token != ''
