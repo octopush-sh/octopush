@@ -99,7 +99,10 @@ pub enum TokenType {
 /// - a Bedrock model version (`-v1:0`; a bare `-v1` only on an
 ///   `anthropic.` id);
 /// - an Ollama `:tag` (`qwen2.5-coder:7b`, `llama3.3:latest`);
-/// - a trailing dated snapshot (`-YYYYMMDD`).
+/// - a trailing dated snapshot (`-YYYYMMDD`);
+///
+/// then, on a `claude-` id only, maps a `.` between digits to `-`
+/// (`anthropic/claude-opus-4.8` → `claude-opus-4-8`).
 ///
 /// Lookups stay exact-match on the result: `us.anthropic.claude-opus-5-5-20261001-v1:0`
 /// and `bedrock/us.anthropic.claude-sonnet-5-5-v1:0` price as their base model,
@@ -155,6 +158,22 @@ pub fn normalize_model_id(model: &str) -> String {
         if tail.starts_with('-') && tail[1..].bytes().all(|c| c.is_ascii_digit()) {
             m = &m[..m.len() - 9];
         }
+    }
+    // Gateway aliases spell Claude versions with dots (`claude-opus-4.8`);
+    // the catalog uses dashes. Only on `claude-` ids, so `qwen2.5-coder` and
+    // `gpt-4.1` stay exact.
+    if m.starts_with("claude-") && m.contains('.') {
+        let b = m.as_bytes();
+        return m
+            .char_indices()
+            .map(|(i, c)| {
+                let between_digits = i > 0
+                    && i + 1 < b.len()
+                    && b[i - 1].is_ascii_digit()
+                    && b[i + 1].is_ascii_digit();
+                if c == '.' && between_digits { '-' } else { c }
+            })
+            .collect();
     }
     m.to_string()
 }
