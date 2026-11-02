@@ -207,10 +207,12 @@ fn ancestors_within(workspace: &str, path: &str) -> Vec<String> {
 /// shared and per-worktree config, every worktree's `commondir`/`gitdir`/
 /// `config.worktree` (a main checkout could otherwise repoint a sibling
 /// worktree), submodule git dirs under every `modules/` (shared, own and each
-/// sibling worktree's), the workspace's own `.git`
-/// entry and any nested `.git` in it (replacing one would redirect git to a
-/// planted config). A hook planted there would run unsandboxed on the user's
-/// next commit or `git status`. Applies to main checkouts too. Pure.
+/// sibling worktree's), `<common>/worktrees` and each worktree's git dir as
+/// paths (so none can be renamed and replaced), the workspace's own `.git`
+/// entry and writes under any nested `.git` path in it (replacing one would
+/// redirect git to a planted config). Not covered: moving in a directory that
+/// already holds a `.git`. A hook planted there would run unsandboxed on the
+/// user's next commit or `git status`. Applies to main checkouts too. Pure.
 fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
     let ws = workspace.trim_end_matches('/');
     let g = layout.git_dir.trim_end_matches('/');
@@ -225,6 +227,9 @@ fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
         format!("{g}/config.worktree.lock"),
         format!("{g}/commondir"),
         format!("{ws}/.git"),
+        // Seatbelt checks a rename only against its source and destination, so
+        // `worktrees/` itself must not be movable or the denies below are moot.
+        format!("{c}/worktrees"),
     ];
     deny_literals.extend(ancestors_within(ws, hooks));
     let mut rules = WriteRules {
@@ -249,6 +254,10 @@ fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
                 "^{}/worktrees/[^/]+/(commondir|gitdir|config\\.worktree|config\\.worktree\\.lock)$",
                 regex_escape(c)
             ),
+            // Each worktree's git dir itself (not its contents), so no worktree
+            // can be renamed away and replaced by a planted dir. Writes inside
+            // the own linked git dir (index, HEAD) stay allowed.
+            format!("^{}/worktrees/[^/]+$", regex_escape(c)),
             // `modules/` is per worktree, so a sibling's submodule git dirs sit
             // under `<common>/worktrees/<name>/modules`, inside a main checkout.
             format!("^{}/worktrees/[^/]+/modules(/|$)", regex_escape(c)),
@@ -593,6 +602,26 @@ mod tests {
     }
 
     #[test]
+    fn git_rules_deny_renaming_worktrees_or_a_worktree_dir() {
+        // Seatbelt checks a rename against its source and destination only, so
+        // the parents of the pointer denies must be pinned as paths too.
+        let r = git_write_rules("/ws", &main_layout());
+        assert!(r.deny_literals.contains(&"/ws/.git/worktrees".to_string()));
+        assert!(r.deny_regexes.contains(&"^/ws/\\.git/worktrees/[^/]+$".to_string()));
+        for d in ["/ws/.git/worktrees/wt", "/ws/.git/worktrees/wt-old"] {
+            assert!(regex_denies(&r, d), "{d} must be denied");
+        }
+        let l = git_write_rules("/wt", &linked_layout());
+        assert!(l.deny_literals.contains(&"/repo/.git/worktrees".to_string()));
+        assert!(regex_denies(&l, "/repo/.git/worktrees/wt"));
+        // Writes inside the own linked git dir stay allowed.
+        for ok in ["/repo/.git/worktrees/wt/index", "/repo/.git/worktrees/wt/HEAD", "/repo/.git/worktrees/wt/index.lock"] {
+            assert!(!regex_denies(&l, ok), "{ok} must stay writable");
+            assert!(!l.deny_literals.contains(&ok.to_string()));
+        }
+    }
+
+    #[test]
     fn git_rules_deny_submodule_git_dirs_and_nested_dot_git() {
         let r = git_write_rules("/ws", &main_layout());
         assert!(r.deny_subpaths.contains(&"/ws/.git/modules".to_string()));
@@ -688,8 +717,10 @@ mod tests {
         assert!(tail.contains("(literal \"/ws/.git/config\")"));
         assert!(tail.contains("(subpath \"/ws/.git/info\")"));
         assert!(tail.contains("(subpath \"/ws/.git/modules\")"));
+        assert!(tail.contains("(literal \"/ws/.git/worktrees\")"));
         // Regex backslashes are doubled once more for the SBPL string literal.
         assert!(tail.contains("(regex \"^/ws/\\\\.git/worktrees/[^/]+/(commondir|"));
+        assert!(tail.contains("(regex \"^/ws/\\\\.git/worktrees/[^/]+$\")"));
     }
 
     #[test]
@@ -830,6 +861,11 @@ mod tests {
         // submodule git dirs can't gain hooks or config.
         assert!(!run(&main, "echo /evil > .git/worktrees/wt/commondir"), "sibling commondir is denied");
         assert!(!run(&main, "echo /evil > .git/worktrees/wt/gitdir"), "sibling gitdir is denied");
+        // Nor renamed away and replaced (seatbelt doesn't check moved children).
+        assert!(!run(&main, "mv .git/worktrees/wt .git/worktrees/wt-old"), "a worktree dir can't be renamed");
+        assert!(!run(&main, "mv .git/worktrees .git/w-old"), "worktrees/ can't be renamed");
+        assert!(!run(&main, "mkdir .git/worktrees/planted"), "no new worktree dir");
+        assert!(main.join(".git/worktrees/wt/commondir").exists(), "the sibling is intact");
         assert!(!run(&main, "mkdir -p .git/modules/m/hooks"), "submodule git dirs are denied");
         assert!(
             !run(&main, "mkdir -p .git/worktrees/wt/modules/m/hooks"),
