@@ -1253,6 +1253,27 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         assert_eq!(inner.to_string(), "SecTrust said no: -67818");
     }
 
+    /// macOS only: the copied OSStatus value really is errSecInvalidExtendedKeyUsage
+    /// ("The extended key usage is not valid."), checked against the OS's own
+    /// message for it, and not one of the SSL or S/MIME extended key usage codes
+    /// next to it in `SecBase.h`. The cross-platform test above pins the same
+    /// literal, so only this one can catch a wrong value.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn eku_code_is_errsec_invalid_extended_key_usage() {
+        let code = ERR_SEC_INVALID_EXTENDED_KEY_USAGE as i32;
+        let message = security_framework::base::Error::from_code(code).message();
+        let lower = message.as_deref().unwrap_or_default().to_lowercase();
+        assert!(
+            lower.contains("extended key usage")
+                && (lower.contains("not valid") || lower.contains("invalid"))
+                && !lower.contains("ssl")
+                && !lower.contains("s/mime")
+                && !lower.contains("smime"),
+            "OSStatus {code} is {message:?}, not errSecInvalidExtendedKeyUsage"
+        );
+    }
+
     #[test]
     fn an_unrelated_issuer_passes() {
         let v = DenylistVerifier::new(Arc::new(Permissive));
