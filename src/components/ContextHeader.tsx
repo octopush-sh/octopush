@@ -230,14 +230,19 @@ export function ContextHeader({
           {/* Branch — middle-truncated chip, full provenance one hover (or one
               Tab) away. The panel anchors to the header rather than to the
               chip, so the ladder can move the chip freely without ever pushing
-              the panel past the canvas (see `.octo-prov` in styles.css). */}
-          <span className="octo-prov min-w-0">
+              the panel past the canvas (see `.octo-prov` in styles.css).
+              The chip and its button both GROW up to the status atom, like
+              the rail's name button: a shrink-to-fit chip is sized from an
+              intrinsic width WebKit underestimates, so with room to spare
+              the head was hard-cut and the tail lost. Grown, the chip has a
+              definite width and the head ellipsizes only when it must. */}
+          <span className="octo-prov min-w-0 flex-1">
             <button
               type="button"
               title={branch}
               aria-label={`Branch ${branch}`}
               aria-describedby="octo-branch-provenance"
-              className="-mx-1 flex min-w-0 items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              className="-mx-1 flex min-w-0 flex-1 items-center gap-1.5 rounded px-1 py-0.5 normal-case tracking-normal text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
               <GitBranch size={11} className="flex-none" aria-hidden />
               <MidTruncate text={branch} tail={12} className="text-[10px]" />

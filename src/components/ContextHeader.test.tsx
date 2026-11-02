@@ -139,6 +139,16 @@ describe("ContextHeader", () => {
       expect(chip).toHaveAttribute("title", LONG);
     });
 
+    it("grows the chip up to the status atom instead of sizing it to its content", () => {
+      render(<ContextHeader {...baseProps} workspaceName="X" branch={LONG} gitStatus={null} />);
+      const chip = screen.getByRole("button", { name: `Branch ${LONG}` });
+      // Regression (#400): shrink-to-fit, WebKit sized the chip below its
+      // text with ~130px of band to spare, hard-cutting the head and dropping
+      // the tail. Both the chip and its wrapper must take the free width.
+      expect(chip).toHaveClass("flex-1", "min-w-0");
+      expect(chip.closest(".octo-prov")).toHaveClass("flex-1", "min-w-0");
+    });
+
     it("never lets the branch displace the name line", () => {
       render(
         <ContextHeader
