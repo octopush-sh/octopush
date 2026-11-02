@@ -12,6 +12,8 @@ import {
   isParameterList,
   wordOccurrences,
   NON_SYMBOL_WORDS,
+  NEVER_SEARCHED_WORDS,
+  scoreOptionsFor,
 } from "./symbolIndex";
 
 describe("identifierAt", () => {
@@ -116,10 +118,11 @@ describe("scoreDefinitionAt — declarations", () => {
 });
 
 describe("scoreDefinitionAt — signatures", () => {
-  it("scores a Java-style method declaration", () => {
+  it("scores a Java-style method as a typed declaration", () => {
+    // Modifiers and a return type in front: the name is what's declared.
     const line = "  public static void main(String[] args) {";
     expect(scoreDefinitionAt(line, line.indexOf("main"), "main")).toBe(
-      DEFINITION_SCORE.signature,
+      DEFINITION_SCORE.declaration,
     );
   });
 
@@ -354,6 +357,150 @@ describe("ordinary identifiers that happen to be pooled keywords", () => {
       expect(findDefinitions(line, name)).toHaveLength(1);
     });
   }
+});
+
+/** Score the first whole-word occurrence of `name` on `line`. */
+const scoreOf = (line: string, name: string, opts = {}) =>
+  scoreDefinitionAt(line, wordOccurrences(line, name)[0].from, name, opts);
+
+describe("the type in front of a declaration is never its name", () => {
+  // Each line declares `declared`; `type` is the word in front of it that used
+  // to score 100 because a modifier (`static`, `const`, `impl`, …) preceded it.
+  const cases: { lang: string; line: string; type: string; declared: string }[] = [
+    { lang: "Java", line: "  public static Integer esperaSugerida() {", type: "Integer", declared: "esperaSugerida" },
+    { lang: "Java", line: "  static String format(String pattern, Object... args) {", type: "String", declared: "format" },
+    { lang: "Java", line: "  private final UserRepository userRepository;", type: "UserRepository", declared: "userRepository" },
+    { lang: "Java", line: "  public static final int MAX_RETRIES = 3;", type: "int", declared: "MAX_RETRIES" },
+    { lang: "Java", line: "    List<String> names = new ArrayList<>();", type: "List", declared: "names" },
+    { lang: "Java", line: "  Map<String, List<Integer>> byOwner;", type: "Map", declared: "byOwner" },
+    { lang: "Java", line: "  public abstract Optional<User> findById(long id);", type: "Optional", declared: "findById" },
+    { lang: "Java", line: "  public ResponseEntity<User> create(", type: "ResponseEntity", declared: "create" },
+    { lang: "C#", line: "    public string Name { get; set; }", type: "string", declared: "Name" },
+    { lang: "C#", line: "    public int Count => _items.Count;", type: "int", declared: "Count" },
+    { lang: "C#", line: "    public event EventHandler Changed;", type: "EventHandler", declared: "Changed" },
+    { lang: "C#", line: "    private readonly ILogger<Worker> _logger;", type: "ILogger", declared: "_logger" },
+    { lang: "C#", line: "    public async Task<User> LoadAsync(int id)", type: "Task", declared: "LoadAsync" },
+    { lang: "C", line: "const char *name = \"octo\";", type: "char", declared: "name" },
+    { lang: "C", line: "static void helper(void);", type: "void", declared: "helper" },
+    { lang: "C", line: "int main(int argc, char **argv) {", type: "int", declared: "main" },
+    { lang: "C", line: "    struct Node *next;", type: "Node", declared: "next" },
+    { lang: "C", line: "    char buf[64];", type: "char", declared: "buf" },
+    { lang: "C++", line: "    std::string label = \"x\";", type: "string", declared: "label" },
+    { lang: "TS", line: "  private readonly repo: Repo;", type: "Repo", declared: "repo" },
+  ];
+  for (const { lang, line, type, declared } of cases) {
+    it(`${lang}: "${line.trim()}" declares ${declared}, not ${type}`, () => {
+      expect(scoreDefinitionLine(line, declared)).toBe(DEFINITION_SCORE.declaration);
+      expect(scoreDefinitionLine(line, type)).toBe(0);
+    });
+  }
+
+  it("the owner's case: Integer never resolves to a method returning Integer", () => {
+    const doc = [
+      "public class ProveedorNoDisponibleException extends RuntimeException {",
+      "  public static Integer esperaSugerida() {",
+      "    return 30;",
+      "  }",
+      "  public static Integer otraEspera(Integer base) { return base; }",
+      "  private final Integer reintentos;",
+      "}",
+    ].join("\n");
+    expect(findDefinitions(doc, "Integer")).toEqual([]);
+    expect(findDefinitions(doc, "esperaSugerida").map((s) => s.line)).toEqual([2]);
+  });
+});
+
+describe("modifiers and keywords that name something else declare nothing", () => {
+  const refusals: { lang: string; line: string; name: string }[] = [
+    { lang: "Rust", line: "impl Display for Foo {", name: "Display" },
+    { lang: "Rust", line: "impl Display for Foo {", name: "Foo" },
+    { lang: "Rust", line: "impl Foo {", name: "Foo" },
+    { lang: "Java", line: "package com.acme.billing;", name: "com" },
+    { lang: "Kotlin", line: "package com.acme", name: "com" },
+    { lang: "C#", line: "    public static Integer Wait() => 3;", name: "Integer" },
+    { lang: "C", line: "const char *name;", name: "const" },
+    { lang: "Java", line: "    return value;", name: "value" },
+    { lang: "Java", line: "    throw error;", name: "error" },
+    { lang: "Go", line: "\tdefer cleanup()", name: "cleanup" },
+    { lang: "Go", line: "\tgo worker(jobs)", name: "worker" },
+    { lang: "Ruby", line: "  puts format(total)", name: "format" },
+    { lang: "Python", line: "print total", name: "total" },
+    { lang: "TS", line: "export default build();", name: "build" },
+    { lang: "TS", line: "export default defineConfig({", name: "defineConfig" },
+    { lang: "Java", line: "    else retry = false;", name: "retry" },
+  ];
+  for (const { lang, line, name } of refusals) {
+    it(`${lang}: refuses ${name} on "${line.trim()}"`, () => {
+      expect(scoreDefinitionLine(line, name)).toBe(0);
+    });
+  }
+});
+
+describe("declarations the old keyword rule missed", () => {
+  const cases: { lang: string; line: string; name: string; opts?: { typeAfterName?: boolean } }[] = [
+    { lang: "Java", line: "  @Bean public RestTemplate restTemplate(RestTemplateBuilder builder) {", name: "restTemplate" },
+    { lang: "Java", line: '  @GetMapping("/users/{id}") public User show(@PathVariable long id) {', name: "show" },
+    { lang: "Java", line: "  @Autowired private UserService users;", name: "users" },
+    { lang: "Java", line: "    for (String line : lines) {", name: "line" },
+    { lang: "Java", line: "    } catch (IOException e) {", name: "e" },
+    { lang: "Java", line: "    var retries = 3;", name: "retries" },
+    { lang: "Kotlin", line: "fun double(x: Int) = x * 2", name: "double" },
+    { lang: "Kotlin", line: "    override fun toString() = name", name: "toString" },
+    { lang: "Kotlin", line: "fun <T> listOfOne(item: T): List<T> = listOf(item)", name: "listOfOne" },
+    { lang: "Kotlin", line: "    private val repo: Repo = Repo()", name: "repo" },
+    { lang: "C#", line: "    [HttpGet] public IActionResult Index()", name: "Index" },
+    { lang: "C#", line: "    public required string Email { get; init; }", name: "Email" },
+    { lang: "TS", line: "  private retries?: number;", name: "retries" },
+    { lang: "TS", line: "  static parse(input: string): Ast {", name: "parse" },
+    { lang: "TS", line: "  const total: number = 0;", name: "total" },
+    { lang: "Rust", line: "    let mut total: u32 = 0;", name: "total" },
+    { lang: "Rust", line: "pub const MAX: usize = 8;", name: "MAX" },
+    { lang: "Rust", line: "static mut COUNTER: u32 = 0;", name: "COUNTER" },
+    { lang: "Rust", line: "pub struct Point<T> where T: Copy {", name: "Point" },
+    { lang: "C", line: "    int count = 0;", name: "count" },
+    { lang: "C", line: "unsigned long hash(const char *s) {", name: "hash" },
+    { lang: "Go", line: "var count int", name: "count", opts: { typeAfterName: true } },
+    { lang: "Go", line: "const limit Duration = 5", name: "limit", opts: { typeAfterName: true } },
+    { lang: "Go", line: "type Server struct {", name: "Server", opts: { typeAfterName: true } },
+  ];
+  for (const { lang, line, name, opts } of cases) {
+    it(`${lang}: "${line.trim()}" declares ${name}`, () => {
+      expect(scoreOf(line, name, opts)).toBe(DEFINITION_SCORE.declaration);
+    });
+  }
+
+  it("Go: the type after a typed const is not its name", () => {
+    const opts = scoreOptionsFor("go");
+    expect(scoreDefinitionLine("const limit Duration = 5", "Duration", opts)).toBe(0);
+    expect(scoreDefinitionLine("var count int", "int", opts)).toBe(0);
+  });
+
+  it("only Go writes the type after the name", () => {
+    expect(scoreOptionsFor("go").typeAfterName).toBe(true);
+    for (const lang of ["java", "rs", "ts", "kt", "cs", "c", undefined]) {
+      expect(scoreOptionsFor(lang).typeAfterName).toBe(false);
+    }
+  });
+});
+
+describe("long lines", () => {
+  it("scores a minified line of thousands of words without stalling", () => {
+    const line = "a ".repeat(20_000) + "const total = 1;";
+    const started = performance.now();
+    expect(scoreDefinitionLine(line, "total")).toBe(DEFINITION_SCORE.declaration);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("NEVER_SEARCHED_WORDS", () => {
+  it("holds modifiers and type keywords, but never ordinary names", () => {
+    for (const w of ["const", "static", "int", "void", "if", "public", "impl"]) {
+      expect(NEVER_SEARCHED_WORDS.has(w)).toBe(true);
+    }
+    for (const w of ["get", "type", "use", "record", "new", "default", "String", "Integer"]) {
+      expect(NEVER_SEARCHED_WORDS.has(w)).toBe(false);
+    }
+  });
 });
 
 describe("isNavigableSymbol", () => {

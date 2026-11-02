@@ -151,6 +151,16 @@ vi.mock("./editor/symbolNav", () => ({
   symbolNav: symbolNavMock,
   goToDefinitionCommand: vi.fn(() => () => true),
 }));
+// The view stand-in below has no syntax tree; definitionTree.test.ts parses
+// real documents. Here the verdicts are dialled in per test.
+const { classifyClickMock, classifySiteMock } = vi.hoisted(() => ({
+  classifyClickMock: vi.fn((..._args: unknown[]) => "unknown"),
+  classifySiteMock: vi.fn((..._args: unknown[]) => "unknown"),
+}));
+vi.mock("./editor/definitionTree", () => ({
+  classifyClick: classifyClickMock,
+  classifySite: classifySiteMock,
+}));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.
@@ -246,6 +256,8 @@ beforeEach(() => {
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
   mockOpenFile.mockResolvedValue(undefined);
   searchWorkspaceTextMock.mockResolvedValue([]);
+  classifyClickMock.mockImplementation(() => "unknown");
+  classifySiteMock.mockImplementation(() => "unknown");
   mockStore.saveConflict = null;
   mockStore.pendingReveal = null;
   mockBlameState.enabled = false;
@@ -628,7 +640,7 @@ describe("EditorPane · go to definition", () => {
     onRequest(at("parse(input)"), navView());
     await waitFor(() =>
       expect(pushToastMock).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "No definition found" }),
+        expect.objectContaining({ title: "No definition found in this workspace" }),
       ),
     );
   });
@@ -641,10 +653,114 @@ describe("EditorPane · go to definition", () => {
     onRequest({ name: "if", from: 0, to: 2 }, navView());
     await waitFor(() =>
       expect(pushToastMock).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "No definition found" }),
+        expect.objectContaining({ title: "No definition found in this workspace" }),
       ),
     );
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("never searches the workspace for a modifier or a type keyword", async () => {
+    // Without a tree (a stream-mode language), the reserved-word set decides.
+    const onRequest = definitionHandler();
+    for (const name of ["const", "static", "int", "void"]) {
+      onRequest({ name, from: 0, to: name.length }, navView());
+    }
+    await waitFor(() => expect(pushToastMock).toHaveBeenCalledTimes(4));
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("trusts the syntax tree about which words are keywords", async () => {
+    // Python lets `final` be a variable; the tree says so, and wins over the set.
+    classifyClickMock.mockImplementation(() => "identifier");
+    const onRequest = definitionHandler();
+    onRequest({ name: "final", from: 0, to: 5 }, navView());
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "final", true, true),
+    );
+    // …and a keyword node never searches, whatever the word.
+    vi.clearAllMocks();
+    classifyClickMock.mockImplementation(() => "keyword");
+    onRequest({ name: "record", from: 0, to: 6 }, navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found in this workspace" }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("says nothing declares a built-in type when only its uses turn up", async () => {
+    // The owner's case: ⌘-click on `Integer` jumped to a method RETURNING
+    // Integer, because the type in front of a declaration scored as its name.
+    const doc = [
+      "class Retry {",                                        // 1
+      "  public static Integer esperaSugerida() {",           // 2
+      "    Integer espera = 3;",                              // 3
+      "    return espera;",                                   // 4
+      "  }",                                                  // 5
+      "}",                                                    // 6
+    ].join("\n");
+    searchWorkspaceTextMock.mockResolvedValue([
+      {
+        file: "src/ProveedorNoDisponibleException.java",
+        line: 14,
+        col: 17,
+        preview: "    public static Integer esperaSugerida() {",
+      },
+      { file: "src/Retry.java", line: 3, col: 5, preview: "    Integer espera = 3;" },
+    ]);
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.indexOf("Integer espera ");
+    onRequest({ name: "Integer", from, to: from + 7 }, view);
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found in this workspace" }),
+      ),
+    );
+    expect(view.dispatch).not.toHaveBeenCalled();
+    expect(mockOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("does not jump to a lone bare binding; it asks the workspace instead", async () => {
+    // `total = 0` is the only candidate in this file, and nothing confirms it
+    // declares anything — the declaration may live in another file.
+    const doc = ["total = 0", "print(total)"].join("\n");
+    searchWorkspaceTextMock.mockResolvedValue([
+      { file: "src/config.py", line: 2, col: 1, preview: "total: int = 0" },
+    ]);
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("total");
+    onRequest({ name: "total", from, to: from + 5 }, view);
+    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalled());
+    expect(view.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("still jumps to a lone binding the syntax tree confirms", async () => {
+    classifySiteMock.mockImplementation(() => "declaration");
+    const doc = ["total = 0", "print(total)"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("total");
+    onRequest({ name: "total", from, to: from + 5 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({ anchor: 0, head: 5 });
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("drops an in-file candidate the syntax tree vetoes", async () => {
+    // `run = 5` reads as a binding line by line; the tree knows it re-assigns.
+    classifySiteMock.mockImplementation(() => "other");
+    const doc = ["run = 5;", "run();"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("run");
+    onRequest({ name: "run", from, to: from + 3 }, view);
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "run", true, true),
+    );
+    expect(view.dispatch).not.toHaveBeenCalled();
   });
 
   it("still escalates ordinary names that only look like keywords", async () => {

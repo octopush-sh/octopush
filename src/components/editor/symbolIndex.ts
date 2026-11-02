@@ -14,7 +14,12 @@
  *
  *   declaration (100)  a declaring keyword immediately precedes the name —
  *                      `function foo`, `const foo`, `fn foo`, `def foo`,
- *                      `class Foo`, `type Foo`, `struct Foo`, …
+ *                      `class Foo`, `type Foo`, `struct Foo`, … — or the
+ *                      name is the declarator of a typed declaration:
+ *                      modifiers and annotations, at most one type, then the
+ *                      name (`private final Repo repo;`, `int count = 0`).
+ *                      The TYPE in front is never the declared name:
+ *                      `static Integer f()` declares `f`, not `Integer`.
  *   signature   (70)   the name is followed by a parameter list and the line
  *                      opens a body — `public void foo(…) {`, `foo(…) {`,
  *                      `func (r *R) foo(…) {` — with a prefix that can only
@@ -203,21 +208,266 @@ const CONTROL_BEFORE_PAREN = new Set([
   "and", "or", "not", "new", "typeof", "instanceof", "assert", "elif",
 ]);
 
-/** Keywords that DECLARE the identifier that follows them. */
+/**
+ * Keywords that DECLARE the identifier that follows them, in every language
+ * that has them — the next word is the name, never a type.
+ *
+ * Deliberately not here: `impl` (`impl Display for Foo` names two types and
+ * declares neither), `package` (`package com.acme` names a path), and the
+ * modifiers below, which may be followed by a type (`static Integer f()`).
+ */
 const DECLARING_KEYWORDS = new Set([
-  "function", "func", "fn", "def", "class", "struct", "enum", "interface",
+  "function", "func", "fn", "fun", "def", "class", "struct", "enum", "interface",
   "trait", "type", "record", "object", "protocol", "union", "namespace",
-  "module", "mod", "package", "const", "let", "var", "val", "static",
-  "declare", "impl", "sub", "proc", "constructor", "property", "event",
-  "delegate", "operator",
+  "module", "mod", "let", "var", "val", "sub", "proc",
 ]);
+
+/** Declaring keywords that C also uses to NAME a type in a variable
+ *  declaration: `struct Node *next;` declares `next`, not `Node`. */
+const TAG_KEYWORDS = new Set(["struct", "enum", "union"]);
+
+/**
+ * Modifiers that bind the next word when no type follows — `const total = 1`,
+ * `static count = 0`, `readonly id: string` — but sit in front of a TYPE in
+ * the C family: `const char *name`, `static String format(…)`.
+ */
+const BINDING_MODIFIERS = new Set(["const", "static", "readonly", "final"]);
+
+/** Words skipped between a declaring keyword and its name: `let mut x`. */
+const BINDING_QUALIFIERS = new Set(["mut", "ref"]);
+
+/** Modifiers a typed declaration may open with. Skipped, never a type. */
+const MODIFIERS = new Set([
+  "public", "private", "protected", "internal", "static", "final", "abstract",
+  "const", "readonly", "volatile", "transient", "synchronized", "native",
+  "override", "virtual", "sealed", "extern", "inline", "unsafe", "async",
+  "partial", "export", "default", "declare", "open", "suspend", "lateinit",
+  "event", "delegate", "register", "unsigned", "signed", "mutable",
+  "constexpr", "strictfp", "required", "pub",
+]);
+
+/** Primitive and built-in type keywords, which may stand as the type of a
+ *  typed declaration even though they are pooled as non-symbols above. */
+const TYPE_KEYWORDS = new Set([
+  "void", "int", "uint", "long", "short", "byte", "char", "float", "double",
+  "bool", "boolean", "string", "object", "decimal", "auto", "dynamic",
+]);
+
+/** Words that start a statement, so `return value;` or `puts total` is never
+ *  read as "a type, then a name". */
+const STATEMENT_WORDS = new Set([
+  "return", "throw", "delete", "yield", "await", "goto", "new", "typeof",
+  "sizeof", "echo", "print", "puts", "using", "go", "defer", "raise", "del",
+  "assert", "import", "package", "include", "require", "else", "case",
+]);
+
+/**
+ * Keywords, type keywords and literals that no workspace declares, so they
+ * never start a workspace-wide search. Only words reserved in the C family
+ * (and the primitive types those languages share): an ordinary identifier
+ * such as `get`, `type`, `use`, `new` or `default` must still search, because
+ * real code declares functions with those names.
+ */
+export const NEVER_SEARCHED_WORDS = new Set([
+  ...NEVER_DEFINED_WORDS,
+  "const", "static", "final", "public", "private", "protected", "abstract",
+  "return", "class", "struct", "enum", "interface", "function", "func", "fn",
+  "def", "let", "var", "val", "void", "int", "uint", "long", "short", "byte",
+  "char", "float", "double", "boolean", "bool", "true", "false", "null", "nil",
+  "undefined", "True", "False", "None", "import", "export", "package",
+  "extends", "implements", "throws", "throw", "try", "finally", "break",
+  "continue", "goto", "typeof", "instanceof", "sizeof", "this", "self",
+  "super", "async", "await", "yield", "readonly", "volatile", "transient",
+  "synchronized", "native", "extern", "unsigned", "signed", "union",
+  "typedef", "namespace", "impl", "trait", "pub", "mut", "elif", "lambda",
+  "usize", "isize", "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64",
+  "f32", "f64",
+]);
+
+/** Options for scoring a line of a known language. */
+export interface ScoreOptions {
+  /**
+   * The language writes the type AFTER the name with no separator (Go:
+   * `var count int`, `const limit Duration = 5`), so "a word followed by
+   * another word" never means the first one is a type.
+   */
+  typeAfterName?: boolean;
+}
+
+/** Go is the one language Octopush highlights that declares `name Type`. */
+export function scoreOptionsFor(langOrExtension: string | undefined): ScoreOptions {
+  return { typeAfterName: langOrExtension === "go" };
+}
 
 // ── Line classification ───────────────────────────────────────────
 
-/** The identifier-ish word ending at the end of `text`, or "". */
-function trailingWord(text: string): string {
-  const m = text.match(/([A-Za-z_$][A-Za-z0-9_$]*)\s*$/);
-  return m ? m[1] : "";
+/** `text` with generic argument lists removed, nested ones included:
+ *  `Map<String, List<Int>> m` → `Map m`. */
+function stripGenerics(text: string): string {
+  let out = text;
+  for (let prev = ""; prev !== out; ) {
+    prev = out;
+    out = out.replace(/<[^<>]*>/g, "");
+  }
+  return out;
+}
+
+/** How much of a prefix `wordsBefore` reads. The regex retries from every
+ *  start position, so a minified line of thousands of words would cost
+ *  quadratic time; the words that matter sit right before the name. */
+const WORDS_BEFORE_WINDOW = 160;
+
+/** The bare words at the end of `text`, separated only by whitespace:
+ *  `"  for (const "` → `["const"]`, `"pub(crate) fn "` → `["fn"]`. */
+function wordsBefore(text: string): string[] {
+  const tail = text.slice(-WORDS_BEFORE_WINDOW);
+  const m = tail.match(/((?:[A-Za-z_$][A-Za-z0-9_$]*\s+)*)$/);
+  const words = m ? m[1].split(/\s+/).filter(Boolean) : [];
+  // The window may have cut the first word in half; it isn't one we can read.
+  if (tail.length < text.length && m && m.index === 0) words.shift();
+  return words;
+}
+
+/**
+ * Does another identifier follow, making the word in front of `suffix` a TYPE
+ * rather than a declared name? `Integer esperaSugerida()`, `char *name`,
+ * `List<String> names`, `int[] xs`. Clause words (`extends`, `where`, `of`)
+ * don't count: `struct Foo where …` still declares `Foo`.
+ */
+function followedByName(suffix: string): boolean {
+  const m = stripGenerics(suffix).match(/^((?:\[\]|[?*&]|\s)+)([A-Za-z_$][A-Za-z0-9_$]*)/);
+  return !!m && !NON_SYMBOL_WORDS.has(m[2]);
+}
+
+/** The score a declaring keyword in front of the name earns: `fn parse`,
+ *  `let mut total`, `const limit = 3` — but not `const char *name` (scoring
+ *  `char`) or `static Integer f()` (scoring `Integer`), where the word after
+ *  the modifier is the declaration's type. */
+function keywordDeclaration(prefix: string, suffix: string, opts: ScoreOptions): boolean {
+  const words = wordsBefore(stripGenerics(prefix));
+  let i = words.length - 1;
+  while (i > 0 && BINDING_QUALIFIERS.has(words[i])) i--;
+  const keyword = words[i];
+  if (keyword === undefined) return false;
+  if (DECLARING_KEYWORDS.has(keyword)) {
+    return !(TAG_KEYWORDS.has(keyword) && !opts.typeAfterName && followedByName(suffix));
+  }
+  if (BINDING_MODIFIERS.has(keyword)) return opts.typeAfterName || !followedByName(suffix);
+  return false;
+}
+
+/** Statement heads whose parenthesis opens a declaration: `for (String s : xs)`,
+ *  `catch (IOException e)`, `using (var r = …)`. */
+const DECLARING_HEAD_RE = /\b(?:for|foreach|catch|using|try)\s*\(\s*/g;
+
+/**
+ * Is the name the declarator of a typed declaration — modifiers, then at most
+ * one type, then the name? `private final UserRepository userRepository;`,
+ * `@Bean public RestTemplate restTemplate(…) {`, `public string Name { get; }`,
+ * `const char *name = …`, `List<String> names = …`.
+ *
+ * The type in front is never what is declared: it is the identifier the
+ * declaration is ABOUT, which is how `public static Integer esperaSugerida()`
+ * came to read as a declaration of `Integer`.
+ */
+function typedDeclaration(prefix: string, suffix: string): boolean {
+  let head = prefix;
+  let inHead = false;
+  for (const m of prefix.matchAll(DECLARING_HEAD_RE)) {
+    head = prefix.slice((m.index ?? 0) + m[0].length);
+    inHead = true;
+  }
+  // Annotations and attributes: `@Bean`, `@GetMapping("/x")`, `[HttpGet]`.
+  head = head.replace(/^\s*(?:(?:@[A-Za-z_$][\w$.]*(?:\([^()]*\))?|\[[^[\]]*\])\s*)+/, "");
+  const bare = stripGenerics(head);
+  // Operators, separators, calls and bodies all mean this is an expression.
+  if (/[=,;()+\-/%|^!~@#\\"'`{}]/.test(bare) || /(^|[^:]):(?!:)/.test(bare)) return false;
+
+  const tokens = bare
+    .split(/\s+/)
+    .map((t) => t.replace(/^[*&]+|[*&]+$/g, ""))
+    .filter(Boolean);
+  let i = 0;
+  while (i < tokens.length && MODIFIERS.has(tokens[i])) i++;
+  const modified = i > 0;
+  let rest = tokens.slice(i);
+  // C names a tagged type with its keyword: `struct Node *next;`.
+  if (rest.length === 2 && TAG_KEYWORDS.has(rest[0])) rest = rest.slice(1);
+  if (rest.length > 1) return false;
+  const type = rest[0];
+  if (type !== undefined) {
+    if (!/^[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)*(?:\[\])*\??$/.test(type)) return false;
+    if (STATEMENT_WORDS.has(type) || CONTROL_BEFORE_PAREN.has(type)) return false;
+    if (NON_SYMBOL_WORDS.has(type) && !TYPE_KEYWORDS.has(type)) return false;
+  } else if (!modified) {
+    return false; // nothing in front of the name: not this shape
+  }
+  return declarationEnds(suffix, { type, modified, inHead });
+}
+
+/** Does `suffix` close the declaration `typedDeclaration` recognised? */
+function declarationEnds(
+  suffix: string,
+  ctx: { type: string | undefined; modified: boolean; inHead: boolean },
+): boolean {
+  const typed = ctx.type !== undefined;
+  if (/^\s*=>/.test(suffix)) return typed; // C# `int Count => n;`
+  if (/^\s*=(?!=)/.test(suffix)) return true; // `Foo foo = …`
+  if (/^\s*;/.test(suffix)) return true; // `Foo foo;`
+  if (/^\s*\[/.test(suffix)) return typed; // `char buf[64];`
+  if (/^\s*\{/.test(suffix)) return typed; // C# `string Name { get; set; }`
+  if (/^\??:(?!:)/.test(suffix)) return ctx.modified; // `const MAX: u32`, `private repo?: Repo`
+  if (ctx.inHead && typed && /^\s*[:)]/.test(suffix)) return true; // `for (String s : xs)`
+  if (/^\s*(<[^<>]*>)?\s*\(/.test(suffix)) return typedParameterList(suffix, ctx);
+  return suffix.trim() === "" && ctx.modified;
+}
+
+/** A method or function signature after a typed prefix — the parameter list
+ *  either continues on the next line or closes before a body, a `;`, a
+ *  `throws` clause or a C# `=>`. */
+function typedParameterList(
+  suffix: string,
+  ctx: { type: string | undefined; modified: boolean },
+): boolean {
+  const open = suffix.replace(/^\s*(<[^<>]*>)?\s*/, "");
+  let depth = 0;
+  let close = -1;
+  for (let i = 0; i < open.length; i++) {
+    if (open[i] === "(") depth++;
+    else if (open[i] === ")" && --depth === 0) {
+      close = i;
+      break;
+    }
+  }
+  const typed = ctx.type !== undefined;
+  // The list runs on below: `public ResponseEntity<User> create(`.
+  if (close === -1) return typed;
+  const tail = stripGenerics(open.slice(close + 1)).trim();
+
+  if (!typed) {
+    // `static parse(x) {`, `private load(id: string): Promise<User> {` — but
+    // never `export default build();`, which is a call.
+    return /^(:[^=(){};]*)?\{/.test(tail) || /^:[^=(){};]*;$/.test(tail);
+  }
+  if (tail === "") {
+    // Brace on the next line (`int main(void)` / Allman C#) — but `puts x(y)`
+    // reads the same, so ask for a modifier, a type keyword or typed params.
+    return ctx.modified || TYPE_KEYWORDS.has(ctx.type!) || hasTypedParameters(open.slice(1, close));
+  }
+  if (tail.startsWith("=>") || /^where\b/.test(tail)) return true;
+  return /^(throws\s+[\w$.]+(\s*,\s*[\w$.]+)*\s*)?((const|override|final|noexcept)\s*)*(\{.*|;|=\s*(0|default|delete)\s*;)$/.test(
+    tail,
+  );
+}
+
+/** `String[] args, final int n` — every parameter carries a type. */
+function hasTypedParameters(params: string): boolean {
+  const list = stripGenerics(params).trim();
+  if (list === "") return false;
+  if (list === "void") return true;
+  return list
+    .split(",")
+    .every((p) => !/[:=()"'`]/.test(p) && p.trim().split(/\s+/).length >= 2);
 }
 
 /**
@@ -290,7 +540,12 @@ export function isParameterList(suffix: string): boolean {
  * Score the identifier that starts at `index` on the single line `line`.
  * Returns 0 when the line does not read as a definition of it.
  */
-export function scoreDefinitionAt(line: string, index: number, name: string): number {
+export function scoreDefinitionAt(
+  line: string,
+  index: number,
+  name: string,
+  opts: ScoreOptions = {},
+): number {
   if (line.slice(index, index + name.length) !== name) return 0;
   if (isIdentChar(line[index - 1]) || isIdentChar(line[index + name.length])) return 0;
 
@@ -304,8 +559,10 @@ export function scoreDefinitionAt(line: string, index: number, name: string): nu
     return 0;
   }
 
-  // 1 — a declaring keyword immediately in front.
-  if (DECLARING_KEYWORDS.has(trailingWord(prefix))) return DEFINITION_SCORE.declaration;
+  // 1 — a declaring keyword immediately in front, or the declarator of a typed
+  // declaration. Either way the name is what is declared, never its type.
+  if (keywordDeclaration(prefix, suffix, opts)) return DEFINITION_SCORE.declaration;
+  if (!opts.typeAfterName && typedDeclaration(prefix, suffix)) return DEFINITION_SCORE.declaration;
 
   // 2 — a signature that opens a body. Checked AFTER the declaration tier, so a
   // statement head is only ever refused here, never in front of a declaring
@@ -322,7 +579,12 @@ export function scoreDefinitionAt(line: string, index: number, name: string): nu
 
   // 3 — a bare binding: `foo = …` / `foo := …`, never `foo == …` or `foo => …`.
   const assigns = /^\s*:?=(?![=>])/.test(suffix);
-  if (assigns && !NEVER_DEFINED_WORDS.has(name) && isSignaturePrefix(prefix)) {
+  // In Go a plain name in front means this word is the TYPE:
+  // `const limit Duration = 5`, `StatusOK Status = iota`.
+  const before = wordsBefore(prefix);
+  const afterName =
+    opts.typeAfterName && before.length > 0 && !NON_SYMBOL_WORDS.has(before[before.length - 1]);
+  if (assigns && !afterName && !NEVER_DEFINED_WORDS.has(name) && isSignaturePrefix(prefix)) {
     return DEFINITION_SCORE.assignment;
   }
 
@@ -331,10 +593,10 @@ export function scoreDefinitionAt(line: string, index: number, name: string): nu
 
 /** Convenience for callers holding only a line of text (search hits): the best
  *  score any whole-word occurrence of `name` on that line earns. */
-export function scoreDefinitionLine(line: string, name: string): number {
+export function scoreDefinitionLine(line: string, name: string, opts: ScoreOptions = {}): number {
   let best = 0;
   for (const r of wordOccurrences(line, name)) {
-    best = Math.max(best, scoreDefinitionAt(line, r.from, name));
+    best = Math.max(best, scoreDefinitionAt(line, r.from, name, opts));
   }
   return best;
 }
@@ -344,7 +606,11 @@ export function scoreDefinitionLine(line: string, name: string): number {
  * position, so the earliest declaration wins — overloads and re-assignments
  * read top-down).
  */
-export function findDefinitions(doc: string, name: string): DefinitionSite[] {
+export function findDefinitions(
+  doc: string,
+  name: string,
+  opts: ScoreOptions = {},
+): DefinitionSite[] {
   if (!isIdentifier(name)) return [];
   const sites: DefinitionSite[] = [];
   let lineNo = 1;
@@ -355,7 +621,7 @@ export function findDefinitions(doc: string, name: string): DefinitionSite[] {
     const line = doc.slice(cursor, nl);
     if (line.includes(name)) {
       for (const r of wordOccurrences(line, name)) {
-        const score = scoreDefinitionAt(line, r.from, name);
+        const score = scoreDefinitionAt(line, r.from, name, opts);
         if (score > 0) {
           sites.push({ from: cursor + r.from, to: cursor + r.to, line: lineNo, score });
         }
