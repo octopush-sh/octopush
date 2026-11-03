@@ -247,9 +247,9 @@ export function Stat({
   testId,
 }: {
   label: string;
-  value: string;
+  value: React.ReactNode;
   /** One quiet line under the figure (what it is measured over). */
-  note?: string;
+  note?: React.ReactNode;
   /** Tooltip explaining how the figure is computed. */
   title?: string;
   testId?: string;
@@ -271,7 +271,7 @@ export function Stat({
   );
 }
 
-export function Row({ label, value }: { label: string; value: string }) {
+export function Row({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex items-baseline justify-between">
       <span className="font-sans text-octo-sage">{label}</span>

@@ -248,9 +248,14 @@ describe("UsagePane — while the ledger is read", () => {
     });
     // The frame is there: headline labels, the sections, budgets and export.
     const skeleton = screen.getByTestId("usage-skeleton");
-    for (const label of ["Cost", "Per active day", "Last 24 hours", "Cache hit", "By mode", "Where it went"]) {
+    for (const label of ["Cost", "Per active day", "Last 24 hours", "Cache hit", "By mode", "Where it went", "By model", "Tokens"]) {
       expect(within(skeleton).getByText(label)).toBeInTheDocument();
     }
+    // The trend panel holds its place between By mode and Where it went.
+    const order = [...skeleton.querySelectorAll("[data-shape]")].map((el) => el.getAttribute("data-shape"));
+    expect(order.indexOf("usage-trend")).toBeGreaterThan(order.lastIndexOf("usage-mode-card"));
+    expect(order.indexOf("usage-trend")).toBeLessThan(order.indexOf("usage-sources"));
+    expect(order.indexOf("usage-tokens")).toBeGreaterThan(order.lastIndexOf("usage-model"));
     expect(screen.getByText("Budgets")).toBeInTheDocument();
     expect(screen.getByText("Export ledger")).toBeInTheDocument();
     // The quiet status says why the figures are not there yet.
@@ -286,6 +291,78 @@ describe("UsagePane — while the ledger is read", () => {
       resolve({ ...REPORT, totals: slice({ costUsd: 40 }) });
     });
     expect(within(screen.getByTestId("usage-stat-cost")).getByText("$40.00")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("builds every placeholder from the shells of the section that replaces it", async () => {
+    // jsdom has no layout, so the heights are held by construction: each
+    // slot carries the real section's classes and the same line boxes.
+    const shape = (el: Element) => ({
+      classes: el.className.split(/\s+/).filter(Boolean),
+      lines: [...el.children].map((c) => c.className),
+    });
+    const shapes = (root: ParentNode) => {
+      const out: Record<string, ReturnType<typeof shape>> = {};
+      out.headline = shape(root.querySelector("[data-tour='usage-headline']")!);
+      for (const el of root.querySelectorAll("[data-shape]")) {
+        const k = el.getAttribute("data-shape")!;
+        out[k] ??= shape(el);
+      }
+      return out;
+    };
+    let resolve: (r: UsageReport) => void = () => {};
+    getUsageReport.mockReset().mockImplementation(() => new Promise((r) => { resolve = r; }));
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    const ghost = shapes(screen.getByTestId("usage-skeleton"));
+    await act(async () => {
+      resolve(REPORT);
+    });
+    const real = shapes(document.body);
+    expect(Object.keys(ghost).sort()).toEqual(
+      ["headline", "usage-mode-card", "usage-model", "usage-source", "usage-sources", "usage-tokens", "usage-trend"],
+    );
+    for (const [k, g] of Object.entries(ghost)) {
+      const r = real[k];
+      expect(r, k).toBeDefined();
+      // The real slot may add motion classes; it never drops a box class.
+      for (const c of g.classes) expect(r.classes, `${k}: ${c}`).toContain(c);
+      expect(g.lines, k).toEqual(r.lines);
+    }
+  });
+
+  it("shows a failed first read as its error row alone, with no loading frame or status", async () => {
+    getUsageReport.mockReset().mockRejectedValue("ledger locked");
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    expect(screen.getByTestId("usage-error")).toHaveTextContent("ledger locked");
+    expect(screen.queryByTestId("usage-skeleton")).toBeNull();
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
+    // Budgets and export do not depend on the report.
+    expect(screen.getByText("Budgets")).toBeInTheDocument();
+    expect(screen.getByText("Export ledger")).toBeInTheDocument();
+  });
+
+  it("reads a new period after an error with the status, and the old error gone", async () => {
+    getUsageReport.mockReset().mockRejectedValue("ledger locked");
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    expect(screen.getByTestId("usage-error")).toBeInTheDocument();
+    let resolve: (r: UsageReport) => void = () => {};
+    getUsageReport.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    await act(async () => {
+      fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "30 days" }));
+    });
+    expect(screen.queryByTestId("usage-error")).toBeNull();
+    expect(screen.getByTestId("usage-skeleton")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "false");
+    await act(async () => {
+      resolve(REPORT);
+    });
+    expect(within(screen.getByTestId("usage-stat-cost")).getByText("$12.50")).toBeInTheDocument();
     expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
   });
 });

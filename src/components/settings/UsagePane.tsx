@@ -65,6 +65,34 @@ function surfaceColor(surface: string, chart: ChartColors): string {
   return chart.series[(i < 0 ? SURFACE_ORDER.length : i) % chart.series.length];
 }
 
+// The boxes and line classes the figures render into. UsageSkeleton draws
+// its placeholders with the same strings, so each slot is the same height
+// as what replaces it and the two cannot drift apart.
+const HEADLINE = "mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4";
+const SECTION = "mt-8 max-w-[860px]";
+const MODE_GRID = "grid grid-cols-2 gap-3 md:grid-cols-4";
+const CARD_SHELL = "rounded-md border px-3 py-3 text-left";
+const CARD_LABEL = "flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute";
+const CARD_VALUE = "octo-tabular mt-1.5 font-serif text-[18px] tracking-[-0.005em] text-octo-ivory";
+const CARD_SHARE = "mt-2 h-[2px] rounded-sm";
+const CARD_META = "octo-tabular mt-2 font-mono text-[10px] text-octo-mute";
+const TREND_PANEL = "h-40 rounded-md border border-octo-hairline bg-octo-panel p-3";
+const SOURCES_HEAD = "mb-3 flex items-center justify-between gap-4";
+const LIST = "space-y-1.5";
+const ROW_SHELL = "rounded-md border border-octo-hairline bg-octo-panel px-3 py-2";
+const ROW_LINE = "flex items-baseline gap-3";
+const ROW_NAME = "min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory";
+const ROW_META = "octo-tabular shrink-0 font-mono text-[10px] text-octo-mute";
+const ROW_COST = "octo-tabular w-16 shrink-0 text-right font-mono text-[11px]";
+const SOURCE_KIND = "mt-0.5 flex items-baseline gap-2 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute";
+const SOURCE_BAR = "mt-1.5 flex h-[3px] overflow-hidden rounded-sm";
+const MODEL_SHARE = "mt-1.5 h-[2px] rounded-sm";
+const TOKENS_PANEL = "space-y-1.5 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px]";
+const TOKENS_NOTE_CLASS = "mt-2 text-[11px] leading-[1.55] text-octo-mute";
+const TOKENS_NOTE =
+  "Cache hit is cache read over all prompt tokens (input + cache read + cache write). A write is a miss: it is billed at a premium and only pays off when a later call reads it.";
+const TOKEN_ROWS = ["Input, uncached", "Cache read", "Cache write", "Output"];
+
 function localMidnight(d: Date): Date {
   const m = new Date(d);
   m.setHours(0, 0, 0, 0);
@@ -140,7 +168,9 @@ export function UsagePane() {
   // the filter bar says the ledger is being read.
   const [reportKey, setReportKey] = useState<string | null>(null);
   const filterKey = `${period}|${custom.from}|${custom.to}|${mode}`;
-  const [error, setError] = useState<string | null>(null);
+  // A failed read belongs to the filter it was asked for: after a switch
+  // the new read is on its way, and the old filter's error is not its answer.
+  const [error, setError] = useState<{ key: string; message: string } | null>(null);
   const [breakdown, setBreakdown] = useState<UsageBreakdown | null>(null);
   // What the gateway billed vs the ledger — only when a provider is one.
   const [gateway, setGateway] = useState<GatewayReconciliation | null>(null);
@@ -171,7 +201,7 @@ export function UsagePane() {
       setError(null);
     } catch (e) {
       if (seq !== reportSeq.current) return;
-      setError(String(e));
+      setError({ key, message: String(e) });
     }
     // Cloud vs local is a side figure; a failure just hides it. Same
     // sequence as the report: a late answer never lands over a newer one.
@@ -280,7 +310,8 @@ export function UsagePane() {
   }
 
   // A failed read says so in its own row; the status only means "on its way".
-  const reading = reportKey !== filterKey && !error;
+  const currentError = error?.key === filterKey ? error.message : null;
+  const reading = reportKey !== filterKey && !currentError;
 
   const pricingAge = pricingAgeDays(report?.pricingRefreshedAt ?? null);
   const pricingStale = report != null && (pricingAge == null || pricingAge >= PRICING_STALE_DAYS);
@@ -343,19 +374,22 @@ export function UsagePane() {
         <Segments ariaLabel="Mode" testId="usage-mode" value={mode} options={MODES} onChange={setMode} className="ml-auto" />
       </div>
 
-      {error && (
-        <div className="mt-4 max-w-[860px] rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px] text-octo-rouge">
-          {error}
+      {currentError && (
+        <div data-testid="usage-error" className="mt-4 max-w-[860px] rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px] text-octo-rouge">
+          {currentError}
         </div>
       )}
 
       {/* Analytics crossfade on a period/mode change, and in over the
           skeleton on first load; budgets and export sit outside the keyed
-          subtree so an open budget dialog survives. */}
+          subtree so an open budget dialog survives. A failed first read
+          shows its error row alone, never a frame that looks like loading. */}
       {!report ? (
-        <div key="reading" className="octo-fade-in">
-          <UsageSkeleton />
-        </div>
+        !currentError && (
+          <div key="reading" className="octo-fade-in">
+            <UsageSkeleton />
+          </div>
+        )
       ) : (
         <div key={`${period}-${mode}`} className="octo-fade-in">
           {/* ── Pricing freshness ── */}
@@ -384,7 +418,7 @@ export function UsagePane() {
           )}
 
           {/* ── Headline ── */}
-          <div data-tour="usage-headline" className="mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4">
+          <div data-tour="usage-headline" className={HEADLINE}>
             <Stat
               label="Cost"
               value={usd(report.totals.costUsd)}
@@ -426,12 +460,12 @@ export function UsagePane() {
           )}
 
           {/* ── By mode ── */}
-          <div className="mt-8 max-w-[860px]">
+          <div className={SECTION}>
             <SectionLabel>By mode</SectionLabel>
             {surfaces.length === 0 ? (
               <div className="font-serif text-[12px] text-octo-mute">Nothing billed in this period.</div>
             ) : (
-              <div className="grid grid-cols-2 gap-3 md:grid-cols-4" data-testid="usage-by-mode">
+              <div className={MODE_GRID} data-testid="usage-by-mode">
                 {surfaces.map((s) => {
                   const share = report.totals.costUsd > 0 ? (s.costUsd / report.totals.costUsd) * 100 : 0;
                   const active = mode === s.surface;
@@ -442,21 +476,22 @@ export function UsagePane() {
                       aria-pressed={active}
                       title={active ? "Show every mode" : `Only ${SURFACE_LABEL[s.surface] ?? s.surface}`}
                       onClick={() => setMode(active ? "all" : (s.surface as UsageMode))}
-                      className="octo-rise-in rounded-md border px-3 py-3 text-left transition-colors duration-[220ms]"
+                      data-shape="usage-mode-card"
+                      className={`octo-rise-in ${CARD_SHELL} transition-colors duration-[220ms]`}
                       style={{
                         borderColor: active ? "var(--brass-dim)" : "var(--color-octo-hairline)",
                         background: active ? "var(--brass-ghost)" : "var(--color-octo-panel)",
                       }}
                     >
-                      <div className="flex items-center gap-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                      <div className={CARD_LABEL}>
                         <span aria-hidden className="h-1.5 w-1.5 rounded-full" style={{ background: surfaceColor(s.surface, chart) }} />
                         {SURFACE_LABEL[s.surface] ?? s.surface}
                       </div>
-                      <div className="octo-tabular mt-1.5 font-serif text-[18px] tracking-[-0.005em] text-octo-ivory">{usd(s.costUsd)}</div>
-                      <div className="mt-2 h-[2px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }} title={`${share.toFixed(0)}% of the period's cost`}>
+                      <div className={CARD_VALUE}>{usd(s.costUsd)}</div>
+                      <div className={CARD_SHARE} style={{ background: "var(--color-octo-hairline)" }} title={`${share.toFixed(0)}% of the period's cost`}>
                         <div className="h-full rounded-sm transition-[width] duration-[320ms]" style={{ width: `${share}%`, background: surfaceColor(s.surface, chart) }} />
                       </div>
-                      <div className="octo-tabular mt-2 font-mono text-[10px] text-octo-mute">
+                      <div className={CARD_META}>
                         {s.calls.toLocaleString()} calls · {formatTokens(s.inputTokens + s.outputTokens)} · <span title={HIT_TITLE}>hit {hitPct(s)}</span>
                       </div>
                     </button>
@@ -468,9 +503,9 @@ export function UsagePane() {
 
           {/* ── Trend ── */}
           {report.trend.length > 0 && (
-            <div className="mt-8 max-w-[860px]">
+            <div className={SECTION} data-shape="usage-trend">
               <SectionLabel>{report.trendBucket === "hour" ? "Cost by hour" : "Cost by day"}</SectionLabel>
-              <div className="h-40 rounded-md border border-octo-hairline bg-octo-panel p-3">
+              <div className={TREND_PANEL}>
                 <ResponsiveContainer width="100%" height="100%">
                   <AreaChart data={report.trend}>
                     <defs>
@@ -505,8 +540,8 @@ export function UsagePane() {
 
           {/* ── Where it went ── */}
           {report.bySource.length > 0 && (
-            <div className="mt-8 max-w-[860px]">
-              <div className="mb-3 flex items-center justify-between gap-4">
+            <div className={SECTION} data-shape="usage-sources">
+              <div className={SOURCES_HEAD}>
                 <SectionLabel>Where it went</SectionLabel>
                 {surfacesPresent.length > 1 && (
                   <div className="mb-3 flex items-center gap-3 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
@@ -519,7 +554,7 @@ export function UsagePane() {
                   </div>
                 )}
               </div>
-              <ul className="space-y-1.5" data-testid="usage-sources">
+              <ul className={LIST} data-testid="usage-sources">
                 {report.bySource.map((s) => (
                   <SourceRow key={s.id} source={s} max={report.bySource[0].costUsd} chart={chart} />
                 ))}
@@ -529,28 +564,28 @@ export function UsagePane() {
 
           {/* ── By model ── */}
           {report.byModel.length > 0 && (
-            <div className="mt-8 max-w-[860px]">
+            <div className={SECTION}>
               <SectionLabel>By model</SectionLabel>
-              <ul className="space-y-1.5" data-testid="usage-models">
+              <ul className={LIST} data-testid="usage-models">
                 {report.byModel.map((m) => {
                   const share = report.totals.costUsd > 0 ? (m.costUsd / report.totals.costUsd) * 100 : 0;
                   const cell = modelCostCell(m, usd);
                   return (
-                    <li key={m.model} className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel px-3 py-2">
-                      <div className="flex items-baseline gap-3">
-                        <span className="min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory" title={m.model}>{m.model}</span>
-                        <span className="octo-tabular shrink-0 font-mono text-[10px] text-octo-mute">
+                    <li key={m.model} data-shape="usage-model" className={`octo-rise-in ${ROW_SHELL}`}>
+                      <div className={ROW_LINE}>
+                        <span className={ROW_NAME} title={m.model}>{m.model}</span>
+                        <span className={ROW_META}>
                           {m.calls.toLocaleString()} calls · {formatTokens(m.inputTokens + m.outputTokens)} · <span title={HIT_TITLE}>hit {hitPct(m)}</span>
                         </span>
                         <span
-                          className={`octo-tabular w-16 shrink-0 text-right font-mono text-[11px] ${cell.unpriced && m.costUsd === 0 ? "text-octo-mute" : "text-octo-ivory"}`}
+                          className={`${ROW_COST} ${cell.unpriced && m.costUsd === 0 ? "text-octo-mute" : "text-octo-ivory"}`}
                           title={cell.title}
                           data-testid={cell.unpriced ? "usage-model-unpriced" : undefined}
                         >
                           {cell.text}
                         </span>
                       </div>
-                      <div className="mt-1.5 h-[2px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }} title={`${share.toFixed(0)}% of the period's cost`}>
+                      <div className={MODEL_SHARE} style={{ background: "var(--color-octo-hairline)" }} title={`${share.toFixed(0)}% of the period's cost`}>
                         <div className="h-full rounded-sm transition-[width] duration-[320ms]" style={{ width: `${share}%`, background: "var(--color-octo-brass)" }} />
                       </div>
                     </li>
@@ -561,17 +596,15 @@ export function UsagePane() {
           )}
 
           {/* ── Prompt tokens ── */}
-          <div className="mt-8 max-w-[860px]">
+          <div className={SECTION} data-shape="usage-tokens">
             <SectionLabel>Tokens</SectionLabel>
-            <div className="space-y-1.5 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3 text-[12px]">
-              <Row label="Input, uncached" value={formatTokens(report.totals.inputTokens)} />
-              <Row label="Cache read" value={formatTokens(report.totals.cacheReadTokens)} />
-              <Row label="Cache write" value={formatTokens(report.totals.cacheCreationTokens)} />
-              <Row label="Output" value={formatTokens(report.totals.outputTokens)} />
+            <div className={TOKENS_PANEL}>
+              <Row label={TOKEN_ROWS[0]} value={formatTokens(report.totals.inputTokens)} />
+              <Row label={TOKEN_ROWS[1]} value={formatTokens(report.totals.cacheReadTokens)} />
+              <Row label={TOKEN_ROWS[2]} value={formatTokens(report.totals.cacheCreationTokens)} />
+              <Row label={TOKEN_ROWS[3]} value={formatTokens(report.totals.outputTokens)} />
             </div>
-            <p className="mt-2 text-[11px] leading-[1.55] text-octo-mute">
-              Cache hit is cache read over all prompt tokens (input + cache read + cache write). A write is a miss: it is billed at a premium and only pays off when a later call reads it.
-            </p>
+            <p className={TOKENS_NOTE_CLASS}>{TOKENS_NOTE}</p>
           </div>
 
           {gateway && <GatewaySection report={gateway} filtered={mode !== "all"} />}
@@ -622,38 +655,88 @@ export function UsagePane() {
 
 const HEADLINE_LABELS = ["Cost", "Per active day", "Last 24 hours", "Cache hit"];
 
-/** The page's frame before the first answer: the headline stats (labels
- *  real, figures as quiet bars), the By mode cards and the first rows of
- *  Where it went, each the height of what replaces it, so the figures
- *  fade into the same slots instead of pushing the page down. */
+/** A placeholder figure: the text is invisible and only its quiet bar
+ *  shows, so the line keeps the height its real type gives it. */
+function Ghost({ children }: { children: string }) {
+  return <span className="select-none rounded-sm bg-octo-panel-2 text-transparent">{children}</span>;
+}
+
+const HAIRLINE_CARD = { borderColor: "var(--color-octo-hairline)", background: "var(--color-octo-panel)" };
+const HAIRLINE = { background: "var(--color-octo-hairline)" };
+
+/** The page's frame before the first answer, in the order and with the
+ *  shells of a ledger with spend: the headline stats (real labels, figures
+ *  as quiet bars), four By mode cards, the trend panel, three Where it went
+ *  rows, two By model rows and the Tokens panel. Every slot is built from
+ *  the class strings the real section uses; only the row counts are a
+ *  guess, so a ledger with more or fewer sources or models still moves what
+ *  sits below by those rows. */
 function UsageSkeleton() {
-  const bar = "rounded-sm bg-octo-panel-2";
   return (
     <div data-testid="usage-skeleton" aria-hidden>
-      <div data-tour="usage-headline" className="mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4">
+      <div data-tour="usage-headline" className={HEADLINE}>
         {HEADLINE_LABELS.map((label) => (
-          <div key={label} className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-3">
-            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">{label}</div>
-            <div className="mt-1.5 flex h-[27px] items-center"><div className={`${bar} h-[16px] w-16`} /></div>
-            <div className="mt-1 flex h-[15px] items-center"><div className={`${bar} h-[8px] w-28`} /></div>
-          </div>
+          <Stat key={label} label={label} value={<Ghost>$00.00</Ghost>} note={<Ghost>00 calls · 00.0k tokens</Ghost>} />
         ))}
       </div>
-      <div className="mt-8 max-w-[860px]">
+      <div className={SECTION}>
         <SectionLabel>By mode</SectionLabel>
-        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
-          {[0, 1, 2, 3].map((i) => (
-            <div key={i} className="h-[96px] rounded-md border border-octo-hairline bg-octo-panel" />
+        <div className={MODE_GRID}>
+          {["Talk", "Run", "Review", "Direct"].map((m) => (
+            <div key={m} data-shape="usage-mode-card" className={CARD_SHELL} style={HAIRLINE_CARD}>
+              <div className={CARD_LABEL}><Ghost>{m}</Ghost></div>
+              <div className={CARD_VALUE}><Ghost>$00.00</Ghost></div>
+              <div className={CARD_SHARE} style={HAIRLINE} />
+              <div className={CARD_META}><Ghost>00 calls · 00.0k · hit 00%</Ghost></div>
+            </div>
           ))}
         </div>
       </div>
-      <div className="mt-8 max-w-[860px]">
-        <SectionLabel>Where it went</SectionLabel>
-        <ul className="space-y-1.5">
-          {[0, 1, 2].map((i) => (
-            <li key={i} className="h-[56px] rounded-md border border-octo-hairline bg-octo-panel" />
+      <div className={SECTION} data-shape="usage-trend">
+        <SectionLabel><Ghost>Cost by day</Ghost></SectionLabel>
+        <div className={TREND_PANEL} />
+      </div>
+      <div className={SECTION} data-shape="usage-sources">
+        <div className={SOURCES_HEAD}>
+          <SectionLabel>Where it went</SectionLabel>
+        </div>
+        <ul className={LIST}>
+          {[60, 40, 25].map((w) => (
+            <li key={w} data-shape="usage-source" className={ROW_SHELL}>
+              <div className={ROW_LINE}>
+                <span className={ROW_NAME}><Ghost>workspace name</Ghost></span>
+                <span className={ROW_META}><Ghost>00 calls · 00.0k · hit 00%</Ghost></span>
+                <span className={`${ROW_COST} text-octo-ivory`}><Ghost>$0.00</Ghost></span>
+              </div>
+              <div className={SOURCE_KIND}><Ghost>workspace</Ghost></div>
+              <div className={SOURCE_BAR} style={{ ...HAIRLINE, width: `${w}%` }} />
+            </li>
           ))}
         </ul>
+      </div>
+      <div className={SECTION}>
+        <SectionLabel>By model</SectionLabel>
+        <ul className={LIST}>
+          {[0, 1].map((i) => (
+            <li key={i} data-shape="usage-model" className={ROW_SHELL}>
+              <div className={ROW_LINE}>
+                <span className={ROW_NAME}><Ghost>model name</Ghost></span>
+                <span className={ROW_META}><Ghost>00 calls · 00.0k · hit 00%</Ghost></span>
+                <span className={`${ROW_COST} text-octo-ivory`}><Ghost>$0.00</Ghost></span>
+              </div>
+              <div className={MODEL_SHARE} style={HAIRLINE} />
+            </li>
+          ))}
+        </ul>
+      </div>
+      <div className={SECTION} data-shape="usage-tokens">
+        <SectionLabel>Tokens</SectionLabel>
+        <div className={TOKENS_PANEL}>
+          {TOKEN_ROWS.map((label) => (
+            <Row key={label} label={label} value={<Ghost>00.0k</Ghost>} />
+          ))}
+        </div>
+        <p className={TOKENS_NOTE_CLASS}>{TOKENS_NOTE}</p>
       </div>
     </div>
   );
@@ -671,21 +754,21 @@ function SourceRow({ source, max, chart }: { source: SourceUsage; max: number; c
         : "unattributed";
   const lastMs = Date.parse(source.lastTs);
   return (
-    <li className="octo-rise-in rounded-md border border-octo-hairline bg-octo-panel px-3 py-2" data-testid="usage-source">
-      <div className="flex items-baseline gap-3">
-        <span className="min-w-0 flex-1 truncate font-serif text-[13px] text-octo-ivory" title={source.label}>
+    <li className={`octo-rise-in ${ROW_SHELL}`} data-testid="usage-source" data-shape="usage-source">
+      <div className={ROW_LINE}>
+        <span className={ROW_NAME} title={source.label}>
           {source.label}
         </span>
-        <span className="octo-tabular shrink-0 font-mono text-[10px] text-octo-mute">
+        <span className={ROW_META}>
           {source.calls.toLocaleString()} calls · {formatTokens(source.inputTokens + source.outputTokens)} · <span title={HIT_TITLE}>hit {hitPct(source)}</span>
         </span>
-        <span className="octo-tabular w-16 shrink-0 text-right font-mono text-[11px] text-octo-ivory">{usd(source.costUsd)}</span>
+        <span className={`${ROW_COST} text-octo-ivory`}>{usd(source.costUsd)}</span>
       </div>
-      <div className="mt-0.5 flex items-baseline gap-2 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">
+      <div className={SOURCE_KIND}>
         <span>{kind}</span>
         {!Number.isNaN(lastMs) && <span className="tracking-normal normal-case">· last {formatRelative(lastMs)}</span>}
       </div>
-      <div className="mt-1.5 flex h-[3px] overflow-hidden rounded-sm" style={{ width: `${width}%`, minWidth: source.costUsd > 0 ? 2 : 0, background: "var(--color-octo-hairline)" }}>
+      <div className={SOURCE_BAR} style={{ width: `${width}%`, minWidth: source.costUsd > 0 ? 2 : 0, background: "var(--color-octo-hairline)" }}>
         {source.surfaces.map((s) => (
           <span
             key={s.surface}
