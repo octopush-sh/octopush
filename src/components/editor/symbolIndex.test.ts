@@ -499,6 +499,12 @@ describe("declarations split after their type", () => {
     { lang: "Java", line: "    public static Integer // retries", type: "Integer" },
     { lang: "C", line: "static int", type: "int", ext: "c" },
     { lang: "C", line: "static Node", type: "Node", ext: "c" },
+    // Generic and array heads (from the re-review of #444).
+    { lang: "Java", line: "    public static Optional<User>", type: "Optional" },
+    { lang: "C#", line: "    public static Task<int>", type: "Task", ext: "cs" },
+    { lang: "Java", line: "    public static Integer[]", type: "Integer" },
+    { lang: "Java", line: "    private final Map<String, Integer>", type: "Map" },
+    { lang: "Java", line: "    public static <T> List<T>", type: "List" },
   ];
   for (const { lang, line, type, ext } of heads) {
     it(`${lang}: a type alone after modifiers, "${line.trim()}", declares nothing`, () => {
@@ -673,5 +679,23 @@ describe("NON_SYMBOL_WORDS", () => {
       expect(NON_SYMBOL_WORDS.has(w)).toBe(true);
     }
     expect(NON_SYMBOL_WORDS.has("parse")).toBe(false);
+  });
+});
+
+describe("findDefinitions on a long file", () => {
+  it("counts lines correctly when it skips ahead to a rare name", () => {
+    const filler = Array.from({ length: 5000 }, (_, i) => `int v${i} = ${i};`);
+    const doc = [...filler, "    public static Optional<User>", "    findUser(int id) {", "    }", ...filler].join("\n");
+    const sites = findDefinitions(doc, "findUser");
+    expect(sites.map((s) => s.line)).toEqual([5002]);
+    expect(sites[0].score).toBe(DEFINITION_SCORE.declaration);
+    expect(findDefinitions(doc, "Optional")).toEqual([]);
+  });
+
+  it("stays fast for a name declared once at the end of a 256 KB file", () => {
+    const doc = Array.from({ length: 25_600 }, (_, i) => `x${i % 10} = 1;`).join("\n") + "\nint rareName = 1;";
+    const t0 = performance.now();
+    for (let i = 0; i < 5; i++) findDefinitions(doc, "rareName");
+    expect((performance.now() - t0) / 5).toBeLessThan(50);
   });
 });

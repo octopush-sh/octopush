@@ -431,6 +431,13 @@ function endsLine(suffix: string): boolean {
   return /^\s*(?:(?:\/\/|\/\*|#).*)?$/.test(suffix);
 }
 
+/** Nothing but the rest of a type follows: its type arguments (`<User>`,
+ *  `<String, Integer>`), array brackets or a nullable mark, then the line ends
+ *  — `public static Optional<User>` ⏎ `find(…)`. */
+function endsLineAfterType(suffix: string): boolean {
+  return endsLine(stripGenerics(suffix).replace(/^(?:\s*\[\s*\]|\s*\?)+/, ""));
+}
+
 /** The score a declaring keyword in front of the name earns: `fn parse`,
  *  `let mut total`, `const limit = 3` — but not `const char *name` (scoring
  *  `char`) or `static Integer f()` (scoring `Integer`), where the word after
@@ -448,7 +455,7 @@ function keywordDeclaration(prefix: string, suffix: string, opts: ScoreOptions):
   // `public static Integer` alone on a line, its name on the next one: with
   // nothing after it, the word after a modifier is the declaration's TYPE as
   // often as its name, so it is never scored as declared.
-  if (BINDING_MODIFIERS.has(keyword)) return !followedByName(suffix) && !endsLine(suffix);
+  if (BINDING_MODIFIERS.has(keyword)) return !followedByName(suffix) && !endsLineAfterType(suffix);
   return false;
 }
 
@@ -527,13 +534,16 @@ function isTypeWord(word: string): boolean {
  */
 function isDanglingDeclarationHead(line: string, opts: ScoreOptions): boolean {
   if (opts.typeAfterName) return false;
+  // Cheap first: statements and bodies are never a head (an annotation line,
+  // `@Table(name = "X")`, goes the long way).
+  if (!/^\s*@/.test(line) && /[=;{}]/.test(line)) return false;
   const head = line.replace(/^\s*(?:(?:@[A-Za-z_$][\w$.]*(?:\([^()]*\))?|\[[^[\]]*\])\s*)+/, "");
   const bare = stripGenerics(head).trim();
   if (bare === "" || /[=,;()+\-/%|^!~@#\\"'`{}:<>]/.test(bare)) return false;
   if (!opts.cDeclarators && /[*&]/.test(bare)) return false;
   const tokens = bare
     .split(/\s+/)
-    .map((t) => t.replace(/^[*&]+|[*&]+$/g, ""))
+    .map((t) => t.replace(/^[*&]+|(?:\[\]|\?|[*&])+$/g, ""))
     .filter(Boolean);
   let i = 0;
   while (i < tokens.length && MODIFIERS.has(tokens[i])) i++;
@@ -771,9 +781,12 @@ export function findDefinitions(
     const next = doc.indexOf(name, cursor);
     if (next === -1) break;
     if (next >= nl) {
-      prevStart = cursor;
-      cursor = nl + 1;
-      lineNo++;
+      // Jump straight to the line holding the next occurrence (a rare name in
+      // a long file would otherwise rescan to it once per skipped line).
+      const lineStart = doc.lastIndexOf("\n", next - 1) + 1;
+      for (let i = nl; i !== -1 && i < lineStart; i = doc.indexOf("\n", i + 1)) lineNo++;
+      prevStart = lineStart >= 2 ? doc.lastIndexOf("\n", lineStart - 2) + 1 : 0;
+      cursor = lineStart;
       continue;
     }
     const line = doc.slice(cursor, nl);
