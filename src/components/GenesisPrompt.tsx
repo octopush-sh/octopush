@@ -126,14 +126,21 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
             placeholder="Paste an Anthropic API key to wake the crew"
             className="min-w-0 flex-1 rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
           />
+          {/* Ceremonial CTA, same voice as "Set a crew on it" — the brass-ghost
+              fill arrives only once there is a key to save. */}
           <button
             type="button"
+            data-tour="genesis-key-save"
             onClick={() => void saveKey()}
             disabled={!keyValue.trim() || savingKey}
-            className="shrink-0 rounded-md px-3 py-2 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-brass transition disabled:opacity-40"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            className="shrink-0 rounded-md px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] disabled:opacity-40"
+            style={
+              keyValue.trim()
+                ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
+                : { background: "transparent", border: "1px solid var(--color-octo-border-strong)" }
+            }
           >
-            {savingKey ? "Saving…" : "Save"}
+            {savingKey ? "Waking the crew…" : "Wake the crew"}
           </button>
         </div>
       )}
@@ -192,7 +199,8 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
             type="button"
             onClick={() => canGenesis && onSketch(prompt.trim())}
             disabled={!canGenesis}
-            className="font-serif text-[12px] text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage disabled:opacity-40"
+            data-tour="genesis-sketch"
+            className="font-serif text-[12px] text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:decoration-octo-brass disabled:opacity-40"
           >
             or think it through first
           </button>
