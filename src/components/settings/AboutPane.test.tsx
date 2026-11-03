@@ -30,7 +30,17 @@ describe("AboutPane — update channel", () => {
   it("carries the tour ids", () => {
     const { container } = render(<AboutPane />);
     expect(container.querySelector('[data-tour="about-update-channel"]')).not.toBeNull();
-    expect(container.querySelector('[data-tour="about-check-updates"]')?.textContent).toMatch(/Check for updates|Checking/);
+    expect(container.querySelector('[data-tour="about-check-updates"]')?.textContent).toMatch(/Look(ing)? for a newer version/);
+  });
+
+  it("words the update check as an upright serif phrase in the ghost recipe", () => {
+    const { container } = render(<AboutPane />);
+    const btn = container.querySelector('[data-tour="about-check-updates"]')!;
+    expect(btn).toHaveClass("font-serif", "border-octo-border-strong");
+    // An operable control is bounded by the strong border tier, never the hairline (WCAG 1.4.11).
+    expect(btn).not.toHaveClass("border-octo-hairline");
+    expect(btn).not.toHaveClass("font-mono");
+    expect(btn).not.toHaveClass("uppercase");
   });
 
   it("shows the persisted channel and switches to beta (which checks)", async () => {

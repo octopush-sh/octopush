@@ -230,7 +230,7 @@ describe("Settings — Integrations / Issue Tracker section", () => {
       fireEvent.change(inputs[1], { target: { value: "SANDBOX" } });
     });
 
-    const saveButtons = screen.getAllByRole("button", { name: /save link/i });
+    const saveButtons = screen.getAllByRole("button", { name: /save the link/i });
     await act(async () => {
       fireEvent.click(saveButtons[1]);
     });
