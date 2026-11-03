@@ -24,7 +24,7 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
     return {
       title: "Claude finished the work but couldn't save its session",
       remedy:
-        "The disk or quota is likely full. The changes are in the worktree — free some space, then accept the work or re-run. Resuming starts a fresh session.",
+        "The disk or quota is likely full. The changes are in the worktree — free some space, then accept the work or re-run. Re-running starts a fresh session.",
     };
   }
   if (raw.includes("error_during_execution")) {

@@ -26,7 +26,9 @@ describe("haltCause", () => {
     );
     expect(c.title).toBe("Claude finished the work but couldn't save its session");
     expect(c.remedy).toMatch(/free some space/);
-    expect(c.remedy).toMatch(/fresh session/);
+    // The session is cleared, so the bar offers only Re-run — the copy must not promise Resume.
+    expect(c.remedy).toMatch(/Re-running starts a fresh session/);
+    expect(c.remedy).not.toMatch(/Resum/);
   });
   it("explains an idle timeout", () => {
     expect(haltCause("claude timed out — no output for 5 minutes", 25).title).toMatch(/no output/i);
