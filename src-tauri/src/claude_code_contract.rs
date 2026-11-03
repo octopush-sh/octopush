@@ -350,6 +350,46 @@ fn stream_json_api_error_is_a_failed_stage_with_the_cli_message() {
 }
 
 #[test]
+fn stream_json_success_result_with_exit_1_keeps_the_work_and_drops_the_session() {
+    // Claude Code 2.1.317+: `-p` exits 1 when a full disk or quota loses the
+    // session transcript or a ~/.claude.json write — after a `success` result.
+    use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let r = result_event(&fx, &events);
+            assert_eq!(require_str(&fx, r, "subtype"), "success", "[{fx}]");
+            assert_eq!(require(&fx, r, "is_error"), &Value::Bool(false), "[{fx}]");
+            let line = serde_json::to_string(r).unwrap();
+            let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, "ENOSPC: no space left on device")
+                .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+            assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+            let err = outcome.error.as_deref().unwrap_or_default();
+            assert!(is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+            assert!(err.contains("no space left on device"), "[{fx}] stderr tail: {err}");
+            assert_eq!(outcome.artifact.text, require_str(&fx, r, "result"), "[{fx}] the result text is kept");
+            assert_eq!(outcome.session_id, None, "[{fx}] the unsaved session must not be resumed");
+            assert_eq!(outcome.input_tokens, require_u64(&fx, r, "usage.input_tokens"), "[{fx}]");
+        }
+    }
+}
+
+#[test]
+fn stream_json_api_error_with_exit_1_still_carries_the_cli_message() {
+    for rec in recordings() {
+        let fx = rec.label("stream-json/error-unknown-model.jsonl");
+        let events = rec.jsonl("stream-json/error-unknown-model.jsonl");
+        let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Note, "").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+        let err = outcome.error.unwrap_or_default();
+        assert!(err.contains("claude-nonexistent-model-0"), "[{fx}] {err}");
+        assert!(!crate::orchestrator::cli_runner::is_session_not_saved(&err), "[{fx}] {err}");
+    }
+}
+
+#[test]
 fn stream_json_argv_flags_are_all_known_to_the_cli() {
     for rec in recordings() {
         let fx = rec.label("cli-help.txt");
