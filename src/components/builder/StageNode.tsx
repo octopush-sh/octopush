@@ -4,6 +4,7 @@ import { X, AlertTriangle } from "lucide-react";
 import { archetypeFor, stageLabel, TOOLS, type StageNode as StageNodeT } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { shortModel } from "../../lib/modelLabel";
+import { effortApplies } from "../../lib/claudeCli";
 import { useBuilder } from "./BuilderContext";
 
 function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
@@ -24,11 +25,13 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
   // The CLI agent manages its own tools, so the allowlist doesn't apply there —
   // show it as "managed" rather than implying a restriction we don't enforce.
   const cliManaged = data.substrate === "cli";
+  // Effort reaches the API and Claude Code (`--effort`), not Codex.
+  const showEffort = effortApplies(data.substrate, data.agentModel);
   // Escalation policy hint: the model swap applies to both substrates; the
-  // effort-only bump is API-only, like the base effort pill.
+  // effort-only bump follows the same rule as the base effort pill.
   const escLabel = data.escalateModel
     ? shortModel(data.escalateModel)
-    : !cliManaged && data.escalateEffort
+    : showEffort && data.escalateEffort
       ? data.escalateEffort
       : null;
   const granted = (toolId: string) => cliManaged || data.tools === null || data.tools.includes(toolId);
@@ -61,7 +64,7 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
           </p>
           <p className="mt-0.5 truncate font-mono text-[10px] text-octo-mute">
             {a.label.toLowerCase()} · {shortModel(data.agentModel)}
-            {data.effort && !cliManaged && <span className="text-octo-brass"> · {data.effort}</span>}
+            {data.effort && showEffort && <span className="text-octo-brass"> · {data.effort}</span>}
             {escLabel && (
               <span
                 className="text-octo-brass"

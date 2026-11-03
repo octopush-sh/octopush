@@ -52,4 +52,19 @@ describe("StageFlow — quiet crew line", () => {
     expect(onOverride).toHaveBeenCalledWith(1, "new-model");
     expect(screen.getByText("⟜ gate")).toBeInTheDocument();           // gate badge inside the editor card
   });
+
+  it("shows the effort pill on a Claude Code CLI stage, not on a Codex one", () => {
+    const cli = (agentModel: string) => [{ ...stages[1], agentModel, effort: "xhigh", loopTargetPosition: null }];
+    const { unmount } = render(<StageFlow stages={cli("claude-sonnet-5-5")} overrides={{}} onOverride={vi.fn()} />);
+    expect(screen.getByText("· xhigh")).toBeInTheDocument();
+    unmount();
+    render(<StageFlow stages={cli("gpt-5-codex")} overrides={{}} onOverride={vi.fn()} />);
+    expect(screen.queryByText("· xhigh")).not.toBeInTheDocument();
+  });
+
+  it("judges a CLI stage's effort on the overridden model", () => {
+    const cli = [{ ...stages[1], agentModel: "claude-sonnet-5-5", effort: "low", loopTargetPosition: null }];
+    render(<StageFlow stages={cli} overrides={{ 1: "gpt-5" }} onOverride={vi.fn()} />);
+    expect(screen.queryByText("· low")).not.toBeInTheDocument();
+  });
 });

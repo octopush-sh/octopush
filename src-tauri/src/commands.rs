@@ -2650,8 +2650,12 @@ pub async fn estimate_run_cost(
                 .find(|(pos, _)| *pos == s.position)
                 .map(|(_, m)| m.clone())
                 .unwrap_or_else(|| s.agent_model.clone());
-            // Effort is ignored on the CLI substrate, so it keys as none there.
-            let effort = if s.substrate == "cli" { None } else { s.effort.as_ref().map(|e| e.as_str().to_string()) };
+            // Effort keys the history only where it reaches the agent (API, or
+            // Claude Code's `--effort`); a Codex stage keys as none.
+            let effort = s
+                .effort
+                .filter(|_| crate::orchestrator::cli_runner::effort_applies(&s.substrate, &model))
+                .map(|e| e.as_str().to_string());
             let samples = db.stage_token_samples(
                 &s.role,
                 effort.as_deref(),

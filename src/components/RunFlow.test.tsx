@@ -90,6 +90,23 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(titles).toHaveLength(1);
   });
 
+  it("judges the effort pill on the model the stage actually ran on", () => {
+    const pill = '[title="Reasoning effort for this stage"]';
+    const base = { id: "e", position: 0, status: "running", startedAt: 1, substrate: "cli", effort: "high" };
+    const onCodex = mk({ ...base, agentModel: "claude-sonnet-5-5", escalated: true, escalateModel: "gpt-5-codex" });
+    const { container, unmount } = render(
+      <RunFlow stages={[onCodex]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(container.querySelector(pill)).toBeNull();
+    unmount();
+    // Not escalated: the base model (Claude Code) decides, whatever the policy says.
+    const notYet = mk({ ...base, agentModel: "claude-sonnet-5-5", escalated: false, escalateModel: "gpt-5-codex" });
+    const again = render(
+      <RunFlow stages={[notYet]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(again.container.querySelector(pill)?.textContent).toBe("high");
+  });
+
   // #312: a flex <button> card must hand its width to its rows in WebKit too,
   // so the truncating rows are `w-full min-w-0` and the card clips.
   it("clips long stage titles and models against the card", () => {

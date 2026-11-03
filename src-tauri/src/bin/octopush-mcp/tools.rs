@@ -441,9 +441,9 @@ fn STAGE_ARRAY_SCHEMA() -> Value {
                 "loopTargetPosition": { "type": ["integer", "null"], "description": "Review roles only: earlier stage to loop back to on rejection. Null = no loop." },
                 "loopMaxIterations": { "type": "integer", "description": "Max loop-backs (>=1 when looping, else 0). Default 0." },
                 "loopMode": { "type": ["string", "null"], "enum": ["gated", "auto", null], "description": "'gated' (human-approved) or 'auto'. Required when looping." },
-                "effort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Per-stage reasoning effort. API substrate only (ignored on cli). Takes effect only on models that support reasoning: the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and the budget-path models (Haiku 4.5, Sonnet 4.5) — on those, higher levels auto-clamp to the model's max (e.g. Sonnet 4.6 caps xhigh→high). On any OTHER model id (legacy claude-3-5-*, unknown/non-Claude) effort is silently IGNORED — no thinking at all, not clamped. Use a current Claude model to get effect. Omit/null = off (no extended thinking)." },
+                "effort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Per-stage reasoning effort. On cli it is passed to Claude Code as `--effort <level>` (the CLI clamps unsupported levels; omitted = the CLI's per-model default) and ignored by Codex. On api it takes effect only on models that support reasoning: the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and the budget-path models (Haiku 4.5, Sonnet 4.5) — on those, higher levels auto-clamp to the model's max (e.g. Sonnet 4.6 caps xhigh→high). On any OTHER model id (legacy claude-3-5-*, unknown/non-Claude) effort is silently IGNORED — no thinking at all, not clamped. Use a current Claude model to get effect. Omit/null = off (no extended thinking)." },
                 "escalateModel": { "type": ["string", "null"], "description": "On this stage FAILING (loop exhausts its tool-turn budget unfinished, or errors), retry it ONCE with this stronger model before halting. Applies to api and cli. The retry fires ONLY if it raises the tier — set a genuinely different, stronger model than agentModel; if escalateModel equals agentModel the escalation no-ops and the stage just halts on failure. Omit = no escalation." },
-                "escalateEffort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Optionally also raise reasoning effort on the escalated retry (api only). On its own (no escalateModel) it triggers a retry only if it is higher than the stage's base effort; an equal effort no-ops and the stage halts." }
+                "escalateEffort": { "type": ["string", "null"], "enum": ["low", "medium", "high", "xhigh", "max", null], "description": "Optionally also raise reasoning effort on the escalated retry (api, and Claude Code cli stages; not Codex). On its own (no escalateModel) it triggers a retry only if it is higher than the stage's base effort; an equal effort no-ops and the stage halts." }
             },
             "required": ["role", "agentModel"],
             "additionalProperties": false
@@ -1234,9 +1234,9 @@ fn describe_pipeline_schema() -> Value {
             "loopTargetPosition": "review roles only — an EARLIER stage to loop back to on rejection; null = no loop.",
             "loopMaxIterations": ">= 1 when looping, otherwise 0.",
             "loopMode": "'gated' (human approves each loop) or 'auto'; required when looping.",
-            "effort": "optional per-stage reasoning effort: low | medium | high | xhigh | max. API substrate only (ignored on cli). Takes effect only on models that support reasoning — the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and budget-path models (Haiku 4.5, Sonnet 4.5), where higher levels auto-clamp to the model's max; on any other id (legacy claude-3-5-*, unknown/non-Claude) it is silently ignored (no thinking at all, not clamped). Use a current Claude model to get effect. Omit/null = off (no extended thinking).",
+            "effort": "optional per-stage reasoning effort: low | medium | high | xhigh | max. On cli it is passed to Claude Code as `--effort <level>` (omitted = the CLI's per-model default) and ignored by Codex. On api it takes effect only on models that support reasoning — the current Claude families (Opus 4.5–4.8, Sonnet 4.6/5, Fable/Mythos 5) and budget-path models (Haiku 4.5, Sonnet 4.5), where higher levels auto-clamp to the model's max; on any other id (legacy claude-3-5-*, unknown/non-Claude) it is silently ignored (no thinking at all, not clamped). Use a current Claude model to get effect. Omit/null = off (no extended thinking).",
             "escalateModel": "optional — a stronger model to retry this stage with ONCE if it fails (loop exhausts its tool-turn budget unfinished, or errors) before halting. Applies to api and cli. Only fires if it raises the tier: pick a genuinely different/stronger model than agentModel; if it equals agentModel the retry no-ops and the stage halts. Omit = no escalation.",
-            "escalateEffort": "optional — also raise the reasoning effort on the escalated retry (api only): low | medium | high | xhigh | max. On its own (no escalateModel) it triggers a retry only when higher than the base effort; equal effort no-ops."
+            "escalateEffort": "optional — also raise the reasoning effort on the escalated retry (api, and Claude Code cli stages; not Codex): low | medium | high | xhigh | max. On its own (no escalateModel) it triggers a retry only when higher than the base effort; equal effort no-ops."
         },
         "rules": [
             "At least one stage.",
@@ -1245,8 +1245,8 @@ fn describe_pipeline_schema() -> Value {
             "A loop's target must be an earlier stage; in an authored graph it must lie on the review's own ancestry path.",
             "When loopTargetPosition is null, loopMaxIterations must be 0 and loopMode must be null.",
             "substrate must be 'api' or 'cli'; agentModel must be non-empty; maxIterations in 1..100.",
-            "effort is API-substrate only (ignored on cli) and takes effect only on reasoning-capable models — the current Claude families and budget-path models auto-clamp higher levels to the model's max (e.g. Sonnet 4.6 caps xhigh→high); on legacy claude-3-5-* or unknown/non-Claude models it is silently ignored (no thinking), not clamped. omit/null = off.",
-            "A stage with an escalateModel (and/or escalateEffort) retries ONCE at the stronger tier when it fails before halting — but ONLY if that raises the tier: if escalateModel equals agentModel (or escalateEffort equals the base effort with no model change) the escalation no-ops and the stage just halts. escalateModel applies to api and cli, escalateEffort is api-only."
+            "effort reaches Claude Code cli stages as `--effort <level>` (Codex ignores it); on api it takes effect only on reasoning-capable models — the current Claude families and budget-path models auto-clamp higher levels to the model's max (e.g. Sonnet 4.6 caps xhigh→high); on legacy claude-3-5-* or unknown/non-Claude models it is silently ignored (no thinking), not clamped. omit/null = off.",
+            "A stage with an escalateModel (and/or escalateEffort) retries ONCE at the stronger tier when it fails before halting — but ONLY if that raises the tier: if escalateModel equals agentModel (or escalateEffort equals the base effort with no model change) the escalation no-ops and the stage just halts. escalateModel applies to api and cli, escalateEffort to api and Claude Code cli stages (not Codex)."
         ],
         "recommendedModels": {
             "claude-opus-4-8": "Most capable — heavy implement/plan stages, and a good escalateModel target.",
@@ -1346,6 +1346,12 @@ mod tests {
         assert_eq!(stages[0]["effort"], "medium");
         assert_eq!(stages[2]["effort"], "high");
         assert_eq!(stages[2]["escalateModel"], "claude-opus-4-8");
+        // Claude CLI stages take effort now (`--effort`); no field says "api only".
+        let text = schema.to_string();
+        for stale in ["API substrate only", "API-substrate only", "api-only", "(api only)"] {
+            assert!(!text.contains(stale), "describe_pipeline_schema still says '{stale}'");
+        }
+        assert!(fields["effort"].as_str().unwrap().contains("--effort"));
     }
 
     /// A stage carrying effort + escalateModel + escalateEffort is accepted by

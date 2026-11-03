@@ -394,9 +394,10 @@ fn stream_json_argv_flags_are_all_known_to_the_cli() {
     for rec in recordings() {
         let fx = rec.label("cli-help.txt");
         let help = rec.text("cli-help.txt");
+        let effort = || CliDialect::Claude.effort_args(Some(crate::providers::Effort::High));
         for argv in [
-            build_cli_args("claude-haiku-4-5", "system", 3, true),
-            build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, true),
+            [build_cli_args("claude-haiku-4-5", "system", 3, true), effort()].concat(),
+            [build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, true), effort()].concat(),
         ] {
             if let Err(e) = flags_documented(&fx, &help, &argv, CLI_HIDDEN_FLAGS) {
                 panic!("{e}");
@@ -404,6 +405,17 @@ fn stream_json_argv_flags_are_all_known_to_the_cli() {
         }
         for value in ["stream-json", "bypassPermissions"] {
             assert!(help.contains(value), "[{fx}] `claude --help` no longer mentions `{value}`");
+        }
+        // `--effort <level>` lists its levels; every `Effort` token must be one.
+        let line = help.lines().skip_while(|l| !l.trim_start().starts_with("--effort")).take(3).collect::<String>();
+        for e in [
+            crate::providers::Effort::Low,
+            crate::providers::Effort::Medium,
+            crate::providers::Effort::High,
+            crate::providers::Effort::Xhigh,
+            crate::providers::Effort::Max,
+        ] {
+            assert!(line.contains(e.as_str()), "[{fx}] `claude --help` --effort no longer lists `{}`: {line}", e.as_str());
         }
     }
 }

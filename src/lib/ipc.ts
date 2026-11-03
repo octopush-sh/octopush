@@ -38,14 +38,16 @@ export interface PipelineStage {
   position: number;
   role: string;
   agentModel: string;
-  /** Per-stage reasoning effort; null/absent = off (no thinking). */
+  /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
+   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. Either escalate field set = the
    *  stage has an escalation policy. */
   escalateModel?: string | null;
-  /** Escalation policy — the effort to bump to on the failed-retry (API only).
-   *  null/absent = keep the base effort on the retry. */
+  /** Escalation policy — the effort to bump to on the failed-retry (API, or a
+   *  Claude Code CLI stage as `--effort`; Codex ignores it). null/absent =
+   *  keep the base effort on the retry. */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;
@@ -154,12 +156,14 @@ export interface RoutinePhaseEvent {
 export interface StageDraft {
   role: string;
   agentModel: string;
-  /** Per-stage reasoning effort; null/absent = off (no thinking). */
+  /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
+   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. */
   escalateModel?: string | null;
-  /** Escalation policy — the effort to bump to on the failed-retry (API only). */
+  /** Escalation policy — the effort to bump to on the failed-retry (API, or a
+   *  Claude Code CLI stage as `--effort`; Codex ignores it). */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;

@@ -83,14 +83,15 @@ A pipeline is a DAG of role-specialized agent stages. Only `role` and
 - `tools`, when set, is a non-empty subset of `read_file, list_files,
   write_file, run_command`.
 - `effort` (`low|medium|high|xhigh|max`; null/omit = off) is optional per-stage
-  reasoning effort — **API substrate only**. It takes effect only on
-  reasoning-capable models: the current Claude families (Opus 4.5–4.8, Sonnet
+  reasoning effort. On a `cli` stage it is passed to Claude Code as
+  `--effort <level>` (omitted = the CLI's per-model default) and ignored by
+  Codex. On an `api` stage it takes effect only on reasoning-capable models: the current Claude families (Opus 4.5–4.8, Sonnet
   4.6/5, Fable/Mythos 5) and the budget-path models (Haiku 4.5, Sonnet 4.5),
   where higher levels auto-clamp to the model's max (e.g. Sonnet 4.6 caps
   xhigh→high). On any **other** id (legacy `claude-3-5-*`, unknown/non-Claude)
   effort is **silently ignored — no thinking at all, not clamped**. Use a
   current Claude model to get effect.
-- `escalateModel` (and optional `escalateEffort`, api-only) sets an escalation
+- `escalateModel` (and optional `escalateEffort`, api and Claude Code cli) sets an escalation
   policy: if the stage **fails** (its tool-turn budget is exhausted unfinished,
   or it errors) it retries **once** at the stronger tier before halting — but
   **only if that raises the tier**. Set `escalateModel` to a genuinely
