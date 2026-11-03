@@ -133,6 +133,31 @@ describe("rankDefinitionHits", () => {
     expect(rankDefinitionHits(hits, "limit")).toHaveLength(1);
   });
 
+  it("never offers a type left alone on a line by a split declaration", () => {
+    // The name is on the next line, which a search preview never shows; the
+    // head alone used to score 100 for its type and win outright.
+    const hits = [
+      hit("src/ProveedorNoDisponibleException.java", 14, "    public static Integer"),
+      hit("src/UserService.java", 8, "    private final UserRepository"),
+      hit("src/util.c", 3, "static int"),
+    ];
+    for (const name of ["Integer", "UserRepository", "int"]) {
+      expect(chooseDefinition(rankDefinitionHits(hits, name, { fromFile: "src/App.java" }))).toEqual({
+        kind: "none",
+      });
+    }
+  });
+
+  it("reads `*` as a pointer declarator only in C and C++ hits", () => {
+    const hits = [
+      hit("src/price.ts", 7, "    total * rate;"),
+      hit("src/Price.java", 7, "    ptr * deref;"),
+      hit("src/list.c", 4, "    struct node *rate;"),
+    ];
+    expect(rankDefinitionHits(hits, "rate").map((c) => c.file)).toEqual(["src/list.c"]);
+    expect(rankDefinitionHits(hits, "deref")).toEqual([]);
+  });
+
   it("caps the list", () => {
     const many = Array.from({ length: 60 }, (_, i) =>
       hit(`src/f${i}.ts`, 1, "function parse() {"),

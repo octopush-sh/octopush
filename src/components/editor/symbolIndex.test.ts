@@ -390,8 +390,9 @@ describe("the type in front of a declaration is never its name", () => {
   ];
   for (const { lang, line, type, declared } of cases) {
     it(`${lang}: "${line.trim()}" declares ${declared}, not ${type}`, () => {
-      expect(scoreDefinitionLine(line, declared)).toBe(DEFINITION_SCORE.declaration);
-      expect(scoreDefinitionLine(line, type)).toBe(0);
+      const opts = scoreOptionsFor(lang === "C" ? "c" : lang === "C++" ? "cpp" : undefined);
+      expect(scoreDefinitionLine(line, declared, opts)).toBe(DEFINITION_SCORE.declaration);
+      expect(scoreDefinitionLine(line, type, opts)).toBe(0);
     });
   }
 
@@ -484,6 +485,131 @@ describe("declarations the old keyword rule missed", () => {
     expect(scoreOptionsFor("go").typeAfterName).toBe(true);
     for (const lang of ["java", "rs", "ts", "kt", "cs", "c", undefined]) {
       expect(scoreOptionsFor(lang).typeAfterName).toBe(false);
+    }
+  });
+});
+
+describe("declarations split after their type", () => {
+  // `public static Integer` alone on a line used to score 100 for `Integer`
+  // (a binding modifier in front, nothing after it), and the workspace tier
+  // then jumped there for every ⌘-click on `Integer`.
+  const heads: { lang: string; line: string; type: string; ext?: string }[] = [
+    { lang: "Java", line: "    public static Integer", type: "Integer" },
+    { lang: "Java", line: "    private final UserRepository", type: "UserRepository" },
+    { lang: "Java", line: "    public static Integer // retries", type: "Integer" },
+    { lang: "C", line: "static int", type: "int", ext: "c" },
+    { lang: "C", line: "static Node", type: "Node", ext: "c" },
+  ];
+  for (const { lang, line, type, ext } of heads) {
+    it(`${lang}: a type alone after modifiers, "${line.trim()}", declares nothing`, () => {
+      expect(scoreDefinitionLine(line, type, scoreOptionsFor(ext))).toBe(0);
+    });
+  }
+
+  it("Go still declares a bare name after var/const", () => {
+    const go = scoreOptionsFor("go");
+    expect(scoreDefinitionLine("var count", "count", go)).toBe(DEFINITION_SCORE.declaration);
+    expect(scoreDefinitionLine("const limit", "limit", go)).toBe(DEFINITION_SCORE.declaration);
+  });
+
+  const docs: { lang: string; ext?: string; doc: string[]; type: string; declared: string; line: number }[] = [
+    {
+      lang: "Java",
+      doc: ["class A {", "    public static Integer", "    esperaSugerida(int a, int b) {", "        return a;", "    }", "}"],
+      type: "Integer",
+      declared: "esperaSugerida",
+      line: 3,
+    },
+    {
+      lang: "Java",
+      doc: ["class A {", "    private final UserRepository", "        userRepository;", "}"],
+      type: "UserRepository",
+      declared: "userRepository",
+      line: 3,
+    },
+    {
+      lang: "C",
+      ext: "c",
+      doc: ["static int", "helper(void)", "{", "    return 0;", "}"],
+      type: "int",
+      declared: "helper",
+      line: 2,
+    },
+    {
+      lang: "C",
+      ext: "c",
+      doc: ["int", "main(int argc, char **argv)", "{", "}"],
+      type: "int",
+      declared: "main",
+      line: 2,
+    },
+  ];
+  for (const { lang, ext, doc, type, declared, line } of docs) {
+    it(`${lang}: finds ${declared} on the line after "${doc[line - 2].trim()}", never ${type}`, () => {
+      const text = doc.join("\n");
+      const opts = scoreOptionsFor(ext);
+      expect(findDefinitions(text, type, opts)).toEqual([]);
+      const [site] = findDefinitions(text, declared, opts);
+      expect(site.line).toBe(line);
+      expect(site.score).toBe(DEFINITION_SCORE.declaration);
+      expect(text.slice(site.from, site.to)).toBe(declared);
+    });
+  }
+
+  it("does not join a line that is an expression or a bare name", () => {
+    // Python: `Foo` alone is an expression statement, not a type.
+    const py = ["Foo", "bar = 1"].join("\n");
+    expect(findDefinitions(py, "bar")[0].score).toBe(DEFINITION_SCORE.assignment);
+    const js = ["return", "value;"].join("\n");
+    expect(findDefinitions(js, "value")).toEqual([]);
+  });
+});
+
+describe("C typedefs", () => {
+  const c = scoreOptionsFor("c");
+  const cases: [string, string][] = [
+    ["typedef struct Node Node;", "Node"],
+    ["typedef struct node_s node_t;", "node_t"],
+    ["typedef unsigned long size_type;", "size_type"],
+    ["typedef int Count;", "Count"],
+  ];
+  for (const [line, name] of cases) {
+    it(`"${line}" declares ${name}`, () => {
+      expect(scoreDefinitionLine(line, name, c)).toBe(DEFINITION_SCORE.declaration);
+      expect(scoreDefinitionLine(line, name)).toBe(DEFINITION_SCORE.declaration);
+    });
+  }
+
+  it("does not declare the type being aliased", () => {
+    expect(scoreDefinitionLine("typedef struct node_s node_t;", "node_s", c)).toBe(0);
+  });
+});
+
+describe("pointer declarators are C and C++ only", () => {
+  const c = scoreOptionsFor("c");
+  it("reads `*` as multiplication elsewhere", () => {
+    for (const ext of [undefined, "java", "ts", "py", "rs", "kt", "cs"]) {
+      const opts = scoreOptionsFor(ext);
+      expect(scoreDefinitionLine("    total * rate;", "rate", opts)).toBe(0);
+      expect(scoreDefinitionLine("    ptr * deref;", "deref", opts)).toBe(0);
+      expect(scoreDefinitionLine("    a & mask;", "mask", opts)).toBe(0);
+    }
+  });
+
+  it("still reads a C declarator", () => {
+    expect(scoreDefinitionLine("    struct Node *next;", "next", c)).toBe(DEFINITION_SCORE.declaration);
+    expect(scoreDefinitionLine("const char *name = \"octo\";", "name", c)).toBe(
+      DEFINITION_SCORE.declaration,
+    );
+    expect(scoreDefinitionLine("    int &ref = x;", "ref", scoreOptionsFor("cpp"))).toBe(
+      DEFINITION_SCORE.declaration,
+    );
+  });
+
+  it("knows C and C++ by language and by extension", () => {
+    for (const k of ["c", "cpp", "h", "cc", "cxx", "hpp"]) expect(scoreOptionsFor(k).cDeclarators).toBe(true);
+    for (const k of ["java", "go", "ts", "javascript", undefined]) {
+      expect(scoreOptionsFor(k).cDeclarators).toBe(false);
     }
   });
 });

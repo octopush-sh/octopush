@@ -366,11 +366,24 @@ export interface ScoreOptions {
    * another word" never means the first one is a type.
    */
   typeAfterName?: boolean;
+  /**
+   * The language writes pointer and reference declarators (C/C++:
+   * `char *name`, `struct Node *next`, `int &ref`). Everywhere else a `*` or
+   * `&` in front of a name is an operator — `total * rate;` multiplies.
+   */
+  cDeclarators?: boolean;
 }
 
-/** Go is the one language Octopush highlights that declares `name Type`. */
+/** C and C++, by editor language id or by file extension. */
+const C_FAMILY = new Set(["c", "cpp", "h", "cc", "cxx", "hpp", "hh", "hxx"]);
+
+/** Go is the one language Octopush highlights that declares `name Type`; C
+ *  and C++ are the ones whose declarators carry `*` and `&`. */
 export function scoreOptionsFor(langOrExtension: string | undefined): ScoreOptions {
-  return { typeAfterName: langOrExtension === "go" };
+  return {
+    typeAfterName: langOrExtension === "go",
+    cDeclarators: C_FAMILY.has(langOrExtension ?? ""),
+  };
 }
 
 // ── Line classification ───────────────────────────────────────────
@@ -413,6 +426,11 @@ function followedByName(suffix: string): boolean {
   return !!m && !NON_SYMBOL_WORDS.has(m[2]);
 }
 
+/** Nothing but whitespace or a trailing comment follows on the line. */
+function endsLine(suffix: string): boolean {
+  return /^\s*(?:(?:\/\/|\/\*|#).*)?$/.test(suffix);
+}
+
 /** The score a declaring keyword in front of the name earns: `fn parse`,
  *  `let mut total`, `const limit = 3` — but not `const char *name` (scoring
  *  `char`) or `static Integer f()` (scoring `Integer`), where the word after
@@ -426,7 +444,11 @@ function keywordDeclaration(prefix: string, suffix: string, opts: ScoreOptions):
   if (DECLARING_KEYWORDS.has(keyword)) {
     return !(TAG_KEYWORDS.has(keyword) && !opts.typeAfterName && followedByName(suffix));
   }
-  if (BINDING_MODIFIERS.has(keyword)) return opts.typeAfterName || !followedByName(suffix);
+  if (opts.typeAfterName) return BINDING_MODIFIERS.has(keyword);
+  // `public static Integer` alone on a line, its name on the next one: with
+  // nothing after it, the word after a modifier is the declaration's TYPE as
+  // often as its name, so it is never scored as declared.
+  if (BINDING_MODIFIERS.has(keyword)) return !followedByName(suffix) && !endsLine(suffix);
   return false;
 }
 
@@ -444,7 +466,7 @@ const DECLARING_HEAD_RE = /\b(?:for|foreach|catch|using|try)\s*\(\s*/g;
  * declaration is ABOUT, which is how `public static Integer esperaSugerida()`
  * came to read as a declaration of `Integer`.
  */
-function typedDeclaration(prefix: string, suffix: string): boolean {
+function typedDeclaration(prefix: string, suffix: string, opts: ScoreOptions): boolean {
   let head = prefix;
   let inHead = false;
   for (const m of prefix.matchAll(DECLARING_HEAD_RE)) {
@@ -456,6 +478,8 @@ function typedDeclaration(prefix: string, suffix: string): boolean {
   const bare = stripGenerics(head);
   // Operators, separators, calls and bodies all mean this is an expression.
   if (/[=,;()+\-/%|^!~@#\\"'`{}]/.test(bare) || /(^|[^:]):(?!:)/.test(bare)) return false;
+  // Outside C/C++ a `*` or `&` is an operator: `total * rate;` multiplies.
+  if (!opts.cDeclarators && /[*&]/.test(bare)) return false;
 
   const tokens = bare
     .split(/\s+/)
@@ -463,6 +487,13 @@ function typedDeclaration(prefix: string, suffix: string): boolean {
     .filter(Boolean);
   let i = 0;
   while (i < tokens.length && MODIFIERS.has(tokens[i])) i++;
+  // A C typedef names its new type LAST, after a type of any length:
+  // `typedef struct node_s node_t;`, `typedef unsigned long size_type;`.
+  if (tokens[i] === "typedef") {
+    const type = tokens.slice(i + 1).filter((t) => !MODIFIERS.has(t) && !TAG_KEYWORDS.has(t));
+    if (type.length === 0 || !type.every(isTypeWord)) return false;
+    return declarationEnds(suffix, { type: type[type.length - 1], modified: true, inHead: false });
+  }
   const modified = i > 0;
   let rest = tokens.slice(i);
   // `export default App;` re-exports a name declared elsewhere.
@@ -472,13 +503,45 @@ function typedDeclaration(prefix: string, suffix: string): boolean {
   if (rest.length > 1) return false;
   const type = rest[0];
   if (type !== undefined) {
-    if (!/^[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)*(?:\[\])*\??$/.test(type)) return false;
-    if (STATEMENT_WORDS.has(type) || CONTROL_BEFORE_PAREN.has(type)) return false;
-    if (NON_SYMBOL_WORDS.has(type) && !TYPE_KEYWORDS.has(type)) return false;
+    if (!isTypeWord(type)) return false;
   } else if (!modified) {
     return false; // nothing in front of the name: not this shape
   }
   return declarationEnds(suffix, { type, modified, inHead });
+}
+
+/** Can `word` stand as the type of a typed declaration? A (qualified) name or
+ *  a type keyword — never a statement word, a control word or another keyword. */
+function isTypeWord(word: string): boolean {
+  if (!/^[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)*(?:\[\])*\??$/.test(word)) return false;
+  if (STATEMENT_WORDS.has(word) || CONTROL_BEFORE_PAREN.has(word)) return false;
+  return !NON_SYMBOL_WORDS.has(word) || TYPE_KEYWORDS.has(word);
+}
+
+/**
+ * Is `line` the dangling head of a declaration whose name sits on the NEXT
+ * line — modifiers and at most one type, nothing else? `public static Integer`,
+ * `private final UserRepository`, `static int`, GNU C's bare `int`. A lone
+ * type with no modifier only counts when it is a type keyword: `Foo` alone on
+ * a line is an expression statement in Python or Ruby.
+ */
+function isDanglingDeclarationHead(line: string, opts: ScoreOptions): boolean {
+  if (opts.typeAfterName) return false;
+  const head = line.replace(/^\s*(?:(?:@[A-Za-z_$][\w$.]*(?:\([^()]*\))?|\[[^[\]]*\])\s*)+/, "");
+  const bare = stripGenerics(head).trim();
+  if (bare === "" || /[=,;()+\-/%|^!~@#\\"'`{}:<>]/.test(bare)) return false;
+  if (!opts.cDeclarators && /[*&]/.test(bare)) return false;
+  const tokens = bare
+    .split(/\s+/)
+    .map((t) => t.replace(/^[*&]+|[*&]+$/g, ""))
+    .filter(Boolean);
+  let i = 0;
+  while (i < tokens.length && MODIFIERS.has(tokens[i])) i++;
+  let rest = tokens.slice(i);
+  if (rest.length === 2 && TAG_KEYWORDS.has(rest[0])) rest = rest.slice(1);
+  if (rest.length === 0) return i > 0;
+  if (rest.length > 1 || !isTypeWord(rest[0])) return false;
+  return i > 0 || TYPE_KEYWORDS.has(rest[0]);
 }
 
 /** Does `suffix` close the declaration `typedDeclaration` recognised? */
@@ -495,7 +558,10 @@ function declarationEnds(
   if (/^\??:(?!:)/.test(suffix)) return ctx.modified; // `const MAX: u32`, `private repo?: Repo`
   if (ctx.inHead && typed && /^\s*[:)]/.test(suffix)) return true; // `for (String s : xs)`
   if (/^\s*(<[^<>]*>)?\s*\(/.test(suffix)) return typedParameterList(suffix, ctx);
-  return suffix.trim() === "" && ctx.modified;
+  // `private final UserRepository userRepository` — but never a lone word after
+  // modifiers (`public static Integer`), which is the type of a declaration
+  // whose name continues on the next line.
+  return endsLine(suffix) && ctx.modified && typed;
 }
 
 /** A method or function signature after a typed prefix — the parameter list
@@ -634,11 +700,18 @@ export function scoreDefinitionAt(
   if (/[.]$/.test(trimmedPrefix) || trimmedPrefix.endsWith("::") || trimmedPrefix.endsWith("->")) {
     return 0;
   }
+  // The quick refusal, before any of the regex work below: no tier declares a
+  // name that directly follows an operator, an opening bracket or a separator
+  // (`f(x`, `+ x`, `c[x`, `a, x`, `= x`, `{ x`). In a dense file most
+  // occurrences of a short name sit exactly there.
+  if (/[([{,=+\-/%!|^~<;:@#"'`]$/.test(trimmedPrefix)) return 0;
 
   // 1 — a declaring keyword immediately in front, or the declarator of a typed
   // declaration. Either way the name is what is declared, never its type.
   if (keywordDeclaration(prefix, suffix, opts)) return DEFINITION_SCORE.declaration;
-  if (!opts.typeAfterName && typedDeclaration(prefix, suffix)) return DEFINITION_SCORE.declaration;
+  if (!opts.typeAfterName && typedDeclaration(prefix, suffix, opts)) {
+    return DEFINITION_SCORE.declaration;
+  }
 
   // 2 — a signature that opens a body. Checked AFTER the declaration tier, so a
   // statement head is only ever refused here, never in front of a declaring
@@ -691,18 +764,38 @@ export function findDefinitions(
   const sites: DefinitionSite[] = [];
   let lineNo = 1;
   let cursor = 0;
+  let prevStart = -1;
   while (cursor <= doc.length) {
     let nl = doc.indexOf("\n", cursor);
     if (nl === -1) nl = doc.length;
+    const next = doc.indexOf(name, cursor);
+    if (next === -1) break;
+    if (next >= nl) {
+      prevStart = cursor;
+      cursor = nl + 1;
+      lineNo++;
+      continue;
+    }
     const line = doc.slice(cursor, nl);
-    if (line.includes(name)) {
-      for (const r of wordOccurrences(line, name)) {
-        const score = scoreDefinitionAt(line, r.from, name, opts);
-        if (score > 0) {
-          sites.push({ from: cursor + r.from, to: cursor + r.to, line: lineNo, score });
-        }
+    // A declaration split after its type (`public static Integer` ⏎
+    // `esperaSugerida(…) {`) is read as one line: the head, then this one.
+    let head: string | null = null;
+    if (prevStart >= 0) {
+      const prev = doc.slice(prevStart, cursor - 1);
+      if (isDanglingDeclarationHead(prev, opts)) head = prev.trim() + " ";
+    }
+    const indent = line.length - line.trimStart().length;
+    const joined = head === null ? "" : head + line.slice(indent);
+    for (const r of wordOccurrences(line, name)) {
+      let score = scoreDefinitionAt(line, r.from, name, opts);
+      if (head !== null) {
+        score = Math.max(score, scoreDefinitionAt(joined, head.length + r.from - indent, name, opts));
+      }
+      if (score > 0) {
+        sites.push({ from: cursor + r.from, to: cursor + r.to, line: lineNo, score });
       }
     }
+    prevStart = cursor;
     cursor = nl + 1;
     lineNo++;
   }

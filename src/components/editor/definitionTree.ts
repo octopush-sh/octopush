@@ -30,8 +30,15 @@ const PARSE_BUDGET_MS = 50;
 
 /** Every Lezer grammar we load names its keyword tokens after their text
  *  (`kw<"static">` is a node called `static`); these are the type keywords
- *  that get a node of their own instead. */
-const TYPE_KEYWORD_NODES = new Set(["PrimitiveType"]);
+ *  and literals that get a node of their own instead: Java's `PrimitiveType`,
+ *  JavaScript/Java's `BooleanLiteral` and Python/Rust's `Boolean`. */
+const TYPE_KEYWORD_NODES = new Set(["PrimitiveType", "BooleanLiteral", "Boolean"]);
+
+/** TypeScript's primitive types are plain `TypeName`s in its grammar. */
+const TS_PRIMITIVES = new Set([
+  "boolean", "any", "string", "number", "unknown", "never", "void", "object",
+  "bigint", "symbol", "undefined", "null",
+]);
 
 /** The grammars' identifier nodes. One of these can share its text with its
  *  node name — a Java class called `Definition`, a Rust type called
@@ -75,6 +82,9 @@ export function classifyClick(
   const node = nodeAt(treeFor(state, range.to), range.from, range.to);
   if (!node) return "unknown";
   if (lang === "rust" && node.name === "TypeIdentifier" && RUST_PRIMITIVES.has(range.name)) {
+    return "keyword";
+  }
+  if (lang === "javascript" && node.name === "TypeName" && TS_PRIMITIVES.has(range.name)) {
     return "keyword";
   }
   if (IDENTIFIER_NODES.has(node.name)) return "identifier";

@@ -714,6 +714,37 @@ describe("EditorPane · go to definition", () => {
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
   });
 
+  it("resolves a Java method split after its return type, and never the type", async () => {
+    mockStore.activeLang = "java";
+    const doc = [
+      "class A {",
+      "    public static Integer",
+      "    esperaSugerida(int a, int b) {",
+      "        return a;",
+      "    }",
+      "    int f() { return esperaSugerida(1, 2); }",
+      "}",
+    ].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("esperaSugerida");
+    onRequest({ name: "esperaSugerida", from, to: from + 14 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+      anchor: doc.indexOf("esperaSugerida"),
+      head: doc.indexOf("esperaSugerida") + 14,
+    });
+
+    // `Integer` is only ever the type here: no in-file jump, the workspace decides.
+    const typeView = navView(doc);
+    const at = doc.indexOf("Integer");
+    onRequest({ name: "Integer", from: at, to: at + 7 }, typeView);
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "Integer", true, true),
+    );
+    expect(typeView.dispatch).not.toHaveBeenCalled();
+  });
+
   it("jumps to a lone Go `x := …`, which declares by definition", async () => {
     mockStore.activeLang = "go";
     const doc = ["\tval := m[k]", "\tresp := http.Get(u)", "\treturn resp, val"].join("\n");

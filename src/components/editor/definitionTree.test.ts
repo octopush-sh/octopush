@@ -26,6 +26,18 @@ describe("classifyClick", () => {
     ["rust", "impl Display for Foo {}", "impl"],
     ["rust", "fn f(x: u32) -> u32 { x }", "u32"],
     ["python", "def run(self):\n    return 1\n", "def"],
+    // Literals and TypeScript's primitive types are part of the language too.
+    ["javascript", "const ok = true;", "true"],
+    ["javascript", "const ok = false;", "false"],
+    ["java", "class A { boolean f() { return true; } }", "true"],
+    ["python", "ok = True\n", "True"],
+    ["python", "ok = False\n", "False"],
+    ["rust", "fn f() -> bool { false }", "false"],
+    ...["boolean", "any", "string", "number", "unknown", "never", "object", "bigint", "symbol", "undefined"].map(
+      (t): [LangId, string, string] => ["javascript", `let x: ${t};`, t],
+    ),
+    ["javascript", "let x: string | null = null;", "null"],
+    ["javascript", "function f(): void {}", "void"],
   ];
   for (const [lang, doc, word] of keywords) {
     it(`${lang}: \`${word}\` is a keyword`, () => {
@@ -39,6 +51,9 @@ describe("classifyClick", () => {
     ["javascript", "const type = kind();", "type"],
     ["python", "final = compute()\n", "final"],
     ["rust", "struct Point { x: u32 }", "Point"],
+    // A TypeScript type that merely sounds primitive is still a name.
+    ["javascript", "let x: Foo;", "Foo"],
+    ["javascript", "let x: String;", "String"],
   ];
   for (const [lang, doc, word] of identifiers) {
     it(`${lang}: \`${word}\` is an ordinary identifier`, () => {
