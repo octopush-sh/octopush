@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  compileGlob,
   createMatchJob,
-  globToRegExp,
+  foldCase,
   MATCH_CHUNK,
   matchFiles,
   normalizeQuery,
@@ -55,13 +56,90 @@ describe("fileMatch — globs", () => {
       "src/components/Pane.tsx",
       "src/main/java/com/acme/Foo.java",
     ]);
-    expect(globToRegExp("[!a]b", true).test("cb")).toBe(true);
-    expect(globToRegExp("[!a]b", true).test("ab")).toBe(false);
+    expect(compileGlob("[!a]b", true)("cb")).toBe(true);
+    expect(compileGlob("[!a]b", true)("ab")).toBe(false);
+  });
+
+  it("never throws on a backwards range: it matches nothing, as in bash", () => {
+    for (const q of ["[z-a]", "[b-a].ts", "[9-0]*", "src/[z-a]/**"]) {
+      expect(() => parseQuery(q)).not.toThrow();
+      expect(() => find(q)).not.toThrow();
+      expect(find(q)).toEqual([]);
+    }
+    // The rest of the class still counts.
+    expect(compileGlob("[z-ap]om.xml", true)("pom.xml")).toBe(true);
+  });
+
+  it("treats unclosed or odd classes sensibly, without throwing", () => {
+    for (const q of ["[", "[abc", "src/[", "[]", "[!]", "[^", "*[", "[a-", "[a-]x", "[]]", "\\[x]"]) {
+      expect(() => find(q)).not.toThrow();
+    }
+    expect(compileGlob("[abc", true)("[abc")).toBe(true);
+    expect(compileGlob("a[", true)("a[")).toBe(true);
+    // `]` first in the class is a member; `-` at either end is literal.
+    expect(compileGlob("[]a]", true)("]")).toBe(true);
+    expect(compileGlob("[!]a]", true)("b")).toBe(true);
+    expect(compileGlob("[!]a]", true)("]")).toBe(false);
+    expect(compileGlob("[a-]", true)("-")).toBe(true);
+    // A class never matches `/`, even negated.
+    expect(compileGlob("a[!x]b", true)("a/b")).toBe(false);
+  });
+
+  it("**/ matches zero or more directories; ** alone crosses /", () => {
+    const g = compileGlob("src/**/*.ts", true);
+    expect(g("src/a.ts")).toBe(true);
+    expect(g("src/a/b/c.ts")).toBe(true);
+    expect(g("srca.ts")).toBe(false);
+    expect(compileGlob("a**b", true)("a/x/b")).toBe(true);
+    expect(compileGlob("a*b", true)("a/b")).toBe(false);
+    expect(compileGlob("**", true)("")).toBe(true);
+    expect(compileGlob("***.ts", true)("a/b.ts")).toBe(true);
+  });
+
+  it("agrees with a reference regex on random globs, short and long", () => {
+    // The old regex translation, kept here as the spec (valid globs only).
+    const reference = (glob: string) => {
+      let re = "";
+      for (let i = 0; i < glob.length; i++) {
+        const c = glob[i];
+        if (c === "*") {
+          let run = 1;
+          while (glob[i + 1] === "*") run++, i++;
+          if (run >= 2 && glob[i + 1] === "/") {
+            i++;
+            re += "(?:.*/)?";
+          } else re += run >= 2 ? ".*" : "[^/]*";
+        } else if (c === "?") re += "[^/]";
+        else if (c === "[") {
+          const close = glob.indexOf("]", i);
+          const body = glob.slice(i + 1, close);
+          re += body[0] === "!" ? `[^/${body.slice(1)}]` : `[${body}]`;
+          i = close;
+        } else re += c;
+      }
+      return new RegExp(`^${re}$`);
+    };
+    let seed = 7;
+    const rand = (n: number) => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) % n);
+    const PIECES = ["a", "b", "/", "*", "**", "**/", "?", "[ab]", "[!a]", "[a-b]"];
+    for (let round = 0; round < 600; round++) {
+      const len = round < 500 ? 1 + rand(6) : 31 + rand(10);
+      let glob = "";
+      for (let k = 0; k < len; k++) glob += PIECES[rand(PIECES.length)];
+      const ours = compileGlob(glob, true);
+      const re = reference(glob);
+      for (let t = 0; t < 20; t++) {
+        let subject = "";
+        const n = rand(round < 500 ? 9 : 40);
+        for (let k = 0; k < n; k++) subject += "ab/c"[rand(4)];
+        expect([glob, subject, ours(subject)]).toEqual([glob, subject, re.test(subject)]);
+      }
+    }
   });
 
   it("treats regex metacharacters literally", () => {
-    expect(globToRegExp("a.b+(c)*", true).test("a.b+(c)d")).toBe(true);
-    expect(globToRegExp("a.b*", true).test("axb")).toBe(false);
+    expect(compileGlob("a.b+(c)*", true)("a.b+(c)d")).toBe(true);
+    expect(compileGlob("a.b*", true)("axb")).toBe(false);
   });
 });
 
@@ -80,6 +158,18 @@ describe("fileMatch — fuzzy", () => {
       "src/test/java/com/acme/service/UserServiceTest.kt",
     ]);
     expect(find("user nothinglikethis")).toEqual([]);
+  });
+
+  it("a file named exactly the query (stem or full name) ranks first", () => {
+    const files = prepareFiles([
+      "src/main/java/com/acme/repo/UserRepo.java",
+      "src/main/java/com/acme/service/UserService.java",
+      "src/main/java/com/acme/domain/model/User.java",
+    ]);
+    const top = (q: string) => matchFiles(files, parseQuery(q))[0].path;
+    expect(top("user")).toBe("src/main/java/com/acme/domain/model/User.java");
+    expect(top("User.java")).toBe("src/main/java/com/acme/domain/model/User.java");
+    expect(top("userrepo")).toBe("src/main/java/com/acme/repo/UserRepo.java");
   });
 
   it("a file-name match beats a directory match", () => {
@@ -124,8 +214,57 @@ describe("fileMatch — positions and normalisation", () => {
     expect(parseQuery(`${WS}/src/main/java/com/acme/Foo.java`, WS).kind).toBe("fuzzy");
   });
 
+  it("a bare :42 or :42:7 is the empty query, not line 42 of whatever ranks first", () => {
+    for (const q of [":42", ":42:7", " :3 ", ":"]) {
+      const parsed = parseQuery(q);
+      expect(parsed.kind).toBe("empty");
+      expect(parsed.line).toBeUndefined();
+      expect(parsed.col).toBeUndefined();
+    }
+  });
+
+  it("a trailing colon typed on the way to :line keeps the matches", () => {
+    expect(parseQuery("index.ts:")).toMatchObject({ kind: "fuzzy", text: "index.ts" });
+    expect(parseQuery("index.ts:").line).toBeUndefined();
+    expect(parseQuery("index.ts:42:")).toMatchObject({ text: "index.ts", line: 42 });
+    expect(parseQuery("index.ts:42:").col).toBeUndefined();
+    expect(find("index.ts:")).toEqual(find("index.ts"));
+    expect(find("index.ts:")[0]).toBe("src/x/index.ts");
+    expect(find("*.ts:")).toEqual(find("*.ts"));
+  });
+
   it("an empty query lists every file", () => {
     expect(find("  ")).toHaveLength(FILES.length);
+  });
+});
+
+describe("fileMatch — unicode", () => {
+  it("folds case without changing the length, so indices stay aligned", () => {
+    expect(foldCase("İstanbul/User.ts")).toHaveLength("İstanbul/User.ts".length);
+    expect(foldCase("İstanbul/User.ts")).toBe("İstanbul/user.ts");
+    expect(foldCase("ÉCOLE")).toBe("école");
+  });
+
+  it("a cased character whose lower case is longer (İ) doesn't shift scores", () => {
+    const [dotted, plain] = matchFiles(prepareFiles(["src/İ/User.ts", "src/I/User.ts"]), parseQuery("user"));
+    expect(dotted.score).toBe(plain.score);
+    // The exact-name bonus lands too: the name is found where it really is.
+    const exact = matchFiles(prepareFiles(["İİİİ/User.ts", "İİİİ/UserX.ts"]), parseQuery("user"));
+    expect(exact[0].path).toBe("İİİİ/User.ts");
+    expect(exact[0].score).toBeGreaterThan(exact[1].score);
+    expect(matchFiles(prepareFiles(["İİ/a.ts"]), parseQuery("İİ/*.ts")).map((m) => m.path)).toEqual(["İİ/a.ts"]);
+  });
+
+  it("matches NFD paths with NFC queries and the other way round, reporting the listed path", () => {
+    const nfd = "docs/Cafe\u0301.md";
+    const nfc = "docs/Caf\u00e9.md";
+    expect(matchFiles(prepareFiles([nfd]), parseQuery("caf\u00e9")).map((m) => m.path)).toEqual([nfd]);
+    expect(matchFiles(prepareFiles([nfc]), parseQuery("cafe\u0301")).map((m) => m.path)).toEqual([nfc]);
+    expect(matchFiles(prepareFiles([nfd]), parseQuery("caf?.md")).map((m) => m.path)).toEqual([nfd]);
+    // Same score either way.
+    const a = matchFiles(prepareFiles([nfd]), parseQuery("café"))[0].score;
+    const b = matchFiles(prepareFiles([nfc]), parseQuery("café"))[0].score;
+    expect(a).toBe(b);
   });
 });
 
@@ -169,6 +308,33 @@ describe("fileMatch — performance", () => {
       expect(job.result().length).toBeGreaterThan(0);
       expect(worst).toBeLessThan(16);
     }
+  });
+
+  it("pathological globs stay linear: all of them over 20,000 60-char paths in < 200 ms", () => {
+    // Backtracking regexes took 55 ms and 272 ms *per file* on the first two.
+    // 60-char paths whose 40-char file names are almost all `a`.
+    const paths = Array.from({ length: 20_000 }, (_, i) =>
+      `src/${"a".repeat(15)}/${(String(i) + "a".repeat(40)).slice(0, 40)}`,
+    );
+    expect(paths.every((p) => p.length === 60)).toBe(true);
+    const files = prepareFiles(paths);
+    const patterns = [
+      "**a**a**a**a**a**/x",
+      "*a*a*a*a*a*a*b",
+      "**a**a**a**a**a**a**a**a**b",
+      "*?*?*?*?*?*?*b",
+      // A class tail gets past the literal-tail shortcut, so the automaton
+      // reads every character.
+      "*a*a*a*a*a*a*[b]",
+      "**a**a**a**a**a**/[x]",
+      // Over 30 states: several words per state set.
+      "*a".repeat(20) + "[b]",
+    ];
+    const parsed = patterns.map((q) => parseQuery(q));
+    for (const q of parsed) matchFiles(files, q); // warm up
+    const t0 = performance.now();
+    for (const q of parsed) expect(matchFiles(files, q)).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(200);
   });
 
   it("step works until its deadline, then yields", () => {

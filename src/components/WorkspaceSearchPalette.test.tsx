@@ -138,6 +138,25 @@ describe("WorkspaceSearchPalette — file finder matching", () => {
     expect(onOpen2).toHaveBeenCalledWith("src/Foo.java", 42, 7);
   });
 
+  it("a bare :42 is no query: every file listed, no :line, Enter passes no line", async () => {
+    const user = userEvent.setup();
+    const onOpenFile = renderFiles(["src/Bar.java", "src/Foo.java"]);
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
+    await user.type(input(), ":42");
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
+    expect(screen.queryByText(":42")).toBeNull();
+    await user.keyboard("{Enter}");
+    expect(onOpenFile).toHaveBeenCalledWith("src/Bar.java");
+  });
+
+  it("a trailing colon typed on the way to :line keeps the matches", async () => {
+    const user = userEvent.setup();
+    renderFiles(["src/Bar.java", "src/Foo.java"]);
+    await waitFor(() => expect(screen.getAllByRole("option")).toHaveLength(2));
+    await user.type(input(), "Foo.java:");
+    await waitFor(() => expect(optionNames()).toEqual(["Foo.java"]));
+  });
+
   it("arrow keys move the selection; Enter opens it", async () => {
     const user = userEvent.setup();
     const onOpenFile = renderFiles(["a.ts", "b.ts", "c.ts"]);
