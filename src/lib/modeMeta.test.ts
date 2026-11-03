@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { diffStat, runTailState, modeMetaLabel, type ModeMetaInput } from "./modeMeta";
+import {
+  diffStat,
+  runTailState,
+  modeMetaLabel,
+  reviewTailParts,
+  type ModeMetaInput,
+} from "./modeMeta";
 
 const base: ModeMetaInput = {
   terminalCount: 0,
@@ -129,6 +135,20 @@ describe("modeMetaLabel", () => {
         diffStat: { added: 214, removed: 61 },
       }),
     ).toBe("7 files changed · +214 −61");
+  });
+
+  it("splits the review tail into the atoms its ladder sheds", () => {
+    expect(reviewTailParts(0, { added: 3, removed: 1 })).toBeNull();
+    expect(reviewTailParts(1, { added: 0, removed: 0 })).toEqual({
+      files: "1 file",
+      verb: "changed",
+      stat: null,
+    });
+    expect(reviewTailParts(2, { added: 2, removed: 1 })).toEqual({
+      files: "2 files",
+      verb: "changed",
+      stat: "+2 −1",
+    });
   });
 
   it("reports the crew's state in direct mode", () => {

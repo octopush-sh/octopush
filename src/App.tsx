@@ -45,6 +45,7 @@ import { TerminalPane } from "./components/TerminalPane";
 import { SessionRail } from "./components/run/SessionRail";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
 import { SessionAnchor } from "./components/run/SessionAnchor";
+import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
@@ -89,7 +90,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { useGlobalShortcuts, type ShortcutContext } from "./hooks/useGlobalShortcuts";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
-import { diffStat, modeMetaLabel, runTailState } from "./lib/modeMeta";
+import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
@@ -1177,12 +1178,20 @@ function App() {
   // anchor names the active session and opens the ⌘⌥K switcher, which is what
   // makes a keyboard-only palette discoverable. With no sessions open there is
   // nothing to anchor, so the plain "No terminals" reading stands.
+  // In Review the tail is a demotion ladder rather than one truncating line,
+  // so a narrow band sheds whole atoms instead of ending on "· …".
+  const reviewParts = useMemo(
+    () => reviewTailParts(gitStatus?.changedFiles.length ?? 0, workingDiffStat),
+    [gitStatus, workingDiffStat],
+  );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
       <SessionAnchor
         workspaceId={activeWorkspaceId}
         onOpen={() => setSessionSwitcherOpen(true)}
       />
+    ) : activeMode === "review" && reviewParts && modeMetaText ? (
+      <ReviewTail parts={reviewParts} label={modeMetaText} />
     ) : (
       modeMetaText
     );

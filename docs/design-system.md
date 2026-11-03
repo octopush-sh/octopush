@@ -376,6 +376,8 @@ The dot-for-label swap at the last rung is §9's "a state shown by a dot does no
 
 **Shedding controls into "More" (2026-11-01; born in the Review toolbar).** When the shed atoms are *controls* rather than meta, a tooltip can't hold them — so the rung that sheds them is paired with an inverse rung: a `MoreHorizontal` button that grows in (same animated width) only once they are gone, opening a `.octo-menu-enter` menu with the same controls. The Review toolbar (`.octo-reviewbar`) sheds Inline/Side-by-side, ±WS and Tests together at ≤ 600px; its floor is Diff/Editor, AI and Accept all. Popovers belonging to shed controls anchor to the band, never to the rung, whose `overflow: hidden` would clip them.
 
+**Shedding by measured width (2026-11-03; born in the Review status tail).** A fixed container breakpoint only works when the rungs have fixed widths. The Review tail's rungs hold counts ("changed", then "· +2 −1"; floor "2 files"), so `ReviewTail.tsx` measures each rung's natural width against the track's and sheds through `.octo-demote-shed` (`rungsToShed`). The motion is the same. This only works when the measured box is sized by its parent (a grid track) and never by the content it sheds, so shedding can't feed back into the measurement.
+
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
 - **S1 — Fixed-slot live text.** Text that changes while something runs lives in a fixed-height truncating slot that exists in every state — content changes never resize the container.
