@@ -1179,6 +1179,32 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
 1303b2e7d1dd9b43d3fc4afff387435740928dd47fd97b99337929cac48a2e00f570a88303e21182e3830b17cef5cc98\
 220e3abfd985981bf21f4e";
 
+    /// The `SecTrust` refusal the macOS fixture test skips on (#490): OSStatus
+    /// -67825 as `trust_evaluation_error` and upstream render it, the code
+    /// being the message's exact `: -67825` suffix. Anything else still fails.
+    fn is_not_standards_compliant(err: &TlsError) -> bool {
+        matches!(
+            err,
+            TlsError::InvalidCertificate(CertificateError::Other(OtherError(inner)))
+                if inner.to_string().ends_with(": -67825")
+        )
+    }
+
+    #[test]
+    fn only_the_exact_not_standards_compliant_code_is_skipped() {
+        let detail = "“letsencrypt.org” certificate is not standards compliant";
+        assert!(is_not_standards_compliant(&trust_evaluation_error(-67825, &detail)));
+        // Neighbouring codes, a code that merely contains it, or the code
+        // anywhere but at the end of the message are real failures.
+        assert!(!is_not_standards_compliant(&trust_evaluation_error(-678250, &detail)));
+        assert!(!is_not_standards_compliant(&trust_evaluation_error(-67818, &"-67825 seen")));
+        assert!(!is_not_standards_compliant(&invalid_certificate("-67825".into())));
+        assert!(!is_not_standards_compliant(&invalid_certificate(": -67825 (retry)".into())));
+        // Mapped codes never carry the text, and other variants never match.
+        assert!(!is_not_standards_compliant(&trust_evaluation_error(-67602, &detail)));
+        assert!(!is_not_standards_compliant(&TlsError::General(format!("{detail}: -67825"))));
+    }
+
     /// Guards the success path of `evaluate_on_macos`: a broken verify date,
     /// policy or chain extraction would otherwise reject every connection on
     /// macOS while the failure-path tests stayed green.
@@ -1192,15 +1218,24 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         let intermediates = [CertificateDer::from(unhex(LETSENCRYPT_E6))];
         let name = ServerName::try_from("letsencrypt.org").unwrap();
 
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
         let built = match evaluate_on_macos(&leaf, &intermediates, &name, &[], now) {
             Ok(built) => built,
             // errSecVerifyActionFailed "certificate is not standards compliant":
             // newer macOS images judge this 2025 fixture's CT evidence against
             // today's log list whatever the verify date, so the fixture no
-            // longer evaluates there (#490). Live chains are unaffected. Skip
-            // rather than fail until the fixture is replaced by one under a
-            // test-only anchor, which the OS does not hold to CT.
-            Err(e) if format!("{e:?}").contains("-67825") => {
+            // longer evaluates there (#490). Turning network fetch off does
+            // not change it. Live chains are unaffected. Skip rather than fail
+            // until the fixture is replaced by one under a test-only anchor,
+            // which the OS does not hold to CT, but only once upstream's
+            // verifier rejects it the same way: the refusal is Apple's, not a
+            // drift in our mirror.
+            Err(e) if is_not_standards_compliant(&e) => {
+                let upstream = rustls_platform_verifier::Verifier::new(provider).unwrap();
+                match upstream.verify_server_cert(&leaf, &intermediates, &name, &[], now) {
+                    Err(up) if is_not_standards_compliant(&up) => {}
+                    other => panic!("our mirror says {e:?} but upstream says {other:?}"),
+                }
                 eprintln!("skipped: this macOS no longer accepts the 2025 fixture (#490): {e:?}");
                 return;
             }
@@ -1213,8 +1248,7 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         assert_eq!(built[0], leaf.as_ref());
         assert_eq!(built[1], intermediates[0].as_ref());
 
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let v = DenylistVerifier::platform(rustls_platform_verifier::Verifier::new(provider).unwrap());
+        let v =DenylistVerifier::platform(rustls_platform_verifier::Verifier::new(provider).unwrap());
         v.verify_server_cert(&leaf, &intermediates, &name, &[], now).expect("production verifier accepts");
         // And the hostname is enforced on the same chain.
         let other = ServerName::try_from("example.com").unwrap();
