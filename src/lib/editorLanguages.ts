@@ -10,18 +10,20 @@ import { html } from "@codemirror/lang-html";
 import { css } from "@codemirror/lang-css";
 import { xml } from "@codemirror/lang-xml";
 import { yaml } from "@codemirror/lang-yaml";
+import { go } from "@codemirror/lang-go";
+import { cpp } from "@codemirror/lang-cpp";
+import { sql } from "@codemirror/lang-sql";
+import { sass } from "@codemirror/lang-sass";
+import { php } from "@codemirror/lang-php";
 import { shell } from "@codemirror/legacy-modes/mode/shell";
 import { toml } from "@codemirror/legacy-modes/mode/toml";
-import { go } from "@codemirror/legacy-modes/mode/go";
-import { standardSQL } from "@codemirror/legacy-modes/mode/sql";
 import { dockerFile } from "@codemirror/legacy-modes/mode/dockerfile";
 import { properties } from "@codemirror/legacy-modes/mode/properties";
 import { ruby } from "@codemirror/legacy-modes/mode/ruby";
 import { swift } from "@codemirror/legacy-modes/mode/swift";
-import { c, cpp, csharp, kotlin, scala, dart } from "@codemirror/legacy-modes/mode/clike";
+import { csharp, kotlin, scala, dart } from "@codemirror/legacy-modes/mode/clike";
 import { groovy } from "@codemirror/legacy-modes/mode/groovy";
 import { protobuf } from "@codemirror/legacy-modes/mode/protobuf";
-import { sass } from "@codemirror/legacy-modes/mode/sass";
 import { lua } from "@codemirror/legacy-modes/mode/lua";
 import type { LangId } from "./editorLang";
 
@@ -54,6 +56,14 @@ export function languageSupport(lang: LangId): Extension {
     case "css":        return css();
     case "xml":        return xml();
     case "yaml":       return yaml();
+    case "go":         return go();
+    // One grammar reads both: C is (near enough) a subset of C++.
+    case "c":
+    case "cpp":        return cpp();
+    case "sql":        return sql();
+    case "sass":       return sass({ indented: true });
+    case "scss":       return sass();
+    case "php":        return php();
     default:           return languageFor(lang) ?? [];
   }
 }
@@ -82,17 +92,19 @@ export function languageFor(lang: LangId): Language | null {
     case "css":        l = css().language; break;
     case "xml":        l = xml().language; break;
     case "yaml":       l = yaml().language; break;
-    case "sass":       l = StreamLanguage.define(sass); break;
+    case "go":         l = go().language; break;
+    case "c":
+    case "cpp":        l = cpp().language; break;
+    case "sql":        l = sql().language; break;
+    case "sass":       l = sass({ indented: true }).language; break;
+    case "scss":       l = sass().language; break;
+    case "php":        l = php().language; break;
     case "shell":      l = StreamLanguage.define(shell); break;
     case "toml":       l = StreamLanguage.define(toml); break;
-    case "go":         l = StreamLanguage.define(go); break;
-    case "sql":        l = StreamLanguage.define(standardSQL); break;
     case "dockerfile": l = StreamLanguage.define(dockerFile); break;
     case "properties": l = StreamLanguage.define(properties); break;
     case "ruby":       l = StreamLanguage.define(ruby); break;
     case "swift":      l = StreamLanguage.define(swift); break;
-    case "c":          l = StreamLanguage.define(c); break;
-    case "cpp":        l = StreamLanguage.define(cpp); break;
     case "csharp":     l = StreamLanguage.define(csharp); break;
     case "kotlin":     l = StreamLanguage.define(kotlin); break;
     case "scala":      l = StreamLanguage.define(scala); break;

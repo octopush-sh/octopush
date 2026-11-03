@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { langForExtension, type LangId } from "./editorLang";
+import { hasCppSources, langForExtension, type LangId } from "./editorLang";
 import { languageFor } from "./editorLanguages";
 
 describe("langForExtension", () => {
@@ -33,7 +33,7 @@ describe("langForExtension", () => {
     ["/a/b/page.html","html"],
     ["/a/b/page.htm", "html"],
     ["/a/b/base.css", "css"],
-    ["/a/b/main.scss","css"],
+    ["/a/b/main.scss","scss"],
     ["/a/b/data.xml", "xml"],
     ["/a/b/icon.svg", "xml"],
     ["/a/b/ci.yaml",  "yaml"],
@@ -54,15 +54,31 @@ describe("langForExtension", () => {
     ["/a/b/x.kt",     "kotlin"],
     ["/a/b/x.lua",    "lua"],
     ["/a/b/x.h",      "c"],
+    ["/a/b/x.php",    "php"],
     // No grammar installed yet: these stay plain text (FEATURES.md §5).
     ["/a/b/Makefile", "plaintext"],
-    ["/a/b/x.php",    "plaintext"],
     ["/a/b/main.tf",  "plaintext"],
     ["/a/b/x.hcl",    "plaintext"],
     ["/a/b/q.graphql","plaintext"],
     ["/a/b/no-ext",   "plaintext"],
   ])("langForExtension(%s) = %s", (path, expected) => {
     expect(langForExtension(path)).toBe(expected);
+  });
+
+  it("reads .h as C++ only in a workspace with C++ sources", () => {
+    expect(langForExtension("/a/b/x.h", { cppHeaders: true })).toBe("cpp");
+    expect(langForExtension("/a/b/x.c", { cppHeaders: true })).toBe("c");
+    expect(langForExtension("/a/b/x.h", { cppHeaders: false })).toBe("c");
+  });
+});
+
+describe("hasCppSources", () => {
+  it.each(["src/a.cpp", "src/a.cc", "src/a.cxx", "inc/a.hpp", "inc/a.hh", "SRC/A.CPP"])("%s is a C++ source", (f) => {
+    expect(hasCppSources(["README.md", "inc/a.h", f])).toBe(true);
+  });
+  it("a C-only workspace has none", () => {
+    expect(hasCppSources(["src/a.c", "inc/a.h", "notes.cpp.txt", "Makefile"])).toBe(false);
+    expect(hasCppSources([])).toBe(false);
   });
 });
 
@@ -72,6 +88,27 @@ function nodeNames(lang: LangId, doc: string): string[] {
   languageFor(lang)!.parser.parse(doc).iterate({ enter: (n) => { names.push(n.name); } });
   return names;
 }
+
+// The Lezer grammars that replaced stream modes: a real tree, no errors.
+describe("Lezer grammars", () => {
+  const TREES: [path: string, doc: string, nodes: string[]][] = [
+    ["main.go", "package main\n\nfunc main() {\n\tx := 1\n\t_ = x\n}\n", ["PackageClause", "FunctionDecl", "DefName", "VarDecl"]],
+    ["a.c", "#include <stdio.h>\nint main(void) { return 0; }\n", ["PreprocDirective", "FunctionDefinition", "PrimitiveType"]],
+    ["a.cpp", "namespace a {\ntemplate <typename T> class Box { public: T v; };\n}\n", ["NamespaceDefinition", "TemplateDeclaration", "ClassSpecifier", "Access"]],
+    ["q.sql", "SELECT id FROM users WHERE id = 1;\n", ["Statement", "Keyword", "Identifier", "Number"]],
+    ["a.sass", "$c: red\n.a\n  color: $c\n", ["SassVariableName", "RuleSet", "ClassName"]],
+    ["a.scss", "$c: red;\n.a { .b { color: $c; } }\n", ["SassVariableName", "RuleSet", "ClassName"]],
+    ["a.php", "<?php\nfunction f($x) { return $x; }\n", ["FunctionDefinition", "VariableName"]],
+  ];
+  it.each(TREES)("%s parses into a syntax tree", (path, doc, nodes) => {
+    const names = nodeNames(langForExtension(path), doc);
+    expect(names).not.toContain("⚠");
+    for (const n of nodes) expect(names).toContain(n);
+  });
+  it("C and C++ share the C++ grammar", () => {
+    expect(languageFor("c")).toBe(languageFor("cpp"));
+  });
+});
 
 describe("JS/TS dialects", () => {
   // Generic arrow functions, angle-bracket casts and generic calls: in a .ts

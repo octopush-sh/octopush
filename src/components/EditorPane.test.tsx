@@ -686,6 +686,7 @@ describe("EditorPane · go to definition", () => {
     expect(mockOpenAsJump).toHaveBeenCalledWith("ws-active", "/repo/src/parser.ts", {
       line: 12,
       from: { path: "/repo/file.ts", anchor: req.from, head: req.from, scrollTop: 0 },
+      root: "/repo",
     });
   });
 
