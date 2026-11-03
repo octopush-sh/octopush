@@ -12,6 +12,6 @@ steps:
   - target: file-finder-results
     caption: Every .ts and .tsx file in the workspace. A backslash makes the next character literal.
 ---
-⌘P globs now expand braces (`*.{ts,tsx}`) and take `\` escapes (`\*.ts`), and `?` matches a
-whole emoji. A glob longer than 256 characters is matched as plain fuzzy text, so a pasted
+⌘P globs now expand braces (`*.{ts,tsx}`) and take `\` escapes (`\*.ts`), and `?` takes a
+whole character, including emoji such as 😀 that need two UTF-16 units. A glob longer than 256 characters is matched as plain fuzzy text, so a pasted
 pattern can't stall the finder.

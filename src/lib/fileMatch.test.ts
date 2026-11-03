@@ -205,6 +205,9 @@ describe("fileMatch — globs", () => {
     expect(compileGlob("😀*", true)("😀b")).toBe(true);
     expect(compileGlob("a?b", true)("a😀b")).toBe(true);
     expect(compileGlob("a?b", true)("a\ud83db")).toBe(true); // a lone surrogate is one character
+    // One code point, not one grapheme: a skin-toned emoji is two code points.
+    expect(compileGlob("?.md", true)("👍🏽.md")).toBe(false);
+    expect(compileGlob("??.md", true)("👍🏽.md")).toBe(true);
     expect(matchFiles(prepareFiles(["docs/😀.md", "docs/ab.md"]), parseQuery("?.md")).map((m) => m.path)).toEqual([
       "docs/😀.md",
     ]);
