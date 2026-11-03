@@ -80,6 +80,26 @@ function compactTokens(n: number): string {
   return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
 }
 
+/** The Review tail split into the atoms its demotion ladder sheds
+ *  (`ReviewTail.tsx`): `files` is the floor ("2 files"), `verb` ("changed")
+ *  goes first as the band narrows, then `stat` ("+2 −1", null with no line
+ *  changes). Null when nothing changed — the tail is then the plain
+ *  "Nothing to review". */
+export interface ReviewTailParts {
+  files: string;
+  verb: string;
+  stat: string | null;
+}
+
+export function reviewTailParts(changedCount: number, stat: DiffStat): ReviewTailParts | null {
+  if (changedCount <= 0) return null;
+  return {
+    files: changedCount === 1 ? "1 file" : `${changedCount} files`,
+    verb: "changed",
+    stat: stat.added === 0 && stat.removed === 0 ? null : `+${stat.added} −${stat.removed}`,
+  };
+}
+
 /** The status tail for a mode, or null when there is nothing worth saying —
  *  a null tail renders nothing rather than an empty slot. */
 export function modeMetaLabel(mode: WorkspaceMode, input: ModeMetaInput): string | null {
@@ -95,11 +115,10 @@ export function modeMetaLabel(mode: WorkspaceMode, input: ModeMetaInput): string
       return `${compactTokens(input.tokensUsed)} / ${compactTokens(input.tokensLimit)} context`;
     }
     case "review": {
-      const { changedCount, diffStat: stat } = input;
-      if (changedCount <= 0) return "Nothing to review";
-      const files = changedCount === 1 ? "1 file changed" : `${changedCount} files changed`;
-      if (stat.added === 0 && stat.removed === 0) return files;
-      return `${files} · +${stat.added} −${stat.removed}`;
+      const parts = reviewTailParts(input.changedCount, input.diffStat);
+      if (!parts) return "Nothing to review";
+      const files = `${parts.files} ${parts.verb}`;
+      return parts.stat ? `${files} · ${parts.stat}` : files;
     }
     case "direct": {
       switch (input.runState) {
