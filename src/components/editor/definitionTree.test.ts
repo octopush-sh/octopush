@@ -89,6 +89,13 @@ describe("classifyClick", () => {
     ["go", "package main\nfunc f() { self := 1; _ = self }\n", "self"],
     ["c", "struct foo *self;", "self"],
     ["c", "struct foo *self;", "foo"],
+    // C++-only keywords are ordinary names in C, though C parses with the C++ grammar.
+    ["c", "int f(struct device *dev) { return dev->class; }", "class"],
+    ["c", "struct node *new;", "new"],
+    ["c", "struct node *new; void f(void) { new = 0; }", "new", 1],
+    ["c", "int this = 0;", "this"],
+    ["c", "int private = 0;", "private"],
+    ["c", "void f(void) { template = 1; }", "template"],
     ["cpp", "std::string name;", "string"],
     ["cpp", "class Parser { };", "Parser"],
     ["cpp", "namespace app { } int x = app::y;", "app", 1],

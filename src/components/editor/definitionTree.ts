@@ -10,7 +10,8 @@
  * language (C#, Kotlin, …), a document not parsed that far, or a node it
  * doesn't know. Callers then fall back to the line heuristic. C and C++ get
  * the keyword answer only: their declarators nest too many ways for the site
- * check to veto a candidate safely.
+ * check to veto a candidate safely. C parses with the C++ grammar, so the
+ * C++-only keywords are names there.
  */
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
@@ -71,6 +72,20 @@ const GO_PREDECLARED = new Set([
   "complex64", "complex128", "string", "iota", "nil",
 ]);
 
+/** C is parsed with the C++ grammar, so these words still get keyword nodes
+ *  in a `.c` file (`private` even gets an `Access` node). C doesn't reserve
+ *  them: `dev->class` and `struct node *new` are ordinary C names. `bool`,
+ *  `true` and `false` stay keywords; C23 reserves them too. */
+const CPP_ONLY_KEYWORDS = new Set([
+  "alignas", "alignof", "asm", "catch", "class", "concept", "consteval", "constexpr",
+  "constinit", "const_cast", "co_await", "co_return", "co_yield", "decltype",
+  "delete", "dynamic_cast", "explicit", "export", "final", "friend", "module",
+  "mutable", "namespace", "new", "noexcept", "nullptr", "operator", "override",
+  "private", "protected", "public", "reinterpret_cast", "requires",
+  "static_assert", "static_cast", "template", "this", "thread_local", "throw",
+  "try", "typeid", "typename", "using", "virtual",
+]);
+
 /** Rust's primitive types are plain `TypeIdentifier`s in its grammar. */
 const RUST_PRIMITIVES = new Set([
   "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128",
@@ -116,6 +131,7 @@ export function classifyClick(
     return "keyword";
   }
   if (IDENTIFIER_NODES.has(node.name)) return "identifier";
+  if (lang === "c" && CPP_ONLY_KEYWORDS.has(range.name)) return "identifier";
   if (node.name === range.name || TYPE_KEYWORD_NODES.has(node.name)) return "keyword";
   return "identifier";
 }
