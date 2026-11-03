@@ -4878,6 +4878,67 @@ mod orchestrator_tests {
         assert_eq!(stage.effort, Some(crate::providers::Effort::Low));
     }
 
+    /// A Claude stage whose `result` said success but whose CLI exited 1
+    /// (Claude Code ≥ 2.1.317 on a full disk), parsed by the real parser.
+    struct SessionNotSavedRunner {
+        calls: Arc<Mutex<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for SessionNotSavedRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            *self.calls.lock() += 1;
+            crate::orchestrator::cli_runner::parse_cli_result(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Implemented the feature.",
+                    "session_id":"sess-lost","total_cost_usd":0.4,"usage":{"input_tokens":30,"output_tokens":9}}"#,
+                false,
+                ArtifactKind::Diff,
+                "ENOSPC: no space left on device, write",
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_stage_that_could_not_save_its_session_keeps_its_work_and_never_escalates() {
+        let (db, run) = esc_run(None, Some("strong-m"), None);
+        let stage_id = db.lock().list_run_stages(&run).unwrap()[0].id.clone();
+        db.lock().set_stage_session(&stage_id, Some("sess-old")).unwrap();
+        let calls = Arc::new(Mutex::new(0));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SessionNotSavedRunner { calls: Arc::clone(&calls) }));
+        let status = orch.run_to_pause(&run).await.unwrap();
+        assert_eq!(status, RunStatus::Paused);
+        assert_eq!(*calls.lock(), 1, "a full disk is not a weak-tier failure — no escalation");
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "failed");
+        assert!(!stage.escalated);
+        let err = stage.error.as_deref().unwrap();
+        assert!(crate::orchestrator::cli_runner::is_session_not_saved(err), "{err}");
+        assert!(!err.starts_with("Implemented the feature."), "the agent's summary is not the failure reason: {err}");
+        assert!(err.contains("no space left on device"), "the stderr tail is kept: {err}");
+        assert!(
+            stage.artifact.as_deref().is_some_and(|a| a.contains("Implemented the feature.")),
+            "the finished work's artifact is kept: {:?}",
+            stage.artifact
+        );
+        assert_eq!(stage.session_id, None, "the unsaved session is never --resume'd");
+        assert!((stage.cost_usd - 0.4).abs() < 1e-9, "the spend stays on the meter");
+
+        // Approving accepts the real result, not a synthesized stub.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "done");
+        let artifact: StageArtifact = serde_json::from_str(stage.artifact.as_deref().unwrap()).unwrap();
+        assert_eq!(artifact.text, "Implemented the feature.");
+        assert_eq!(artifact.kind, ArtifactKind::Diff);
+        assert!(artifact.refs_worktree);
+    }
+
     #[tokio::test]
     async fn a_blocked_stage_never_escalates_even_with_a_policy() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
@@ -8525,6 +8586,72 @@ mod cli_runner_tests {
     fn nonzero_exit_yields_failed_even_if_json_ok() {
         let outcome = parse_cli_result(SUCCESS, false, ArtifactKind::Plan, "").unwrap();
         assert_eq!(outcome.status, StageStatus::Failed);
+    }
+
+    #[test]
+    fn success_result_with_exit_1_says_the_session_was_not_saved_and_keeps_the_artifact() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved};
+        const WITH_SESSION: &str = r#"{"type":"result","subtype":"success","is_error":false,
+            "result":"Implemented the feature.","session_id":"sess-lost","total_cost_usd":0.0123,
+            "usage":{"input_tokens":1200,"output_tokens":340}}"#;
+        let outcome = parse_cli_result(WITH_SESSION, false, ArtifactKind::Diff, "ENOSPC: no space left on device").unwrap();
+        assert_eq!(outcome.status, StageStatus::Failed);
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.starts_with("Claude Code finished the work but exited with an error"), "{err}");
+        assert!(is_session_not_saved(err), "{err}");
+        assert!(!is_budget_stop(err));
+        assert!(err.ends_with("— stderr —\nENOSPC: no space left on device"), "{err}");
+        assert_eq!(outcome.artifact.text, "Implemented the feature.", "the work is kept");
+        assert_eq!(outcome.artifact.kind, ArtifactKind::Diff);
+        assert!(outcome.artifact.refs_worktree);
+        assert_eq!(outcome.session_id, None, "the transcript was never written — no --resume");
+        assert!((outcome.cost_usd - 0.0123).abs() < 1e-9);
+        assert_eq!(outcome.input_tokens, 1200);
+    }
+
+    #[test]
+    fn exit_1_without_a_clean_success_keeps_the_old_failure_paths() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved};
+        // is_error, a budget stop and a bad subtype read exactly as before.
+        let errored = parse_cli_result(ERRORED, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(errored.error.as_deref(), Some("claude stopped early (error_during_execution): Something broke."));
+        let budget = parse_cli_result(BUDGET_STOPPED, false, ArtifactKind::Diff, "").unwrap();
+        assert!(is_budget_stop(budget.error.as_deref().unwrap()));
+        assert_eq!(budget.session_id.as_deref(), Some("sess-b"));
+        const MAX_TURNS: &str = r#"{"subtype":"error_max_turns","result":"partial","is_error":false}"#;
+        let turns = parse_cli_result(MAX_TURNS, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(turns.error.as_deref(), Some("claude stopped early (error_max_turns): partial"));
+        // A success with no text has nothing to keep.
+        const EMPTY: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":""}"#;
+        let empty = parse_cli_result(EMPTY, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(empty.error.as_deref(), Some("claude exited with an error"));
+        for o in [&errored, &budget, &turns, &empty] {
+            assert!(!is_session_not_saved(o.error.as_deref().unwrap()));
+            assert!(o.artifact.text.is_empty(), "only the unsaved-session case keeps an artifact");
+        }
+        // Exit 0 is still a clean Done.
+        assert_eq!(parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap().status, StageStatus::Done);
+    }
+
+    #[test]
+    fn unsaved_session_error_names_the_free_space_on_the_worktree_volume() {
+        use crate::orchestrator::cli_runner::{format_free_bytes, free_bytes, with_free_space};
+        let outcome = parse_cli_result(SUCCESS, false, ArtifactKind::Diff, "").unwrap();
+        let err = with_free_space(outcome, || Some(1_234_000_000)).error.unwrap();
+        assert!(err.ends_with("\n1.2 GB free on the worktree's volume"), "{err}");
+        // Any other failure is left alone, and the volume is never queried.
+        let other = parse_cli_result(ERRORED, true, ArtifactKind::Diff, "").unwrap();
+        let before = other.error.clone();
+        assert_eq!(with_free_space(other, || panic!("queried")).error, before);
+        // Unknown free space leaves the message as it was.
+        let outcome = parse_cli_result(SUCCESS, false, ArtifactKind::Diff, "").unwrap();
+        let before = outcome.error.clone();
+        assert_eq!(with_free_space(outcome, || None).error, before);
+        assert_eq!(format_free_bytes(340_000_000), "340 MB");
+        assert_eq!(format_free_bytes(12_000), "12 KB");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(free_bytes(dir.path()).is_some_and(|b| b > 0));
+        assert_eq!(free_bytes(&dir.path().join("missing")), None);
     }
 
     #[test]

@@ -379,6 +379,58 @@ pub fn is_budget_stop(error: &str) -> bool {
     error.contains(BUDGET_STOP_SUBTYPE)
 }
 
+/// The marker in the error of a stage whose `result` said `success` but whose
+/// `claude -p` exited non-zero. Since Claude Code 2.1.317 that is how `-p`
+/// reports a full disk or quota that lost the session transcript (or a
+/// `~/.claude.json` write): the work is finished, the session is not saved.
+pub const SESSION_NOT_SAVED: &str = "could not save its session";
+
+/// True when a stage error is a finished-but-unsaved Claude Code stage (see
+/// [`parse_cli_result`]): the drive must not escalate it — a stronger model
+/// will not free a full disk — and its session must not be `--resume`d.
+pub fn is_session_not_saved(error: &str) -> bool {
+    error.contains(SESSION_NOT_SAVED)
+}
+
+/// Free space for an unprivileged user on the volume holding `path`.
+#[allow(clippy::unnecessary_cast)] // statvfs field widths differ between macOS and Linux
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+/// `1.2 GB` / `340 MB` / `12 KB` — decimal units, as Finder shows them.
+pub(crate) fn format_free_bytes(bytes: u64) -> String {
+    const KB: f64 = 1e3;
+    const MB: f64 = 1e6;
+    const GB: f64 = 1e9;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else {
+        format!("{:.0} KB", b / KB)
+    }
+}
+
+/// Append the worktree volume's free space to a [`SESSION_NOT_SAVED`]
+/// outcome's error; any other outcome is returned unchanged (and `free` is
+/// not called).
+pub(crate) fn with_free_space(mut outcome: StageOutcome, free: impl FnOnce() -> Option<u64>) -> StageOutcome {
+    if let Some(err) = outcome.error.as_mut().filter(|e| is_session_not_saved(e)) {
+        if let Some(bytes) = free() {
+            err.push_str(&format!("\n{} free on the worktree's volume", format_free_bytes(bytes)));
+        }
+    }
+    outcome
+}
+
 /// The `--max-budget-usd` cap for a Claude stage: the stage's share of the
 /// run's remaining budget (`spend_limit`, absent when unmetered — no budget,
 /// or the director's conscious override), plus, for a `--resume`d stage, the
@@ -409,6 +461,9 @@ pub fn max_budget_args(cap: Option<f64>) -> Vec<String> {
 /// A [`BUDGET_STOP_SUBTYPE`] result is a budget stop, not a crash: it keeps
 /// its spend and session (Resume continues it) and its error says so —
 /// [`is_budget_stop`] tells the drive not to escalate it.
+/// A `success` result with text but a non-zero exit is a finished stage whose
+/// session could not be saved: Failed with a [`SESSION_NOT_SAVED`] error, the
+/// artifact kept and no session id ([`is_session_not_saved`]).
 /// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
@@ -422,6 +477,48 @@ pub fn parse_cli_result(
     })?;
 
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
+    let kind = artifact_kind;
+    let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
+
+    // The CLI finished the work and reported success, then exited non-zero:
+    // since 2.1.317 that means it could not save its session (full disk or
+    // quota). Fail with that cause, not the agent's own summary, and keep the
+    // artifact so the director can review and accept the finished work. The
+    // session is dropped: its transcript was never written, so `--resume`
+    // would fail.
+    if !exit_success
+        && !parsed.is_error
+        && parsed.subtype.as_deref() == Some("success")
+        && !parsed.result.trim().is_empty()
+    {
+        let error = format!(
+            "Claude Code finished the work but exited with an error — it {SESSION_NOT_SAVED} \
+             (disk full or quota?). The changes are in the worktree; free space, then accept or re-run."
+        );
+        let tail = stderr_tail(stderr_text, 10);
+        let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
+        return Ok(StageOutcome {
+            artifact: StageArtifact {
+                kind,
+                text: parsed.result.clone(),
+                payload: None,
+                refs_worktree,
+            },
+            input_tokens: parsed.usage.input_tokens,
+            output_tokens: parsed.usage.output_tokens,
+            cache_read_tokens: parsed.usage.cache_read_input_tokens,
+            cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+            cost_usd: parsed.total_cost_usd,
+            status: StageStatus::Failed,
+            tool_calls: vec![],
+            error: Some(error),
+            verdict: None,
+            session_id: None,
+            blocked: None,
+            blocked_transcript: None,
+        });
+    }
+
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
         let error = match (bad_subtype, parsed.result.is_empty()) {
             (Some(BUDGET_STOP_SUBTYPE), _) => format!(
@@ -462,8 +559,6 @@ pub fn parse_cli_result(
         });
     }
 
-    let kind = artifact_kind;
-    let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
     Ok(StageOutcome {
         artifact: StageArtifact {
             kind,
@@ -1585,7 +1680,10 @@ impl AgentRunner for CliRunner {
             }
             CliDialect::Claude => match result_line {
                 Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                    Ok(outcome) => Ok(apply_question_guard(outcome)),
+                    Ok(outcome) => Ok(apply_question_guard(with_free_space(
+                        outcome,
+                        || free_bytes(&ctx.workspace_path),
+                    ))),
                     Err(_) => Ok(failed_stage(&format!(
                         "claude produced no parseable result: {}",
                         failure_detail(&stderr_out, &line)

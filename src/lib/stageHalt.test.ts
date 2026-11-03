@@ -19,6 +19,17 @@ describe("haltCause", () => {
     expect(c.remedy).toContain("within whatever budget is left");
     expect(c.remedy).not.toMatch(/approve the budget gate/);
   });
+  it("explains a finished stage whose session could not be saved", () => {
+    const c = haltCause(
+      "Claude Code finished the work but exited with an error — it could not save its session (disk full or quota?). The changes are in the worktree; free space, then accept or re-run.\n— stderr —\nENOSPC\n1.2 GB free on the worktree's volume",
+      25,
+    );
+    expect(c.title).toBe("Claude finished the work but couldn't save its session");
+    expect(c.remedy).toMatch(/free some space/);
+    // The session is cleared, so the bar offers only Re-run — the copy must not promise Resume.
+    expect(c.remedy).toMatch(/Re-running starts a fresh session/);
+    expect(c.remedy).not.toMatch(/Resum/);
+  });
   it("explains an idle timeout", () => {
     expect(haltCause("claude timed out — no output for 5 minutes", 25).title).toMatch(/no output/i);
   });

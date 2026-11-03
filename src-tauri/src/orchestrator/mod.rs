@@ -683,6 +683,15 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Finished but its session could not be saved (full disk or quota):
+        // the work is done, and a stronger model would not free the disk.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_session_not_saved)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -1108,10 +1117,27 @@ impl Orchestrator {
                 // Read before outcome.error is (partially) moved below.
                 let outcome_no_new_session = outcome.session_id.is_none();
                 let err = outcome.error.unwrap_or_else(|| "stage failed".into());
+                // A Claude stage that finished but could not save its session
+                // keeps its artifact (Review and Approve use the real result),
+                // and drops the session: its transcript was never written, so
+                // a Resume must start fresh instead of `--resume`-ing it.
+                let session_not_saved = crate::orchestrator::cli_runner::is_session_not_saved(&err);
+                let kept_artifact = if session_not_saved && !outcome.artifact.text.trim().is_empty() {
+                    Some(serde_json::to_string(&outcome.artifact)?)
+                } else {
+                    None
+                };
+                if session_not_saved {
+                    self.db.lock().set_stage_session(&stage.id, None)?;
+                }
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
                 // then mark the failure. Reset-on-rerun retires it as usual.
-                if outcome.cost_usd > 0.0 || outcome.input_tokens > 0 || outcome.output_tokens > 0 {
+                if outcome.cost_usd > 0.0
+                    || outcome.input_tokens > 0
+                    || outcome.output_tokens > 0
+                    || kept_artifact.is_some()
+                {
                     self.db.lock().complete_run_stage(
                         &stage.id,
                         "failed",
@@ -1120,7 +1146,7 @@ impl Orchestrator {
                         outcome.cache_read_tokens as i64,
                         outcome.cache_creation_tokens as i64,
                         outcome.cost_usd,
-                        None,
+                        kept_artifact.as_deref(),
                     )?;
                     self.recompute_run_cost(&run.id)?;
                 }
@@ -2104,31 +2130,45 @@ impl Orchestrator {
                         // input and runs against the worktree as the halted agent
                         // left it — the following review stage catches any gaps
                         // and loops back (the pipeline-native recovery).
-                        let kind = self.db.lock().get_role(&s.role)
-                            .ok().flatten()
-                            .map(|rd| rd.artifact_kind)
-                            .unwrap_or(ArtifactKind::Diff);
-                        let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
-                        let reason = s
+                        // A stage that finished but could not save its session
+                        // kept its real result — accept that, not a stub.
+                        let kept = s
                             .error
                             .as_deref()
-                            .and_then(|e| e.lines().next())
-                            .map(str::trim)
-                            .filter(|l| !l.is_empty())
-                            .unwrap_or("stage halted");
-                        // Salvage the halted attempt's narration so the next
-                        // stage inherits the partial work, not an empty stub.
-                        let text = match self.salvage_journal_text(&s.id) {
-                            Some(salvaged) => format!(
-                                "(accepted by the director after a halt: {reason})\n\nWhat the stage had produced before the halt:\n{salvaged}"
-                            ),
-                            None => format!("(accepted by the director after a halt: {reason})"),
-                        };
-                        let artifact = StageArtifact {
-                            kind,
-                            text,
-                            payload: None,
-                            refs_worktree,
+                            .is_some_and(crate::orchestrator::cli_runner::is_session_not_saved)
+                            .then(|| s.artifact.as_deref().and_then(|j| serde_json::from_str::<StageArtifact>(j).ok()))
+                            .flatten()
+                            .filter(|a| !a.text.trim().is_empty());
+                        let artifact = match kept {
+                            Some(a) => a,
+                            None => {
+                                let kind = self.db.lock().get_role(&s.role)
+                                    .ok().flatten()
+                                    .map(|rd| rd.artifact_kind)
+                                    .unwrap_or(ArtifactKind::Diff);
+                                let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
+                                let reason = s
+                                    .error
+                                    .as_deref()
+                                    .and_then(|e| e.lines().next())
+                                    .map(str::trim)
+                                    .filter(|l| !l.is_empty())
+                                    .unwrap_or("stage halted");
+                                // Salvage the halted attempt's narration so the next
+                                // stage inherits the partial work, not an empty stub.
+                                let text = match self.salvage_journal_text(&s.id) {
+                                    Some(salvaged) => format!(
+                                        "(accepted by the director after a halt: {reason})\n\nWhat the stage had produced before the halt:\n{salvaged}"
+                                    ),
+                                    None => format!("(accepted by the director after a halt: {reason})"),
+                                };
+                                StageArtifact {
+                                    kind,
+                                    text,
+                                    payload: None,
+                                    refs_worktree,
+                                }
+                            }
                         };
                         let json = serde_json::to_string(&artifact)?;
                         // Preserve the failed attempt's spend — only status/artifact
