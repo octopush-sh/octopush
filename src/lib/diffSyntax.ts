@@ -16,8 +16,7 @@
  * mount) and highlight again when it resolves — on a warm cache it is
  * already there and the first render is coloured.
  *
- * Supersedes `diffHighlight.ts` (per-line, Lezer-only), which no longer has
- * callers.
+ * Replaced the old per-line, Lezer-only diff highlighter.
  */
 import { highlightTree } from "@lezer/highlight";
 import { HighlightStyle } from "@codemirror/language";

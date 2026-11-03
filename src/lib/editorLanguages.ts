@@ -26,9 +26,14 @@ const stream = <T>(parser: StreamParser<T>): Grammar => {
   return { support: l, language: l };
 };
 
-/** One loader per LangId that has a grammar. Each `import()` names its module
+/** LangIds with no loader of their own: plain text, and C (read with the C++
+ *  grammar, see `keyOf`). */
+type NoLoader = "plaintext" | "c";
+
+/** One loader per LangId that has a grammar — exhaustive, so a LangId added
+ *  without a loader fails the build. Each `import()` names its module
  *  literally so the bundler can split it out. */
-const LOADERS: Partial<Record<LangId, () => Promise<Grammar>>> = {
+const LOADERS: Record<Exclude<LangId, NoLoader>, () => Promise<Grammar>> = {
   javascript: () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript())),
   jsx:        () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ jsx: true }))),
   typescript: () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ typescript: true }))),
@@ -70,6 +75,9 @@ export const GRAMMAR_LANGS: readonly LangId[] = [...(Object.keys(LOADERS) as Lan
 
 const keyOf = (lang: LangId): LangId => (lang === "c" ? "cpp" : lang);
 
+const loaderOf = (key: LangId): (() => Promise<Grammar>) | undefined =>
+  key in LOADERS ? LOADERS[key as keyof typeof LOADERS] : undefined;
+
 /** Memoised loads, one per LangId, and the grammars that have landed. */
 const pending = new Map<LangId, Promise<Grammar | null>>();
 const loaded = new Map<LangId, Grammar | null>();
@@ -78,7 +86,7 @@ function loadGrammar(lang: LangId): Promise<Grammar | null> {
   const key = keyOf(lang);
   const known = pending.get(key);
   if (known) return known;
-  const load = LOADERS[key];
+  const load = loaderOf(key);
   if (!load) {
     // Plain text: nothing to fetch, and known synchronously from now on.
     loaded.set(key, null);
@@ -116,7 +124,7 @@ export function loadLanguage(lang: LangId): Promise<Language | null> {
 /** The editor extension, if it has already loaded; undefined while not yet. */
 export function loadedLanguageSupport(lang: LangId): Extension | undefined {
   const key = keyOf(lang);
-  if (!loaded.has(key)) return LOADERS[key] ? undefined : [];
+  if (!loaded.has(key)) return loaderOf(key) ? undefined : [];
   return loaded.get(key)?.support ?? [];
 }
 
@@ -124,6 +132,6 @@ export function loadedLanguageSupport(lang: LangId): Extension | undefined {
  *  while not yet. Never starts a load. */
 export function loadedLanguage(lang: LangId): Language | null | undefined {
   const key = keyOf(lang);
-  if (!loaded.has(key)) return LOADERS[key] ? undefined : null;
+  if (!loaded.has(key)) return loaderOf(key) ? undefined : null;
   return loaded.get(key)?.language ?? null;
 }
