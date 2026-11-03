@@ -77,18 +77,31 @@ vi.mock("@codemirror/language", () => ({
   bracketMatching: vi.fn(() => ({})),
 }));
 
-const langMock = () => ({ javascript: vi.fn(() => ({})) });
-vi.mock("@codemirror/lang-javascript", () => ({ javascript: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-rust", () => ({ rust: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-python", () => ({ python: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-java", () => ({ java: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-json", () => ({ json: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-markdown", () => ({ markdown: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-html", () => ({ html: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-css", () => ({ css: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-xml", () => ({ xml: vi.fn(() => ({})) }));
-vi.mock("@codemirror/lang-yaml", () => ({ yaml: vi.fn(() => ({})) }));
-void langMock;
+// The lazy grammar loader. Every grammar starts cold; a test lands one with
+// `grammars.land(lang)` and reads what reached the compartment.
+const grammars = vi.hoisted(() => {
+  const loaded = new Map<string, unknown>();
+  const waiting = new Map<string, ((ext: unknown) => void)[]>();
+  return {
+    loaded,
+    waiting,
+    land(lang: string) {
+      const ext = { grammar: lang };
+      loaded.set(lang, ext);
+      for (const resolve of waiting.get(lang) ?? []) resolve(ext);
+      waiting.delete(lang);
+    },
+    reset() { loaded.clear(); waiting.clear(); },
+  };
+});
+vi.mock("../lib/editorLanguages", () => ({
+  loadedLanguageSupport: vi.fn((lang: string) =>
+    lang === "plaintext" ? [] : grammars.loaded.get(lang)),
+  loadLanguageSupport: vi.fn((lang: string) =>
+    new Promise((resolve) => {
+      grammars.waiting.set(lang, [...(grammars.waiting.get(lang) ?? []), resolve]);
+    })),
+}));
 
 vi.mock("./editor/atelierTheme", () => ({
   buildEditorTheme: vi.fn(() => []),
@@ -117,7 +130,76 @@ import { useScratchpadStore } from "../stores/scratchpadStore";
 describe("ScratchpadCodeEditor", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    grammars.reset();
     useScratchpadStore.getState().reset();
+  });
+
+  describe("language", () => {
+    async function extensions() {
+      const { EditorState } = await import("@codemirror/state");
+      const call = vi.mocked(EditorState.create).mock.calls.at(-1) as
+        | [{ extensions: unknown[] }]
+        | undefined;
+      expect(call).toBeDefined();
+      return call![0].extensions;
+    }
+
+    /** A tab named `name`, so its language is detected from it. */
+    function tabNamed(name: string) {
+      const store = useScratchpadStore.getState();
+      store.createTab();
+      store.renameTab(useScratchpadStore.getState().tabs[0].id, name);
+    }
+
+    it("asks the shared lazy loader for the tab's grammar", async () => {
+      // The Scratchpad used to import ten grammars statically, which kept them
+      // in the app's startup bundle (editorLanguages.bundle.test.ts guards that).
+      const { loadLanguageSupport } = await import("../lib/editorLanguages");
+      tabNamed("notes.py");
+      render(<ScratchpadCodeEditor />);
+      expect(loadLanguageSupport).toHaveBeenCalledWith("python");
+    });
+
+    it("opens before its grammar has loaded, then installs it through the compartment", async () => {
+      tabNamed("notes.py");
+      render(<ScratchpadCodeEditor />);
+      expect(await extensions()).toContainEqual({ compartment: [] });
+      const view = hoisted.lastView!;
+      expect(view.dispatch).not.toHaveBeenCalledWith({
+        effects: { reconfigure: expect.anything() },
+      });
+
+      await act(async () => { grammars.land("python"); });
+      expect(view.dispatch).toHaveBeenCalledWith({
+        effects: { reconfigure: { grammar: "python" } },
+      });
+    });
+
+    it("opens with the grammar on the first frame once it has loaded", async () => {
+      const { loadLanguageSupport } = await import("../lib/editorLanguages");
+      grammars.land("tsx");
+      tabNamed("app.tsx");
+      render(<ScratchpadCodeEditor />);
+      expect(await extensions()).toContainEqual({ compartment: { grammar: "tsx" } });
+      expect(loadLanguageSupport).not.toHaveBeenCalled();
+    });
+
+    it("drops a grammar that lands after the tab moved on", async () => {
+      tabNamed("notes.py");
+      render(<ScratchpadCodeEditor />);
+      const first = hoisted.lastView!;
+      await act(async () => { useScratchpadStore.getState().createTab(); });
+      const second = hoisted.lastView!;
+      expect(second).not.toBe(first);
+
+      await act(async () => { grammars.land("python"); });
+      expect(first.dispatch).not.toHaveBeenCalledWith({
+        effects: { reconfigure: { grammar: "python" } },
+      });
+      expect(second.dispatch).not.toHaveBeenCalledWith({
+        effects: { reconfigure: { grammar: "python" } },
+      });
+    });
   });
 
   it("shows the empty state when no tab is active", () => {

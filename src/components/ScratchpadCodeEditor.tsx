@@ -17,59 +17,45 @@ import {
 } from "@codemirror/commands";
 import { search, searchKeymap, setSearchQuery, SearchQuery } from "@codemirror/search";
 import { indentOnInput, bracketMatching } from "@codemirror/language";
-import { javascript } from "@codemirror/lang-javascript";
-import { rust } from "@codemirror/lang-rust";
-import { python } from "@codemirror/lang-python";
-import { java } from "@codemirror/lang-java";
-import { json } from "@codemirror/lang-json";
-import { markdown } from "@codemirror/lang-markdown";
-import { html } from "@codemirror/lang-html";
-import { css } from "@codemirror/lang-css";
-import { xml } from "@codemirror/lang-xml";
-import { yaml } from "@codemirror/lang-yaml";
-import type { Extension } from "@codemirror/state";
 import { buildEditorTheme } from "./editor/atelierTheme";
 import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { useScratchpadStore } from "../stores/scratchpadStore";
+import { loadLanguageSupport, loadedLanguageSupport } from "../lib/editorLanguages";
+import type { LangId } from "../lib/editorLang";
 
 /**
- * Maps a scratchpad tab's language id to the matching CodeMirror language
- * extension. Languages without a dedicated CodeMirror package fall back to no
- * extension (plain editing, no highlighting) — the editor stays fully usable.
+ * Maps a scratchpad tab's language id (`detectLanguageFromName`) to the
+ * grammar it is highlighted with. The grammars are the shared lazy ones in
+ * `editorLanguages.ts`. Languages outside this list stay plain text (plain
+ * editing, no highlighting) — the editor stays fully usable.
  *
  * Exported for unit testing.
  */
-export function langExtension(lang: string): Extension {
+export function scratchpadLang(lang: string): LangId {
   switch (lang) {
+    // Scratchpad tabs don't tell JSX apart: both dialects allow it.
     case "javascript":
-      return javascript({ jsx: true });
+      return "jsx";
     case "typescript":
-      return javascript({ typescript: true, jsx: true });
+      return "tsx";
     case "python":
-      return python();
     case "rust":
-      return rust();
     case "java":
-      return java();
     case "json":
-      return json();
     case "markdown":
-      return markdown();
     case "html":
-      return html();
     case "css":
+    case "xml":
+    case "yaml":
+      return lang;
     case "scss":
     case "sass":
     case "less":
-      return css();
-    case "xml":
-      return xml();
-    case "yaml":
-      return yaml();
+      return "css";
     default:
-      return [];
+      return "plaintext";
   }
 }
 
@@ -87,6 +73,9 @@ const scratchpadLayout = EditorView.theme({
  *  Module-level and stable, as in EditorPane — there is only ever one
  *  scratchpad editor mounted. */
 const themeComp = new Compartment();
+// Grammars load on first use (editorLanguages.ts): the editor opens with
+// whatever has landed and is reconfigured once the grammar does.
+const langComp = new Compartment();
 
 export function ScratchpadCodeEditor() {
   const isOpen = useScratchpadStore((s) => s.isOpen);
@@ -134,6 +123,7 @@ export function ScratchpadCodeEditor() {
     const initialContent =
       useScratchpadStore.getState().tabs.find((t) => t.id === activeTabId)
         ?.content ?? "";
+    const lang = scratchpadLang(activeLanguage);
 
     const state = EditorState.create({
       doc: initialContent,
@@ -165,7 +155,7 @@ export function ScratchpadCodeEditor() {
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        langExtension(activeLanguage),
+        langComp.of(loadedLanguageSupport(lang) ?? []),
         themeComp.of(buildEditorTheme()),
         scratchpadLayout,
         EditorView.updateListener.of((update) => {
@@ -179,6 +169,11 @@ export function ScratchpadCodeEditor() {
     const created = new EditorView({ state, parent: hostRef.current });
     viewRef.current = created;
     setView(created);
+    if (!loadedLanguageSupport(lang)) {
+      void loadLanguageSupport(lang).then((support) => {
+        if (viewRef.current === created) created.dispatch({ effects: langComp.reconfigure(support) });
+      });
+    }
 
     return () => {
       created.destroy();

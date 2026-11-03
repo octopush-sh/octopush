@@ -27,7 +27,14 @@ vi.mock("@codemirror/legacy-modes/mode/swift", (orig) => { imported.add("mode/sw
 vi.mock("@codemirror/legacy-modes/mode/clike", (orig) => { imported.add("mode/clike"); return orig(); });
 vi.mock("@codemirror/legacy-modes/mode/groovy", (orig) => { imported.add("mode/groovy"); return orig(); });
 vi.mock("@codemirror/legacy-modes/mode/protobuf", (orig) => { imported.add("mode/protobuf"); return orig(); });
-vi.mock("@codemirror/legacy-modes/mode/lua", (orig) => { imported.add("mode/lua"); return orig(); });
+// Lua's chunk fails to load the first time it is asked for (`failLua`), like
+// a chunk the webview couldn't fetch.
+const failLua = vi.hoisted(() => ({ next: false }));
+vi.mock("@codemirror/legacy-modes/mode/lua", (orig) => {
+  if (failLua.next) { failLua.next = false; throw new Error("chunk failed to load"); }
+  imported.add("mode/lua");
+  return orig();
+});
 
 import { loadLanguage, loadLanguageSupport, loadedLanguage, loadedLanguageSupport } from "./editorLanguages";
 import { diffGrammarReady, highlightLine, loadDiffGrammar } from "./diffSyntax";
@@ -84,5 +91,23 @@ describe("lazy grammars", () => {
     // Warm cache: synchronous, no await.
     expect(highlightLine(line, "src/main.rs").some((t) => t.cls.startsWith("tok-"))).toBe(true);
     expect(diffGrammarReady("notes.txt")).toBe(true);
+  });
+
+  it("a chunk that fails to load reads as plain text, and is tried again next time", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    failLua.next = true;
+    expect(await loadLanguage("lua")).toBeNull();
+    expect(warn).toHaveBeenCalled();
+    expect(failLua.next).toBe(false);
+    // Not remembered as plain text: still "not loaded yet".
+    expect(loadedLanguage("lua")).toBeUndefined();
+    expect(loadedLanguageSupport("lua")).toBeUndefined();
+    expect([...imported]).not.toContain("mode/lua");
+
+    const lua = await loadLanguage("lua");
+    expect(lua?.parser).toBeDefined();
+    expect([...imported]).toContain("mode/lua");
+    expect(loadedLanguage("lua")).toBe(lua);
+    warn.mockRestore();
   });
 });
