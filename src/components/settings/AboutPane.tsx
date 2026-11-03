@@ -71,7 +71,7 @@ export function AboutPane() {
             data-tour="about-check-updates"
             onClick={() => checkForUpdates(true)}
             disabled={checking || installing}
-            className="flex items-center gap-1.5 rounded-lg border border-octo-hairline px-3 py-1.5 font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-40"
+            className="flex items-center gap-1.5 rounded-lg border border-octo-border-strong px-3 py-1.5 font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-40"
           >
             {checking ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             {checking ? "Looking for a newer version…" : "Look for a newer version"}
