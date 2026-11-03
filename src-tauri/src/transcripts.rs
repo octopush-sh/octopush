@@ -11,7 +11,9 @@
 //! message's `model` and its full `usage` (`input_tokens`,
 //! `cache_read_input_tokens`, `cache_creation_input_tokens`,
 //! `output_tokens`, and `cache_creation.ephemeral_1h_input_tokens` — the
-//! 1-hour-TTL share of the writes, priced at the 1-hour rate). That is the same data an API provider returns, so the
+//! 1-hour-TTL share of the writes, priced at the 1-hour rate) — plus
+//! `speed: "fast"` on a fast-mode turn, priced at the fast rate
+//! (`token_engine::fast_prices`). That is the same data an API provider returns, so the
 //! ingestor reads it and records RUN spend with the real model and the real
 //! cache split — one ledger row per API message.
 //!
@@ -41,7 +43,7 @@
 
 use crate::db::{Db, SpendEvent};
 use crate::error::AppResult;
-use crate::token_engine::{prices_for, ModelPrices};
+use crate::token_engine::{prices_at_speed, prices_for, ModelPrices};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -178,6 +180,8 @@ pub struct TranscriptUsage {
     /// (`usage.cache_creation.ephemeral_1h_input_tokens`); `0` without the
     /// breakdown.
     pub cache_creation_1h_tokens: u64,
+    /// `usage.speed` (`"fast"` in fast mode); `None` when not reported.
+    pub speed: Option<String>,
 }
 
 /// What one ingestion pass did — for logs and tests.
@@ -252,6 +256,7 @@ pub fn parse_transcript_line(line: &str, file_session_id: &str) -> Option<Transc
         cache_read_tokens,
         cache_creation_tokens,
         cache_creation_1h_tokens,
+        speed: crate::token_engine::usage_speed(usage),
     })
 }
 
@@ -524,15 +529,15 @@ impl TranscriptIngestor {
         db.execute_batch("SAVEPOINT cc_ingest")?;
         let result = (|| -> AppResult<()> {
             for u in entries {
-                let priced = prices
-                    .entry(u.model.clone())
-                    .or_insert_with(|| prices_for(&u.model))
-                    .as_ref()
+                let base = *prices.entry(u.model.clone()).or_insert_with(|| prices_for(&u.model));
+                // A fast-mode turn costs the fast rate, or is unpriced on a
+                // model fast mode doesn't support — never the standard rate.
+                let priced = prices_at_speed(&u.model, base, u.speed.as_deref())
                     // One transcript line = one API request: per-request tiers.
                     .map(|p| {
                         crate::token_engine::request_cost_split(
                             &u.model,
-                            *p,
+                            p,
                             u.input_tokens,
                             u.output_tokens,
                             u.cache_read_tokens,
@@ -574,6 +579,7 @@ impl TranscriptIngestor {
                     idempotency_key: Some(u.key.clone()),
                     thread_id: None,
                     origin: None,
+                    speed: u.speed.clone(),
                 };
                 let new_row = db.upsert_spend_event_by_key(&ev)?;
                 if let Some(msg) = &u.message_id {
