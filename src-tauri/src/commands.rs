@@ -5711,10 +5711,13 @@ pub async fn search_workspace_text(
 /// The walk behind `search_workspace_text`, on every core: ⌘-click runs it, and
 /// a single-threaded walk of a large worktree made go-to-definition feel slow.
 ///
-/// Hits come back sorted by file, then line, so the answer is the same whatever
-/// order the threads finish in. Once the cap is reached the walk stops early;
-/// which files made it in is then up to the threads, and the caller already
-/// treats a full result as "too many to narrow" (`searchSaturated`).
+/// Hits come back sorted by file, then line, and the cap always cuts at the
+/// same place: the files are listed and sorted first, then read in that order,
+/// one batch at a time across the cores. A batch is read in full before the
+/// cap is checked, so the hits kept are the first ones in path order — never
+/// whichever files the threads reached first. That matters when a common
+/// symbol fills the cap: the target go-to-definition picks must not change
+/// from one run to the next.
 pub fn search_tree(
     base: &std::path::Path,
     needle: &str,
@@ -5725,17 +5728,13 @@ pub fn search_tree(
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
 
-    let found = AtomicUsize::new(0);
-    let per_file: Mutex<Vec<Vec<SearchHit>>> = Mutex::new(Vec::new());
+    let listed: Mutex<Vec<(String, std::path::PathBuf)>> = Mutex::new(Vec::new());
     // workspace_walk_builder prunes `.git` at every depth.
     workspace_walk_builder(base, None, true)
         .build_parallel()
         .run(|| {
-            let (found, per_file) = (&found, &per_file);
+            let listed = &listed;
             Box::new(move |entry: Result<ignore::DirEntry, ignore::Error>| {
-                if found.load(Ordering::Relaxed) >= SEARCH_RESULT_CAP {
-                    return WalkState::Quit;
-                }
                 let Ok(entry) = entry else {
                     return WalkState::Continue;
                 };
@@ -5743,27 +5742,50 @@ pub fn search_tree(
                     return WalkState::Continue;
                 }
                 let path = entry.path();
-                let Ok(rel) = path.strip_prefix(base) else {
-                    return WalkState::Continue;
-                };
-                let hits = search_file(path, &rel.to_string_lossy(), needle, case_sensitive, whole_word);
-                if !hits.is_empty() {
-                    found.fetch_add(hits.len(), Ordering::Relaxed);
-                    per_file
+                if let Ok(rel) = path.strip_prefix(base) {
+                    let rel = rel.to_string_lossy().into_owned();
+                    listed
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .push(hits);
+                        .push((rel, path.to_path_buf()));
                 }
                 WalkState::Continue
             })
         });
+    let mut files = listed.into_inner().unwrap_or_else(|e| e.into_inner());
+    files.sort_unstable_by(|a, b| a.0.cmp(&b.0));
 
-    let mut hits: Vec<SearchHit> = per_file
-        .into_inner()
-        .unwrap_or_else(|e| e.into_inner())
-        .into_iter()
-        .flatten()
-        .collect();
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    let mut hits: Vec<SearchHit> = Vec::new();
+    for batch in files.chunks(threads * 64) {
+        let next = AtomicUsize::new(0);
+        let mut found: Vec<(usize, Vec<SearchHit>)> = std::thread::scope(|s| {
+            let mut workers = Vec::with_capacity(threads);
+            for _ in 0..threads {
+                workers.push(s.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some((rel, path)) = batch.get(i) else { break };
+                        let file_hits = search_file(path, rel, needle, case_sensitive, whole_word);
+                        if !file_hits.is_empty() {
+                            mine.push((i, file_hits));
+                        }
+                    }
+                    mine
+                }));
+            }
+            workers
+                .into_iter()
+                .flat_map(|w| w.join().unwrap_or_default())
+                .collect()
+        });
+        found.sort_unstable_by_key(|(i, _)| *i);
+        hits.extend(found.into_iter().flat_map(|(_, file_hits)| file_hits));
+        if hits.len() >= SEARCH_RESULT_CAP {
+            break;
+        }
+    }
     hits.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
     hits.truncate(SEARCH_RESULT_CAP);
     hits

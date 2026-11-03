@@ -125,6 +125,14 @@ interface EditorStore {
   /** Push where the reader is now (or `from`, when the jump began earlier)
    *  onto the back trail. Clears the forward trail, like any browser or IDE. */
   recordLocation: (workspaceId: string, from?: NavLocation) => void;
+  /** `openFile` as a jump: the place it starts from (`from`, or where the
+   *  reader is when it's called) joins the back trail once the file is open.
+   *  Resolves false when the open was declined (an oversized file). */
+  openAsJump: (
+    workspaceId: string,
+    path: string,
+    opts?: { confirm?: OpenConfirm; line?: number; col?: number; from?: NavLocation | null },
+  ) => Promise<boolean>;
   /** Return to the previous / next stop. False when the trail is empty. */
   navigateBack: (workspaceId: string) => Promise<boolean>;
   navigateForward: (workspaceId: string) => Promise<boolean>;
@@ -209,7 +217,16 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       });
       return false;
     }
-    if (!findFile(workspaceId, target.path)) return false;
+    // Declined without a confirm to ask: it has grown past the size limit.
+    if (!findFile(workspaceId, target.path)) {
+      pushToast({
+        level: "info",
+        title: "Couldn't reopen file",
+        body: `${fileName(target.path)} is too large to open here — open it from the file tree to confirm.`,
+        timeout: 4000,
+      });
+      return false;
+    }
     const { path, ...restore } = target;
     set((s) => ({
       pendingRevealByWs: {
@@ -405,6 +422,22 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     if (!here) return;
     const nav = get().navByWs[workspaceId] ?? EMPTY_NAV;
     setNav(workspaceId, { back: pushCapped(nav.back, here), forward: [] });
+  },
+
+  openAsJump: async (workspaceId, path, opts = {}) => {
+    const { confirm, line, col } = opts;
+    // Taken now: the open may wait on the large-file confirm, and the
+    // caller's own awaits (a workspace search) are already behind it.
+    const origin =
+      opts.from !== undefined ? opts.from : locationProviders.get(workspaceId)?.() ?? null;
+    await get().openFile(workspaceId, path, confirm, line, col);
+    // Declined: no stop, or Back would lead nowhere.
+    if (!findFile(workspaceId, path)) return false;
+    // Reopening the file already in front, with no line to go to, didn't move.
+    if (origin && !(line == null && origin.path === path)) {
+      get().recordLocation(workspaceId, origin);
+    }
+    return true;
   },
 
   navigateBack: (workspaceId) => step(workspaceId, "back"),

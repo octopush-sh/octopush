@@ -12141,6 +12141,30 @@ mod search_tree_tests {
             assert_eq!(key(&again), key(&first));
         }
     }
+
+    #[test]
+    fn a_saturated_search_keeps_the_first_files_in_path_order() {
+        // More matching files than the cap: which ones make it in must not
+        // depend on the threads, or go-to-definition's target would drift.
+        let dir = tempfile::tempdir().unwrap();
+        let mut all = Vec::new();
+        for i in 0..700 {
+            let sub = format!("d{}", i % 9);
+            fs::create_dir_all(dir.path().join(&sub)).unwrap();
+            let rel = format!("{sub}/f{i:04}.ts");
+            fs::write(dir.path().join(&rel), "id\n").unwrap();
+            all.push(rel);
+        }
+        all.sort();
+        all.truncate(500);
+        for _ in 0..3 {
+            let files: Vec<String> = search_tree(dir.path(), "id", true, true)
+                .into_iter()
+                .map(|h| h.file)
+                .collect();
+            assert_eq!(files, all);
+        }
+    }
 }
 
 #[cfg(test)]

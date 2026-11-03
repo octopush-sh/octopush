@@ -215,6 +215,8 @@ const mockClearSaveConflict = vi.fn();
 
 const mockClearPendingReveal = vi.fn();
 const mockRecordLocation = vi.fn();
+/** The store's open-and-record, reduced to its open (the trail is store-tested). */
+const mockOpenAsJump = vi.fn();
 
 const mockStore = {
   saveConflict: null as
@@ -245,6 +247,7 @@ const buildEditorState = () => ({
       wsId === "ws-active" ? mockStore.pendingReveal : null,
     clearPendingReveal: mockClearPendingReveal,
     openFile: mockOpenFile,
+    openAsJump: mockOpenAsJump,
     markEdited: vi.fn(),
     setLocationProvider: vi.fn(),
     recordLocation: mockRecordLocation,
@@ -269,6 +272,12 @@ beforeEach(() => {
   mockReloadFromDisk.mockResolvedValue(true);
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
   mockOpenFile.mockResolvedValue(undefined);
+  mockOpenAsJump.mockImplementation(
+    async (ws: string, path: string, opts?: { line?: number }) => {
+      await mockOpenFile(ws, path, undefined, opts?.line);
+      return true;
+    },
+  );
   searchWorkspaceTextMock.mockResolvedValue([]);
   classifyClickMock.mockImplementation(() => "unknown");
   classifySiteMock.mockImplementation(() => "unknown");
@@ -635,7 +644,12 @@ describe("EditorPane · go to definition", () => {
     expect(spec.selection).toEqual({ anchor: NAV_DOC.indexOf("run"), head: NAV_DOC.indexOf("run") + 3 });
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
     // The jump's origin joins the back trail (⌃−), before the selection moves.
-    expect(mockRecordLocation).toHaveBeenCalledWith("ws-active", undefined);
+    // It is the clicked occurrence, not the caret (still at 0: a ⌘-click
+    // doesn't move it), so Back leaves the caret where the reader was looking.
+    const clicked = NAV_DOC.lastIndexOf("run");
+    expect(mockRecordLocation).toHaveBeenCalledWith("ws-active", {
+      path: "/repo/file.ts", anchor: clicked, head: clicked, scrollTop: 0,
+    });
     expect(mockRecordLocation.mock.invocationCallOrder[0]).toBeLessThan(
       view.dispatch.mock.invocationCallOrder[0],
     );
@@ -662,13 +676,30 @@ describe("EditorPane · go to definition", () => {
       { file: "src/parser.ts", line: 12, col: 17, preview: "export function parse(x) {" },
     ]);
     const onRequest = definitionHandler();
-    onRequest(at("parse(input)"), navView());
+    const req = at("parse(input)");
+    onRequest(req, navView());
     await waitFor(() =>
       expect(mockOpenFile).toHaveBeenCalledWith("ws-active", "/repo/src/parser.ts", undefined, 12),
     );
-    expect(mockRecordLocation).toHaveBeenCalledWith("ws-active", undefined);
-    expect(mockRecordLocation.mock.invocationCallOrder[0]).toBeLessThan(
-      mockOpenFile.mock.invocationCallOrder[0],
+    // The stop is the clicked `parse`, handed over for the store to record
+    // once the file is open.
+    expect(mockOpenAsJump).toHaveBeenCalledWith("ws-active", "/repo/src/parser.ts", {
+      line: 12,
+      from: { path: "/repo/file.ts", anchor: req.from, head: req.from, scrollTop: 0 },
+    });
+  });
+
+  it("says a file too large to open here was not opened", async () => {
+    mockOpenAsJump.mockResolvedValueOnce(false);
+    searchWorkspaceTextMock.mockResolvedValue([
+      { file: "src/parser.ts", line: 12, col: 17, preview: "export function parse(x) {" },
+    ]);
+    const onRequest = definitionHandler();
+    onRequest(at("parse(input)"), navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "File too large to open here" }),
+      ),
     );
   });
 

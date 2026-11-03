@@ -319,12 +319,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   // workspace scan (a literal search over every text file is fast, but not
   // instant, and a ⌘-click that shows nothing reads as a dead click).
   const [definitionPicker, setDefinitionPicker] =
-    useState<{ symbol: string; candidates: DefinitionCandidate[] } | null>(null);
+    useState<{
+      symbol: string;
+      candidates: DefinitionCandidate[];
+      /** Where the request came from: the stop a pick leaves behind. */
+      origin: NavLocation | null;
+    } | null>(null);
   const [definitionSearching, setDefinitionSearching] = useState<string | null>(null);
   /** Bumped per request so a superseded workspace scan lands nowhere. */
   const definitionGenerationRef = useRef(0);
 
-  const openFile = useEditorStore((s) => s.openFile);
+  const openAsJump = useEditorStore((s) => s.openAsJump);
 
   const toRelative = useCallback(
     (path: string) =>
@@ -333,13 +338,13 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   );
 
   const openAtLine = useCallback(
-    async (relativePath: string, line: number) => {
+    async (relativePath: string, line: number, from: NavLocation | null) => {
       const absolute = relativePath.startsWith("/")
         ? relativePath
         : `${workspacePath}/${relativePath}`;
-      recordLocation();
+      let opened: boolean;
       try {
-        await openFile(workspaceId, absolute, undefined, line);
+        opened = await openAsJump(workspaceId, absolute, { line, from });
       } catch (e) {
         pushToast({ level: "error", title: "Could not open file", body: String(e) });
         return;
@@ -348,10 +353,6 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // and it declines silently. EditorPane has no dialog of its own to offer
       // (the large-file confirm lives in App, above the Review canvas), so say
       // what happened rather than letting the jump look like a dead click.
-      const opened = useEditorStore
-        .getState()
-        .getFiles(workspaceId)
-        .some((f) => f.path === absolute);
       if (!opened) {
         pushToast({
           level: "info",
@@ -360,7 +361,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         });
       }
     },
-    [openFile, recordLocation, workspaceId, workspacePath],
+    [openAsJump, workspaceId, workspacePath],
   );
 
   /**
@@ -381,6 +382,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // so declines to touch the state, which left the chip on screen forever
       // whenever the newer request answered without searching.
       setDefinitionSearching(null);
+      // The stop is the occurrence asked about, taken before any await. A
+      // ⌘-click doesn't move the caret (symbolNav swallows the mousedown), so
+      // the selection may still be on a line scrolled far out of view.
+      const here = currentLocation();
+      const origin = here && { ...here, anchor: req.from, head: req.from };
 
       const lang = activeFile?.lang;
       const doc = view.state.doc.toString();
@@ -406,7 +412,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         lone.score < DEFINITION_SCORE.signature;
       if (elsewhere.length > 0 && !loneIsWeak) {
         const site = elsewhere[0];
-        recordLocation();
+        if (origin) recordLocation(origin);
         view.dispatch({
           selection: { anchor: site.from, head: site.to },
           effects: EditorView.scrollIntoView(site.from, { y: "center" }),
@@ -461,9 +467,9 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           rankDefinitionHits(hits, req.name, { fromFile, fromLine }),
         );
         if (choice.kind === "jump") {
-          await openAtLine(choice.candidate.file, choice.candidate.line);
+          await openAtLine(choice.candidate.file, choice.candidate.line, origin);
         } else if (choice.kind === "choose") {
-          setDefinitionPicker({ symbol: req.name, candidates: choice.candidates });
+          setDefinitionPicker({ symbol: req.name, candidates: choice.candidates, origin });
         } else if (searchSaturated(hits)) {
           // The scan stops at its own ceiling, and even whole-word a genuinely
           // common symbol (`id`, `value`) can fill it with real uses before
@@ -491,7 +497,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         if (current()) setDefinitionSearching(null);
       }
     },
-    [activePath, activeFile?.lang, openAtLine, recordLocation, toRelative, workspacePath],
+    [activePath, activeFile?.lang, currentLocation, openAtLine, recordLocation, toRelative, workspacePath],
   );
 
   // Cached editor states hold whatever handler they were built with, so the
@@ -819,7 +825,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           candidates={definitionPicker.candidates}
           onPick={(c) => {
             setDefinitionPicker(null);
-            void openAtLine(c.file, c.line);
+            void openAtLine(c.file, c.line, definitionPicker.origin);
           }}
           onClose={() => setDefinitionPicker(null)}
         />
