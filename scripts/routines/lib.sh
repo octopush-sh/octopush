@@ -51,6 +51,19 @@ ci_starved_run_for() {
     | if ($bad | length) > 0 and all($bad[]; .conclusion == "cancelled" and ((.steps // []) | length) == 0) then "'"$id"'" else empty end'
 }
 
+# The newest release.yml run, if it failed only because no job got a runner
+# (the same "cancelled, no step ran" test as above). Empty otherwise.
+release_starved_run() {
+  local id
+  id="$(gh api "repos/$1/actions/workflows/release.yml/runs?per_page=1" --jq '
+    .workflow_runs[0] // empty
+    | if .status == "completed" and .conclusion == "failure" then .id else empty end')" || return 1
+  [[ -n "$id" ]] || return 0
+  gh api "repos/$1/actions/runs/$id/jobs?per_page=100" --jq '
+    [.jobs[] | select((.conclusion // "") | IN("success", "skipped") | not)] as $bad
+    | if ($bad | length) > 0 and all($bad[]; .conclusion == "cancelled" and ((.steps // []) | length) == 0) then "'"$id"'" else empty end'
+}
+
 # success | pending | failure | none — latest "CI" workflow run for a commit.
 ci_status_for() {
   gh api "repos/$1/actions/runs?head_sha=$2&per_page=50" --jq '
