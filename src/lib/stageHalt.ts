@@ -20,6 +20,13 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
         "The partial work is still in the worktree. Resuming continues the same session within whatever budget is left; if the budget is used up, the run asks you before it continues. You can also accept the partial work or discard the changes.",
     };
   }
+  if (raw.includes("could not save its session")) {
+    return {
+      title: "Claude finished the work but couldn't save its session",
+      remedy:
+        "The disk or quota is likely full. The changes are in the worktree — free some space, then accept the work or re-run. Re-running starts a fresh session.",
+    };
+  }
   if (raw.includes("error_during_execution")) {
     return { title: "Claude hit an execution error mid-run", remedy: "Resume or re-run to continue." };
   }
