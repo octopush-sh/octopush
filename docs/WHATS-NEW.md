@@ -64,6 +64,7 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `genesis-key-save` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): "Wake the crew" beside the inline key field (only with no key) · "or think it through first" | `GenesisPrompt.tsx` |
 | `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
 | `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
