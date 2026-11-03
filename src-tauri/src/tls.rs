@@ -1192,7 +1192,20 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         let intermediates = [CertificateDer::from(unhex(LETSENCRYPT_E6))];
         let name = ServerName::try_from("letsencrypt.org").unwrap();
 
-        let built = evaluate_on_macos(&leaf, &intermediates, &name, &[], now).expect("SecTrust accepts");
+        let built = match evaluate_on_macos(&leaf, &intermediates, &name, &[], now) {
+            Ok(built) => built,
+            // errSecVerifyActionFailed "certificate is not standards compliant":
+            // newer macOS images judge this 2025 fixture's CT evidence against
+            // today's log list whatever the verify date, so the fixture no
+            // longer evaluates there (#490). Live chains are unaffected. Skip
+            // rather than fail until the fixture is replaced by one under a
+            // test-only anchor, which the OS does not hold to CT.
+            Err(e) if format!("{e:?}").contains("-67825") => {
+                eprintln!("skipped: this macOS no longer accepts the 2025 fixture (#490): {e:?}");
+                return;
+            }
+            Err(e) => panic!("SecTrust accepts: {e:?}"),
+        };
         assert!(built.len() >= 3, "leaf, intermediate and anchor, got {}", built.len());
         // A fully qualified name (trailing `.`) matches too, as upstream 0.7 does.
         let fqdn = ServerName::try_from("letsencrypt.org.").unwrap();
