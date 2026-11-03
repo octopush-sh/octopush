@@ -699,3 +699,10 @@ describe("findDefinitions on a long file", () => {
     expect((performance.now() - t0) / 5).toBeLessThan(50);
   });
 });
+
+it("a C# attribute with `=` on the head line still joins the next line", () => {
+  const doc = ["class A {", "    [Attr(X = 1)] public static Task<int>", "    Find(int id) {", "    }", "}"].join("\n");
+  const [site] = findDefinitions(doc, "Find", scoreOptionsFor("cs"));
+  expect(site.line).toBe(3);
+  expect(site.score).toBe(DEFINITION_SCORE.declaration);
+});

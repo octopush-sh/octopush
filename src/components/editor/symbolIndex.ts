@@ -535,8 +535,8 @@ function isTypeWord(word: string): boolean {
 function isDanglingDeclarationHead(line: string, opts: ScoreOptions): boolean {
   if (opts.typeAfterName) return false;
   // Cheap first: statements and bodies are never a head (an annotation line,
-  // `@Table(name = "X")`, goes the long way).
-  if (!/^\s*@/.test(line) && /[=;{}]/.test(line)) return false;
+  // `@Table(name = "X")` or a C# `[Attr(X = 1)]`, goes the long way).
+  if (!/^\s*[@[]/.test(line) && /[=;{}]/.test(line)) return false;
   const head = line.replace(/^\s*(?:(?:@[A-Za-z_$][\w$.]*(?:\([^()]*\))?|\[[^[\]]*\])\s*)+/, "");
   const bare = stripGenerics(head).trim();
   if (bare === "" || /[=,;()+\-/%|^!~@#\\"'`{}:<>]/.test(bare)) return false;
