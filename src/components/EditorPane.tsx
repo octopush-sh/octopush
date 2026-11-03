@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   EditorView, lineNumbers, highlightActiveLineGutter, drawSelection, keymap,
-  highlightActiveLine, rectangularSelection, crosshairCursor,
+  highlightActiveLine, rectangularSelection, crosshairCursor, getDialog,
 } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirror/commands";
@@ -14,7 +14,7 @@ import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
 import { blameGutter } from "./editor/blameGutter";
 import { diffGutter, gotoNextChange, gotoPrevChange } from "./editor/diffGutter";
-import { EDITOR_NAV_KEYS } from "./editor/navKeys";
+import { EDITOR_NAV_KEYS, EDITOR_PANE_KEYS, GOTO_LINE_DIALOG } from "./editor/navKeys";
 import { selectAllOccurrences } from "./editor/multiCursor";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
@@ -85,7 +85,9 @@ function buildState(opts: {
   onNavigate: (dir: "back" | "forward") => void;
   onGotoLine: () => void;
   onUpdate: (u: {
-    docChanged: boolean; selectionSet: boolean; gotoLineOpen: boolean;
+    docChanged: boolean; selectionSet: boolean;
+    /** Asked only while a ⌘⌥G is pending: a state-field read, no DOM. */
+    gotoLineOpen: () => boolean;
     line: number; col: number; selections: number;
   }) => void;
 }) {
@@ -120,26 +122,26 @@ function buildState(opts: {
       symbolOccurrenceHighlight,
       symbolNav(onGoToDefinition),
       keymap.of([
-        { key: "Mod-s", run: () => { onSave(); return true; } },
+        { ...EDITOR_PANE_KEYS.save, run: () => { onSave(); return true; } },
         // Our Octopush-native find overlay owns ⌘F. Listed BEFORE searchKeymap
         // so this binding wins and ⌘F never opens CodeMirror's docked panel — while
         // searchKeymap still provides find-next/prev, go-to-line and
         // select-next-occurrence (⌘G/F3, ⌘⌥G, ⌘D). ⌘G/F3 CAN still open that panel:
         // they're wrapped in `searchCommand`, which opens it when no valid query is
         // set. searchHighlight stands down when it does, so nothing double-paints.
-        { key: "Mod-f", run: () => { onOpenSearch(); return true; } },
-        { key: "Mod-Shift-l", run: selectAllOccurrences },
-        { key: "F12", run: goToDefinitionCommand(onGoToDefinition) },
-        { key: "Alt-z", run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },
-        { key: "Mod-=", run: () => { useEditorPrefs.getState().bumpFontSize(1); return true; } },
-        { key: "Mod--", run: () => { useEditorPrefs.getState().bumpFontSize(-1); return true; } },
-        { key: EDITOR_NAV_KEYS.back, run: () => { onNavigate("back"); return true; } },
-        { key: EDITOR_NAV_KEYS.forward, run: () => { onNavigate("forward"); return true; } },
-        { key: EDITOR_NAV_KEYS.nextChange, run: gotoNextChange },
-        { key: EDITOR_NAV_KEYS.prevChange, run: gotoPrevChange },
+        { ...EDITOR_PANE_KEYS.find, run: () => { onOpenSearch(); return true; } },
+        { ...EDITOR_PANE_KEYS.selectAllOccurrences, run: selectAllOccurrences },
+        { ...EDITOR_PANE_KEYS.definition, run: goToDefinitionCommand(onGoToDefinition) },
+        { ...EDITOR_PANE_KEYS.wrap, run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },
+        { ...EDITOR_PANE_KEYS.fontUp, run: () => { useEditorPrefs.getState().bumpFontSize(1); return true; } },
+        { ...EDITOR_PANE_KEYS.fontDown, run: () => { useEditorPrefs.getState().bumpFontSize(-1); return true; } },
+        { ...EDITOR_NAV_KEYS.back, run: () => { onNavigate("back"); return true; } },
+        { ...EDITOR_NAV_KEYS.forward, run: () => { onNavigate("forward"); return true; } },
+        { ...EDITOR_NAV_KEYS.nextChange, run: gotoNextChange },
+        { ...EDITOR_NAV_KEYS.prevChange, run: gotoPrevChange },
         // Ahead of searchKeymap's own ⌘⌥G so the pane can note where the
         // reader stood: the dialog jumps on submit, long after the key.
-        { key: EDITOR_NAV_KEYS.gotoLine, run: (view) => { onGotoLine(); return gotoLine(view); } },
+        { ...EDITOR_NAV_KEYS.gotoLine, run: (view) => { onGotoLine(); return gotoLine(view); } },
         indentWithTab,
         ...searchKeymap,
         ...defaultKeymap,
@@ -158,7 +160,7 @@ function buildState(opts: {
           // pane copies the text once typing pauses (CONTENT_SYNC_MS).
           docChanged: update.docChanged,
           selectionSet: update.selectionSet,
-          gotoLineOpen: !!update.view.dom.querySelector(".cm-goto-line"),
+          gotoLineOpen: () => getDialog(update.view, GOTO_LINE_DIALOG) !== null,
           line: lineObj.number,
           col: head - lineObj.from + 1,
           selections: update.state.selection.ranges.length,
@@ -491,15 +493,21 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       onGotoLine: () => { gotoLineOriginRef.current = currentLocation(); },
       onUpdate: (u) => {
         if (u.docChanged) scheduleSync(workspaceId, file.path);
-        // The first selection change while ⌘⌥G's dialog was open is its jump
-        // (the same transaction closes the dialog); a close without one is a
-        // cancel.
+        // ⌘⌥G's jump is the first selection change once its dialog has
+        // closed. A click in the text while the dialog stays open isn't it.
         const origin = gotoLineOriginRef.current;
-        if (origin && u.selectionSet && !u.docChanged) {
-          gotoLineOriginRef.current = null;
-          recordLocation(origin);
-        } else if (origin && !u.gotoLineOpen) {
-          gotoLineOriginRef.current = null;
+        if (origin && !u.gotoLineOpen()) {
+          if (u.selectionSet && !u.docChanged) {
+            gotoLineOriginRef.current = null;
+            recordLocation(origin);
+          } else {
+            // A close alone isn't a cancel yet: the dialog queues its own close
+            // one microtask AHEAD of the submit handler that jumps. Escape and
+            // bad input never jump, so the origin goes after this task.
+            window.setTimeout(() => {
+              if (gotoLineOriginRef.current === origin) gotoLineOriginRef.current = null;
+            }, 0);
+          }
         }
         // Same values → same object, so React bails out instead of re-rendering
         // the pane for every transaction that left the caret where it was.
@@ -535,6 +543,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: "" })) });
       stateCache.current.set(prevPath, view.state);
     }
+    // A ⌘⌥G left open on the outgoing tab never jumps from this one.
+    gotoLineOriginRef.current = null;
 
     // No active file, or a binary file: clear the view so neither stale text
     // nor garbled bytes show behind the overlay / binary pane.

@@ -3,15 +3,20 @@ import { defaultKeymap, historyKeymap } from "@codemirror/commands";
 import { searchKeymap, gotoLine } from "@codemirror/search";
 import { foldKeymap, foldCode, unfoldCode } from "@codemirror/language";
 import type { KeyBinding } from "@codemirror/view";
-import { EDITOR_NAV_KEYS } from "./navKeys";
+import { EDITOR_NAV_KEYS, EDITOR_PANE_KEYS } from "./navKeys";
 import { matchShortcut } from "../../hooks/useGlobalShortcuts";
 
-/** A CodeMirror key name as macOS resolves it, modifiers in a fixed order. */
-function macChord(key: string): string {
+type Platform = "mac" | "other";
+const PLATFORMS: Platform[] = ["mac", "other"];
+
+/** A CodeMirror key name as `platform` resolves it, modifiers in a fixed
+ *  order. `Mod` is Cmd on macOS and Ctrl everywhere else. */
+function chord(key: string, platform: Platform): string {
   const parts = key.split(/-(?!$)/);
   const name = parts.pop()!;
   const mods = parts.map((p) =>
-    /^(cmd|meta|m|mod)$/i.test(p) ? "Meta"
+    /^(cmd|meta|m)$/i.test(p) ? "Meta"
+      : /^mod$/i.test(p) ? (platform === "mac" ? "Meta" : "Ctrl")
       : /^(ctrl|control|c)$/i.test(p) ? "Ctrl"
       : /^(shift|s)$/i.test(p) ? "Shift"
       : /^(alt|a)$/i.test(p) ? "Alt"
@@ -19,28 +24,55 @@ function macChord(key: string): string {
   );
   return [...mods.sort(), name.length === 1 ? name.toLowerCase() : name].join("-");
 }
+const macChord = (key: string) => chord(key, "mac");
 
-const macKey = (b: KeyBinding) => b.mac ?? b.key;
-const chordsOf = (bindings: readonly KeyBinding[]) =>
-  bindings.map(macKey).filter((k): k is string => !!k).map(macChord);
+/** The key name CodeMirror picks for `b` on `platform` (none if it has none). */
+const keyOn = (b: KeyBinding, platform: Platform) =>
+  platform === "mac" ? b.mac ?? b.key : b.win ?? b.linux ?? b.key;
+const macKey = (b: KeyBinding) => keyOn(b, "mac");
+const chordsOf = (bindings: readonly KeyBinding[], platform: Platform) =>
+  bindings
+    .map((b) => keyOn(b, platform))
+    .filter((k): k is string => !!k)
+    .map((k) => chord(k, platform));
 
 const BUILT_IN = [...defaultKeymap, ...searchKeymap, ...historyKeymap, ...foldKeymap];
+const NEW_CHORDS = [
+  EDITOR_NAV_KEYS.back, EDITOR_NAV_KEYS.forward,
+  EDITOR_NAV_KEYS.nextChange, EDITOR_NAV_KEYS.prevChange,
+];
 
 describe("editor navigation shortcuts (Appendix C)", () => {
-  it("back, forward and next/previous change take no chord CodeMirror already binds", () => {
-    const taken = new Set(chordsOf(BUILT_IN));
-    const ours = [
-      EDITOR_NAV_KEYS.back, EDITOR_NAV_KEYS.forward,
-      EDITOR_NAV_KEYS.nextChange, EDITOR_NAV_KEYS.prevChange,
-    ].map(macChord);
-    expect(new Set(ours).size).toBe(ours.length);
-    for (const chord of ours) expect(taken.has(chord), chord).toBe(false);
+  it.each(PLATFORMS)(
+    "on %s, back, forward and next/previous change take no chord CodeMirror or the pane already binds",
+    (platform) => {
+      // The pane's own bindings win over the built-in keymaps, so a clash with
+      // one of them (⌃− against Ctrl+− font size off macOS) silently kills ours.
+      const taken = new Set([
+        ...chordsOf(BUILT_IN, platform),
+        ...chordsOf(Object.values(EDITOR_PANE_KEYS), platform),
+      ]);
+      const ours = chordsOf(NEW_CHORDS, platform);
+      expect(ours).toHaveLength(NEW_CHORDS.length);
+      expect(new Set(ours).size).toBe(ours.length);
+      for (const c of ours) expect(taken.has(c), `${platform}: ${c}`).toBe(false);
+    },
+  );
+
+  it("back is ⌃− on macOS and Ctrl+Alt+− elsewhere; forward is Ctrl+Shift+− on both", () => {
+    expect(chord(keyOn(EDITOR_NAV_KEYS.back, "mac")!, "mac")).toBe("Ctrl--");
+    expect(chord(keyOn(EDITOR_NAV_KEYS.back, "other")!, "other")).toBe("Alt-Ctrl--");
+    for (const p of PLATFORMS) {
+      expect(chord(keyOn(EDITOR_NAV_KEYS.forward, p)!, p)).toBe("Ctrl-Shift--");
+    }
   });
 
   it("go to line replaces CodeMirror's own ⌘⌥G binding rather than adding a second", () => {
     const builtIn = searchKeymap.find((b) => b.run === gotoLine);
     expect(builtIn).toBeDefined();
-    expect(macChord(EDITOR_NAV_KEYS.gotoLine)).toBe(macChord(macKey(builtIn!)!));
+    for (const p of PLATFORMS) {
+      expect(chord(keyOn(EDITOR_NAV_KEYS.gotoLine, p)!, p)).toBe(chord(keyOn(builtIn!, p)!, p));
+    }
   });
 
   it("fold and unfold are ⌘⌥[ and ⌘⌥] on macOS", () => {
@@ -52,7 +84,8 @@ describe("editor navigation shortcuts (Appendix C)", () => {
 
   it("no global shortcut claims any of the editor's navigation chords", () => {
     const presses: KeyboardEventInit[] = [
-      { key: "-", code: "Minus", ctrlKey: true },                       // ⌃− back
+      { key: "-", code: "Minus", ctrlKey: true },                       // ⌃− back (macOS)
+      { key: "-", code: "Minus", ctrlKey: true, altKey: true },         // Ctrl+Alt+− back (elsewhere)
       { key: "_", code: "Minus", ctrlKey: true, shiftKey: true },       // ⌃⇧− forward
       { key: "F7", code: "F7", altKey: true },                          // ⌥F7
       { key: "F7", code: "F7", altKey: true, shiftKey: true },          // ⇧⌥F7
