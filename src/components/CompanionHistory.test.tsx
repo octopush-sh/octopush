@@ -109,6 +109,31 @@ describe("CompanionHistory — rendering & actions", () => {
     ]);
   });
 
+  it("boxes only the open chat; other rows get a hover-only wash", () => {
+    renderHistory({
+      chats: [
+        { id: "a", title: "Same title", meta: "14:32" },
+        { id: "b", title: "Same title", meta: "14:32" },
+        { id: "c", title: "Same title", meta: "14:32" },
+      ],
+      activeChatId: "b",
+    });
+    const rows = Array.from(document.querySelectorAll("[data-row-select]")).map(
+      (b) => b.parentElement!,
+    );
+    const selected = rows.filter(
+      (r) => r.className.includes("bg-octo-panel-2") || r.className.includes("var(--brass-dim)"),
+    );
+    expect(selected).toEqual([rows[1]]);
+    expect(rows[1].dataset.active).toBe("true");
+    expect(rows[1].className).not.toContain("hover:bg-");
+    for (const r of [rows[0], rows[2]]) {
+      expect(r.className).toContain("hover:bg-[var(--brass-ghost)]");
+      expect(r.className).not.toMatch(/(^|\s)bg-\[var\(--brass-ghost\)\]/);
+      expect(r.dataset.active).toBeUndefined();
+    }
+  });
+
   it("lets a long title wrap to two lines instead of cutting it to one", () => {
     renderHistory();
     const title = screen.getAllByTestId("chat-row-title")[0];

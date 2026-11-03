@@ -132,11 +132,15 @@ export function CompanionHistory({
           const live = !!streamingChatId && c.id === streamingChatId;
           return (
             <li key={c.id}>
+              {/* Only the open chat is boxed (panel-2 + brass-dim border);
+                  every other row gets a hover-only wash, so a hovered row
+                  can never look like a second selection. */}
               <div
-                className={`octo-rise-in group relative flex items-center rounded-md border-l pr-1 transition-colors duration-[220ms] hover:bg-[var(--brass-ghost)] ${
+                data-active={active ? "true" : undefined}
+                className={`octo-rise-in group relative flex items-center rounded-md border pr-1 transition-colors duration-[220ms] ${
                   active
-                    ? "border-l-[color:var(--brass-dim)] bg-[var(--brass-ghost)]"
-                    : "border-l-transparent"
+                    ? "border-[color:var(--brass-dim)] bg-octo-panel-2"
+                    : "border-transparent hover:bg-[var(--brass-ghost)]"
                 }`}
               >
                 {editing ? (
