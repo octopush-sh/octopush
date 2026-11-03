@@ -50,6 +50,10 @@ import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
 import { ToastContainer, pushToast } from "./components/Toasts";
 import { UpgradeSheet } from "./components/UpgradeSheet";
 import { HistorySheet } from "./components/HistorySheet";
+import { ErrorBoundary } from "./components/ErrorBoundary";
+import { useHistoryStore } from "./stores/historyStore";
+import { useUpgradeStore } from "./stores/upgradeStore";
+import { useWhatsNewStore } from "./stores/whatsNewStore";
 import { MissionControl } from "./components/MissionControl";
 import { LogbookRoom } from "./components/LogbookRoom";
 import { FirstRunInvite } from "./components/FirstRunInvite";
@@ -2041,6 +2045,9 @@ function App() {
             <div className="relative w-full h-full min-w-0 flex-1 overflow-hidden">
               {/* Talk panel — chat for the active workspace. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "talk"}>
+                {/* Each mode canvas has its own error boundary: a crash in one
+                    shows an inline "Try again" card, and the others keep working. */}
+                <ErrorBoundary surface="Talk" resetKey={activeWorkspaceId}>
                 {activeWorkspace && (
                   <ChatView
                     workspaceId={activeChatId!}
@@ -2053,6 +2060,7 @@ function App() {
                 {/* One-shot first-run invite — floats over the Talk canvas
                     (where every new user lands); eligibility gated inside. */}
                 {activeWorkspace && <FirstRunInvite onSendCrew={() => void handleSendFirstCrew()} onOpenReadiness={() => setSettingsTab("general")} />}
+                </ErrorBoundary>
               </ModeOverlay>
 
               {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs
@@ -2063,7 +2071,10 @@ function App() {
               <ModeOverlay active={!!activeWorkspace && activeMode === "run"}>
                 {/* Session rail + terminal. The rail lives INSIDE the canvas
                     (not the Companion) so collapsing the Companion no longer
-                    removes the only way to change session. */}
+                    removes the only way to change session. A crash here
+                    unmounts the panes, but their PTYs live in the daemon and
+                    reattach when Try again remounts them. */}
+                <ErrorBoundary surface="Run">
                 <div className="flex h-full w-full min-h-0">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
                     <SessionRail workspaceId={activeWorkspaceId} />
@@ -2107,10 +2118,12 @@ function App() {
                   )}
                   </div>
                 </div>
+                </ErrorBoundary>
               </ModeOverlay>
 
               {/* Review panel — only meaningful with an active workspace. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "review"}>
+                <ErrorBoundary surface="Review" resetKey={activeWorkspaceId}>
                 {activeWorkspace && (
                   <div className="flex h-full min-h-0">
                     {/* Left: unified, collapsible Changes + Files navigator */}
@@ -2188,10 +2201,12 @@ function App() {
                     </div>
                   </div>
                 )}
+                </ErrorBoundary>
               </ModeOverlay>
 
               {/* Direct mode overlay */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "direct"}>
+                <ErrorBoundary surface="Direct" resetKey={activeWorkspaceId}>
                 {activeWorkspace && (
                   <DirectCanvas
                     key={activeWorkspace.id}
@@ -2202,6 +2217,7 @@ function App() {
                     workspacePath={activeWorkspace.worktreePath || project.path}
                   />
                 )}
+                </ErrorBoundary>
               </ModeOverlay>
             </div>
           </CanvasSplit>
@@ -2211,6 +2227,14 @@ function App() {
               const targetProjectId = creatorProjectId || project.id;
               const targetProject = getProjectById(targetProjectId);
               return targetProject ? (
+                <ErrorBoundary
+                  surface="New mission"
+                  variant="overlay"
+                  onDismiss={() => {
+                    setShowCreator(false);
+                    setCreatorProjectId(null);
+                  }}
+                >
                 <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
                   <MissionCreator
                     projectId={targetProject.id}
@@ -2226,6 +2250,7 @@ function App() {
                     }}
                   />
                 </div>
+                </ErrorBoundary>
               ) : null;
             })()}
 
@@ -2245,6 +2270,7 @@ function App() {
                 about a project having no workspaces. */}
             {!activeWorkspace && !hasStaleActiveState && (
               <div className="absolute inset-0 z-40 bg-octo-bg octo-fade-in">
+                <ErrorBoundary surface="New mission">
                 {showInlineCreator ? (
                   <MissionCreator
                     projectId={project.id}
@@ -2260,6 +2286,7 @@ function App() {
                     dismissWorkspaceName={dismissTarget?.workspace.name}
                   />
                 )}
+                </ErrorBoundary>
               </div>
             )}
         </div>
@@ -2293,6 +2320,7 @@ function App() {
               }`}
             />
           )}
+          <ErrorBoundary surface="Companion" resetKey={activeWorkspaceId} compact={isCompanionCollapsed}>
           <Companion
             mode={activeMode}
             workspaceId={activeWorkspaceId}
@@ -2319,6 +2347,7 @@ function App() {
               sketchbookPath && activeProject?.path === sketchbookPath ? handleMakeProject : undefined
             }
         />
+          </ErrorBoundary>
       </div>
       </div>
       <PerfMonitorBar
@@ -2327,7 +2356,10 @@ function App() {
         onToggleRail={() => setIsRailCollapsed((v) => !v)}
       />
 
+      {/* Palettes and dialogs: a crash shows the error card in a ModalShell,
+          where Try again remounts the surface and Close dismisses it. */}
       {customizingWorkspace && (
+        <ErrorBoundary surface="Customize workspace" variant="overlay" onDismiss={() => setCustomizingWorkspaceId(null)}>
         <div
           className="absolute inset-0 z-30 flex items-start justify-start bg-black/30 p-2 octo-overlay-enter"
           onClick={() => setCustomizingWorkspaceId(null)}
@@ -2344,9 +2376,11 @@ function App() {
             />
           </div>
         </div>
+        </ErrorBoundary>
       )}
 
       {renamingWorkspace && (
+        <ErrorBoundary surface="Rename workspace" variant="overlay" onDismiss={() => setRenamingWorkspace(null)}>
         <ModalShell onClose={() => setRenamingWorkspace(null)} ariaLabel="Rename workspace">
           <RenameDialog
             title="Rename workspace"
@@ -2359,18 +2393,22 @@ function App() {
             onCancel={() => setRenamingWorkspace(null)}
           />
         </ModalShell>
+        </ErrorBoundary>
       )}
 
       {/* Session switcher (⌘⌥K / the band anchor). Available with zero
           sessions too — its last row opens one, which is exactly what an empty
           workspace needs. */}
       {sessionSwitcherOpen && activeWorkspaceId && (
+        <ErrorBoundary surface="Session switcher" variant="overlay" onDismiss={() => setSessionSwitcherOpen(false)}>
         <SessionSwitcher
           workspaceId={activeWorkspaceId}
           onClose={() => setSessionSwitcherOpen(false)}
         />
+        </ErrorBoundary>
       )}
 
+      <ErrorBoundary surface="Command palette" variant="overlay" onDismiss={() => setShowPalette(false)}>
       <CommandPalette
         open={showPalette}
         onClose={() => setShowPalette(false)}
@@ -2383,22 +2421,26 @@ function App() {
           activeWorkspaceId ? () => usePrStore.getState().openComposer(activeWorkspaceId) : undefined
         }
       />
+      </ErrorBoundary>
 
       {(() => {
         const ws = prComposerFor ? workspaces.find((w) => w.id === prComposerFor) : undefined;
         const path = ws?.worktreePath ?? project?.path;
         if (!ws || !path) return null;
         return (
+          <ErrorBoundary surface="Pull request" variant="overlay" onDismiss={() => usePrStore.getState().closeComposer()}>
           <PrComposer
             key={ws.id}
             workspace={ws}
             workspacePath={path}
             onClose={() => usePrStore.getState().closeComposer()}
           />
+          </ErrorBoundary>
         );
       })()}
 
       {activeWorkspace && (
+        <ErrorBoundary surface="Search" variant="overlay" onDismiss={() => setShowSearch(false)}>
         <WorkspaceSearchPalette
           open={showSearch}
           initialMode={searchMode}
@@ -2408,14 +2450,17 @@ function App() {
             navigateToFile(relativePath, "editor", line)
           }
         />
+        </ErrorBoundary>
       )}
 
+      <ErrorBoundary surface="Settings" variant="overlay" onDismiss={() => setSettingsTab(null)}>
       <Settings
         open={settingsTab !== null}
         initialTab={settingsTab ?? "general"}
         onClose={() => setSettingsTab(null)}
         onIssueTrackerConfigSaved={refreshIssueTrackerConfigured}
       />
+      </ErrorBoundary>
 
       {/* Project context menu (right-click on project header) */}
       {projectContextMenu && (() => {
@@ -2429,6 +2474,7 @@ function App() {
           await copyToClipboard(projPath, "Path copied");
         };
         return (
+          <ErrorBoundary surface="Project menu" variant="overlay" onDismiss={() => setProjectContextMenu(null)}>
           <ProjectContextMenu
             projectId={projectContextMenu.projectId}
             projectName={proj.name}
@@ -2499,10 +2545,12 @@ function App() {
             onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
             onDismiss={() => setProjectContextMenu(null)}
           />
+          </ErrorBoundary>
         );
       })()}
 
       {archivedForProject && (
+        <ErrorBoundary surface="Archived workspaces" variant="overlay" onDismiss={() => setArchivedForProject(null)}>
         <ModalShell onClose={() => setArchivedForProject(null)} ariaLabel="Archived workspaces">
           <ArchivedWorkspacesModal
             projectId={archivedForProject.id}
@@ -2517,6 +2565,7 @@ function App() {
             onClose={() => setArchivedForProject(null)}
           />
         </ModalShell>
+        </ErrorBoundary>
       )}
 
       {/* Project customization menu */}
@@ -2528,6 +2577,7 @@ function App() {
         const customized = customizations[customizingProjectId] || {};
 
         return (
+          <ErrorBoundary surface="Customize project" variant="overlay" onDismiss={() => setShowProjectCustomizer(false)}>
           <div
             className="absolute inset-0 z-30 flex items-start justify-start bg-black/30 p-2 octo-overlay-enter"
             onClick={() => setShowProjectCustomizer(false)}
@@ -2543,6 +2593,7 @@ function App() {
               />
             </div>
           </div>
+          </ErrorBoundary>
         );
       })()}
 
@@ -2552,6 +2603,7 @@ function App() {
         if (!proj) return null;
 
         return (
+          <ErrorBoundary surface="Delete project" variant="overlay" onDismiss={() => setDeletingProjectId(null)}>
           <ConfirmDialog
             title="Delete Project Permanently?"
             body={`This will permanently delete "${proj.name}" and ALL its workspaces from disk.`}
@@ -2561,6 +2613,7 @@ function App() {
             onConfirm={() => handleConfirmDeleteProject(deletingProjectId!)}
             onCancel={() => setDeletingProjectId(null)}
           />
+          </ErrorBoundary>
         );
       })()}
 
@@ -2593,6 +2646,7 @@ function App() {
           await copyToClipboard(text, label);
         };
         return (
+          <ErrorBoundary surface="Workspace menu" variant="overlay" onDismiss={() => setContextMenu(null)}>
           <WorkspaceContextMenu
             x={contextMenu.x}
             y={contextMenu.y}
@@ -2654,11 +2708,13 @@ function App() {
               setContextMenu(null);
             }}
           />
+          </ErrorBoundary>
         );
       })()}
 
       {/* Large-file confirmation dialog */}
       {largeFile && (
+        <ErrorBoundary surface="Large file" variant="overlay" onDismiss={() => resolveLargeFile(false)}>
         <ConfirmDialog
           title="Large file"
           body={`${largeFile.path.split("/").pop()} is ${formatBytes(largeFile.size)}. Opening large files can make the editor slow. Open anyway?`}
@@ -2667,6 +2723,7 @@ function App() {
           onConfirm={() => resolveLargeFile(true)}
           onCancel={() => resolveLargeFile(false)}
         />
+        </ErrorBoundary>
       )}
 
       {/* Delete confirmation modal */}
@@ -2678,6 +2735,7 @@ function App() {
           if (ws) break;
         }
         return ws ? (
+          <ErrorBoundary surface="Delete workspace" variant="overlay" onDismiss={() => setDeletingWorkspaceId(null)}>
           <ConfirmDialog
             title={`Delete "${ws.name}"?`}
             body={`This will remove the worktree and branch from disk. This cannot be undone.`}
@@ -2685,11 +2743,13 @@ function App() {
             onConfirm={handleDeleteWorkspace}
             onCancel={() => setDeletingWorkspaceId(null)}
           />
+          </ErrorBoundary>
         ) : null;
       })()}
 
       {/* Project switcher sheet — overlaid without unmounting the canvas */}
       {showAddProject && (
+        <ErrorBoundary surface="Add project" variant="overlay" onDismiss={() => setShowAddProject(false)}>
         <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
           <NewProjectFlow
             onBack={() => setShowAddProject(false)}
@@ -2697,6 +2757,7 @@ function App() {
             onSketch={handleSketch}
           />
         </div>
+        </ErrorBoundary>
       )}
 
       {/* Jira ticket picker modal (link / change from workspace context menu) */}
@@ -2713,6 +2774,7 @@ function App() {
           : null;
         const pickerProjectKey = pickerProject?.jiraProjectKey ?? null;
         return (
+          <ErrorBoundary surface="Jira ticket picker" variant="overlay" onDismiss={() => setJiraTicketPickerOpen(null)}>
           <JiraTicketPickerModal
             candidates={allIssues ?? []}
             projectKey={pickerProjectKey}
@@ -2725,6 +2787,7 @@ function App() {
             }}
             onClose={() => setJiraTicketPickerOpen(null)}
           />
+          </ErrorBoundary>
         );
       })()}
 
@@ -2734,6 +2797,7 @@ function App() {
           ?? (project?.id === jiraProjectKeyEditorOpen.projectId ? project : null);
         if (!proj) return null;
         return (
+          <ErrorBoundary surface="Jira project key" variant="overlay" onDismiss={() => setJiraProjectKeyEditorOpen(null)}>
           <JiraProjectKeyModal
             initialValue={proj.jiraProjectKey ?? ""}
             projectName={proj.name}
@@ -2744,21 +2808,25 @@ function App() {
             }}
             onClose={() => setJiraProjectKeyEditorOpen(null)}
           />
+          </ErrorBoundary>
         );
       })()}
 
       {/* Backlog ticket context menu */}
       {backlogTicketMenu && (
+        <ErrorBoundary surface="Ticket menu" variant="overlay" onDismiss={() => setBacklogTicketMenu(null)}>
         <BacklogRowContextMenu
           x={backlogTicketMenu.x}
           y={backlogTicketMenu.y}
           onCreateWorkspace={() => void startCreateForTicket(backlogTicketMenu.issue)}
           onClose={() => setBacklogTicketMenu(null)}
         />
+        </ErrorBoundary>
       )}
 
       {/* Existing workspace alert modal */}
       {existingWsAlert && (
+        <ErrorBoundary surface="Existing workspace" variant="overlay" onDismiss={() => setExistingWsAlert(null)}>
         <ExistingWorkspaceAlertModal
           ticketKey={existingWsAlert.ticketKey}
           workspaceName={existingWsAlert.existingName}
@@ -2769,10 +2837,12 @@ function App() {
           }}
           onCancel={() => setExistingWsAlert(null)}
         />
+        </ErrorBoundary>
       )}
 
       {/* Project picker modal (multiple projects match the Jira prefix) */}
       {projectPickerForTicket && (
+        <ErrorBoundary surface="Project picker" variant="overlay" onDismiss={() => setProjectPickerForTicket(null)}>
         <ProjectPickerModal
           candidates={projectPickerForTicket.candidates}
           title="Select Octopush Project"
@@ -2789,12 +2859,14 @@ function App() {
           }}
           onClose={() => setProjectPickerForTicket(null)}
         />
+        </ErrorBoundary>
       )}
 
       {/* Ticket-driven workspace creator (overlay, does not unmount canvas) */}
       {creatorForTicket && (() => {
         const targetProject = getProjectById(creatorForTicket.projectId);
         return targetProject ? (
+          <ErrorBoundary surface="New mission" variant="overlay" onDismiss={() => setCreatorForTicket(null)}>
           <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
             {/* The `key` forces a remount when the ticket-driven creator
              *  opens for a different ticket — `useState(initialTask)` only
@@ -2811,18 +2883,26 @@ function App() {
               onCancel={() => setCreatorForTicket(null)}
             />
           </div>
+          </ErrorBoundary>
         ) : null;
       })()}
 
       <ToastContainer />
       <UpdateNotifier />
-      <WhatsNewHost />
-      <UpgradeSheet />
-      <HistorySheet />
+      <ErrorBoundary surface="What's new" variant="overlay" onDismiss={() => useWhatsNewStore.getState().close()}>
+        <WhatsNewHost />
+      </ErrorBoundary>
+      <ErrorBoundary surface="Upgrade" variant="overlay" onDismiss={() => useUpgradeStore.getState().hide()}>
+        <UpgradeSheet />
+      </ErrorBoundary>
+      <ErrorBoundary surface="Run history" variant="overlay" onDismiss={() => useHistoryStore.getState().close()}>
+        <HistorySheet />
+      </ErrorBoundary>
       {/* Mounted only while open — the room subscribes to the whole runs
           board, so an always-mounted instance would churn on every stage
           event for nothing. OverlayRoom's fade-in covers the entrance. */}
       {missionControlOpen && (
+        <ErrorBoundary surface="Mission Control" variant="overlay" onDismiss={() => setMissionControlOpen(false)}>
         <MissionControl
           open
           onClose={() => setMissionControlOpen(false)}
@@ -2830,9 +2910,12 @@ function App() {
           onJumpToAttention={handleJumpToAttention}
           onDispatch={handleDispatchCrew}
         />
+        </ErrorBoundary>
       )}
       {logbookOpen && (
+        <ErrorBoundary surface="Logbook" variant="overlay" onDismiss={() => setLogbookOpen(false)}>
         <LogbookRoom open onClose={() => setLogbookOpen(false)} project={project} />
+        </ErrorBoundary>
       )}
     </div>
   );
