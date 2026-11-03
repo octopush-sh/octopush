@@ -531,6 +531,13 @@ fn evaluate_on_macos(
     trust
         .set_trust_verify_date(&CFDate::new(secs as f64))
         .map_err(|e| invalid_certificate(e.to_string()))?;
+    // Tests evaluate fixed fixture chains at a fixed date: keep SecTrust off
+    // the network so the result can't depend on the runner's connectivity
+    // (#490). Production evaluation is unchanged.
+    #[cfg(test)]
+    trust
+        .set_network_fetch_allowed(false)
+        .map_err(|e| TlsError::General(e.to_string()))?;
     if !ocsp_response.is_empty() {
         trust
             .set_trust_ocsp_response(std::iter::once(ocsp_response))
