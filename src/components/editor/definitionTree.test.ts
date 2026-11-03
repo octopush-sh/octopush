@@ -1,11 +1,15 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { EditorState } from "@codemirror/state";
-import { languageSupport } from "../../lib/editorLanguages";
+import { GRAMMAR_LANGS, loadLanguageSupport, loadedLanguageSupport } from "../../lib/editorLanguages";
 import type { LangId } from "../../lib/editorLang";
 import { classifyClick, classifySite, hasDefinitionTree } from "./definitionTree";
 
+beforeAll(async () => {
+  await Promise.all(GRAMMAR_LANGS.map(loadLanguageSupport));
+});
+
 function stateFor(lang: LangId, doc: string) {
-  return EditorState.create({ doc, extensions: [languageSupport(lang)] });
+  return EditorState.create({ doc, extensions: [loadedLanguageSupport(lang) ?? []] });
 }
 
 /** The `nth` whole-word occurrence of `name` in `doc`, as a range. */

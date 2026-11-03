@@ -5,7 +5,7 @@ import { DiffLines } from "./DiffLines";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import { ipc } from "../../lib/ipc";
-import { highlightFile } from "../../lib/diffSyntax";
+import { diffGrammarReady, highlightFile, loadDiffGrammar } from "../../lib/diffSyntax";
 import type { DiffFile } from "../../lib/diffParser";
 
 /** Larger files are highlighted hunk by hunk, without the rest of the file. */
@@ -55,7 +55,24 @@ export function FileDiffSection({
     return () => { live = false; };
   }, [workspacePath, file, collapsed]);
   const newContent = disk?.file === file ? disk.text : null;
-  const tokens = useMemo(() => highlightFile(file, newContent), [file, newContent]);
+
+  // Grammars load on first use. Until this one lands the rows are plain; the
+  // load starts at mount, beside the disk read, and highlighting runs again
+  // when it resolves. On a warm cache it is already here: no plain frame.
+  const grammarReady = diffGrammarReady(file.filePath);
+  const [, setGrammarLanded] = useState(0);
+  useEffect(() => {
+    if (grammarReady) return;
+    let live = true;
+    void loadDiffGrammar(file.filePath).then(() => { if (live) setGrammarLanded((n) => n + 1); });
+    return () => { live = false; };
+  }, [file.filePath, grammarReady]);
+  const tokens = useMemo(
+    () => highlightFile(file, newContent),
+    // `grammarReady` re-highlights once the grammar lands.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [file, newContent, grammarReady],
+  );
 
   const typeLabel =
     file.changeType === "new"

@@ -1,6 +1,10 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { hasCppSources, langForExtension, type LangId } from "./editorLang";
-import { languageFor } from "./editorLanguages";
+import { GRAMMAR_LANGS, loadLanguage, loadedLanguage } from "./editorLanguages";
+
+beforeAll(async () => {
+  await Promise.all(GRAMMAR_LANGS.map(loadLanguage));
+});
 
 describe("langForExtension", () => {
   it.each([
@@ -85,7 +89,7 @@ describe("hasCppSources", () => {
 /** Every node name in a parsed document. */
 function nodeNames(lang: LangId, doc: string): string[] {
   const names: string[] = [];
-  languageFor(lang)!.parser.parse(doc).iterate({ enter: (n) => { names.push(n.name); } });
+  loadedLanguage(lang)!.parser.parse(doc).iterate({ enter: (n) => { names.push(n.name); } });
   return names;
 }
 
@@ -105,8 +109,9 @@ describe("Lezer grammars", () => {
     expect(names).not.toContain("⚠");
     for (const n of nodes) expect(names).toContain(n);
   });
-  it("C and C++ share the C++ grammar", () => {
-    expect(languageFor("c")).toBe(languageFor("cpp"));
+  it("C and C++ share the C++ grammar", async () => {
+    expect(loadedLanguage("c")).toBe(loadedLanguage("cpp"));
+    expect(await loadLanguage("c")).toBe(await loadLanguage("cpp"));
   });
 });
 

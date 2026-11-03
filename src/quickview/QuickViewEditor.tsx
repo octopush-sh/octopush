@@ -15,11 +15,14 @@ import { buildEditorTheme } from "../components/editor/atelierTheme";
 import { EditorSearch } from "../components/editor/EditorSearch";
 import { searchMatchHighlight } from "../components/editor/searchHighlight";
 import { symbolOccurrenceHighlight } from "../components/editor/symbolHighlight";
-import { languageSupport } from "../lib/editorLanguages";
+import { loadLanguageSupport, loadedLanguageSupport } from "../lib/editorLanguages";
 import type { LangId } from "../lib/editorLang";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 
 const themeComp = new Compartment();
+// Grammars load on first use (editorLanguages.ts): the editor opens with
+// whatever has landed and is reconfigured once the grammar does.
+const langComp = new Compartment();
 
 const layout = EditorView.theme({
   "&": { height: "100%" },
@@ -95,7 +98,7 @@ export function QuickViewEditor({ doc, lang, eol, onChange, onSave, onReady }: P
           ...defaultKeymap,
           ...historyKeymap,
         ]),
-        languageSupport(lang),
+        langComp.of(loadedLanguageSupport(lang) ?? []),
         themeComp.of(buildEditorTheme()),
         layout,
         EditorView.updateListener.of((u) => {
@@ -107,6 +110,11 @@ export function QuickViewEditor({ doc, lang, eol, onChange, onSave, onReady }: P
     viewRef.current = created;
     setView(created);
     onReady(created);
+    if (!loadedLanguageSupport(lang)) {
+      void loadLanguageSupport(lang).then((support) => {
+        if (viewRef.current === created) created.dispatch({ effects: langComp.reconfigure(support) });
+      });
+    }
     return () => {
       created.destroy();
       viewRef.current = null;

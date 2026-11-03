@@ -127,6 +127,24 @@ describe("FileDiffSection", () => {
     expect(readFileChecked).not.toHaveBeenCalled();
     expect(rowTexts(container)).toEqual(exactRows);
   });
+  it("colours rows once a cold grammar lands, and on the first render once warm", async () => {
+    // Go appears nowhere else in this file, so its grammar starts cold.
+    const [gf] = parseFullDiff([
+      "diff --git a/main.go b/main.go", "new file mode 100644", "--- /dev/null", "+++ b/main.go",
+      "@@ -0,0 +1,1 @@", "+func main() {}", "",
+    ].join("\n"));
+    const goRender = () => render(<FileDiffSection file={gf} focusedHunk={-1} viewed={false} collapsed={false}
+      onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+    const keyword = (c: HTMLElement) => c.querySelector("[data-diff-row] .tok-kw")?.textContent;
+
+    const cold = goRender();
+    expect(keyword(cold.container)).toBeUndefined();
+    await waitFor(() => expect(keyword(cold.container)).toBe("func"));
+    cold.unmount();
+
+    const warm = goRender();
+    expect(keyword(warm.container)).toBe("func");
+  });
   it.each(["new", "deleted"] as const)("does not read the file for a %s file", (changeType) => {
     renderJava({ ...javaFile(), changeType });
     expect(readFileChecked).not.toHaveBeenCalled();

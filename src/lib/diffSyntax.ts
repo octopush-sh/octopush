@@ -8,7 +8,13 @@
  * file (old and new) is parsed as one document and the tokens are mapped
  * back onto the diff rows, so a line inside a block comment, a docstring
  * or a multi-line string is coloured as such. The language set is the
- * editor's (`languageFor`), stream modes included.
+ * editor's (`editorLanguages.ts`), stream modes included.
+ *
+ * Highlighting is synchronous and uses only grammars that have already
+ * loaded; a file whose grammar is still in flight reads as plain text.
+ * Callers start the load with `loadDiffGrammar` (FileDiffSection does on
+ * mount) and highlight again when it resolves — on a warm cache it is
+ * already there and the first render is coloured.
  *
  * Supersedes `diffHighlight.ts` (per-line, Lezer-only), which no longer has
  * callers.
@@ -17,7 +23,7 @@ import { highlightTree } from "@lezer/highlight";
 import { HighlightStyle } from "@codemirror/language";
 import { tags as t } from "@lezer/highlight";
 import { langForExtension, type LangId } from "./editorLang";
-import { languageFor } from "./editorLanguages";
+import { loadLanguage, loadedLanguage } from "./editorLanguages";
 import type { DiffFile, DiffRow } from "./diffParser";
 import type { WordSegment } from "./wordDiff";
 
@@ -75,6 +81,17 @@ const classStyle = HighlightStyle.define([
 
 const plain = (text: string): DiffTok[] => [{ text, cls: "" }];
 
+/** Has the grammar `filePath` is highlighted with landed (plain text counts)? */
+export function diffGrammarReady(filePath: string): boolean {
+  return loadedLanguage(langForExtension(filePath)) !== undefined;
+}
+
+/** Fetch the grammar `filePath` is highlighted with. Resolves once
+ *  `diffGrammarReady` holds, or the load failed (the file stays plain). */
+export function loadDiffGrammar(filePath: string): Promise<void> {
+  return loadLanguage(langForExtension(filePath)).then(() => {});
+}
+
 // Memoize by (langId, document): diff rows re-render often (focus changes,
 // etc.), and the same file version is highlighted again after a remount.
 // Bounded so it can't grow without limit across long-lived sessions.
@@ -85,10 +102,11 @@ const memo = new Map<string, DiffTok[][]>();
  * Highlight `lines` as ONE document (joined with "\n") and return the
  * tokens of each line. Every line's tokens concatenate to it exactly
  * (round-trip guarantee); tokens with no applicable class have `cls: ""`.
- * Unknown / plaintext languages give one unclassed token per line.
+ * Unknown / plaintext languages, and grammars not loaded yet, give one
+ * unclassed token per line.
  */
 export function highlightLines(lines: string[], langId: LangId): DiffTok[][] {
-  const lang = languageFor(langId);
+  const lang = loadedLanguage(langId);
   if (!lang) return lines.map(plain);
 
   const doc = lines.join("\n");
@@ -153,7 +171,7 @@ export function highlightHunk(rows: DiffRow[], filePath: string): DiffTok[][] {
  */
 export function highlightFile(file: DiffFile, newContent: string | null): DiffTok[][][] {
   const langId = langForExtension(file.filePath);
-  if (!languageFor(langId)) return file.hunks.map((h) => h.rows.map((r) => plain(r.text)));
+  if (!loadedLanguage(langId)) return file.hunks.map((h) => h.rows.map((r) => plain(r.text)));
 
   const sides = newContent == null ? null : rebuildSides(file, newContent);
   if (!sides) return file.hunks.map((h) => highlightHunk(h.rows, file.filePath));

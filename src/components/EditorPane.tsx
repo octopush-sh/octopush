@@ -8,7 +8,7 @@ import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirro
 import { indentOnInput, bracketMatching, foldGutter, foldKeymap, indentUnit } from "@codemirror/language";
 import { search, searchKeymap, setSearchQuery, SearchQuery, gotoLine } from "@codemirror/search";
 import { buildEditorTheme } from "./editor/atelierTheme";
-import { languageSupport } from "../lib/editorLanguages";
+import { loadLanguageSupport, loadedLanguageSupport } from "../lib/editorLanguages";
 import type { LangId } from "../lib/editorLang";
 import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
@@ -55,6 +55,9 @@ const tabComp = new Compartment();
 const fontComp = new Compartment();
 const blameComp = new Compartment();
 const themeComp = new Compartment();
+// Grammars load on first use (editorLanguages.ts): a state is built with
+// whatever has landed and reconfigured once the rest does.
+const langComp = new Compartment();
 
 interface Prefs { wrap: boolean; fontSize: number; tabWidth: number; lineNumbers: boolean; }
 
@@ -154,7 +157,7 @@ function buildState(opts: {
         ...historyKeymap,
         ...foldKeymap,
       ]),
-      languageSupport(lang as LangId),
+      langComp.of(loadedLanguageSupport(lang as LangId) ?? []),
       themeComp.of(buildEditorTheme()),
       diffGutter(markers),
       EditorView.updateListener.of((update) => {
@@ -556,6 +559,17 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     });
   };
 
+  // Fetch the grammar a document was built without, and install it if that
+  // document is still the one showing when it lands. A tab left before then
+  // gets it from the swap effect when it comes back.
+  const installLanguageWhenLoaded = (view: EditorView, file: { path: string; lang: string }) => {
+    if (loadedLanguageSupport(file.lang as LangId)) return;
+    void loadLanguageSupport(file.lang as LangId).then((support) => {
+      if (viewRef.current !== view || lastPathRef.current !== file.path) return;
+      view.dispatch({ effects: langComp.reconfigure(support) });
+    });
+  };
+
   // Create the view once; destroy on unmount.
   useEffect(() => {
     if (!hostRef.current || viewRef.current) return;
@@ -600,8 +614,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // Restored cached states carry the theme they were built with; re-apply
       // the current one so a theme switch while another tab was active lands.
       themeComp.reconfigure(buildEditorTheme()),
+      // Likewise a grammar that landed while this tab was in the background.
+      langComp.reconfigure(loadedLanguageSupport(activeFile.lang as LangId) ?? []),
     ]});
     lastPathRef.current = activeFile.path;
+    installLanguageWhenLoaded(view, activeFile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activePath, workspaceId]);
 
@@ -681,6 +698,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     dropPendingSync();
     stateCache.current.delete(activeFile.path); // drop the stale doc
     view.setState(freshState(activeFile));
+    installLanguageWhenLoaded(view, activeFile);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeVersion, activePath]);
 
