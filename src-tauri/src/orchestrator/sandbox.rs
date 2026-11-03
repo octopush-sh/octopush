@@ -186,15 +186,16 @@ struct GitLayout {
     hooks_dir: String,
 }
 
-/// The dirs strictly between `workspace` and `path` (nearest first). Denying
-/// them stops an agent renaming an ancestor of the hooks dir and putting a
-/// symlink in its place. Empty when `path` isn't inside the workspace. Pure.
-fn ancestors_within(workspace: &str, path: &str) -> Vec<String> {
-    let ws = Path::new(workspace);
+/// The dirs strictly between `root` (a writable root) and `path` (nearest
+/// first). Denying them stops an agent renaming an ancestor of the hooks dir
+/// and putting a symlink in its place. Empty when `path` isn't inside `root`.
+/// Pure.
+fn ancestors_within(root: &str, path: &str) -> Vec<String> {
+    let root = Path::new(root);
     Path::new(path)
         .ancestors()
         .skip(1)
-        .take_while(|dir| *dir != ws && dir.starts_with(ws))
+        .take_while(|dir| *dir != root && dir.starts_with(root))
         .map(|dir| dir.to_string_lossy().into_owned())
         .collect()
 }
@@ -203,7 +204,10 @@ fn ancestors_within(workspace: &str, path: &str) -> Vec<String> {
 /// — the per-worktree git dir plus the shared objects, refs, reflogs and
 /// packed-refs (or reftable) — which a linked worktree keeps outside its own
 /// subtree. Then denies everything that runs code or changes git's behaviour
-/// on the host: the effective hooks dir (and `<common>/hooks`), `info/`, the
+/// on the host: the effective hooks dir (and `<common>/hooks`) plus its parent
+/// dirs inside the workspace or any other of `write_roots` (a `core.hooksPath`
+/// may point into `$TMPDIR` or `~/.cache`), `info/`, the legacy `remotes/` and
+/// `branches/` (a planted file there redirects a later `git fetch`), the
 /// shared and per-worktree config, every worktree's `commondir`/`gitdir`/
 /// `config.worktree` (a main checkout could otherwise repoint a sibling
 /// worktree), submodule git dirs under every `modules/` (shared, own and each
@@ -213,7 +217,7 @@ fn ancestors_within(workspace: &str, path: &str) -> Vec<String> {
 /// redirect git to a planted config). Not covered: moving in a directory that
 /// already holds a `.git`. A hook planted there would run unsandboxed on the
 /// user's next commit or `git status`. Applies to main checkouts too. Pure.
-fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
+fn git_write_rules(workspace: &str, layout: &GitLayout, write_roots: &[String]) -> WriteRules {
     let ws = workspace.trim_end_matches('/');
     let g = layout.git_dir.trim_end_matches('/');
     let c = layout.common_dir.trim_end_matches('/');
@@ -231,7 +235,10 @@ fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
         // `worktrees/` itself must not be movable or the denies below are moot.
         format!("{c}/worktrees"),
     ];
-    deny_literals.extend(ancestors_within(ws, hooks));
+    let other_roots = write_roots.iter().map(|r| r.trim_end_matches('/')).filter(|r| !r.is_empty());
+    for root in std::iter::once(ws).chain(other_roots) {
+        deny_literals.extend(ancestors_within(root, hooks));
+    }
     let mut rules = WriteRules {
         subpaths: vec![
             g.to_string(),
@@ -245,6 +252,8 @@ fn git_write_rules(workspace: &str, layout: &GitLayout) -> WriteRules {
             hooks.to_string(),
             format!("{c}/hooks"),
             format!("{c}/info"),
+            format!("{c}/remotes"),
+            format!("{c}/branches"),
             format!("{c}/modules"),
             format!("{g}/modules"),
         ],
@@ -351,9 +360,9 @@ fn resolve_git_layout(workspace: &str) -> AppResult<Option<GitLayout>> {
 
 /// Render an SBPL profile that allows everything by default, denies all file
 /// writes, then re-allows writes under `subpaths` (directory subtrees) and to
-/// `literals` (individual files), and finally denies `deny_subpaths`,
-/// `deny_literals` and `deny_regexes` again. In SBPL the last matching rule
-/// wins, so the trailing denies beat any allow above them. `(allow default)`
+/// `literals` (individual files), and finally denies writes to and hardlinks
+/// of `deny_subpaths`, `deny_literals` and `deny_regexes`. In SBPL the last
+/// matching rule wins, so the trailing denies beat any allow above them. `(allow default)`
 /// keeps reads and network working — confinement is on writes only. Pure.
 fn render_profile(rules: &WriteRules) -> String {
     fn filters(p: &mut String, kind: &str, values: &[String]) {
@@ -374,11 +383,19 @@ fn render_profile(rules: &WriteRules) -> String {
     filters(&mut p, "literal", &rules.literals);
     p.push_str(")\n");
     if !rules.deny_subpaths.is_empty() || !rules.deny_literals.is_empty() || !rules.deny_regexes.is_empty() {
-        p.push_str("(deny file-write*\n");
-        filters(&mut p, "subpath", &rules.deny_subpaths);
-        filters(&mut p, "literal", &rules.deny_literals);
-        filters(&mut p, "regex", &rules.deny_regexes);
-        p.push_str(")\n");
+        // `file-link` is checked against the file being linked, not the new
+        // name, and isn't part of `file-write*`: without it a stage could
+        // hardlink `.git/config` or a hook into the workspace and write
+        // through the link.
+        for op in ["file-write*", "file-link"] {
+            p.push_str("(deny ");
+            p.push_str(op);
+            p.push('\n');
+            filters(&mut p, "subpath", &rules.deny_subpaths);
+            filters(&mut p, "literal", &rules.deny_literals);
+            filters(&mut p, "regex", &rules.deny_regexes);
+            p.push_str(")\n");
+        }
     }
     p
 }
@@ -422,9 +439,10 @@ pub fn build_seatbelt_profile(mission_write_roots: &[String]) -> AppResult<Strin
         literals: system_write_files(home.as_deref()),
         ..WriteRules::default()
     };
+    let write_roots = rules.subpaths.clone();
     for root in mission_write_roots {
         if let Some(layout) = resolve_git_layout(root)? {
-            rules.extend(git_write_rules(&canonical_string(Path::new(root)), &layout));
+            rules.extend(git_write_rules(&canonical_string(Path::new(root)), &layout, &write_roots));
         }
     }
     rules.dedup();
@@ -584,7 +602,7 @@ mod tests {
     fn git_rules_deny_every_worktrees_pointers_not_just_the_own() {
         // From a main checkout, a sibling worktree's commondir sits inside the
         // workspace subtree; repointing it would plant config for that worktree.
-        let r = git_write_rules("/ws", &main_layout());
+        let r = git_write_rules("/ws", &main_layout(), &[]);
         for d in [
             "/ws/.git/worktrees/sib/commondir",
             "/ws/.git/worktrees/sib/gitdir",
@@ -596,7 +614,7 @@ mod tests {
         // The sibling's index/HEAD aren't code; git may still touch them.
         assert!(!regex_denies(&r, "/ws/.git/worktrees/sib/HEAD"));
         assert!(!regex_denies(&r, "/ws/.git/worktrees/sib/commondir2"));
-        let l = git_write_rules("/wt", &linked_layout());
+        let l = git_write_rules("/wt", &linked_layout(), &[]);
         assert!(regex_denies(&l, "/repo/.git/worktrees/other/commondir"));
         assert!(regex_denies(&l, "/repo/.git/worktrees/wt/gitdir"));
     }
@@ -605,13 +623,13 @@ mod tests {
     fn git_rules_deny_renaming_worktrees_or_a_worktree_dir() {
         // Seatbelt checks a rename against its source and destination only, so
         // the parents of the pointer denies must be pinned as paths too.
-        let r = git_write_rules("/ws", &main_layout());
+        let r = git_write_rules("/ws", &main_layout(), &[]);
         assert!(r.deny_literals.contains(&"/ws/.git/worktrees".to_string()));
         assert!(r.deny_regexes.contains(&"^/ws/\\.git/worktrees/[^/]+$".to_string()));
         for d in ["/ws/.git/worktrees/wt", "/ws/.git/worktrees/wt-old"] {
             assert!(regex_denies(&r, d), "{d} must be denied");
         }
-        let l = git_write_rules("/wt", &linked_layout());
+        let l = git_write_rules("/wt", &linked_layout(), &[]);
         assert!(l.deny_literals.contains(&"/repo/.git/worktrees".to_string()));
         assert!(regex_denies(&l, "/repo/.git/worktrees/wt"));
         // Writes inside the own linked git dir stay allowed.
@@ -623,9 +641,9 @@ mod tests {
 
     #[test]
     fn git_rules_deny_submodule_git_dirs_and_nested_dot_git() {
-        let r = git_write_rules("/ws", &main_layout());
+        let r = git_write_rules("/ws", &main_layout(), &[]);
         assert!(r.deny_subpaths.contains(&"/ws/.git/modules".to_string()));
-        let l = git_write_rules("/wt", &linked_layout());
+        let l = git_write_rules("/wt", &linked_layout(), &[]);
         // A linked worktree's submodules live under its own git dir.
         assert!(l.deny_subpaths.contains(&"/repo/.git/modules".to_string()));
         assert!(l.deny_subpaths.contains(&"/repo/.git/worktrees/wt/modules".to_string()));
@@ -653,7 +671,7 @@ mod tests {
     fn git_rules_deny_a_configured_hooks_path_inside_the_workspace() {
         // Husky v9: core.hooksPath=.husky/_ (gitignored, so invisible in a diff).
         let layout = GitLayout { hooks_dir: "/wt/.husky/_".into(), ..linked_layout() };
-        let r = git_write_rules("/wt", &layout);
+        let r = git_write_rules("/wt", &layout, &[]);
         assert!(r.deny_subpaths.contains(&"/wt/.husky/_".to_string()));
         // The default hooks dir stays denied too.
         assert!(r.deny_subpaths.contains(&"/repo/.git/hooks".to_string()));
@@ -666,9 +684,33 @@ mod tests {
     }
 
     #[test]
+    fn git_rules_deny_a_hooks_path_parents_inside_any_writable_root() {
+        // core.hooksPath pointed into $TMPDIR or ~/.cache: its parents there are
+        // writable too, so they must be pinned like the workspace's.
+        let roots = vec!["/private/tmp".to_string(), "/home/u/.cache/".to_string(), "/wt".to_string()];
+        let layout = GitLayout { hooks_dir: "/private/tmp/shared/git/hooks".into(), ..linked_layout() };
+        let r = git_write_rules("/wt", &layout, &roots);
+        assert!(r.deny_subpaths.contains(&"/private/tmp/shared/git/hooks".to_string()));
+        for d in ["/private/tmp/shared/git", "/private/tmp/shared"] {
+            assert!(r.deny_literals.contains(&d.to_string()), "{d} must be denied");
+        }
+        // The allowed root itself stays usable.
+        assert!(!r.deny_literals.contains(&"/private/tmp".to_string()));
+        let layout = GitLayout { hooks_dir: "/home/u/.cache/hooks/x".into(), ..linked_layout() };
+        let r = git_write_rules("/wt", &layout, &roots);
+        assert!(r.deny_literals.contains(&"/home/u/.cache/hooks".to_string()));
+        assert!(!r.deny_literals.contains(&"/home/u/.cache".to_string()));
+        // A hooks dir outside every writable root needs no parent denies.
+        let layout = GitLayout { hooks_dir: "/opt/hooks/x".into(), ..linked_layout() };
+        let r = git_write_rules("/wt", &layout, &roots);
+        assert!(!r.deny_literals.iter().any(|d| d.starts_with("/opt")));
+    }
+
+    #[test]
     fn git_rules_for_a_main_checkout_deny_hooks_config_and_info() {
-        let r = git_write_rules("/ws", &main_layout());
-        for d in ["/ws/.git/hooks", "/ws/.git/info"] {
+        let r = git_write_rules("/ws", &main_layout(), &[]);
+        // `remotes/` and `branches/` are legacy remote definitions `git fetch` still reads.
+        for d in ["/ws/.git/hooks", "/ws/.git/info", "/ws/.git/remotes", "/ws/.git/branches"] {
             assert!(r.deny_subpaths.contains(&d.to_string()), "{d} must be denied");
         }
         for d in ["/ws/.git/config", "/ws/.git/config.lock", "/ws/.git/config.worktree", "/ws/.git"] {
@@ -681,7 +723,7 @@ mod tests {
 
     #[test]
     fn git_rules_for_a_linked_worktree_allow_commits_but_not_hooks() {
-        let r = git_write_rules("/wt", &linked_layout());
+        let r = git_write_rules("/wt", &linked_layout(), &[]);
         // What `git add` / `git commit` write, outside the worktree's own subtree.
         for a in ["/repo/.git/worktrees/wt", "/repo/.git/objects", "/repo/.git/refs", "/repo/.git/logs"] {
             assert!(r.subpaths.contains(&a.to_string()), "{a} must be writable");
@@ -707,7 +749,7 @@ mod tests {
         // SBPL: the last matching rule wins, so the denies must come last to
         // beat the workspace (and $TMPDIR) subtree allows.
         let mut rules = WriteRules { subpaths: vec!["/ws".into()], ..WriteRules::default() };
-        rules.extend(git_write_rules("/ws", &main_layout()));
+        rules.extend(git_write_rules("/ws", &main_layout(), &[]));
         let p = render_profile(&rules);
         let allow = p.find("(allow file-write*").unwrap();
         let deny = p.rfind("(deny file-write*\n").unwrap();
@@ -721,6 +763,13 @@ mod tests {
         // Regex backslashes are doubled once more for the SBPL string literal.
         assert!(tail.contains("(regex \"^/ws/\\\\.git/worktrees/[^/]+/(commondir|"));
         assert!(tail.contains("(regex \"^/ws/\\\\.git/worktrees/[^/]+$\")"));
+        // Hardlinking a protected file (to write through the link) is denied
+        // for the same paths; `file-link` isn't covered by `file-write*`.
+        let link = p.find("(deny file-link\n").expect("a file-link deny block");
+        assert!(allow < link);
+        let link_block = &p[link..];
+        assert!(link_block.contains("(literal \"/ws/.git/config\")"));
+        assert!(link_block.contains("(subpath \"/ws/.git/hooks\")"));
     }
 
     #[test]
@@ -729,6 +778,7 @@ mod tests {
         let p = build_seatbelt_profile(&[]).unwrap();
         assert!(!p.contains("/objects\""));
         assert!(!p.contains("(deny file-write*\n"));
+        assert!(!p.contains("(deny file-link"));
     }
 
     #[test]
@@ -829,7 +879,7 @@ mod tests {
     fn seatbelt_denies_git_hooks_and_config_but_allows_commits() {
         // Kernel check that the trailing denies beat the earlier allows (the
         // tempdir sits under the allowed $TMPDIR, so only the denies stop it).
-        let Some((_dir, main, wt)) = repo_with_worktree() else {
+        let Some((dir, main, wt)) = repo_with_worktree() else {
             eprintln!("git unavailable; skipping");
             return;
         };
@@ -857,6 +907,25 @@ mod tests {
         assert!(!run(&main, &format!("echo x > '{}/pre-commit'", hooks.display())));
         assert!(!run(&wt, &format!("echo x > '{}/pre-commit'", hooks.display())));
         assert!(!hooks.join("pre-commit").exists(), "no hook was planted");
+        // No hardlink to the config or a hook inside the writable tree, so
+        // nothing can be written through one. `probe` isn't a hook name git runs.
+        let config = main.join(".git/config");
+        let config_before = std::fs::read(&config).unwrap();
+        let probe = hooks.join("probe");
+        std::fs::write(&probe, "#!/bin/sh\n").unwrap();
+        for ws in [&main, &wt] {
+            let to_config = format!("ln '{}' cfg-link && echo '[core]' >> cfg-link", config.display());
+            assert!(!run(ws, &to_config), "no hardlink to .git/config from {}", ws.display());
+            assert!(!ws.join("cfg-link").exists());
+            let to_hook = format!("ln '{}' hook-link && echo evil >> hook-link", probe.display());
+            assert!(!run(ws, &to_hook), "no hardlink to a hook from {}", ws.display());
+            assert!(!ws.join("hook-link").exists());
+        }
+        assert_eq!(std::fs::read(&config).unwrap(), config_before, "the config is unchanged");
+        assert_eq!(std::fs::read(&probe).unwrap(), b"#!/bin/sh\n", "the hook is unchanged");
+        // Legacy remote definitions a later `git fetch` would follow.
+        assert!(!run(&main, "mkdir -p .git/remotes && echo 'URL: /evil' > .git/remotes/origin"), "remotes/ is denied");
+        assert!(!run(&main, "mkdir -p .git/branches && echo /evil > .git/branches/origin"), "branches/ is denied");
         // From the main checkout, a sibling worktree can't be repointed, and
         // submodule git dirs can't gain hooks or config.
         assert!(!run(&main, "echo /evil > .git/worktrees/wt/commondir"), "sibling commondir is denied");
@@ -879,6 +948,21 @@ mod tests {
         assert!(!wt.join(".husky/_/pre-commit").exists(), "no hook was planted");
         // Commits still work with a configured hooks path.
         let commit = "echo y > note.txt && git add note.txt && git -c user.name=t -c user.email=t@example.com commit -qm y";
+        assert!(run(&wt, commit), "git commit still works");
+        // A hooks dir in another writable root ($TMPDIR holds the tempdir): its
+        // parents there can't be swapped either.
+        let shared = dir.path().join("shared");
+        std::fs::create_dir_all(shared.join("hooks")).unwrap();
+        assert!(git(&main, &["config", "core.hooksPath", shared.join("hooks").to_str().unwrap()]));
+        let moved = dir.path().join("shared-old");
+        for ws in [&main, &wt] {
+            let swap = format!("mv '{}' '{}'", shared.display(), moved.display());
+            assert!(!run(ws, &swap), "the hooks dir's parent outside the workspace can't be swapped");
+            let plant = format!("echo x > '{}/pre-commit'", shared.join("hooks").display());
+            assert!(!run(ws, &plant), "hooksPath outside the workspace is denied");
+        }
+        assert!(!moved.exists() && !shared.join("hooks/pre-commit").exists(), "nothing was swapped or planted");
+        let commit = "echo z > note.txt && git add note.txt && git -c user.name=t -c user.email=t@example.com commit -qm z";
         assert!(run(&wt, commit), "git commit still works");
     }
 
