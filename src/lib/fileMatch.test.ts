@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { globToRegExp, matchFiles, normalizeQuery, parseQuery, prepareFiles } from "./fileMatch";
+import {
+  createMatchJob,
+  globToRegExp,
+  MATCH_CHUNK,
+  matchFiles,
+  normalizeQuery,
+  parseQuery,
+  prepareFiles,
+} from "./fileMatch";
 
 const FILES = [
   "README.md",
@@ -129,16 +137,47 @@ describe("fileMatch — performance", () => {
     ),
   );
 
-  it("ranks 20,000 paths in a frame-sized budget", () => {
-    for (const q of ["java", "tsvc", "*.java", "module4 thing"]) {
+  const QUERIES = ["", "java", "tsvc", "*.java", "module4 thing"];
+
+  it("a job run one unit per step gives the same ranking as matchFiles", () => {
+    for (const q of QUERIES) {
+      const parsed = parseQuery(q);
+      const job = createMatchJob(big, parsed, ["src/main/java/com/acme/module5/pkg5/Thing5Service.java"]);
+      let steps = 0;
+      // A deadline in the past: exactly one unit per step.
+      while (!job.step(-Infinity)) steps++;
+      // 20,000 / MATCH_CHUNK chunks to score, then the merges.
+      expect(steps).toBeGreaterThanOrEqual(Math.ceil(big.length / MATCH_CHUNK));
+      expect(job.result()).toEqual(
+        matchFiles(big, parsed, ["src/main/java/com/acme/module5/pkg5/Thing5Service.java"]),
+      );
+    }
+  });
+
+  it("no single unit of work over 20,000 paths takes more than a frame (16 ms)", () => {
+    for (const q of QUERIES) {
       const parsed = parseQuery(q);
       matchFiles(big, parsed); // warm up
-      const t0 = performance.now();
-      const out = matchFiles(big, parsed);
-      const ms = performance.now() - t0;
-      expect(out.length).toBeGreaterThan(0);
-      // 16 ms on a laptop; generous here so a busy CI runner doesn't flake.
-      expect(ms).toBeLessThan(150);
+      const job = createMatchJob(big, parsed);
+      let worst = 0;
+      let finished = false;
+      while (!finished) {
+        const t0 = performance.now();
+        finished = job.step(-Infinity);
+        worst = Math.max(worst, performance.now() - t0);
+      }
+      expect(job.result().length).toBeGreaterThan(0);
+      expect(worst).toBeLessThan(16);
     }
+  });
+
+  it("step works until its deadline, then yields", () => {
+    const job = createMatchJob(big, parseQuery("java"));
+    const t0 = performance.now();
+    const finished = job.step(t0 + 1);
+    // Either it finished, or it stopped soon after the deadline (one unit).
+    if (!finished) expect(performance.now() - t0).toBeLessThan(17);
+    expect(job.step(Infinity)).toBe(true);
+    expect(job.result()).toEqual(matchFiles(big, parseQuery("java")));
   });
 });

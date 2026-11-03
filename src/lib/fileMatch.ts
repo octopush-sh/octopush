@@ -16,6 +16,10 @@
  *
  * Equal scores fall back to the caller's `boost` order (open tabs, recently
  * opened files), then to the shorter path, then alphabetical.
+ *
+ * `createMatchJob` ranks in small units (score + sort a chunk, or merge two
+ * sorted chunks) so the finder can spread 20k paths over several frames and
+ * no single pass blocks a keystroke for long.
  */
 
 /** Matches `list_workspace_files`' FILE_LIST_CAP in `commands.rs`. */
@@ -233,46 +237,111 @@ function scoreFile(file: PreparedFile, terms: string[], caseSensitive: boolean):
 
 // ─── Ranking ───────────────────────────────────────────────────────
 
+/** Files scored and sorted per unit of work; one unit is the most a
+ *  `MatchJob.step` can overrun its deadline by. */
+export const MATCH_CHUNK = 2048;
+
+/** A ranking split into small units so the UI can spread it over frames. */
+export interface MatchJob {
+  /** Work until `performance.now()` passes `deadline` (at least one unit);
+   *  `true` once the ranking is complete. */
+  step: (deadline: number) => boolean;
+  /** The ranking; complete only after `step` returned `true`. */
+  result: () => FileMatch[];
+}
+
+interface Ranked extends FileMatch {
+  /** Position in `boost`; MAX_SAFE_INTEGER when not boosted. */
+  rank: number;
+}
+
+const compareRanked = (a: Ranked, b: Ranked) =>
+  b.score - a.score ||
+  a.rank - b.rank ||
+  a.path.length - b.path.length ||
+  (a.path < b.path ? -1 : a.path > b.path ? 1 : 0);
+
+function mergeRanked(a: Ranked[], b: Ranked[]): Ranked[] {
+  const out: Ranked[] = new Array(a.length + b.length);
+  let i = 0;
+  let j = 0;
+  let k = 0;
+  while (i < a.length && j < b.length) out[k++] = compareRanked(a[i], b[j]) <= 0 ? a[i++] : b[j++];
+  while (i < a.length) out[k++] = a[i++];
+  while (j < b.length) out[k++] = b[j++];
+  return out;
+}
+
 /**
- * Filter and rank `files` for `query`. `boost` lists paths that win ties,
- * most important first (open tabs, then recently opened).
+ * Rank `files` for `query` in units: score and sort `MATCH_CHUNK` files at a
+ * time, then merge the sorted chunks pairwise. `boost` lists paths that win
+ * ties, most important first (open tabs, then recently opened).
  */
-export function matchFiles(
+export function createMatchJob(
   files: PreparedFile[],
   query: ParsedQuery,
   boost: readonly string[] = [],
-): FileMatch[] {
+): MatchJob {
   const boostRank = new Map<string, number>();
   boost.forEach((p, i) => {
     if (!boostRank.has(p)) boostRank.set(p, i);
   });
   const rankOf = (p: string) => boostRank.get(p) ?? Number.MAX_SAFE_INTEGER;
 
-  const out: FileMatch[] = [];
+  let score: (f: PreparedFile) => number | null;
   if (query.kind === "empty") {
-    for (const f of files) out.push({ path: f.path, score: 0 });
+    score = () => 0;
   } else if (query.kind === "glob") {
     const re = globToRegExp(query.text, query.caseSensitive);
     const onName = !query.text.includes("/");
-    for (const f of files) {
-      if (re.test(onName ? f.path.slice(f.nameStart) : f.path)) {
-        out.push({ path: f.path, score: 0 });
-      }
-    }
+    score = (f) => (re.test(onName ? f.path.slice(f.nameStart) : f.path) ? 0 : null);
   } else {
     const terms = query.caseSensitive ? query.terms : query.terms.map((t) => t.toLowerCase());
-    for (const f of files) {
-      const score = scoreFile(f, terms, query.caseSensitive);
-      if (score !== null) out.push({ path: f.path, score });
-    }
+    score = (f) => scoreFile(f, terms, query.caseSensitive);
   }
 
-  out.sort(
-    (a, b) =>
-      b.score - a.score ||
-      rankOf(a.path) - rankOf(b.path) ||
-      a.path.length - b.path.length ||
-      (a.path < b.path ? -1 : a.path > b.path ? 1 : 0),
-  );
-  return out;
+  let next = 0;
+  // Sorted runs waiting to be merged, as a queue so merges stay balanced.
+  const runs: Ranked[][] = [];
+  let done = false;
+
+  const unit = () => {
+    if (next < files.length) {
+      const end = Math.min(files.length, next + MATCH_CHUNK);
+      const run: Ranked[] = [];
+      for (; next < end; next++) {
+        const f = files[next];
+        const s = score(f);
+        if (s !== null) run.push({ path: f.path, score: s, rank: rankOf(f.path) });
+      }
+      run.sort(compareRanked);
+      runs.push(run);
+    } else if (runs.length > 1) {
+      const a = runs.shift()!;
+      const b = runs.shift()!;
+      runs.push(mergeRanked(a, b));
+    }
+    done = next >= files.length && runs.length <= 1;
+  };
+
+  return {
+    step: (deadline) => {
+      if (done) return true;
+      do unit();
+      while (!done && performance.now() < deadline);
+      return done;
+    },
+    result: () => runs[0] ?? [],
+  };
+}
+
+/** Filter and rank `files` for `query` in one go (see `createMatchJob`). */
+export function matchFiles(
+  files: PreparedFile[],
+  query: ParsedQuery,
+  boost: readonly string[] = [],
+): FileMatch[] {
+  const job = createMatchJob(files, query, boost);
+  job.step(Infinity);
+  return job.result();
 }

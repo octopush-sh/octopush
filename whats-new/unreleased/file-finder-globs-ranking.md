@@ -14,4 +14,4 @@ steps:
 ---
 The ⌘P file finder understands globs (`*.java`, `src/**/*.ts`), ranks file-name and camel-case
 matches first (`edpn` finds `EditorPane.tsx`), takes several words (`user service`) and opens
-`Foo.java:42` at line 42. It stays quick in workspaces with 20,000 files.
+`Foo.java:42` at line 42. It ranks in small slices, so typing never waits on a 20,000-file workspace.

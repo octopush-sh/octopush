@@ -16,13 +16,16 @@
  */
 
 import { Command } from "cmdk";
-import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  createMatchJob,
   FILE_LIST_CAP,
   matchFiles,
   parseQuery,
   prepareFiles,
   type FileMatch,
+  type ParsedQuery,
+  type PreparedFile,
 } from "../lib/fileMatch";
 import { ipc } from "../lib/ipc";
 import type { SearchHit } from "../lib/types";
@@ -38,7 +41,23 @@ const LIST_HEIGHT = 420;
 const LIST_PAD = 8;
 const OVERSCAN = 8;
 
+/** Ranking work per slice; the rest of the frame is left for input and paint. */
+const RANK_SLICE_MS = 8;
+
+const INPUT_CLASS =
+  "flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute";
+
+const LISTBOX_ID = "file-finder-results";
+const rowId = (i: number) => `file-finder-row-${i}`;
+
 const EMPTY_PATHS: string[] = [];
+
+interface Ranking {
+  prepared: PreparedFile[] | null;
+  parsed: ParsedQuery | null;
+  matches: FileMatch[];
+}
+const NO_RANKING: Ranking = { prepared: null, parsed: null, matches: [] };
 
 interface Props {
   /** Workspace root — used as the base for both file listing and text search. */
@@ -68,6 +87,7 @@ export function WorkspaceSearchPalette({
   // File-mode catalog: loaded once per open, then ranked client-side.
   const [files, setFiles] = useState<string[]>([]);
   const [filesLoading, setFilesLoading] = useState(false);
+  const [filesError, setFilesError] = useState<string | null>(null);
 
   // Text-mode results: re-fetched on debounced query change.
   const [hits, setHits] = useState<SearchHit[]>([]);
@@ -88,10 +108,14 @@ export function WorkspaceSearchPalette({
   useEffect(() => {
     if (!open || mode !== "files") return;
     setFilesLoading(true);
+    setFilesError(null);
     ipc
       .listWorkspaceFiles(workspacePath)
       .then((paths) => setFiles(paths))
-      .catch((e) => console.error("list files failed:", e))
+      .catch((e) => {
+        console.error("list files failed:", e);
+        setFilesError(String(e));
+      })
       .finally(() => setFilesLoading(false));
   }, [open, mode, workspacePath]);
 
@@ -127,14 +151,11 @@ export function WorkspaceSearchPalette({
     };
   }, [open, mode, query, workspacePath]);
 
-  // File-mode ranking. Prepared once per listing; the query is deferred so a
-  // keystroke paints before 20k paths are re-scored.
+  // File-mode ranking. Prepared once per listing, then ranked in slices of
+  // RANK_SLICE_MS (lib/fileMatch's `createMatchJob`) so a keystroke never
+  // waits on 20k paths being re-scored in one go.
   const prepared = useMemo(() => prepareFiles(files), [files]);
-  const deferredQuery = useDeferredValue(query);
-  const parsed = useMemo(
-    () => parseQuery(deferredQuery, workspacePath),
-    [deferredQuery, workspacePath],
-  );
+  const parsed = useMemo(() => parseQuery(query, workspacePath), [query, workspacePath]);
   // Ties go to open tabs, then to files recently opened from here.
   const filesByWs = useEditorStore((s) => s.filesByWs);
   const recent = useRecentFilesStore((s) => s.byWs[workspacePath] ?? EMPTY_PATHS);
@@ -147,10 +168,26 @@ export function WorkspaceSearchPalette({
     }
     return [...tabs, ...recent];
   }, [filesByWs, recent, workspacePath]);
-  const matches = useMemo(
-    () => (mode === "files" ? matchFiles(prepared, parsed, boost) : []),
-    [mode, prepared, parsed, boost],
-  );
+  // The last finished ranking and the inputs it was for. Until the job for
+  // the current inputs finishes, the previous ranking stays on screen.
+  const [ranked, setRanked] = useState<Ranking>(NO_RANKING);
+  useEffect(() => {
+    if (!open || mode !== "files") return;
+    const job = createMatchJob(prepared, parsed, boost);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const run = () => {
+      if (job.step(performance.now() + RANK_SLICE_MS)) {
+        setRanked({ prepared, parsed, matches: job.result() });
+      } else {
+        // Yield so the next keystroke is handled before the next slice.
+        timer = setTimeout(run, 0);
+      }
+    };
+    run();
+    return () => clearTimeout(timer);
+  }, [open, mode, prepared, parsed, boost]);
+  const matches = ranked.matches;
+  const caughtUp = ranked.prepared === prepared && ranked.parsed === parsed;
   const [selected, setSelected] = useState(0);
   useEffect(() => setSelected(0), [matches]);
 
@@ -181,12 +218,11 @@ export function WorkspaceSearchPalette({
     if (mode !== "files") return;
     if (e.key === "Enter") {
       e.preventDefault();
-      // Enter right after a keystroke must act on what was typed, not on the
-      // deferred ranking still catching up.
-      if (deferredQuery !== query) {
-        const now = parseQuery(query, workspacePath);
-        const top = matchFiles(prepared, now, boost)[0];
-        if (top) openMatch(top.path, now);
+      // Enter right after a keystroke must act on what was typed, not on a
+      // ranking still catching up: finish it now (once, on Enter).
+      if (!caughtUp) {
+        const top = matchFiles(prepared, parsed, boost)[0];
+        if (top) openMatch(top.path);
         return;
       }
       const pick = matches[Math.min(selected, matches.length - 1)];
@@ -222,18 +258,37 @@ export function WorkspaceSearchPalette({
             <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
               {mode === "files" ? "⌘ P" : "⌘ ⇧ F"}
             </span>
-            <Command.Input
-              ref={inputRef}
-              value={query}
-              onValueChange={setQuery}
-              data-tour="file-finder-input"
-              placeholder={
-                mode === "files"
-                  ? "Search files: name, *.java, src/**/*.ts, Foo.java:42…"
-                  : "Search text in every file…"
-              }
-              className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
-            />
+            {mode === "files" ? (
+              // A plain combobox: cmdk's input would overwrite
+              // aria-activedescendant with its own (empty) selection, and
+              // focus stays here, so this is where the active row is named.
+              <input
+                ref={inputRef}
+                type="text"
+                role="combobox"
+                aria-expanded
+                aria-autocomplete="list"
+                aria-controls={LISTBOX_ID}
+                aria-activedescendant={matches.length > 0 ? rowId(selected) : undefined}
+                autoComplete="off"
+                autoCorrect="off"
+                spellCheck={false}
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                data-tour="file-finder-input"
+                placeholder="Search files: name, *.java, src/**/*.ts, Foo.java:42…"
+                className={INPUT_CLASS}
+              />
+            ) : (
+              <Command.Input
+                ref={inputRef}
+                value={query}
+                onValueChange={setQuery}
+                data-tour="file-finder-input"
+                placeholder="Search text in every file…"
+                className={INPUT_CLASS}
+              />
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -277,6 +332,7 @@ export function WorkspaceSearchPalette({
               total={files.length}
               matches={matches}
               loading={filesLoading}
+              error={filesError}
               selected={selected}
               line={parsed.line}
               onHover={setSelected}
@@ -346,6 +402,7 @@ function FilesResults({
   total,
   matches,
   loading,
+  error,
   selected,
   line,
   onHover,
@@ -354,6 +411,8 @@ function FilesResults({
   total: number;
   matches: FileMatch[];
   loading: boolean;
+  /** Why the listing failed, if it did. */
+  error: string | null;
   selected: number;
   /** From a `file:line` query — shown after each name. */
   line?: number;
@@ -380,6 +439,13 @@ function FilesResults({
     setScrollTop(0);
   }, [matches]);
 
+  if (error) {
+    return (
+      <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-rouge">
+        Couldn't list the files in this workspace: {error}
+      </div>
+    );
+  }
   if (loading && total === 0) {
     return (
       <div className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
@@ -409,12 +475,13 @@ function FilesResults({
     rows.push(
       <div
         key={path}
-        id={`file-finder-row-${i}`}
+        id={rowId(i)}
         role="option"
         aria-selected={i === selected}
         onMouseMove={() => i !== selected && onHover(i)}
         onClick={() => onSelect(path)}
-        className="absolute inset-x-1 flex cursor-pointer items-center gap-2 rounded-md px-3 text-[12.5px] text-octo-sage aria-selected:text-octo-ivory"
+        // Same highlight as cmdk rows (CommandPalette's `[cmdk-item]` rule).
+        className="absolute inset-x-1 flex cursor-pointer items-center gap-2 rounded-md px-3 text-[12.5px] text-octo-sage aria-selected:bg-[var(--brass-ghost)] aria-selected:text-octo-ivory"
         style={{ top: LIST_PAD + i * ROW_HEIGHT, height: ROW_HEIGHT }}
       >
         <span className="truncate font-mono text-octo-ivory">{name}</span>
@@ -435,9 +502,9 @@ function FilesResults({
   return (
     <div
       ref={scrollRef}
+      id={LISTBOX_ID}
       role="listbox"
       aria-label="Matching files"
-      aria-activedescendant={`file-finder-row-${selected}`}
       data-tour="file-finder-results"
       onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
       className="overflow-y-auto"
