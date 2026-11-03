@@ -20,6 +20,8 @@ export type NavigateDetail =
   /** Open one Run terminal of a workspace of the open project (the setup toast). */
   | { kind: "terminal"; workspaceId: string; terminalId: string }
   | { kind: "palette" }
+  /** The ⌘P file finder of the active workspace. */
+  | { kind: "file-finder" }
   | { kind: "mission-control" }
   | { kind: "logbook" };
 
@@ -47,6 +49,7 @@ export const SURFACES: Record<string, () => void> = {
   "mode/review": mode("review"),
   "mode/direct": mode("direct"),
   "palette": () => navigate({ kind: "palette" }),
+  "file-finder": () => navigate({ kind: "file-finder" }),
   "mission-control": () => navigate({ kind: "mission-control" }),
   "logbook": () => navigate({ kind: "logbook" }),
 };

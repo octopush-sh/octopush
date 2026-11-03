@@ -510,7 +510,12 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
 
     const doc = view.state.doc;
     const lineNo = Math.max(1, Math.min(pendingReveal.line, doc.lines));
-    const pos = doc.line(lineNo).from;
+    const target = doc.line(lineNo);
+    // A column past the end of the line lands on its end.
+    const pos =
+      pendingReveal.col == null
+        ? target.from
+        : target.from + Math.max(0, Math.min(pendingReveal.col - 1, target.length));
     view.dispatch({
       selection: { anchor: pos },
       effects: EditorView.scrollIntoView(pos, { y: "center" }),
