@@ -239,6 +239,57 @@ describe("UsagePane", () => {
   });
 });
 
+describe("UsagePane — while the ledger is read", () => {
+  it("holds the page's frame before the first answer and fills it in place", async () => {
+    let resolve: (r: UsageReport) => void = () => {};
+    getUsageReport.mockReset().mockImplementation(() => new Promise((r) => { resolve = r; }));
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    // The frame is there: headline labels, the sections, budgets and export.
+    const skeleton = screen.getByTestId("usage-skeleton");
+    for (const label of ["Cost", "Per active day", "Last 24 hours", "Cache hit", "By mode", "Where it went"]) {
+      expect(within(skeleton).getByText(label)).toBeInTheDocument();
+    }
+    expect(screen.getByText("Budgets")).toBeInTheDocument();
+    expect(screen.getByText("Export ledger")).toBeInTheDocument();
+    // The quiet status says why the figures are not there yet.
+    const status = screen.getByTestId("usage-reading");
+    expect(status).toHaveTextContent("reading the ledger…");
+    expect(status).toHaveAttribute("aria-hidden", "false");
+    expect(screen.queryByText("Reading the ledger…")).toBeNull();
+
+    await act(async () => {
+      resolve(REPORT);
+    });
+    expect(screen.queryByTestId("usage-skeleton")).toBeNull();
+    expect(within(screen.getByTestId("usage-stat-cost")).getByText("$12.50")).toBeInTheDocument();
+    // The status slot stays mounted and fades out.
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("keeps the previous figures while a new period is read", async () => {
+    await act(async () => {
+      render(<UsagePane />);
+    });
+    await waitFor(() => expect(getUsageReport).toHaveBeenCalledTimes(1));
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
+    let resolve: (r: UsageReport) => void = () => {};
+    getUsageReport.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    await act(async () => {
+      fireEvent.click(within(screen.getByTestId("usage-period")).getByRole("radio", { name: "30 days" }));
+    });
+    expect(screen.queryByTestId("usage-skeleton")).toBeNull();
+    expect(within(screen.getByTestId("usage-stat-cost")).getByText("$12.50")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "false");
+    await act(async () => {
+      resolve({ ...REPORT, totals: slice({ costUsd: 40 }) });
+    });
+    expect(within(screen.getByTestId("usage-stat-cost")).getByText("$40.00")).toBeInTheDocument();
+    expect(screen.getByTestId("usage-reading")).toHaveAttribute("aria-hidden", "true");
+  });
+});
+
 describe("UsagePane — gateway reconciliation", () => {
   const RECON = {
     gateway: { kind: "litellm", label: "LiteLLM", host: "llm.corp", provider: "anthropic", keyAlias: "me@corp", keyHash: "330d5a", keySpendUsd: 7061.18, keyMaxBudgetUsd: 5400, budgetResetAt: null },

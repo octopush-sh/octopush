@@ -135,6 +135,11 @@ export function UsagePane() {
   });
   const [mode, setMode] = useState<UsageMode>("all");
   const [report, setReport] = useState<UsageReport | null>(null);
+  // Which period/mode the shown report answers. Until the current filter's
+  // answer lands, the previous figures stay (stale-while-revalidate) and
+  // the filter bar says the ledger is being read.
+  const [reportKey, setReportKey] = useState<string | null>(null);
+  const filterKey = `${period}|${custom.from}|${custom.to}|${mode}`;
   const [error, setError] = useState<string | null>(null);
   const [breakdown, setBreakdown] = useState<UsageBreakdown | null>(null);
   // What the gateway billed vs the ledger — only when a provider is one.
@@ -151,6 +156,7 @@ export function UsagePane() {
   // at midnight) or new spend would never appear.
   const load = useCallback(async () => {
     const range = periodRange(period, custom);
+    const key = `${period}|${custom.from}|${custom.to}|${mode}`;
     const seq = ++reportSeq.current;
     try {
       const r = await ipc.getUsageReport(
@@ -161,6 +167,7 @@ export function UsagePane() {
       );
       if (seq !== reportSeq.current) return;
       setReport(r);
+      setReportKey(key);
       setError(null);
     } catch (e) {
       if (seq !== reportSeq.current) return;
@@ -272,6 +279,9 @@ export function UsagePane() {
     }
   }
 
+  // A failed read says so in its own row; the status only means "on its way".
+  const reading = reportKey !== filterKey && !error;
+
   const pricingAge = pricingAgeDays(report?.pricingRefreshedAt ?? null);
   const pricingStale = report != null && (pricingAge == null || pricingAge >= PRICING_STALE_DAYS);
 
@@ -320,6 +330,16 @@ export function UsagePane() {
             />
           </div>
         )}
+        {/* Fixed slot, mounted in every state: it fades, never shifts the bar. */}
+        <span
+          role="status"
+          data-testid="usage-reading"
+          aria-hidden={!reading}
+          className="font-mono text-[10px] text-octo-mute transition-opacity duration-[220ms]"
+          style={{ opacity: reading ? 1 : 0 }}
+        >
+          reading the ledger…
+        </span>
         <Segments ariaLabel="Mode" testId="usage-mode" value={mode} options={MODES} onChange={setMode} className="ml-auto" />
       </div>
 
@@ -329,12 +349,14 @@ export function UsagePane() {
         </div>
       )}
 
+      {/* Analytics crossfade on a period/mode change, and in over the
+          skeleton on first load; budgets and export sit outside the keyed
+          subtree so an open budget dialog survives. */}
       {!report ? (
-        <div className="mt-8 font-serif text-[13px] text-octo-mute">Reading the ledger…</div>
+        <div key="reading" className="octo-fade-in">
+          <UsageSkeleton />
+        </div>
       ) : (
-        <>
-        {/* Analytics crossfade on a period/mode change; budgets and export
-            sit outside the keyed subtree so an open budget dialog survives. */}
         <div key={`${period}-${mode}`} className="octo-fade-in">
           {/* ── Pricing freshness ── */}
           {pricingStale && (
@@ -362,7 +384,7 @@ export function UsagePane() {
           )}
 
           {/* ── Headline ── */}
-          <div className="mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4">
+          <div data-tour="usage-headline" className="mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4">
             <Stat
               label="Cost"
               value={usd(report.totals.costUsd)}
@@ -566,36 +588,74 @@ export function UsagePane() {
           )}
 
         </div>
-
-          {/* ── Claude plan headroom (only once a Claude-plan stage reported) ── */}
-          <ClaudePlanCard />
-
-          {/* ── Budgets ── */}
-          <div className="mt-8 max-w-[860px]">
-            <BudgetsSection budgets={budgets} spend={spend} onRefresh={refreshAllSpend} />
-          </div>
-
-          {/* ── Export ── */}
-          <div className="mt-8 max-w-[860px]">
-            <SectionLabel>Export ledger</SectionLabel>
-            <div className="flex items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3">
-              <span className="min-w-0 flex-1 text-[12px] text-octo-sage">
-                Every billed call in the selected period, as CSV.
-              </span>
-              <button
-                type="button"
-                onClick={handleExport}
-                disabled={exporting}
-                className="rounded-md px-4 py-1.5 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
-                style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-              >
-                {exporting ? "Exporting…" : "Export CSV"}
-              </button>
-            </div>
-          </div>
-        </>
       )}
+
+      {/* ── Claude plan headroom (only once a Claude-plan stage reported) ── */}
+      <ClaudePlanCard />
+
+      {/* ── Budgets ── */}
+      <div className="mt-8 max-w-[860px]">
+        <BudgetsSection budgets={budgets} spend={spend} onRefresh={refreshAllSpend} />
+      </div>
+
+      {/* ── Export ── */}
+      <div className="mt-8 max-w-[860px]">
+        <SectionLabel>Export ledger</SectionLabel>
+        <div className="flex items-center gap-3 rounded-md border border-octo-hairline bg-octo-panel px-4 py-3">
+          <span className="min-w-0 flex-1 text-[12px] text-octo-sage">
+            Every billed call in the selected period, as CSV.
+          </span>
+          <button
+            type="button"
+            onClick={handleExport}
+            disabled={exporting}
+            className="rounded-md px-4 py-1.5 font-serif text-[13px] text-octo-brass transition disabled:opacity-50"
+            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+          >
+            {exporting ? "Exporting…" : "Export CSV"}
+          </button>
+        </div>
+      </div>
     </>
+  );
+}
+
+const HEADLINE_LABELS = ["Cost", "Per active day", "Last 24 hours", "Cache hit"];
+
+/** The page's frame before the first answer: the headline stats (labels
+ *  real, figures as quiet bars), the By mode cards and the first rows of
+ *  Where it went, each the height of what replaces it, so the figures
+ *  fade into the same slots instead of pushing the page down. */
+function UsageSkeleton() {
+  const bar = "rounded-sm bg-octo-panel-2";
+  return (
+    <div data-testid="usage-skeleton" aria-hidden>
+      <div data-tour="usage-headline" className="mt-6 grid max-w-[860px] grid-cols-2 gap-3 md:grid-cols-4">
+        {HEADLINE_LABELS.map((label) => (
+          <div key={label} className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-3">
+            <div className="font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">{label}</div>
+            <div className="mt-1.5 flex h-[27px] items-center"><div className={`${bar} h-[16px] w-16`} /></div>
+            <div className="mt-1 flex h-[15px] items-center"><div className={`${bar} h-[8px] w-28`} /></div>
+          </div>
+        ))}
+      </div>
+      <div className="mt-8 max-w-[860px]">
+        <SectionLabel>By mode</SectionLabel>
+        <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+          {[0, 1, 2, 3].map((i) => (
+            <div key={i} className="h-[96px] rounded-md border border-octo-hairline bg-octo-panel" />
+          ))}
+        </div>
+      </div>
+      <div className="mt-8 max-w-[860px]">
+        <SectionLabel>Where it went</SectionLabel>
+        <ul className="space-y-1.5">
+          {[0, 1, 2].map((i) => (
+            <li key={i} className="h-[56px] rounded-md border border-octo-hairline bg-octo-panel" />
+          ))}
+        </ul>
+      </div>
+    </div>
   );
 }
 
