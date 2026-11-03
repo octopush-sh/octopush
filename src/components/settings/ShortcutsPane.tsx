@@ -53,7 +53,7 @@ function Shortcut({ keys, desc }: { keys: string; desc: string }) {
   return (
     <li className="flex items-baseline justify-between px-4 py-2.5">
       <span className="text-[13px] text-octo-sage">{desc}</span>
-      <kbd className="rounded border border-octo-hairline bg-octo-onyx px-2 py-0.5 font-mono text-[10px] text-octo-brass">
+      <kbd className="rounded border border-octo-hairline bg-octo-onyx px-2 py-0.5 font-mono text-[10px] text-octo-mute">
         {keys}
       </kbd>
     </li>
