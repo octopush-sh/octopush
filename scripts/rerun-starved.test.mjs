@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
-function run({ starved = {}, attempts = {} } = {}) {
+function run({ starved = {}, attempts = {}, release = null } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "starved-"));
   const log = join(dir, "calls.log");
   writeFileSync(log, "");
@@ -22,6 +22,7 @@ echo "gh $*" >> "${log}"
 args="$*"
 case "$args" in
   *"rerun-failed-jobs"*) echo '{}' ;;
+${release ? `  *"workflows/release.yml/runs"*) echo ${release} ;;\n  *"actions/runs/${release}/jobs"*) echo ${release} ;;\n  *"actions/runs/${release} "*|*"actions/runs/${release}") echo ${attempts[release] ?? 1} ;;` : ""}
 ${cases}
   *"pulls?state=open"*) printf 'aaa\\nbbb\\n' ;;
   *"commits/main"*) echo ccc ;;
@@ -42,7 +43,7 @@ test("a starved run on a PR head or main is re-run; healthy ones are left alone"
   assert.ok(r.calls.some((c) => /-X POST repos\/o\/r\/actions\/runs\/42\/rerun-failed-jobs/.test(c)), r.calls.join("\n"));
   assert.ok(r.calls.some((c) => /actions\/runs\/43\/rerun-failed-jobs/.test(c)));
   assert.equal(r.calls.filter((c) => /rerun-failed-jobs/.test(c)).length, 2);
-  assert.match(r.out, /2 starved CI run\(s\) re-run/);
+  assert.match(r.out, /2 starved run\(s\) re-run/);
 });
 
 test("a run already re-run to the attempt limit is left for a person", () => {
@@ -56,4 +57,18 @@ test("nothing starved → nothing re-run", () => {
   const r = run();
   assert.equal(r.code, 0, r.out);
   assert.ok(!r.calls.some((c) => /rerun-failed-jobs/.test(c)));
+});
+
+test("a release build that never got a runner is re-run", () => {
+  const r = run({ release: 99 });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(r.calls.some((c) => /-X POST repos\/o\/r\/actions\/runs\/99\/rerun-failed-jobs/.test(c)), r.calls.join("\n"));
+  assert.match(r.out, /re-ran release run 99/);
+});
+
+test("a release build starved to the attempt limit is left alone", () => {
+  const r = run({ release: 99, attempts: { 99: 3 } });
+  assert.equal(r.code, 0, r.out);
+  assert.ok(!r.calls.some((c) => /rerun-failed-jobs/.test(c)));
+  assert.match(r.out, /release run 99 starved 3 times/);
 });
