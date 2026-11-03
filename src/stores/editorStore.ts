@@ -69,6 +69,7 @@ export type OpenConfirm = (sizeBytes: number, path: string) => Promise<boolean>;
 export interface PendingReveal {
   path: string;
   line: number; // 1-based new-file line; ignored when `restore` is set
+  col?: number; // 1-based column; the line start when unset (ignored with `restore`)
   /** Back/forward: the exact selection and scroll to put back. */
   restore?: Omit<NavLocation, "path">;
 }
@@ -97,12 +98,14 @@ interface EditorStore {
 
   // Actions
   /** Open `path` as a tab and activate it. `line` (optional, 1-based)
-   *  additionally requests a one-shot cursor reveal at that line. */
+   *  additionally requests a one-shot cursor reveal at that line, at `col`
+   *  (1-based) when given. */
   openFile: (
     workspaceId: string,
     path: string,
     confirm?: OpenConfirm,
     line?: number,
+    col?: number,
   ) => Promise<void>;
   /** Request a one-shot cursor reveal at `line` in a file that is ALREADY open
    *  — the rendered-Markdown jump uses it. A no-op when the path isn't open,
@@ -245,7 +248,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
 
   // ── Actions ───────────────────────────────────────────────────
 
-  openFile: async (workspaceId, path, confirm, line) => {
+  openFile: async (workspaceId, path, confirm, line, col) => {
     // Every open supersedes any previous reveal: a plain open clears a stale
     // one, an open-at-line replaces it on success below.
     const setReveal = (reveal: PendingReveal | null) =>
@@ -253,13 +256,15 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         pendingRevealByWs: { ...s.pendingRevealByWs, [workspaceId]: reveal },
       }));
     setReveal(null);
+    const reveal: PendingReveal | null =
+      line == null ? null : col == null ? { path, line } : { path, line, col };
 
     const existing = (get().filesByWs[workspaceId] ?? EMPTY_FILES).find(
       (f) => f.path === path,
     );
     if (existing) {
       set((s) => ({ activeByWs: { ...s.activeByWs, [workspaceId]: path } }));
-      if (line != null) setReveal({ path, line });
+      if (reveal) setReveal(reveal);
       return;
     }
 
@@ -302,11 +307,11 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       return {
         filesByWs: { ...s.filesByWs, [workspaceId]: [...prev, newFile] },
         activeByWs: { ...s.activeByWs, [workspaceId]: path },
-        ...(line != null
+        ...(reveal
           ? {
               pendingRevealByWs: {
                 ...s.pendingRevealByWs,
-                [workspaceId]: { path, line },
+                [workspaceId]: reveal,
               },
             }
           : {}),

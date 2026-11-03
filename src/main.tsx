@@ -1,6 +1,7 @@
 import React, { Suspense, lazy } from "react";
 import ReactDOM from "react-dom/client";
 import { ipc } from "./lib/ipc";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import "./styles.css";
 
 // Quick View windows (files opened from the OS) share this bundle but load
@@ -12,10 +13,14 @@ const Root = isQuickView
   ? lazy(() => import("./quickview/QuickViewApp").then((m) => ({ default: m.QuickViewApp })))
   : lazy(() => import("./App"));
 
+// The root boundary is the last line of defence: a render error that no
+// surface boundary caught shows a recovery screen instead of a blank window.
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <Suspense fallback={null}>
-      <Root />
-    </Suspense>
+    <ErrorBoundary surface={isQuickView ? "Quick View" : "Octopush"} variant="root">
+      <Suspense fallback={null}>
+        <Root />
+      </Suspense>
+    </ErrorBoundary>
   </React.StrictMode>,
 );

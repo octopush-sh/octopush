@@ -267,6 +267,18 @@ describe("editorStore.openFile — open at line (pending reveal)", () => {
     expect(readFileChecked).toHaveBeenCalledTimes(1); // no re-read
   });
 
+  it("carries a column into the reveal when one is given", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42, 7);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/a.ts", line: 42, col: 7,
+    });
+    await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 3, 2);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/a.ts", line: 3, col: 2,
+    });
+  });
+
   it("a plain open clears any stale pending reveal for the workspace", async () => {
     readFileChecked.mockResolvedValue({ kind: "text", content: "hi", size: 2, mtime: 1 });
     await useEditorStore.getState().openFile("ws", "/a.ts", undefined, 42);
@@ -655,6 +667,24 @@ describe("editorStore — back/forward trail", () => {
     expect(useEditorStore.getState().navByWs.ws.forward).toEqual([
       { path: "/b.ts", anchor: 1, head: 1 },
     ]);
+  });
+
+  it("a file:line:col open is a stop, and Back restores past its column reveal", async () => {
+    // What App's navigateToFile does for a ⌘P `b.ts:4:2` open.
+    useEditorStore.getState().recordLocation("ws");
+    await useEditorStore.getState().openFile("ws", "/b.ts", undefined, 4, 2);
+    expect(useEditorStore.getState().getPendingReveal("ws")).toEqual({
+      path: "/b.ts", line: 4, col: 2,
+    });
+    land();
+    here = { path: "/b.ts", anchor: 12, head: 12 };
+
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(true);
+    const reveal = land();
+    expect(reveal?.col).toBeUndefined();
+    expect(reveal).toEqual({
+      path: "/a.ts", line: 1, restore: { anchor: 3, head: 7, scrollTop: 40 },
+    });
   });
 
   it("records nothing while no text file is showing", () => {

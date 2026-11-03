@@ -100,6 +100,64 @@ describe("rankDefinitionHits", () => {
     ).toHaveLength(1);
   });
 
+  it("never offers a method whose RETURN TYPE is the symbol (the Integer regression)", () => {
+    // ⌘-click on `Integer` jumped to `ProveedorNoDisponibleException.esperaSugerida`
+    // with no picker: the type after `static` scored as a declaration, and the
+    // same-extension bonus put it a full tier clear of everything else.
+    const hits = [
+      hit("src/ProveedorNoDisponibleException.java", 14, "    public static Integer esperaSugerida() {"),
+      hit("src/Retry.java", 3, "    private final Integer reintentos;"),
+      hit("src/Retry.java", 9, "    Integer espera = Integer.valueOf(3);"),
+    ];
+    expect(rankDefinitionHits(hits, "Integer", { fromFile: "src/App.java" })).toEqual([]);
+    expect(
+      rankDefinitionHits(hits, "esperaSugerida", { fromFile: "src/App.java" }).map((c) => c.line),
+    ).toEqual([14]);
+  });
+
+  it("jumps to a default-exported component, not its re-export", () => {
+    // `export default App;` tied with `function App()` and opened a picker.
+    const hits = [
+      hit("src/App.tsx", 4, "function App() {"),
+      hit("src/App.tsx", 40, "export default App;"),
+      hit("src/main.tsx", 2, 'import App from "./App";'),
+    ];
+    const ranked = rankDefinitionHits(hits, "App", { fromFile: "src/main.tsx" });
+    expect(ranked.map((c) => c.line)).toEqual([4]);
+    expect(chooseDefinition(ranked).kind).toBe("jump");
+  });
+
+  it("reads Go declarations name-first, by the hit's extension", () => {
+    const hits = [hit("pkg/limits.go", 3, "const limit Duration = 5")];
+    expect(rankDefinitionHits(hits, "Duration")).toEqual([]);
+    expect(rankDefinitionHits(hits, "limit")).toHaveLength(1);
+  });
+
+  it("never offers a type left alone on a line by a split declaration", () => {
+    // The name is on the next line, which a search preview never shows; the
+    // head alone used to score 100 for its type and win outright.
+    const hits = [
+      hit("src/ProveedorNoDisponibleException.java", 14, "    public static Integer"),
+      hit("src/UserService.java", 8, "    private final UserRepository"),
+      hit("src/util.c", 3, "static int"),
+    ];
+    for (const name of ["Integer", "UserRepository", "int"]) {
+      expect(chooseDefinition(rankDefinitionHits(hits, name, { fromFile: "src/App.java" }))).toEqual({
+        kind: "none",
+      });
+    }
+  });
+
+  it("reads `*` as a pointer declarator only in C and C++ hits", () => {
+    const hits = [
+      hit("src/price.ts", 7, "    total * rate;"),
+      hit("src/Price.java", 7, "    ptr * deref;"),
+      hit("src/list.c", 4, "    struct node *rate;"),
+    ];
+    expect(rankDefinitionHits(hits, "rate").map((c) => c.file)).toEqual(["src/list.c"]);
+    expect(rankDefinitionHits(hits, "deref")).toEqual([]);
+  });
+
   it("caps the list", () => {
     const many = Array.from({ length: 60 }, (_, i) =>
       hit(`src/f${i}.ts`, 1, "function parse() {"),

@@ -12,6 +12,8 @@ import {
   isParameterList,
   wordOccurrences,
   NON_SYMBOL_WORDS,
+  isReservedWord,
+  scoreOptionsFor,
 } from "./symbolIndex";
 
 describe("identifierAt", () => {
@@ -116,10 +118,11 @@ describe("scoreDefinitionAt — declarations", () => {
 });
 
 describe("scoreDefinitionAt — signatures", () => {
-  it("scores a Java-style method declaration", () => {
+  it("scores a Java-style method as a typed declaration", () => {
+    // Modifiers and a return type in front: the name is what's declared.
     const line = "  public static void main(String[] args) {";
     expect(scoreDefinitionAt(line, line.indexOf("main"), "main")).toBe(
-      DEFINITION_SCORE.signature,
+      DEFINITION_SCORE.declaration,
     );
   });
 
@@ -356,6 +359,310 @@ describe("ordinary identifiers that happen to be pooled keywords", () => {
   }
 });
 
+/** Score the first whole-word occurrence of `name` on `line`. */
+const scoreOf = (line: string, name: string, opts = {}) =>
+  scoreDefinitionAt(line, wordOccurrences(line, name)[0].from, name, opts);
+
+describe("the type in front of a declaration is never its name", () => {
+  // Each line declares `declared`; `type` is the word in front of it that used
+  // to score 100 because a modifier (`static`, `const`, `impl`, …) preceded it.
+  const cases: { lang: string; line: string; type: string; declared: string }[] = [
+    { lang: "Java", line: "  public static Integer esperaSugerida() {", type: "Integer", declared: "esperaSugerida" },
+    { lang: "Java", line: "  static String format(String pattern, Object... args) {", type: "String", declared: "format" },
+    { lang: "Java", line: "  private final UserRepository userRepository;", type: "UserRepository", declared: "userRepository" },
+    { lang: "Java", line: "  public static final int MAX_RETRIES = 3;", type: "int", declared: "MAX_RETRIES" },
+    { lang: "Java", line: "    List<String> names = new ArrayList<>();", type: "List", declared: "names" },
+    { lang: "Java", line: "  Map<String, List<Integer>> byOwner;", type: "Map", declared: "byOwner" },
+    { lang: "Java", line: "  public abstract Optional<User> findById(long id);", type: "Optional", declared: "findById" },
+    { lang: "Java", line: "  public ResponseEntity<User> create(", type: "ResponseEntity", declared: "create" },
+    { lang: "C#", line: "    public string Name { get; set; }", type: "string", declared: "Name" },
+    { lang: "C#", line: "    public int Count => _items.Count;", type: "int", declared: "Count" },
+    { lang: "C#", line: "    public event EventHandler Changed;", type: "EventHandler", declared: "Changed" },
+    { lang: "C#", line: "    private readonly ILogger<Worker> _logger;", type: "ILogger", declared: "_logger" },
+    { lang: "C#", line: "    public async Task<User> LoadAsync(int id)", type: "Task", declared: "LoadAsync" },
+    { lang: "C", line: "const char *name = \"octo\";", type: "char", declared: "name" },
+    { lang: "C", line: "static void helper(void);", type: "void", declared: "helper" },
+    { lang: "C", line: "int main(int argc, char **argv) {", type: "int", declared: "main" },
+    { lang: "C", line: "    struct Node *next;", type: "Node", declared: "next" },
+    { lang: "C", line: "    char buf[64];", type: "char", declared: "buf" },
+    { lang: "C++", line: "    std::string label = \"x\";", type: "string", declared: "label" },
+    { lang: "TS", line: "  private readonly repo: Repo;", type: "Repo", declared: "repo" },
+  ];
+  for (const { lang, line, type, declared } of cases) {
+    it(`${lang}: "${line.trim()}" declares ${declared}, not ${type}`, () => {
+      const opts = scoreOptionsFor(lang === "C" ? "c" : lang === "C++" ? "cpp" : undefined);
+      expect(scoreDefinitionLine(line, declared, opts)).toBe(DEFINITION_SCORE.declaration);
+      expect(scoreDefinitionLine(line, type, opts)).toBe(0);
+    });
+  }
+
+  it("the owner's case: Integer never resolves to a method returning Integer", () => {
+    const doc = [
+      "public class ProveedorNoDisponibleException extends RuntimeException {",
+      "  public static Integer esperaSugerida() {",
+      "    return 30;",
+      "  }",
+      "  public static Integer otraEspera(Integer base) { return base; }",
+      "  private final Integer reintentos;",
+      "}",
+    ].join("\n");
+    expect(findDefinitions(doc, "Integer")).toEqual([]);
+    expect(findDefinitions(doc, "esperaSugerida").map((s) => s.line)).toEqual([2]);
+  });
+});
+
+describe("modifiers and keywords that name something else declare nothing", () => {
+  const refusals: { lang: string; line: string; name: string }[] = [
+    { lang: "Rust", line: "impl Display for Foo {", name: "Display" },
+    { lang: "Rust", line: "impl Display for Foo {", name: "Foo" },
+    { lang: "Rust", line: "impl Foo {", name: "Foo" },
+    { lang: "Java", line: "package com.acme.billing;", name: "com" },
+    { lang: "Kotlin", line: "package com.acme", name: "com" },
+    { lang: "C#", line: "    public static Integer Wait() => 3;", name: "Integer" },
+    { lang: "C", line: "const char *name;", name: "const" },
+    { lang: "Java", line: "    return value;", name: "value" },
+    { lang: "Java", line: "    throw error;", name: "error" },
+    { lang: "Go", line: "\tdefer cleanup()", name: "cleanup" },
+    { lang: "Go", line: "\tgo worker(jobs)", name: "worker" },
+    { lang: "Ruby", line: "  puts format(total)", name: "format" },
+    { lang: "Python", line: "print total", name: "total" },
+    { lang: "TS", line: "export default build();", name: "build" },
+    { lang: "TS", line: "export default defineConfig({", name: "defineConfig" },
+    // A re-export names a declaration elsewhere; in the workspace tier (no
+    // tree) it used to tie with `function App()` and open a picker.
+    { lang: "TS", line: "export default App;", name: "App" },
+    { lang: "TS", line: "export default App", name: "App" },
+    { lang: "TS", line: "export App;", name: "App" },
+    { lang: "Java", line: "    else retry = false;", name: "retry" },
+  ];
+  for (const { lang, line, name } of refusals) {
+    it(`${lang}: refuses ${name} on "${line.trim()}"`, () => {
+      expect(scoreDefinitionLine(line, name)).toBe(0);
+    });
+  }
+});
+
+describe("declarations the old keyword rule missed", () => {
+  const cases: { lang: string; line: string; name: string; opts?: { typeAfterName?: boolean } }[] = [
+    { lang: "Java", line: "  @Bean public RestTemplate restTemplate(RestTemplateBuilder builder) {", name: "restTemplate" },
+    { lang: "Java", line: '  @GetMapping("/users/{id}") public User show(@PathVariable long id) {', name: "show" },
+    { lang: "Java", line: "  @Autowired private UserService users;", name: "users" },
+    { lang: "Java", line: "    for (String line : lines) {", name: "line" },
+    { lang: "Java", line: "    } catch (IOException e) {", name: "e" },
+    { lang: "Java", line: "    var retries = 3;", name: "retries" },
+    { lang: "Kotlin", line: "fun double(x: Int) = x * 2", name: "double" },
+    { lang: "Kotlin", line: "    override fun toString() = name", name: "toString" },
+    { lang: "Kotlin", line: "fun <T> listOfOne(item: T): List<T> = listOf(item)", name: "listOfOne" },
+    { lang: "Kotlin", line: "    private val repo: Repo = Repo()", name: "repo" },
+    { lang: "C#", line: "    [HttpGet] public IActionResult Index()", name: "Index" },
+    { lang: "C#", line: "    public required string Email { get; init; }", name: "Email" },
+    { lang: "TS", line: "  private retries?: number;", name: "retries" },
+    { lang: "TS", line: "  static parse(input: string): Ast {", name: "parse" },
+    { lang: "TS", line: "  const total: number = 0;", name: "total" },
+    { lang: "Rust", line: "    let mut total: u32 = 0;", name: "total" },
+    { lang: "Rust", line: "pub const MAX: usize = 8;", name: "MAX" },
+    { lang: "Rust", line: "static mut COUNTER: u32 = 0;", name: "COUNTER" },
+    { lang: "Rust", line: "pub struct Point<T> where T: Copy {", name: "Point" },
+    { lang: "C", line: "    int count = 0;", name: "count" },
+    { lang: "C", line: "unsigned long hash(const char *s) {", name: "hash" },
+    { lang: "Go", line: "var count int", name: "count", opts: { typeAfterName: true } },
+    { lang: "Go", line: "const limit Duration = 5", name: "limit", opts: { typeAfterName: true } },
+    { lang: "Go", line: "type Server struct {", name: "Server", opts: { typeAfterName: true } },
+  ];
+  for (const { lang, line, name, opts } of cases) {
+    it(`${lang}: "${line.trim()}" declares ${name}`, () => {
+      expect(scoreOf(line, name, opts)).toBe(DEFINITION_SCORE.declaration);
+    });
+  }
+
+  it("Go: the type after a typed const is not its name", () => {
+    const opts = scoreOptionsFor("go");
+    expect(scoreDefinitionLine("const limit Duration = 5", "Duration", opts)).toBe(0);
+    expect(scoreDefinitionLine("var count int", "int", opts)).toBe(0);
+  });
+
+  it("only Go writes the type after the name", () => {
+    expect(scoreOptionsFor("go").typeAfterName).toBe(true);
+    for (const lang of ["java", "rs", "ts", "kt", "cs", "c", undefined]) {
+      expect(scoreOptionsFor(lang).typeAfterName).toBe(false);
+    }
+  });
+});
+
+describe("declarations split after their type", () => {
+  // `public static Integer` alone on a line used to score 100 for `Integer`
+  // (a binding modifier in front, nothing after it), and the workspace tier
+  // then jumped there for every ⌘-click on `Integer`.
+  const heads: { lang: string; line: string; type: string; ext?: string }[] = [
+    { lang: "Java", line: "    public static Integer", type: "Integer" },
+    { lang: "Java", line: "    private final UserRepository", type: "UserRepository" },
+    { lang: "Java", line: "    public static Integer // retries", type: "Integer" },
+    { lang: "C", line: "static int", type: "int", ext: "c" },
+    { lang: "C", line: "static Node", type: "Node", ext: "c" },
+    // Generic and array heads (from the re-review of #444).
+    { lang: "Java", line: "    public static Optional<User>", type: "Optional" },
+    { lang: "C#", line: "    public static Task<int>", type: "Task", ext: "cs" },
+    { lang: "Java", line: "    public static Integer[]", type: "Integer" },
+    { lang: "Java", line: "    private final Map<String, Integer>", type: "Map" },
+    { lang: "Java", line: "    public static <T> List<T>", type: "List" },
+  ];
+  for (const { lang, line, type, ext } of heads) {
+    it(`${lang}: a type alone after modifiers, "${line.trim()}", declares nothing`, () => {
+      expect(scoreDefinitionLine(line, type, scoreOptionsFor(ext))).toBe(0);
+    });
+  }
+
+  it("Go still declares a bare name after var/const", () => {
+    const go = scoreOptionsFor("go");
+    expect(scoreDefinitionLine("var count", "count", go)).toBe(DEFINITION_SCORE.declaration);
+    expect(scoreDefinitionLine("const limit", "limit", go)).toBe(DEFINITION_SCORE.declaration);
+  });
+
+  const docs: { lang: string; ext?: string; doc: string[]; type: string; declared: string; line: number }[] = [
+    {
+      lang: "Java",
+      doc: ["class A {", "    public static Integer", "    esperaSugerida(int a, int b) {", "        return a;", "    }", "}"],
+      type: "Integer",
+      declared: "esperaSugerida",
+      line: 3,
+    },
+    {
+      lang: "Java",
+      doc: ["class A {", "    private final UserRepository", "        userRepository;", "}"],
+      type: "UserRepository",
+      declared: "userRepository",
+      line: 3,
+    },
+    {
+      lang: "C",
+      ext: "c",
+      doc: ["static int", "helper(void)", "{", "    return 0;", "}"],
+      type: "int",
+      declared: "helper",
+      line: 2,
+    },
+    {
+      lang: "C",
+      ext: "c",
+      doc: ["int", "main(int argc, char **argv)", "{", "}"],
+      type: "int",
+      declared: "main",
+      line: 2,
+    },
+  ];
+  for (const { lang, ext, doc, type, declared, line } of docs) {
+    it(`${lang}: finds ${declared} on the line after "${doc[line - 2].trim()}", never ${type}`, () => {
+      const text = doc.join("\n");
+      const opts = scoreOptionsFor(ext);
+      expect(findDefinitions(text, type, opts)).toEqual([]);
+      const [site] = findDefinitions(text, declared, opts);
+      expect(site.line).toBe(line);
+      expect(site.score).toBe(DEFINITION_SCORE.declaration);
+      expect(text.slice(site.from, site.to)).toBe(declared);
+    });
+  }
+
+  it("does not join a line that is an expression or a bare name", () => {
+    // Python: `Foo` alone is an expression statement, not a type.
+    const py = ["Foo", "bar = 1"].join("\n");
+    expect(findDefinitions(py, "bar")[0].score).toBe(DEFINITION_SCORE.assignment);
+    const js = ["return", "value;"].join("\n");
+    expect(findDefinitions(js, "value")).toEqual([]);
+  });
+});
+
+describe("C typedefs", () => {
+  const c = scoreOptionsFor("c");
+  const cases: [string, string][] = [
+    ["typedef struct Node Node;", "Node"],
+    ["typedef struct node_s node_t;", "node_t"],
+    ["typedef unsigned long size_type;", "size_type"],
+    ["typedef int Count;", "Count"],
+  ];
+  for (const [line, name] of cases) {
+    it(`"${line}" declares ${name}`, () => {
+      expect(scoreDefinitionLine(line, name, c)).toBe(DEFINITION_SCORE.declaration);
+      expect(scoreDefinitionLine(line, name)).toBe(DEFINITION_SCORE.declaration);
+    });
+  }
+
+  it("does not declare the type being aliased", () => {
+    expect(scoreDefinitionLine("typedef struct node_s node_t;", "node_s", c)).toBe(0);
+  });
+});
+
+describe("pointer declarators are C and C++ only", () => {
+  const c = scoreOptionsFor("c");
+  it("reads `*` as multiplication elsewhere", () => {
+    for (const ext of [undefined, "java", "ts", "py", "rs", "kt", "cs"]) {
+      const opts = scoreOptionsFor(ext);
+      expect(scoreDefinitionLine("    total * rate;", "rate", opts)).toBe(0);
+      expect(scoreDefinitionLine("    ptr * deref;", "deref", opts)).toBe(0);
+      expect(scoreDefinitionLine("    a & mask;", "mask", opts)).toBe(0);
+    }
+  });
+
+  it("still reads a C declarator", () => {
+    expect(scoreDefinitionLine("    struct Node *next;", "next", c)).toBe(DEFINITION_SCORE.declaration);
+    expect(scoreDefinitionLine("const char *name = \"octo\";", "name", c)).toBe(
+      DEFINITION_SCORE.declaration,
+    );
+    expect(scoreDefinitionLine("    int &ref = x;", "ref", scoreOptionsFor("cpp"))).toBe(
+      DEFINITION_SCORE.declaration,
+    );
+  });
+
+  it("knows C and C++ by language and by extension", () => {
+    for (const k of ["c", "cpp", "h", "cc", "cxx", "hpp"]) expect(scoreOptionsFor(k).cDeclarators).toBe(true);
+    for (const k of ["java", "go", "ts", "javascript", undefined]) {
+      expect(scoreOptionsFor(k).cDeclarators).toBe(false);
+    }
+  });
+});
+
+describe("long lines", () => {
+  it("scores a minified line of thousands of words without stalling", () => {
+    const line = "a ".repeat(20_000) + "const total = 1;";
+    const started = performance.now();
+    expect(scoreDefinitionLine(line, "total")).toBe(DEFINITION_SCORE.declaration);
+    expect(performance.now() - started).toBeLessThan(1000);
+  });
+});
+
+describe("isReservedWord", () => {
+  it("holds a language's modifiers and type keywords", () => {
+    for (const w of ["const", "static", "int", "void", "if", "public"]) {
+      expect(isReservedWord("java", w)).toBe(true);
+    }
+    for (const w of ["impl", "fn", "self", "mut", "u32"]) expect(isReservedWord("rust", w)).toBe(true);
+    for (const w of ["val", "fun"]) expect(isReservedWord("kotlin", w)).toBe(true);
+    for (const w of ["def", "lambda", "None"]) expect(isReservedWord("python", w)).toBe(true);
+  });
+
+  it("never holds ordinary names", () => {
+    for (const w of ["get", "type", "use", "record", "new", "default", "String", "Integer"]) {
+      expect(isReservedWord("javascript", w)).toBe(false);
+    }
+  });
+
+  it("only reserves a word in the languages that reserve it", () => {
+    // Ordinary names in Go and C, keywords elsewhere.
+    for (const w of ["val", "self", "fn", "def", "let", "mut", "pub", "impl", "trait", "this", "class"]) {
+      expect(isReservedWord("go", w)).toBe(false);
+      expect(isReservedWord("c", w)).toBe(false);
+    }
+    expect(isReservedWord("python", "self")).toBe(false);
+    expect(isReservedWord("go", "func")).toBe(true);
+    expect(isReservedWord("c", "struct")).toBe(true);
+  });
+
+  it("falls back to statement heads for a language without a list", () => {
+    expect(isReservedWord("shell", "if")).toBe(true);
+    expect(isReservedWord(undefined, "while")).toBe(true);
+    expect(isReservedWord("shell", "static")).toBe(false);
+  });
+});
+
 describe("isNavigableSymbol", () => {
   it("is the one gate both the highlighter and ⌘-click go through", () => {
     expect(isNavigableSymbol("parse")).toBe(true);
@@ -373,4 +680,29 @@ describe("NON_SYMBOL_WORDS", () => {
     }
     expect(NON_SYMBOL_WORDS.has("parse")).toBe(false);
   });
+});
+
+describe("findDefinitions on a long file", () => {
+  it("counts lines correctly when it skips ahead to a rare name", () => {
+    const filler = Array.from({ length: 5000 }, (_, i) => `int v${i} = ${i};`);
+    const doc = [...filler, "    public static Optional<User>", "    findUser(int id) {", "    }", ...filler].join("\n");
+    const sites = findDefinitions(doc, "findUser");
+    expect(sites.map((s) => s.line)).toEqual([5002]);
+    expect(sites[0].score).toBe(DEFINITION_SCORE.declaration);
+    expect(findDefinitions(doc, "Optional")).toEqual([]);
+  });
+
+  it("stays fast for a name declared once at the end of a 256 KB file", () => {
+    const doc = Array.from({ length: 25_600 }, (_, i) => `x${i % 10} = 1;`).join("\n") + "\nint rareName = 1;";
+    const t0 = performance.now();
+    for (let i = 0; i < 5; i++) findDefinitions(doc, "rareName");
+    expect((performance.now() - t0) / 5).toBeLessThan(50);
+  });
+});
+
+it("a C# attribute with `=` on the head line still joins the next line", () => {
+  const doc = ["class A {", "    [Attr(X = 1)] public static Task<int>", "    Find(int id) {", "    }", "}"].join("\n");
+  const [site] = findDefinitions(doc, "Find", scoreOptionsFor("cs"));
+  expect(site.line).toBe(3);
+  expect(site.score).toBe(DEFINITION_SCORE.declaration);
 });
