@@ -4,7 +4,9 @@
 # run is not a test result: left alone it reads as red CI, so the builder
 # spends a fix round on code that is fine and the reviewer never sees the PR.
 #
-#   rerun-starved.sh            open PRs' heads and main's head, this repo
+#   rerun-starved.sh            open PRs' heads and main's head, this repo,
+#                               and the newest release.yml run (a beta whose
+#                               build never got a runner is otherwise lost)
 #
 # At most two re-runs per run (it stops at attempt 3); after that it is left
 # for a person. Exit 0 always unless gh itself fails (2).
@@ -28,4 +30,15 @@ while read -r sha; do
     echo "could not re-run CI run $id: $err"
   fi
 done <<< "$shas"
-echo "$n starved CI run(s) re-run"
+# The newest release build: release-beta.sh dispatches it and exits, so
+# nothing else notices when it starves.
+if id="$(release_starved_run "$REPO")" && [[ -n "$id" ]]; then
+  attempt="$(gh api "repos/$REPO/actions/runs/$id" --jq .run_attempt)" || attempt="$MAX_ATTEMPTS"
+  if [[ "$attempt" -ge "$MAX_ATTEMPTS" ]]; then echo "release run $id starved $attempt times — leaving it"
+  elif err="$(gh api -X POST "repos/$REPO/actions/runs/$id/rerun-failed-jobs" 2>&1 >/dev/null </dev/null)"; then
+    echo "re-ran release run $id (attempt $attempt): its jobs never got a runner"; n=$((n + 1))
+  else
+    echo "could not re-run release run $id: $err"
+  fi
+fi
+echo "$n starved run(s) re-run"
