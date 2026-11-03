@@ -18,9 +18,20 @@ import { dockerFile } from "@codemirror/legacy-modes/mode/dockerfile";
 import { properties } from "@codemirror/legacy-modes/mode/properties";
 import { ruby } from "@codemirror/legacy-modes/mode/ruby";
 import { swift } from "@codemirror/legacy-modes/mode/swift";
-import { c, cpp, csharp, kotlin } from "@codemirror/legacy-modes/mode/clike";
+import { c, cpp, csharp, kotlin, scala, dart } from "@codemirror/legacy-modes/mode/clike";
+import { groovy } from "@codemirror/legacy-modes/mode/groovy";
+import { protobuf } from "@codemirror/legacy-modes/mode/protobuf";
+import { sass } from "@codemirror/legacy-modes/mode/sass";
 import { lua } from "@codemirror/legacy-modes/mode/lua";
 import type { LangId } from "./editorLang";
+
+/** `@codemirror/lang-javascript` options per JS/TS dialect. */
+const JS_OPTIONS = {
+  javascript: {},
+  jsx: { jsx: true },
+  typescript: { typescript: true },
+  tsx: { typescript: true, jsx: true },
+} as const;
 
 /**
  * CodeMirror language support for a `LangId` (see `editorLang.ts`). Shared by
@@ -30,7 +41,10 @@ import type { LangId } from "./editorLang";
  */
 export function languageSupport(lang: LangId): Extension {
   switch (lang) {
-    case "javascript": return javascript({ typescript: true, jsx: true });
+    case "javascript":
+    case "jsx":
+    case "typescript":
+    case "tsx":        return javascript(JS_OPTIONS[lang]);
     case "rust":       return rust();
     case "python":     return python();
     case "java":       return java();
@@ -55,7 +69,10 @@ export function languageFor(lang: LangId): Language | null {
   if (languages.has(lang)) return languages.get(lang)!;
   let l: Language | null;
   switch (lang) {
-    case "javascript": l = javascript({ typescript: true, jsx: true }).language; break;
+    case "javascript":
+    case "jsx":
+    case "typescript":
+    case "tsx":        l = javascript(JS_OPTIONS[lang]).language; break;
     case "rust":       l = rust().language; break;
     case "python":     l = python().language; break;
     case "java":       l = java().language; break;
@@ -65,6 +82,7 @@ export function languageFor(lang: LangId): Language | null {
     case "css":        l = css().language; break;
     case "xml":        l = xml().language; break;
     case "yaml":       l = yaml().language; break;
+    case "sass":       l = StreamLanguage.define(sass); break;
     case "shell":      l = StreamLanguage.define(shell); break;
     case "toml":       l = StreamLanguage.define(toml); break;
     case "go":         l = StreamLanguage.define(go); break;
@@ -77,6 +95,10 @@ export function languageFor(lang: LangId): Language | null {
     case "cpp":        l = StreamLanguage.define(cpp); break;
     case "csharp":     l = StreamLanguage.define(csharp); break;
     case "kotlin":     l = StreamLanguage.define(kotlin); break;
+    case "scala":      l = StreamLanguage.define(scala); break;
+    case "groovy":     l = StreamLanguage.define(groovy); break;
+    case "dart":       l = StreamLanguage.define(dart); break;
+    case "protobuf":   l = StreamLanguage.define(protobuf); break;
     case "lua":        l = StreamLanguage.define(lua); break;
     default:           l = null;
   }

@@ -13,16 +13,16 @@
 
 import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
-import type { LangId } from "../../lib/editorLang";
+import { JS_DIALECTS, type LangId } from "../../lib/editorLang";
 
 type Tree = ReturnType<typeof syntaxTree>;
 type SyntaxNode = ReturnType<Tree["resolveInner"]>;
 
 /** Languages whose grammar names the nodes this module looks for. */
-const TREE_LANGS = new Set<LangId>(["javascript", "java", "rust", "python"]);
+const TREE_LANGS = new Set<string>([...JS_DIALECTS, ...(["java", "rust", "python"] satisfies LangId[])]);
 
 export function hasDefinitionTree(lang: string | undefined): boolean {
-  return !!lang && TREE_LANGS.has(lang as LangId);
+  return !!lang && TREE_LANGS.has(lang);
 }
 
 /** How long a go-to-definition may wait for the parser to reach a position. */
@@ -84,7 +84,7 @@ export function classifyClick(
   if (lang === "rust" && node.name === "TypeIdentifier" && RUST_PRIMITIVES.has(range.name)) {
     return "keyword";
   }
-  if (lang === "javascript" && node.name === "TypeName" && TS_PRIMITIVES.has(range.name)) {
+  if (JS_DIALECTS.has(lang ?? "") && node.name === "TypeName" && TS_PRIMITIVES.has(range.name)) {
     return "keyword";
   }
   if (IDENTIFIER_NODES.has(node.name)) return "identifier";
@@ -99,7 +99,7 @@ const RUST_TYPE_ITEMS = new Set([
 
 function declaresName(lang: string, node: SyntaxNode): boolean {
   const parent = node.parent?.name ?? "";
-  switch (lang) {
+  switch (JS_DIALECTS.has(lang) ? "javascript" : lang) {
     case "java":
       return node.name === "Definition";
     case "javascript":

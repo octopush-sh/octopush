@@ -34,10 +34,12 @@ describe("classifyClick", () => {
     ["python", "ok = False\n", "False"],
     ["rust", "fn f() -> bool { false }", "false"],
     ...["boolean", "any", "string", "number", "unknown", "never", "object", "bigint", "symbol", "undefined"].map(
-      (t): [LangId, string, string] => ["javascript", `let x: ${t};`, t],
+      (t): [LangId, string, string] => ["typescript", `let x: ${t};`, t],
     ),
-    ["javascript", "let x: string | null = null;", "null"],
-    ["javascript", "function f(): void {}", "void"],
+    ["typescript", "let x: string | null = null;", "null"],
+    ["typescript", "function f(): void {}", "void"],
+    ["tsx", "const total: number = 1;", "number"],
+    ["jsx", "export function run() {}", "function"],
   ];
   for (const [lang, doc, word] of keywords) {
     it(`${lang}: \`${word}\` is a keyword`, () => {
@@ -52,8 +54,8 @@ describe("classifyClick", () => {
     ["python", "final = compute()\n", "final"],
     ["rust", "struct Point { x: u32 }", "Point"],
     // A TypeScript type that merely sounds primitive is still a name.
-    ["javascript", "let x: Foo;", "Foo"],
-    ["javascript", "let x: String;", "String"],
+    ["typescript", "let x: Foo;", "Foo"],
+    ["typescript", "let x: String;", "String"],
   ];
   for (const [lang, doc, word] of identifiers) {
     it(`${lang}: \`${word}\` is an ordinary identifier`, () => {
@@ -93,7 +95,9 @@ describe("classifySite", () => {
     ["java", "class A { @Bean public RestTemplate restTemplate() { return null; } }", "restTemplate"],
     ["javascript", "const total = 1;", "total"],
     ["javascript", "class A { render(props) { return 1; } }", "render"],
-    ["javascript", "type Parser = (x: string) => Ast;", "Parser"],
+    ["typescript", "type Parser = (x: string) => Ast;", "Parser"],
+    ["typescript", "const id = <T>(x: T): T => x;", "id"],
+    ["tsx", "const App = () => <div />;", "App"],
     ["rust", "pub fn parse(input: &str) {}", "parse"],
     ["rust", "pub struct Point { x: u32 }", "Point"],
     ["rust", "fn f() { let mut total = 0; }", "total"],

@@ -9,7 +9,10 @@ const joined = (toks: DiffTok[]) => toks.map((t) => t.text).join("");
 // One fixture per language the editor claims (editorLang.ts). A Record, so a
 // LangId added without a fixture here fails the typecheck.
 const FIXTURES: Record<Exclude<LangId, "plaintext">, [path: string, line: string]> = {
-  javascript: ["src/a.ts", "const x = 1;"],
+  javascript: ["src/a.js", "const x = 1;"],
+  jsx: ["src/A.jsx", "const a = <div>{x}</div>;"],
+  typescript: ["src/a.ts", "const id = <T>(x: T): T => x;"],
+  tsx: ["src/A.tsx", "const a: number = <b>{1}</b>;"],
   rust: ["src/main.rs", "fn main() { let x = 1; }"],
   python: ["app.py", "def f(x): return 1"],
   java: ["A.java", "public class A { int x = 1; }"],
@@ -17,6 +20,7 @@ const FIXTURES: Record<Exclude<LangId, "plaintext">, [path: string, line: string
   markdown: ["README.md", "# Octopush"],
   html: ["index.html", '<div class="a">hi</div>'],
   css: ["a.css", ".a { color: red; }"],
+  sass: ["a.sass", "// a comment"],
   xml: ["a.xml", '<item id="1"/>'],
   yaml: ["ci.yml", "name: build"],
   shell: ["run.sh", 'if [ -f x ]; then echo "hi"; fi'],
@@ -31,6 +35,10 @@ const FIXTURES: Record<Exclude<LangId, "plaintext">, [path: string, line: string
   cpp: ["a.cpp", "int main() { return 0; }"],
   csharp: ["A.cs", "public class A { }"],
   kotlin: ["A.kt", "fun main() { val x = 1 }"],
+  scala: ["A.scala", "object A { val x = 1 }"],
+  groovy: ["build.gradle", "def version = '1.0'"],
+  dart: ["a.dart", "void main() { var x = 1; }"],
+  protobuf: ["a.proto", 'syntax = "proto3";'],
   lua: ["a.lua", "local x = 1"],
 };
 
@@ -58,7 +66,7 @@ describe("highlightLines", () => {
   });
   it("round-trips each line, empty lines included", () => {
     const lines = ["const a = `x", "", "y`;", "let b = 2"];
-    const toks = highlightLines(lines, "javascript");
+    const toks = highlightLines(lines, "typescript");
     expect(toks.map(joined)).toEqual(lines);
   });
 });
