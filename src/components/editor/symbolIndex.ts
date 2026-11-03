@@ -32,6 +32,8 @@
  * `scoreDefinitionAt` to rank workspace-wide hits with the same yardstick.
  */
 
+import { JS_DIALECTS } from "../../lib/editorLang";
+
 /** One identifier occurrence in a document, as absolute offsets. */
 export interface SymbolRange {
   from: number;
@@ -355,7 +357,8 @@ const RESERVED_WORDS: Partial<Record<string, ReadonlySet<string>>> = {
  * heads in `NEVER_DEFINED_WORDS`.
  */
 export function isReservedWord(lang: string | undefined, name: string): boolean {
-  return (RESERVED_WORDS[lang ?? ""] ?? NEVER_DEFINED_WORDS).has(name);
+  const key = JS_DIALECTS.has(lang ?? "") ? "javascript" : lang ?? "";
+  return (RESERVED_WORDS[key] ?? NEVER_DEFINED_WORDS).has(name);
 }
 
 /** Options for scoring a line of a known language. */

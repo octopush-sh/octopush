@@ -10,6 +10,9 @@ import { getExtension } from "./getExtension";
 
 export type LangId =
   | "javascript"
+  | "jsx"
+  | "typescript"
+  | "tsx"
   | "rust"
   | "python"
   | "java"
@@ -17,6 +20,7 @@ export type LangId =
   | "markdown"
   | "html"
   | "css"
+  | "sass"
   | "xml"
   | "yaml"
   | "shell"
@@ -31,8 +35,15 @@ export type LangId =
   | "cpp"
   | "csharp"
   | "kotlin"
+  | "scala"
+  | "groovy"
+  | "dart"
+  | "protobuf"
   | "lua"
   | "plaintext";
+
+/** The JavaScript/TypeScript dialects: one grammar, four configurations. */
+export const JS_DIALECTS: ReadonlySet<string> = new Set<LangId>(["javascript", "jsx", "typescript", "tsx"]);
 
 export function langForExtension(path: string): LangId {
   // Extension-less files known by name.
@@ -44,12 +55,19 @@ export function langForExtension(path: string): LangId {
 
   switch (ext) {
     case "js":
-    case "jsx":
-    case "ts":
-    case "tsx":
     case "mjs":
     case "cjs":
       return "javascript";
+    case "jsx":
+      return "jsx";
+    // Plain TypeScript has no JSX: `<T>(x) => x` and `<Foo>expr` are generics
+    // and casts there, not tags.
+    case "ts":
+    case "mts":
+    case "cts":
+      return "typescript";
+    case "tsx":
+      return "tsx";
     case "rs":
       return "rust";
     case "py":
@@ -57,16 +75,23 @@ export function langForExtension(path: string): LangId {
     case "java":
       return "java";
     case "json":
+    case "jsonc":
       return "json";
     case "md":
     case "markdown":
+    case "mdx":
       return "markdown";
     case "html":
     case "htm":
+    // Single-file components: the HTML grammar nests their <script> and <style>.
+    case "vue":
+    case "svelte":
       return "html";
     case "css":
     case "scss":
       return "css";
+    case "sass":
+      return "sass";
     case "xml":
     case "svg":
       return "xml";
@@ -102,12 +127,23 @@ export function langForExtension(path: string): LangId {
     case "cc":
     case "cxx":
     case "hpp":
+    case "hh":
+    case "hxx":
       return "cpp";
     case "cs":
       return "csharp";
     case "kt":
     case "kts":
       return "kotlin";
+    case "scala":
+      return "scala";
+    case "gradle":
+    case "groovy":
+      return "groovy";
+    case "dart":
+      return "dart";
+    case "proto":
+      return "protobuf";
     case "lua":
       return "lua";
     default:

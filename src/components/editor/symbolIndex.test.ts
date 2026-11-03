@@ -639,6 +639,13 @@ describe("isReservedWord", () => {
     for (const w of ["def", "lambda", "None"]) expect(isReservedWord("python", w)).toBe(true);
   });
 
+  it("shares one list across the JS/TS dialects", () => {
+    for (const lang of ["javascript", "jsx", "typescript", "tsx"]) {
+      expect(isReservedWord(lang, "instanceof")).toBe(true);
+      expect(isReservedWord(lang, "type")).toBe(false);
+    }
+  });
+
   it("never holds ordinary names", () => {
     for (const w of ["get", "type", "use", "record", "new", "default", "String", "Integer"]) {
       expect(isReservedWord("javascript", w)).toBe(false);

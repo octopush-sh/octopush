@@ -35,7 +35,11 @@ const LARGE_DOC = 1_000_000;
 const SETTLE_MS = 150;
 
 const LANG_LABEL: Partial<Record<LangId, string>> = {
-  javascript: "TypeScript / JavaScript",
+  javascript: "JavaScript",
+  jsx: "JavaScript (JSX)",
+  typescript: "TypeScript",
+  tsx: "TypeScript (JSX)",
+  protobuf: "Protocol Buffers",
   plaintext: "Plain text",
   csharp: "C#",
   cpp: "C++",
