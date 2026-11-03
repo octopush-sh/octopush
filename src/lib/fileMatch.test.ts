@@ -2,6 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   compileGlob,
   createMatchJob,
+  expandBraces,
+  MAX_GLOB_LENGTH,
+  MAX_POSITION,
   foldCase,
   MATCH_CHUNK,
   matchFiles,
@@ -141,6 +144,71 @@ describe("fileMatch — globs", () => {
     expect(compileGlob("a.b+(c)*", true)("a.b+(c)d")).toBe(true);
     expect(compileGlob("a.b*", true)("axb")).toBe(false);
   });
+
+  it("\\ makes the next character literal, in and out of classes", () => {
+    expect(parseQuery("\\*.ts").kind).toBe("glob");
+    expect(compileGlob("\\*.ts", true)("*.ts")).toBe(true);
+    expect(compileGlob("\\*.ts", true)("a.ts")).toBe(false);
+    expect(compileGlob("a\\?", true)("a?")).toBe(true);
+    expect(compileGlob("a\\?", true)("ab")).toBe(false);
+    expect(compileGlob("\\[x]", true)("[x]")).toBe(true);
+    expect(compileGlob("\\[x]", true)("x")).toBe(false);
+    expect(compileGlob("\\{a,b}", true)("{a,b}")).toBe(true);
+    expect(compileGlob("\\\\", true)("\\")).toBe(true);
+    // A trailing `\` is itself.
+    expect(compileGlob("a\\", true)("a\\")).toBe(true);
+    // In a class: an escaped `]` or `-` is a member.
+    expect(compileGlob("[\\]]", true)("]")).toBe(true);
+    expect(compileGlob("[a\\-c]", true)("-")).toBe(true);
+    expect(compileGlob("[a\\-c]", true)("b")).toBe(false);
+    const files = prepareFiles(["src/*.ts", "src/a.ts"]);
+    expect(matchFiles(files, parseQuery("\\*.ts")).map((m) => m.path)).toEqual(["src/*.ts"]);
+  });
+
+  it("expands {a,b} braces, nested, and each alternative picks name or path", () => {
+    expect(find("*.{ts,tsx}").sort()).toEqual([
+      "src/components/EditorPane.tsx",
+      "src/components/Pane.tsx",
+      "src/components/editor/deep/pin.ts",
+      "src/lib/ipc.ts",
+      "src/x/index.ts",
+    ]);
+    expect(parseQuery("{Foo,Pane}.*").kind).toBe("glob");
+    expect(find("{Foo,Pane}.{java,tsx}").sort()).toEqual(["src/components/Pane.tsx", "src/main/java/com/acme/Foo.java"]);
+    expect(find("{src/lib/*,README}.{ts,md}").sort()).toEqual(["README.md", "src/lib/ipc.ts"]);
+    expect(expandBraces("a{b,{c,d}e}f")).toEqual(["abf", "acef", "adef"]);
+    expect(expandBraces("{,x}.ts")).toEqual([".ts", "x.ts"]);
+    // No comma, unclosed, or escaped: literal, as in bash.
+    expect(expandBraces("{a}{b,c")).toEqual(["{a}{b,c"]);
+    expect(expandBraces("\\{a,b}")).toEqual(["\\{a,b}"]);
+    expect(parseQuery("{id}").kind).toBe("fuzzy");
+    expect(compileGlob("[{]x", true)("{x")).toBe(true);
+  });
+
+  it("caps brace expansion: past the limit the query is fuzzy text", () => {
+    expect(expandBraces("{a,b}".repeat(5))).toHaveLength(32);
+    expect(expandBraces("{a,b}".repeat(6))).toBeNull();
+    expect(expandBraces("{a,b}".repeat(40))).toBeNull();
+    expect(parseQuery("*{a,b}".repeat(6)).kind).toBe("fuzzy");
+    // 8 alternatives of ~200 characters: over the total length.
+    expect(expandBraces("{a,b,c,d,e,f,g,h}" + "x".repeat(200))).toBeNull();
+  });
+
+  it("? and classes take a whole astral character", () => {
+    expect(compileGlob("?.ts", true)("😀.ts")).toBe(true);
+    expect(compileGlob("??.ts", true)("😀.ts")).toBe(false);
+    expect(compileGlob("[😀😃].ts", true)("😃.ts")).toBe(true);
+    expect(compileGlob("[!😀].ts", true)("😃.ts")).toBe(true);
+    expect(compileGlob("[!😀].ts", true)("😀.ts")).toBe(false);
+    expect(compileGlob("[😀-😆]", true)("😃")).toBe(true);
+    expect(compileGlob("*😀", true)("a😀")).toBe(true);
+    expect(compileGlob("😀*", true)("😀b")).toBe(true);
+    expect(compileGlob("a?b", true)("a😀b")).toBe(true);
+    expect(compileGlob("a?b", true)("a\ud83db")).toBe(true); // a lone surrogate is one character
+    expect(matchFiles(prepareFiles(["docs/😀.md", "docs/ab.md"]), parseQuery("?.md")).map((m) => m.path)).toEqual([
+      "docs/😀.md",
+    ]);
+  });
 });
 
 describe("fileMatch — fuzzy", () => {
@@ -201,6 +269,13 @@ describe("fileMatch — positions and normalisation", () => {
 
   it("parses :line:col", () => {
     expect(parseQuery("UserService.java:42:7")).toMatchObject({ text: "UserService.java", line: 42, col: 7 });
+  });
+
+  it("clamps a huge :line or :col to MAX_POSITION", () => {
+    expect(parseQuery("foo:99999999999999999999")).toMatchObject({ text: "foo", line: MAX_POSITION });
+    expect(parseQuery("foo:3:99999999999999999999")).toMatchObject({ line: 3, col: MAX_POSITION });
+    expect(parseQuery(`foo:${MAX_POSITION}`).line).toBe(MAX_POSITION);
+    expect(parseQuery("foo:0").line).toBe(1);
   });
 
   it("./src/x matches like src/x", () => {
@@ -334,6 +409,24 @@ describe("fileMatch — performance", () => {
     for (const q of parsed) matchFiles(files, q); // warm up
     const t0 = performance.now();
     for (const q of parsed) expect(matchFiles(files, q)).toEqual([]);
+    expect(performance.now() - t0).toBeLessThan(200);
+  });
+
+  it("a glob over MAX_GLOB_LENGTH is fuzzy text; one at the limit stays fast", () => {
+    const pasted = "**/".repeat(1000) + "*.ts";
+    expect(parseQuery(pasted).kind).toBe("fuzzy");
+    const atLimit = "**/".repeat((MAX_GLOB_LENGTH - 4) / 3) + "*.ts";
+    expect(atLimit).toHaveLength(MAX_GLOB_LENGTH);
+    expect(parseQuery(atLimit).kind).toBe("glob");
+    expect(parseQuery(atLimit + "x").kind).toBe("fuzzy");
+    // Paths that end in .ts, so the literal-tail shortcut can't reject them.
+    const files = prepareFiles(
+      Array.from({ length: 20_000 }, (_, i) => `src/a${i % 7}/b${i % 5}/c/d/e/f/g/file${i}.ts`),
+    );
+    const parsed = parseQuery(atLimit);
+    matchFiles(files, parsed); // warm up
+    const t0 = performance.now();
+    expect(matchFiles(files, parsed)).toHaveLength(20_000);
     expect(performance.now() - t0).toBeLessThan(200);
   });
 
