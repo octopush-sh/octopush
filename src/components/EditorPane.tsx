@@ -17,7 +17,13 @@ import { diffGutter } from "./editor/diffGutter";
 import { selectAllOccurrences } from "./editor/multiCursor";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
-import { findDefinitions, DEFINITION_SCORE, NEVER_DEFINED_WORDS } from "./editor/symbolIndex";
+import {
+  findDefinitions,
+  DEFINITION_SCORE,
+  isReservedWord,
+  scoreOptionsFor,
+} from "./editor/symbolIndex";
+import { classifyClick, classifySite } from "./editor/definitionTree";
 import { DefinitionPicker } from "./editor/DefinitionPicker";
 import {
   chooseDefinition,
@@ -291,12 +297,29 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // whenever the newer request answered without searching.
       setDefinitionSearching(null);
 
+      const lang = activeFile?.lang;
       const doc = view.state.doc.toString();
-      const sites = findDefinitions(doc, req.name);
+      // The tree vetoes line-heuristic candidates it knows are not
+      // declarations (a JavaScript `run = 5` re-assigns, it doesn't declare).
+      const sites = findDefinitions(doc, req.name, scoreOptionsFor(lang))
+        .map((site) => ({ ...site, verdict: classifySite(view.state, lang, site) }))
+        .filter((site) => site.verdict !== "other");
       // Skip the occurrence that was clicked: standing on a use of `foo` must
       // not "jump" to that same use and look like nothing happened.
       const elsewhere = sites.filter((d) => d.from !== req.from);
-      if (elsewhere.length > 0) {
+      // Go's `x := …` declares by definition, and Go has no tree to say so.
+      const shortVarDecl = (site: { to: number }) =>
+        lang === "go" && /^\s*:=/.test(doc.slice(site.to, site.to + 16));
+      // A lone candidate that is only a bare `foo = …` binding (and that no
+      // tree confirmed) is not worth a jump without asking: the real
+      // declaration may well be in another file, so let the workspace rank it.
+      const lone = elsewhere.length === 1 ? elsewhere[0] : null;
+      const loneIsWeak =
+        !!lone &&
+        lone.verdict !== "declaration" &&
+        !shortVarDecl(lone) &&
+        lone.score < DEFINITION_SCORE.signature;
+      if (elsewhere.length > 0 && !loneIsWeak) {
         const site = elsewhere[0];
         view.dispatch({
           selection: { anchor: site.from, head: site.to },
@@ -310,10 +333,11 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // file. Escalating to a workspace search here would drop the reader into
       // an unrelated same-named declaration somewhere else — or, worse, report
       // that nothing declares `parse` while they sit on `function parse`. Only
-      // the two confident tiers short-circuit; a bare `foo = …` binding is weak
-      // enough that the real declaration may well be in another file.
+      // the two confident tiers (and Go's `:=`) short-circuit; a bare `foo = …`
+      // binding is weak enough that the real declaration may well be in
+      // another file.
       const clicked = sites.find((d) => d.from === req.from);
-      if (clicked && clicked.score >= DEFINITION_SCORE.signature) {
+      if (clicked && (clicked.score >= DEFINITION_SCORE.signature || shortVarDecl(clicked))) {
         pushToast({
           level: "info",
           title: "Already at the definition",
@@ -322,21 +346,24 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         return;
       }
 
-      const fromFile = activePath ? toRelative(activePath) : undefined;
-      const fromLine = view.state.doc.lineAt(req.from).number;
-      // Statement heads stop here rather than at the gesture: escalating `if`
-      // to a workspace-wide literal search is a hunt for a word, not a symbol.
-      // Deliberately the NARROW set — gating this on the ambient-noise pool
-      // silently refused cross-file lookup for `get`, `type`, `use`, `record`
-      // and friends, which are ordinary names.
-      if (NEVER_DEFINED_WORDS.has(req.name)) {
+      // A keyword or a type keyword is part of the language: nothing in the
+      // workspace declares `static` or `int`, and a literal hunt for the word
+      // only finds the lines that use it. Checked only once the open file had
+      // its say, and per language: `val` and `self` are keywords in Kotlin and
+      // Rust but ordinary names in Go and C. The syntax tree answers where
+      // the language has one; elsewhere, the active language's reserved words.
+      const click = classifyClick(view.state, lang, req);
+      if (click === "keyword" || (click === "unknown" && isReservedWord(lang, req.name))) {
         pushToast({
           level: "info",
-          title: "No definition found",
-          body: `Nothing in this file declares ${req.name}.`,
+          title: "No definition found in this workspace",
+          body: `${req.name} is part of the language.`,
         });
         return;
       }
+
+      const fromFile = activePath ? toRelative(activePath) : undefined;
+      const fromLine = view.state.doc.lineAt(req.from).number;
 
       setDefinitionSearching(req.name);
       try {
@@ -362,10 +389,12 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
             body: `${req.name} appears too often for the search to find its declaration. Try ⌘⇧F.`,
           });
         } else {
+          // Also the answer for a built-in such as `String` or `Integer`: the
+          // lines that mention it only ever use it as a type.
           pushToast({
             level: "info",
-            title: "No definition found",
-            body: `Nothing in this workspace declares ${req.name}.`,
+            title: "No definition found in this workspace",
+            body: `Nothing here declares ${req.name}. It may come from the language or a library.`,
           });
         }
       } catch (e) {
@@ -376,7 +405,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         if (current()) setDefinitionSearching(null);
       }
     },
-    [activePath, openAtLine, toRelative, workspacePath],
+    [activePath, activeFile?.lang, openAtLine, toRelative, workspacePath],
   );
 
   // Cached editor states hold whatever handler they were built with, so the

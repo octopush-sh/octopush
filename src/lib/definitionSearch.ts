@@ -17,7 +17,7 @@
  * people stop trusting the gesture.
  */
 
-import { scoreDefinitionLine } from "../components/editor/symbolIndex";
+import { scoreDefinitionLine, scoreOptionsFor } from "../components/editor/symbolIndex";
 import type { SearchHit } from "./types";
 
 export interface DefinitionCandidate {
@@ -106,7 +106,7 @@ export function rankDefinitionHits(
   const out: DefinitionCandidate[] = [];
   for (const hit of hits) {
     if (fromFile && hit.file === fromFile && hit.line === fromLine) continue;
-    const base = scoreDefinitionLine(hit.preview, name);
+    const base = scoreDefinitionLine(hit.preview, name, scoreOptionsFor(extensionOf(hit.file)));
     if (base <= 0) continue;
 
     let score = base;

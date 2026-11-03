@@ -76,6 +76,8 @@ vi.mock("@codemirror/language", () => ({
   bracketMatching: vi.fn(() => ({})),
   foldGutter: vi.fn(() => ({})),
   indentUnit: { of: vi.fn(() => ({})) },
+  // Go, C and Kotlin files highlight through a stream parser.
+  StreamLanguage: { define: vi.fn(() => ({})) },
 }));
 
 vi.mock("./editor/multiCursor", () => ({
@@ -151,6 +153,16 @@ vi.mock("./editor/symbolNav", () => ({
   symbolNav: symbolNavMock,
   goToDefinitionCommand: vi.fn(() => () => true),
 }));
+// The view stand-in below has no syntax tree; definitionTree.test.ts parses
+// real documents. Here the verdicts are dialled in per test.
+const { classifyClickMock, classifySiteMock } = vi.hoisted(() => ({
+  classifyClickMock: vi.fn((..._args: unknown[]) => "unknown"),
+  classifySiteMock: vi.fn((..._args: unknown[]) => "unknown"),
+}));
+vi.mock("./editor/definitionTree", () => ({
+  classifyClick: classifyClickMock,
+  classifySite: classifySiteMock,
+}));
 
 // Controllable blame store — EditorPane reads enabled/linesByPath via
 // selector and calls getState().load() to fetch.
@@ -205,6 +217,8 @@ const mockStore = {
     | { workspaceId: string; path: string; kind: "changed" | "deleted" }
     | null,
   pendingReveal: null as { path: string; line: number } | null,
+  /** The active file's language (go-to-definition reads it). */
+  activeLang: "javascript",
 };
 
 const buildEditorState = () => ({
@@ -212,7 +226,7 @@ const buildEditorState = () => ({
       wsId === "ws-active" ? "/repo/file.ts" : wsId === "ws-binary" ? "/repo/app.war" : null,
     getFiles: (wsId: string) =>
       wsId === "ws-active"
-        ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: "javascript", kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
+        ? [{ path: "/repo/file.ts", content: "hello", savedContent: "hello", lang: mockStore.activeLang, kind: "text", mtime: 0, size: 5, version: 0, diskStale: false }]
         : wsId === "ws-binary"
         ? [{ path: "/repo/app.war", content: "", savedContent: "", lang: "plaintext", kind: "binary", binaryReason: "binary", mtime: 0, size: 2048, version: 0, diskStale: false }]
         : [],
@@ -246,8 +260,11 @@ beforeEach(() => {
   mockCheckActiveAgainstDisk.mockResolvedValue(undefined);
   mockOpenFile.mockResolvedValue(undefined);
   searchWorkspaceTextMock.mockResolvedValue([]);
+  classifyClickMock.mockImplementation(() => "unknown");
+  classifySiteMock.mockImplementation(() => "unknown");
   mockStore.saveConflict = null;
   mockStore.pendingReveal = null;
+  mockStore.activeLang = "javascript";
   mockBlameState.enabled = false;
   mockBlameState.linesByPath = {};
   mockBlameLoad.mockResolvedValue(undefined);
@@ -628,7 +645,7 @@ describe("EditorPane · go to definition", () => {
     onRequest(at("parse(input)"), navView());
     await waitFor(() =>
       expect(pushToastMock).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "No definition found" }),
+        expect.objectContaining({ title: "No definition found in this workspace" }),
       ),
     );
   });
@@ -641,10 +658,216 @@ describe("EditorPane · go to definition", () => {
     onRequest({ name: "if", from: 0, to: 2 }, navView());
     await waitFor(() =>
       expect(pushToastMock).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "No definition found" }),
+        expect.objectContaining({ title: "No definition found in this workspace" }),
       ),
     );
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("never searches the workspace for a modifier or a type keyword", async () => {
+    // Without a tree verdict, the active language's reserved words decide.
+    mockStore.activeLang = "java";
+    const onRequest = definitionHandler();
+    for (const name of ["const", "static", "int", "void"]) {
+      onRequest({ name, from: 0, to: name.length }, navView());
+    }
+    await waitFor(() => expect(pushToastMock).toHaveBeenCalledTimes(4));
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("reserves a word only in the languages that reserve it", async () => {
+    // `val` is a Kotlin keyword and an ordinary Go name.
+    mockStore.activeLang = "kotlin";
+    let onRequest = definitionHandler();
+    onRequest({ name: "val", from: 0, to: 3 }, navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ body: "val is part of the language." }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    mockStore.activeLang = "go";
+    onRequest = definitionHandler();
+    onRequest({ name: "val", from: 0, to: 3 }, navView());
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "val", true, true),
+    );
+  });
+
+  it("jumps in-file to a name another language reserves", async () => {
+    // The reserved-word screen runs after the open file had its say: C's
+    // `struct foo *self` declares `self`, whatever Rust thinks of the word.
+    mockStore.activeLang = "c";
+    const doc = ["struct foo *self = get();", "self->x = 1;"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("self");
+    onRequest({ name: "self", from, to: from + 4 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+      anchor: doc.indexOf("self"),
+      head: doc.indexOf("self") + 4,
+    });
+    expect(pushToastMock).not.toHaveBeenCalled();
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("resolves a Java method split after its return type, and never the type", async () => {
+    mockStore.activeLang = "java";
+    const doc = [
+      "class A {",
+      "    public static Integer",
+      "    esperaSugerida(int a, int b) {",
+      "        return a;",
+      "    }",
+      "    int f() { return esperaSugerida(1, 2); }",
+      "}",
+    ].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("esperaSugerida");
+    onRequest({ name: "esperaSugerida", from, to: from + 14 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+      anchor: doc.indexOf("esperaSugerida"),
+      head: doc.indexOf("esperaSugerida") + 14,
+    });
+
+    // `Integer` is only ever the type here: no in-file jump, the workspace decides.
+    const typeView = navView(doc);
+    const at = doc.indexOf("Integer");
+    onRequest({ name: "Integer", from: at, to: at + 7 }, typeView);
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "Integer", true, true),
+    );
+    expect(typeView.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("jumps to a lone Go `x := …`, which declares by definition", async () => {
+    mockStore.activeLang = "go";
+    const doc = ["\tval := m[k]", "\tresp := http.Get(u)", "\treturn resp, val"].join("\n");
+    const onRequest = definitionHandler();
+    for (const name of ["resp", "val"]) {
+      const view = navView(doc);
+      const from = doc.lastIndexOf(name);
+      onRequest({ name, from, to: from + name.length }, view);
+      await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+      expect(view.dispatch.mock.calls[0][0].selection).toEqual({
+        anchor: doc.indexOf(name),
+        head: doc.indexOf(name) + name.length,
+      });
+    }
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("is already at the definition on a Go `x := …`", async () => {
+    mockStore.activeLang = "go";
+    const doc = ["\tresp := http.Get(u)", "\treturn resp"].join("\n");
+    const onRequest = definitionHandler();
+    const from = doc.indexOf("resp");
+    onRequest({ name: "resp", from, to: from + 4 }, navView(doc));
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Already at the definition" }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("trusts the syntax tree about which words are keywords", async () => {
+    // Python lets `final` be a variable; the tree says so, and wins over the set.
+    classifyClickMock.mockImplementation(() => "identifier");
+    const onRequest = definitionHandler();
+    onRequest({ name: "final", from: 0, to: 5 }, navView());
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "final", true, true),
+    );
+    // …and a keyword node never searches, whatever the word.
+    vi.clearAllMocks();
+    classifyClickMock.mockImplementation(() => "keyword");
+    onRequest({ name: "record", from: 0, to: 6 }, navView());
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found in this workspace" }),
+      ),
+    );
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("says nothing declares a built-in type when only its uses turn up", async () => {
+    // The owner's case: ⌘-click on `Integer` jumped to a method RETURNING
+    // Integer, because the type in front of a declaration scored as its name.
+    const doc = [
+      "class Retry {",                                        // 1
+      "  public static Integer esperaSugerida() {",           // 2
+      "    Integer espera = 3;",                              // 3
+      "    return espera;",                                   // 4
+      "  }",                                                  // 5
+      "}",                                                    // 6
+    ].join("\n");
+    searchWorkspaceTextMock.mockResolvedValue([
+      {
+        file: "src/ProveedorNoDisponibleException.java",
+        line: 14,
+        col: 17,
+        preview: "    public static Integer esperaSugerida() {",
+      },
+      { file: "src/Retry.java", line: 3, col: 5, preview: "    Integer espera = 3;" },
+    ]);
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.indexOf("Integer espera ");
+    onRequest({ name: "Integer", from, to: from + 7 }, view);
+    await waitFor(() =>
+      expect(pushToastMock).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "No definition found in this workspace" }),
+      ),
+    );
+    expect(view.dispatch).not.toHaveBeenCalled();
+    expect(mockOpenFile).not.toHaveBeenCalled();
+  });
+
+  it("does not jump to a lone bare binding; it asks the workspace instead", async () => {
+    // `total = 0` is the only candidate in this file, and nothing confirms it
+    // declares anything — the declaration may live in another file.
+    const doc = ["total = 0", "print(total)"].join("\n");
+    searchWorkspaceTextMock.mockResolvedValue([
+      { file: "src/config.py", line: 2, col: 1, preview: "total: int = 0" },
+    ]);
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("total");
+    onRequest({ name: "total", from, to: from + 5 }, view);
+    await waitFor(() => expect(searchWorkspaceTextMock).toHaveBeenCalled());
+    expect(view.dispatch).not.toHaveBeenCalled();
+  });
+
+  it("still jumps to a lone binding the syntax tree confirms", async () => {
+    classifySiteMock.mockImplementation(() => "declaration");
+    const doc = ["total = 0", "print(total)"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("total");
+    onRequest({ name: "total", from, to: from + 5 }, view);
+    await waitFor(() => expect(view.dispatch).toHaveBeenCalled());
+    expect(view.dispatch.mock.calls[0][0].selection).toEqual({ anchor: 0, head: 5 });
+    expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+  });
+
+  it("drops an in-file candidate the syntax tree vetoes", async () => {
+    // `run = 5` reads as a binding line by line; the tree knows it re-assigns.
+    classifySiteMock.mockImplementation(() => "other");
+    const doc = ["run = 5;", "run();"].join("\n");
+    const onRequest = definitionHandler();
+    const view = navView(doc);
+    const from = doc.lastIndexOf("run");
+    onRequest({ name: "run", from, to: from + 3 }, view);
+    await waitFor(() =>
+      expect(searchWorkspaceTextMock).toHaveBeenCalledWith("/repo", "run", true, true),
+    );
+    expect(view.dispatch).not.toHaveBeenCalled();
   });
 
   it("still escalates ordinary names that only look like keywords", async () => {
