@@ -820,6 +820,41 @@ fn transcript_line_missing_fields_is_skipped_not_a_panic() {
     assert!(parse(&no_ids).is_none(), "a row with no request or message id cannot be keyed");
 }
 
+const FAST_MODE_REL: &str = "transcript-synthetic/fast-mode.jsonl";
+
+#[test]
+fn transcript_fast_mode_turns_carry_their_speed() {
+    // Synthetic fixture (see the README) — pinned to the recording that has it.
+    let rec = recording("2.1.314");
+    let fx = rec.label(FAST_MODE_REL);
+    for l in of_type(&rec.jsonl(FAST_MODE_REL), "assistant") {
+        require_str(&fx, l, "message.usage.speed");
+    }
+    let (rows, _) = crate::transcripts::read_new_entries(&rec.path(FAST_MODE_REL), 0)
+        .unwrap_or_else(|e| panic!("[{fx}] read_new_entries failed: {e}"));
+    let speeds: Vec<(&str, Option<&str>)> = rows.iter().map(|r| (r.model.as_str(), r.speed.as_deref())).collect();
+    assert_eq!(
+        speeds,
+        [
+            ("claude-opus-5", Some("fast")),
+            ("claude-opus-4-8", Some("fast")),
+            ("claude-opus-5-5", Some("fast")),
+            ("claude-opus-5", Some("standard")),
+        ],
+        "[{fx}] one row per request, with its usage.speed"
+    );
+    assert_eq!(rows[1].cache_creation_1h_tokens, 2_000, "[{fx}] 1-hour writes on a fast turn");
+
+    // No `speed` field (every older transcript): no speed, priced as before.
+    let rel = transcript_file(&rec).0;
+    let stem = "s";
+    for l in of_type(&rec.jsonl(&rel), "assistant") {
+        if let Some(u) = crate::transcripts::parse_transcript_line(&serde_json::to_string(l).unwrap(), stem) {
+            assert_eq!(u.speed, None, "[{}] the real recording reports no speed", rec.label(&rel));
+        }
+    }
+}
+
 // ─── PTY `Total cost:` tail ──────────────────────────────────────────────
 
 #[test]

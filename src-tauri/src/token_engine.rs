@@ -511,6 +511,66 @@ pub fn request_cost_for_split(model: &str, input: u64, output: u64, cache_read: 
         .unwrap_or(0.0)
 }
 
+// ─── Fast mode ────────────────────────────────────────────────────────
+//
+// Claude Code's fast mode marks each request `usage.speed: "fast"` and bills
+// it at a premium (https://code.claude.com/docs/en/fast-mode, checked by the
+// owner 2026-11-03): Opus 5 and Opus 4.8 only, $10/$50 per MTok flat across
+// the 1M context, with the usual cache multipliers on top. On a Claude plan
+// it is billed to usage credits, not the plan.
+
+/// `usage.speed` of a fast-mode request.
+pub const SPEED_FAST: &str = "fast";
+
+/// `usage.speed`, when the provider reported one (`"fast"`, `"standard"`).
+pub fn usage_speed(usage: &serde_json::Value) -> Option<String> {
+    usage
+        .get("speed")
+        .and_then(|s| s.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Whether a request ran in fast mode.
+pub fn is_fast(speed: Option<&str>) -> bool {
+    speed == Some(SPEED_FAST)
+}
+
+/// The fast-mode multiplier on a model's standard price, for the models
+/// fast mode supports. Every column scales (input, output, cache hits, both
+/// cache-write TTLs), so the cache multipliers apply on top: Opus 5 $5/$25
+/// → $10/$50, a cache hit $0.50 → $1, a 1-hour write $10 → $20.
+fn fast_mode_multiplier(model: &str) -> Option<f64> {
+    match normalize_model_id(model).as_str() {
+        "claude-opus-5" | "claude-opus-4-8" => Some(2.0),
+        _ => None,
+    }
+}
+
+/// A fast-mode request's prices on top of `base` (so a user-edited catalog
+/// price scales), or `None` for a model fast mode does not support — its
+/// fast spend is *unpriced*, never billed at the standard rate.
+pub fn fast_prices(model: &str, base: ModelPrices) -> Option<ModelPrices> {
+    let k = fast_mode_multiplier(model)?;
+    Some(ModelPrices {
+        input_per_m: base.input_per_m * k,
+        output_per_m: base.output_per_m * k,
+        cache_read_per_m: base.cache_read_per_m * k,
+        cache_creation_per_m: base.cache_creation_per_m * k,
+        cache_creation_1h_per_m: base.cache_creation_1h_per_m * k,
+    })
+}
+
+/// The prices of a request at `speed`: `base` at standard speed (or no
+/// speed reported), [`fast_prices`] in fast mode. `None` means unpriced.
+pub fn prices_at_speed(model: &str, base: Option<ModelPrices>, speed: Option<&str>) -> Option<ModelPrices> {
+    if is_fast(speed) {
+        base.and_then(|b| fast_prices(model, b))
+    } else {
+        base
+    }
+}
+
 /// The ledger `cost_basis` of a computed row, from whether its model had a
 /// price: `'unpriced'` when it carries tokens at $0 with no price — so the
 /// Usage page can flag it and savings leave it out — else `'computed'`.

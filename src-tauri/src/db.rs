@@ -962,6 +962,9 @@ impl Db {
         // on: a gateway logs one or the other, and reconciliation matches
         // its rows against both. NULL on rows ingested before this column.
         add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN provider_msg_id TEXT")?;
+        // `usage.speed` of a single-request row (`'fast'` in fast mode, priced
+        // at the fast rate). NULL on older rows and on aggregated ones.
+        add_column_if_missing(&self.conn, "ALTER TABLE spend_events ADD COLUMN speed TEXT")?;
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_spend_thread ON spend_events(thread_id, ts_utc);",
         )?;
@@ -1391,8 +1394,8 @@ impl Db {
                  model_raw, model, input_tokens, output_tokens,
                  cache_read_tokens, cache_creation_tokens,
                  provider_cost_usd, computed_cost_usd, cost_usd, cost_basis, idempotency_key,
-                 mission_id, thread_id, origin)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20)",
+                 mission_id, thread_id, origin, speed)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
             params![
                 ev.ts_utc,
                 ev.surface,
@@ -1414,6 +1417,7 @@ impl Db {
                 ev.mission_id,
                 ev.thread_id,
                 ev.origin,
+                ev.speed,
             ],
         )?;
         Ok(n > 0)
@@ -1528,7 +1532,7 @@ impl Db {
                     "UPDATE spend_events
                      SET model_raw = ?2, model = ?3, input_tokens = ?4, output_tokens = ?5,
                          cache_read_tokens = ?6, cache_creation_tokens = ?7,
-                         computed_cost_usd = ?8, cost_usd = ?9
+                         computed_cost_usd = ?8, cost_usd = ?9, cost_basis = ?10, speed = ?11
                      WHERE id = ?1",
                     params![
                         id,
@@ -1540,6 +1544,8 @@ impl Db {
                         ev.cache_creation_tokens,
                         ev.computed_cost_usd,
                         ev.cost_usd,
+                        ev.cost_basis,
+                        ev.speed,
                     ],
                 )?;
                 Ok(false)
@@ -1694,6 +1700,7 @@ impl Db {
             idempotency_key: None,
             thread_id: thread_id.map(str::to_string),
             origin: origin.map(str::to_string),
+            speed: None,
         })
     }
 
@@ -3816,7 +3823,7 @@ impl Db {
     /// rescanned on every launch).
     pub fn reprice_candidates(&self, include_legacy: bool) -> AppResult<Vec<RepriceCandidate>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+            "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, speed
              FROM spend_events
              WHERE cost_usd = 0
                AND (cost_basis = 'unpriced' OR (?1 AND cost_basis = 'computed'))
@@ -3834,7 +3841,7 @@ impl Db {
         let mut out = Vec::new();
         for pat in like_patterns {
             let mut stmt = self.conn.prepare(
-                "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens
+                "SELECT id, model, surface, origin, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, speed
                  FROM spend_events
                  WHERE cost_basis = 'computed' AND provider_cost_usd IS NULL AND cost_usd > 0
                    AND model LIKE ?1",
@@ -5773,6 +5780,8 @@ impl Db {
             idempotency_key: Some(format!("direct:{stage_id}:{ts_utc}")),
             thread_id: None,
             origin: None,
+            // A stage aggregates many requests.
+            speed: None,
         })
     }
 
@@ -6529,6 +6538,8 @@ pub struct RepriceCandidate {
     pub output_tokens: i64,
     pub cache_read_tokens: i64,
     pub cache_creation_tokens: i64,
+    /// `usage.speed` (`"fast"` re-prices at the fast rate, or stays unpriced).
+    pub speed: Option<String>,
 }
 
 impl RepriceCandidate {
@@ -6542,6 +6553,7 @@ impl RepriceCandidate {
             output_tokens: r.get(5)?,
             cache_read_tokens: r.get(6)?,
             cache_creation_tokens: r.get(7)?,
+            speed: r.get(8)?,
         })
     }
 
@@ -6574,7 +6586,8 @@ impl RepricePlan {
 
 /// Plan a re-price without touching the DB: resolve each distinct model
 /// once with `price` (callers resolve OUTSIDE the DB lock), apply
-/// per-request tiers to single-request rows.
+/// per-request tiers to single-request rows and the fast-mode rate to fast
+/// rows (a fast row on a model without one stays unpriced).
 pub fn plan_reprice(
     rows: &[RepriceCandidate],
     price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
@@ -6583,7 +6596,8 @@ pub fn plan_reprice(
         std::collections::HashMap::new();
     let mut plan = RepricePlan::default();
     for r in rows {
-        let prices = *book.entry(r.model.as_str()).or_insert_with(|| price(&r.model));
+        let base = *book.entry(r.model.as_str()).or_insert_with(|| price(&r.model));
+        let prices = crate::token_engine::prices_at_speed(&r.model, base, r.speed.as_deref());
         let Some(p) = prices else {
             plan.unpriced.push(r.id);
             continue;
@@ -7038,6 +7052,9 @@ pub struct SpendEvent {
     pub thread_id: Option<String>,
     /// `director` or `subagent:<call id>` for talk rows; NULL elsewhere.
     pub origin: Option<String>,
+    /// The request's `usage.speed` (`"fast"` for a fast-mode turn); NULL
+    /// when it wasn't reported or the row aggregates several requests.
+    pub speed: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone, Debug)]

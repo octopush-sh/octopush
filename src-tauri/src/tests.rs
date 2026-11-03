@@ -243,6 +243,7 @@ mod db_tests {
             idempotency_key: Some(key.into()),
             thread_id: None,
             origin: None,
+            speed: None,
         };
         db.insert_spend_event(&mk("k1")).unwrap();
         db.insert_spend_event(&mk("k1")).unwrap(); // dup key → ignored
@@ -9611,6 +9612,38 @@ mod live_tests {
         assert!((stage_cost("claude-fable-5-1", 0, 0, 0, 1_000_000) - 12.50).abs() < 1e-9);
     }
 
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_prices_its_streamed_fast_messages_at_the_fast_rate() {
+        use crate::orchestrator::cli_runner::{streamed_cost, usage_from_stream_event};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let mk = |id: &str, speed: Option<&str>| {
+            let mut usage = serde_json::json!({ "input_tokens": 1_000, "output_tokens": 100,
+                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 });
+            if let Some(s) = speed {
+                usage["speed"] = serde_json::Value::from(s);
+            }
+            serde_json::json!({ "type": "assistant", "message": { "id": id, "usage": usage } })
+        };
+        let map: std::collections::HashMap<String, _> = [mk("msg_1", Some("fast")), mk("msg_2", None), mk("msg_3", Some("standard"))]
+            .iter()
+            .map(|e| {
+                let (id, u) = usage_from_stream_event(e).unwrap();
+                (id.unwrap(), u)
+            })
+            .collect();
+        assert!(map["msg_1"].fast && !map["msg_2"].fast && !map["msg_3"].fast);
+        let standard = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let fast = (1_000.0 * 10.0 + 100.0 * 50.0) / 1e6;
+        let c = streamed_cost("claude-opus-5", &map);
+        assert!((c - (fast + 2.0 * standard)).abs() < 1e-12, "{c}");
+        // Opus 5.5 has no fast rate: the fast message adds nothing, the
+        // others still bill at $4/$20.
+        let c = streamed_cost("claude-opus-5-5", &map);
+        assert!((c - 2.0 * (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
     #[tokio::test]
     async fn agentic_loop_ask_director_blocks_and_supersedes_acting() {
         let dir = tempfile::tempdir().unwrap();
@@ -12536,6 +12569,7 @@ mod usage_report_tests {
             idempotency_key: Some(key.into()),
             thread_id: None,
             origin: None,
+            speed: None,
         }
     }
 
@@ -12843,6 +12877,56 @@ mod transcript_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fast_mode_turns_at_the_fast_rate_and_stores_their_speed() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/Users/dev/project";
+        session_on(&db.lock(), "sess-fast", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude-code/2.1.314/transcript-synthetic/fast-mode.jsonl");
+        std::fs::copy(&fixture, pdir.join("aaaaaaaa-0000-4000-8000-000000000002.jsonl")).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4);
+
+        let row = |key: &str| -> (f64, String, Option<String>) {
+            db.lock()
+                .conn_ref()
+                .query_row(
+                    "SELECT cost_usd, cost_basis, speed FROM spend_events WHERE idempotency_key = ?1",
+                    [key],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // Opus 5 fast: 1K in × $10 + 2K out × $50 + 10K hits × $1 + 4K 5-minute writes × $12.50.
+        let (c, basis, speed) = row("cc:req_fixture_0101");
+        assert!(near(c, (1_000.0 * 10.0 + 2_000.0 * 50.0 + 10_000.0 * 1.0 + 4_000.0 * 12.50) / 1e6), "{c}");
+        assert_eq!((basis.as_str(), speed.as_deref()), ("computed", Some("fast")));
+        // Opus 4.8 fast with 1-hour writes: 500 × $10 + 1K × $50 + 2K × $20.
+        let (c, _, speed) = row("cc:req_fixture_0102");
+        assert!(near(c, (500.0 * 10.0 + 1_000.0 * 50.0 + 2_000.0 * 20.0) / 1e6), "{c}");
+        assert_eq!(speed.as_deref(), Some("fast"));
+        // Opus 5.5 has no fast rate: unpriced, not the $4/$20 standard rate.
+        assert_eq!(row("cc:req_fixture_0103"), (0.0, "unpriced".to_string(), Some("fast".to_string())));
+        // Standard speed on Opus 5: $5/$25, as before.
+        let (c, basis, speed) = row("cc:req_fixture_0104");
+        assert!(near(c, (1_000.0 * 5.0 + 2_000.0 * 25.0) / 1e6), "{c}");
+        assert_eq!((basis.as_str(), speed.as_deref()), ("computed", Some("standard")));
+
+        // The re-pricer never gives the unpriced fast row the standard rate.
+        crate::commands::reprice_ledger(&db).unwrap();
+        assert_eq!(row("cc:req_fixture_0103"), (0.0, "unpriced".to_string(), Some("fast".to_string())));
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 1);
+    }
+
+    #[test]
     fn ledger_ids_carry_both_the_request_id_and_the_message_id() {
         // A RUN row keyed on the request id, whose message id was recorded
         // beside it; a row keyed on the message id alone; a row of another
@@ -12870,6 +12954,7 @@ mod transcript_tests {
             idempotency_key: Some(key.into()),
             thread_id: None,
             origin: None,
+            speed: None,
         };
         db.insert_spend_event(&mk("2026-09-30T10:00:00+00:00", "cc:req_1")).unwrap();
         db.set_spend_provider_msg_id("cc:req_1", "msg_1").unwrap();
@@ -13495,6 +13580,41 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn fast_mode_prices_opus_5_and_4_8_at_twice_standard_and_nothing_else() {
+        use crate::token_engine::{fast_prices, is_fast, prices_at_speed, usage_speed};
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        // Fast-mode docs (2026-11-03): $10/$50 per MTok, cache multipliers on top.
+        for model in ["claude-opus-5", "claude-opus-4-8", "us.anthropic.claude-opus-4-8-v1:0", "claude-opus-5-20260601"] {
+            let fast = fast_prices(model, builtin_prices(model).unwrap()).unwrap_or_else(|| panic!("{model} has no fast rate"));
+            assert!(near(fast.input_per_m, 10.0) && near(fast.output_per_m, 50.0), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_per_m, 12.50) && near(fast.cache_read_per_m, 1.0), "{model}: {fast:?}");
+            assert!(near(fast.cache_creation_1h_per_m, 20.0), "{model}: {fast:?}");
+        }
+        // A user-edited base price scales.
+        let mut edited = builtin_prices("claude-opus-5").unwrap();
+        edited.input_per_m = 3.0;
+        assert!(near(fast_prices("claude-opus-5", edited).unwrap().input_per_m, 6.0));
+        // Any other model in fast mode is unpriced — never the standard rate.
+        for model in ["claude-opus-5-5", "claude-opus-4-7", "claude-sonnet-5-5", "claude-fable-5-1", "gpt-4o"] {
+            let base = builtin_prices(model);
+            assert!(base.is_some(), "{model}");
+            assert_eq!(fast_prices(model, base.unwrap()), None, "{model}");
+            assert_eq!(prices_at_speed(model, base, Some("fast")), None, "{model}");
+            assert_eq!(prices_at_speed(model, base, Some("standard")), base, "{model}");
+        }
+        // Standard speed, or none reported, is the base price unchanged.
+        let opus = builtin_prices("claude-opus-5");
+        assert_eq!(prices_at_speed("claude-opus-5", opus, None), opus);
+        assert_eq!(prices_at_speed("claude-opus-5", opus, Some("standard")), opus);
+        assert_eq!(prices_at_speed("claude-mystery", None, Some("fast")), None);
+        // `usage.speed`.
+        assert_eq!(usage_speed(&serde_json::json!({ "speed": "fast" })).as_deref(), Some("fast"));
+        assert_eq!(usage_speed(&serde_json::json!({ "speed": "" })), None);
+        assert_eq!(usage_speed(&serde_json::json!({ "input_tokens": 1 })), None);
+        assert!(is_fast(Some("fast")) && !is_fast(Some("standard")) && !is_fast(None));
+    }
+
+    #[test]
     fn config_dir_env_override_wins_over_home() {
         use crate::provider_router::config_dir_from;
         use std::path::PathBuf;
@@ -13756,6 +13876,7 @@ mod unpriced_ledger_tests {
             idempotency_key: Some(key.into()),
             thread_id: None,
             origin: origin.map(str::to_string),
+            speed: None,
         }
     }
 
@@ -13816,6 +13937,7 @@ mod unpriced_ledger_tests {
             output_tokens: 1_000,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
+            speed: None,
         };
         let rows = vec![row(1, "run", None), row(2, "talk", Some("director")), row(3, "talk", Some("subagent:x")), row(4, "direct", None)];
         let plan = plan_reprice(&rows, &crate::token_engine::builtin_prices);
@@ -13825,6 +13947,36 @@ mod unpriced_ledger_tests {
         for (g, want) in got.iter().zip([long, long, base, base]) {
             assert!((g - want).abs() < 1e-12, "{got:?}");
         }
+    }
+
+    #[test]
+    fn plan_reprices_fast_rows_at_the_fast_rate_or_leaves_them_unpriced() {
+        use crate::db::{plan_reprice, RepriceCandidate};
+        let row = |id: i64, model: &str, speed: Option<&str>| RepriceCandidate {
+            id,
+            model: model.into(),
+            surface: "run".into(),
+            origin: None,
+            input_tokens: 1_000,
+            output_tokens: 100,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+            speed: speed.map(str::to_string),
+        };
+        let rows = vec![
+            row(1, "claude-opus-5", Some("fast")),
+            row(2, "claude-opus-5", None),
+            row(3, "claude-opus-5-5", Some("fast")),
+            row(4, "claude-opus-5-5", Some("standard")),
+        ];
+        let plan = plan_reprice(&rows, &crate::token_engine::builtin_prices);
+        let cost = |id: i64| plan.priced.iter().find(|(i, _)| *i == id).map(|(_, c)| *c);
+        let near = |a: Option<f64>, b: f64| a.is_some_and(|a| (a - b).abs() < 1e-12);
+        assert!(near(cost(1), (1_000.0 * 10.0 + 100.0 * 50.0) / 1e6), "{plan:?}");
+        assert!(near(cost(2), (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6), "{plan:?}");
+        assert_eq!(cost(3), None);
+        assert_eq!(plan.unpriced, vec![3]);
+        assert!(near(cost(4), (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6), "{plan:?}");
     }
 
     #[test]
@@ -13869,6 +14021,7 @@ mod unpriced_ledger_tests {
             idempotency_key: Some(key.into()),
             thread_id: None,
             origin: None,
+            speed: None,
         };
         db.insert_spend_event(&mk("mystery", "a")).unwrap();
         db.insert_spend_event(&mk("local-free", "b")).unwrap();

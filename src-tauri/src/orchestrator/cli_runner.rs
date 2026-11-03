@@ -65,6 +65,10 @@ pub(crate) struct CliUsage {
     /// the breakdown).
     #[serde(default, rename = "cache_creation", deserialize_with = "one_hour_writes")]
     pub(crate) cache_creation_1h_input_tokens: u64,
+    /// One streamed message ran in fast mode (`usage.speed: "fast"`). Only
+    /// set per message by [`usage_from_stream_event`]; a sum doesn't carry it.
+    #[serde(skip)]
+    pub(crate) fast: bool,
 }
 
 fn one_hour_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -105,6 +109,7 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
             cache_read_input_tokens: g("cache_read_input_tokens"),
             cache_creation_input_tokens: g("cache_creation_input_tokens"),
             cache_creation_1h_input_tokens: crate::token_engine::one_hour_cache_writes(u),
+            fast: crate::token_engine::is_fast(crate::token_engine::usage_speed(u).as_deref()),
         },
     ))
 }
@@ -890,6 +895,7 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
             cache_read_input_tokens: cached,
             cache_creation_input_tokens: 0,
             cache_creation_1h_input_tokens: 0,
+            fast: false,
         },
     ))
 }
@@ -1424,11 +1430,10 @@ impl AgentRunner for CliRunner {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
-                let u = sum_usage(&streamed_usage.lock());
                 return Ok(failed_stage_with_usage(
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
-                    u,
+                    &streamed_usage.lock(),
                 ));
             }
         };
@@ -1453,11 +1458,10 @@ impl AgentRunner for CliRunner {
         if let (Some(kind), false) = (timeout_kind, has_terminal) {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
-            let u = sum_usage(&streamed_usage.lock());
             return Ok(failed_stage_with_usage(
                 &format!("{bin} {kind}"),
                 &stage.agent_model,
-                u,
+                &streamed_usage.lock(),
             ));
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -1568,24 +1572,59 @@ fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
     total
 }
 
+/// The estimated cost of the streamed per-message usage: standard-speed
+/// messages at the model's price, fast-mode ones at the fast rate
+/// (`token_engine::fast_prices`). A fast message on a model without a fast
+/// rate adds nothing — unpriced, never billed at the standard rate.
+pub(crate) fn streamed_cost(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> f64 {
+    let mut standard = CliUsage::default();
+    let mut fast = CliUsage::default();
+    for u in map.values() {
+        if u.fast {
+            fast.add(u);
+        } else {
+            standard.add(u);
+        }
+    }
+    let mut cost = crate::orchestrator::cost::stage_cost_split(
+        model,
+        standard.input_tokens,
+        standard.output_tokens,
+        standard.cache_read_input_tokens,
+        standard.cache_creation_input_tokens,
+        standard.cache_creation_1h_input_tokens,
+    );
+    if fast != CliUsage::default() {
+        let prices = crate::token_engine::prices_at_speed(
+            model,
+            crate::token_engine::prices_for(model),
+            Some(crate::token_engine::SPEED_FAST),
+        );
+        if let Some(p) = prices {
+            cost += p.cost_split(
+                fast.input_tokens,
+                fast.output_tokens,
+                fast.cache_read_input_tokens,
+                fast.cache_creation_input_tokens,
+                fast.cache_creation_1h_input_tokens,
+            );
+        }
+    }
+    cost
+}
+
 /// A failed outcome carrying the ESTIMATED usage summed from the streamed
 /// assistant events (no terminal `result` event arrived to be authoritative).
-/// Cost is priced through the normal catalog so the run meter and budget see
-/// the burned spend instead of zero.
-fn failed_stage_with_usage(msg: &str, model: &str, u: CliUsage) -> StageOutcome {
+/// Cost is priced through the normal catalog ([`streamed_cost`]) so the run
+/// meter and budget see the burned spend instead of zero.
+fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StageOutcome {
+    let u = sum_usage(map);
     let mut out = failed_stage(msg);
     out.input_tokens = u.input_tokens;
     out.output_tokens = u.output_tokens;
     out.cache_read_tokens = u.cache_read_input_tokens;
     out.cache_creation_tokens = u.cache_creation_input_tokens;
-    out.cost_usd = crate::orchestrator::cost::stage_cost_split(
-        model,
-        u.input_tokens,
-        u.output_tokens,
-        u.cache_read_input_tokens,
-        u.cache_creation_input_tokens,
-        u.cache_creation_1h_input_tokens,
-    );
+    out.cost_usd = streamed_cost(model, map);
     out
 }
 
