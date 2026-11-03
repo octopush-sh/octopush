@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ChevronRight, X } from "lucide-react";
 import { ModelPicker } from "../ModelPicker";
 import { Listbox } from "../controls/Listbox";
@@ -9,6 +9,8 @@ import { Reveal } from "../primitives/Reveal";
 import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
+import { cliTooOldForEffort, effortApplies, loadClaudeCliVersion } from "../../lib/claudeCli";
+import type { ClaudeCliVersion, Effort } from "../../lib/ipc";
 
 const SUBSTRATE_OPTIONS = [
   { value: "api" as const, label: "API", activeClass: "bg-[var(--state-blue-ghost)] text-octo-state-blue" },
@@ -28,6 +30,60 @@ const EFFORT_OPTIONS = [
   { value: "xhigh" as const, label: "XHi", title: "Very deep reasoning" },
   { value: "max" as const, label: "Max", title: "Maximum reasoning depth" },
 ];
+/** On a Claude Code stage no effort means the CLI's own per-model default, not
+ *  "no thinking" — so the null segment reads Auto there. */
+const CLI_EFFORT_OPTIONS = [
+  { value: "off" as const, label: "Auto", title: "Claude Code's own default effort for this model" },
+  ...EFFORT_OPTIONS.slice(1),
+];
+
+/** One effort segment (base or escalation). API: the full track. Claude Code
+ *  CLI: the same levels, passed as `--effort`, hidden on a CLI older than the
+ *  tested floor (it would not get the flag). Codex: disabled, it ignores effort. */
+function EffortControl({
+  substrate,
+  model,
+  cli,
+  value,
+  onChange,
+  ariaLabel,
+}: {
+  substrate: "api" | "cli";
+  model: string;
+  cli: ClaudeCliVersion | null;
+  value: Effort | null;
+  onChange: (v: Effort | null) => void;
+  ariaLabel: string;
+}) {
+  const isCli = substrate === "cli";
+  const applies = effortApplies(substrate, model);
+  // Auto only where Claude Code actually supplies its own default; Codex keeps
+  // the plain track (disabled).
+  const claudeCli = isCli && applies;
+  const tooOld = claudeCli && cliTooOldForEffort(cli);
+  return (
+    <>
+      <Reveal open={!tooOld}>
+        <SegmentedControl
+          fill
+          disabled={!applies}
+          options={claudeCli ? CLI_EFFORT_OPTIONS : EFFORT_OPTIONS}
+          value={value ?? "off"}
+          onChange={(v) => onChange(v === "off" ? null : v)}
+          ariaLabel={ariaLabel}
+        />
+      </Reveal>
+      <Reveal open={tooOld}>
+        <span className="font-mono text-[9px] text-octo-mute">
+          Update Claude Code ({cli?.floor} or newer) to set reasoning on this stage.
+        </span>
+      </Reveal>
+      <Reveal open={!applies}>
+        <span className="font-mono text-[9px] text-octo-mute">Codex manages its own reasoning.</span>
+      </Reveal>
+    </>
+  );
+}
 
 export interface LoopState {
   target: string | null;
@@ -62,6 +118,16 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
   const roleOptions = archetypes().map((arch) => ({ value: arch.role, label: arch.label, description: arch.description }));
   const isCli = data.substrate === "cli";
   const grantedSet = new Set(data.tools ?? TOOLS.map((t) => t.id));
+
+  // The installed Claude Code's version, only once a CLI stage is open: an
+  // old CLI gets no `--effort`, so its effort controls hide.
+  const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
+  useEffect(() => {
+    if (!isCli) return;
+    let alive = true;
+    void loadClaudeCliVersion().then((v) => { if (alive) setCli(v); });
+    return () => { alive = false; };
+  }, [isCli]);
 
   // Escalate on failure — collapsed until configured; ~180px of controls that
   // most stages never touch stay out of the scroll path.
@@ -156,29 +222,34 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
             />
           </div>
 
-          {/* Reasoning effort — how hard the model thinks per turn. Off = no thinking.
-              API substrate only: the CLI agent manages its own reasoning. */}
-          <div className="flex flex-col gap-1">
+          {/* Reasoning effort — how hard the model thinks per turn. API: Off =
+              no thinking. Claude Code CLI: passed as `--effort`, Auto = the
+              CLI's default. Codex ignores it. */}
+          <div className="flex flex-col gap-1" data-tour="builder-stage-reasoning">
             <span
               className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute"
-              title="How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking. Applies to API stages only."
+              title={
+                isCli
+                  ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort; Auto keeps the CLI's default for the model."
+                  : "How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking."
+              }
             >
               Reasoning
             </span>
-            <SegmentedControl
-              fill
-              disabled={isCli}
-              options={EFFORT_OPTIONS}
-              value={data.effort ?? "off"}
-              onChange={(v) => onPatch({ effort: v === "off" ? null : v })}
+            <EffortControl
+              substrate={data.substrate}
+              model={data.agentModel}
+              cli={cli}
+              value={data.effort}
+              onChange={(v) => onPatch({ effort: v })}
               ariaLabel="Reasoning effort"
             />
-            {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
           </div>
 
           {/* Escalate on failure — retry ONCE at a stronger tier before halting.
               The model swap applies to both substrates (the CLI runner reads the
-              model too); the effort bump is API-only, like the base effort.
+              model too); the effort bump follows the base effort's rules, judged
+              on the model the stage escalates to.
               The entire escalation block — model picker, effort segment, and
               CLI hint — is collapsed until configured: it's ~180px of controls
               most stages never touch, so none of it belongs in the default
@@ -223,15 +294,14 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
                     <span className="font-mono text-[9px] text-octo-mute">— none —</span>
                   )}
                 </div>
-                <SegmentedControl
-                  fill
-                  disabled={isCli}
-                  options={EFFORT_OPTIONS}
-                  value={data.escalateEffort ?? "off"}
-                  onChange={(v) => onPatch({ escalateEffort: v === "off" ? null : v })}
+                <EffortControl
+                  substrate={data.substrate}
+                  model={data.escalateModel || data.agentModel}
+                  cli={cli}
+                  value={data.escalateEffort}
+                  onChange={(v) => onPatch({ escalateEffort: v })}
                   ariaLabel="Escalation effort"
                 />
-                {isCli && <span className="font-mono text-[9px] text-octo-mute">The CLI agent manages its own reasoning.</span>}
               </div>
             </Reveal>
           </div>

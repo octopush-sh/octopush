@@ -247,10 +247,19 @@ pub fn version_below(version: &str, floor: &str) -> bool {
 /// The installed CLI's version, probed once per app session with the same
 /// login-shell PATH and environment the CLI stages run with.
 pub fn claude_cli_version() -> ClaudeCliVersion {
-    static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    let version = CACHE.get_or_init(probe_claude_version).clone();
+    let version = CLAUDE_VERSION_CACHE.get_or_init(probe_claude_version).clone();
     ClaudeCliVersion::new(version, TESTED_CLAUDE_FLOOR)
 }
+
+/// The cached probe result without probing; `None` until a CLI stage, the
+/// preflight or Settings has run [`claude_cli_version`] this session.
+pub fn claude_cli_version_cached() -> Option<ClaudeCliVersion> {
+    CLAUDE_VERSION_CACHE
+        .get()
+        .map(|v| ClaudeCliVersion::new(v.clone(), TESTED_CLAUDE_FLOOR))
+}
+
+static CLAUDE_VERSION_CACHE: OnceLock<Option<String>> = OnceLock::new();
 
 fn probe_claude_version() -> Option<String> {
     use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
