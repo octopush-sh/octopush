@@ -671,13 +671,15 @@ impl CliDialect {
     /// Extra environment for the stage's CLI process. Claude: bound its own
     /// waits on subagents and Monitor to [`BG_WAIT_CEILING_MS`], below the
     /// settle grace after its `result` ([`SETTLE_AFTER_RESULT_SECS`]), so the
-    /// CLI's own clean exit (EOF) comes before the runner stops it.
+    /// CLI's own clean exit (EOF) comes before the runner stops it. Fast mode
+    /// is off for stages (`CLAUDE_CODE_DISABLE_FAST_MODE`): a stage runs at the
+    /// rate its model was routed for, not the doubled fast-mode rate.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
-            CliDialect::Claude => vec![(
-                "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS",
-                BG_WAIT_CEILING_MS.to_string(),
-            )],
+            CliDialect::Claude => vec![
+                ("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", BG_WAIT_CEILING_MS.to_string()),
+                ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
+            ],
             CliDialect::Codex => Vec::new(),
         }
     }

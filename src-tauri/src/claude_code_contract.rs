@@ -527,6 +527,14 @@ fn claude_stage_env_ceils_background_waits_below_the_settle_grace() {
     assert!(CliDialect::Codex.stage_env().is_empty());
 }
 
+#[test]
+fn claude_stage_env_disables_fast_mode() {
+    let env = CliDialect::Claude.stage_env();
+    let fast = env.iter().find(|(k, _)| *k == "CLAUDE_CODE_DISABLE_FAST_MODE").map(|(_, v)| v.as_str());
+    assert_eq!(fast, Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_FAST_MODE"));
+}
+
 // ─── `rate_limit_event` → Claude plan windows ────────────────────────────
 
 const SUBSCRIBER_REL: &str = "stream-json/subscriber-rate-limit.jsonl";
@@ -636,7 +644,7 @@ fn rate_limit_event_missing_fields_degrade_without_panicking() {
     assert!(plan_windows_from_stream_event(&junk).is_empty());
 }
 
-// ─── `system/api_retry` and `system/init` load errors → journal notices ──
+// ─── `system/api_retry`, `system/notification` and `system/init` load errors → journal notices ──
 
 const API_RETRY_REL: &str = "stream-json/api-retry.jsonl";
 const LOAD_ERRORS_REL: &str = "stream-json/init-with-load-errors.jsonl";
@@ -696,6 +704,31 @@ fn api_retry_events_journal_a_throttled_retry_notice() {
         .collect();
     assert_eq!(shown.len(), 3, "[{fx}] {shown:?}");
     assert!(shown[0].contains("attempt 1/10") && shown[1].contains("rate_limit"), "[{fx}] {shown:?}");
+}
+
+const NOTIFICATION_REL: &str = "stream-json/notification.jsonl";
+
+#[test]
+fn notification_events_journal_their_message() {
+    // Synthetic fixture (see the README) — pinned to the recording that has it.
+    let rec = recording("2.1.314");
+    let fx = rec.label(NOTIFICATION_REL);
+    let events = rec.jsonl(NOTIFICATION_REL);
+    check_stream_shape(&fx, &events);
+    let notes: Vec<&Value> = events.iter().filter(|e| e["subtype"] == "notification").collect();
+    assert_eq!(notes.len(), 3, "[{fx}]");
+    require_str(&fx, notes[0], "text");
+    let (entries, _, outcome) = replay(&fx, &events);
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+    // A notification with no text journals nothing.
+    assert_eq!(notice_texts(&entries), [
+        "Fast mode disabled · usage credits exhausted",
+        "fixture notice under message",
+    ], "[{fx}]");
+    // Notifications aren't retries: the throttle never drops them.
+    let mut th = RetryThrottle::default();
+    let t0 = std::time::Instant::now();
+    assert!(notes.iter().all(|e| th.allow(e, t0) && th.allow(e, t0)), "[{fx}]");
 }
 
 #[test]
