@@ -1251,7 +1251,7 @@ function App() {
     ],
   );
 
-  const openFileInEditor = useEditorStore((s) => s.openFile);
+  const openFileAsJump = useEditorStore((s) => s.openAsJump);
 
   // Large-file confirm dialog state
   const [largeFile, setLargeFile] = useState<{ size: number; path: string } | null>(null);
@@ -1304,8 +1304,9 @@ function App() {
 
       if (view === "editor") {
         // ⌘P, search results and every other open land on the back trail.
-        useEditorStore.getState().recordLocation(activeWorkspace.id);
-        openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile, line ?? undefined, col).catch((e) =>
+        openFileAsJump(activeWorkspace.id, absolute, {
+          confirm: confirmLargeFile, line: line ?? undefined, col,
+        }).catch((e) =>
           pushToast({
             level: "error",
             title: "Could not open file",
@@ -1328,7 +1329,7 @@ function App() {
         });
       }
     },
-    [activeWorkspace, project, openFileInEditor, setMode, confirmLargeFile],
+    [activeWorkspace, project, openFileAsJump, setMode, confirmLargeFile],
   );
 
   // ── Open With → "Continue in the workspace" (from a Quick View window) ──

@@ -687,6 +687,63 @@ describe("editorStore — back/forward trail", () => {
     });
   });
 
+  it("a ⌘-click jump's stop is the click point: Back puts the caret there", async () => {
+    // Caret on line 10 (offset 3); the reader scrolled away and ⌘-clicked at 900.
+    const click = { path: "/a.ts", anchor: 900, head: 900, scrollTop: 4000 };
+    readFileChecked.mockResolvedValue({ kind: "text", content: "def", size: 3, mtime: 1 });
+    expect(
+      await useEditorStore.getState().openAsJump("ws", "/d.ts", { line: 2, from: click }),
+    ).toBe(true);
+    land();
+    here = { path: "/d.ts", anchor: 1, head: 1 };
+
+    await useEditorStore.getState().navigateBack("ws");
+    expect(land()?.restore).toEqual({ anchor: 900, head: 900, scrollTop: 4000 });
+  });
+
+  it("an open-as-jump takes its stop before the open, and records it after", async () => {
+    let resolveRead!: (v: unknown) => void;
+    readFileChecked.mockReturnValueOnce(new Promise((r) => { resolveRead = r; }));
+    const opening = useEditorStore.getState().openAsJump("ws", "/d.ts");
+    // The caret moves while the read is in flight; the stop is where it began.
+    here = { path: "/a.ts", anchor: 50, head: 50 };
+    expect(useEditorStore.getState().navByWs.ws).toBeUndefined();
+    resolveRead({ kind: "text", content: "d", size: 1, mtime: 1 });
+    expect(await opening).toBe(true);
+    expect(useEditorStore.getState().navByWs.ws.back).toEqual([
+      { path: "/a.ts", anchor: 3, head: 7, scrollTop: 40 },
+    ]);
+  });
+
+  it("declining the large-file confirm leaves no stop", async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "big", size: 5_000_000, mtime: 1 });
+    const confirm = vi.fn().mockResolvedValue(false);
+    expect(await useEditorStore.getState().openAsJump("ws", "/big.ts", { confirm })).toBe(false);
+    expect(useEditorStore.getState().navByWs.ws).toBeUndefined();
+  });
+
+  it("reopening the file already in front, with no line, adds no stop", async () => {
+    expect(await useEditorStore.getState().openAsJump("ws", "/a.ts")).toBe(true);
+    expect(useEditorStore.getState().navByWs.ws).toBeUndefined();
+    // With a line it does move, so it counts.
+    await useEditorStore.getState().openAsJump("ws", "/a.ts", { line: 40 });
+    expect(useEditorStore.getState().navByWs.ws.back).toHaveLength(1);
+  });
+
+  it("a stop that grew too large to reopen says so", async () => {
+    jump({ path: "/b.ts", anchor: 1, head: 1 });
+    useEditorStore.getState().closeFile("ws", "/a.ts");
+    readFileChecked.mockResolvedValue({ kind: "text", content: "big", size: 5_000_000, mtime: 1 });
+
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(false);
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({
+        title: "Couldn't reopen file",
+        body: expect.stringContaining("too large"),
+      }),
+    );
+  });
+
   it("records nothing while no text file is showing", () => {
     here = null;
     useEditorStore.getState().recordLocation("ws");
