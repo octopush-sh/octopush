@@ -205,7 +205,7 @@ function StageCard({
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
             <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
-            {s.effort && effortApplies(s.substrate, s.agentModel) && (
+            {s.effort && effortApplies(s.substrate, s.escalated && s.escalateModel ? s.escalateModel : s.agentModel) && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}
               </span>

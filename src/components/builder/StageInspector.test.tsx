@@ -113,17 +113,28 @@ describe("StageInspector — reasoning on CLI stages", () => {
     renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
     expect(group.getAttribute("aria-disabled")).toBe("true");
-    expect(screen.getAllByText("Codex manages its own reasoning.").length).toBeGreaterThan(0);
+    expect(screen.getAllByText("Codex manages its own reasoning.")[0].closest("[aria-hidden='true']")).toBeNull();
+    // No Claude Code default applies on Codex, so no Auto segment or its tooltip.
+    expect(within(group).queryByText("Auto")).toBeNull();
+    expect(within(group).getByText("Off")).toBeTruthy();
+    expect(group.querySelector("[title=\"Claude Code's own default effort for this model\"]")).toBeNull();
   });
 
-  it("hides reasoning on a Claude Code older than the floor", async () => {
+  it("hides reasoning on a Claude Code older than the floor, folding the hint in", async () => {
+    const hint = "Update Claude Code (2.1.314 or newer) to set reasoning on this stage.";
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
     renderInspector({ substrate: "cli", agentModel: "claude-opus-5-5" });
-    await waitFor(() =>
-      expect(screen.getAllByText("Update Claude Code (2.1.314 or newer) to set reasoning on this stage.").length).toBeGreaterThan(0),
-    );
+    // Mounted from the start inside a Reveal, so it folds in rather than appearing.
+    await waitFor(() => expect(screen.getAllByText(hint)[0].closest("[aria-hidden='true']")).toBeNull());
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort", hidden: true });
     expect(group.closest("[aria-hidden='true']")).not.toBeNull();
+  });
+
+  it("keeps the old-CLI hint folded away on a current Claude Code", async () => {
+    renderInspector({ substrate: "cli", agentModel: "claude-opus-5-5" });
+    await waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
+    const hint = screen.getAllByText(/to set reasoning on this stage\./)[0];
+    expect(hint.closest("[aria-hidden='true']")).not.toBeNull();
   });
 });
 

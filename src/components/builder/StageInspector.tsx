@@ -57,26 +57,30 @@ function EffortControl({
 }) {
   const isCli = substrate === "cli";
   const applies = effortApplies(substrate, model);
-  const tooOld = isCli && applies && cliTooOldForEffort(cli);
+  // Auto only where Claude Code actually supplies its own default; Codex keeps
+  // the plain track (disabled).
+  const claudeCli = isCli && applies;
+  const tooOld = claudeCli && cliTooOldForEffort(cli);
   return (
     <>
       <Reveal open={!tooOld}>
         <SegmentedControl
           fill
           disabled={!applies}
-          options={isCli ? CLI_EFFORT_OPTIONS : EFFORT_OPTIONS}
+          options={claudeCli ? CLI_EFFORT_OPTIONS : EFFORT_OPTIONS}
           value={value ?? "off"}
           onChange={(v) => onChange(v === "off" ? null : v)}
           ariaLabel={ariaLabel}
         />
       </Reveal>
-      {tooOld ? (
+      <Reveal open={tooOld}>
         <span className="font-mono text-[9px] text-octo-mute">
           Update Claude Code ({cli?.floor} or newer) to set reasoning on this stage.
         </span>
-      ) : (
-        !applies && <span className="font-mono text-[9px] text-octo-mute">Codex manages its own reasoning.</span>
-      )}
+      </Reveal>
+      <Reveal open={!applies}>
+        <span className="font-mono text-[9px] text-octo-mute">Codex manages its own reasoning.</span>
+      </Reveal>
     </>
   );
 }

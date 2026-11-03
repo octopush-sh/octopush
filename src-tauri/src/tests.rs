@@ -4729,6 +4729,25 @@ mod orchestrator_tests {
     }
 
     #[test]
+    fn cli_effort_only_escalation_is_inert_on_an_old_claude_cli() {
+        // A Claude Code CLI below the floor gets no `--effort`, so the retry
+        // would run identically — no tier change.
+        use crate::orchestrator::escalation_changes_tier_on;
+        let (db, run) = esc_run_on("cli", "claude-sonnet-5-5", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(escalation_changes_tier_on(&stage, false));
+        assert!(!escalation_changes_tier_on(&stage, true), "old CLI drops --effort ⇒ no change");
+        // A real model swap still escalates on an old CLI.
+        let (db, run) = esc_run_on("cli", "claude-haiku-5-5", Some("low"), Some("claude-opus-5-5"), Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(escalation_changes_tier_on(&stage, true));
+        // The API substrate never depends on the CLI version.
+        let (db, run) = esc_run(Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(escalation_changes_tier_on(&stage, true));
+    }
+
+    #[test]
     fn try_escalate_refuses_when_escalate_model_equals_base() {
         // escalate_model identical to the base ⇒ the retry would be identical.
         let (db, run) = esc_run(None, Some("base-m"), None);
