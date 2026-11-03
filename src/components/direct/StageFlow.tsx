@@ -5,6 +5,7 @@ import { TOOLS } from "../builder/graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { shortModel } from "../../lib/modelLabel";
 import { stageTitle } from "../../lib/stageMeta";
+import { effortApplies } from "../../lib/claudeCli";
 import { ModelPicker } from "../ModelPicker";
 import { Reveal } from "../primitives/Reveal";
 import { IconButton } from "../controls/IconButton";
@@ -16,11 +17,12 @@ interface Props {
   onOverride: (position: number, model: string) => void;
 }
 
-/** The escalation-policy label for a stage: the escalate model (short), or the
- *  escalate effort when only that is set (API only). null = no policy. */
-function escalationLabel(s: PipelineStage): string | null {
+/** The escalation-policy label for a stage running `model`: the escalate model
+ *  (short), or the escalate effort when only that is set and effort reaches the
+ *  agent (API or Claude Code, not Codex). null = no policy. */
+function escalationLabel(s: PipelineStage, model: string): string | null {
   if (s.escalateModel) return shortModel(s.escalateModel);
-  if (s.escalateEffort && s.substrate !== "cli") return s.escalateEffort;
+  if (s.escalateEffort && effortApplies(s.substrate, model)) return s.escalateEffort;
   return null;
 }
 
@@ -46,6 +48,8 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
           {sorted.map((s, i) => {
             const Icon = iconForRole(s.role);
             const override = overrides[s.position];
+            const model = override ?? s.agentModel;
+            const escLabel = escalationLabel(s, model);
             const looping = s.loopTargetPosition !== null;
             return (
               <span key={s.id} className="flex items-center">
@@ -66,17 +70,17 @@ export function StageFlow({ stages, overrides, onOverride }: Props) {
                     · {override}
                   </span>
                 )}
-                {s.effort && s.substrate !== "cli" && (
+                {s.effort && effortApplies(s.substrate, model) && (
                   <span className="ml-1.5 font-mono text-[10px] text-octo-brass" title="Reasoning effort for this stage">
                     · {s.effort}
                   </span>
                 )}
-                {escalationLabel(s) && (
+                {escLabel && (
                   <span
                     className="ml-1.5 font-mono text-[10px] text-octo-brass"
                     title={`Escalates to ${s.escalateModel ?? "higher effort"} if this stage fails`}
                   >
-                    · ↑ {escalationLabel(s)}
+                    · ↑ {escLabel}
                   </span>
                 )}
                 {looping && (
@@ -140,6 +144,7 @@ function CrewCard({
   // that never carried the column.
   const granted = (toolId: string) => cliManaged || !stage.tools || stage.tools.includes(toolId);
   const looping = stage.loopTargetPosition !== null;
+  const escLabel = escalationLabel(stage, model);
 
   return (
     <div
@@ -175,7 +180,7 @@ function CrewCard({
         >
           {stage.substrate}
         </span>
-        {stage.effort && !cliManaged && (
+        {stage.effort && effortApplies(stage.substrate, model) && (
           <span
             className="rounded-sm bg-[var(--brass-ghost)] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass"
             title="Reasoning effort for this stage"
@@ -183,12 +188,12 @@ function CrewCard({
             {stage.effort}
           </span>
         )}
-        {escalationLabel(stage) && (
+        {escLabel && (
           <span
             className="rounded-sm bg-[var(--brass-ghost)] px-1.5 py-0.5 font-mono text-[9px] uppercase tracking-[0.18em] text-octo-brass"
             title={`Escalates to ${stage.escalateModel ?? "higher effort"} if this stage fails`}
           >
-            ↑ {escalationLabel(stage)}
+            ↑ {escLabel}
           </span>
         )}
         <span

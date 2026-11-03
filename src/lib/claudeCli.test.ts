@@ -3,8 +3,15 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("./ipc", () => ({ ipc: { claudeCliVersion: cliVersionMock } }));
 
-const { claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion, resetClaudeCliVersionCache, runsOnClaudeCode } =
-  await import("./claudeCli");
+const {
+  claudeUpdateLabel,
+  cliTooOldForEffort,
+  crewUsesClaudeCode,
+  effortApplies,
+  loadClaudeCliVersion,
+  resetClaudeCliVersionCache,
+  runsOnClaudeCode,
+} = await import("./claudeCli");
 
 beforeEach(() => {
   resetClaudeCliVersionCache();
@@ -39,6 +46,22 @@ describe("crewUsesClaudeCode", () => {
     expect(crewUsesClaudeCode([stage("cli", "gpt-5")], {})).toBe(false);
     expect(crewUsesClaudeCode([stage("cli", "gpt-5")], { 0: "claude-opus-4-8" })).toBe(true);
     expect(crewUsesClaudeCode([stage("cli", "claude-sonnet-4-6")], { 0: "gpt-5" })).toBe(false);
+  });
+});
+
+describe("effortApplies", () => {
+  it("mirrors the backend: API, and Claude Code CLI stages, but not Codex", () => {
+    expect(effortApplies("api", "gpt-5")).toBe(true);
+    expect(effortApplies("cli", "claude-opus-5-5")).toBe(true);
+    expect(effortApplies("cli", "my-proxy-model")).toBe(true);
+    expect(effortApplies("cli", "gpt-5-codex")).toBe(false);
+  });
+
+  it("hides CLI effort only for a known version below the floor", () => {
+    expect(cliTooOldForEffort({ version: "2.1.307", floor: "2.1.314", belowFloor: true })).toBe(true);
+    expect(cliTooOldForEffort({ version: "2.1.316", floor: "2.1.314", belowFloor: false })).toBe(false);
+    expect(cliTooOldForEffort({ version: null, floor: "2.1.314", belowFloor: false })).toBe(false);
+    expect(cliTooOldForEffort(null)).toBe(false);
   });
 });
 

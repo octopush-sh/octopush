@@ -43,6 +43,22 @@ pub(crate) fn cap_diff(text: &str) -> String {
     format!("{}\n… (diff truncated)", &text[..end])
 }
 
+/// True when the stage's escalation policy would actually change its tier: a
+/// different `escalate_model`, or a different `escalate_effort` where effort
+/// reaches the agent (see [`cli_runner::effort_applies`]), judged on the model
+/// the stage escalates to. Shared by failure and loop-cap escalation.
+pub(crate) fn escalation_changes_tier(stage: &RunStageRow) -> bool {
+    let model_changes = stage
+        .escalate_model
+        .as_deref()
+        .is_some_and(|m| m != stage.agent_model);
+    let target_model = stage.escalate_model.as_deref().unwrap_or(stage.agent_model.as_str());
+    let effort_changes = cli_runner::effort_applies(&stage.substrate, target_model)
+        && stage.escalate_effort.is_some()
+        && stage.escalate_effort != stage.effort;
+    model_changes || effort_changes
+}
+
 /// The transitive ancestors of the stage at `position`, following the recorded
 /// `parents` (flow-edge) links. Excludes `position` itself. Cycle-safe (the
 /// `seen` set bounds the walk) even though saved graphs are acyclic.
@@ -674,19 +690,11 @@ impl Orchestrator {
         }
         // Escalate only if the tier would ACTUALLY change — otherwise the retry
         // re-runs identically and burns spend for nothing. `escalate_model`
-        // must differ from the base; `escalate_effort` counts only on the API
-        // substrate (a CLI agent ignores effort, so an effort-only policy there
-        // is inert). No real change ⇒ halt exactly as before.
-        let model_changes = fresh
-            .escalate_model
-            .as_deref()
-            .is_some_and(|m| m != fresh.agent_model);
-        let effort_changes = matches!(
-            AgentSubstrate::from_db(&fresh.substrate),
-            Some(AgentSubstrate::Api)
-        ) && fresh.escalate_effort.is_some()
-            && fresh.escalate_effort != fresh.effort;
-        if !(model_changes || effort_changes) {
+        // must differ from the base; `escalate_effort` counts only where effort
+        // reaches the agent — the API, or a Claude Code CLI stage (`--effort`)
+        // judged on the model it escalates to. Codex ignores effort, so an
+        // effort-only policy there is inert. No real change ⇒ halt as before.
+        if !escalation_changes_tier(&fresh) {
             return Ok(false);
         }
         // Mirror the re-run reset sequence the reject / loop_back paths use:
@@ -743,16 +751,7 @@ impl Orchestrator {
         if target.escalated {
             return Ok(false);
         }
-        let model_changes = target
-            .escalate_model
-            .as_deref()
-            .is_some_and(|m| m != target.agent_model);
-        let effort_changes = matches!(
-            AgentSubstrate::from_db(&target.substrate),
-            Some(AgentSubstrate::Api)
-        ) && target.escalate_effort.is_some()
-            && target.escalate_effort != target.effort;
-        if !(model_changes || effort_changes) {
+        if !escalation_changes_tier(target) {
             return Ok(false);
         }
         self.db.lock().set_run_stage_escalated(&target.id, true)?;

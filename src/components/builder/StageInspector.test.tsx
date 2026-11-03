@@ -1,15 +1,26 @@
-import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent, within } from "@testing-library/react";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import { render, screen, fireEvent, within, waitFor } from "@testing-library/react";
 
 // ModelPicker (rendered by the escalate-model control) fetches providers on
 // mount — stub it so these tests don't reach real Tauri IPC.
+const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("../../lib/ipc", async () => {
   const actual = await vi.importActual<any>("../../lib/ipc");
-  return { ...actual, ipc: { ...actual.ipc, listProviders: vi.fn().mockResolvedValue([]) } };
+  return {
+    ...actual,
+    ipc: { ...actual.ipc, listProviders: vi.fn().mockResolvedValue([]), claudeCliVersion: cliVersionMock },
+  };
 });
 
 const { StageInspector } = await import("./StageInspector");
 const { newStageData } = await import("./graph");
+const { resetClaudeCliVersionCache } = await import("../../lib/claudeCli");
+
+beforeEach(() => {
+  resetClaudeCliVersionCache();
+  cliVersionMock.mockReset();
+  cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+});
 import type { StageNode, StageNodeData } from "./graph";
 
 function mkNode(over: Partial<StageNodeData>): StageNode {
@@ -58,11 +69,61 @@ describe("StageInspector — escalate on failure", () => {
     expect(within(group).getByText("Max").getAttribute("aria-checked")).toBe("true");
   });
 
-  it("disables the escalate-effort control for a CLI stage (effort is API-only)", () => {
-    renderInspector({ substrate: "cli" });
+  it("enables the escalate effort on a Claude Code CLI stage", () => {
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "claude-sonnet-5-5" });
+    fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
+    const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    fireEvent.click(within(group).getByText("Max"));
+    expect(onPatch).toHaveBeenCalledWith({ escalateEffort: "max" });
+  });
+
+  it("disables the escalate effort on a Codex CLI stage", () => {
+    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
     fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     expect(group.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("judges the escalate effort on the escalation model", () => {
+    renderInspector({ substrate: "cli", agentModel: "claude-sonnet-5-5", escalateModel: "gpt-5" });
+    const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
+    expect(group.getAttribute("aria-disabled")).toBe("true");
+  });
+});
+
+describe("StageInspector — reasoning on CLI stages", () => {
+  it("passes a Claude Code stage's effort, with Auto for the CLI's default", () => {
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "claude-opus-5-5", effort: null });
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    expect(within(group).getByText("Auto").getAttribute("aria-checked")).toBe("true");
+    expect(within(group).queryByText("Off")).toBeNull();
+    fireEvent.click(within(group).getByText("High"));
+    expect(onPatch).toHaveBeenCalledWith({ effort: "high" });
+  });
+
+  it("keeps Off on an API stage", () => {
+    renderInspector({ substrate: "api", effort: null });
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(within(group).getByText("Off").getAttribute("aria-checked")).toBe("true");
+  });
+
+  it("disables reasoning on a Codex stage and says why", () => {
+    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.getAttribute("aria-disabled")).toBe("true");
+    expect(screen.getAllByText("Codex manages its own reasoning.").length).toBeGreaterThan(0);
+  });
+
+  it("hides reasoning on a Claude Code older than the floor", async () => {
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    renderInspector({ substrate: "cli", agentModel: "claude-opus-5-5" });
+    await waitFor(() =>
+      expect(screen.getAllByText("Update Claude Code (2.1.314 or newer) to set reasoning on this stage.").length).toBeGreaterThan(0),
+    );
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort", hidden: true });
+    expect(group.closest("[aria-hidden='true']")).not.toBeNull();
   });
 });
 

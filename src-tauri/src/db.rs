@@ -5692,8 +5692,9 @@ impl Db {
     /// Tokens of the `limit` most recent stages of `role` at `effort` in
     /// completed runs, each summed over every attempt the ledger recorded
     /// (loop-backs and re-runs included — that is what the stage cost).
-    /// Effort only applies off the CLI substrate, so a CLI stage counts as no
-    /// effort. Read-only; feeds the pre-run estimate.
+    /// Effort reaches the API and Claude Code (`--effort`) but not Codex, so a
+    /// Codex CLI stage counts as no effort — the model test mirrors
+    /// `cli_runner::dialect_for_model`. Read-only; feeds the pre-run estimate.
     pub fn stage_token_samples(
         &self,
         role: &str,
@@ -5707,7 +5708,11 @@ impl Db {
              JOIN run_stages s ON s.id = se.source_id
              JOIN runs r ON r.id = s.run_id
              WHERE se.surface = 'direct' AND r.status = 'completed' AND s.role = ?1
-               AND (CASE WHEN s.substrate = 'cli' THEN NULL ELSE s.effort END) IS ?2
+               AND (CASE WHEN s.substrate = 'cli' AND (
+                        lower(s.agent_model) LIKE 'gpt-%' OR lower(s.agent_model) LIKE 'o1%'
+                        OR lower(s.agent_model) LIKE 'o3%' OR lower(s.agent_model) LIKE 'o4%'
+                        OR lower(s.agent_model) LIKE '%codex%'
+                    ) THEN NULL ELSE s.effort END) IS ?2
              GROUP BY s.id
              HAVING SUM(se.input_tokens + se.output_tokens + se.cache_read_tokens + se.cache_creation_tokens) > 0
              ORDER BY MAX(se.ts_utc) DESC

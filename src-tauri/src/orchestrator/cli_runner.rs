@@ -601,6 +601,18 @@ pub fn dialect_for_model(model: &str) -> CliDialect {
     }
 }
 
+/// True when a stage's reasoning effort actually reaches the agent: always on
+/// the API substrate; on the CLI only for a dialect that takes `--effort`
+/// (Claude Code, selected by `model`). Escalation and the pre-run estimate key
+/// on this, so an effort Codex would ignore never counts as a tier change.
+pub fn effort_applies(substrate: &str, model: &str) -> bool {
+    match substrate {
+        "api" => true,
+        "cli" => dialect_for_model(model).takes_effort(),
+        _ => false,
+    }
+}
+
 impl CliDialect {
     pub fn binary(&self) -> &'static str {
         match self {
@@ -681,6 +693,35 @@ impl CliDialect {
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
+        }
+    }
+
+    /// True when the stage's reasoning effort reaches this CLI. Claude Code
+    /// takes `--effort <level>` (low/medium/high/xhigh/max, the same tokens as
+    /// [`crate::providers::Effort`]); Codex has no wired equivalent.
+    pub fn takes_effort(&self) -> bool {
+        matches!(self, CliDialect::Claude)
+    }
+
+    /// `--effort <level>` for a stage with an effort on a dialect that takes
+    /// it; empty otherwise (the CLI keeps its per-model default). Appended to
+    /// fresh and resumed runs alike.
+    pub fn effort_args(&self, effort: Option<crate::providers::Effort>) -> Vec<String> {
+        match effort {
+            Some(e) if self.takes_effort() => vec!["--effort".to_string(), e.as_str().to_string()],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Inherited variables removed from the stage's CLI process. Claude Code
+    /// lets `CLAUDE_CODE_EFFORT_LEVEL` beat `--effort`, so a value exported in
+    /// the user's shell would silently override the stage's own setting — it
+    /// is dropped when the stage passes an effort, and left alone otherwise.
+    pub fn stage_env_remove(&self, effort: Option<crate::providers::Effort>) -> Vec<&'static str> {
+        if effort.is_some() && self.takes_effort() {
+            vec!["CLAUDE_CODE_EFFORT_LEVEL"]
+        } else {
+            Vec::new()
         }
     }
 
@@ -1163,6 +1204,16 @@ impl AgentRunner for CliRunner {
         // The MODEL selects the CLI dialect (B6): claude-* → Claude Code,
         // OpenAI-family ids → Codex CLI. See `dialect_for_model`.
         let dialect = dialect_for_model(&stage.agent_model);
+        // Version preflight (Claude Code only), cached per app session. An old
+        // CLI is a journal warning, never a reason to stop the stage — but it
+        // gets no `--effort`, which the tested floor is known to accept.
+        let cli_version = if dialect == CliDialect::Claude {
+            tokio::task::spawn_blocking(crate::agent_adapter::claude_cli_version).await.ok()
+        } else {
+            None
+        };
+        let old_cli = cli_version.as_ref().is_some_and(|v| v.below_floor);
+        let effort = stage.effort.filter(|_| !old_cli);
         // Resume only on dialects with a confirmed continuation contract; a
         // dialect without one falls back to a fresh run (worktree preserved,
         // feedback in the prompt) even when a session id is on the row.
@@ -1207,6 +1258,7 @@ impl AgentRunner for CliRunner {
             CliDialect::Codex => None,
         };
         args.extend(max_budget_args(budget_cap));
+        args.extend(dialect.effort_args(effort));
 
         let path_env = resolved_cli_path();
         let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
@@ -1271,6 +1323,10 @@ impl AgentRunner for CliRunner {
         for (k, v) in dialect.stage_env() {
             command.env(k, v);
         }
+        // After the login-shell env, which may carry the user's own export.
+        for k in dialect.stage_env_remove(effort) {
+            command.env_remove(k);
+        }
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())
@@ -1289,14 +1345,14 @@ impl AgentRunner for CliRunner {
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
         );
-        // Version preflight (Claude Code only): an old CLI is a warning in the
-        // journal, never a reason to stop the stage. Cached per app session.
-        if dialect == CliDialect::Claude {
-            if let Ok(info) = tokio::task::spawn_blocking(crate::agent_adapter::claude_cli_version).await {
-                if let Some(note) = info.update_notice() {
-                    emitter.notice(&note);
-                }
-            }
+        if let Some(note) = cli_version.as_ref().and_then(|v| v.update_notice()) {
+            emitter.notice(&note);
+        }
+        if let (Some(e), true) = (stage.effort, old_cli) {
+            emitter.notice(&format!(
+                "This stage's {} effort is not passed to the older Claude Code; it runs at the CLI's default effort.",
+                e.as_str()
+            ));
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -1306,9 +1362,10 @@ impl AgentRunner for CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}",
+            "launching {} · {}{}{}",
             dialect.binary(),
             stage.agent_model,
+            dialect.effort_args(effort).get(1).map(|e| format!(" · {e} effort")).unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {

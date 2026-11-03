@@ -3776,33 +3776,38 @@ mod run_crud_tests {
         let pid = db.insert_pipeline("P", "d", false).unwrap();
         db.insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
         db.insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
-        // One run per (status, implement effort, implement substrate, implement tokens).
-        let mk = |status: &str, effort: Option<&str>, substrate: &str, tokens: i64| {
+        // One run per (status, implement effort, implement substrate + model, implement tokens).
+        let mk_on = |status: &str, effort: Option<&str>, substrate: &str, model: &str, tokens: i64| {
             let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
             let st = db.list_run_stages(&run).unwrap();
             db.conn_ref()
                 .execute(
-                    "UPDATE run_stages SET effort = ?2, substrate = ?3 WHERE id = ?1",
-                    rusqlite::params![st[1].id, effort, substrate],
+                    "UPDATE run_stages SET effort = ?2, substrate = ?3, agent_model = ?4 WHERE id = ?1",
+                    rusqlite::params![st[1].id, effort, substrate, model],
                 )
                 .unwrap();
             db.complete_run_stage(&st[0].id, "done", 999, 9, 0, 0, 0.1, None).unwrap();
             db.complete_run_stage(&st[1].id, "done", tokens, tokens / 10, 7, 3, 0.1, None).unwrap();
             db.set_run_status(&run, status, true).unwrap();
         };
+        let mk = |status: &str, effort: Option<&str>, substrate: &str, tokens: i64| {
+            mk_on(status, effort, substrate, "claude-sonnet-5-5", tokens)
+        };
         mk("completed", None, "api", 1_000);
         mk("completed", None, "api", 2_000);
         mk("aborted", None, "api", 50_000); // not a completed run
         mk("completed", Some("high"), "api", 8_000); // another effort
-        mk("completed", Some("high"), "cli", 3_000); // effort is ignored on cli
+        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex ignores effort
+        mk("completed", Some("high"), "cli", 4_000); // Claude Code takes --effort
 
         let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
         none.sort();
         assert_eq!(none, vec![1_000, 2_000, 3_000]);
-        let high = db.stage_token_samples("implement", Some("high"), 20).unwrap();
-        assert_eq!(high.len(), 1);
-        assert_eq!((high[0].input, high[0].output, high[0].cache_read, high[0].cache_creation), (8_000, 800, 7, 3));
-        assert_eq!(db.stage_token_samples("plan", None, 20).unwrap().len(), 4);
+        let mut high = db.stage_token_samples("implement", Some("high"), 20).unwrap();
+        high.sort_by_key(|s| s.input);
+        assert_eq!(high.iter().map(|s| s.input).collect::<Vec<_>>(), vec![4_000, 8_000]);
+        assert_eq!((high[1].input, high[1].output, high[1].cache_read, high[1].cache_creation), (8_000, 800, 7, 3));
+        assert_eq!(db.stage_token_samples("plan", None, 20).unwrap().len(), 5);
         assert_eq!(db.stage_token_samples("implement", None, 2).unwrap().len(), 2, "limit caps the samples");
         assert!(db.stage_token_samples("test", None, 20).unwrap().is_empty());
     }
@@ -4592,9 +4597,20 @@ mod orchestrator_tests {
         escalate_model: Option<&str>,
         escalate_effort: Option<&str>,
     ) -> (Arc<Mutex<Db>>, String) {
+        esc_run_on(substrate, "base-m", base_effort, escalate_model, escalate_effort)
+    }
+
+    /// `esc_run_sub` with an explicit base model (the CLI dialect follows it).
+    fn esc_run_on(
+        substrate: &str,
+        base_model: &str,
+        base_effort: Option<&str>,
+        escalate_model: Option<&str>,
+        escalate_effort: Option<&str>,
+    ) -> (Arc<Mutex<Db>>, String) {
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("Esc", "d", false).unwrap();
-        db.lock().insert_pipeline_stage(&pid, 0, "implement", "base-m", substrate, false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", base_model, substrate, false, None, 0, None, 25).unwrap();
         db.lock().conn_ref().execute(
             "UPDATE pipeline_stages SET effort = ?1, escalate_model = ?2, escalate_effort = ?3 WHERE pipeline_id = ?4",
             rusqlite::params![base_effort, escalate_model, escalate_effort, pid],
@@ -4680,14 +4696,36 @@ mod orchestrator_tests {
     }
 
     #[test]
-    fn try_escalate_refuses_effort_only_policy_on_cli() {
-        // effort is inert on CLI — an effort-only policy there must NOT burn a
-        // pointless same-tier retry (the retry would run identically).
-        let (db, run) = esc_run_sub("cli", Some("low"), None, Some("high"));
+    fn try_escalate_accepts_effort_only_policy_on_claude_cli() {
+        // Claude Code takes `--effort`, so low → high is a real tier change.
+        let (db, run) = esc_run_on("cli", "claude-sonnet-5-5", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         let orch = orch_for(&db);
-        assert!(!orch.try_escalate(&run, &stage).unwrap(), "CLI ignores effort — no tier change, no retry");
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "a Claude CLI effort-only policy escalates");
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn try_escalate_refuses_effort_only_policy_on_codex_cli() {
+        // Codex ignores effort — an effort-only policy there must NOT burn a
+        // pointless same-tier retry (the retry would run identically).
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "Codex ignores effort — no tier change, no retry");
         assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn try_escalate_judges_cli_effort_on_the_escalated_model() {
+        // An escalate_model equal to the base is no model change, but the
+        // effort bump still counts: the target model takes `--effort`.
+        let (db, run) = esc_run_on("cli", "claude-haiku-5-5", Some("low"), Some("claude-haiku-5-5"), Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier(&stage));
+        let (db, run) = esc_run_on("cli", "claude-haiku-5-5", Some("high"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier(&stage), "same effort ⇒ no change");
     }
 
     #[test]
@@ -8791,6 +8829,34 @@ mod cli_dialect_tests {
         assert_eq!(dialect_for_model("codex-mini-latest"), CliDialect::Codex);
         // Unknown/proxy ids keep the historical claude behavior.
         assert_eq!(dialect_for_model("my-proxy-model"), CliDialect::Claude);
+    }
+
+    #[test]
+    fn claude_stages_pass_their_effort_and_codex_stages_do_not() {
+        use crate::providers::Effort;
+        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::High)), vec!["--effort", "high"]);
+        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
+        assert!(CliDialect::Claude.effort_args(None).is_empty(), "no effort ⇒ the CLI's own default");
+        assert!(CliDialect::Codex.effort_args(Some(Effort::High)).is_empty());
+    }
+
+    #[test]
+    fn an_inherited_effort_variable_is_dropped_only_when_the_stage_sets_one() {
+        use crate::providers::Effort;
+        // CLAUDE_CODE_EFFORT_LEVEL beats --effort, so it must not reach a stage
+        // that passes its own effort; without one, the user's export stands.
+        assert_eq!(CliDialect::Claude.stage_env_remove(Some(Effort::Low)), vec!["CLAUDE_CODE_EFFORT_LEVEL"]);
+        assert!(CliDialect::Claude.stage_env_remove(None).is_empty());
+        assert!(CliDialect::Codex.stage_env_remove(Some(Effort::Low)).is_empty());
+    }
+
+    #[test]
+    fn effort_applies_to_api_and_claude_cli_only() {
+        use crate::orchestrator::cli_runner::effort_applies;
+        assert!(effort_applies("api", "gpt-5"));
+        assert!(effort_applies("cli", "claude-opus-5-5"));
+        assert!(!effort_applies("cli", "gpt-5-codex"));
+        assert!(!effort_applies("bogus", "claude-opus-5-5"));
     }
 
     #[test]

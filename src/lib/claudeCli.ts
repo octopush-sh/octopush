@@ -21,6 +21,13 @@ export function runsOnClaudeCode(model: string): boolean {
   return !(m.startsWith("gpt-") || m.startsWith("o1") || m.startsWith("o3") || m.startsWith("o4") || m.includes("codex"));
 }
 
+/** Mirrors `cli_runner::effort_applies`: a stage's reasoning effort reaches
+ *  the agent on the API, and on a CLI stage only through Claude Code
+ *  (`claude -p --effort <level>`) — Codex ignores it. */
+export function effortApplies(substrate: string, model: string): boolean {
+  return substrate === "api" || (substrate === "cli" && runsOnClaudeCode(model));
+}
+
 /** True when any CLI stage of the crew (with the launcher's per-position
  *  model overrides applied) will run on Claude Code. */
 export function crewUsesClaudeCode(
@@ -28,6 +35,13 @@ export function crewUsesClaudeCode(
   overrides: Record<number, string>,
 ): boolean {
   return stages.some((s) => s.substrate === "cli" && runsOnClaudeCode(overrides[s.position] || s.agentModel));
+}
+
+/** True when the installed Claude Code is known to be older than the tested
+ *  floor — the backend then drops `--effort`, so the effort controls hide.
+ *  An unknown version never hides them. */
+export function cliTooOldForEffort(info: ClaudeCliVersion | null): boolean {
+  return !!info?.version && info.belowFloor;
 }
 
 let cached: Promise<ClaudeCliVersion | null> | null = null;
