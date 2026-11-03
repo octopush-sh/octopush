@@ -2,7 +2,6 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { langForExtension } from "../lib/editorLang";
 import { pushToast } from "../components/Toasts";
-
 const LARGE_WARN_BYTES = 2 * 1024 * 1024;
 
 export type BinaryReason = "binary" | "unsupportedEncoding";
@@ -22,7 +21,37 @@ export interface OpenFile {
   /** Disk changed (or file deleted) under a dirty buffer — surfaced as a
    *  quiet status-bar signal; the save guard owns the actual dialog. */
   diskStale: boolean;
+  /** The editor holds keystrokes not yet copied into `content`. EditorPane
+   *  syncs the text after a short pause instead of on every key; this flag is
+   *  what keeps the buffer dirty (and the tab dot lit) meanwhile. */
+  pendingEdit?: boolean;
 }
+
+/** Dirty = unsaved edits, whether or not they've been synced into `content`. */
+export const isFileDirty = (f: OpenFile): boolean =>
+  f.kind === "text" && (!!f.pendingEdit || f.content !== f.savedContent);
+
+/** One stop in the back/forward trail: a file, its selection and scroll. */
+export interface NavLocation {
+  path: string;
+  anchor: number;
+  head: number;
+  /** The editor column's scroll offset, in pixels. */
+  scrollTop?: number;
+}
+
+interface NavHistory {
+  back: NavLocation[];
+  forward: NavLocation[];
+}
+
+/** Where the active editor is right now, or null when it shows no text file.
+ *  EditorPane registers one per workspace; the store asks it on every jump. */
+export type LocationProvider = () => NavLocation | null;
+
+const NAV_HISTORY_CAP = 50;
+const EMPTY_NAV: NavHistory = { back: [], forward: [] };
+const locationProviders = new Map<string, LocationProvider>();
 
 /** A blocked save: the disk changed or vanished under the buffer. */
 export interface SaveConflict {
@@ -39,7 +68,9 @@ export type OpenConfirm = (sizeBytes: number, path: string) => Promise<boolean>;
  *  EditorPane consumes it via `clearPendingReveal`. */
 export interface PendingReveal {
   path: string;
-  line: number; // 1-based new-file line
+  line: number; // 1-based new-file line; ignored when `restore` is set
+  /** Back/forward: the exact selection and scroll to put back. */
+  restore?: Omit<NavLocation, "path">;
 }
 
 // Stable empty list — returning a new array per call would bust React memo
@@ -55,6 +86,8 @@ interface EditorStore {
   saveConflict: SaveConflict | null;
   /** One-shot open-at-line requests, keyed by workspace. */
   pendingRevealByWs: Record<string, PendingReveal | null>;
+  /** Back/forward trail of jumps, keyed by workspace. */
+  navByWs: Record<string, NavHistory>;
 
   // Selectors
   getFiles: (workspaceId: string) => OpenFile[];
@@ -81,6 +114,17 @@ interface EditorStore {
   /** Move an open tab from one position to another (drag-reorder). */
   reorderFiles: (workspaceId: string, fromIndex: number, toIndex: number) => void;
   setContent: (workspaceId: string, path: string, content: string) => void;
+  /** The editor has unsynced keystrokes for `path`. Writes only on the first
+   *  one, so typing doesn't re-render every subscriber per key. */
+  markEdited: (workspaceId: string, path: string) => void;
+  /** EditorPane tells the store where the cursor is; `null` unregisters. */
+  setLocationProvider: (workspaceId: string, provider: LocationProvider | null) => void;
+  /** Push where the reader is now (or `from`, when the jump began earlier)
+   *  onto the back trail. Clears the forward trail, like any browser or IDE. */
+  recordLocation: (workspaceId: string, from?: NavLocation) => void;
+  /** Return to the previous / next stop. False when the trail is empty. */
+  navigateBack: (workspaceId: string) => Promise<boolean>;
+  navigateForward: (workspaceId: string) => Promise<boolean>;
   saveActive: (workspaceId: string, opts?: { force?: boolean }) => Promise<void>;
   clearSaveConflict: () => void;
   /** Replace the buffer with the disk contents (clears dirty + stale).
@@ -120,11 +164,54 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   const findFile = (workspaceId: string, path: string) =>
     (get().filesByWs[workspaceId] ?? EMPTY_FILES).find((f) => f.path === path);
 
+  const setNav = (workspaceId: string, nav: NavHistory) =>
+    set((s) => ({ navByWs: { ...s.navByWs, [workspaceId]: nav } }));
+
+  /** Same file and caret: pushing it again would make Back a dead key. */
+  const samePlace = (a: NavLocation | undefined, b: NavLocation) =>
+    !!a && a.path === b.path && a.head === b.head;
+
+  const pushCapped = (stack: NavLocation[], loc: NavLocation) =>
+    samePlace(stack[stack.length - 1], loc)
+      ? stack
+      : [...stack, loc].slice(-NAV_HISTORY_CAP);
+
+  /** Pop one stop off `from`, push the current place onto `to`, and go. */
+  const step = async (workspaceId: string, dir: "back" | "forward") => {
+    const nav = get().navByWs[workspaceId] ?? EMPTY_NAV;
+    const from = dir === "back" ? nav.back : nav.forward;
+    const to = dir === "back" ? nav.forward : nav.back;
+    const target = from[from.length - 1];
+    if (!target) return false;
+    const here = locationProviders.get(workspaceId)?.() ?? null;
+    const nextFrom = from.slice(0, -1);
+    const nextTo = here ? pushCapped(to, here) : to;
+    setNav(
+      workspaceId,
+      dir === "back"
+        ? { back: nextFrom, forward: nextTo }
+        : { back: nextTo, forward: nextFrom },
+    );
+
+    await get().openFile(workspaceId, target.path);
+    // The file may have been deleted or declined since; the stop is spent.
+    if (!findFile(workspaceId, target.path)) return false;
+    const { path, ...restore } = target;
+    set((s) => ({
+      pendingRevealByWs: {
+        ...s.pendingRevealByWs,
+        [workspaceId]: { path, line: 1, restore },
+      },
+    }));
+    return true;
+  };
+
   return {
   filesByWs: {},
   activeByWs: {},
   saveConflict: null,
   pendingRevealByWs: {},
+  navByWs: {},
 
   // ── Selectors ─────────────────────────────────────────────────
 
@@ -142,8 +229,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
     const file = (get().filesByWs[workspaceId] ?? EMPTY_FILES).find(
       (f) => f.path === path,
     );
-    if (!file || file.kind === "binary") return false;
-    return file.content !== file.savedContent;
+    return !!file && isFileDirty(file);
   },
 
   // ── Actions ───────────────────────────────────────────────────
@@ -281,11 +367,32 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         filesByWs: {
           ...s.filesByWs,
           [workspaceId]: prev.map((f) =>
-            f.path === path ? { ...f, content } : f,
+            f.path === path ? { ...f, content, pendingEdit: false } : f,
           ),
         },
       };
     }),
+
+  markEdited: (workspaceId, path) => {
+    const file = findFile(workspaceId, path);
+    if (!file || file.kind !== "text" || file.pendingEdit) return;
+    patchFile(workspaceId, path, (f) => ({ ...f, pendingEdit: true }));
+  },
+
+  setLocationProvider: (workspaceId, provider) => {
+    if (provider) locationProviders.set(workspaceId, provider);
+    else locationProviders.delete(workspaceId);
+  },
+
+  recordLocation: (workspaceId, from) => {
+    const here = from ?? locationProviders.get(workspaceId)?.() ?? null;
+    if (!here) return;
+    const nav = get().navByWs[workspaceId] ?? EMPTY_NAV;
+    setNav(workspaceId, { back: pushCapped(nav.back, here), forward: [] });
+  },
+
+  navigateBack: (workspaceId) => step(workspaceId, "back"),
+  navigateForward: (workspaceId) => step(workspaceId, "forward"),
 
   saveActive: async (workspaceId, opts) => {
     const activePath = get().getActivePath(workspaceId);
@@ -349,7 +456,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         // flight. Judge dirtiness from the CURRENT state, not the snapshot.
         const current = findFile(workspaceId, path);
         if (!current || current.kind !== "text") return false;
-        if (current.content !== current.savedContent) {
+        if (isFileDirty(current)) {
           patchFile(workspaceId, path, (f) => ({ ...f, diskStale: true }));
           return false;
         }
@@ -370,6 +477,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         mtime: res.mtime,
         size: res.size,
         diskStale: false,
+        pendingEdit: false,
         version: f.version + 1,
       }));
       return true;
@@ -420,8 +528,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       return;
     }
 
-    const dirty = fresh.content !== fresh.savedContent;
-    if (dirty) {
+    if (isFileDirty(fresh)) {
       // Unsaved local edits + external change: quiet signal only; the
       // reload-or-overwrite dialog appears when they save.
       setStale(true);

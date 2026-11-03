@@ -1296,6 +1296,8 @@ function App() {
       setReviewViewMode(view);
 
       if (view === "editor") {
+        // ⌘P, search results and every other open land on the back trail.
+        useEditorStore.getState().recordLocation(activeWorkspace.id);
         openFileInEditor(activeWorkspace.id, absolute, confirmLargeFile, line ?? undefined).catch((e) =>
           pushToast({
             level: "error",

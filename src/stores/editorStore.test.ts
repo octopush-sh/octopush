@@ -19,7 +19,7 @@ import { useEditorStore } from "./editorStore";
 
 function reset() {
   useEditorStore.setState({
-    filesByWs: {}, activeByWs: {}, saveConflict: null, pendingRevealByWs: {},
+    filesByWs: {}, activeByWs: {}, saveConflict: null, pendingRevealByWs: {}, navByWs: {},
   });
   vi.clearAllMocks();
   // Default: disk matches the tracked state (no external change).
@@ -494,5 +494,155 @@ describe("editorStore.checkActiveAgainstDisk", () => {
     fileMeta.mockResolvedValue({ mtimeMs: 100, size: 2 });
     await useEditorStore.getState().checkActiveAgainstDisk("ws");
     expect(useEditorStore.getState().getFiles("ws")[0].diskStale).toBe(false);
+  });
+});
+
+describe("editorStore — cheap dirty flag while typing", () => {
+  beforeEach(reset);
+
+  const openText = async () => {
+    readFileChecked.mockResolvedValue({ kind: "text", content: "v1", size: 2, mtime: 100 });
+    await useEditorStore.getState().openFile("ws", "/a.ts");
+  };
+
+  it("markEdited lights the dirty flag on the first key and writes nothing after", async () => {
+    await openText();
+    const listener = vi.fn();
+    const unsubscribe = useEditorStore.subscribe(listener);
+    for (let i = 0; i < 50; i++) useEditorStore.getState().markEdited("ws", "/a.ts");
+    unsubscribe();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(true);
+  });
+
+  it("the synced text decides: typing back to the saved text is clean again", async () => {
+    await openText();
+    useEditorStore.getState().markEdited("ws", "/a.ts");
+    useEditorStore.getState().setContent("ws", "/a.ts", "v1");
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(false);
+    useEditorStore.getState().markEdited("ws", "/a.ts");
+    useEditorStore.getState().setContent("ws", "/a.ts", "v2");
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(true);
+  });
+
+  it("unsynced keystrokes block the silent reload on focus", async () => {
+    await openText();
+    useEditorStore.getState().markEdited("ws", "/a.ts");
+    fileMeta.mockResolvedValue({ mtimeMs: 500, size: 2 });
+    await useEditorStore.getState().checkActiveAgainstDisk("ws");
+    expect(readFileChecked).toHaveBeenCalledTimes(1); // only the open
+    expect(useEditorStore.getState().getFiles("ws")[0].diskStale).toBe(true);
+  });
+
+  it("an explicit reload drops the unsynced flag with the edits", async () => {
+    await openText();
+    useEditorStore.getState().markEdited("ws", "/a.ts");
+    readFileChecked.mockResolvedValue({ kind: "text", content: "disk", size: 4, mtime: 200 });
+    await useEditorStore.getState().reloadFromDisk("ws", "/a.ts");
+    expect(useEditorStore.getState().isDirty("ws", "/a.ts")).toBe(false);
+  });
+});
+
+describe("editorStore — back/forward trail", () => {
+  type Loc = { path: string; anchor: number; head: number; scrollTop?: number };
+  let here: Loc | null;
+
+  const text = (path: string) => ({
+    path, content: "x", savedContent: "x", lang: "javascript", kind: "text" as const,
+    mtime: 1, size: 1, version: 0, diskStale: false,
+  });
+
+  /** What EditorPane does on a jump: record, then the cursor lands elsewhere. */
+  const jump = (to: Loc) => {
+    useEditorStore.getState().recordLocation("ws");
+    useEditorStore.setState((s) => ({ activeByWs: { ...s.activeByWs, ws: to.path } }));
+    here = to;
+  };
+
+  /** What EditorPane does with the reveal: the cursor is now at the target. */
+  const land = () => {
+    const reveal = useEditorStore.getState().getPendingReveal("ws");
+    if (reveal?.restore) here = { path: reveal.path, ...reveal.restore };
+    useEditorStore.getState().clearPendingReveal("ws");
+    return reveal;
+  };
+
+  beforeEach(() => {
+    reset();
+    useEditorStore.setState({
+      filesByWs: { ws: [text("/a.ts"), text("/b.ts"), text("/c.ts")] },
+      activeByWs: { ws: "/a.ts" },
+    });
+    here = { path: "/a.ts", anchor: 3, head: 7, scrollTop: 40 };
+    useEditorStore.getState().setLocationProvider("ws", () => here);
+  });
+
+  it("definition → definition → back → back returns to the start", async () => {
+    jump({ path: "/b.ts", anchor: 10, head: 10, scrollTop: 300 });
+    jump({ path: "/c.ts", anchor: 20, head: 25, scrollTop: 900 });
+
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(true);
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/b.ts");
+    expect(land()).toEqual({
+      path: "/b.ts", line: 1, restore: { anchor: 10, head: 10, scrollTop: 300 },
+    });
+
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(true);
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/a.ts");
+    expect(land()?.restore).toEqual({ anchor: 3, head: 7, scrollTop: 40 });
+
+    // The start of the trail: nothing further back.
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(false);
+  });
+
+  it("forward retraces the jumps; a fresh jump clears it", async () => {
+    jump({ path: "/b.ts", anchor: 10, head: 10 });
+    jump({ path: "/c.ts", anchor: 20, head: 20 });
+    await useEditorStore.getState().navigateBack("ws"); land();
+    await useEditorStore.getState().navigateBack("ws"); land();
+
+    expect(await useEditorStore.getState().navigateForward("ws")).toBe(true);
+    expect(land()?.path).toBe("/b.ts");
+    expect(await useEditorStore.getState().navigateForward("ws")).toBe(true);
+    expect(land()?.path).toBe("/c.ts");
+    expect(await useEditorStore.getState().navigateForward("ws")).toBe(false);
+
+    await useEditorStore.getState().navigateBack("ws"); land();
+    jump({ path: "/a.ts", anchor: 0, head: 0 });
+    expect(await useEditorStore.getState().navigateForward("ws")).toBe(false);
+  });
+
+  it("back within one file restores the selection without switching tabs", async () => {
+    jump({ path: "/a.ts", anchor: 90, head: 95 });
+    await useEditorStore.getState().navigateBack("ws");
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/a.ts");
+    expect(land()?.restore).toMatchObject({ anchor: 3, head: 7 });
+  });
+
+  it("recording the same place twice leaves one stop", () => {
+    useEditorStore.getState().recordLocation("ws");
+    useEditorStore.getState().recordLocation("ws");
+    expect(useEditorStore.getState().navByWs.ws.back).toHaveLength(1);
+  });
+
+  it("keeps the trail per workspace", async () => {
+    jump({ path: "/b.ts", anchor: 1, head: 1 });
+    expect(await useEditorStore.getState().navigateBack("other")).toBe(false);
+  });
+
+  it("reopens a stop whose tab was closed since", async () => {
+    jump({ path: "/b.ts", anchor: 1, head: 1 });
+    useEditorStore.getState().closeFile("ws", "/a.ts");
+    readFileChecked.mockResolvedValue({ kind: "text", content: "again", size: 5, mtime: 3 });
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(true);
+    expect(readFileChecked).toHaveBeenCalledWith("/a.ts");
+    expect(useEditorStore.getState().getActivePath("ws")).toBe("/a.ts");
+    expect(land()?.restore).toMatchObject({ anchor: 3, head: 7 });
+  });
+
+  it("records nothing while no text file is showing", () => {
+    here = null;
+    useEditorStore.getState().recordLocation("ws");
+    expect(useEditorStore.getState().navByWs.ws).toBeUndefined();
   });
 });

@@ -75,6 +75,7 @@ vi.mock("@codemirror/language", () => ({
   indentOnInput: vi.fn(() => ({})),
   bracketMatching: vi.fn(() => ({})),
   foldGutter: vi.fn(() => ({})),
+  foldKeymap: [],
   indentUnit: { of: vi.fn(() => ({})) },
 }));
 
@@ -112,6 +113,8 @@ vi.mock("./editor/EditorSearch", () => ({
 
 vi.mock("../components/editor/diffGutter", () => ({
   diffGutter: vi.fn(() => ({})),
+  gotoNextChange: vi.fn(() => true),
+  gotoPrevChange: vi.fn(() => true),
 }));
 
 const { blameGutterMock } = vi.hoisted(() => ({
@@ -199,6 +202,7 @@ const mockCheckActiveAgainstDisk = vi.fn().mockResolvedValue(undefined);
 const mockClearSaveConflict = vi.fn();
 
 const mockClearPendingReveal = vi.fn();
+const mockRecordLocation = vi.fn();
 
 const mockStore = {
   saveConflict: null as
@@ -227,9 +231,15 @@ const buildEditorState = () => ({
       wsId === "ws-active" ? mockStore.pendingReveal : null,
     clearPendingReveal: mockClearPendingReveal,
     openFile: mockOpenFile,
+    markEdited: vi.fn(),
+    setLocationProvider: vi.fn(),
+    recordLocation: mockRecordLocation,
+    navigateBack: vi.fn().mockResolvedValue(false),
+    navigateForward: vi.fn().mockResolvedValue(false),
 });
 
 vi.mock("../stores/editorStore", () => ({
+  isFileDirty: (f: { content: string; savedContent: string }) => f.content !== f.savedContent,
   useEditorStore: Object.assign(
     vi.fn((selector: (s: unknown) => unknown) => selector(buildEditorState())),
     { getState: () => buildEditorState() },
@@ -591,6 +601,11 @@ describe("EditorPane · go to definition", () => {
     const spec = view.dispatch.mock.calls[0][0];
     expect(spec.selection).toEqual({ anchor: NAV_DOC.indexOf("run"), head: NAV_DOC.indexOf("run") + 3 });
     expect(searchWorkspaceTextMock).not.toHaveBeenCalled();
+    // The jump's origin joins the back trail (⌃−), before the selection moves.
+    expect(mockRecordLocation).toHaveBeenCalledWith("ws-active", undefined);
+    expect(mockRecordLocation.mock.invocationCallOrder[0]).toBeLessThan(
+      view.dispatch.mock.invocationCallOrder[0],
+    );
   });
 
   it("says so when the reader is already standing on the declaration", async () => {
@@ -617,6 +632,10 @@ describe("EditorPane · go to definition", () => {
     onRequest(at("parse(input)"), navView());
     await waitFor(() =>
       expect(mockOpenFile).toHaveBeenCalledWith("ws-active", "/repo/src/parser.ts", undefined, 12),
+    );
+    expect(mockRecordLocation).toHaveBeenCalledWith("ws-active", undefined);
+    expect(mockRecordLocation.mock.invocationCallOrder[0]).toBeLessThan(
+      mockOpenFile.mock.invocationCallOrder[0],
     );
   });
 

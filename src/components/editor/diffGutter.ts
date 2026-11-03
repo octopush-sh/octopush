@@ -5,9 +5,53 @@
  * added or had deletions immediately after them, matching the Atelier palette.
  */
 
-import { gutter, GutterMarker } from "@codemirror/view";
-import type { Extension } from "@codemirror/state";
+import { EditorView, gutter, GutterMarker, type Command } from "@codemirror/view";
+import { Facet, type Extension } from "@codemirror/state";
 import type { DiffLineMarker } from "../../lib/diffParser";
+
+/** The markers the gutter draws, so the next/previous-change commands step
+ *  through exactly what the reader sees. */
+const diffMarkers = Facet.define<DiffLineMarker[], DiffLineMarker[]>({
+  combine: (values) => values[0] ?? [],
+});
+
+/** First line of each change: a run of consecutive marked lines is one stop. */
+export function changeStarts(markers: readonly DiffLineMarker[]): number[] {
+  const lines = new Set(markers.map((m) => m.line));
+  return [...lines].filter((l) => !lines.has(l - 1)).sort((a, b) => a - b);
+}
+
+/** The change to land on from `current` (1-based), wrapping at either end. */
+export function nextChangeLine(
+  starts: readonly number[],
+  current: number,
+  dir: 1 | -1,
+): number | null {
+  if (starts.length === 0) return null;
+  if (dir === 1) return starts.find((l) => l > current) ?? starts[0];
+  for (let i = starts.length - 1; i >= 0; i--) if (starts[i] < current) return starts[i];
+  return starts[starts.length - 1];
+}
+
+function stepChange(dir: 1 | -1): Command {
+  return (view) => {
+    const { doc } = view.state;
+    const current = doc.lineAt(view.state.selection.main.head).number;
+    const target = nextChangeLine(changeStarts(view.state.facet(diffMarkers)), current, dir);
+    // No changes in this file: let the key fall through.
+    if (target == null) return false;
+    const pos = doc.line(Math.min(target, doc.lines)).from;
+    view.dispatch({
+      selection: { anchor: pos },
+      effects: EditorView.scrollIntoView(pos, { y: "center" }),
+      userEvent: "select",
+    });
+    return true;
+  };
+}
+
+export const gotoNextChange = stepChange(1);
+export const gotoPrevChange = stepChange(-1);
 
 // ── Token hex mirrors ──────────────────────────────────────────────
 // Matches tokens.ts values — no hardcoded literals beyond what the
@@ -86,7 +130,7 @@ export function diffGutter(markers: DiffLineMarker[]): Extension {
     byLine.set(m.line, m);
   }
 
-  return gutter({
+  return [diffMarkers.of(markers), gutter({
     class: "cm-diff-gutter",
     lineMarker(view, line) {
       const lineNo = view.state.doc.lineAt(line.from).number;
@@ -97,5 +141,5 @@ export function diffGutter(markers: DiffLineMarker[]): Extension {
       return null;
     },
     initialSpacer: () => addedMarker,
-  });
+  })];
 }

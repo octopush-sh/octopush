@@ -12084,6 +12084,65 @@ mod search_word_boundary {
     }
 }
 
+// ─── Workspace text search — the parallel walk ────────────────────
+//
+// ⌘-click searches the whole worktree; the walk runs on every core, so the
+// order threads finish in must never leak into the answer.
+#[cfg(test)]
+mod search_tree_tests {
+    use crate::commands::search_tree;
+    use std::fs;
+
+    #[test]
+    fn hits_are_sorted_by_file_then_line_and_skip_what_the_walk_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/deep")).unwrap();
+        fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+        fs::write(root.join("src/b.rs"), "x\nrun();\nfn run() {}\n").unwrap();
+        fs::write(root.join("src/a.rs"), "rerun();\nrun();\n").unwrap();
+        fs::write(root.join("src/deep/c.rs"), "let run = 1;\n").unwrap();
+        fs::write(root.join("ignored.rs"), "fn run() {}\n").unwrap();
+        fs::write(root.join("blob.bin"), b"run\0run").unwrap();
+        for i in 0..40 {
+            fs::write(root.join(format!("src/deep/noise{i}.rs")), "nothing here\n").unwrap();
+        }
+
+        let found: Vec<(String, u32)> = search_tree(root, "run", true, true)
+            .into_iter()
+            .map(|h| (h.file, h.line))
+            .collect();
+        assert_eq!(
+            found,
+            vec![
+                ("src/a.rs".to_string(), 2),
+                ("src/b.rs".to_string(), 2),
+                ("src/b.rs".to_string(), 3),
+                ("src/deep/c.rs".to_string(), 1),
+            ],
+        );
+    }
+
+    #[test]
+    fn the_same_tree_gives_the_same_answer_every_time() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..60 {
+            let sub = dir.path().join(format!("d{}", i % 7));
+            fs::create_dir_all(&sub).unwrap();
+            fs::write(sub.join(format!("f{i}.ts")), "parse(x)\nfunction parse() {}\n").unwrap();
+        }
+        let first = search_tree(dir.path(), "parse", false, true);
+        assert_eq!(first.len(), 120);
+        for _ in 0..5 {
+            let again = search_tree(dir.path(), "parse", false, true);
+            let key = |v: &[crate::commands::SearchHit]| {
+                v.iter().map(|h| (h.file.clone(), h.line)).collect::<Vec<_>>()
+            };
+            assert_eq!(key(&again), key(&first));
+        }
+    }
+}
+
 #[cfg(test)]
 mod clone_askpass_tests {
     //! The askpass helper turns the credentials typed into the Add Project
