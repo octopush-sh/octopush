@@ -129,6 +129,13 @@ fn api_retry_notice(v: &Value) -> String {
     parts.join(" · ")
 }
 
+/// `system/notification` → its message as-is (first line), e.g. "Fast mode
+/// disabled · usage credits exhausted". The field name isn't documented, so
+/// `text`, then `message`, then `notification`; none of them → no notice.
+fn notification_notice(v: &Value) -> Vec<String> {
+    first_str(v, &["text", "message", "notification"]).map(one_line).into_iter().collect()
+}
+
 /// `system/init` → one notice per `mcp_server_errors[]` / `plugin_errors[]`
 /// entry. A host that captures stderr gets no other warning that a stage
 /// runs without those tools.
@@ -199,8 +206,8 @@ impl RetryThrottle {
 /// Map ONE claude `--output-format stream-json` event to zero or more entries
 /// (as the JSON values `LiveEmitter` would emit). `assistant` → text + tool
 /// entries; `user` tool_result → tool_result entries; `system/api_retry` →
-/// a retry notice; `system/init` → a notice per MCP server / plugin that
-/// failed to load; everything else → none.
+/// a retry notice; `system/notification` → its message; `system/init` → a
+/// notice per MCP server / plugin that failed to load; everything else → none.
 ///
 /// Sub-agent hierarchy: an event that belongs to a Claude Code sub-agent
 /// carries a top-level `parent_tool_use_id` (the `Agent`/`Task` block that
@@ -220,6 +227,7 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
     if kind == Some("system") {
         let notices = match v.get("subtype").and_then(Value::as_str) {
             Some("api_retry") => vec![api_retry_notice(v)],
+            Some("notification") => notification_notice(v),
             Some("init") => init_error_notices(v),
             _ => Vec::new(),
         };

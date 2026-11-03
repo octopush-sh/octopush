@@ -9859,6 +9859,27 @@ mod live_tests {
     }
 
     #[test]
+    fn entries_from_stream_event_journals_notifications() {
+        let note = json!({"type":"system","subtype":"notification",
+            "text":"Fast mode disabled · usage credits exhausted"});
+        assert_eq!(
+            entries_from_stream_event(&note),
+            vec![json!({"kind":"notice","text":"Fast mode disabled · usage credits exhausted"})]
+        );
+        // Falls back to `message`, then `notification`; first line only.
+        let msg = json!({"type":"system","subtype":"notification","message":"  one\ntwo"});
+        assert_eq!(entries_from_stream_event(&msg)[0]["text"], "one");
+        let alt = json!({"type":"system","subtype":"notification","notification":"three"});
+        assert_eq!(entries_from_stream_event(&alt)[0]["text"], "three");
+        // A sub-agent's notification nests under its spawner.
+        let sub = json!({"type":"system","subtype":"notification","text":"x","parent_tool_use_id":"toolu_1"});
+        assert_eq!(entries_from_stream_event(&sub)[0]["parent"], "toolu_1");
+        // No text, or a blank one → nothing.
+        assert!(entries_from_stream_event(&json!({"type":"system","subtype":"notification"})).is_empty());
+        assert!(entries_from_stream_event(&json!({"type":"system","subtype":"notification","text":"  "})).is_empty());
+    }
+
+    #[test]
     fn entries_from_stream_event_journals_init_load_errors() {
         let init = json!({"type":"system","subtype":"init","session_id":"s",
             "mcp_server_errors":[
