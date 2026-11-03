@@ -4193,6 +4193,16 @@ pub(crate) fn workspace_walker(
     max_depth: Option<usize>,
     apply_ignore_filters: bool,
 ) -> ignore::Walk {
+    workspace_walk_builder(base, max_depth, apply_ignore_filters).build()
+}
+
+/// The builder behind `workspace_walker`, for callers that want
+/// `build_parallel()` instead (`search_workspace_text`).
+pub(crate) fn workspace_walk_builder(
+    base: &std::path::Path,
+    max_depth: Option<usize>,
+    apply_ignore_filters: bool,
+) -> ignore::WalkBuilder {
     let mut builder = ignore::WalkBuilder::new(base);
     builder
         .max_depth(max_depth)
@@ -4200,7 +4210,7 @@ pub(crate) fn workspace_walker(
         .require_git(false)
         .hidden(false)
         .filter_entry(|entry| entry.file_name() != ".git");
-    builder.build()
+    builder
 }
 
 /// One level of `base`: entry paths only (root itself and `.git` excluded).
@@ -5690,100 +5700,151 @@ pub async fn search_workspace_text(
     };
 
     let hits = tokio::task::spawn_blocking(move || {
-        let mut hits: Vec<SearchHit> = Vec::new();
-        // workspace_walker prunes `.git` at every depth.
-        for entry in workspace_walker(&base, None, true) {
-            if hits.len() >= SEARCH_RESULT_CAP {
-                break;
-            }
-            let Ok(entry) = entry else { continue };
-            if entry.depth() == 0 {
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
-                continue;
-            }
-            // Skip oversized files outright.
-            let size = match std::fs::metadata(path).map(|m| m.len()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            if size > FILE_SIZE_CAP_BYTES {
-                continue;
-            }
-            // Read in bytes; bail on binary files.
-            let bytes = match std::fs::read(path) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            if bytes
-                .iter()
-                .take(8192)
-                .any(|&b| b == 0)
-            {
-                continue;
-            }
-            let text = match std::str::from_utf8(&bytes) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-
-            let rel = match path.strip_prefix(&base) {
-                Ok(r) => r.to_string_lossy().into_owned(),
-                Err(_) => continue,
-            };
-
-            for (idx, line) in text.lines().enumerate() {
-                let haystack = if case_sensitive {
-                    line.to_string()
-                } else {
-                    line.to_lowercase()
-                };
-                if let Some(col) = find_match(&haystack, &needle_owned, 0, whole_word) {
-                    // Trim very long lines for transport.
-                    let preview = if line.len() > PREVIEW_LEN_CAP {
-                        let (start, end) = char_boundary_range(
-                            line,
-                            col.saturating_sub(40),
-                            col + needle_owned.len() + 60,
-                        );
-                        let snippet = &line[start..end];
-                        if start > 0 {
-                            format!("…{snippet}")
-                        } else {
-                            snippet.to_string()
-                        }
-                    } else {
-                        line.to_string()
-                    };
-                    hits.push(SearchHit {
-                        file: rel.clone(),
-                        line: (idx as u32) + 1,
-                        // A CHARACTER column, not a byte one: `col` indexes
-                        // `haystack`, which on the case-insensitive path is a
-                        // lowercased copy whose byte length can differ from the
-                        // line. Shipping the byte offset would put any consumer
-                        // that placed a cursor from it mid-line on the first
-                        // accented source line. (Residual: a character whose
-                        // lowercase form is a different NUMBER of characters —
-                        // `İ` → `i̇` — still shifts this by one; no consumer
-                        // reads `col` today, and `line` is what navigation uses.)
-                        col: (haystack[..col].chars().count() as u32) + 1,
-                        preview,
-                    });
-                    if hits.len() >= SEARCH_RESULT_CAP {
-                        break;
-                    }
-                }
-            }
-        }
-        hits
+        search_tree(&base, &needle_owned, case_sensitive, whole_word)
     })
     .await
     .map_err(|e| AppError::Other(format!("search join error: {e}")))?;
 
     Ok(hits)
+}
+
+/// The walk behind `search_workspace_text`, on every core: ⌘-click runs it, and
+/// a single-threaded walk of a large worktree made go-to-definition feel slow.
+///
+/// Hits come back sorted by file, then line, so the answer is the same whatever
+/// order the threads finish in. Once the cap is reached the walk stops early;
+/// which files made it in is then up to the threads, and the caller already
+/// treats a full result as "too many to narrow" (`searchSaturated`).
+pub fn search_tree(
+    base: &std::path::Path,
+    needle: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<SearchHit> {
+    use ignore::WalkState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    let found = AtomicUsize::new(0);
+    let per_file: Mutex<Vec<Vec<SearchHit>>> = Mutex::new(Vec::new());
+    // workspace_walk_builder prunes `.git` at every depth.
+    workspace_walk_builder(base, None, true)
+        .build_parallel()
+        .run(|| {
+            let (found, per_file) = (&found, &per_file);
+            Box::new(move |entry: Result<ignore::DirEntry, ignore::Error>| {
+                if found.load(Ordering::Relaxed) >= SEARCH_RESULT_CAP {
+                    return WalkState::Quit;
+                }
+                let Ok(entry) = entry else {
+                    return WalkState::Continue;
+                };
+                if entry.depth() == 0 || entry.file_type().map(|t| !t.is_file()).unwrap_or(true) {
+                    return WalkState::Continue;
+                }
+                let path = entry.path();
+                let Ok(rel) = path.strip_prefix(base) else {
+                    return WalkState::Continue;
+                };
+                let hits = search_file(path, &rel.to_string_lossy(), needle, case_sensitive, whole_word);
+                if !hits.is_empty() {
+                    found.fetch_add(hits.len(), Ordering::Relaxed);
+                    per_file
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(hits);
+                }
+                WalkState::Continue
+            })
+        });
+
+    let mut hits: Vec<SearchHit> = per_file
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner())
+        .into_iter()
+        .flatten()
+        .collect();
+    hits.sort_by(|a, b| a.file.cmp(&b.file).then(a.line.cmp(&b.line)));
+    hits.truncate(SEARCH_RESULT_CAP);
+    hits
+}
+
+/// Every matching line of one file (at most `SEARCH_RESULT_CAP`). Empty for a
+/// file the search skips: over 1 MB, binary (a NUL in the first 8 KiB), or
+/// not UTF-8.
+fn search_file(
+    path: &std::path::Path,
+    rel: &str,
+    needle_owned: &str,
+    case_sensitive: bool,
+    whole_word: bool,
+) -> Vec<SearchHit> {
+    let mut hits: Vec<SearchHit> = Vec::new();
+    // Skip oversized files outright.
+    let size = match std::fs::metadata(path).map(|m| m.len()) {
+        Ok(s) => s,
+        Err(_) => return hits,
+    };
+    if size > FILE_SIZE_CAP_BYTES {
+        return hits;
+    }
+    // Read in bytes; bail on binary files.
+    let bytes = match std::fs::read(path) {
+        Ok(b) => b,
+        Err(_) => return hits,
+    };
+    if bytes.iter().take(8192).any(|&b| b == 0) {
+        return hits;
+    }
+    let text = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return hits,
+    };
+
+    for (idx, line) in text.lines().enumerate() {
+        let haystack = if case_sensitive {
+            line.to_string()
+        } else {
+            line.to_lowercase()
+        };
+        if let Some(col) = find_match(&haystack, needle_owned, 0, whole_word) {
+            // Trim very long lines for transport.
+            let preview = if line.len() > PREVIEW_LEN_CAP {
+                let (start, end) = char_boundary_range(
+                    line,
+                    col.saturating_sub(40),
+                    col + needle_owned.len() + 60,
+                );
+                let snippet = &line[start..end];
+                if start > 0 {
+                    format!("…{snippet}")
+                } else {
+                    snippet.to_string()
+                }
+            } else {
+                line.to_string()
+            };
+            hits.push(SearchHit {
+                file: rel.to_string(),
+                line: (idx as u32) + 1,
+                // A CHARACTER column, not a byte one: `col` indexes
+                // `haystack`, which on the case-insensitive path is a
+                // lowercased copy whose byte length can differ from the
+                // line. Shipping the byte offset would put any consumer
+                // that placed a cursor from it mid-line on the first
+                // accented source line. (Residual: a character whose
+                // lowercase form is a different NUMBER of characters —
+                // `İ` → `i̇` — still shifts this by one; no consumer
+                // reads `col` today, and `line` is what navigation uses.)
+                col: (haystack[..col].chars().count() as u32) + 1,
+                preview,
+            });
+            if hits.len() >= SEARCH_RESULT_CAP {
+                break;
+            }
+        }
+    }
+    hits
 }
 
 // ─── Performance monitor ──────────────────────────────────────────

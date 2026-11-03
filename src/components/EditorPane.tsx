@@ -1,19 +1,20 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   EditorView, lineNumbers, highlightActiveLineGutter, drawSelection, keymap,
-  highlightActiveLine, rectangularSelection, crosshairCursor,
+  highlightActiveLine, rectangularSelection, crosshairCursor, getDialog,
 } from "@codemirror/view";
 import { EditorState, Compartment } from "@codemirror/state";
 import { defaultKeymap, indentWithTab, history, historyKeymap } from "@codemirror/commands";
-import { indentOnInput, bracketMatching, foldGutter, indentUnit } from "@codemirror/language";
-import { search, searchKeymap, setSearchQuery, SearchQuery } from "@codemirror/search";
+import { indentOnInput, bracketMatching, foldGutter, foldKeymap, indentUnit } from "@codemirror/language";
+import { search, searchKeymap, setSearchQuery, SearchQuery, gotoLine } from "@codemirror/search";
 import { buildEditorTheme } from "./editor/atelierTheme";
 import { languageSupport } from "../lib/editorLanguages";
 import type { LangId } from "../lib/editorLang";
 import { EditorSearch } from "./editor/EditorSearch";
 import { searchMatchHighlight } from "./editor/searchHighlight";
 import { blameGutter } from "./editor/blameGutter";
-import { diffGutter } from "./editor/diffGutter";
+import { diffGutter, gotoNextChange, gotoPrevChange } from "./editor/diffGutter";
+import { EDITOR_NAV_KEYS, EDITOR_PANE_KEYS, GOTO_LINE_DIALOG } from "./editor/navKeys";
 import { selectAllOccurrences } from "./editor/multiCursor";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
@@ -34,7 +35,7 @@ import {
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
 import { parseDiffForFile } from "../lib/diffParser";
-import { useEditorStore } from "../stores/editorStore";
+import { useEditorStore, isFileDirty, type NavLocation } from "../stores/editorStore";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 import { EditorStatusBar } from "./EditorStatusBar";
@@ -63,6 +64,11 @@ interface Prefs { wrap: boolean; fontSize: number; tabWidth: number; lineNumbers
 const REVEAL_POLL_MS = 120;
 const REVEAL_HOLD_MS = 10_000;
 
+/** Pause after the last keystroke before the text is copied into the store.
+ *  Copying it per key cost a full `doc.toString()` and re-rendered the pane,
+ *  the tab bar and the Review canvas on every character. */
+export const CONTENT_SYNC_MS = 250;
+
 /** Is the editor column actually on screen? False only when something has
  *  deliberately hidden it (reading mode collapses it rather than unmounting).
  *  Environments with no layout engine report "visible" — see the reveal effect. */
@@ -82,9 +88,19 @@ function buildState(opts: {
   doc: string; lang: string; markers: ReturnType<typeof parseDiffForFile>;
   prefs: Prefs; onSave: () => void; onOpenSearch: () => void;
   onGoToDefinition: (req: DefinitionRequest, view: EditorView) => void;
-  onUpdate: (u: { doc: string | null; line: number; col: number; selections: number }) => void;
+  onNavigate: (dir: "back" | "forward") => void;
+  onGotoLine: () => void;
+  onUpdate: (u: {
+    docChanged: boolean; selectionSet: boolean;
+    /** Asked only while a ⌘⌥G is pending: a state-field read, no DOM. */
+    gotoLineOpen: () => boolean;
+    line: number; col: number; selections: number;
+  }) => void;
 }) {
-  const { doc, lang, markers, prefs, onSave, onOpenSearch, onGoToDefinition, onUpdate } = opts;
+  const {
+    doc, lang, markers, prefs, onSave, onOpenSearch, onGoToDefinition,
+    onNavigate, onGotoLine, onUpdate,
+  } = opts;
   return EditorState.create({
     doc,
     extensions: [
@@ -112,23 +128,31 @@ function buildState(opts: {
       symbolOccurrenceHighlight,
       symbolNav(onGoToDefinition),
       keymap.of([
-        { key: "Mod-s", run: () => { onSave(); return true; } },
+        { ...EDITOR_PANE_KEYS.save, run: () => { onSave(); return true; } },
         // Our Octopush-native find overlay owns ⌘F. Listed BEFORE searchKeymap
         // so this binding wins and ⌘F never opens CodeMirror's docked panel — while
         // searchKeymap still provides find-next/prev, go-to-line and
         // select-next-occurrence (⌘G/F3, ⌘⌥G, ⌘D). ⌘G/F3 CAN still open that panel:
         // they're wrapped in `searchCommand`, which opens it when no valid query is
         // set. searchHighlight stands down when it does, so nothing double-paints.
-        { key: "Mod-f", run: () => { onOpenSearch(); return true; } },
-        { key: "Mod-Shift-l", run: selectAllOccurrences },
-        { key: "F12", run: goToDefinitionCommand(onGoToDefinition) },
-        { key: "Alt-z", run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },
-        { key: "Mod-=", run: () => { useEditorPrefs.getState().bumpFontSize(1); return true; } },
-        { key: "Mod--", run: () => { useEditorPrefs.getState().bumpFontSize(-1); return true; } },
+        { ...EDITOR_PANE_KEYS.find, run: () => { onOpenSearch(); return true; } },
+        { ...EDITOR_PANE_KEYS.selectAllOccurrences, run: selectAllOccurrences },
+        { ...EDITOR_PANE_KEYS.definition, run: goToDefinitionCommand(onGoToDefinition) },
+        { ...EDITOR_PANE_KEYS.wrap, run: () => { useEditorPrefs.getState().toggleWrap(); return true; } },
+        { ...EDITOR_PANE_KEYS.fontUp, run: () => { useEditorPrefs.getState().bumpFontSize(1); return true; } },
+        { ...EDITOR_PANE_KEYS.fontDown, run: () => { useEditorPrefs.getState().bumpFontSize(-1); return true; } },
+        { ...EDITOR_NAV_KEYS.back, run: () => { onNavigate("back"); return true; } },
+        { ...EDITOR_NAV_KEYS.forward, run: () => { onNavigate("forward"); return true; } },
+        { ...EDITOR_NAV_KEYS.nextChange, run: gotoNextChange },
+        { ...EDITOR_NAV_KEYS.prevChange, run: gotoPrevChange },
+        // Ahead of searchKeymap's own ⌘⌥G so the pane can note where the
+        // reader stood: the dialog jumps on submit, long after the key.
+        { ...EDITOR_NAV_KEYS.gotoLine, run: (view) => { onGotoLine(); return gotoLine(view); } },
         indentWithTab,
         ...searchKeymap,
         ...defaultKeymap,
         ...historyKeymap,
+        ...foldKeymap,
       ]),
       languageSupport(lang as LangId),
       themeComp.of(buildEditorTheme()),
@@ -137,11 +161,12 @@ function buildState(opts: {
         const head = update.state.selection.main.head;
         const lineObj = update.state.doc.lineAt(head);
         onUpdate({
-          // Serialising the whole document costs the same as the edit that
-          // caused it, and this listener runs on EVERY update — every cursor
-          // move, and every transaction the ⌘-hover plugin dispatches to
-          // repaint its underline. Only an actual edit needs the text.
-          doc: update.docChanged ? update.state.doc.toString() : null,
+          // No text here: serialising the whole document costs the same as the
+          // edit that caused it, and this listener runs on EVERY update. The
+          // pane copies the text once typing pauses (CONTENT_SYNC_MS).
+          docChanged: update.docChanged,
+          selectionSet: update.selectionSet,
+          gotoLineOpen: () => getDialog(update.view, GOTO_LINE_DIALOG) !== null,
           line: lineObj.number,
           col: head - lineObj.from + 1,
           selections: update.state.selection.ranges.length,
@@ -154,7 +179,6 @@ function buildState(opts: {
 export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const activePath = useEditorStore((s) => s.getActivePath(workspaceId));
   const files = useEditorStore((s) => s.getFiles(workspaceId));
-  const setContent = useEditorStore((s) => s.setContent);
   const saveActive = useEditorStore((s) => s.saveActive);
   const closeFile = useEditorStore((s) => s.closeFile);
   const reloadFromDisk = useEditorStore((s) => s.reloadFromDisk);
@@ -190,6 +214,66 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   const lastPathRef = useRef<string | null>(null);
   const prefsRef = useRef(prefs);
   prefsRef.current = prefs;
+
+  // ── Buffer → store sync ─────────────────────────────────────────
+  // The first keystroke only flags the buffer dirty (`markEdited`, one store
+  // write); the text itself is copied once typing pauses, or right away when
+  // something needs it: a save, a tab switch, unmount.
+  const syncRef = useRef<{ workspaceId: string; path: string; timer: number } | null>(null);
+  const flushContent = useCallback(() => {
+    const pending = syncRef.current;
+    if (!pending) return;
+    window.clearTimeout(pending.timer);
+    syncRef.current = null;
+    const view = viewRef.current;
+    // Only while the view still holds that file's document.
+    if (view && lastPathRef.current === pending.path) {
+      useEditorStore
+        .getState()
+        .setContent(pending.workspaceId, pending.path, view.state.doc.toString());
+    }
+  }, []);
+  const dropPendingSync = useCallback(() => {
+    if (syncRef.current) window.clearTimeout(syncRef.current.timer);
+    syncRef.current = null;
+  }, []);
+  const scheduleSync = useCallback(
+    (ws: string, path: string) => {
+      if (syncRef.current && syncRef.current.path !== path) flushContent();
+      if (!syncRef.current) useEditorStore.getState().markEdited(ws, path);
+      else window.clearTimeout(syncRef.current.timer);
+      syncRef.current = {
+        workspaceId: ws,
+        path,
+        timer: window.setTimeout(flushContent, CONTENT_SYNC_MS),
+      };
+    },
+    [flushContent],
+  );
+
+  // ── Back/forward trail ──────────────────────────────────────────
+  // The store asks this where the reader is whenever a jump starts or Back
+  // runs. Null while no text file is showing (nothing to come back to).
+  const currentLocation = useCallback((): NavLocation | null => {
+    const view = viewRef.current;
+    const path = lastPathRef.current;
+    if (!view || !path) return null;
+    const { anchor, head } = view.state.selection.main;
+    // The host div scrolls, not `.cm-scroller`: the editor grows to its
+    // content, so CodeMirror's own scroll snapshot would always read 0.
+    return { path, anchor, head, scrollTop: hostRef.current?.scrollTop ?? 0 };
+  }, []);
+  useEffect(() => {
+    const { setLocationProvider } = useEditorStore.getState();
+    setLocationProvider(workspaceId, currentLocation);
+    return () => setLocationProvider(workspaceId, null);
+  }, [workspaceId, currentLocation]);
+  const recordLocation = useCallback(
+    (from?: NavLocation) => useEditorStore.getState().recordLocation(workspaceId, from),
+    [workspaceId],
+  );
+  // Where ⌘⌥G was pressed, held until its dialog jumps (recorded) or closes.
+  const gotoLineOriginRef = useRef<NavLocation | null>(null);
 
   const [pos, setPos] = useState({ line: 1, col: 1, selections: 1 });
 
@@ -253,6 +337,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       const absolute = relativePath.startsWith("/")
         ? relativePath
         : `${workspacePath}/${relativePath}`;
+      recordLocation();
       try {
         await openFile(workspaceId, absolute, undefined, line);
       } catch (e) {
@@ -275,7 +360,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         });
       }
     },
-    [openFile, workspaceId, workspacePath],
+    [openFile, recordLocation, workspaceId, workspacePath],
   );
 
   /**
@@ -321,6 +406,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         lone.score < DEFINITION_SCORE.signature;
       if (elsewhere.length > 0 && !loneIsWeak) {
         const site = elsewhere[0];
+        recordLocation();
         view.dispatch({
           selection: { anchor: site.from, head: site.to },
           effects: EditorView.scrollIntoView(site.from, { y: "center" }),
@@ -405,7 +491,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         if (current()) setDefinitionSearching(null);
       }
     },
-    [activePath, activeFile?.lang, openAtLine, toRelative, workspacePath],
+    [activePath, activeFile?.lang, openAtLine, recordLocation, toRelative, workspacePath],
   );
 
   // Cached editor states hold whatever handler they were built with, so the
@@ -426,11 +512,32 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     const markers = parseDiffForFile(diffText, relPath);
     return buildState({
       doc: file.content, lang: file.lang, markers, prefs: prefsRef.current,
-      onSave: () => saveActive(workspaceId).catch(console.error),
+      onSave: () => { flushContent(); saveActive(workspaceId).catch(console.error); },
       onOpenSearch: openSearch,
       onGoToDefinition: requestDefinition,
+      onNavigate: (dir) => {
+        const store = useEditorStore.getState();
+        void (dir === "back" ? store.navigateBack(workspaceId) : store.navigateForward(workspaceId));
+      },
+      onGotoLine: () => { gotoLineOriginRef.current = currentLocation(); },
       onUpdate: (u) => {
-        if (u.doc !== null) setContent(workspaceId, file.path, u.doc);
+        if (u.docChanged) scheduleSync(workspaceId, file.path);
+        // ⌘⌥G's jump is the first selection change once its dialog has
+        // closed. A click in the text while the dialog stays open isn't it.
+        const origin = gotoLineOriginRef.current;
+        if (origin && !u.gotoLineOpen()) {
+          if (u.selectionSet && !u.docChanged) {
+            gotoLineOriginRef.current = null;
+            recordLocation(origin);
+          } else {
+            // A close alone isn't a cancel yet: the dialog queues its own close
+            // one microtask AHEAD of the submit handler that jumps. Escape and
+            // bad input never jump, so the origin goes after this task.
+            window.setTimeout(() => {
+              if (gotoLineOriginRef.current === origin) gotoLineOriginRef.current = null;
+            }, 0);
+          }
+        }
         // Same values → same object, so React bails out instead of re-rendering
         // the pane for every transaction that left the caret where it was.
         setPos((prev) =>
@@ -447,7 +554,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     if (!hostRef.current || viewRef.current) return;
     const view = new EditorView({ parent: hostRef.current });
     viewRef.current = view;
-    return () => { view.destroy(); viewRef.current = null; stateCache.current.clear(); lastPathRef.current = null; };
+    return () => { flushContent(); view.destroy(); viewRef.current = null; stateCache.current.clear(); lastPathRef.current = null; };
   }, []);
 
   // Swap the document state when the active file changes; preserve per-tab state.
@@ -460,9 +567,13 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     // cached snapshot and reappear (with no overlay to drive them) on return.
     const prevPath = lastPathRef.current;
     if (prevPath && prevPath !== activeFile?.path) {
+      // The view still holds the outgoing document: sync its text now.
+      flushContent();
       view.dispatch({ effects: setSearchQuery.of(new SearchQuery({ search: "" })) });
       stateCache.current.set(prevPath, view.state);
     }
+    // A ⌘⌥G left open on the outgoing tab never jumps from this one.
+    gotoLineOriginRef.current = null;
 
     // No active file, or a binary file: clear the view so neither stale text
     // nor garbled bytes show behind the overlay / binary pane.
@@ -509,17 +620,42 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     if (!isHostVisible(hostRef.current)) return;
 
     const doc = view.state.doc;
-    const lineNo = Math.max(1, Math.min(pendingReveal.line, doc.lines));
-    const target = doc.line(lineNo);
-    // A column past the end of the line lands on its end.
-    const pos =
-      pendingReveal.col == null
-        ? target.from
-        : target.from + Math.max(0, Math.min(pendingReveal.col - 1, target.length));
-    view.dispatch({
-      selection: { anchor: pos },
-      effects: EditorView.scrollIntoView(pos, { y: "center" }),
-    });
+    const { restore } = pendingReveal;
+    if (restore) {
+      // Back/forward: the exact selection and scroll the reader left. The
+      // file may have shrunk since; clamp, and only put the old scroll back
+      // while the document still reaches the old selection.
+      const clamp = (n: number) => Math.max(0, Math.min(n, doc.length));
+      const anchor = clamp(restore.anchor);
+      const head = clamp(restore.head);
+      const { scrollTop } = restore;
+      if (scrollTop != null && doc.length >= Math.max(restore.anchor, restore.head)) {
+        view.dispatch({ selection: { anchor, head } });
+        // After CodeMirror's own measure, once the restored document has its
+        // height — set any earlier and the browser clamps the offset.
+        view.requestMeasure({
+          read: () => null,
+          write: () => { if (hostRef.current) hostRef.current.scrollTop = scrollTop; },
+        });
+      } else {
+        view.dispatch({
+          selection: { anchor, head },
+          effects: EditorView.scrollIntoView(head, { y: "center" }),
+        });
+      }
+    } else {
+      const lineNo = Math.max(1, Math.min(pendingReveal.line, doc.lines));
+      const target = doc.line(lineNo);
+      // A column past the end of the line lands on its end.
+      const pos =
+        pendingReveal.col == null
+          ? target.from
+          : target.from + Math.max(0, Math.min(pendingReveal.col - 1, target.length));
+      view.dispatch({
+        selection: { anchor: pos },
+        effects: EditorView.scrollIntoView(pos, { y: "center" }),
+      });
+    }
     view.focus?.();
     clearPendingReveal(workspaceId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -534,6 +670,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
     if (!view || !activeFile || activeFile.kind !== "text") return;
     if (activeFile.version === 0) return; // never reloaded
     if (view.state.doc.toString() === activeFile.content) return;
+    // The disk version replaces the buffer; unsynced keys go with it.
+    dropPendingSync();
     stateCache.current.delete(activeFile.path); // drop the stale doc
     view.setState(freshState(activeFile));
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -622,7 +760,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   // not an early return — an early return would unmount the host on the
   // null→active transition and the `[]` effect would never create the view.
   return (
-    <div className="octo-selectable flex min-h-0 flex-1 flex-col overflow-hidden">
+    <div data-tour="review-editor" className="octo-selectable flex min-h-0 flex-1 flex-col overflow-hidden">
       <div className="relative min-h-0 flex-1">
         <div
           ref={hostRef}
@@ -672,7 +810,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           selectionCount={pos.selections}
           lang={activeFile.lang}
           diskStale={activeFile.diskStale}
-          blameSavedNote={blameEnabled && activeFile.content !== activeFile.savedContent}
+          blameSavedNote={blameEnabled && isFileDirty(activeFile)}
         />
       )}
       {definitionPicker && (
@@ -703,6 +841,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           cancelLabel="Keep editing"
           onConfirm={() => {
             clearSaveConflict();
+            flushContent();
             saveActive(workspaceId, { force: true }).catch(console.error);
           }}
           onSecondary={() => {
