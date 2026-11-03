@@ -41,7 +41,7 @@ vi.mock("@codemirror/view", () => {
 vi.mock("@codemirror/state", () => {
   class CompartmentMock {
     of = vi.fn(() => ({}));
-    reconfigure = vi.fn(() => ({}));
+    reconfigure = vi.fn((ext: unknown) => ({ reconfigure: ext }));
   }
   return {
     EditorState: {
@@ -575,6 +575,27 @@ describe("EditorPane · search highlighting", () => {
     const lastCall = create.mock.calls.at(-1) as [{ extensions: unknown[] }] | undefined;
     expect(lastCall).toBeDefined();
     expect(lastCall![0].extensions).toContainEqual({ __searchMatchHighlight: true });
+  });
+});
+
+describe("EditorPane · language", () => {
+  /** Everything handed to a compartment's `reconfigure` on the live view. */
+  const reconfigured = () => {
+    const view = hoisted.lastView as unknown as { dispatch: ReturnType<typeof vi.fn> };
+    return view.dispatch.mock.calls
+      .flatMap(([spec]) => [(spec as { effects?: unknown }).effects ?? []].flat())
+      .map((e) => (e as { reconfigure?: unknown }).reconfigure)
+      .filter((x) => x !== undefined);
+  };
+
+  it("opens before its grammar has loaded, then installs it through the compartment", async () => {
+    // Python is loaded by no other case in this file: its grammar starts cold.
+    mockStore.activeLang = "python";
+    render(<EditorPane workspaceId="ws-active" workspacePath="/repo" diffText="" />);
+    expect(EditorState.create).toHaveBeenCalled();
+    const isPython = (x: unknown) => (x as { language?: { name?: string } })?.language?.name === "python";
+    expect(reconfigured().some(isPython)).toBe(false);
+    await waitFor(() => expect(reconfigured().some(isPython)).toBe(true));
   });
 });
 

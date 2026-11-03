@@ -1,7 +1,14 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll } from "vitest";
 import { highlightFile, highlightHunk, highlightLine, highlightLines, overlaySegments, rebuildSides, type DiffTok } from "./diffSyntax";
 import { parseFullDiff } from "./diffParser";
 import { langForExtension, type LangId } from "./editorLang";
+import { GRAMMAR_LANGS, loadLanguage } from "./editorLanguages";
+
+// Highlighting uses only grammars that have landed (editorLanguages.test.ts
+// covers the cold path); warm them all.
+beforeAll(async () => {
+  await Promise.all(GRAMMAR_LANGS.map(loadLanguage));
+});
 
 const clsOf = (toks: DiffTok[], text: string) => toks.find((t) => t.text.includes(text))?.cls;
 const joined = (toks: DiffTok[]) => toks.map((t) => t.text).join("");
@@ -176,7 +183,9 @@ const GO_DIFF = [
 describe("highlightFile: Go", () => {
   const [file] = parseFullDiff(GO_DIFF);
   const rows = file.hunks[0].rows;
-  const [toks] = highlightFile(file, GO);
+  // Inside the cases, not at collection: the grammar lands in beforeAll.
+  let toks: DiffTok[][] = [];
+  beforeAll(() => { [toks] = highlightFile(file, GO); });
   const row = (text: string) => toks[rows.findIndex((r) => r.text === text)];
 
   it("colours a hunk that opens inside a raw string as string", () => {
