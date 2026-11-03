@@ -43,6 +43,8 @@ const LANG_LABEL: Partial<Record<LangId, string>> = {
   plaintext: "Plain text",
   csharp: "C#",
   cpp: "C++",
+  php: "PHP",
+  scss: "SCSS",
 };
 
 function formatBytes(n: number): string {

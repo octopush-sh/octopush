@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import { langForExtension } from "../lib/editorLang";
+import { hasCppSources, langForExtension, type LangId } from "../lib/editorLang";
+import { getExtension } from "../lib/getExtension";
 import { pushToast } from "../components/Toasts";
 const LARGE_WARN_BYTES = 2 * 1024 * 1024;
 
@@ -52,6 +53,31 @@ export type LocationProvider = () => NavLocation | null;
 const NAV_HISTORY_CAP = 50;
 const EMPTY_NAV: NavHistory = { back: [], forward: [] };
 const locationProviders = new Map<string, LocationProvider>();
+
+/** Each workspace's root, as last passed to `openAsJump`. */
+const workspaceRoots = new Map<string, string>();
+/** Per root: does the workspace hold C++ sources? Listed once per session. */
+const cppHeadersByRoot = new Map<string, Promise<boolean>>();
+
+/** A `.h` file is C++ when its workspace has C++ sources, C otherwise. */
+async function headerLang(workspaceId: string, path: string): Promise<LangId> {
+  const root = workspaceRoots.get(workspaceId);
+  if (!root) return langForExtension(path);
+  let cppHeaders = cppHeadersByRoot.get(root);
+  if (!cppHeaders) {
+    cppHeaders = Promise.resolve()
+      .then(() => ipc.listWorkspaceFiles(root))
+      .then(hasCppSources, () => false);
+    cppHeadersByRoot.set(root, cppHeaders);
+  }
+  return langForExtension(path, { cppHeaders: await cppHeaders });
+}
+
+/** Tests: forget the remembered roots and listings. */
+export function resetHeaderLangCache(): void {
+  workspaceRoots.clear();
+  cppHeadersByRoot.clear();
+}
 
 /** A blocked save: the disk changed or vanished under the buffer. */
 export interface SaveConflict {
@@ -127,11 +153,13 @@ interface EditorStore {
   recordLocation: (workspaceId: string, from?: NavLocation) => void;
   /** `openFile` as a jump: the place it starts from (`from`, or where the
    *  reader is when it's called) joins the back trail once the file is open.
-   *  Resolves false when the open was declined (an oversized file). */
+   *  Resolves false when the open was declined (an oversized file). `root`,
+   *  the workspace's root, is remembered for the workspace: its file listing
+   *  decides whether a `.h` file opens as C or C++. */
   openAsJump: (
     workspaceId: string,
     path: string,
-    opts?: { confirm?: OpenConfirm; line?: number; col?: number; from?: NavLocation | null },
+    opts?: { confirm?: OpenConfirm; line?: number; col?: number; from?: NavLocation | null; root?: string },
   ) => Promise<boolean>;
   /** Return to the previous / next stop. False when the trail is empty. */
   navigateBack: (workspaceId: string) => Promise<boolean>;
@@ -295,10 +323,13 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       res = await ipc.readFileChecked(path, Number.MAX_SAFE_INTEGER);
     }
 
+    const lang = getExtension(path) === "h"
+      ? await headerLang(workspaceId, path)
+      : langForExtension(path);
     let newFile: OpenFile;
     if (res.kind === "binary" || res.kind === "unsupportedEncoding") {
       newFile = {
-        path, content: "", savedContent: "", lang: langForExtension(path),
+        path, content: "", savedContent: "", lang,
         kind: "binary",
         binaryReason: res.kind === "binary" ? "binary" : "unsupportedEncoding",
         mtime: res.mtime, size: res.size,
@@ -313,7 +344,7 @@ export const useEditorStore = create<EditorStore>((set, get) => {
       }
       newFile = {
         path, content: res.content, savedContent: res.content,
-        lang: langForExtension(path), kind: "text",
+        lang, kind: "text",
         mtime: res.mtime, size: res.size,
         version: 0, diskStale: false,
       };
@@ -425,7 +456,8 @@ export const useEditorStore = create<EditorStore>((set, get) => {
   },
 
   openAsJump: async (workspaceId, path, opts = {}) => {
-    const { confirm, line, col } = opts;
+    const { confirm, line, col, root } = opts;
+    if (root) workspaceRoots.set(workspaceId, root);
     // Taken now: the open may wait on the large-file confirm, and the
     // caller's own awaits (a workspace search) are already behind it.
     const origin =

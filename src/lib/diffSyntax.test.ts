@@ -21,6 +21,7 @@ const FIXTURES: Record<Exclude<LangId, "plaintext">, [path: string, line: string
   html: ["index.html", '<div class="a">hi</div>'],
   css: ["a.css", ".a { color: red; }"],
   sass: ["a.sass", "// a comment"],
+  scss: ["a.scss", "$gap: 4px;"],
   xml: ["a.xml", '<item id="1"/>'],
   yaml: ["ci.yml", "name: build"],
   shell: ["run.sh", 'if [ -f x ]; then echo "hi"; fi'],
@@ -40,6 +41,7 @@ const FIXTURES: Record<Exclude<LangId, "plaintext">, [path: string, line: string
   dart: ["a.dart", "void main() { var x = 1; }"],
   protobuf: ["a.proto", 'syntax = "proto3";'],
   lua: ["a.lua", "local x = 1"],
+  php: ["a.php", "<?php echo $x; ?>"],
 };
 
 describe("highlightLine", () => {
@@ -135,6 +137,80 @@ describe("highlightFile", () => {
   it("leaves plaintext files unclassed", () => {
     const [txt] = parseFullDiff(JAVA_DIFF.replace(/A\.java/g, "notes.txt"));
     expect(highlightFile(txt, null)[0].every((t) => t.length === 1 && t[0].cls === "")).toBe(true);
+  });
+});
+
+// A Go file whose hunk opens inside a raw string: only the full file says so.
+const GO = [
+  "package main",
+  "",
+  "const usage = `",
+  "func not code",
+  "`",
+  "",
+  "func main() {",
+  "\tn := 42",
+  "\tif n > 0 && true {",
+  '\t\tprintln("hi", nil)',
+  "\t}",
+  "}",
+  "",
+].join("\n");
+const GO_DIFF = [
+  "diff --git a/main.go b/main.go",
+  "--- a/main.go",
+  "+++ b/main.go",
+  "@@ -4,8 +4,8 @@ const usage = `",
+  " func not code",
+  " `",
+  " ",
+  " func main() {",
+  "-\tn := 41",
+  "+\tn := 42",
+  " \tif n > 0 && true {",
+  ' \t\tprintln("hi", nil)',
+  " \t}",
+  "",
+].join("\n");
+
+describe("highlightFile: Go", () => {
+  const [file] = parseFullDiff(GO_DIFF);
+  const rows = file.hunks[0].rows;
+  const [toks] = highlightFile(file, GO);
+  const row = (text: string) => toks[rows.findIndex((r) => r.text === text)];
+
+  it("colours a hunk that opens inside a raw string as string", () => {
+    expect(clsOf(row("func not code"), "func")).toBe("tok-str");
+  });
+  it("colours keywords, numbers, literals and strings from the Go tree", () => {
+    expect(clsOf(row("func main() {"), "func")).toBe("tok-kw");
+    expect(clsOf(row("\tn := 42"), "42")).toBe("tok-num");
+    expect(clsOf(row("\tn := 41"), "41")).toBe("tok-num");
+    expect(clsOf(row("\tif n > 0 && true {"), "if")).toBe("tok-kw");
+    expect(clsOf(row("\tif n > 0 && true {"), "true")).toBe("tok-kw");
+    expect(clsOf(row('\t\tprintln("hi", nil)'), '"hi"')).toBe("tok-str");
+    expect(clsOf(row('\t\tprintln("hi", nil)'), "nil")).toBe("tok-cmt");
+    expect(clsOf(row('\t\tprintln("hi", nil)'), "println")).toBe("tok-fn");
+  });
+  it("round-trips every row", () => {
+    toks.forEach((t, i) => expect(joined(t)).toBe(rows[i].text));
+  });
+});
+
+// Every tag the new grammars emit on a typical file maps to a diff class.
+describe("highlightLines: new grammars style what they emit", () => {
+  const SAMPLES: [LangId, string[], [text: string, cls: string][]][] = [
+    ["go", ["// c", "type T struct{ N int }"], [["// c", "tok-cmt"], ["type", "tok-kw"], ["int", "tok-type"]]],
+    ["cpp", ["#include <a.h>", "bool f() { return nullptr == 0; }"], [["#include", "tok-cmt"], ["bool", "tok-type"], ["return", "tok-kw"], ["nullptr", "tok-cmt"], ["0", "tok-num"]]],
+    ["c", ["/* c */ int x = 'a';"], [["/* c */", "tok-cmt"], ["int", "tok-type"]]],
+    ["sql", ["SELECT 'a', 1 FROM t; -- c"], [["SELECT", "tok-kw"], ["'a'", "tok-str"], ["1", "tok-num"], ["-- c", "tok-cmt"]]],
+    ["scss", ["@mixin m { .card { color: red; } }"], [["@mixin", "tok-kw"], ["card", "tok-type"], ["color", "tok-var"]]],
+    ["sass", ["@mixin m", "  color: red"], [["@mixin", "tok-kw"], ["color", "tok-var"]]],
+    ["php", ["<?php", "function f() { return 'a' . 1; }"], [["function", "tok-kw"], ["'a'", "tok-str"], ["1", "tok-num"]]],
+  ];
+  it.each(SAMPLES)("%s", (lang, lines, expected) => {
+    const toks = highlightLines(lines, lang).flat();
+    for (const [text, cls] of expected) expect(clsOf(toks, text), text).toBe(cls);
   });
 });
 

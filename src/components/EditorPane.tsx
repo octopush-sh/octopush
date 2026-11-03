@@ -344,7 +344,7 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         : `${workspacePath}/${relativePath}`;
       let opened: boolean;
       try {
-        opened = await openAsJump(workspaceId, absolute, { line, from });
+        opened = await openAsJump(workspaceId, absolute, { line, from, root: workspacePath });
       } catch (e) {
         pushToast({ level: "error", title: "Could not open file", body: String(e) });
         return;
@@ -398,7 +398,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
       // Skip the occurrence that was clicked: standing on a use of `foo` must
       // not "jump" to that same use and look like nothing happened.
       const elsewhere = sites.filter((d) => d.from !== req.from);
-      // Go's `x := …` declares by definition, and Go has no tree to say so.
+      // Go's `x := …` declares by definition, even where the tree hasn't
+      // parsed that far to say so.
       const shortVarDecl = (site: { to: number }) =>
         lang === "go" && /^\s*:=/.test(doc.slice(site.to, site.to + 16));
       // A lone candidate that is only a bare `foo = …` binding (and that no

@@ -1305,7 +1305,7 @@ function App() {
       if (view === "editor") {
         // ⌘P, search results and every other open land on the back trail.
         openFileAsJump(activeWorkspace.id, absolute, {
-          confirm: confirmLargeFile, line: line ?? undefined, col,
+          confirm: confirmLargeFile, line: line ?? undefined, col, root: rootPath,
         }).catch((e) =>
           pushToast({
             level: "error",

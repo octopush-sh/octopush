@@ -21,6 +21,7 @@ export type LangId =
   | "html"
   | "css"
   | "sass"
+  | "scss"
   | "xml"
   | "yaml"
   | "shell"
@@ -40,12 +41,25 @@ export type LangId =
   | "dart"
   | "protobuf"
   | "lua"
+  | "php"
   | "plaintext";
 
 /** The JavaScript/TypeScript dialects: one grammar, four configurations. */
 export const JS_DIALECTS: ReadonlySet<string> = new Set<LangId>(["javascript", "jsx", "typescript", "tsx"]);
 
-export function langForExtension(path: string): LangId {
+/** Sources that make a workspace's `.h` files C++ headers. */
+const CPP_SOURCE = /\.(cpp|cc|cxx|hpp|hh)$/i;
+
+/** Does a workspace file listing hold C++ sources? Then its `.h` files are C++. */
+export function hasCppSources(files: readonly string[]): boolean {
+  return files.some((f) => CPP_SOURCE.test(f));
+}
+
+/**
+ * `cppHeaders`: the file's workspace holds C++ sources (`hasCppSources`), so
+ * a `.h` file is a C++ header. Without it `.h` is C.
+ */
+export function langForExtension(path: string, opts: { cppHeaders?: boolean } = {}): LangId {
   // Extension-less files known by name.
   const base = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
   if (base === "dockerfile" || base.startsWith("dockerfile.")) return "dockerfile";
@@ -88,8 +102,9 @@ export function langForExtension(path: string): LangId {
     case "svelte":
       return "html";
     case "css":
-    case "scss":
       return "css";
+    case "scss":
+      return "scss";
     case "sass":
       return "sass";
     case "xml":
@@ -121,8 +136,9 @@ export function langForExtension(path: string): LangId {
     case "swift":
       return "swift";
     case "c":
-    case "h":
       return "c";
+    case "h":
+      return opts.cppHeaders ? "cpp" : "c";
     case "cpp":
     case "cc":
     case "cxx":
@@ -146,6 +162,8 @@ export function langForExtension(path: string): LangId {
       return "protobuf";
     case "lua":
       return "lua";
+    case "php":
+      return "php";
     default:
       return "plaintext";
   }
