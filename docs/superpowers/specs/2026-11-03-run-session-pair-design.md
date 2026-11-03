@@ -37,7 +37,7 @@ Run's view is an ordered list of **slots**: `slots: (terminalId | null)[]`, leng
 - `orientation` (`"auto" | "side" | "stacked"`) applies to two and three panes. Four panes are always a 2×2 grid.
 - With `auto`, the view is side by side when every column of panes is at least 72 columns wide. Columns are counted at the current font size, using the narrowest pane in the row. Otherwise the view stacks.
 - *Stack* / *Side by side* in the caption menu sets the override per workspace. It applies to both two and three panes until the user picks *Automatic* again.
-- At 4 panes below 72 columns, the 2×2 grid stays. The user can maximize a pane or leave the view; the 72-column rule is not applied at 4.
+- At 4 panes below 72 columns, the 2×2 grid stays. The user can leave a pane to get room back; the 72-column rule is not applied at 4.
 
 **Dividers.**
 - `ratios` holds one fraction per divider:
@@ -55,7 +55,7 @@ Run's view is an ordered list of **slots**: `slots: (terminalId | null)[]`, leng
 **Open beside** (`⌘D`, the flyout item, or `⌥⏎` in `⌘⌥K`) opens the switcher in pairing mode. Its serif placeholder reads *Which session sits beside this one?*. The list leaves out sessions already on screen. Its last row is *Open a new session beside*.
 
 - **Picking a session** puts it in the first empty seat if there is one. Otherwise it goes in a new slot appended at the end.
-- **With four panes**, there is no new slot. The list's header line reads *Replaces the session in the focused pane*, and picking a session replaces it. The flyout item then reads **Replace in the focused pane**.
+- **With four panes and no empty seat**, there is no new slot. The list's header line reads *Replaces the session in the focused pane*, and picking a session replaces it. The flyout item then reads **Replace in the focused pane**.
 - **If every session is already on screen**, Open beside appends an **empty seat**:
   - eyebrow `BESIDE`;
   - serif line *Bring a session alongside.*;
@@ -95,10 +95,10 @@ The daemon has one client and one size per session, so this invariant must never
 - `aria-selected` is true only on the focused session's cell. Shown cells add `aria-current="true"`.
 
 **Companion.**
-- While Run has more than one pane, the Companion folds to its 56px strip. The strip's tooltip reads *Folded to make room for the panes · ⌘\\*.
+- While Run has more than one pane, the Companion folds to its 56px strip. The strip's tooltip reads *Folded to make room for the panes · ⌘\*.
 - `⌘\` while folded brings the Companion back **over** the panes, without resizing them, and keeps it there until the next fold.
 - Returning to one pane restores the user's latest explicit Companion choice. If they toggled it while paired, that toggle wins.
-- Talk's seat folds the Companion the same way. The context meter stays on the folded strip.
+- Talk's seat folds the Companion the same way. Its context meter comes back with `⌘\`.
 
 **Talk.**
 - A `SquareTerminal` icon in the Talk canvas toggles one seat beside the chat column. Its tooltip reads *Open a terminal beside the conversation · ⌘D*. Picking the session uses the same pairing switcher.
@@ -133,6 +133,7 @@ The daemon has one client and one size per session, so this invariant must never
   - `terminalLayoutStore`'s Run `focused` slot is authoritative.
   - `activeByWs` is derived from it.
   - Every existing writer — `createTerminal`, `trackSetup`, the refresh fallback and `deleteTerminal` — goes through one `setActive(id)`. If the session is on screen, `setActive` focuses its pane. Otherwise it puts the session in the focused pane.
+  - **New sessions take a target.** `createTerminal` accepts an optional target slot. *Open a new session beside* and *Open a new session here* create the session straight into the new slot or the empty seat, never into the focused pane. A setup terminal (`trackSetup`) never replaces a session that is on screen: with more than one pane open, it starts unseated and its rail cell is marked as usual.
 - **`TerminalPane`.** The single `visible` prop becomes two, `shown` and `focused`.
   - Only the focused pane takes keyboard focus and OSC 52 clipboard writes.
   - Bell and attention pings are suppressed for any pane that is shown.
@@ -156,7 +157,7 @@ Every PR with a user-visible change updates FEATURES.md and Appendix C, and adds
 |---|---|
 | 1 | `terminalLayoutStore` (in memory) with reducers and tests; the single `setActive` path; `TerminalPane` `shown`/`focused`; fit suspension. No visible change. |
 | 2 | `TerminalHost`, the slot registry and following the crossfade. Behaviour matches one pane exactly; no visible change. |
-| 3a | Two panes in Run: the split, divider, captions, focus by click and `⌘[`/`⌘]`, rail markers, and the Companion fold. *Swap with…* and *Leave the view*. Opened from the flyout item. |
+| 3a | Two panes in Run: the split, divider, captions, focus by click and `⌘[`/`⌘]`, rail markers, and the Companion fold. *Swap with…* and *Leave the view*. In 3a the flyout item **Open beside** seats the most recently used session that is not on screen; 3b switches it to the pairing switcher. |
 | 3b | The pairing switcher (`⌘D`, `⌥⏎` in `⌘⌥K`), empty seats, deleting a session that is on screen. |
 | 4 | Three and four panes: slot positions, orientation `auto`/override, ratios, the 2×2 cross. |
 | 5 | The Talk seat; persistence and pruning for Run and Talk; `RunEmptyState` copy ("You can keep several sessions open, switch from the rail, or open them side by side."). |
