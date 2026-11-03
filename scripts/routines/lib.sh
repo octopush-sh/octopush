@@ -35,13 +35,20 @@ days_ago_iso() { node -e "console.log(new Date(Date.now()-$1*864e5).toISOString(
 # run id, or nothing.
 ci_starved_run_for() {
   local id
+  # The run ci_status_for reports (same selection), and only if it failed:
+  # never an older failed run behind a newer green or running one.
   id="$(gh api "repos/$1/actions/runs?head_sha=$2&per_page=50" --jq '
-    [.workflow_runs[] | select(.name == "CI" and .status == "completed" and .conclusion == "failure")]
-    | sort_by(.created_at) | last | .id // empty')" || return 1
+    [.workflow_runs[] | select(.name == "CI")
+      | select(.status != "waiting")
+      | select((.status == "completed" and ((.conclusion // "") | IN("action_required", "cancelled", "skipped", "stale", "neutral"))) | not)]
+    | sort_by(.created_at) | last
+    | if . != null and .status == "completed" and .conclusion == "failure" then .id else empty end')" || return 1
   [[ -n "$id" ]] || return 0
+  # Starved = cancelled before any step ran. A job that hit its timeout is also
+  # "cancelled", but it ran steps: that is a real result, never re-run.
   gh api "repos/$1/actions/runs/$id/jobs?per_page=100" --jq '
     [.jobs[] | select((.conclusion // "") | IN("success", "skipped") | not)] as $bad
-    | if ($bad | length) > 0 and all($bad[]; .conclusion == "cancelled") then "'"$id"'" else empty end'
+    | if ($bad | length) > 0 and all($bad[]; .conclusion == "cancelled" and ((.steps // []) | length) == 0) then "'"$id"'" else empty end'
 }
 
 # success | pending | failure | none — latest "CI" workflow run for a commit.

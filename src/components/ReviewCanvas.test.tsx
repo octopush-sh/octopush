@@ -34,6 +34,8 @@ vi.mock("../lib/ipc", () => ({
     detectDefaultTestCommand: vi.fn(),
     getGitStatus: vi.fn(),
     getGitDiff: vi.fn(),
+    // The diff reads each file for in-context highlighting; none on disk here.
+    readFileChecked: vi.fn(() => Promise.resolve({ kind: "binary", size: 0, mtime: 0 })),
   },
 }));
 

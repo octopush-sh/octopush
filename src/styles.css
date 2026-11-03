@@ -195,7 +195,7 @@
   font-synthesis: none;
 }
 
-/* ── Diff syntax token classes — used by diffHighlight.ts ───────
+/* ── Diff syntax token classes — used by diffSyntax.ts ──────────
    Colors mirror the atelierTheme palette via design tokens.
    class-only approach keeps inline-style out of diff DOM nodes.   */
 .tok-kw   { color: var(--color-octo-brass); }
