@@ -108,7 +108,7 @@ describe("ModelsPane — model editing", () => {
     await renderModelsPane();
 
     // Open the add-model dialog.
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /bring in another model/i })); });
 
     const dialog = modelDialog();
     const idInput = within(dialog).getByPlaceholderText(/model id/i);
@@ -136,12 +136,23 @@ describe("ModelsPane — model editing", () => {
   it("blocks a model with an empty id", async () => {
     await renderModelsPane();
 
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /bring in another model/i })); });
 
     const dialog = modelDialog();
     await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /^add model$/i })); });
 
     expect(within(dialog).getByText(/model id is required/i)).toBeInTheDocument();
+  });
+
+  it("words its add CTAs as serif phrases with no plus glyph", async () => {
+    await renderModelsPane();
+    for (const name of [/bring in another model/i, /connect another provider/i]) {
+      const btn = screen.getByRole("button", { name });
+      expect(btn).toHaveClass("font-serif");
+      expect(btn.querySelector("svg")).toBeNull();
+      expect(btn.textContent).not.toMatch(/\+|^add\b/i);
+    }
+    expect(screen.queryByRole("button", { name: /^add a (model|provider)$/i })).not.toBeInTheDocument();
   });
 
   it("does not show an unsaved bar until something changes", async () => {
@@ -152,7 +163,7 @@ describe("ModelsPane — model editing", () => {
   it("rejects a model whose id duplicates an existing one", async () => {
     await renderModelsPane();
 
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a model/i })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /bring in another model/i })); });
     const dialog = modelDialog();
     await act(async () => {
       fireEvent.change(within(dialog).getByPlaceholderText(/model id/i), {
@@ -202,7 +213,7 @@ describe("ModelsPane — custom provider management", () => {
     await renderModelsPane();
 
     // Open the add-provider wizard.
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a provider/i })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /connect another provider/i })); });
 
     const dialog = screen.getByRole("dialog", { name: /add a provider/i });
     await act(async () => {
@@ -219,7 +230,7 @@ describe("ModelsPane — custom provider management", () => {
   it("shows an error when adding a provider with empty name", async () => {
     await renderModelsPane();
 
-    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /add a provider/i })); });
+    await act(async () => { fireEvent.click(screen.getByRole("button", { name: /connect another provider/i })); });
     const dialog = screen.getByRole("dialog", { name: /add a provider/i });
     // Click Continue with no name.
     await act(async () => { fireEvent.click(within(dialog).getByRole("button", { name: /continue/i })); });

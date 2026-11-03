@@ -4,7 +4,7 @@
 // diverges from what's on disk. Backend contract is unchanged: saveProviders
 // validates server-side, then keys/base-URLs merge into settings.json.
 import { useEffect, useMemo, useState } from "react";
-import { Pencil, X, RefreshCw, Plus } from "lucide-react";
+import { Pencil, X, RefreshCw } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import { useProvidersStore } from "../../stores/providersStore";
 import type { ModelInfo, ProviderConfig } from "../../lib/types";
@@ -214,11 +214,12 @@ export function ModelsPane() {
 
           <button
             type="button"
+            data-tour="settings-models-add-provider"
             onClick={() => setShowAddProvider(true)}
-            className="mt-2 flex items-center gap-2 rounded-md px-3 py-2 font-serif text-[13px] text-octo-brass transition"
+            className="mt-2 flex items-center rounded-md px-3 py-2 font-serif text-[13px] text-octo-brass transition"
             style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
           >
-            <Plus size={13} /> Add a provider
+            Connect another provider
           </button>
 
           {/* Pricing — quiet footer */}
@@ -495,12 +496,12 @@ function ProviderDetail({
           </div>
           <button
             type="button"
+            data-tour="settings-models-add-model"
             onClick={onAddModel}
-            className="flex items-center gap-1.5 rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition"
+            className="flex items-center rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition"
             style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
-            aria-label="Add a model"
           >
-            <Plus size={12} /> Add a model
+            Bring in another model
           </button>
         </div>
 

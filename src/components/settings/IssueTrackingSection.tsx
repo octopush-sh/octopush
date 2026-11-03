@@ -284,12 +284,12 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
                   type="button"
                   onClick={() => void saveMapping(p.id)}
                   disabled={mapSaving[p.id]}
-                  aria-label={`Save link for ${p.name}`}
+                  aria-label={`Save the link for ${p.name}`}
                   className="inline-flex min-w-[88px] items-center justify-center gap-1.5 rounded-md px-3 py-2 font-serif text-[12px] text-octo-brass transition-colors disabled:opacity-50"
                   style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
                 >
                   {mapSaved[p.id] ? <Check size={12} /> : null}
-                  {mapSaved[p.id] ? "Saved" : mapSaving[p.id] ? "Saving…" : "Save"}
+                  {mapSaved[p.id] ? "Saved" : mapSaving[p.id] ? "Saving…" : "Save the link"}
                 </button>
               </div>
             ))}
