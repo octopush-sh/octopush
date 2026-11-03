@@ -193,8 +193,19 @@ export const useEditorStore = create<EditorStore>((set, get) => {
         : { back: nextTo, forward: nextFrom },
     );
 
-    await get().openFile(workspaceId, target.path);
-    // The file may have been deleted or declined since; the stop is spent.
+    // The file may have been deleted, moved or declined since; the stop is
+    // spent either way. A failed read rejects, so say which file is gone.
+    try {
+      await get().openFile(workspaceId, target.path);
+    } catch {
+      pushToast({
+        level: "info",
+        title: "Couldn't reopen file",
+        body: `${fileName(target.path)} was moved or deleted.`,
+        timeout: 4000,
+      });
+      return false;
+    }
     if (!findFile(workspaceId, target.path)) return false;
     const { path, ...restore } = target;
     set((s) => ({

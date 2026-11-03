@@ -640,6 +640,23 @@ describe("editorStore — back/forward trail", () => {
     expect(land()?.restore).toMatchObject({ anchor: 3, head: 7 });
   });
 
+  it("a stop whose file was deleted since says so and is spent", async () => {
+    jump({ path: "/b.ts", anchor: 1, head: 1 });
+    useEditorStore.getState().closeFile("ws", "/a.ts");
+    readFileChecked.mockRejectedValueOnce(new Error("No such file"));
+
+    expect(await useEditorStore.getState().navigateBack("ws")).toBe(false);
+    expect(pushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "info", body: expect.stringContaining("a.ts") }),
+    );
+    expect(useEditorStore.getState().getPendingReveal("ws")).toBeNull();
+    // Spent: Back doesn't retry the dead stop, and Forward returns to where we were.
+    expect(useEditorStore.getState().navByWs.ws.back).toHaveLength(0);
+    expect(useEditorStore.getState().navByWs.ws.forward).toEqual([
+      { path: "/b.ts", anchor: 1, head: 1 },
+    ]);
+  });
+
   it("records nothing while no text file is showing", () => {
     here = null;
     useEditorStore.getState().recordLocation("ws");
