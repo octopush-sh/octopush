@@ -560,6 +560,21 @@ mod effort {
     }
 
     #[test]
+    fn haiku_5_5_takes_the_effort_path_up_to_max() {
+        // platform.claude.com/docs/en/build-with-claude/effort (2026-11-04):
+        // "Claude Haiku 5.5 supports all five effort levels".
+        let (thinking, output_config) = thinking_json("claude-haiku-5-5", Some(Effort::Low), 32768);
+        assert_eq!(thinking, Some(json!({ "type": "adaptive" })));
+        assert_eq!(output_config, Some(json!({ "effort": "low" })));
+        let (_t, oc) = thinking_json("claude-haiku-5-5", Some(Effort::Xhigh), 64000);
+        assert_eq!(oc, Some(json!({ "effort": "xhigh" })));
+        // Haiku 4.5 keeps the budget path.
+        let (t45, oc45) = thinking_json("claude-haiku-4-5", Some(Effort::Medium), 32768);
+        assert_eq!(t45, Some(json!({ "type": "enabled", "budget_tokens": 8192 })));
+        assert_eq!(oc45, None);
+    }
+
+    #[test]
     fn low_effort_on_a_budget_model_means_no_thinking() {
         // The fast tier's sub-agents run `low` on Haiku: that must not turn
         // on a thinking budget the model never had.
