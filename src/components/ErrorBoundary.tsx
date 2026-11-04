@@ -27,6 +27,9 @@ interface Props {
   /** `panel` only: render the fallback as a single icon button, for chrome
    *  too narrow for a card (the collapsed Companion). */
   compact?: boolean;
+  /** `panel` only: the fallback takes the pointer itself, for a boundary
+   *  inside a pointer-transparent layer (`TerminalHost`). */
+  interactive?: boolean;
   children: ReactNode;
 }
 
@@ -72,7 +75,7 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     const { error, componentStack } = this.state;
     if (!error) return this.props.children;
-    const { surface, variant = "panel", compact } = this.props;
+    const { surface, variant = "panel", compact, interactive } = this.props;
     const details = () => formatErrorDetails(surface, error, componentStack);
     if (variant === "root") return <RootErrorScreen details={details} />;
     if (variant === "overlay") {
@@ -101,7 +104,10 @@ export class ErrorBoundary extends Component<Props, State> {
       );
     }
     return (
-      <div className="flex h-full w-full min-w-0 flex-col items-center justify-center overflow-hidden px-8 py-6 text-center octo-fade-in">
+      <div
+        className="flex h-full w-full min-w-0 flex-col items-center justify-center overflow-hidden px-8 py-6 text-center octo-fade-in"
+        style={interactive ? { pointerEvents: "auto" } : undefined}
+      >
         <PanelErrorBody surface={surface} details={details} onRetry={this.reset} />
       </div>
     );

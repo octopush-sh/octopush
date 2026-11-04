@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ModeOverlay } from "./ModeOverlay";
+import { ErrorBoundary } from "./ErrorBoundary";
 import { placements, useTerminalSlotsStore, type SlotMode } from "../stores/terminalSlotsStore";
 
 interface Props {
@@ -19,6 +20,11 @@ interface Props {
  * `display:none`. Frames are keyed by session and never re-parented, so a
  * pane never remounts. The layer fades with the same transition as the mode
  * overlays, so a terminal never appears abruptly.
+ *
+ * The Run error boundary sits inside the layer, so its card fades with the
+ * layer and shows only in a terminal mode; the card takes the pointer itself
+ * so Try again stays clickable. Try again remounts the panes, which reattach
+ * to their PTYs in the daemon.
  */
 export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
   const ref = useRef<HTMLDivElement>(null);
@@ -49,6 +55,7 @@ export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
   return (
     <ModeOverlay active={mode !== null} passThrough>
       <div ref={ref} data-testid="terminal-host" className="contents">
+        <ErrorBoundary surface="Run" interactive>
         {terminalIds.map((id) => {
           const rect = placed[id];
           return (
@@ -72,6 +79,7 @@ export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
             </div>
           );
         })}
+        </ErrorBoundary>
       </div>
     </ModeOverlay>
   );

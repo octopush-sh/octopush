@@ -2213,10 +2213,10 @@ function App() {
               {/* Every TerminalPane, for ALL (workspace, terminal) pairs, mounted
                   unconditionally and drawn over its slot in the active mode.
                   Never gated by activeWorkspace, so PTYs and scrollback
-                  survive project switches and new-project creation. A crash
-                  here unmounts the panes, but their PTYs live in the daemon
-                  and reattach when Try again remounts them. */}
-              <ErrorBoundary surface="Run">
+                  survive project switches and new-project creation. The host
+                  holds its own Run error boundary: a crash there unmounts the
+                  panes, but their PTYs live in the daemon and reattach when
+                  Try again remounts them. */}
                 <TerminalHost
                   mode={activeWorkspace && activeMode === "run" ? "run" : null}
                   terminalIds={allTerminalIds}
@@ -2246,7 +2246,6 @@ function App() {
                     );
                   }}
                 />
-              </ErrorBoundary>
             </div>
           </CanvasSplit>
 

@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import { useEffect } from "react";
 import { TerminalHost } from "./TerminalHost";
 import { TerminalSlot } from "./TerminalSlot";
@@ -89,6 +89,36 @@ describe("TerminalHost", () => {
     rerender(<Canvas mode={null} runId="A" />);
     expect(layer.style.opacity).toBe("0");
     expect(layer.style.visibility).toBe("hidden");
+  });
+
+  it("shows a crashed pane's error card inside the layer, clickable only in Run", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const crash = { on: true };
+    function Bomb({ id, shown }: { id: string; shown: boolean }) {
+      if (crash.on) throw new Error("pane blew up");
+      return <Pane id={id} shown={shown} />;
+    }
+    const host = (mode: SlotMode | null) => (
+      <div>
+        <TerminalSlot mode="run" terminalId="A" />
+        <TerminalHost mode={mode} terminalIds={["A"]} renderPane={(id, shown) => <Bomb id={id} shown={shown} />} />
+      </div>
+    );
+    const { rerender } = render(host(null));
+    const layer = screen.getByTestId("terminal-host").parentElement as HTMLElement;
+    const card = screen.getByTestId("panel-error-card");
+    expect(layer.contains(card)).toBe(true);
+    // Outside Run the card is hidden with the layer.
+    expect(layer.style.visibility).toBe("hidden");
+    rerender(host("run"));
+    expect(layer.style.visibility).toBe("visible");
+    expect(layer.style.pointerEvents).toBe("none");
+    // The fallback opts back into the pointer, so Try again can be clicked.
+    expect((card.parentElement as HTMLElement).style.pointerEvents).toBe("auto");
+    crash.on = false;
+    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    expect(screen.queryByTestId("panel-error-card")).toBeNull();
+    expect(screen.getByTestId("pane-A").dataset.shown).toBe("true");
   });
 
   it("withdraws a slot that unmounts or empties", () => {
