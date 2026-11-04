@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import {
+  leaveView,
   EMPTY_RUN_LAYOUT,
   assign,
   besideAction,
@@ -106,6 +107,15 @@ describe("terminalLayout reducers", () => {
     expect(one.slots).toEqual(["B"]);
     expect(one.ratios).toEqual([]);
     expect(leave(layout(["A"]), 0).slots).toEqual([null]);
+  });
+
+  it("leaveView beside only empty seats keeps the session on screen and drops the seats", () => {
+    const next = leaveView(layout(["A", null], 0), 0);
+    expect(next.slots).toEqual(["A"]);
+    expect(focusedId(next)).toBe("A");
+    // Otherwise it is plain leave.
+    expect(leaveView(layout(["A", "B"], 0), 0).slots).toEqual(["B"]);
+    expect(leaveView(layout(["A", null], 0), 1).slots).toEqual(["A"]);
   });
 
   it("swap exchanges two slots and focus follows its session", () => {

@@ -139,6 +139,19 @@ export function leave(layout: RunLayout, slot: number): RunLayout {
   return withSlots(layout, slots, focused);
 }
 
+/**
+ * The user leaving a pane (`×`, *Leave the view*). Like `leave`, except that
+ * leaving a session beside nothing but empty seats drops the seats instead:
+ * the view returns to one pane showing that session, never to a blank Run
+ * while the session still exists. (`prune` keeps using `leave`.)
+ */
+export function leaveView(layout: RunLayout, slot: number): RunLayout {
+  const id = layout.slots[slot];
+  const next = leave(layout, slot);
+  if (id != null && next.slots.every((s) => s === null)) return withSlots(layout, [id], 0);
+  return next;
+}
+
 /** Swap two slots' sessions. Focus stays with the session that had it. */
 export function swap(layout: RunLayout, a: number, b: number): RunLayout {
   const n = layout.slots.length;

@@ -4,7 +4,7 @@ import { useTerminalsStore } from "../../stores/terminalsStore";
 import {
   evenRatios,
   focus,
-  leave,
+  leaveView,
   setRatios,
   swap,
   useTerminalLayoutStore,
@@ -139,7 +139,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
                 .filter((o) => o.slot !== i && o.id !== null)}
               onFocus={() => updateLayout(workspaceId, (l) => focus(l, i))}
               onSwap={(j) => updateLayout(workspaceId, (l) => swap(l, i, j))}
-              onLeave={() => updateLayout(workspaceId, (l) => leave(l, i))}
+              onLeave={() => updateLayout(workspaceId, (l) => leaveView(l, i))}
             />
             <div className="relative min-h-0 flex-1">
               {id === null ? (
@@ -242,7 +242,7 @@ function PaneCaption({
               focused ? "border-octo-border-strong text-octo-ivory" : "border-transparent text-octo-mute"
             }`}
           >
-            <Icon size={13} strokeWidth={1.75} aria-hidden className="shrink-0" />
+            {session && <Icon size={13} strokeWidth={1.75} aria-hidden className="shrink-0" />}
             <span className="min-w-0 truncate">{session?.label}</span>
           </span>
         </FadeSwap>

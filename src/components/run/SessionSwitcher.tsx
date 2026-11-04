@@ -44,6 +44,10 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
   // With no room left, a beside pick (⏎ when pairing, ⌥⏎ when switching)
   // replaces the focused pane's session.
   const replaces = !!layout && besideReplaces(layout, RUN_PANES);
+  const full = replaces;
+  // A new session never lands in the focused pane from here (spec): when Run
+  // is full, pairing mode drops the "Open a new session beside" row.
+  const showNew = !(pairing && full);
   const terminals = useMemo(
     () =>
       pairing
@@ -73,13 +77,13 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
 
   // The "open a new session" row sits one past the matches, so the selection
   // range is [0, matches.length].
-  const maxSel = matches.length;
-  const selected = Math.min(sel, maxSel);
+  const maxSel = showNew ? matches.length : matches.length - 1;
+  const selected = Math.max(0, Math.min(sel, maxSel));
 
   /** Open row `index`: beside the panes, or (switching) in the focused one. */
   const choose = (index: number, beside = pairing) => {
-    if (index === maxSel) {
-      (beside ? createBeside(workspaceId) : createTerminal(workspaceId)).catch(console.error);
+    if (showNew && index === matches.length) {
+      (beside && !full ? createBeside(workspaceId) : createTerminal(workspaceId)).catch(console.error);
       onClose();
       return;
     }
@@ -209,6 +213,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
             );
           })}
 
+          {showNew && (
           <button
             type="button"
             role="option"
@@ -229,6 +234,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
               {pairing ? "Open a new session beside" : "Open a new session"}
             </span>
           </button>
+          )}
         </div>
 
         {/* The app's canonical key-hint voice: mono caps, `ESC · CLOSE`. */}
