@@ -296,13 +296,32 @@ describe("atelier syntax inks", () => {
   });
 });
 
+// The Vellum palette the app renders with (mirrors theme.rs's palette;
+// see the "vellum, the light theme" gate below).
+const VELLUM = {
+  bg: "#f2ece0",
+  panel: "#faf6ec",
+  panel2: "#ece4d4",
+  borderStrong: "#8a7a5f",
+  inks: {
+    text: "#2a201a",
+    textDim: "#6d5e4b",
+    textMuted: "#6f5f4a",
+    accent: "#91522c",
+    accentDim: "#6d3710",
+    success: "#246f47",
+    warning: "#7f5300",
+    danger: "#b33024",
+  },
+};
+
 describe("word-diff spans", () => {
   // A changed word sits on its fill (WORD_DIFF_*_ALPHA), over the row's tint
   // (solved to DIFF_TINT_TARGET), over the ground — the stack themeStore and
   // styles.css build.
   const GROUNDS = [
     { name: "atelier", bg: tokens.onyx, add: tokens.verdigris, del: tokens.rouge, text: tokens.ivory },
-    { name: "vellum", bg: "#f2ece0", add: vellumInks.verdigris, del: "#b33024", text: "#2a201a" },
+    { name: "vellum", bg: VELLUM.bg, add: vellumInks.verdigris, del: VELLUM.inks.danger, text: VELLUM.inks.text },
   ];
   const fillOf = (bg: string, ink: string, alpha: number) => {
     const row = composite(hexToRgb(ink)!, solveTintAlpha(ink, bg, DIFF_TINT_TARGET)!, hexToRgb(bg)!);
@@ -319,7 +338,7 @@ describe("word-diff spans", () => {
   });
 
   it("shows why they own their ink: a function name (tok-fn) on Vellum's added fill fails AA", () => {
-    const add = fillOf("#f2ece0", vellumInks.verdigris, WORD_DIFF_ADD_ALPHA);
+    const add = fillOf(VELLUM.bg, vellumInks.verdigris, WORD_DIFF_ADD_ALPHA);
     expect(contrastRatio(hexToRgb(vellumInks.verdigris)!, add)).toBeLessThan(4.5);
   });
 
@@ -340,22 +359,6 @@ describe("vellum, the light theme", () => {
   // The frontend mirror of theme.rs's `vellum_clears_wcag_aa_on_every_surface`.
   // Kept on both sides on purpose: the Rust gate guards the palette source, and
   // this one guards the values the app actually renders with.
-  const VELLUM = {
-    bg: "#f2ece0",
-    panel: "#faf6ec",
-    panel2: "#ece4d4",
-    borderStrong: "#8a7a5f",
-    inks: {
-      text: "#2a201a",
-      textDim: "#6d5e4b",
-      textMuted: "#6f5f4a",
-      accent: "#91522c",
-      accentDim: "#6d3710",
-      success: "#246f47",
-      warning: "#7f5300",
-      danger: "#b33024",
-    },
-  };
 
   const worst = (ink: string) =>
     Math.min(
