@@ -27,6 +27,10 @@ interface Props {
   /** `panel` only: render the fallback as a single icon button, for chrome
    *  too narrow for a card (the collapsed Companion). */
   compact?: boolean;
+  /** `panel` only: the card takes the pointer itself, for a boundary inside
+   *  a pointer-transparent layer (`TerminalHost`). The full-size fallback
+   *  around it stays transparent, so what shows through stays clickable. */
+  interactive?: boolean;
   children: ReactNode;
 }
 
@@ -72,7 +76,7 @@ export class ErrorBoundary extends Component<Props, State> {
   render() {
     const { error, componentStack } = this.state;
     if (!error) return this.props.children;
-    const { surface, variant = "panel", compact } = this.props;
+    const { surface, variant = "panel", compact, interactive } = this.props;
     const details = () => formatErrorDetails(surface, error, componentStack);
     if (variant === "root") return <RootErrorScreen details={details} />;
     if (variant === "overlay") {
@@ -102,7 +106,7 @@ export class ErrorBoundary extends Component<Props, State> {
     }
     return (
       <div className="flex h-full w-full min-w-0 flex-col items-center justify-center overflow-hidden px-8 py-6 text-center octo-fade-in">
-        <PanelErrorBody surface={surface} details={details} onRetry={this.reset} />
+        <PanelErrorBody surface={surface} details={details} onRetry={this.reset} interactive={interactive} />
       </div>
     );
   }
@@ -129,14 +133,21 @@ function PanelErrorBody({
   details,
   onRetry,
   onClose,
+  interactive,
 }: {
   surface: string;
   details: () => string;
   onRetry: () => void;
   onClose?: () => void;
+  interactive?: boolean;
 }) {
   return (
-    <div role="alert" data-testid="panel-error-card" className="flex flex-col items-center gap-3 text-center">
+    <div
+      role="alert"
+      data-testid="panel-error-card"
+      className="flex flex-col items-center gap-3 text-center"
+      style={interactive ? { pointerEvents: "auto" } : undefined}
+    >
       <div className="font-mono text-[10px] uppercase tracking-[0.3em] text-octo-rouge">{surface}</div>
       <div className="font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory">
         This panel hit an error.
