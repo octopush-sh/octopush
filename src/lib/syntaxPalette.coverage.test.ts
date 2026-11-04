@@ -84,11 +84,34 @@ describe("syntax palette tag coverage", () => {
 });
 
 /** The class the diff gives the first token whose text includes `needle` on
- *  any line of `doc`. */
+ *  any line of `doc`. A rule nested in an inherited one repeats its class
+ *  (`tok-meta tok-meta`), so repeats are folded: a token that still carries
+ *  two different classes fails the spot checks below, since one of them would
+ *  win by stylesheet order alone. */
 async function classOf(lang: LangId, doc: string, needle: string): Promise<string | undefined> {
   await loadLanguage(lang);
-  return highlightLines(doc.split("\n"), lang).flat().find((t) => t.text.includes(needle))?.cls;
+  const cls = highlightLines(doc.split("\n"), lang).flat().find((t) => t.text.includes(needle))?.cls;
+  return cls === undefined ? undefined : [...new Set(cls.split(" "))].join(" ");
 }
+
+describe("grammar shapes the extra rules rely on", () => {
+  // `JAVA_RULES` and `RUST_RULES` in `editorLanguages.ts` name node paths of
+  // the Lezer packages. A grammar update that renames them would leave those
+  // names plain without failing anything else, so pin the shapes here.
+  it("java: annotations parse as MarkerAnnotation / Annotation over an Identifier", async () => {
+    const java = await loadLanguage("java");
+    const tree = java!.parser.parse("@Override @SuppressWarnings(\"x\") class A {}").toString();
+    expect(tree).toContain("MarkerAnnotation(Identifier)");
+    expect(tree).toMatch(/Annotation\(Identifier,AnnotationArgumentList/);
+  });
+
+  it("rust: attributes parse as Attribute / InnerAttribute over a MetaItem", async () => {
+    const rust = await loadLanguage("rust");
+    const tree = rust!.parser.parse("#![allow(x)]\n#[derive(Debug)]\nstruct S;").toString();
+    expect(tree).toMatch(/InnerAttribute\("!","\[",MetaItem\(Identifier/);
+    expect(tree).toMatch(/[^r]Attribute\("\[",MetaItem\(Identifier,ParenthesizedTokens/);
+  });
+});
 
 describe("syntax kinds read apart", () => {
   it.each<[LangId, string, string, string]>([
@@ -111,18 +134,41 @@ describe("syntax kinds read apart", () => {
     // Rust: macros take the macro ink, not the call ink.
     ["rust", "fn main() { println!(\"x\"); }", "println", "tok-meta"],
     ["rust", "fn main() { run(1); }", "run", "tok-fn"],
-    ["rust", "#[derive(Debug)]\nstruct S;", "derive", "tok-meta tok-var"],
+    // Attributes are amber as a whole in both highlighters, never `tok-var`.
+    ["rust", "#[derive(Debug)]\nstruct S;", "derive", "tok-meta"],
+    ["rust", "#[derive(Debug)]\nstruct S;", "Debug", "tok-meta"],
+    ["rust", "#[serde::rename(\"x\")]\nstruct S;", "rename", "tok-meta"],
+    ["rust", "#![allow(dead_code)]\nfn main() {}", "allow", "tok-meta"],
     // Legacy modes: builtin, def, qualifier, meta, atom, variable-2.
     ["shell", "echo hi", "echo", "tok-fn"],
     ["shell", "FOO=1", "FOO", "tok-num"],
     ["kotlin", "fun main() { run(1) }", "run", "tok-fn"],
+    ["kotlin", "fun greet() {}", "greet", "tok-fn"],
     ["kotlin", "@Suppress(\"x\") class K", "@Suppress", "tok-meta"],
     ["kotlin", "val x = true", "true", "tok-num"],
     ["swift", "func greet() {}", "greet", "tok-fn"],
+    ["scala", "def greet: Int = 1", "greet", "tok-fn"],
     ["ruby", "def greet\nend", "greet", "tok-fn"],
+    ["csharp", "class A { string F() { return null; } }", "F", "tok-fn"],
     ["ruby", "x = :sym", ":sym", "tok-num"],
     ["lua", "print(1)", "print", "tok-fn"],
   ])("%s: %j → %s is %s", async (lang, doc, needle, cls) => {
     expect(await classOf(lang, doc, needle)).toBe(cls);
+  });
+
+  // A legacy mode's `def` is any declared name; only functions take the
+  // function ink.
+  it.each<[LangId, string, string]>([
+    ["kotlin", "val x = 1", "x"],
+    ["kotlin", "class K", "K"],
+    ["swift", "let s = 1", "s"],
+    ["swift", "struct P {}", "P"],
+    ["scala", "object O", "O"],
+    ["scala", "val n = 1", "n"],
+    ["ruby", "class K\nend", "K"],
+  ])("%s: %j → %s is a declared name, not a function", async (lang, doc, needle) => {
+    const cls = await classOf(lang, doc, needle);
+    expect(cls).toBeDefined();
+    expect(cls).not.toBe("tok-fn");
   });
 });

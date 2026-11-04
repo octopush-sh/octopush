@@ -216,8 +216,12 @@
 .tok-invalid { color: var(--color-octo-rouge); }
 
 /* ── Word-diff inline segments ───────────────────────────────── */
-.wd-add { background: var(--verdigris-strong); border-radius: 2px; }
-.wd-del { background: var(--rouge-strong); border-radius: 2px; }
+/* A changed word owns its ink, as a search match does: on its fill the
+   syntax inks fall under AA (verdigris ~3.4:1 on Vellum), the text ink
+   doesn't. Declared after .tok-* so it wins (lib/contrast.ts,
+   WORD_DIFF_ADD_ALPHA). */
+.wd-add { background: var(--verdigris-strong); color: var(--color-octo-ivory); border-radius: 2px; }
+.wd-del { background: var(--rouge-strong); color: var(--color-octo-ivory); border-radius: 2px; }
 
 /* The wordmark's voice — brand surfaces only (welcome, settings, about).
    Not a fourth UI font: body/serif/mono roles are unchanged. */

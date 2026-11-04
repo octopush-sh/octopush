@@ -1,5 +1,5 @@
 import type { Extension } from "@codemirror/state";
-import { LanguageSupport, StreamLanguage, type Language, type LRLanguage, type StreamParser } from "@codemirror/language";
+import { LanguageSupport, StreamLanguage, type Language, type LRLanguage, type StreamParser, type StringStream } from "@codemirror/language";
 import { styleTags, tags } from "@lezer/highlight";
 import type { LangId } from "./editorLang";
 
@@ -42,25 +42,49 @@ const JAVA_RULES = {
   "MarkerAnnotation/Identifier Annotation/Identifier MarkerAnnotation/ScopedIdentifier Annotation/ScopedIdentifier": tags.annotation,
 };
 
+/** Rust: an attribute (`#[derive(Debug)]`, `#![allow(x)]`) is amber as a
+ *  whole. The package marks `Attribute/...` as `meta`, but the identifiers
+ *  inside keep their own `variableName`, which then decides the colour; and
+ *  an `Identifier` rule can't win (see `refined`). `MetaItem` has no rule of
+ *  its own, so an opaque one keeps its children from being tagged at all. */
+const RUST_RULES = {
+  "MetaItem!": tags.annotation,
+  "InnerAttribute/...": tags.meta,
+};
+
+/** What StreamLanguage's own table makes of `def`: a declared name, plain. */
+const DEF = "variableName.definition";
+const DEF_FUNCTION = "variableName.function.definition";
+
 /**
  * Legacy-mode token names → highlighting tag paths. StreamLanguage's own table
- * maps `def` to a plain `definition(variableName)` and `builtin` to
- * `standard(variableName)`, and knows no `variable-3` at all, so Go-like modes
- * read uncoloured. Renaming before the table sees the name puts each on a
- * category of the syntax palette (`lib/syntaxPalette.ts`):
- * `def` → function definition, `builtin` → builtin call, `variable-3` → type,
- * `qualifier` → modifier (keyword). `atom`, `meta` and `variable-2` already
- * resolve to tags the palette styles (constant, annotation, special variable).
+ * maps `builtin` to `standard(variableName)` and knows no `variable-3` at all,
+ * so Go-like modes read uncoloured. Renaming before the table sees the name
+ * puts each on a category of the syntax palette (`lib/syntaxPalette.ts`):
+ * `builtin` → builtin call, `variable-3` → type, `qualifier` → modifier
+ * (keyword). `def` is any declared name (`val x`, `class K`, `let s`), so it
+ * stays plain unless it names a function (see `isFunctionDef`). `atom`, `meta`
+ * and `variable-2` already resolve to tags the palette styles (constant,
+ * annotation, special variable).
  */
 const LEGACY_NAMES: Record<string, string> = {
-  def: "variableName.function.definition",
+  def: DEF,
   builtin: "variableName.function.standard",
   "variable-3": "typeName",
   qualifier: "modifier",
 };
 
-/** Shell's `def` is a variable (`FOO=`, `$FOO`, `${FOO}`), not a function. */
+/** Shell's `def` is a variable (`FOO=`, `$FOO`, `${FOO}`), never a function. */
 const SHELL_NAMES: Record<string, string> = { ...LEGACY_NAMES, def: "variableName.special" };
+
+/** The keywords that make the name after them a function: Kotlin `fun`,
+ *  Swift `func`, Scala/Ruby `def`, Lua `function`. */
+const FUNCTION_KEYWORD = /\b(?:fun|func|def|function)\s+$/;
+
+/** A `def` token names a function when a function keyword precedes it or a
+ *  `(` follows it (C#/Dart `String f(`, C++ constructors). */
+const isFunctionDef = (s: StringStream) =>
+  FUNCTION_KEYWORD.test(s.string.slice(0, s.start)) || !!s.match(/^\s*\(/, false);
 
 const stream = <T>(parser: StreamParser<T>, names: Record<string, string> = LEGACY_NAMES): Grammar => {
   const l = StreamLanguage.define<T>({
@@ -71,7 +95,10 @@ const stream = <T>(parser: StreamParser<T>, names: Record<string, string> = LEGA
       // An identifier followed by `(` is a call or a definition: `fun f(`,
       // `foo(x)`. Modes like clike's Kotlin tag both as a plain variable.
       if (style === "variable" && s.peek() === "(") return "variableName.function";
-      return style.split(" ").map((part) => names[part] ?? part).join(" ");
+      return style
+        .split(" ")
+        .map((part) => (part === "def" && names.def === DEF && isFunctionDef(s) ? DEF_FUNCTION : names[part] ?? part))
+        .join(" ");
     },
   });
   return { support: l, language: l };
@@ -89,7 +116,7 @@ const LOADERS: Record<Exclude<LangId, NoLoader>, () => Promise<Grammar>> = {
   jsx:        () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ jsx: true }))),
   typescript: () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ typescript: true }))),
   tsx:        () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ typescript: true, jsx: true }))),
-  rust:       () => import("@codemirror/lang-rust").then((m) => lezer(m.rust())),
+  rust:       () => import("@codemirror/lang-rust").then((m) => refined(m.rust(), m.rustLanguage, RUST_RULES)),
   python:     () => import("@codemirror/lang-python").then((m) => lezer(m.python())),
   java:       () => import("@codemirror/lang-java").then((m) => refined(m.java(), m.javaLanguage, JAVA_RULES)),
   json:       () => import("@codemirror/lang-json").then((m) => lezer(m.json())),

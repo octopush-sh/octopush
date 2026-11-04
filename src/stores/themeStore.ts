@@ -7,6 +7,8 @@ import {
   rgba,
   solveMatchWashAlpha,
   solveTintAlpha,
+  WORD_DIFF_ADD_ALPHA,
+  WORD_DIFF_DEL_ALPHA,
 } from "../lib/contrast";
 import { stateInks } from "../lib/tokens";
 import type { ThemeConfig } from "../lib/types";
@@ -212,9 +214,9 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
   // so under vellum a "deleted line" row was tinted with the DARK theme's
   // rouge, at an alpha tuned against near-black.
   root.style.setProperty("--verdigris-ghost", rgba(t.success, 0.08));
-  root.style.setProperty("--verdigris-strong", rgba(t.success, 0.3));
+  root.style.setProperty("--verdigris-strong", rgba(t.success, WORD_DIFF_ADD_ALPHA));
   root.style.setProperty("--rouge-ghost", rgba(t.danger, 0.08));
-  root.style.setProperty("--rouge-strong", rgba(t.danger, 0.28));
+  root.style.setProperty("--rouge-strong", rgba(t.danger, WORD_DIFF_DEL_ALPHA));
   root.style.setProperty("--rouge-active-bg", rgba(t.danger, 0.1));
   root.style.setProperty("--rouge-disabled-bg", rgba(t.danger, 0.05));
   root.style.setProperty("--rouge-border", rgba(t.danger, 0.3));
