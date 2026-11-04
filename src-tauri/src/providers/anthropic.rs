@@ -123,7 +123,7 @@ fn parse_rate_limit(headers: &HeaderMap) -> Option<RateLimitSnapshot> {
 fn is_effort_model(id: &str) -> bool {
     [
         "opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5",
-        "sonnet-4-6", "sonnet-5", "fable-5", "mythos-5",
+        "sonnet-4-6", "sonnet-5", "haiku-5", "fable-5", "mythos-5",
     ]
     .iter()
     .any(|m| id.contains(m))
@@ -138,10 +138,10 @@ fn is_budget_model(id: &str) -> bool {
 }
 
 /// Whether a model accepts the top `xhigh` effort level. Only the newest
-/// families do (Opus 4.7/4.8, Sonnet 5, Fable 5, Mythos 5); Opus 4.6 / Sonnet
+/// families do (Opus 4.7/4.8, Sonnet 5, Haiku 5.5, Fable 5, Mythos 5); Opus 4.6 / Sonnet
 /// 4.6 cap at `max` (no `xhigh`), and Opus 4.5 caps at `high`.
 fn supports_xhigh(id: &str) -> bool {
-    ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5", "mythos-5"]
+    ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "haiku-5", "fable-5", "mythos-5"]
         .iter()
         .any(|m| id.contains(m))
 }
@@ -155,7 +155,7 @@ fn supports_max(id: &str) -> bool {
 /// Clamp a requested effort to the highest LEVEL a given effort-path model
 /// actually accepts, so we never 400 by sending `xhigh` to Sonnet 4.6 (the
 /// default) or `max` to Opus 4.5:
-/// - `xhigh`-capable (Opus 4.7/4.8, Sonnet 5, Fable 5, Mythos 5) → pass as-is.
+/// - `xhigh`-capable (Opus 4.7/4.8, Sonnet 5, Haiku 5.5, Fable 5, Mythos 5) → pass as-is.
 /// - `max`-capable (Opus 4.6, Sonnet 4.6) → `xhigh` folds to `high`; `max` kept.
 /// - otherwise (Opus 4.5, unknown effort-path) → both `xhigh` and `max` fold to `high`.
 pub fn effective_effort_level(model_id: &str, effort: Effort) -> &'static str {
@@ -190,7 +190,7 @@ fn budget_for_effort(effort: Effort) -> u32 {
 /// model-capability matrix. Pure + unit-tested. Three-way, allowlist-based:
 ///
 /// - `None` effort ⇒ `(None, None)` — no thinking params at all.
-/// - Effort model (Opus 4.5–5, Sonnet 4.6/5, Fable 5, Mythos 5) ⇒
+/// - Effort model (Opus 4.5–5, Sonnet 4.6/5, Haiku 5.5, Fable 5, Mythos 5) ⇒
 ///   `thinking:{type:"adaptive"}` + `output_config:{effort:"<level>"}`, the
 ///   level clamped per model (`effective_effort_level`).
 /// - Budget model (Haiku 4.5, Sonnet 4.5/4.0) ⇒
