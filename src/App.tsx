@@ -42,6 +42,8 @@ import { usePrStore } from "./stores/prStore";
 import { PrComposer } from "./components/PrComposer";
 import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
+import { TerminalHost } from "./components/TerminalHost";
+import { TerminalSlot } from "./components/TerminalSlot";
 import { SessionRail } from "./components/run/SessionRail";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
 import { SessionAnchor } from "./components/run/SessionAnchor";
@@ -73,8 +75,7 @@ import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
-import { useTerminalsStore } from "./stores/terminalsStore";
-import { useTerminalLayoutStore } from "./stores/terminalLayoutStore";
+import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
@@ -258,19 +259,19 @@ function App() {
   const markRunning = useTerminalsStore((s) => s.markRunning);
   const markFailed = useTerminalsStore((s) => s.markFailed);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
-  // The sessions Run puts on screen; the focused one is `activeTerminalId`.
-  const runSlots = useTerminalLayoutStore((s) => s.getRun(activeWorkspaceId ?? "").slots);
-
-  // Flat list of every (workspace, terminal) pair so the Run panel can mount
+  // Every (workspace, terminal) pair, by id, so the TerminalHost can mount
   // every TerminalPane simultaneously. This is the only way to keep PTYs and
   // their xterm scrollback alive across workspace switches — if we only
   // rendered the active workspace's panes, switching would unmount the
   // previous workspace's panes and their cleanup would kill the PTYs.
   const allTerminalRefs = useMemo(() => {
-    return Object.entries(terminalsByWs).flatMap(([wsId, ts]) =>
-      ts.map((t) => ({ workspaceId: wsId, ...t })),
-    );
+    const byId = new Map<string, TerminalState & { workspaceId: string }>();
+    for (const [wsId, ts] of Object.entries(terminalsByWs)) {
+      for (const t of ts) byId.set(t.id, { ...t, workspaceId: wsId });
+    }
+    return byId;
   }, [terminalsByWs]);
+  const allTerminalIds = useMemo(() => [...allTerminalRefs.keys()], [allTerminalRefs]);
 
   // Project store — for switcher
   const recentProjects = useProjectStore((s) => s.recent);
@@ -2081,53 +2082,23 @@ function App() {
                 </ErrorBoundary>
               </ModeOverlay>
 
-              {/* Run panel — TerminalPanes for ALL (workspace, terminal) pairs
-                  in the store are mounted here unconditionally. Individual
-                  panes hide via display:none when not the active one, but the
-                  container itself is never gated by activeWorkspace, so PTYs
-                  survive project switches and new-project creation. */}
+              {/* Run panel — the session rail and the slot the focused
+                  session's pane is drawn over. The panes themselves live in
+                  the TerminalHost below, so they survive project switches,
+                  new-project creation and a crash here. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "run"}>
-                {/* Session rail + terminal. The rail lives INSIDE the canvas
-                    (not the Companion) so collapsing the Companion no longer
-                    removes the only way to change session. A crash here
-                    unmounts the panes, but their PTYs live in the daemon and
-                    reattach when Try again remounts them. */}
+                {/* The rail lives INSIDE the canvas (not the Companion) so
+                    collapsing the Companion no longer removes the only way
+                    to change session. */}
                 <ErrorBoundary surface="Run">
                 <div className="flex h-full w-full min-h-0">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
                     <SessionRail workspaceId={activeWorkspaceId} />
                   )}
                   <div className="relative min-w-0 flex-1">
-                  {allTerminalRefs.map((t) => {
-                    const ws = workspaces.find((w) => w.id === t.workspaceId);
-                    const wsPath = ws?.worktreePath || project.path;
-                    const shown =
-                      activeMode === "run" &&
-                      !!activeWorkspaceId &&
-                      t.workspaceId === activeWorkspaceId &&
-                      (t.id === activeTerminalId || runSlots.includes(t.id));
-                    return (
-                      <TerminalPane
-                        key={t.id}
-                        terminalId={t.id}
-                        workspaceId={t.workspaceId}
-                        workspacePath={wsPath}
-                        workspaceName={ws?.name}
-                        label={t.label}
-                        shown={shown}
-                        focused={shown && t.id === activeTerminalId}
-                        layoutVersion={layoutVersion}
-                        onSpawn={() => markRunning(t.workspaceId, t.id, true)}
-                        onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
-                        onExit={() => markRunning(t.workspaceId, t.id, false)}
-                        onReattach={() => {
-                          // Mark as running (it already was, but be explicit).
-                          markRunning(t.workspaceId, t.id, true);
-                        }}
-                        onOpenFile={(p) => navigateToFile(p, "editor")}
-                      />
-                    );
-                  })}
+                  {activeWorkspace && terminals.length > 0 && (
+                    <TerminalSlot mode="run" terminalId={activeTerminalId} />
+                  )}
                   {activeWorkspace && terminals.length === 0 && (
                     <RunEmptyState
                       onStart={() => {
@@ -2238,6 +2209,44 @@ function App() {
                 )}
                 </ErrorBoundary>
               </ModeOverlay>
+
+              {/* Every TerminalPane, for ALL (workspace, terminal) pairs, mounted
+                  unconditionally and drawn over its slot in the active mode.
+                  Never gated by activeWorkspace, so PTYs and scrollback
+                  survive project switches and new-project creation. A crash
+                  here unmounts the panes, but their PTYs live in the daemon
+                  and reattach when Try again remounts them. */}
+              <ErrorBoundary surface="Run">
+                <TerminalHost
+                  mode={activeWorkspace && activeMode === "run" ? "run" : null}
+                  terminalIds={allTerminalIds}
+                  renderPane={(id, shown) => {
+                    const t = allTerminalRefs.get(id);
+                    if (!t) return null;
+                    const ws = workspaces.find((w) => w.id === t.workspaceId);
+                    return (
+                      <TerminalPane
+                        terminalId={t.id}
+                        workspaceId={t.workspaceId}
+                        workspacePath={ws?.worktreePath || project.path}
+                        workspaceName={ws?.name}
+                        label={t.label}
+                        shown={shown}
+                        focused={shown && t.id === activeTerminalId}
+                        layoutVersion={layoutVersion}
+                        onSpawn={() => markRunning(t.workspaceId, t.id, true)}
+                        onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
+                        onExit={() => markRunning(t.workspaceId, t.id, false)}
+                        onReattach={() => {
+                          // Mark as running (it already was, but be explicit).
+                          markRunning(t.workspaceId, t.id, true);
+                        }}
+                        onOpenFile={(p) => navigateToFile(p, "editor")}
+                      />
+                    );
+                  }}
+                />
+              </ErrorBoundary>
             </div>
           </CanvasSplit>
 
