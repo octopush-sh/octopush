@@ -399,7 +399,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     const shown = workspaceId in layouts.runByWs
       ? layouts.getRun(workspaceId).slots
       : [get().activeByWs[workspaceId] ?? null];
-    if (shown.length >= RUN_PANES) return null;
+    if (shown.length >= RUN_PANES || shown.every((id) => id === null)) return null;
     const exists = (id: string) => terminals.some((t) => t.id === id);
     return (
       layouts.recentNotShown(workspaceId, exists) ??

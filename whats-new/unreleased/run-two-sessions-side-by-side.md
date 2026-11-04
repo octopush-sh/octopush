@@ -3,6 +3,7 @@ title: Two sessions side by side in Run
 kind: feature
 area: app
 highlight: true
+scenario: run-two-sessions
 steps:
   - open: mode/run
     target: run-session-cell
