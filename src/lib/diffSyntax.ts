@@ -20,7 +20,7 @@
  */
 import { highlightTree } from "@lezer/highlight";
 import { HighlightStyle } from "@codemirror/language";
-import { tags as t } from "@lezer/highlight";
+import { SYNTAX_KINDS, SYNTAX_RULES } from "./syntaxPalette";
 import { langForExtension, type LangId } from "./editorLang";
 import { loadLanguage, loadedLanguage } from "./editorLanguages";
 import type { DiffFile, DiffRow } from "./diffParser";
@@ -29,54 +29,14 @@ import type { WordSegment } from "./wordDiff";
 export interface DiffTok { text: string; cls: string; }
 
 /**
- * Class-only HighlightStyle — mirrors the atelierTheme palette (tag for
- * tag, so the diff colours what the editor colours) but emits CSS class
- * names instead of inline style properties.
+ * Class-only HighlightStyle — built from the same table as the editor's
+ * (`syntaxPalette.ts`, so the diff colours what the editor colours) but
+ * emits CSS class names instead of inline style properties.
  * Colors are defined in src/styles.css as .tok-* rules.
  */
-const classStyle = HighlightStyle.define([
-  { tag: t.keyword,           class: "tok-kw" },
-  { tag: t.controlKeyword,    class: "tok-kw" },
-  { tag: t.definitionKeyword, class: "tok-kw" },
-  { tag: t.moduleKeyword,     class: "tok-kw" },
-  { tag: t.operatorKeyword,   class: "tok-kw" },
-  { tag: t.bool,              class: "tok-kw" },
-  { tag: t.heading,           class: "tok-kw" },
-
-  { tag: t.string,                 class: "tok-str" },
-  { tag: t.special(t.string),      class: "tok-str" },
-  { tag: t.regexp,                 class: "tok-str" },
-  { tag: t.escape,                 class: "tok-str" },
-  { tag: t.attributeValue,         class: "tok-str" },
-  { tag: t.link,                   class: "tok-str" },
-
-  { tag: t.number,   class: "tok-num" },
-  { tag: t.integer,  class: "tok-num" },
-  { tag: t.float,    class: "tok-num" },
-
-  { tag: t.comment,      class: "tok-cmt" },
-  { tag: t.lineComment,  class: "tok-cmt" },
-  { tag: t.blockComment, class: "tok-cmt" },
-  { tag: t.null,         class: "tok-cmt" },
-  { tag: t.meta,         class: "tok-cmt" },
-  { tag: t.processingInstruction, class: "tok-cmt" },
-
-  { tag: t.typeName,  class: "tok-type" },
-  { tag: t.className, class: "tok-type" },
-  { tag: t.namespace, class: "tok-type" },
-  { tag: t.tagName,   class: "tok-type" },
-
-  { tag: t.function(t.variableName), class: "tok-fn" },
-  { tag: t.function(t.propertyName), class: "tok-fn" },
-
-  { tag: t.operator,      class: "tok-op" },
-  { tag: t.punctuation,   class: "tok-op" },
-  { tag: t.angleBracket,  class: "tok-op" },
-  { tag: t.attributeName, class: "tok-op" },
-
-  { tag: t.variableName, class: "tok-var" },
-  { tag: t.propertyName, class: "tok-var" },
-]);
+export const diffClassStyle = HighlightStyle.define(
+  SYNTAX_RULES.map(({ tag, kind }) => ({ tag, class: SYNTAX_KINDS[kind].cls })),
+);
 
 const plain = (text: string): DiffTok[] => [{ text, cls: "" }];
 
@@ -124,7 +84,7 @@ export function highlightLines(lines: string[], langId: LangId): DiffTok[][] {
   };
 
   let pos = 0;
-  highlightTree(lang.parser.parse(doc), classStyle, (from, to, cls) => {
+  highlightTree(lang.parser.parse(doc), diffClassStyle, (from, to, cls) => {
     if (from > pos) emit(doc.slice(pos, from), "");
     emit(doc.slice(from, to), cls);
     pos = to;

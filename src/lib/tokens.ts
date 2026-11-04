@@ -32,7 +32,35 @@ export const tokens = {
   rouge: "#d18b8b",
   // Amber — distinct from brass: warning/caution, never the accent.
   warning: "#dfae4a",
+
+  // State hues. The editor also inks types (blue) and constants (purple)
+  // with them; see lib/syntaxPalette.ts.
+  stateBlue: "#7a9cb8",
+  statePurple: "#a888b8",
 } as const;
+
+/**
+ * Vellum (light) values of the inks the editor's syntax palette uses beyond
+ * the text ramp and brass. Each clears WCAG AA (4.5:1) on every Vellum surface.
+ *
+ * `stateBlue` / `statePurple` have no ThemeConfig field: themeStore picks
+ * these on a light ground and the `tokens` values on a dark one. `verdigris`
+ * and `warning` ARE ThemeConfig fields (`success` / `warning` in
+ * src-tauri/src/theme.rs) and are mirrored here only for the contrast test;
+ * a drift test keeps them equal to theme.rs.
+ */
+export const vellumInks = {
+  stateBlue: "#2f5a7e",
+  statePurple: "#6a4682",
+  verdigris: "#246f47",
+  warning: "#7f5300",
+} as const;
+
+/** The state hues for a theme, by whether its ground is dark. */
+export function stateInks(dark: boolean): { stateBlue: string; statePurple: string } {
+  const src = dark ? tokens : vellumInks;
+  return { stateBlue: src.stateBlue, statePurple: src.statePurple };
+}
 
 export const fonts = {
   serif: '"Spectral", "Iowan Old Style", "Times New Roman", serif',

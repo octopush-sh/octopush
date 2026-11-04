@@ -12,6 +12,8 @@ import {
   solveTintAlpha,
   DIFF_TINT_TARGET,
 } from "./contrast";
+import { tokens, vellumInks } from "./tokens";
+import { SYNTAX_KINDS } from "./syntaxPalette";
 
 /** Every built-in theme, mirroring src-tauri/src/theme.rs · builtin_themes().
  *  Kept here so the search-match guarantee is asserted against the real
@@ -277,6 +279,21 @@ describe("solveTintAlpha", () => {
   });
 });
 
+describe("atelier syntax inks", () => {
+  it("clear AA on every Onyx surface", () => {
+    const surfaces = [tokens.onyx, tokens.panel, tokens.panel2];
+    for (const [label, ink] of Object.entries({
+      stateBlue: tokens.stateBlue,
+      statePurple: tokens.statePurple,
+      verdigris: tokens.verdigris,
+      warning: tokens.warning,
+    })) {
+      const worst = Math.min(...surfaces.map((s) => contrastRatio(hexToRgb(ink)!, hexToRgb(s)!)));
+      expect(worst, `atelier ${label} (${ink})`).toBeGreaterThanOrEqual(4.5);
+    }
+  });
+});
+
 describe("vellum, the light theme", () => {
   // The frontend mirror of theme.rs's `vellum_clears_wcag_aa_on_every_surface`.
   // Kept on both sides on purpose: the Rust gate guards the palette source, and
@@ -312,6 +329,26 @@ describe("vellum, the light theme", () => {
     for (const [label, ink] of Object.entries(VELLUM.inks)) {
       expect(worst(ink), `vellum ${label} (${ink})`).toBeGreaterThanOrEqual(4.5);
     }
+  });
+
+  it("clears AA for every syntax ink the editor uses", () => {
+    // Types, constants, functions and annotations are inked with these
+    // (lib/syntaxPalette.ts). Checked on every surface, not just the editor
+    // ground: the same tokens paint the Review diff and the rest of the app.
+    for (const [label, ink] of Object.entries(vellumInks)) {
+      expect(worst(ink), `vellum ${label} (${ink})`).toBeGreaterThanOrEqual(4.5);
+    }
+    // verdigris and warning are ThemeConfig inks; the mirror must not drift
+    // from the palette this table is checked against.
+    expect(vellumInks.verdigris).toBe(VELLUM.inks.success);
+    expect(vellumInks.warning).toBe(VELLUM.inks.warning);
+  });
+
+  it("gives keywords, types, functions, constants and annotations five different inks", () => {
+    const kinds = ["keyword", "type", "function", "constant", "meta"] as const;
+    const vellumHex: Record<string, string> = { ...vellumInks, brass: VELLUM.inks.accent };
+    const inks = kinds.map((k) => vellumHex[SYNTAX_KINDS[k].ink]);
+    expect(new Set(inks).size).toBe(kinds.length);
   });
 
   it("clears 3:1 for interactive boundaries (WCAG 1.4.11)", () => {

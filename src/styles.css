@@ -53,6 +53,10 @@
   --color-state-blue:    #7a9cb8;
   --color-state-purple:  #a888b8;
 
+  /* Per-theme like the inks above: themeStore repaints these two (and their
+     -dim / -ghost alphas) from src/lib/tokens.ts — these Onyx values on a dark
+     ground, `vellumInks` (#2f5a7e / #6a4682, AA on cream) on a light one.
+     The editor inks types and constants with them (lib/syntaxPalette.ts). */
   --color-octo-state-blue:   #7a9cb8;
   --color-octo-state-purple: #a888b8;
 
@@ -196,16 +200,20 @@
 }
 
 /* ── Diff syntax token classes — used by diffSyntax.ts ──────────
-   Colors mirror the atelierTheme palette via design tokens.
-   class-only approach keeps inline-style out of diff DOM nodes.   */
-.tok-kw   { color: var(--color-octo-brass); }
-.tok-str  { color: var(--color-octo-sage);  }
-.tok-num  { color: var(--color-octo-rouge); }
-.tok-cmt  { color: var(--color-octo-mute);  }
-.tok-type { color: var(--color-octo-brass); }
-.tok-fn   { color: var(--color-octo-ivory); }
-.tok-op   { color: var(--color-octo-sage);  }
-.tok-var  { color: var(--color-octo-ivory); }
+   One class per kind in lib/syntaxPalette.ts (SYNTAX_KINDS), inked as the
+   editor inks it. Class-only approach keeps inline-style out of diff DOM
+   nodes.                                                           */
+.tok-kw      { color: var(--color-octo-brass); }
+.tok-type    { color: var(--color-octo-state-blue); }
+.tok-fn      { color: var(--color-octo-verdigris); }
+.tok-str     { color: var(--color-octo-sage); }
+.tok-num     { color: var(--color-octo-state-purple); }
+.tok-meta    { color: var(--color-octo-warning); }
+.tok-prop    { color: var(--color-octo-ivory); }
+.tok-var     { color: var(--color-octo-ivory); }
+.tok-cmt     { color: var(--color-octo-mute); }
+.tok-punct   { color: var(--color-octo-mute); }
+.tok-invalid { color: var(--color-octo-rouge); }
 
 /* ── Word-diff inline segments ───────────────────────────────── */
 .wd-add { background: var(--verdigris-strong); border-radius: 2px; }
