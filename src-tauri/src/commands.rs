@@ -925,6 +925,7 @@ pub async fn create_workspace(
             db.update_mission_exec_isolation(&mission.id, exec_isolation)?;
         }
     }
+    install_claude_hooks_later(state.inner(), ws.clone());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
@@ -1040,6 +1041,7 @@ fn archive_workspace_internal(state: &AppState, workspace_id: &str) -> AppResult
     let project_path = { state.db.lock().get_project(&ws.project_id)?.map(|p| p.path) };
     let Some(project_path) = project_path else { return Ok(()) };
     if owns_worktree_on_disk(&state.db, workspace_id, &project_path, ws.worktree_path.as_deref()) {
+        crate::claude_hooks::remove_for_workspace(&state.db, workspace_id, ws.worktree_path.as_deref());
         if let Some(wt) = &ws.worktree_path {
             let _ = crate::git_ops::delete_worktree(
                 std::path::Path::new(&project_path),
@@ -1228,6 +1230,18 @@ fn owns_worktree_on_disk(
     managed && !is_main
 }
 
+/// Claude Code hooks for Run-mode attention (#287), off the command's path:
+/// a cold CLI version probe can take seconds. A no-op unless the setting is
+/// on and the worktree is one Octopush made.
+fn install_claude_hooks_later(state: &AppState, ws: crate::db::WorkspaceRow) {
+    let db = std::sync::Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(bin) = crate::mcp_setup::resolve_mcp_binary() {
+            crate::claude_hooks::install_for_workspace(&db, &ws, &bin);
+        }
+    });
+}
+
 #[tauri::command]
 pub async fn delete_workspace(
     state: State<'_, AppState>,
@@ -1245,6 +1259,7 @@ pub async fn delete_workspace(
     // it isn't the project root. An adopted checkout (made by the user/another
     // tool) and the main workspace are left on disk — we just drop the DB row.
     if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
+        crate::claude_hooks::remove_for_workspace(&state.db, &workspace_id, worktree_path.as_deref());
         if let Some(wt) = &worktree_path {
             // Prune the worktree's registry slot (by path — slot names aren't
             // tied to the branch), then remove its working-tree directory.
@@ -1297,6 +1312,7 @@ pub async fn archive_workspace(
     // main workspace (project root) keep their directory — archiving just flips
     // the DB row. (Archive always keeps the branch.)
     if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
+        crate::claude_hooks::remove_for_workspace(&state.db, &workspace_id, worktree_path.as_deref());
         if let Some(wt) = &worktree_path {
             // Prune the worktree's registry slot (by path), then remove its dir.
             let _ = crate::git_ops::delete_worktree(
@@ -1345,7 +1361,9 @@ pub async fn restore_workspace(
         .get_workspace(&workspace_id)?
         .ok_or_else(|| AppError::Other("workspace not found".into()))?;
     crate::workspace::heal_worktree(&state.db, std::path::Path::new(&project_path), &mut ws)?;
-    state.db.lock().restore_workspace(&workspace_id)
+    state.db.lock().restore_workspace(&workspace_id)?;
+    install_claude_hooks_later(state.inner(), ws);
+    Ok(())
 }
 
 // ─── Update workspace customization ──────────────────────────────
@@ -2924,10 +2942,13 @@ fn spawn_terminal_session(
     id: String,
     cwd: String,
     label: String,
-    env: std::collections::HashMap<String, String>,
+    mut env: std::collections::HashMap<String, String>,
     shell: Option<String>,
 ) -> AppResult<crate::pty_manager::SpawnMode> {
     use crate::pty_manager::SpawnOptions;
+
+    // Names the terminal to `octopush-mcp hook` (Claude Code hooks, #287).
+    env.insert(crate::claude_hooks::TERMINAL_ENV.to_string(), id.clone());
 
     let db_for_hook = std::sync::Arc::clone(&state.db);
     // Logbook: resolve the terminal's workspace once, then beat coalesced PTY

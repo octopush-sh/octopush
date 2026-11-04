@@ -22,6 +22,14 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 fn main() {
+    // `octopush-mcp hook --octopush-hook`: what the Claude Code hooks Octopush
+    // installs in a worktree run (#287) — one payload on stdin, one queued
+    // signal, never an error that could reach Claude.
+    if std::env::args().nth(1).as_deref() == Some("hook") {
+        run_hook();
+        return;
+    }
+
     // Open the store once. A failure here is fatal and worth surfacing on
     // stderr (stdout is reserved for protocol frames). Wrapped in a Mutex so
     // workspace creation can lock per-operation (and never across its git
@@ -57,6 +65,20 @@ fn main() {
                 }
             }
         }
+    }
+}
+
+/// The hook mode: always exits 0. Outside an Octopush terminal (no terminal
+/// id, e.g. a Direct stage's `claude -p`) it records nothing. Skips
+/// migrations: only an app that already created `hook_signals` installs it.
+fn run_hook() {
+    use std::io::Read;
+    use octopush_lib::claude_hooks::{record_hook, MAX_PAYLOAD, TERMINAL_ENV};
+    let mut payload = String::new();
+    let _ = io::stdin().lock().take(MAX_PAYLOAD).read_to_string(&mut payload);
+    let Ok(terminal) = std::env::var(TERMINAL_ENV) else { return };
+    if let Ok(db) = Db::open_without_migrations(&Db::default_path()) {
+        record_hook(&db, Some(&terminal), &payload);
     }
 }
 

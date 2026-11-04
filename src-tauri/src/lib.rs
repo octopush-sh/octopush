@@ -6,6 +6,7 @@ pub mod billing;
 pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
+pub mod claude_hooks;
 pub mod claude_plan;
 mod commands;
 pub mod context_guard;
@@ -469,6 +470,9 @@ pub fn run() {
                     }
                 });
             }
+
+            // Claude Code hook signals from Run terminals → attention events.
+            claude_hooks::spawn_poller(app.handle().clone(), std::sync::Arc::clone(&state.db));
 
             // Pricing: give $0 ledger rows a price if their model has one now
             // (e.g. a model this release added to the table) and mark the

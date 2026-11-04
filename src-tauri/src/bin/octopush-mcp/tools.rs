@@ -859,6 +859,11 @@ fn create_workspace(db: &Mutex<Db>, args: &Value) -> Result<Value, String> {
         octopush_lib::mission::ensure_for_workspace(&dbg, &ws, &intent, "worktree")
             .map_err(|e| e.to_string())?;
     }
+    // Claude Code hooks for Run-mode attention, as the app does (#287); a
+    // no-op unless the setting is on. This binary is the hook command.
+    if let Ok(bin) = std::env::current_exe() {
+        octopush_lib::claude_hooks::install_for_workspace(db, &ws, &bin);
+    }
 
     use octopush_lib::workspace::CreateOutcome;
     let (status, note) = match outcome {

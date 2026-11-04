@@ -49,10 +49,14 @@ struct PtyExitEvent {
 /// Event payload for `pty://attention` — emitted by the daemon when a
 /// session has been idle long enough after a meaningful burst of
 /// output to be considered "waiting for user input."
+///
+/// `reason` is `idle` here; Claude Code hook signals arrive on the same event
+/// as `permission` / `input` (`claude_hooks`).
 #[derive(Serialize, Clone)]
 struct PtyAttentionEvent {
     #[serde(rename = "sessionId")]
     session_id: String,
+    reason: &'static str,
 }
 
 /// Event payload for `pty://foreground` — emitted when the PTY's foreground
@@ -332,11 +336,15 @@ fn start_reader_thread(
                         );
                         break;
                     }
+                    // A terminal whose Claude Code reports through hooks
+                    // gets its attention from them alone.
+                    Ok(TermEvent::Attention) if crate::claude_hooks::has_hook_signals(&id) => {}
                     Ok(TermEvent::Attention) => {
                         let _ = app.emit(
                             "pty://attention",
                             PtyAttentionEvent {
                                 session_id: id.clone(),
+                                reason: "idle",
                             },
                         );
                     }
