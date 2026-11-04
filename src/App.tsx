@@ -2217,35 +2217,35 @@ function App() {
                   holds its own Run error boundary: a crash there unmounts the
                   panes, but their PTYs live in the daemon and reattach when
                   Try again remounts them. */}
-                <TerminalHost
-                  mode={activeWorkspace && activeMode === "run" ? "run" : null}
-                  terminalIds={allTerminalIds}
-                  renderPane={(id, shown) => {
-                    const t = allTerminalRefs.get(id);
-                    if (!t) return null;
-                    const ws = workspaces.find((w) => w.id === t.workspaceId);
-                    return (
-                      <TerminalPane
-                        terminalId={t.id}
-                        workspaceId={t.workspaceId}
-                        workspacePath={ws?.worktreePath || project.path}
-                        workspaceName={ws?.name}
-                        label={t.label}
-                        shown={shown}
-                        focused={shown && t.id === activeTerminalId}
-                        layoutVersion={layoutVersion}
-                        onSpawn={() => markRunning(t.workspaceId, t.id, true)}
-                        onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
-                        onExit={() => markRunning(t.workspaceId, t.id, false)}
-                        onReattach={() => {
-                          // Mark as running (it already was, but be explicit).
-                          markRunning(t.workspaceId, t.id, true);
-                        }}
-                        onOpenFile={(p) => navigateToFile(p, "editor")}
-                      />
-                    );
-                  }}
-                />
+              <TerminalHost
+                mode={activeWorkspace && activeMode === "run" ? "run" : null}
+                terminalIds={allTerminalIds}
+                renderPane={(id, shown) => {
+                  const t = allTerminalRefs.get(id);
+                  if (!t) return null;
+                  const ws = workspaces.find((w) => w.id === t.workspaceId);
+                  return (
+                    <TerminalPane
+                      terminalId={t.id}
+                      workspaceId={t.workspaceId}
+                      workspacePath={ws?.worktreePath || project.path}
+                      workspaceName={ws?.name}
+                      label={t.label}
+                      shown={shown}
+                      focused={shown && t.id === activeTerminalId}
+                      layoutVersion={layoutVersion}
+                      onSpawn={() => markRunning(t.workspaceId, t.id, true)}
+                      onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
+                      onExit={() => markRunning(t.workspaceId, t.id, false)}
+                      onReattach={() => {
+                        // Mark as running (it already was, but be explicit).
+                        markRunning(t.workspaceId, t.id, true);
+                      }}
+                      onOpenFile={(p) => navigateToFile(p, "editor")}
+                    />
+                  );
+                }}
+              />
             </div>
           </CanvasSplit>
 

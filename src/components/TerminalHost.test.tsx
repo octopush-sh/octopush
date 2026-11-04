@@ -113,8 +113,10 @@ describe("TerminalHost", () => {
     rerender(host("run"));
     expect(layer.style.visibility).toBe("visible");
     expect(layer.style.pointerEvents).toBe("none");
-    // The fallback opts back into the pointer, so Try again can be clicked.
-    expect((card.parentElement as HTMLElement).style.pointerEvents).toBe("auto");
+    // Only the card opts back into the pointer, so Try again can be clicked
+    // while the full-size fallback lets clicks reach the rail below.
+    expect(card.style.pointerEvents).toBe("auto");
+    expect((card.parentElement as HTMLElement).style.pointerEvents).not.toBe("auto");
     crash.on = false;
     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
     expect(screen.queryByTestId("panel-error-card")).toBeNull();
