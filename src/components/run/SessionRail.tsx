@@ -47,7 +47,8 @@ export function SessionRail({ workspaceId }: Props) {
   useTerminalLayoutStore((s) => s.mruByWs[workspaceId]);
   const openBeside = useTerminalsStore((s) => s.openBeside);
   const besideCandidate = useTerminalsStore((s) => s.besideCandidate);
-  const canOpenBeside = besideCandidate(workspaceId) !== null;
+  const candidateId = besideCandidate(workspaceId);
+  const canOpenBeside = candidateId !== null;
   // With more than one pane, the sessions on screen besides the focused one.
   const paired = (layout?.slots.length ?? 1) > 1;
   const shownIds = paired ? (layout?.slots ?? []) : [];
@@ -202,6 +203,9 @@ export function SessionRail({ workspaceId }: Props) {
               aria-current={shown ? "true" : undefined}
               tabIndex={active || (activeId === null && i === 0) ? 0 : -1}
               data-testid={`session-cell-${t.id}`}
+              // The demo hovers the session Open beside would seat, so the
+              // pane it opens is the cell it pointed at.
+              data-tour={t.id === candidateId ? tourId("run-session-cell") : undefined}
               // No native `title`: the flyout opens on the same hover (and on
               // focus) and already carries label, activity and jump key. The
               // aria-label keeps the cell named for assistive tech.
@@ -342,7 +346,7 @@ export function SessionRail({ workspaceId }: Props) {
                       type="button"
                       data-testid={`session-beside-${t.id}`}
                       data-tour={tourId("run-open-beside")}
-                      title="Seat the session you used last beside this one"
+                      title="Show the last session you used that isn't on screen, beside the current pane"
                       onClick={() => {
                         closeFlyout(t.id);
                         openBeside(workspaceId);

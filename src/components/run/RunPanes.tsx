@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { MoreHorizontal, X } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import {
@@ -37,7 +37,20 @@ export function RunPanes({ workspaceId }: Props) {
   const rowRef = useRef<HTMLDivElement>(null);
 
   const slots = layout?.slots ?? [activeId];
-  if (slots.length < 2 || !layout) {
+  const paired = slots.length > 1 && !!layout;
+
+  // A drag that never sees its release (the view drops to one pane, or Run
+  // unmounts mid-drag) must not leave every PTY waiting for its size.
+  useEffect(() => {
+    if (!paired) return;
+    return () => {
+      if (!useTerminalLayoutStore.getState().resizing) return;
+      useTerminalLayoutStore.getState().setResizing(false);
+      document.body.style.cursor = "";
+    };
+  }, [paired]);
+
+  if (!paired || !layout) {
     return <TerminalSlot mode="run" terminalId={slots[0] ?? null} />;
   }
 
@@ -219,13 +232,24 @@ function PaneCaption({
               type="button"
               role="menuitem"
               className={MENU_ITEM}
-              onClick={() => (setMenu(null), onSwap(o.slot))}
+              onClick={() => {
+                setMenu(null);
+                onSwap(o.slot);
+              }}
             >
               <span className="min-w-0 truncate">{terminals.find((t) => t.id === o.id)?.label}</span>
             </button>
           ))}
           <div className={MENU_SEP} />
-          <button type="button" role="menuitem" className={MENU_ITEM} onClick={() => (setMenu(null), onLeave())}>
+          <button
+            type="button"
+            role="menuitem"
+            className={MENU_ITEM}
+            onClick={() => {
+              setMenu(null);
+              onLeave();
+            }}
+          >
             Leave the view
           </button>
         </MenuSurface>

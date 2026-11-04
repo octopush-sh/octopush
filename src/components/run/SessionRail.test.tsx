@@ -330,13 +330,23 @@ describe("SessionRail — sessions side by side", () => {
       useTerminalsStore.getState().setActive(WS, "a");
     });
     render(<SessionRail workspaceId={WS} />);
+    // The demo's anchor sits on the cell Open beside would seat, and only there.
+    expect(screen.getByTestId("session-cell-c")).toHaveAttribute("data-tour", "run-session-cell");
+    expect(document.querySelectorAll('[data-tour="run-session-cell"]')).toHaveLength(1);
     fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
-    fireEvent.click(screen.getByTestId("session-beside-b"));
+    const beside = screen.getByTestId("session-beside-b");
+    // The tooltip names what is seated and where, not the hovered cell.
+    expect(beside).toHaveAttribute(
+      "title",
+      "Show the last session you used that isn't on screen, beside the current pane",
+    );
+    fireEvent.click(beside);
     expect(useTerminalLayoutStore.getState().getRun(WS).slots).toEqual(["a", "c"]);
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("c");
 
     // Two panes are the most for now: the item goes.
     fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
     expect(screen.queryByTestId("session-beside-b")).toBeNull();
+    expect(document.querySelector('[data-tour="run-session-cell"]')).toBeNull();
   });
 });

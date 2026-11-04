@@ -114,4 +114,22 @@ describe("RunPanes", () => {
     fireEvent.pointerUp(divider, { pointerId: 1 });
     expect(useTerminalLayoutStore.getState().resizing).toBe(false);
   });
+
+  it("ends a drag the divider never saw released, so the PTYs get their size again", () => {
+    seed(["a", "b"], ["a", "b"]);
+    const { unmount } = render(<RunPanes workspaceId={WS} />);
+    fireEvent.pointerDown(screen.getByRole("separator"), { button: 0, pointerId: 1 });
+    expect(document.body.style.cursor).toBe("col-resize");
+    // The view drops to one pane mid-drag.
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a"], focused: 0, ratios: [] })));
+    expect(useTerminalLayoutStore.getState().resizing).toBe(false);
+    expect(document.body.style.cursor).toBe("");
+
+    // And when Run goes away mid-drag.
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b"], ratios: [0.5] })));
+    fireEvent.pointerDown(screen.getByRole("separator"), { button: 0, pointerId: 1 });
+    unmount();
+    expect(useTerminalLayoutStore.getState().resizing).toBe(false);
+    expect(document.body.style.cursor).toBe("");
+  });
 });

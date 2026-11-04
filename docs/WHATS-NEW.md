@@ -71,7 +71,7 @@ Current anchors:
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
-| `run-session-rail` · `run-open-beside` | Run canvas: the session rail · a rail cell flyout's "Open beside" (on hover, only while one pane is shown and another session exists) | `run/SessionRail.tsx` |
+| `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the rail cell of the session Open beside would seat (only while it is offered) · a rail cell flyout's "Open beside" (on hover, only while one pane is shown and another session exists) | `run/SessionRail.tsx` |
 | `run-pane-caption` · `run-pane-divider` | Run canvas, only with two panes: the first pane's caption · the divider between the panes | `run/RunPanes.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
