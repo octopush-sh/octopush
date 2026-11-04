@@ -37,7 +37,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   const resizing = useTerminalLayoutStore((s) => s.resizing);
   const updateLayout = useTerminalsStore((s) => s.updateLayout);
-  const createTerminal = useTerminalsStore((s) => s.createTerminal);
+  const createBeside = useTerminalsStore((s) => s.createBeside);
   const rowRef = useRef<HTMLDivElement>(null);
 
   const slots = layout?.slots ?? [activeId];
@@ -148,7 +148,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
                     updateLayout(workspaceId, (l) => focus(l, i));
                     onOpenBeside();
                   }}
-                  onCreate={() => createTerminal(workspaceId, undefined, i).catch(console.error)}
+                  onCreate={() => createBeside(workspaceId).catch(console.error)}
                 />
               ) : (
                 <TerminalSlot mode="run" terminalId={id} />
@@ -184,7 +184,7 @@ function EmptySeat({ onOpen, onCreate }: { onOpen: () => void; onCreate: () => v
           e.stopPropagation();
           onCreate();
         }}
-        className="rounded-lg border border-octo-hairline px-3 py-2 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        className="rounded-lg border border-octo-border-strong px-3 py-2 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
       >
         Open a new session here
       </button>

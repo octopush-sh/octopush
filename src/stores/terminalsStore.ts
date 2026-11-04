@@ -117,13 +117,14 @@ interface TerminalsStore {
 
   // Actions
   loadTerminals: (workspaceId: string) => Promise<void>;
-  /** Create a session. It goes in the focused pane, or in `targetSlot` when
-   *  given (`slots.length` appends a new slot); a slot that can't take it
-   *  leaves it unseated. */
+  /** Create a session. It goes in the focused pane, or in the slot
+   *  `targetSlot` picks from the layout once the session exists (so a layout
+   *  that changed meanwhile is respected; `slots.length` appends a new slot).
+   *  A slot that can't take it (e.g. -1) leaves it unseated. */
   createTerminal: (
     workspaceId: string,
     label?: string,
-    targetSlot?: number,
+    targetSlot?: (layout: RunLayout) => number,
   ) => Promise<TerminalState>;
   renameTerminal: (workspaceId: string, id: string, label: string) => Promise<void>;
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
@@ -140,7 +141,9 @@ interface TerminalsStore {
   /** Put `id` beside the panes — in the empty seat, else a new slot, else the
    *  focused pane — and focus it. `null` leaves an empty seat. */
   openBeside: (workspaceId: string, id: string | null) => void;
-  /** Open a new session straight into the slot Open beside fills. */
+  /** Open a new session straight into the slot Open beside fills, chosen
+   *  when the session exists; never over a shown session it wasn't asked to
+   *  replace. */
   createBeside: (workspaceId: string) => Promise<TerminalState>;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Record that a terminal's PTY failed to start (or, with `false`, that
@@ -321,7 +324,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       };
     });
     get().updateLayout(workspaceId, (layout) =>
-      assign(layout, targetSlot ?? layout.focused, newTerminal.id),
+      assign(layout, targetSlot ? targetSlot(layout) : layout.focused, newTerminal.id),
     );
 
     return newTerminal;
@@ -418,8 +421,15 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   openBeside: (workspaceId, id) =>
     get().updateLayout(workspaceId, (layout) => openBeside(layout, id, RUN_PANES)),
 
-  createBeside: (workspaceId) =>
-    get().createTerminal(workspaceId, undefined, besideSlot(runOf(workspaceId), RUN_PANES)),
+  // The slot is picked when the session exists. If the seat or the room went
+  // while it was being created, it stays off screen rather than replace a
+  // shown session — unless replacing was what the user asked for.
+  createBeside: (workspaceId) => {
+    const replaces = besideReplaces(runOf(workspaceId), RUN_PANES);
+    return get().createTerminal(workspaceId, undefined, (layout) =>
+      besideReplaces(layout, RUN_PANES) && !replaces ? -1 : besideSlot(layout, RUN_PANES),
+    );
+  },
 
   markRunning: (workspaceId, id, running) =>
     set((s) => {

@@ -41,7 +41,9 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
   const openBeside = useTerminalsStore((s) => s.openBeside);
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
-  const replaces = pairing && !!layout && besideReplaces(layout, RUN_PANES);
+  // With no room left, a beside pick (⏎ when pairing, ⌥⏎ when switching)
+  // replaces the focused pane's session.
+  const replaces = !!layout && besideReplaces(layout, RUN_PANES);
   const terminals = useMemo(
     () =>
       pairing
@@ -143,7 +145,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
           />
         </div>
 
-        {replaces && (
+        {pairing && replaces && (
           <div
             data-testid="session-switcher-replaces"
             className="octo-fade-in border-b border-octo-hairline px-4 py-2 font-mono text-[10px] text-octo-mute"
@@ -237,7 +239,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
           ) : (
             <>
               <span>⏎ · Switch</span>
-              <span>⌥⏎ · Beside</span>
+              <span data-testid="session-switcher-alt-hint">⌥⏎ · {replaces ? "Replace" : "Beside"}</span>
             </>
           )}
           <span>⌫ · Close</span>
