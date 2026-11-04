@@ -1,5 +1,5 @@
-import { describe, it, expect, afterEach } from "vitest";
-import { getXtermTheme, XTERM_FONT_FAMILY } from "./xtermTheme";
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { getXtermTheme, terminalCellWidth, XTERM_FONT_FAMILY } from "./xtermTheme";
 
 describe("xtermTheme", () => {
   afterEach(() => {
@@ -34,6 +34,30 @@ describe("xtermTheme", () => {
     expect(theme.brightWhite).toBe("#2a201a");
     // Foreground must not equal background — the bug this fixes.
     expect(theme.foreground).not.toBe(theme.background);
+  });
+
+  it("keeps a column width only once the terminal font has loaded, never the estimate", () => {
+    let advance = 7;
+    let loaded = false;
+    const ctx = { font: "", measureText: () => ({ width: advance * 10 }) };
+    const canvas = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
+    Object.defineProperty(document, "fonts", { configurable: true, value: { check: () => loaded } });
+    try {
+      // No canvas: the 0.6em estimate, not kept.
+      expect(terminalCellWidth(20)).toBe(12);
+      canvas.mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+      // A fallback face is measured, used, but not kept.
+      expect(terminalCellWidth(20)).toBe(7);
+      advance = 9;
+      loaded = true;
+      expect(terminalCellWidth(20)).toBe(9);
+      // Once loaded, the measurement is kept.
+      advance = 11;
+      expect(terminalCellWidth(20)).toBe(9);
+    } finally {
+      canvas.mockRestore();
+      delete (document as { fonts?: unknown }).fonts;
+    }
   });
 
   it("tints xterm's own scrollbar from the border tokens", () => {

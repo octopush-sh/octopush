@@ -375,11 +375,17 @@ describe("SessionRail — sessions side by side", () => {
   });
 
   it("reads Replace in the focused pane once Run has no room left", () => {
-    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
-    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b"], ratios: [0.5] })));
+    seed(["a", "b", "c", "d", "e"].map((id) => ({ id, label: id })));
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b", "c"], ratios: [0.5, 0.5] })));
+    const { unmount } = render(<SessionRail workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-e").parentElement!);
+    expect(screen.getByTestId("session-beside-e").textContent).toBe("Open beside");
+    unmount();
+
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b", "c", "d"], ratios: [0.5, 0.5] })));
     render(<SessionRail workspaceId={WS} onOpenBeside={noop} />);
-    fireEvent.mouseEnter(screen.getByTestId("session-cell-c").parentElement!);
-    expect(screen.getByTestId("session-beside-c").textContent).toBe("Replace in the focused pane");
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-e").parentElement!);
+    expect(screen.getByTestId("session-beside-e").textContent).toBe("Replace in the focused pane");
   });
 
   it("offers Open beside with every session on screen (it leaves a seat), not with no room", () => {
@@ -389,8 +395,8 @@ describe("SessionRail — sessions side by side", () => {
     expect(screen.getByTestId("session-beside-a")).toBeTruthy();
     unmount();
 
-    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
-    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b"], ratios: [0.5] })));
+    seed(["a", "b", "c", "d"].map((id) => ({ id, label: id })));
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b", "c", "d"], ratios: [0.5, 0.5] })));
     render(<SessionRail workspaceId={WS} onOpenBeside={noop} />);
     fireEvent.mouseEnter(screen.getByTestId("session-cell-a").parentElement!);
     expect(screen.queryByTestId("session-beside-a")).toBeNull();

@@ -905,11 +905,18 @@ describe("the single setActive path", () => {
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
   });
 
-  it("Open beside replaces the focused pane once Run has no room left", () => {
-    seed(["a", "b", "c"], ["a", "b"], 1);
-    expect(useTerminalsStore.getState().besideReplaces(ws)).toBe(true);
+  it("Open beside appends a third and a fourth pane, then replaces the focused one", () => {
+    seed(["a", "b", "c", "d", "e"], ["a", "b"], 1);
     useTerminalsStore.getState().openBeside(ws, "c");
-    expect(run().slots).toEqual(["a", "c"]);
+    expect(run().slots).toEqual(["a", "b", "c"]);
+    expect(useTerminalsStore.getState().besideReplaces(ws)).toBe(false);
+    useTerminalsStore.getState().openBeside(ws, "d");
+    expect(run().slots).toEqual(["a", "b", "c", "d"]);
+    expect(run().ratios).toEqual([0.5, 0.5]);
+    expect(useTerminalsStore.getState().besideReplaces(ws)).toBe(true);
+    useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, focused: 1 }));
+    useTerminalsStore.getState().openBeside(ws, "e");
+    expect(run().slots).toEqual(["a", "e", "c", "d"]);
   });
 
   it("with every session on screen, Open beside leaves one empty seat", () => {
@@ -923,6 +930,8 @@ describe("the single setActive path", () => {
     expect(useTerminalsStore.getState().besideAction(ws)).toBe("pair");
 
     seed(["a", "b"], ["a", "b"]);
+    expect(useTerminalsStore.getState().besideAction(ws)).toBe("seat");
+    seed(["a", "b", "c", "d"], ["a", "b", "c", "d"]);
     expect(useTerminalsStore.getState().besideAction(ws)).toBeNull();
   });
 
@@ -935,16 +944,16 @@ describe("the single setActive path", () => {
   });
 
   it("a new session beside never lands on a session that filled the seat meanwhile", async () => {
-    seed(["a", "b"], ["a", null], 0);
+    seed(["a", "b", "c", "d"], ["a", "b", "c", null], 0);
     let resolve!: (r: ReturnType<typeof makeRecord>) => void;
     mockIpc.createTerminal.mockReturnValueOnce(new Promise((r) => (resolve = r)));
     const pending = useTerminalsStore.getState().createBeside(ws);
     // The seat is filled, and focus moves back to "a", before the IPC resolves.
-    useTerminalsStore.getState().openBeside(ws, "b");
+    useTerminalsStore.getState().openBeside(ws, "d");
     useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, focused: 0 }));
-    resolve(makeRecord(ws, "Terminal 3", 2));
+    resolve(makeRecord(ws, "Terminal 5", 4));
     const t = await pending;
-    expect(run().slots).toEqual(["a", "b"]);
+    expect(run().slots).toEqual(["a", "b", "c", "d"]);
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
     expect(useTerminalsStore.getState().getTerminals(ws).map((x) => x.id)).toContain(t.id);
   });
@@ -962,14 +971,14 @@ describe("the single setActive path", () => {
   });
 
   it("a new session beside replaces the focused pane only when that was asked for", async () => {
-    seed(["a", "b", "c"], ["a", "b"], 0);
+    seed(["a", "b", "c", "d", "e"], ["a", "b", "c", "d"], 0);
     let resolve!: (r: ReturnType<typeof makeRecord>) => void;
     mockIpc.createTerminal.mockReturnValueOnce(new Promise((r) => (resolve = r)));
     const pending = useTerminalsStore.getState().createBeside(ws);
     useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, focused: 1 }));
-    resolve(makeRecord(ws, "Terminal 4", 3));
+    resolve(makeRecord(ws, "Terminal 6", 5));
     const t = await pending;
-    expect(run().slots).toEqual(["a", t.id]);
+    expect(run().slots).toEqual(["a", t.id, "c", "d"]);
   });
 
   it("deleting the last shown session beside an empty seat takes a neighbour", async () => {

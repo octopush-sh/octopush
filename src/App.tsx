@@ -1192,6 +1192,16 @@ function App() {
   // "pair" is its Open beside mode (⌘D, the rail flyout, an empty seat).
   const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | null>(null);
   const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
+  // The `run/open-beside` tour surface: Open beside exactly as ⌘D does it,
+  // in Run only.
+  useEffect(() => {
+    const onNavigate = (e: Event) => {
+      const d = (e as CustomEvent<NavigateDetail>).detail;
+      if (d?.kind === "open-beside" && shortcutCtx.mode() === "run") openBeside();
+    };
+    window.addEventListener(NAVIGATE_EVENT, onNavigate);
+    return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
+  }, [openBeside, shortcutCtx]);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
   const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
   const modeMetaText = useMemo(

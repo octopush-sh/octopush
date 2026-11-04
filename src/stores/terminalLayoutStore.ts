@@ -174,6 +174,89 @@ export function setRatios(layout: RunLayout, ratios: number[]): RunLayout {
   return { ...layout, ratios: ratios.map((r) => Math.max(RATIO_MIN, Math.min(RATIO_MAX, r))) };
 }
 
+// ─── Geometry ─────────────────────────────────────────────────────
+
+/** Narrowest pane, in terminal columns, that `auto` still puts side by side. */
+export const MIN_SIDE_COLUMNS = 72;
+
+/** A divider: the line at `at` across `axis` (`"x"` splits left from right),
+ *  spanning `from`–`to` of the other axis, set by `ratios[ratio]`. */
+export interface Divider {
+  ratio: number;
+  axis: "x" | "y";
+  at: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * Where `auto` lands for this layout `width` pixels wide with `cellWidth`-pixel
+ * columns: side by side when every pane of an EVEN side-by-side layout for the
+ * current count would keep 72 columns, else stacked. The dividers never enter
+ * into it, so dragging or evening one never changes the orientation; only the
+ * width and the pane count do. An override wins; one and four panes have no
+ * choice (four are always a 2×2 grid), so they report `"side"`. An unmeasured
+ * width stays side by side.
+ */
+export function resolveOrientation(layout: RunLayout, width: number, cellWidth: number): "side" | "stacked" {
+  const count = layout.slots.length;
+  if (count !== 2 && count !== 3) return "side";
+  if (layout.orientation !== "auto") return layout.orientation;
+  if (width <= 0 || cellWidth <= 0) return "side";
+  // Even, two panes are halves; three are a half beside a stacked pair, so
+  // the narrowest pane is half the width either way.
+  const split = evenRatios(count)[0];
+  const narrowest = width * Math.min(split, 1 - split);
+  return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
+}
+
+/** A slot's place in `paneGrid`: 1-based grid lines, `[start, end]`. */
+export interface GridArea {
+  column: [number, number];
+  row: [number, number];
+}
+
+/**
+ * The slots and dividers for `count` panes (spec "Slots and layout") as one
+ * 2×2 grid: two column and two row tracks in `fr` (each pair sums to 1), each
+ * slot's area and the dividers. Three panes: slot 0 is the large pane, the
+ * main divider between it and the pair, the side divider between the pair.
+ * Four: one shared cross. Every layout uses two tracks per axis, an unused one
+ * at `0fr`, so a change between any two interpolates the tracks: the
+ * grid-rows `0fr↔1fr` idiom (spec "Motion").
+ */
+export function paneGrid(
+  count: number,
+  orientation: "side" | "stacked",
+  ratios: number[],
+): { columns: [number, number]; rows: [number, number]; areas: GridArea[]; dividers: Divider[] } {
+  const a = ratios[0] ?? 0.5;
+  const b = ratios[1] ?? 0.5;
+  const at = (c0: number, c1: number, r0: number, r1: number): GridArea => ({ column: [c0, c1], row: [r0, r1] });
+  const main = orientation === "side" ? "x" : "y";
+  const cross = main === "x" ? "y" : "x";
+  if (count <= 1) return { columns: [1, 0], rows: [1, 0], areas: [at(1, 3, 1, 3)], dividers: [] };
+  const first: Divider = { ratio: 0, axis: count === 4 ? "x" : main, at: a, from: 0, to: 1 };
+  if (count === 2) {
+    const dividers: Divider[] = [first];
+    return orientation === "side"
+      ? { columns: [a, 1 - a], rows: [1, 0], areas: [at(1, 2, 1, 3), at(2, 3, 1, 3)], dividers }
+      : { columns: [1, 0], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 3, 2, 3)], dividers };
+  }
+  if (count === 3) {
+    const dividers: Divider[] = [first, { ratio: 1, axis: cross, at: b, from: a, to: 1 }];
+    return orientation === "side"
+      ? { columns: [a, 1 - a], rows: [b, 1 - b], areas: [at(1, 2, 1, 3), at(2, 3, 1, 2), at(2, 3, 2, 3)], dividers }
+      : { columns: [b, 1 - b], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)], dividers };
+  }
+  return {
+    columns: [a, 1 - a],
+    rows: [b, 1 - b],
+    areas: [at(1, 2, 1, 2), at(2, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)],
+    dividers: [first, { ratio: 1, axis: "y", at: b, from: 0, to: 1 }],
+  };
+}
+
 /** Drop every slot whose session no longer exists, exactly as leaving it. */
 export function prune(layout: RunLayout, exists: (id: string) => boolean): RunLayout {
   let next = layout;

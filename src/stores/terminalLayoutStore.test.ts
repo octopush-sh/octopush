@@ -10,7 +10,9 @@ import {
   focusedId,
   leave,
   openBeside,
+  paneGrid,
   prune,
+  resolveOrientation,
   setOrientation,
   setRatios,
   swap,
@@ -151,6 +153,64 @@ describe("terminalLayout reducers", () => {
 
   it("touchMru moves a session to the front", () => {
     expect(touchMru(["A", "B", "C"], "C")).toEqual(["C", "A", "B"]);
+  });
+});
+
+describe("terminalLayout geometry", () => {
+  const CELL = 8; // 72 columns = 576px
+
+  it("auto decides from the width at even splits, never from the dividers", () => {
+    // 72 columns = 576px, so two or three even panes need 1152px.
+    expect(resolveOrientation(layout(["A", "B"]), 1200, CELL)).toBe("side");
+    expect(resolveOrientation(layout(["A", "B"]), 1100, CELL)).toBe("stacked");
+    expect(resolveOrientation(layout(["A", "B", "C"]), 1152, CELL)).toBe("side");
+    expect(resolveOrientation(layout(["A", "B", "C"]), 1151, CELL)).toBe("stacked");
+    // A divider moved anywhere changes nothing: wide stays side by side, narrow stays stacked.
+    for (const r of [0.2, 0.45, 0.5, 0.7, 0.8]) {
+      expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [r] }, 1600, CELL)).toBe("side");
+      expect(resolveOrientation({ ...layout(["A", "B", "C"]), ratios: [r, 0.5] }, 1600, CELL)).toBe("side");
+      expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [r] }, 1000, CELL)).toBe("stacked");
+    }
+    // Unmeasured: side by side.
+    expect(resolveOrientation(layout(["A", "B"]), 0, CELL)).toBe("side");
+  });
+
+  it("an override wins for two and three panes; four are always the grid", () => {
+    const stacked = setOrientation(layout(["A", "B"]), "stacked");
+    expect(resolveOrientation(stacked, 3000, CELL)).toBe("stacked");
+    expect(resolveOrientation(setOrientation(layout(["A", "B", "C"]), "side"), 300, CELL)).toBe("side");
+    // The override outlives a change of count, until Automatic again.
+    expect(openBeside(stacked, "C").orientation).toBe("stacked");
+    expect(resolveOrientation(setOrientation(layout(["A", "B", "C", "D"]), "stacked"), 3000, CELL)).toBe("side");
+    expect(resolveOrientation(layout(["A", "B", "C", "D"]), 300, CELL)).toBe("side");
+  });
+
+  it("places every count in one 2×2 grid whose tracks sum to one", () => {
+    expect(paneGrid(2, "side", [0.4])).toMatchObject({
+      columns: [0.4, 0.6],
+      rows: [1, 0],
+      areas: [{ column: [1, 2], row: [1, 3] }, { column: [2, 3], row: [1, 3] }],
+    });
+    expect(paneGrid(2, "stacked", [0.4])).toMatchObject({ columns: [1, 0], rows: [0.4, 0.6] });
+    // Three: a large slot 0, the main divider beside it, the side one between the pair.
+    expect(paneGrid(3, "side", [0.6, 0.3])).toMatchObject({
+      areas: [{ column: [1, 2], row: [1, 3] }, { column: [2, 3], row: [1, 2] }, { column: [2, 3], row: [2, 3] }],
+      dividers: [
+        { ratio: 0, axis: "x", at: 0.6, from: 0, to: 1 },
+        { ratio: 1, axis: "y", at: 0.3, from: 0.6, to: 1 },
+      ],
+    });
+    const stacked = paneGrid(3, "stacked", [0.6, 0.3]);
+    expect(stacked).toMatchObject({ columns: [0.3, 0.7], rows: [0.6, 0.4] });
+    expect(stacked.areas.map((a) => a.column)).toEqual([[1, 3], [1, 2], [2, 3]]);
+    expect(stacked.dividers.map((d) => d.axis)).toEqual(["y", "x"]);
+    // Four in reading order around one shared cross: each line runs the whole way.
+    const four = paneGrid(4, "side", [0.4, 0.6]);
+    expect(four.areas.map((a) => [a.column[0], a.row[0]])).toEqual([[1, 1], [2, 1], [1, 2], [2, 2]]);
+    expect(four.dividers).toEqual([
+      { ratio: 0, axis: "x", at: 0.4, from: 0, to: 1 },
+      { ratio: 1, axis: "y", at: 0.6, from: 0, to: 1 },
+    ]);
   });
 });
 

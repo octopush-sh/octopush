@@ -6,7 +6,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 const noop = () => {};
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
-const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
+const { useTerminalLayoutStore, evenRatios, leaveView } = await import("../../stores/terminalLayoutStore");
 const { useTerminalSlotsStore } = await import("../../stores/terminalSlotsStore");
 const { RunPanes } = await import("./RunPanes");
 
@@ -23,15 +23,20 @@ function seed(ids: string[], slots: (string | null)[], focused = 0) {
     },
   });
   act(() =>
-    useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots, focused, ratios: slots.length > 1 ? [0.5] : [] })),
+    useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots, focused, ratios: evenRatios(slots.length) })),
   );
 }
 
 /** The sessions the slot registry has on screen, in slot order. */
 const published = () =>
   Object.values(useTerminalSlotsStore.getState().slots).map((s) => s.terminalId).sort();
+/** Every element measures `width` wide: 72 columns of the 7.8px estimate are ≈ 562px. */
+const sized = (width: number) =>
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ left: 0, top: 0, width, height: 800 } as DOMRect);
 
 beforeEach(() => {
+  // A failed test must not leave its measured rect behind for the next one.
+  vi.restoreAllMocks();
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
   useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false });
   useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
@@ -107,8 +112,8 @@ describe("RunPanes", () => {
     seed(["a", "b"], ["a", "b"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = screen.getByRole("separator");
-    const row = divider.parentElement!.parentElement!;
-    vi.spyOn(row, "getBoundingClientRect").mockReturnValue({ left: 100, width: 1000 } as DOMRect);
+    const area = divider.parentElement!;
+    vi.spyOn(area, "getBoundingClientRect").mockReturnValue({ left: 100, width: 1000 } as DOMRect);
     fireEvent.pointerDown(divider, { button: 0, pointerId: 1 });
     expect(useTerminalLayoutStore.getState().resizing).toBe(true);
     fireEvent.pointerMove(divider, { clientX: 400, pointerId: 1 });
@@ -136,6 +141,126 @@ describe("RunPanes", () => {
     });
     expect(onOpenBeside).toHaveBeenCalledTimes(1);
     expect(run().slots).toEqual(["a", "n"]);
+  });
+
+  it("lays three panes around a large slot 0, with a main and a side divider", () => {
+    seed(["a", "b", "c"], ["a", "b", "c"], 2);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(published()).toEqual(["a", "b", "c"]);
+    const [main, side] = screen.getAllByRole("separator");
+    expect(main).toHaveAttribute("aria-orientation", "vertical");
+    expect(side).toHaveAttribute("aria-orientation", "horizontal");
+    // The side divider moves with ↑/↓ and leaves the main split alone.
+    fireEvent.keyDown(side, { key: "ArrowDown" });
+    fireEvent.keyDown(side, { key: "ArrowRight" });
+    expect(run().ratios[0]).toBe(0.5);
+    expect(run().ratios[1]).toBeCloseTo(0.55);
+    fireEvent.doubleClick(side);
+    expect(run().ratios).toEqual([0.5, 0.5]);
+  });
+
+  it("stacks from the caption menu for two and three panes, until Automatic again", () => {
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute("aria-checked", "true");
+    // The checked item carries a Check, not ink alone.
+    const checks = screen.getAllByRole("menuitemradio").map((item) => item.querySelector("svg") !== null);
+    expect(checks).toEqual([false, false, true]);
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Stack" }));
+    expect(run().orientation).toBe("stacked");
+    expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowUp" });
+    expect(run().ratios[0]).toBeCloseTo(0.45);
+
+    // The override holds at three panes.
+    act(() => useTerminalsStore.getState().openBeside(WS, null));
+    expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+    expect(screen.getByRole("menuitemradio", { name: "Stack" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByRole("menuitemradio", { name: "Automatic" }));
+    expect(run().orientation).toBe("auto");
+    expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
+  });
+
+  it("never changes orientation on a drag or an even: wide stays side by side", () => {
+    sized(1600);
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const divider = () => screen.getByRole("separator");
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+    fireEvent.pointerDown(divider(), { button: 0, pointerId: 1 });
+    // 480px is under 72 columns (≈ 562px): the split doesn't decide, the width does.
+    fireEvent.pointerMove(divider(), { clientX: 480, pointerId: 1 });
+    expect(run().ratios[0]).toBeCloseTo(0.3);
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+    fireEvent.pointerMove(divider(), { clientX: 720, pointerId: 1 });
+    fireEvent.pointerUp(divider(), { pointerId: 1 });
+    expect(run().ratios[0]).toBeCloseTo(0.45);
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+    fireEvent.doubleClick(divider());
+    expect(run().ratios[0]).toBe(0.5);
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+  });
+
+  it("stacks under 72 columns at an even split, and a divider never un-stacks it", () => {
+    sized(1100);
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const divider = () => screen.getByRole("separator");
+    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.keyDown(divider(), { key: "ArrowDown" });
+    expect(run().ratios[0]).toBeCloseTo(0.55);
+    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.doubleClick(divider());
+    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+  });
+
+  it("decides again when the count changes: narrow three stack, four are the grid", () => {
+    sized(1000);
+    seed(["a", "b", "c", "d"], ["a", "b", "c"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const orientations = () => screen.getAllByRole("separator").map((d) => d.getAttribute("aria-orientation"));
+    expect(orientations()).toEqual(["horizontal", "vertical"]);
+    act(() => useTerminalsStore.getState().openBeside(WS, "d"));
+    expect(orientations()).toEqual(["vertical", "horizontal"]);
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => leaveView(l, 3)));
+    expect(orientations()).toEqual(["horizontal", "vertical"]);
+  });
+
+  it("lays the panes out as grid tracks that glide, except during a drag", () => {
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const area = screen.getByTestId("run-pane-0").parentElement!;
+    expect(area.style.gridTemplateColumns).toBe("0.5fr 0.5fr");
+    expect(area.style.gridTemplateRows).toBe("1fr 0fr");
+    expect(area.style.transition).toContain("grid-template-rows var(--dur-standard) var(--ease-octo)");
+    expect(screen.getByTestId("run-pane-1").style.gridColumn).toBe("2 / 3");
+
+    fireEvent.pointerDown(screen.getByRole("separator"), { button: 0, pointerId: 1 });
+    expect(area.style.transition).toBe("");
+    fireEvent.pointerUp(screen.getByRole("separator"), { pointerId: 1 });
+  });
+
+  it("puts four panes in a 2×2 grid with one shared cross and no orientation choice", () => {
+    sized(700);
+    seed(["a", "b", "c", "d"], ["a", "b", "c", "d"], 3);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    vi.restoreAllMocks();
+    expect(published()).toEqual(["a", "b", "c", "d"]);
+    // Narrow, yet still the grid: the 72-column rule doesn't apply at four.
+    const dividers = screen.getAllByRole("separator");
+    expect(dividers.map((d) => d.getAttribute("aria-orientation"))).toEqual(["vertical", "horizontal"]);
+    fireEvent.keyDown(dividers[1], { key: "ArrowDown", shiftKey: true });
+    expect(run().ratios).toEqual([0.5, 0.51]);
+    fireEvent.click(screen.getByTestId("run-pane-menu-3"));
+    expect(screen.queryByRole("menuitemradio")).toBeNull();
+    expect(screen.getByRole("menu")).toHaveTextContent("Leave the view");
+
+    // Leaving a pane shifts the rest down and lays out three.
+    fireEvent.click(screen.getByRole("menuitem", { name: "Leave the view" }));
+    fireEvent.click(screen.getByTestId("run-pane-leave-1"));
+    expect(run().slots).toEqual(["a", "c"]);
   });
 
   it("ends a drag the divider never saw released, so the PTYs get their size again", () => {
