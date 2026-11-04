@@ -353,7 +353,11 @@ mod tests {
         let up = ollama_check(&addr, CHECK_TIMEOUT);
         assert_eq!((up.status, up.value.as_str()), (CheckStatus::Ok, addr.as_str()));
         drop(listener);
-        let down = ollama_check(&addr, Duration::from_millis(500));
+        // Not the port just released: with tests running in parallel another
+        // test's `bind(":0")` can be handed that same ephemeral port at once,
+        // and the probe then reaches *it* (flaked on CI 2026-11-04). Port 0
+        // can never accept a connection.
+        let down = ollama_check("127.0.0.1:0", Duration::from_millis(500));
         assert_eq!((down.status, down.command.as_deref()), (CheckStatus::Warn, Some("ollama serve")));
     }
 
