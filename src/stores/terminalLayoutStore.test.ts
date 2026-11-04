@@ -1,7 +1,14 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, vi } from "vitest";
 import {
   leaveView,
   EMPTY_RUN_LAYOUT,
+  EMPTY_TALK_SEAT,
+  LAYOUTS_KEY,
+  pruneTalk,
+  readLayouts,
+  seatTalk,
+  setTalkWidth,
+  toggleTalk,
   assign,
   besideAction,
   besideReplaces,
@@ -234,5 +241,79 @@ describe("terminalLayoutStore", () => {
     expect(useTerminalLayoutStore.getState().recentNotShown("ws", exists)).toBe("C");
     s.forget("ws", "C");
     expect(useTerminalLayoutStore.getState().recentNotShown("ws", exists)).toBeNull();
+  });
+});
+
+describe("Talk's seat", () => {
+  beforeEach(() =>
+    useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false, resizing: false }),
+  );
+
+  it("toggles keeping its session, clamps its width and prunes a gone session", () => {
+    const seat = seatTalk(EMPTY_TALK_SEAT, "A");
+    expect(seat).toEqual({ ...EMPTY_TALK_SEAT, terminalId: "A", open: true });
+    expect(toggleTalk(seat)).toEqual({ ...seat, open: false });
+    expect(setTalkWidth(seat, 0.95).width).toBe(0.8);
+    expect(setTalkWidth(seat, 0.05).width).toBe(0.2);
+    expect(setTalkWidth(seat, Number.NaN)).toBe(seat);
+    expect(pruneTalk(seat, () => true)).toBe(seat);
+    expect(pruneTalk(seat, () => false)).toEqual({ ...seat, terminalId: null });
+  });
+
+  it("forgetting a session empties the seat that held it", () => {
+    const s = useTerminalLayoutStore.getState();
+    s.seatTalkSession("ws", "A");
+    s.forget("ws", "B");
+    expect(useTerminalLayoutStore.getState().getTalk("ws").terminalId).toBe("A");
+    s.forget("ws", "A");
+    expect(useTerminalLayoutStore.getState().getTalk("ws")).toEqual({ ...EMPTY_TALK_SEAT, open: true });
+  });
+});
+
+describe("terminal layout persistence", () => {
+  beforeEach(() => localStorage.clear());
+
+  it("writes Run and Talk layouts through to localStorage", () => {
+    const s = useTerminalLayoutStore.getState();
+    s.commitRun("ws", layout(["A", "B"], 1));
+    s.seatTalkSession("ws", "A");
+    const saved = JSON.parse(localStorage.getItem(LAYOUTS_KEY) ?? "null");
+    expect(saved.run.ws).toEqual(layout(["A", "B"], 1));
+    expect(saved.talk.ws).toEqual({ ...EMPTY_TALK_SEAT, terminalId: "A", open: true });
+  });
+
+  it("reads back only well-formed layouts", () => {
+    const read = readLayouts({
+      run: {
+        ok: { slots: ["A", null], orientation: "stacked", ratios: [0.9], focused: 1 },
+        twice: { slots: ["A", "A"], orientation: "auto", ratios: [0.5], focused: 0 },
+        seats: { slots: ["A", null, null], orientation: "auto", ratios: [0.5, 0.5], focused: 0 },
+        many: { slots: ["A", "B", "C", "D", "E"] },
+        none: { slots: [] },
+        odd: { slots: ["A", "B"], orientation: "diagonal", ratios: [0.5, 0.5], focused: 7 },
+      },
+      talk: { ok: { terminalId: "A", width: 0.1, open: true }, bad: "seat" },
+    });
+    expect(read.run).toEqual({
+      ok: { slots: ["A", null], orientation: "stacked", ratios: [0.8], focused: 1 },
+      odd: { slots: ["A", "B"], orientation: "auto", ratios: [0.5], focused: 1 },
+    });
+    expect(read.talk).toEqual({ ok: { terminalId: "A", width: 0.2, open: true } });
+    expect(readLayouts("nope")).toEqual({ run: {}, talk: {} });
+  });
+
+  it("restores the stored layouts when the app starts", async () => {
+    localStorage.setItem(
+      LAYOUTS_KEY,
+      JSON.stringify({
+        run: { ws: layout(["A", "B"], 1) },
+        talk: { ws: { terminalId: "B", width: 0.4, open: true } },
+      }),
+    );
+    vi.resetModules();
+    const fresh = await import("./terminalLayoutStore");
+    const s = fresh.useTerminalLayoutStore.getState();
+    expect(s.getRun("ws")).toEqual(layout(["A", "B"], 1));
+    expect(s.getTalk("ws")).toEqual({ terminalId: "B", width: 0.4, open: true });
   });
 });

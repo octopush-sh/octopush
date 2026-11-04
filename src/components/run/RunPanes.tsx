@@ -230,15 +230,23 @@ function paneInset({ column, row }: GridArea): React.CSSProperties {
 }
 
 /**
- * The empty seat Open beside leaves when every session is already on screen.
- * A click anywhere opens the pairing switcher for it; the CTA opens a new
- * session straight into it.
+ * The empty seat Open beside leaves when every session is already on screen
+ * (also Talk's seat before it holds a session). A click anywhere opens the
+ * pairing switcher for it; the CTA opens a new session straight into it.
  */
-function EmptySeat({ onOpen, onCreate }: { onOpen: () => void; onCreate: () => void }) {
+export function EmptySeat({
+  onOpen,
+  onCreate,
+  mode = "run",
+}: {
+  onOpen: () => void;
+  onCreate: () => void;
+  mode?: "run" | "talk";
+}) {
   return (
     <div
-      data-testid="run-empty-seat"
-      data-tour={tourId("run-empty-seat")}
+      data-testid={`${mode}-empty-seat`}
+      data-tour={mode === "run" ? tourId("run-empty-seat") : undefined}
       title="Choose a session for this seat · ⌘D"
       onClick={onOpen}
       className="octo-fade-in flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 px-6 text-center"
@@ -247,7 +255,7 @@ function EmptySeat({ onOpen, onCreate }: { onOpen: () => void; onCreate: () => v
       <p className="font-serif text-[15px] text-octo-ivory">Bring a session alongside.</p>
       <button
         type="button"
-        data-testid="run-empty-seat-new"
+        data-testid={`${mode}-empty-seat-new`}
         onClick={(e) => {
           e.stopPropagation();
           onCreate();

@@ -60,7 +60,7 @@ const { useTerminalLayoutStore } = await import("./terminalLayoutStore");
 
 function resetStore() {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false, resizing: false });
   localStorage.removeItem("octopush.setupTerminals");
   nextId = 0;
   vi.clearAllMocks();
@@ -894,6 +894,47 @@ describe("the single setActive path", () => {
     await useTerminalsStore.getState().loadTerminals(ws);
     expect(run().slots).toEqual(["a"]);
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+  });
+
+  it("a reload empties Talk's seat when its session is gone", async () => {
+    seed(["a", "b"], ["a"]);
+    useTerminalLayoutStore.getState().seatTalkSession(ws, "b");
+    mockIpc.listTerminals.mockResolvedValueOnce([{ id: "a", workspaceId: ws, label: "a", position: 0, createdAt: 0 }]);
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalLayoutStore.getState().getTalk(ws)).toMatchObject({ terminalId: null, open: true });
+  });
+
+  it("deleting the seat's session empties Talk's seat", async () => {
+    seed(["a", "b"], ["a"]);
+    useTerminalLayoutStore.getState().seatTalkSession(ws, "b");
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "b");
+    expect(useTerminalLayoutStore.getState().getTalk(ws).terminalId).toBeNull();
+    expect(run().slots).toEqual(["a"]);
+  });
+
+  it("deleting a shown session the list doesn't know leaves its pane empty", async () => {
+    // A restored layout can name a session the list no longer has: no
+    // neighbour to fall back to, exactly as before.
+    seed(["a", "b"], ["x"]);
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "x");
+    expect(run().slots).toEqual([null]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBeNull();
+  });
+
+  it("Talk's seat never changes activeByWs or Run's focused slot", async () => {
+    seed(["a", "b", "c"], ["a", "b"], 1);
+    const before = run();
+    useTerminalLayoutStore.getState().seatTalkSession(ws, "c");
+    useTerminalLayoutStore.getState().seatTalkSession(ws, "a");
+    useTerminalLayoutStore.getState().setTalkFocused(true);
+    mockIpc.createTerminal.mockResolvedValueOnce(makeRecord(ws, "Terminal 4", 3));
+    const t = await useTerminalsStore.getState().createInTalkSeat(ws);
+    expect(run()).toBe(before);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
+    expect(useTerminalLayoutStore.getState().getTalk(ws)).toMatchObject({ terminalId: t.id, open: true });
+    expect(useTerminalLayoutStore.getState().talkFocused).toBe(true);
   });
 
   it("Open beside puts the picked session in a new pane and focuses it", () => {

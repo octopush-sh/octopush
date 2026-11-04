@@ -44,8 +44,31 @@ function seed(
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {} });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false });
   vi.clearAllMocks();
+});
+
+describe("SessionSwitcher — Talk's seat", () => {
+  it("lists every session but the seat's own, Run's shown ones too, and seats the pick", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a", "b"], 1);
+    useTerminalLayoutStore.getState().seatTalkSession(WS, "c");
+    const run = useTerminalLayoutStore.getState().getRun(WS);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} talk />);
+
+    expect(screen.getByPlaceholderText("Which session sits beside this one?")).toBeTruthy();
+    expect(screen.queryByTestId("session-switcher-row-c")).toBeNull();
+    expect(screen.getByTestId("session-switcher-row-a")).toBeTruthy();
+    expect(screen.getByTestId("session-switcher-new").textContent).toBe("Open a new session beside");
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Enter" });
+    expect(useTerminalLayoutStore.getState().getTalk(WS)).toMatchObject({ terminalId: "a", open: true });
+    // Run is untouched: same layout, same focused session.
+    expect(useTerminalLayoutStore.getState().getRun(WS)).toBe(run);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("b");
+    expect(onClose).toHaveBeenCalled();
+  });
 });
 
 /** Put `slots` on screen, focusing `focused`. */

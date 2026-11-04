@@ -74,6 +74,7 @@ Current anchors:
 | `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the focused session's rail cell · a rail cell flyout's "Open beside" / "Replace in the focused pane" (on hover, while Open beside can do something) | `run/SessionRail.tsx` |
 | `run-pane-caption` · `run-pane-menu` · `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first pane's caption · its "Pane options" button · the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
 | `run-pane-orientation` | The first pane's options menu, while open with two or three panes: "Automatic" | `run/RunPanes.tsx` |
+| `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `run-pair-input` · `run-pair-pick` | Pairing switcher (Open beside), while open: its query input · its first session row (only when a session is off screen) | `run/SessionSwitcher.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
@@ -114,7 +115,7 @@ opening the step's surface, then skips the step.
 
 `open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
 `settings/account`, `settings/privacy`, `mode/run`, `mode/direct`, `mode/review`,
-`palette`, `file-finder`, `run/open-beside`: Run's Open beside, as `⌘D` does it). Each entry is a function that navigates the real app there. The tour runner and
+`palette`, `file-finder`, `run/open-beside`: Run's pairing switcher, only when Open beside would pair — it never leaves an empty seat). Each entry is a function that navigates the real app there. The tour runner and
 the clip recorder both call it, so a demo never depends on clicking through menus.
 
 ## 4. Scenarios

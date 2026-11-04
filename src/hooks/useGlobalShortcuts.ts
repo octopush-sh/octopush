@@ -38,6 +38,9 @@ export interface ShortcutContext {
   /** ⌘D in Run: open beside (the pairing switcher, or an empty seat).
    *  Returns false when there is nothing to open beside. */
   openBeside: () => boolean;
+  /** ⌘D in Talk: open or close the terminal seat beside the conversation.
+   *  Returns false when it can't (another dialog is open). */
+  toggleTalkSeat: () => boolean;
   terminalIds: () => readonly string[];
   /** The sessions in Run's panes, in reading order (empty seats are null). */
   shownTerminalIds: () => readonly (string | null)[];
@@ -118,17 +121,21 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     run: (_e, c) => (c.setMode("direct"), true),
   },
   {
-    // One entry that branches on the mode: in Run, open beside; Talk's seat
-    // arrives with the Talk pairing (spec "PR plan", row 5). The physical
-    // key, and a focused editor keeps ⌘D (next occurrence): CodeMirror's
-    // preventDefault comes first. `shift: false` keeps ⌘⇧D (Direct) apart.
+    // One entry that branches on the mode: in Run, open beside; in Talk,
+    // toggle the seat; elsewhere nothing. The physical key, and a focused
+    // editor keeps ⌘D (next occurrence): CodeMirror's preventDefault comes
+    // first. `shift: false` keeps ⌘⇧D (Direct) apart.
     id: "open-beside",
     chords: ["⌘D"],
     scope: "global",
     shift: false,
     alt: false,
     codes: ["KeyD"],
-    run: (_e, c) => c.mode() === "run" && !!c.activeWorkspaceId && c.openBeside(),
+    run: (_e, c) => {
+      if (!c.activeWorkspaceId) return false;
+      const mode = c.mode();
+      return mode === "run" ? c.openBeside() : mode === "talk" ? c.toggleTalkSeat() : false;
+    },
   },
   {
     id: "mission-control",
