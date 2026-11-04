@@ -501,6 +501,9 @@ export interface AppSettings {
   /** Tool-call rounds one Talk message may run before the model is asked to
    *  answer with what it has. Unset/null → **no limit**. */
   talkMaxIterations?: number | null;
+  /** Run-mode attention from Claude Code's lifecycle hooks instead of the
+   *  terminal bell (#287). Unset/null → off. */
+  claudeHooksEnabled?: boolean | null;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */

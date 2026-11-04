@@ -55,6 +55,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub subagent_max_turns: Option<u32>,
 
+    /// Run-mode attention from Claude Code's own lifecycle hooks
+    /// (`Notification`/`Stop`, #287) instead of the terminal bell. `None` =
+    /// the default, which is **off** until the frontend toggle lands.
+    #[serde(default)]
+    pub claude_hooks_enabled: Option<bool>,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
@@ -453,6 +459,16 @@ mod tests {
         assert_eq!(settings.subagent_max_turns, Some(40));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""subagentMaxTurns":40"#), "{json}");
+    }
+
+    #[test]
+    fn claude_hooks_enabled_round_trips_and_defaults_to_none() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.claude_hooks_enabled, None);
+        let settings: AppSettings = serde_json::from_str(r#"{"claudeHooksEnabled":true}"#).unwrap();
+        assert_eq!(settings.claude_hooks_enabled, Some(true));
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""claudeHooksEnabled":true"#), "{json}");
     }
 
     #[test]
