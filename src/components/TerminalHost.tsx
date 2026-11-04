@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { useLayoutEffect, useRef, type ReactNode } from "react";
 import { ModeOverlay } from "./ModeOverlay";
 import { ErrorBoundary } from "./ErrorBoundary";
 import { placements, useTerminalSlotsStore, type SlotMode } from "../stores/terminalSlotsStore";
@@ -28,17 +28,18 @@ interface Props {
  */
 export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
   const ref = useRef<HTMLDivElement>(null);
-  const [origin, setOrigin] = useState({ left: 0, top: 0 });
   const slots = useTerminalSlotsStore((s) => s.slots);
+  const origin = useTerminalSlotsStore((s) => s.origin);
 
   // Slots publish viewport rects; the frames are placed relative to this
-  // layer, so follow where it sits.
+  // layer, so follow where it sits. The origin goes through the store so it
+  // lands in the same synchronous render as the slot rects (never a frame late).
   useLayoutEffect(() => {
     const el = ref.current?.parentElement;
     if (!el) return;
     const measure = () => {
       const r = el.getBoundingClientRect();
-      setOrigin((o) => (o.left === r.left && o.top === r.top ? o : { left: r.left, top: r.top }));
+      useTerminalSlotsStore.getState().setOrigin({ left: r.left, top: r.top });
     };
     measure();
     const ro = new ResizeObserver(measure);

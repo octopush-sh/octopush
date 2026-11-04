@@ -55,12 +55,24 @@ export function placements(
 interface TerminalSlotsStore {
   /** Keyed by the placeholder's own id. */
   slots: Record<string, SlotEntry>;
+  /** The host layer's viewport origin. Kept here, not in React state, so it
+   *  updates in the same synchronous render as the slot rects: a plain
+   *  `useState` origin rendered a frame late and drew the pane offset while
+   *  the canvas moved (the rail's width animation, a header height change). */
+  origin: { left: number; top: number };
   publish: (key: string, entry: SlotEntry) => void;
   withdraw: (key: string) => void;
+  setOrigin: (origin: { left: number; top: number }) => void;
 }
 
 export const useTerminalSlotsStore = create<TerminalSlotsStore>((set) => ({
   slots: {},
+  origin: { left: 0, top: 0 },
+
+  setOrigin: (origin) =>
+    set((s) =>
+      s.origin.left === origin.left && s.origin.top === origin.top ? s : { origin },
+    ),
 
   publish: (key, entry) =>
     set((s) => {

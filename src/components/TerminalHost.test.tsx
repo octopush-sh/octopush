@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { useEffect } from "react";
 import { TerminalHost } from "./TerminalHost";
 import { TerminalSlot } from "./TerminalSlot";
@@ -38,7 +38,7 @@ function frame(id: string): HTMLElement {
 
 describe("TerminalHost", () => {
   beforeEach(() => {
-    useTerminalSlotsStore.setState({ slots: {} });
+    useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
     for (const k of Object.keys(mounts)) delete mounts[k];
     vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(function (this: HTMLElement) {
       return this.hasAttribute("data-terminal-slot") ? domRect(40, 100, 600, 400) : domRect(0, 60, 1000, 700);
@@ -55,6 +55,16 @@ describe("TerminalHost", () => {
     expect(frame("A").style.height).toBe("400px");
     expect(screen.getByTestId("pane-B").dataset.shown).toBe("false");
     expect(frame("B").style.display).toBe("none");
+  });
+
+  it("places frames against the host origin from the store, in the same render", () => {
+    render(<Canvas mode="run" runId="A" />);
+    expect(useTerminalSlotsStore.getState().origin).toEqual({ left: 0, top: 60 });
+    // The canvas moves right and down (rail collapse, header growth): the
+    // frame follows in the very commit that updates the origin.
+    act(() => useTerminalSlotsStore.getState().setOrigin({ left: 20, top: 80 }));
+    expect(frame("A").style.left).toBe("20px");
+    expect(frame("A").style.top).toBe("20px");
   });
 
   it("uses only the active mode's slots", () => {
