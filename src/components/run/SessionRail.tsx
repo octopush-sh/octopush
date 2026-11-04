@@ -139,8 +139,10 @@ export function SessionRail({ workspaceId }: Props) {
       // hairline, panel ground) — one canonical chrome per concept.
       className="octo-fade-in flex w-[44px] shrink-0 flex-col items-center border-r border-octo-hairline bg-octo-panel py-2"
       // Flex siblings paint as atomic units, so the rail needs its own
-      // stacking context to keep the hover flyout above the terminal.
-      style={{ position: "relative", zIndex: 2 }}
+      // stacking context to keep the hover flyout above the terminal and
+      // above the paired panes' divider (z-10, RunPanes), which a narrow
+      // split can place under the flyout.
+      style={{ position: "relative", zIndex: 20 }}
     >
       {/* The cells scroll; the New control below never leaves the viewport,
           however many sessions a workspace accumulates. */}
