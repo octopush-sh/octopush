@@ -847,7 +847,7 @@ function App() {
   // The switcher belongs to the Run canvas of one workspace; leaving either
   // takes it with us rather than leaving a stale palette floating.
   useEffect(() => {
-    setSessionSwitcherOpen(false);
+    setSessionSwitcher(null);
   }, [activeWorkspaceId, activeMode]);
 
   const setMode = useCallback(
@@ -988,7 +988,18 @@ function App() {
       // (Settings, the command palette) the switcher stays shut rather than
       // opening underneath it: `isModalOpen()` is true for our own shell
       // too, hence the open/closed split.
-      toggleSessionSwitcher: () => setSessionSwitcherOpen((v) => (v ? false : !isModalOpen())),
+      toggleSessionSwitcher: () =>
+        setSessionSwitcher((v) => (v ? null : isModalOpen() ? null : "switch")),
+      // Open beside: the pairing switcher while a session is off screen,
+      // else an empty seat. Never under another dialog.
+      openBeside: () => {
+        if (!activeWorkspaceId || isModalOpen()) return false;
+        const store = useTerminalsStore.getState();
+        const action = store.besideAction(activeWorkspaceId);
+        if (action === "pair") setSessionSwitcher("pair");
+        else if (action === "seat") store.openBeside(activeWorkspaceId, null);
+        return action !== null;
+      },
       terminalIds: () =>
         activeWorkspaceId
           ? useTerminalsStore.getState().getTerminals(activeWorkspaceId).map((t) => t.id)
@@ -1177,8 +1188,10 @@ function App() {
   // band costs no extra IPC. The diff stat is only non-zero in review mode —
   // that is the only mode this component fetches `gitDiff` for — which is
   // also the only mode whose tail reads it.
-  // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too.
-  const [sessionSwitcherOpen, setSessionSwitcherOpen] = useState(false);
+  // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too;
+  // "pair" is its Open beside mode (⌘D, the rail flyout, an empty seat).
+  const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | null>(null);
+  const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
   const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
   const modeMetaText = useMemo(
@@ -1216,7 +1229,7 @@ function App() {
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
       <SessionAnchor
         workspaceId={activeWorkspaceId}
-        onOpen={() => setSessionSwitcherOpen(true)}
+        onOpen={() => setSessionSwitcher("switch")}
       />
     ) : activeMode === "review" && reviewParts && modeMetaText ? (
       <ReviewTail parts={reviewParts} label={modeMetaText} />
@@ -2117,11 +2130,11 @@ function App() {
                 <ErrorBoundary surface="Run">
                 <div className="flex h-full w-full min-h-0">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
-                    <SessionRail workspaceId={activeWorkspaceId} />
+                    <SessionRail workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
                   )}
                   <div className="relative min-w-0 flex-1">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
-                    <RunPanes workspaceId={activeWorkspaceId} />
+                    <RunPanes workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
                   )}
                   {activeWorkspace && terminals.length === 0 && (
                     <RunEmptyState
@@ -2468,11 +2481,12 @@ function App() {
       {/* Session switcher (⌘⌥K / the band anchor). Available with zero
           sessions too — its last row opens one, which is exactly what an empty
           workspace needs. */}
-      {sessionSwitcherOpen && activeWorkspaceId && (
-        <ErrorBoundary surface="Session switcher" variant="overlay" onDismiss={() => setSessionSwitcherOpen(false)}>
+      {sessionSwitcher && activeWorkspaceId && (
+        <ErrorBoundary surface="Session switcher" variant="overlay" onDismiss={() => setSessionSwitcher(null)}>
         <SessionSwitcher
           workspaceId={activeWorkspaceId}
-          onClose={() => setSessionSwitcherOpen(false)}
+          pairing={sessionSwitcher === "pair"}
+          onClose={() => setSessionSwitcher(null)}
         />
         </ErrorBoundary>
       )}

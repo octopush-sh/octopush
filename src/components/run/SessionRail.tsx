@@ -10,6 +10,8 @@ import { tourId } from "../../lib/tour/ids";
 
 interface Props {
   workspaceId: string;
+  /** Open beside: the pairing switcher, or an empty seat (App decides). */
+  onOpenBeside: () => void;
 }
 
 /**
@@ -33,7 +35,7 @@ interface Props {
  *
  * Design record: docs/superpowers/plans/2026-08-15-run-terminal-navigation-design.md
  */
-export function SessionRail({ workspaceId }: Props) {
+export function SessionRail({ workspaceId, onOpenBeside }: Props) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
   const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
   const setActive = useTerminalsStore((s) => s.setActive);
@@ -43,12 +45,10 @@ export function SessionRail({ workspaceId }: Props) {
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
   const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
-  // Re-render when the MRU moves: it decides what Open beside would seat.
-  useTerminalLayoutStore((s) => s.mruByWs[workspaceId]);
-  const openBeside = useTerminalsStore((s) => s.openBeside);
-  const besideCandidate = useTerminalsStore((s) => s.besideCandidate);
-  const candidateId = besideCandidate(workspaceId);
-  const canOpenBeside = candidateId !== null;
+  // Read on every render: `terminals` and `layout` above re-render the rail
+  // whenever either answer can change.
+  const canOpenBeside = useTerminalsStore.getState().besideAction(workspaceId) !== null;
+  const replaces = useTerminalsStore.getState().besideReplaces(workspaceId);
   // With more than one pane, the sessions on screen besides the focused one.
   const paired = (layout?.slots.length ?? 1) > 1;
   const shownIds = paired ? (layout?.slots ?? []) : [];
@@ -213,9 +213,8 @@ export function SessionRail({ workspaceId }: Props) {
               aria-current={shown ? "true" : undefined}
               tabIndex={active || (activeId === null && i === 0) ? 0 : -1}
               data-testid={`session-cell-${t.id}`}
-              // The demo hovers the session Open beside would seat, so the
-              // pane it opens is the cell it pointed at.
-              data-tour={t.id === candidateId ? tourId("run-session-cell") : undefined}
+              // The demo hovers the focused session's cell to reach Open beside.
+              data-tour={active ? tourId("run-session-cell") : undefined}
               // No native `title`: the flyout opens on the same hover (and on
               // focus) and already carries label, activity and jump key. The
               // aria-label keeps the cell named for assistive tech.
@@ -356,14 +355,18 @@ export function SessionRail({ workspaceId }: Props) {
                       type="button"
                       data-testid={`session-beside-${t.id}`}
                       data-tour={tourId("run-open-beside")}
-                      title="Show the last session you used that isn't on screen, beside the current pane"
+                      title={
+                        replaces
+                          ? "Choose the session for the focused pane · ⌘D"
+                          : "Choose a session to sit beside this one · ⌘D"
+                      }
                       onClick={() => {
                         closeFlyout(t.id);
-                        openBeside(workspaceId);
+                        onOpenBeside();
                       }}
                       className="font-mono text-[9px] uppercase tracking-[0.14em] text-octo-mute transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
                     >
-                      Open beside
+                      {replaces ? "Replace in the focused pane" : "Open beside"}
                     </button>
                   )}
                   {jump && (

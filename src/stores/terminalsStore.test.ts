@@ -885,28 +885,57 @@ describe("the single setActive path", () => {
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
   });
 
-  it("Open beside seats the most recently used session that is not on screen", () => {
+  it("Open beside puts the picked session in a new pane and focuses it", () => {
     seed(["a", "b", "c"], ["a"]);
-    useTerminalsStore.getState().setActive(ws, "b");
-    useTerminalsStore.getState().setActive(ws, "a");
-    expect(useTerminalsStore.getState().besideCandidate(ws)).toBe("b");
-    useTerminalsStore.getState().openBeside(ws);
-    expect(run().slots).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().besideAction(ws)).toBe("pair");
+    expect(useTerminalsStore.getState().besideReplaces(ws)).toBe(false);
+    useTerminalsStore.getState().openBeside(ws, "c");
+    expect(run().slots).toEqual(["a", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
+  });
+
+  it("Open beside replaces the focused pane once Run has no room left", () => {
+    seed(["a", "b", "c"], ["a", "b"], 1);
+    expect(useTerminalsStore.getState().besideReplaces(ws)).toBe(true);
+    useTerminalsStore.getState().openBeside(ws, "c");
+    expect(run().slots).toEqual(["a", "c"]);
+  });
+
+  it("with every session on screen, Open beside leaves one empty seat", () => {
+    seed(["a"], ["a"]);
+    expect(useTerminalsStore.getState().besideAction(ws)).toBe("seat");
+    useTerminalsStore.getState().openBeside(ws, null);
+    useTerminalsStore.getState().openBeside(ws, null);
+    expect(run().slots).toEqual(["a", null]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+    // Now the seat is there, Open beside opens the switcher for it.
+    expect(useTerminalsStore.getState().besideAction(ws)).toBe("pair");
+
+    seed(["a", "b"], ["a", "b"]);
+    expect(useTerminalsStore.getState().besideAction(ws)).toBeNull();
+  });
+
+  it("a new session beside goes straight into the empty seat", async () => {
+    seed(["a"], ["a", null], 0);
+    mockIpc.createTerminal.mockResolvedValueOnce(makeRecord(ws, "Terminal 2", 1));
+    const t = await useTerminalsStore.getState().createBeside(ws);
+    expect(run().slots).toEqual(["a", t.id]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe(t.id);
+  });
+
+  it("deleting the last shown session beside an empty seat takes a neighbour", async () => {
+    seed(["a", "b"], ["a", null], 1);
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "a");
+    expect(run().slots).toEqual(["b"]);
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
   });
 
-  it("Open beside falls back to rail order for sessions never used", () => {
-    seed(["a", "b", "c"], ["b"]);
-    expect(useTerminalsStore.getState().besideCandidate(ws)).toBe("a");
-  });
-
-  it("Open beside offers nothing with two panes, or with every session on screen", () => {
-    seed(["a", "b", "c"], ["a", "b"]);
-    expect(useTerminalsStore.getState().besideCandidate(ws)).toBeNull();
-    useTerminalsStore.getState().openBeside(ws);
-    expect(run().slots).toEqual(["a", "b"]);
-
-    seed(["a"], ["a"]);
-    expect(useTerminalsStore.getState().besideCandidate(ws)).toBeNull();
+  it("deleting a focused shown session never picks one already on screen", async () => {
+    seed(["a", "b", "c"], ["a", "b"], 0);
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "a");
+    expect(run().slots).toEqual(["b"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
   });
 });

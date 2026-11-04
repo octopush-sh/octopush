@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach } from "vitest";
 import {
   EMPTY_RUN_LAYOUT,
   assign,
+  besideAction,
+  besideReplaces,
+  besideSlot,
   focus,
   focusedId,
   leave,
@@ -63,6 +66,31 @@ describe("terminalLayout reducers", () => {
     expect(openBeside(seated, null)).toBe(seated);
     const full = layout(["A", "B", "C", "D"]);
     expect(openBeside(full, null)).toBe(full);
+  });
+
+  it("openBeside honours a lower pane cap", () => {
+    expect(openBeside(layout(["A", "B"], 1), "C", 2).slots).toEqual(["A", "C"]);
+    const two = layout(["A", "B"]);
+    expect(openBeside(two, null, 2)).toBe(two);
+  });
+
+  it("besideSlot picks the seat, else the end, else the focused pane", () => {
+    expect(besideSlot(layout(["A", null]))).toBe(1);
+    expect(besideSlot(layout(["A", "B"]))).toBe(2);
+    expect(besideSlot(layout(["A", "B", "C", "D"], 3))).toBe(3);
+    expect(besideReplaces(layout(["A", "B", "C", "D"]))).toBe(true);
+    expect(besideReplaces(layout(["A", "B", null, "D"]))).toBe(false);
+    expect(besideReplaces(layout(["A", "B"]), 2)).toBe(true);
+  });
+
+  it("besideAction pairs while a session is hidden, else leaves a seat", () => {
+    expect(besideAction(layout(["A"]), true)).toBe("pair");
+    expect(besideAction(layout(["A"]), false)).toBe("seat");
+    // The seat is already there: the switcher can only open a session into it.
+    expect(besideAction(layout(["A", null]), false)).toBe("pair");
+    expect(besideAction(layout(["A", "B", "C", "D"]), false)).toBeNull();
+    expect(besideAction(layout(["A", "B", "C", "D"]), true)).toBe("pair");
+    expect(besideAction(layout([null]), true)).toBeNull();
   });
 
   it("leave shifts later slots down and hands focus to the next pane", () => {

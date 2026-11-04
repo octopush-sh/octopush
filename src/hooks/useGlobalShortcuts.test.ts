@@ -51,6 +51,7 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     toggleCompanion: vi.fn(),
     openSettings: vi.fn(),
     toggleSessionSwitcher: vi.fn(),
+    openBeside: vi.fn(() => true),
     terminalIds: () => ["t1", "t2", "t3"],
     shownTerminalIds: () => ["t1"],
     activeTerminalId: () => "t1",
@@ -277,6 +278,33 @@ describe("handleShortcut", () => {
       const both = ctx({ modeNow: "run", terminalIds: () => ["t1", "t2"], shownTerminalIds: () => ["t1", "t2"] });
       handleShortcut(press({ key: "ArrowRight", alt: true }), both);
       expect(both.setActiveTerminal).not.toHaveBeenCalled();
+    });
+
+    it("⌘D opens beside in Run by physical key, and leaves the key alone elsewhere", () => {
+      const c = ctx({ modeNow: "run" });
+      const e = press({ key: "d", code: "KeyD" });
+      handleShortcut(e, c);
+      expect(c.openBeside).toHaveBeenCalledTimes(1);
+      expect(e.preventDefault).toHaveBeenCalled();
+      // ⌘⇧D stays Direct.
+      expect(idOf({ key: "D", code: "KeyD", shift: true })).toBe("mode-direct");
+
+      const talk = ctx({ modeNow: "talk" });
+      const t = press({ key: "d", code: "KeyD" });
+      handleShortcut(t, talk);
+      expect(talk.openBeside).not.toHaveBeenCalled();
+      expect(t.preventDefault).not.toHaveBeenCalled();
+
+      // Nothing to open beside: the key is left alone.
+      const none = ctx({ modeNow: "run", openBeside: vi.fn(() => false) });
+      const n = press({ key: "d", code: "KeyD" });
+      handleShortcut(n, none);
+      expect(n.preventDefault).not.toHaveBeenCalled();
+
+      // A focused editor that handled ⌘D (next occurrence) keeps it.
+      const ed = ctx({ modeNow: "run" });
+      handleShortcut(press({ key: "d", code: "KeyD", defaultPrevented: true }), ed);
+      expect(ed.openBeside).not.toHaveBeenCalled();
     });
 
     it("⌘[ / ⌘] move focus between panes, only with two or more", () => {

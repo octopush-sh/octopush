@@ -77,21 +77,49 @@ export function assign(layout: RunLayout, slot: number, id: string | null): RunL
   return withSlots(layout, slots, slot);
 }
 
+/** True when Open beside has no seat and no room left (`max` panes, none
+ *  empty): a pick then replaces the session in the focused pane. */
+export function besideReplaces(layout: RunLayout, max = MAX_SLOTS): boolean {
+  return !layout.slots.includes(null) && layout.slots.length >= max;
+}
+
+/** The slot Open beside fills: the first empty seat, else a new slot at the
+ *  end, else (no room) the focused pane. */
+export function besideSlot(layout: RunLayout, max = MAX_SLOTS): number {
+  const seat = layout.slots.indexOf(null);
+  if (seat !== -1) return seat;
+  return besideReplaces(layout, max) ? layout.focused : layout.slots.length;
+}
+
+/**
+ * What Open beside does now: `"pair"` opens the pairing switcher, `"seat"`
+ * appends an empty seat (every session is already on screen), null nothing
+ * (no session on screen yet, or no room and nothing to bring in).
+ * `hasHidden` is whether any session is not on screen.
+ */
+export function besideAction(
+  layout: RunLayout,
+  hasHidden: boolean,
+  max = MAX_SLOTS,
+): "pair" | "seat" | null {
+  if (layout.slots.every((id) => id === null)) return null;
+  if (hasHidden || layout.slots.includes(null)) return "pair";
+  return layout.slots.length < max ? "seat" : null;
+}
+
 /**
  * Open beside: `id` goes in the first empty seat, else a new slot at the end;
- * with four panes and no empty seat it replaces the focused pane. `null` adds
- * an empty seat (at most one, never a fifth slot) and keeps focus.
+ * with `max` panes and no empty seat it replaces the focused pane. `null` adds
+ * an empty seat (at most one, never past `max`) and keeps focus.
  */
-export function openBeside(layout: RunLayout, id: string | null): RunLayout {
+export function openBeside(layout: RunLayout, id: string | null, max = MAX_SLOTS): RunLayout {
   const seat = layout.slots.indexOf(null);
   if (id === null) {
-    if (seat !== -1 || layout.slots.length >= MAX_SLOTS) return layout;
+    if (seat !== -1 || layout.slots.length >= max) return layout;
     return withSlots(layout, [...layout.slots, null], layout.focused);
   }
-  if (layout.slots.includes(id)) return assign(layout, layout.focused, id);
-  if (seat !== -1) return assign(layout, seat, id);
-  if (layout.slots.length < MAX_SLOTS) return assign(layout, layout.slots.length, id);
-  return assign(layout, layout.focused, id);
+  if (layout.slots.includes(id)) return assign(layout, layout.slots.indexOf(id), id);
+  return assign(layout, besideSlot(layout, max), id);
 }
 
 /**

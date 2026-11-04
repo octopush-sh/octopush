@@ -16,6 +16,7 @@ const mockIpc = {
 vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
+const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
 const { SessionSwitcher } = await import("./SessionSwitcher");
 
 const WS = "ws-switcher";
@@ -43,7 +44,86 @@ function seed(
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {} });
   vi.clearAllMocks();
+});
+
+/** Put `slots` on screen, focusing `focused`. */
+function show(slots: (string | null)[], focused = 0) {
+  useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots, focused }));
+}
+const slots = () => useTerminalLayoutStore.getState().getRun(WS).slots;
+
+describe("SessionSwitcher — pairing", () => {
+  it("asks which session sits beside and lists only sessions not on screen", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    expect(screen.getByPlaceholderText("Which session sits beside this one?")).toBeTruthy();
+    expect(screen.queryByTestId("session-switcher-row-a")).toBeNull();
+    // Rows keep their rail number.
+    expect(screen.getByTestId("session-switcher-row-c").textContent).toContain("3");
+    expect(screen.getByTestId("session-switcher-new").textContent).toBe("Open a new session beside");
+    expect(screen.queryByTestId("session-switcher-replaces")).toBeNull();
+  });
+
+  it("puts the pick in a new pane beside, then closes", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} pairing />);
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Enter" });
+    expect(slots()).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("b");
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("says a pick replaces the focused pane when there is no room left", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a", "b"], 0);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    expect(screen.getByTestId("session-switcher-replaces").textContent).toBe(
+      "Replaces the session in the focused pane",
+    );
+    fireEvent.click(screen.getByTestId("session-switcher-row-c"));
+    expect(slots()).toEqual(["c", "b"]);
+  });
+
+  it("opens a new session straight into the empty seat", () => {
+    seed([{ id: "a", label: "main" }]);
+    show(["a", null]);
+    mockIpc.createTerminal.mockResolvedValue({ id: "new", label: "Terminal 2", position: 1 });
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    fireEvent.click(screen.getByTestId("session-switcher-new"));
+    expect(mockIpc.createTerminal).toHaveBeenCalledWith(WS, "Terminal 2");
+  });
+
+  it("still closes the selected session with Backspace on an empty query", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    mockIpc.deleteTerminal.mockResolvedValue(undefined);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
+  });
+
+  it("⌥⏎ in ⌘⌥K opens the selected session beside instead of switching", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} />);
+
+    const input = screen.getByTestId("session-switcher-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter", altKey: true });
+    expect(slots()).toEqual(["a", "b"]);
+    expect(onClose).toHaveBeenCalled();
+  });
 });
 
 describe("SessionSwitcher", () => {

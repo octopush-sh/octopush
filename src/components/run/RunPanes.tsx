@@ -18,6 +18,8 @@ import { FadeSwap } from "../primitives/FadeSwap";
 
 interface Props {
   workspaceId: string;
+  /** Open beside: the pairing switcher, here for the empty seat. */
+  onOpenBeside: () => void;
 }
 
 const STEP = 0.05;
@@ -27,13 +29,15 @@ const FINE_STEP = 0.01;
  * Run's panes (docs/superpowers/specs/2026-11-03-run-session-pair-design.md).
  * One pane is today's full canvas. Two sit side by side, each under a caption
  * naming its session, split by a 1px divider. Each pane is only a
- * `TerminalSlot`: `TerminalHost` draws the session's terminal over it.
+ * `TerminalSlot`: `TerminalHost` draws the session's terminal over it. An
+ * empty seat (at most one) invites a session instead.
  */
-export function RunPanes({ workspaceId }: Props) {
+export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   const resizing = useTerminalLayoutStore((s) => s.resizing);
   const updateLayout = useTerminalsStore((s) => s.updateLayout);
+  const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const rowRef = useRef<HTMLDivElement>(null);
 
   const slots = layout?.slots ?? [activeId];
@@ -130,17 +134,60 @@ export function RunPanes({ workspaceId }: Props) {
               slot={i}
               terminalId={id}
               focused={i === layout.focused}
-              others={slots.map((other, j) => ({ slot: j, id: other })).filter((o) => o.slot !== i)}
+              others={slots
+                .map((other, j) => ({ slot: j, id: other }))
+                .filter((o) => o.slot !== i && o.id !== null)}
               onFocus={() => updateLayout(workspaceId, (l) => focus(l, i))}
               onSwap={(j) => updateLayout(workspaceId, (l) => swap(l, i, j))}
               onLeave={() => updateLayout(workspaceId, (l) => leave(l, i))}
             />
             <div className="relative min-h-0 flex-1">
-              <TerminalSlot mode="run" terminalId={id} />
+              {id === null ? (
+                <EmptySeat
+                  onOpen={() => {
+                    updateLayout(workspaceId, (l) => focus(l, i));
+                    onOpenBeside();
+                  }}
+                  onCreate={() => createTerminal(workspaceId, undefined, i).catch(console.error)}
+                />
+              ) : (
+                <TerminalSlot mode="run" terminalId={id} />
+              )}
             </div>
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * The empty seat Open beside leaves when every session is already on screen.
+ * A click anywhere opens the pairing switcher for it; the CTA opens a new
+ * session straight into it.
+ */
+function EmptySeat({ onOpen, onCreate }: { onOpen: () => void; onCreate: () => void }) {
+  return (
+    <div
+      data-testid="run-empty-seat"
+      data-tour={tourId("run-empty-seat")}
+      title="Choose a session for this seat · ⌘D"
+      onClick={onOpen}
+      className="octo-fade-in flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 px-6 text-center"
+    >
+      <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">Beside</span>
+      <p className="font-serif text-[15px] text-octo-ivory">Bring a session alongside.</p>
+      <button
+        type="button"
+        data-testid="run-empty-seat-new"
+        onClick={(e) => {
+          e.stopPropagation();
+          onCreate();
+        }}
+        className="rounded-lg border border-octo-hairline px-3 py-2 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+      >
+        Open a new session here
+      </button>
     </div>
   );
 }
