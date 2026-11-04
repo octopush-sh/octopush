@@ -1248,7 +1248,7 @@ b3cb9b927473b3edc2fc19b5f5114ea223e90e4c2fc8d7ef990d785e4caaa8a2b9a19f33843df690
         assert_eq!(built[0], leaf.as_ref());
         assert_eq!(built[1], intermediates[0].as_ref());
 
-        let v =DenylistVerifier::platform(rustls_platform_verifier::Verifier::new(provider).unwrap());
+        let v = DenylistVerifier::platform(rustls_platform_verifier::Verifier::new(provider).unwrap());
         v.verify_server_cert(&leaf, &intermediates, &name, &[], now).expect("production verifier accepts");
         // And the hostname is enforced on the same chain.
         let other = ServerName::try_from("example.com").unwrap();
