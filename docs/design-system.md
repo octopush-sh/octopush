@@ -68,7 +68,7 @@ Code highlighting uses palette inks only, no syntax-only hues. One table, `src/l
 
 State-blue and state-purple have no `ThemeConfig` field, so `themeStore` switches them with the ground: the Onyx values on a dark theme, `vellumInks` from `tokens.ts` on a light one (`#2f5a7e` / `#6a4682`, AA on every Vellum surface). Verdigris and amber are ThemeConfig inks already. `contrast.test.ts` holds both themes' syntax inks to 4.5:1, and `syntaxPalette.coverage.test.ts` fails if a supported language emits a tag with no rule.
 
-A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris about 3.4:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
+A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris falls below 4.5:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
 
 ---
 

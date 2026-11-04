@@ -98,7 +98,7 @@ export const DIFF_TINT_TARGET = 1.11;
 
 /** Fill alphas of a changed word inside a diff row (`--verdigris-strong`,
  *  `--rouge-strong`), on top of the row's own tint. A fill this strong costs
- *  the dark syntax inks AA on cream (verdigris lands near 3.4:1 on Vellum) and
+ *  the dark syntax inks AA on cream (verdigris lands below 4.5:1 on Vellum) and
  *  the dim ones AA on onyx, so `.wd-add` / `.wd-del` own their foreground
  *  (theme text), as a search match does. */
 export const WORD_DIFF_ADD_ALPHA = 0.3;
