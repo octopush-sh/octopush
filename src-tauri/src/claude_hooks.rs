@@ -10,7 +10,8 @@
 //! Everything is gated on Settings' `claudeHooksEnabled` (off by default) and
 //! on a known Claude Code version at or above the tested floor; otherwise the
 //! terminal bell/idle heuristic is unchanged. Once a terminal has delivered a
-//! hook signal, the daemon's idle heuristic stays quiet for it.
+//! hook signal, the daemon's idle heuristic stays quiet for it while the
+//! setting is on.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -18,6 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -34,6 +36,9 @@ pub const EXCLUDE_LINE: &str = "/.claude/settings.local.json";
 const EXCLUDE_COMMENT: &str = "# added by Octopush (Claude Code hooks)";
 
 const POLL_EVERY: Duration = Duration::from_secs(1);
+/// A queued signal older than this is dropped, not delivered: PTYs outlive
+/// the app, so a relaunch would otherwise replay prompts answered long ago.
+const STALE_AFTER_SECS: i64 = 10;
 /// Hook payloads are a few hundred bytes; anything past this isn't one.
 pub const MAX_PAYLOAD: u64 = 1 << 20;
 
@@ -58,10 +63,17 @@ pub fn install_for_workspace(db: &Mutex<Db>, ws: &WorkspaceRow, hook_bin: &Path)
     if !hooks_enabled() || !agent_adapter::claude_cli_version().supports_hooks() {
         return false;
     }
-    // Without the exclude the file would show in Review and in crew commits.
-    if let Err(e) = ensure_local_settings_excluded(&wt) {
-        tracing::warn!(workspace = %ws.id, error = %e, "info/exclude not writable; Claude Code hooks skipped");
-        return false;
+    // Unless git ignores the file, it would show in Review and in crew commits.
+    match keep_local_settings_out_of_git(&wt) {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::info!(workspace = %ws.id, "settings.local.json is tracked; Claude Code hooks skipped");
+            return false;
+        }
+        Err(e) => {
+            tracing::warn!(workspace = %ws.id, error = %e, "info/exclude not writable; Claude Code hooks skipped");
+            return false;
+        }
     }
     match agent_adapter::install_claude_hooks(&wt, hook_bin) {
         Ok(installed) => installed,
@@ -88,6 +100,17 @@ pub fn remove_for_workspace(db: &Mutex<Db>, workspace_id: &str, worktree_path: O
 pub fn ensure_local_settings_excluded(worktree: &Path) -> std::io::Result<()> {
     let repo = git2::Repository::open(worktree).map_err(std::io::Error::other)?;
     append_exclude(&common_dir(repo.path())?.join("info").join("exclude"))
+}
+
+/// [`ensure_local_settings_excluded`], then whether git now keeps the file
+/// out of the worktree's changes: ignored and not in the index. `info/exclude`
+/// doesn't apply to a tracked file, so a repo that commits it gets `false`.
+fn keep_local_settings_out_of_git(worktree: &Path) -> std::io::Result<bool> {
+    ensure_local_settings_excluded(worktree)?;
+    let repo = git2::Repository::open(worktree).map_err(std::io::Error::other)?;
+    let rel = Path::new(agent_adapter::LOCAL_SETTINGS_FILE);
+    let tracked = repo.index().map_err(std::io::Error::other)?.get_path(rel, 0).is_some();
+    Ok(!tracked && repo.status_should_ignore(rel).map_err(std::io::Error::other)?)
 }
 
 /// The shared git dir for `git_dir`, resolved as git resolves
@@ -135,21 +158,56 @@ fn hooked() -> &'static Mutex<HashSet<String>> {
     HOOKED.get_or_init(Default::default)
 }
 
-/// Whether `terminal` has delivered a hook signal this app session — then
-/// the daemon's idle heuristic stays quiet for it (also after a `Stop`).
+/// Whether `terminal` has delivered a hook signal this app session and the
+/// setting is still on — then the daemon's idle heuristic stays quiet for it
+/// (also after a `Stop`). Turning the setting off gives it the heuristic back.
 pub fn has_hook_signals(terminal: &str) -> bool {
-    hooked().lock().contains(terminal)
+    let known = hooked().lock().contains(terminal);
+    suppress_idle(known, hooks_enabled)
+}
+
+/// The reader thread's check: drop the daemon's idle attention only for a
+/// hooked terminal while the setting is on. `enabled` (a settings read) runs
+/// only for a hooked terminal.
+fn suppress_idle(hooked: bool, enabled: impl FnOnce() -> bool) -> bool {
+    hooked && enabled()
 }
 
 /// The rows to deliver, in order. With the toggle off, none: hooks a user
-/// installed earlier then change nothing.
-fn deliverable(rows: Vec<HookSignalRow>, enabled: bool) -> Vec<(String, HookSignal)> {
+/// installed earlier then change nothing. Rows older than
+/// [`STALE_AFTER_SECS`] (or with an unreadable time) are dropped.
+fn deliverable(rows: Vec<HookSignalRow>, enabled: bool, now: DateTime<Utc>) -> Vec<(String, HookSignal)> {
     if !enabled {
         return Vec::new();
     }
     rows.into_iter()
+        .filter(|r| is_fresh(&r.created_at, now))
         .filter_map(|r| Some((r.terminal_id, HookSignal::parse(&r.signal)?)))
         .collect()
+}
+
+fn is_fresh(created_at: &str, now: DateTime<Utc>) -> bool {
+    DateTime::parse_from_rfc3339(created_at)
+        .is_ok_and(|t| now - t.with_timezone(&Utc) <= chrono::Duration::seconds(STALE_AFTER_SECS))
+}
+
+/// What the poller emits for one delivered row.
+#[derive(Debug, PartialEq)]
+enum HookEmit {
+    /// `pty://attention` with this `reason`.
+    Attention(&'static str),
+    /// `pty://settled`.
+    Settled,
+}
+
+/// The poller's per-row step: `terminal` now reports through hooks, and
+/// `signal` becomes the event to emit.
+fn deliver_one(hooked: &mut HashSet<String>, terminal: &str, signal: HookSignal) -> HookEmit {
+    hooked.insert(terminal.to_string());
+    match signal {
+        HookSignal::Settled => HookEmit::Settled,
+        s => HookEmit::Attention(s.as_str()),
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -183,11 +241,13 @@ pub fn spawn_poller(app: AppHandle, db: Arc<Mutex<Db>>) {
             if rows.is_empty() {
                 continue;
             }
-            for (terminal, signal) in deliverable(rows, hooks_enabled()) {
-                hooked().lock().insert(terminal.clone());
-                let _ = match signal {
-                    HookSignal::Settled => app.emit("pty://settled", HookSettledEvent { session_id: terminal }),
-                    s => app.emit("pty://attention", HookAttentionEvent { session_id: terminal, reason: s.as_str() }),
+            for (terminal, signal) in deliverable(rows, hooks_enabled(), Utc::now()) {
+                let emit = deliver_one(&mut hooked().lock(), &terminal, signal);
+                let _ = match emit {
+                    HookEmit::Settled => app.emit("pty://settled", HookSettledEvent { session_id: terminal }),
+                    HookEmit::Attention(reason) => {
+                        app.emit("pty://attention", HookAttentionEvent { session_id: terminal, reason })
+                    }
                 };
             }
         }
@@ -246,7 +306,7 @@ mod tests {
         std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
         repo.worktree("feat", &wt, None).unwrap();
 
-        ensure_local_settings_excluded(&wt).unwrap();
+        assert!(keep_local_settings_out_of_git(&wt).unwrap(), "untracked and ignored");
         let exclude = std::fs::read_to_string(main.join(".git/info/exclude")).unwrap();
         assert!(exclude.lines().any(|l| l == EXCLUDE_LINE), "{exclude}");
 
@@ -296,10 +356,63 @@ mod tests {
         assert!(db.drain_hook_signals().unwrap().is_empty(), "a drained row is delivered once");
         assert!(!format!("{rows:?}").contains("secret text"), "message text is never stored");
 
-        assert!(deliverable(rows.clone(), false).is_empty(), "toggle off delivers nothing");
-        assert_eq!(deliverable(rows, true), [
+        assert!(deliverable(rows.clone(), false, Utc::now()).is_empty(), "toggle off delivers nothing");
+        assert_eq!(deliverable(rows, true, Utc::now()), [
             ("t1".to_string(), HookSignal::NeedsPermission),
             ("t1".to_string(), HookSignal::Settled),
         ]);
+    }
+
+    #[test]
+    fn signals_queued_while_the_app_was_closed_are_dropped() {
+        let now = Utc::now();
+        let row = |id: i64, terminal: &str, age_secs: i64| HookSignalRow {
+            id,
+            terminal_id: terminal.to_string(),
+            signal: "permission".to_string(),
+            session_id: None,
+            created_at: (now - chrono::Duration::seconds(age_secs)).to_rfc3339(),
+        };
+        let mut unreadable = row(4, "t4", 0);
+        unreadable.created_at = "yesterday".to_string();
+        let rows = vec![row(1, "t1", 3600), row(2, "t2", STALE_AFTER_SECS + 1), row(3, "t3", 1), unreadable];
+        assert_eq!(deliverable(rows, true, now), [("t3".to_string(), HookSignal::NeedsPermission)]);
+    }
+
+    #[test]
+    fn a_hooked_terminal_gets_its_attention_from_hooks_alone_while_the_setting_is_on() {
+        let mut hooked = HashSet::new();
+        assert_eq!(deliver_one(&mut hooked, "t1", HookSignal::NeedsPermission), HookEmit::Attention("permission"));
+        assert_eq!(deliver_one(&mut hooked, "t1", HookSignal::NeedsInput), HookEmit::Attention("input"));
+        assert_eq!(deliver_one(&mut hooked, "t1", HookSignal::Settled), HookEmit::Settled);
+
+        // After `Stop`, the daemon's idle ping for t1 stays dropped.
+        assert!(suppress_idle(hooked.contains("t1"), || true));
+        // A terminal without hooks keeps the heuristic, without a settings read.
+        assert!(!suppress_idle(hooked.contains("t2"), || panic!("read settings for an unhooked terminal")));
+        // Turning the setting off gives the hooked terminal its heuristic back.
+        assert!(!suppress_idle(hooked.contains("t1"), || false));
+    }
+
+    #[test]
+    fn a_committed_settings_file_is_never_installed_into() {
+        let root = tempfile::tempdir().unwrap();
+        let main = root.path().join("project");
+        let repo = git2::Repository::init(&main).unwrap();
+        let rel = Path::new(agent_adapter::LOCAL_SETTINGS_FILE);
+        std::fs::create_dir_all(main.join(".claude")).unwrap();
+        std::fs::write(main.join(rel), "{}\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(rel).unwrap();
+        index.write().unwrap();
+        let sig = git2::Signature::now("t", "t@example.com").unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        let wt = root.path().join(".octopus-worktrees").join("feat");
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        repo.worktree("feat", &wt, None).unwrap();
+        assert!(wt.join(rel).is_file(), "the worktree checks out the committed file");
+
+        assert!(!keep_local_settings_out_of_git(&wt).unwrap(), "a tracked file isn't kept out by info/exclude");
     }
 }

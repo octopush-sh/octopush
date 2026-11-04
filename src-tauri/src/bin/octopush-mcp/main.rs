@@ -5,8 +5,14 @@
 //! inspect pipelines / projects / workspaces / runs, author DIRECT-mode
 //! pipeline templates, stage runs in `draft`, and create workspaces. It drives
 //! the same local SQLite store the desktop app uses, so it works whether or
-//! not the app is running. It never executes runs or spends tokens; the only
-//! git mutation it performs is creating a workspace's worktree.
+//! not the app is running. It never executes runs or spends tokens. Its only
+//! writes outside the database come with `create_workspace`: the worktree
+//! itself and, when the Claude Code hooks setting is on (#287), one line in
+//! the repo's shared `info/exclude` and `<worktree>/.claude/settings.local.json`.
+//!
+//! Run as `octopush-mcp hook --octopush-hook` (what those hooks call), it is
+//! not an MCP server: it reads one hook payload from stdin, queues one
+//! `hook_signals` row in the database and exits.
 //!
 //! The loop is deliberately synchronous: stdio MCP is one JSON object per line,
 //! and a single rusqlite connection is neither needed on multiple threads nor

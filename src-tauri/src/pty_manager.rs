@@ -337,7 +337,7 @@ fn start_reader_thread(
                         break;
                     }
                     // A terminal whose Claude Code reports through hooks
-                    // gets its attention from them alone.
+                    // gets its attention from them alone (while the setting is on).
                     Ok(TermEvent::Attention) if crate::claude_hooks::has_hook_signals(&id) => {}
                     Ok(TermEvent::Attention) => {
                         let _ = app.emit(
