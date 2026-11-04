@@ -10,6 +10,7 @@ import {
   assign,
   focusedId,
   leave,
+  openBeside,
   prune,
   useTerminalLayoutStore,
   type RunLayout,
@@ -55,6 +56,10 @@ export interface TerminalState {
 
 // Stable empty list — returning a new array per call would bust React memo.
 const EMPTY_TERMINALS: TerminalState[] = [];
+
+/** Panes Run lays out for now: two side by side. Three and four come with the
+ *  grid (spec "PR plan", row 4). */
+export const RUN_PANES = 2;
 
 // ─── Module-level bookkeeping ─────────────────────────────────────
 
@@ -123,6 +128,12 @@ interface TerminalsStore {
   setActive: (workspaceId: string, id: string | null) => void;
   /** The one path that changes Run's layout; derives `activeByWs` from it. */
   updateLayout: (workspaceId: string, fn: (layout: RunLayout) => RunLayout) => void;
+  /** The session *Open beside* would seat: the most recently used one that
+   *  is not on screen (else the first such in rail order), or null when
+   *  there is none or Run already shows `RUN_PANES` panes. */
+  besideCandidate: (workspaceId: string) => string | null;
+  /** Seat `besideCandidate` beside the focused pane and focus it. */
+  openBeside: (workspaceId: string) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
@@ -380,6 +391,26 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     const byWs = get().activeByWs;
     if (workspaceId in byWs && byWs[workspaceId] === id) return;
     set((s) => ({ activeByWs: { ...s.activeByWs, [workspaceId]: id } }));
+  },
+
+  besideCandidate: (workspaceId) => {
+    const terminals = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+    const layouts = useTerminalLayoutStore.getState();
+    const shown = workspaceId in layouts.runByWs
+      ? layouts.getRun(workspaceId).slots
+      : [get().activeByWs[workspaceId] ?? null];
+    if (shown.length >= RUN_PANES || shown.every((id) => id === null)) return null;
+    const exists = (id: string) => terminals.some((t) => t.id === id);
+    return (
+      layouts.recentNotShown(workspaceId, exists) ??
+      terminals.find((t) => !shown.includes(t.id))?.id ??
+      null
+    );
+  },
+
+  openBeside: (workspaceId) => {
+    const id = get().besideCandidate(workspaceId);
+    if (id) get().updateLayout(workspaceId, (layout) => openBeside(layout, id));
   },
 
   markRunning: (workspaceId, id, running) =>

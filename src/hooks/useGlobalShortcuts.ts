@@ -31,12 +31,17 @@ export interface ShortcutContext {
   /** The active workspace's checked-out branch (`"HEAD"` when detached), or null. */
   activeBranch: () => string | null;
   openSearch: (mode: "files" | "text") => void;
-  bumpLayout: () => void;
+  /** ⌘\: collapse or expand the Companion (over the panes while Run is split). */
+  toggleCompanion: () => void;
   openSettings: (tab: "general" | "usage") => void;
   toggleSessionSwitcher: () => void;
   terminalIds: () => readonly string[];
+  /** The sessions in Run's panes, in reading order (empty seats are null). */
+  shownTerminalIds: () => readonly (string | null)[];
   activeTerminalId: () => string | null;
   setActiveTerminal: (id: string) => void;
+  /** Move focus to the previous (-1) or next (1) Run pane, wrapping. */
+  stepPaneFocus: (step: -1 | 1) => void;
 }
 
 export interface Shortcut {
@@ -200,7 +205,7 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     chords: ["⌘\\"],
     scope: "global",
     keys: ["\\"],
-    run: (_e, c) => (c.bumpLayout(), true),
+    run: (_e, c) => (c.toggleCompanion(), true),
   },
   {
     id: "settings",
@@ -236,7 +241,8 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     },
   },
   {
-    // Previous / next session, wrapping.
+    // Previous / next session in the focused pane, wrapping. Sessions in the
+    // other panes are skipped: a session is on screen at most once.
     id: "session-step",
     chords: ["⌘⌥←", "⌘⌥→"],
     scope: "run",
@@ -245,9 +251,11 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     keys: ["ArrowLeft", "ArrowRight"],
     run: (e, c) => {
       if (!c.activeWorkspaceId) return false;
-      const ids = c.terminalIds();
+      const active = c.activeTerminalId();
+      const shown = c.shownTerminalIds();
+      const ids = c.terminalIds().filter((id) => id === active || !shown.includes(id));
       if (ids.length < 2) return false;
-      const at = ids.indexOf(c.activeTerminalId() ?? "");
+      const at = ids.indexOf(active ?? "");
       const step = e.key === "ArrowRight" ? 1 : -1;
       const next = ids[(at + step + ids.length) % ids.length];
       if (next) c.setActiveTerminal(next);
@@ -268,6 +276,22 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
         const id = c.terminalIds()[n - 1];
         if (id) c.setActiveTerminal(id);
       }
+      return true;
+    },
+  },
+  {
+    // Previous / next pane in reading order. The physical bracket keys, so
+    // layouts that print something else there (ISO, Spanish) behave the same.
+    // ⌘⌥[ / ⌘⌥] stay the editor's fold keys.
+    id: "pane-focus",
+    chords: ["⌘[", "⌘]"],
+    scope: "run",
+    shift: false,
+    alt: false,
+    codes: ["BracketLeft", "BracketRight"],
+    run: (e, c) => {
+      if (!c.activeWorkspaceId || c.shownTerminalIds().length < 2) return false;
+      c.stepPaneFocus(e.code === "BracketLeft" ? -1 : 1);
       return true;
     },
   },

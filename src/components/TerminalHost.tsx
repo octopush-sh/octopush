@@ -11,6 +11,8 @@ interface Props {
   /** Renders one session's `TerminalPane`; `shown` is whether it has a slot
    *  in the active mode. */
   renderPane: (terminalId: string, shown: boolean) => ReactNode;
+  /** A shown pane was clicked or took keyboard focus. */
+  onPaneFocus?: (terminalId: string) => void;
 }
 
 /**
@@ -26,7 +28,7 @@ interface Props {
  * so Try again stays clickable. Try again remounts the panes, which reattach
  * to their PTYs in the daemon.
  */
-export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
+export function TerminalHost({ mode, terminalIds, renderPane, onPaneFocus }: Props) {
   const ref = useRef<HTMLDivElement>(null);
   const slots = useTerminalSlotsStore((s) => s.slots);
   const origin = useTerminalSlotsStore((s) => s.origin);
@@ -63,7 +65,11 @@ export function TerminalHost({ mode, terminalIds, renderPane }: Props) {
             <div
               key={id}
               data-terminal-frame={id}
-              className="absolute overflow-hidden"
+              // A frame leaving `display:none` replays the fade, so a pane
+              // that comes on screen never appears abruptly.
+              className="octo-fade-in absolute overflow-hidden"
+              onPointerDownCapture={rect ? () => onPaneFocus?.(id) : undefined}
+              onFocusCapture={rect ? () => onPaneFocus?.(id) : undefined}
               style={
                 rect
                   ? {

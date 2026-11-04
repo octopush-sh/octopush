@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
+import { useTerminalLayoutStore } from "../../stores/terminalLayoutStore";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { ROLE_WORD } from "../../lib/sessionRole";
@@ -41,6 +42,16 @@ export function SessionRail({ workspaceId }: Props) {
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
   const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
+  // Re-render when the MRU moves: it decides what Open beside would seat.
+  useTerminalLayoutStore((s) => s.mruByWs[workspaceId]);
+  const openBeside = useTerminalsStore((s) => s.openBeside);
+  const besideCandidate = useTerminalsStore((s) => s.besideCandidate);
+  const candidateId = besideCandidate(workspaceId);
+  const canOpenBeside = candidateId !== null;
+  // With more than one pane, the sessions on screen besides the focused one.
+  const paired = (layout?.slots.length ?? 1) > 1;
+  const shownIds = paired ? (layout?.slots ?? []) : [];
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
 
@@ -54,6 +65,8 @@ export function SessionRail({ workspaceId }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // The element the open flyout was measured against.
+  const anchorRef = useRef<HTMLElement | null>(null);
   const peek = useModifierPeek();
 
   const openFlyout = useCallback((id: string, anchor: HTMLElement) => {
@@ -61,6 +74,7 @@ export function SessionRail({ workspaceId }: Props) {
       clearTimeout(closeTimer.current);
       closeTimer.current = undefined;
     }
+    anchorRef.current = anchor;
     const r = anchor.getBoundingClientRect();
     setHover({ id, top: r.top - 2, left: r.right + 8 });
   }, []);
@@ -120,12 +134,15 @@ export function SessionRail({ workspaceId }: Props) {
 
   return (
     <div
+      data-tour={tourId("run-session-rail")}
       // Same geometry as Review's collapsed navigator rail (w-44px, one right
       // hairline, panel ground) — one canonical chrome per concept.
       className="octo-fade-in flex w-[44px] shrink-0 flex-col items-center border-r border-octo-hairline bg-octo-panel py-2"
       // Flex siblings paint as atomic units, so the rail needs its own
-      // stacking context to keep the hover flyout above the terminal.
-      style={{ position: "relative", zIndex: 2 }}
+      // stacking context to keep the hover flyout above the terminal and
+      // above the paired panes' divider (z-10, RunPanes), which a narrow
+      // split can place under the flyout.
+      style={{ position: "relative", zIndex: 20 }}
     >
       {/* The cells scroll; the New control below never leaves the viewport,
           however many sessions a workspace accumulates. */}
@@ -135,11 +152,19 @@ export function SessionRail({ workspaceId }: Props) {
         aria-orientation="vertical"
         className="flex min-h-0 w-full flex-1 flex-col items-center gap-1 overflow-y-auto"
         // Scrolling moves the cells out from under a measured flyout, so the
-        // flyout goes rather than drifting off its anchor.
-        onScroll={() => setHover(null)}
+        // flyout goes rather than drifting off its anchor. A scroll that leaves
+        // the anchored cell where it was measured (a scrollIntoView elsewhere
+        // in the list, a zero-distance scroll) keeps it.
+        onScroll={() => {
+          const r = anchorRef.current?.getBoundingClientRect();
+          setHover((h) => (h && r && Math.abs(r.top - 2 - h.top) < 0.5 ? h : null));
+        }}
       >
       {terminals.map((t, i) => {
         const active = t.id === activeId;
+        const shown = shownIds.includes(t.id);
+        // On screen in another pane: watched, so never the sage edge.
+        const beside = shown && !active;
         const Icon = iconForSessionRole(t.role);
         const isEditing = t.id === editingId;
         const jump = i < 9 ? `⌘⌥${i + 1}` : null;
@@ -185,8 +210,12 @@ export function SessionRail({ workspaceId }: Props) {
               type="button"
               role="tab"
               aria-selected={active}
+              aria-current={shown ? "true" : undefined}
               tabIndex={active || (activeId === null && i === 0) ? 0 : -1}
               data-testid={`session-cell-${t.id}`}
+              // The demo hovers the session Open beside would seat, so the
+              // pane it opens is the cell it pointed at.
+              data-tour={t.id === candidateId ? tourId("run-session-cell") : undefined}
               // No native `title`: the flyout opens on the same hover (and on
               // focus) and already carries label, activity and jump key. The
               // aria-label keeps the cell named for assistive tech.
@@ -209,8 +238,15 @@ export function SessionRail({ workspaceId }: Props) {
 
             {/* Identity edge — a reserved slot, so selection never shifts the
                 cell by a pixel. Marching segments while a command runs, the
-                same idiom (and class) as the workspace rail's activity bar. */}
-            {t.busy ? (
+                same idiom (and class) as the workspace rail's activity bar.
+                A session shown in another pane gets a quiet ivory hairline. */}
+            {beside ? (
+              <span
+                aria-hidden
+                data-testid={`session-shown-${t.id}`}
+                className="octo-fade-in absolute bottom-1 left-[-3px] top-1 w-px bg-octo-ivory"
+              />
+            ) : t.busy ? (
               <span
                 data-testid={`session-busy-${t.id}`}
                 className="rail-bar-running"
@@ -315,6 +351,21 @@ export function SessionRail({ workspaceId }: Props) {
                   >
                     Close
                   </button>
+                  {canOpenBeside && (
+                    <button
+                      type="button"
+                      data-testid={`session-beside-${t.id}`}
+                      data-tour={tourId("run-open-beside")}
+                      title="Show the last session you used that isn't on screen, beside the current pane"
+                      onClick={() => {
+                        closeFlyout(t.id);
+                        openBeside(workspaceId);
+                      }}
+                      className="font-mono text-[9px] uppercase tracking-[0.14em] text-octo-mute transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                    >
+                      Open beside
+                    </button>
+                  )}
                   {jump && (
                     <span className="ml-auto font-mono text-[9px] text-octo-mute">{jump}</span>
                   )}

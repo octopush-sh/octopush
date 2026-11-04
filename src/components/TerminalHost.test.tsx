@@ -133,6 +133,26 @@ describe("TerminalHost", () => {
     expect(screen.getByTestId("pane-A").dataset.shown).toBe("true");
   });
 
+  it("reports a click or focus inside a shown pane, never a hidden one", () => {
+    const onPaneFocus = vi.fn();
+    render(
+      <div>
+        <TerminalSlot mode="run" terminalId="A" />
+        <TerminalHost
+          mode="run"
+          terminalIds={["A", "B"]}
+          renderPane={(id, shown) => <Pane id={id} shown={shown} />}
+          onPaneFocus={onPaneFocus}
+        />
+      </div>,
+    );
+    fireEvent.pointerDown(screen.getByTestId("pane-A"));
+    fireEvent.pointerDown(screen.getByTestId("pane-B"));
+    expect(onPaneFocus.mock.calls).toEqual([["A"]]);
+    // A pane coming on screen fades in rather than appearing abruptly.
+    expect(frame("A").className).toContain("octo-fade-in");
+  });
+
   it("withdraws a slot that unmounts or empties", () => {
     const { rerender, unmount } = render(<Canvas mode="run" runId="A" />);
     rerender(<Canvas mode="run" runId={null} />);

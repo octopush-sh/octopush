@@ -43,7 +43,7 @@ import { PrComposer } from "./components/PrComposer";
 import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { TerminalHost } from "./components/TerminalHost";
-import { TerminalSlot } from "./components/TerminalSlot";
+import { RunPanes } from "./components/run/RunPanes";
 import { SessionRail } from "./components/run/SessionRail";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
 import { SessionAnchor } from "./components/run/SessionAnchor";
@@ -76,6 +76,7 @@ import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
+import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
@@ -91,6 +92,7 @@ import type { SettingsTab } from "./lib/settingsTabs";
 import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { useGlobalShortcuts, type ShortcutContext } from "./hooks/useGlobalShortcuts";
+import { useCompanionFold } from "./hooks/useCompanionFold";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -698,6 +700,20 @@ function App() {
   const activeMode: WorkspaceMode =
     (activeWorkspaceId && modePerWorkspace[activeWorkspaceId]) || defaultMode;
 
+  // ── Companion fold ───────────────────────────────────────────────
+  // While Run shows more than one pane the Companion folds to its strip;
+  // ⌘\ brings it back over the panes (hooks/useCompanionFold).
+  const runPaneCount = useTerminalLayoutStore((s) =>
+    activeWorkspaceId ? (s.runByWs[activeWorkspaceId]?.slots.length ?? 1) : 1,
+  );
+  const panesFold = activeMode === "run" && runPaneCount > 1;
+  const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
+  const toggleCompanionFold = companionFold.toggle;
+  const toggleCompanion = useCallback(() => {
+    toggleCompanionFold();
+    bumpLayout();
+  }, [toggleCompanionFold, bumpLayout]);
+
   // Review whitespace pref — when it flips, the review diff is re-fetched
   // (the effect below depends on it) so the canvas honours the toggle.
   const ignoreWs = useReviewPrefs((s) => s.ignoreWhitespace);
@@ -966,7 +982,7 @@ function App() {
         setSearchMode(mode);
         setShowSearch(true);
       },
-      bumpLayout,
+      toggleCompanion,
       openSettings: (tab) => setSettingsTab(tab),
       // Toggle, like ⌘K does. When some OTHER dialog owns the screen
       // (Settings, the command palette) the switcher stays shut rather than
@@ -977,13 +993,21 @@ function App() {
         activeWorkspaceId
           ? useTerminalsStore.getState().getTerminals(activeWorkspaceId).map((t) => t.id)
           : [],
+      shownTerminalIds: () =>
+        activeWorkspaceId ? useTerminalLayoutStore.getState().getRun(activeWorkspaceId).slots : [],
       activeTerminalId: () =>
         activeWorkspaceId ? useTerminalsStore.getState().getActiveId(activeWorkspaceId) : null,
       setActiveTerminal: (id) => {
         if (activeWorkspaceId) setActiveTerminal(activeWorkspaceId, id);
       },
+      stepPaneFocus: (step) => {
+        if (!activeWorkspaceId) return;
+        useTerminalsStore.getState().updateLayout(activeWorkspaceId, (l) =>
+          focusPane(l, (l.focused + step + l.slots.length) % l.slots.length),
+        );
+      },
     }),
-    [workspaces, selectWorkspace, setMode, project, bumpLayout, activeWorkspaceId, setActiveTerminal],
+    [workspaces, selectWorkspace, setMode, project, toggleCompanion, activeWorkspaceId, setActiveTerminal],
   );
   useGlobalShortcuts(shortcutCtx);
 
@@ -2096,8 +2120,8 @@ function App() {
                     <SessionRail workspaceId={activeWorkspaceId} />
                   )}
                   <div className="relative min-w-0 flex-1">
-                  {activeWorkspace && terminals.length > 0 && (
-                    <TerminalSlot mode="run" terminalId={activeTerminalId} />
+                  {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
+                    <RunPanes workspaceId={activeWorkspaceId} />
                   )}
                   {activeWorkspace && terminals.length === 0 && (
                     <RunEmptyState
@@ -2220,6 +2244,10 @@ function App() {
               <TerminalHost
                 mode={activeWorkspace && activeMode === "run" ? "run" : null}
                 terminalIds={allTerminalIds}
+                onPaneFocus={(id) => {
+                  const t = allTerminalRefs.get(id);
+                  if (t) setActiveTerminal(t.workspaceId, id);
+                }}
                 renderPane={(id, shown) => {
                   const t = allTerminalRefs.get(id);
                   if (!t) return null;
@@ -2331,10 +2359,12 @@ function App() {
           edge: drag to widen/narrow, double-click to reset to default. */}
       <div
         className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
-        style={{ width: isCompanionCollapsed ? COMPANION_COLLAPSED_WIDTH : companionWidth }}
+        style={{
+          width: isCompanionCollapsed || panesFold ? COMPANION_COLLAPSED_WIDTH : companionWidth,
+        }}
       >
-          {/* The resize handle only makes sense when expanded. */}
-          {!isCompanionCollapsed && (
+          {/* The resize handle only makes sense when expanded in place. */}
+          {!isCompanionCollapsed && !panesFold && (
             <div
               role="separator"
               aria-orientation="vertical"
@@ -2347,7 +2377,17 @@ function App() {
               }`}
             />
           )}
-          <ErrorBoundary surface="Companion" resetKey={activeWorkspaceId} compact={isCompanionCollapsed}>
+          {/* Brought back while the panes are split, it floats over them
+              from the strip's edge instead of taking their width. */}
+          <div
+            className={
+              companionFold.over
+                ? "octo-fade-in absolute inset-y-0 right-0 z-30 flex flex-col shadow-2xl"
+                : "flex min-h-0 flex-1 flex-col"
+            }
+            style={companionFold.over ? { width: companionWidth } : undefined}
+          >
+          <ErrorBoundary surface="Companion" resetKey={activeWorkspaceId} compact={companionFold.collapsed}>
           <Companion
             mode={activeMode}
             workspaceId={activeWorkspaceId}
@@ -2367,14 +2407,16 @@ function App() {
                 : null
             }
             onJumpToFile={handleJumpToFile}
-            collapsed={isCompanionCollapsed}
-            onToggleCollapsed={() => setIsCompanionCollapsed((v) => !v)}
+            collapsed={companionFold.collapsed}
+            foldedForPanes={companionFold.folded}
+            onToggleCollapsed={toggleCompanion}
             onOpenLogbook={() => setLogbookOpen(true)}
             onMakeProject={
               sketchbookPath && activeProject?.path === sketchbookPath ? handleMakeProject : undefined
             }
         />
           </ErrorBoundary>
+          </div>
       </div>
       </div>
       <PerfMonitorBar

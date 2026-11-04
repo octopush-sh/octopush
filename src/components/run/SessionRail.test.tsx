@@ -21,6 +21,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useAttentionStore } = await import("../../stores/attentionStore");
+const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
 const { SessionRail } = await import("./SessionRail");
 
 const WS = "ws-rail";
@@ -194,6 +195,39 @@ describe("SessionRail", () => {
     expect(screen.queryByTestId("session-flyout-a")).toBeNull();
   });
 
+  it("keeps the flyout through a scroll that leaves its cell in place, and drops it when the cell moves", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    const wrapper = screen.getByTestId("session-cell-a").parentElement!;
+    let top = 100;
+    wrapper.getBoundingClientRect = () => ({ top, bottom: top + 32, left: 0, right: 32, width: 32, height: 32, x: 0, y: top, toJSON: () => ({}) });
+    fireEvent.mouseEnter(wrapper);
+    expect(screen.getByTestId("session-flyout-a")).toBeTruthy();
+
+    // A tour step's scrollIntoView on the flyout scrolls the list without
+    // moving this cell: closing here detached the button it was about to click.
+    const list = screen.getByRole("tablist");
+    fireEvent.scroll(list);
+    expect(screen.getByTestId("session-flyout-a")).toBeTruthy();
+
+    top = 60;
+    fireEvent.scroll(list);
+    expect(screen.queryByTestId("session-flyout-a")).toBeNull();
+  });
+
+  it("lets the cell's rise-in let go of its transform, so the fixed flyout measures against the viewport", async () => {
+    // @ts-expect-error node:fs is untyped in this project
+    const fs = await import("node:fs");
+    const css: string = fs.readFileSync("src/styles.css", "utf8");
+    const rule = css.match(/\.octo-rise-in\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rule).toMatch(/\bbackwards\b/);
+    expect(rule).not.toMatch(/\b(both|forwards)\b/);
+    seed([{ id: "a", label: "main" }]);
+    render(<SessionRail workspaceId={WS} />);
+    expect(screen.getByTestId("session-cell-a").parentElement!.className).toContain("octo-rise-in");
+  });
+
   it("keeps a rename alive when the pointer wanders off the cell", () => {
     seed([{ id: "a", label: "main" }]);
     render(<SessionRail workspaceId={WS} />);
@@ -298,5 +332,54 @@ describe("SessionRail", () => {
     render(<SessionRail workspaceId={WS} />);
 
     expect(screen.getByTestId("session-cell-a")).toHaveAttribute("tabindex", "0");
+  });
+});
+
+describe("SessionRail — sessions side by side", () => {
+  beforeEach(() => useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false }));
+
+  it("marks a session shown in another pane with an ivory hairline and aria-current", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev", busy: true }, { id: "c", label: "tests" }]);
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b"], ratios: [0.5] })));
+    render(<SessionRail workspaceId={WS} />);
+
+    const a = screen.getByTestId("session-cell-a");
+    const b = screen.getByTestId("session-cell-b");
+    expect(a).toHaveAttribute("aria-selected", "true");
+    expect(b).toHaveAttribute("aria-selected", "false");
+    expect(a).toHaveAttribute("aria-current", "true");
+    expect(b).toHaveAttribute("aria-current", "true");
+    expect(screen.getByTestId("session-cell-c")).not.toHaveAttribute("aria-current");
+    // Watched, so the quiet hairline instead of the sage marching edge.
+    expect(screen.getByTestId("session-shown-b").className).toContain("bg-octo-ivory");
+    expect(screen.queryByTestId("session-busy-b")).toBeNull();
+    expect(screen.queryByTestId("session-shown-a")).toBeNull();
+  });
+
+  it("the flyout's Open beside seats the most recent session not on screen", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    act(() => {
+      useTerminalsStore.getState().setActive(WS, "c");
+      useTerminalsStore.getState().setActive(WS, "a");
+    });
+    render(<SessionRail workspaceId={WS} />);
+    // The demo's anchor sits on the cell Open beside would seat, and only there.
+    expect(screen.getByTestId("session-cell-c")).toHaveAttribute("data-tour", "run-session-cell");
+    expect(document.querySelectorAll('[data-tour="run-session-cell"]')).toHaveLength(1);
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
+    const beside = screen.getByTestId("session-beside-b");
+    // The tooltip names what is seated and where, not the hovered cell.
+    expect(beside).toHaveAttribute(
+      "title",
+      "Show the last session you used that isn't on screen, beside the current pane",
+    );
+    fireEvent.click(beside);
+    expect(useTerminalLayoutStore.getState().getRun(WS).slots).toEqual(["a", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("c");
+
+    // Two panes are the most for now: the item goes.
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
+    expect(screen.queryByTestId("session-beside-b")).toBeNull();
+    expect(document.querySelector('[data-tour="run-session-cell"]')).toBeNull();
   });
 });

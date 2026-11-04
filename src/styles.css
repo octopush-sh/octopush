@@ -346,7 +346,14 @@
    forever, overriding utility opacities (depth-of-field dimming). From-only
    keyframes animate to the element's underlying computed values, so 0 → 0.45
    dims correctly and hover raises work; `both` still back-fills `from` during
-   animationDelay staggers. */
+   animationDelay staggers.
+
+   `.octo-rise-in` fills `backwards` only. Its forward fill would be a visual
+   no-op (from-only keyframes end on the underlying values), but an animation
+   still in effect on `transform` makes the row the containing block for its
+   `fixed` descendants, so a flyout measured against the viewport (the Run
+   session rail's) would land somewhere else. `backwards` keeps the stagger
+   back-fill and lets go of the transform once the rise ends. */
 @keyframes octo-enter-fade {
   from { opacity: 0; }
 }
@@ -362,7 +369,7 @@
 .octo-menu-enter    { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
 .octo-fade-in       { animation: octo-enter-fade var(--dur-quick) var(--ease-octo) both; }
 .octo-pop-in        { animation: octo-enter-pop var(--dur-quick) var(--ease-octo) both; }
-.octo-rise-in       { animation: octo-enter-rise var(--dur-standard) var(--ease-octo) both; }
+.octo-rise-in       { animation: octo-enter-rise var(--dur-standard) var(--ease-octo) backwards; }
 
 /* Guided-tour spotlight (TourOverlay; docs/design-system.md §4 "Tour
    spotlight"). One element does both jobs: its huge spread shadow IS the scrim

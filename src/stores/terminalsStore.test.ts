@@ -884,4 +884,29 @@ describe("the single setActive path", () => {
     expect(run().slots).toEqual(["a"]);
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
   });
+
+  it("Open beside seats the most recently used session that is not on screen", () => {
+    seed(["a", "b", "c"], ["a"]);
+    useTerminalsStore.getState().setActive(ws, "b");
+    useTerminalsStore.getState().setActive(ws, "a");
+    expect(useTerminalsStore.getState().besideCandidate(ws)).toBe("b");
+    useTerminalsStore.getState().openBeside(ws);
+    expect(run().slots).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
+  });
+
+  it("Open beside falls back to rail order for sessions never used", () => {
+    seed(["a", "b", "c"], ["b"]);
+    expect(useTerminalsStore.getState().besideCandidate(ws)).toBe("a");
+  });
+
+  it("Open beside offers nothing with two panes, or with every session on screen", () => {
+    seed(["a", "b", "c"], ["a", "b"]);
+    expect(useTerminalsStore.getState().besideCandidate(ws)).toBeNull();
+    useTerminalsStore.getState().openBeside(ws);
+    expect(run().slots).toEqual(["a", "b"]);
+
+    seed(["a"], ["a"]);
+    expect(useTerminalsStore.getState().besideCandidate(ws)).toBeNull();
+  });
 });
