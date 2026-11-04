@@ -11,6 +11,7 @@ import {
   leave,
   openBeside,
   paneGeometry,
+  paneGrid,
   prune,
   resolveOrientation,
   setOrientation,
@@ -208,6 +209,36 @@ describe("terminalLayout geometry", () => {
       { ratio: 1, axis: "y", at: 0.6, from: 0, to: 1 },
     ]);
     expect(paneGeometry(2, "stacked", [0.5]).panes[1]).toEqual({ left: 0, top: 0.5, width: 1, height: 0.5 });
+  });
+
+  it("measures auto against the split it is given, not a stacked height", () => {
+    // Stacked, ratios[0] is the top pane's height: an even height must not
+    // un-stack a view whose side-by-side split was 0.3.
+    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL, 0.3)).toBe("stacked");
+    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL)).toBe("side");
+  });
+
+  it("places every count in one 2×2 grid whose tracks sum to one", () => {
+    expect(paneGrid(2, "side", [0.4])).toEqual({
+      columns: [0.4, 0.6],
+      rows: [1, 0],
+      areas: [{ column: [1, 2], row: [1, 3] }, { column: [2, 3], row: [1, 3] }],
+    });
+    expect(paneGrid(2, "stacked", [0.4])).toMatchObject({ columns: [1, 0], rows: [0.4, 0.6] });
+    // Three stacked: a large top across both columns, the pair split by sideSplit.
+    expect(paneGrid(3, "stacked", [0.6, 0.3])).toEqual({
+      columns: [0.3, 0.7],
+      rows: [0.6, 0.4],
+      areas: [
+        { column: [1, 3], row: [1, 2] },
+        { column: [1, 2], row: [2, 3] },
+        { column: [2, 3], row: [2, 3] },
+      ],
+    });
+    expect(paneGrid(3, "side", [0.6, 0.3]).areas[0]).toEqual({ column: [1, 2], row: [1, 3] });
+    expect(paneGrid(4, "side", [0.4, 0.6]).areas.map((a) => [a.column[0], a.row[0]])).toEqual([
+      [1, 1], [2, 1], [1, 2], [2, 2],
+    ]);
   });
 
   it("removing a slot shifts the rest down and evens the dividers for the new count", () => {

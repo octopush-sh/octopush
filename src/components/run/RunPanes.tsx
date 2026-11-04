@@ -1,11 +1,12 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MoreHorizontal, X } from "lucide-react";
+import { Check, MoreHorizontal, X } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import {
   evenRatios,
   focus,
   leaveView,
   paneGeometry,
+  paneGrid,
   resolveOrientation,
   setOrientation,
   setRatios,
@@ -34,7 +35,8 @@ const FINE_STEP = 0.01;
 /**
  * Run's panes (docs/superpowers/specs/2026-11-03-run-session-pair-design.md).
  * One pane is today's full canvas. Two to four sit in fixed positions
- * (`paneGeometry`), each under a caption naming its session, split by 1px
+ * (`paneGrid` places them in one 2×2 grid, `paneGeometry` the dividers), each
+ * under a caption naming its session, split by 1px
  * dividers; two and three side by side or stacked (`resolveOrientation`), four
  * a 2×2 grid around one shared cross. Each pane is only a
  * `TerminalSlot`: `TerminalHost` draws the session's terminal over it. An
@@ -48,8 +50,10 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const createBeside = useTerminalsStore((s) => s.createBeside);
   const areaRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
-  // The orientation a drag started in: `auto` doesn't flip mid-drag.
-  const held = useRef<"side" | "stacked">("side");
+  // What each workspace last drew: a drag holds that orientation, and while
+  // stacked `auto` measures the side-by-side split last drawn, which the
+  // stacked dividers never move.
+  const drawn = useRef(new Map<string, { orientation: "side" | "stacked"; sideSplit: number }>());
 
   const slots = layout?.slots ?? [activeId];
   const paired = slots.length > 1 && !!layout;
@@ -79,12 +83,16 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
     return <TerminalSlot mode="run" terminalId={slots[0] ?? null} />;
   }
 
-  const orientation = resizing
-    ? held.current
-    : resolveOrientation(layout, width, terminalCellWidth());
-  held.current = orientation;
+  const last = drawn.current.get(workspaceId);
+  const sideSplit = last?.orientation === "stacked" ? last.sideSplit : (layout.ratios[0] ?? 0.5);
+  const orientation =
+    resizing && last
+      ? last.orientation
+      : resolveOrientation(layout, width, terminalCellWidth(), sideSplit);
+  drawn.current.set(workspaceId, { orientation, sideSplit });
   const count = slots.length;
   const { panes, dividers } = paneGeometry(count, orientation, layout.ratios);
+  const grid = paneGrid(count, orientation, layout.ratios);
 
   const setRatio = (index: number, r: number) =>
     updateLayout(workspaceId, (l) => {
@@ -100,15 +108,23 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
     document.body.style.cursor = on ? (axis === "x" ? "col-resize" : "row-resize") : "";
   };
 
-  // Sizes glide on the standard clock, except while a divider is dragged.
-  const glide = resizing
-    ? undefined
-    : ["left", "top", "width", "height"]
-        .map((p) => `${p} var(--dur-standard) var(--ease-octo)`)
-        .join(", ");
+  // Sizes glide on the standard clock, except while a divider is dragged: the
+  // panes through their grid tracks, the dividers along with them.
+  const glide = (props: string[]) =>
+    resizing ? undefined : props.map((p) => `${p} var(--dur-standard) var(--ease-octo)`).join(", ");
+  const fr = (t: [number, number]) => `${t[0]}fr ${t[1]}fr`;
 
   return (
-    <div ref={areaRef} data-orientation={orientation} className="relative h-full w-full min-w-0">
+    <div
+      ref={areaRef}
+      data-orientation={orientation}
+      className="relative grid h-full w-full min-w-0"
+      style={{
+        gridTemplateColumns: fr(grid.columns),
+        gridTemplateRows: fr(grid.rows),
+        transition: glide(["grid-template-columns", "grid-template-rows"]),
+      }}
+    >
       {dividers.map((d) => {
         const at = layout.ratios[d.ratio] ?? 0.5;
         const x = d.axis === "x";
@@ -159,8 +175,8 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
             }`}
             style={
               x
-                ? { left: `calc(${d.at * 100}% - 0.5px)`, top: pct(d.from), width: 1, height: pct(d.to - d.from), transition: glide }
-                : { top: `calc(${d.at * 100}% - 0.5px)`, left: pct(d.from), height: 1, width: pct(d.to - d.from), transition: glide }
+                ? { left: `calc(${d.at * 100}% - 0.5px)`, top: pct(d.from), width: 1, height: pct(d.to - d.from), transition: glide(["left", "top", "height"]) }
+                : { top: `calc(${d.at * 100}% - 0.5px)`, left: pct(d.from), height: 1, width: pct(d.to - d.from), transition: glide(["left", "top", "width"]) }
             }
           >
             <span
@@ -176,8 +192,12 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
         <div
           key={i}
           data-testid={`run-pane-${i}`}
-          className="absolute flex min-h-0 min-w-0 flex-col"
-          style={{ ...paneBox(panes[i]), transition: glide }}
+          className="flex min-h-0 min-w-0 flex-col overflow-hidden"
+          style={{
+            gridColumn: grid.areas[i].column.join(" / "),
+            gridRow: grid.areas[i].row.join(" / "),
+            ...paneInset(panes[i]),
+          }}
         >
           <PaneCaption
             workspaceId={workspaceId}
@@ -215,17 +235,14 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
 const pct = (f: number) => `${f * 100}%`;
 const EDGE = 1e-6;
 
-/** A pane's box, giving half a pixel to each divider it touches. */
-function paneBox(f: Frac): React.CSSProperties {
-  const l = f.left > EDGE ? 0.5 : 0;
-  const t = f.top > EDGE ? 0.5 : 0;
-  const r = f.left + f.width < 1 - EDGE ? 0.5 : 0;
-  const b = f.top + f.height < 1 - EDGE ? 0.5 : 0;
+/** A pane's margins in its grid area: half a pixel to each divider it touches. */
+function paneInset(f: Frac): React.CSSProperties {
+  const px = (touches: boolean) => (touches ? "0.5px" : 0);
   return {
-    left: `calc(${pct(f.left)} + ${l}px)`,
-    top: `calc(${pct(f.top)} + ${t}px)`,
-    width: `calc(${pct(f.width)} - ${l + r}px)`,
-    height: `calc(${pct(f.height)} - ${t + b}px)`,
+    marginLeft: px(f.left > EDGE),
+    marginTop: px(f.top > EDGE),
+    marginRight: px(f.left + f.width < 1 - EDGE),
+    marginBottom: px(f.top + f.height < 1 - EDGE),
   };
 }
 
@@ -380,14 +397,16 @@ function PaneCaption({
                   aria-checked={orientation === o.value}
                   data-tour={slot === 0 && o.value === "auto" ? tourId("run-pane-orientation") : undefined}
                   title={o.value === "auto" ? "Side by side while every pane keeps 72 columns" : undefined}
-                  className={
-                    orientation === o.value ? MENU_ITEM.replace("text-octo-sage", "text-octo-ivory") : MENU_ITEM
-                  }
+                  className={MENU_ITEM}
                   onClick={() => {
                     setMenu(null);
                     onOrient(o.value);
                   }}
                 >
+                  {/* The checked item's Check, in a fixed 14px icon column. */}
+                  <span aria-hidden className="flex w-3.5 shrink-0 justify-center">
+                    {orientation === o.value && <Check size={13} strokeWidth={1.75} />}
+                  </span>
                   {o.label}
                 </button>
               ))}

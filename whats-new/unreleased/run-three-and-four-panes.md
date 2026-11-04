@@ -23,5 +23,5 @@ steps:
     action: none
 ---
 Run now shows up to **four** sessions at once: three put a large pane beside two smaller ones, four
-make a 2×2 grid. Panes stack on their own when side by side would leave one under 72 columns; each
-pane's menu sets **Stack**, **Side by side** or **Automatic** for the workspace.
+make a 2×2 grid. Panes stack on their own when side by side would leave one under 72 columns; with
+two or three panes, each pane's menu sets **Stack**, **Side by side** or **Automatic** for the workspace.

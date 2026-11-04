@@ -22,24 +22,27 @@ export const XTERM_FONT_SIZE = 13;
 
 const cellWidths = new Map<number, number>();
 
-/** One terminal column's width in pixels at `fontSize`: measured off the font
- *  once per size, or 0.6em (JetBrains Mono's advance) where there is no canvas. */
+/** One terminal column's width in pixels at `fontSize`: measured off the font,
+ *  or 0.6em (JetBrains Mono's advance) where there is no canvas. A measurement
+ *  is kept only once the font has loaded (before that the canvas measures a
+ *  fallback face); the estimate is never kept. */
 export function terminalCellWidth(fontSize = XTERM_FONT_SIZE): number {
   const known = cellWidths.get(fontSize);
   if (known) return known;
-  let width = fontSize * 0.6;
   try {
     const ctx = document.createElement("canvas").getContext("2d");
     if (ctx) {
       ctx.font = `${fontSize}px ${XTERM_FONT_FAMILY}`;
       const measured = ctx.measureText("W".repeat(10)).width / 10;
-      if (measured > 0) width = measured;
+      if (measured > 0) {
+        if (document.fonts?.check(ctx.font) ?? true) cellWidths.set(fontSize, measured);
+        return measured;
+      }
     }
   } catch {
-    // No canvas (tests): keep the estimate.
+    // No canvas (tests): use the estimate.
   }
-  cellWidths.set(fontSize, width);
-  return width;
+  return fontSize * 0.6;
 }
 
 // Static fallbacks (canonical Onyx & Brass / atelier) — used before the

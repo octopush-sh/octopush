@@ -202,17 +202,21 @@ export interface Divider {
  * columns: side by side while every pane in the row keeps 72 columns, else
  * stacked. An override wins; one and four panes have no choice (four are
  * always a 2×2 grid), so they report `"side"`. An unmeasured width stays side by side.
+ * `split` is the side-by-side main split to measure: `ratios[0]` while the view
+ * is side by side, but once stacked `ratios[0]` is the top pane's height, so the
+ * caller passes the split it last drew side by side (a stacked divider must
+ * never un-stack the view).
  */
 export function resolveOrientation(
   layout: RunLayout,
   width: number,
   cellWidth: number,
+  split = layout.ratios[0] ?? 0.5,
 ): "side" | "stacked" {
   const count = layout.slots.length;
   if (count !== 2 && count !== 3) return "side";
   if (layout.orientation !== "auto") return layout.orientation;
   if (width <= 0 || cellWidth <= 0) return "side";
-  const split = layout.ratios[0] ?? 0.5;
   const narrowest = width * Math.min(split, 1 - split);
   return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
 }
@@ -272,6 +276,45 @@ export function paneGeometry(
       { ratio: 0, axis: "x", at: a, from: 0, to: 1 },
       { ratio: 1, axis: "y", at: b, from: 0, to: 1 },
     ],
+  };
+}
+
+/** A slot's place in `paneGrid`: 1-based grid lines, `[start, end]`. */
+export interface GridArea {
+  column: [number, number];
+  row: [number, number];
+}
+
+/**
+ * The same layout as `paneGeometry`, as one 2×2 grid: two column and two row
+ * tracks in `fr` (each pair sums to 1) and each slot's area. Every count and
+ * orientation uses two tracks per axis, an unused one at `0fr`, so a change
+ * between any two layouts interpolates the tracks: the grid-rows `0fr↔1fr`
+ * idiom (spec "Motion").
+ */
+export function paneGrid(
+  count: number,
+  orientation: "side" | "stacked",
+  ratios: number[],
+): { columns: [number, number]; rows: [number, number]; areas: GridArea[] } {
+  const a = ratios[0] ?? 0.5;
+  const b = ratios[1] ?? 0.5;
+  const at = (c0: number, c1: number, r0: number, r1: number): GridArea => ({ column: [c0, c1], row: [r0, r1] });
+  if (count <= 1) return { columns: [1, 0], rows: [1, 0], areas: [at(1, 3, 1, 3)] };
+  if (count === 2) {
+    return orientation === "side"
+      ? { columns: [a, 1 - a], rows: [1, 0], areas: [at(1, 2, 1, 3), at(2, 3, 1, 3)] }
+      : { columns: [1, 0], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 3, 2, 3)] };
+  }
+  if (count === 3) {
+    return orientation === "side"
+      ? { columns: [a, 1 - a], rows: [b, 1 - b], areas: [at(1, 2, 1, 3), at(2, 3, 1, 2), at(2, 3, 2, 3)] }
+      : { columns: [b, 1 - b], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)] };
+  }
+  return {
+    columns: [a, 1 - a],
+    rows: [b, 1 - b],
+    areas: [at(1, 2, 1, 2), at(2, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)],
   };
 }
 
