@@ -54,11 +54,13 @@ vi.mock("../components/Toasts", () => ({
 
 const { useTerminalsStore } = await import("./terminalsStore");
 const { useAttentionStore } = await import("./attentionStore");
+const { useTerminalLayoutStore } = await import("./terminalLayoutStore");
 
 // ─── Helpers ──────────────────────────────────────────────────────
 
 function resetStore() {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false });
   localStorage.removeItem("octopush.setupTerminals");
   nextId = 0;
   vi.clearAllMocks();
@@ -788,5 +790,98 @@ describe("closing a session", () => {
     await useTerminalsStore.getState().deleteTerminal(ws, "t1");
 
     expect(useAttentionStore.getState().flagsByWs[ws]?.terminalId).toBe("t2");
+  });
+});
+
+describe("the single setActive path", () => {
+  const ws = "ws-layout";
+  const session = (id: string, position: number) => ({
+    id, label: id, position, running: true, busy: false, restored: false, role: "shell" as const, command: null,
+  });
+  const run = () => useTerminalLayoutStore.getState().getRun(ws);
+
+  /** Seed `ids` as sessions and put `slots` on screen, focusing `focused`. */
+  function seed(ids: string[], slots: (string | null)[], focused = 0) {
+    useTerminalsStore.setState({ terminalsByWs: { [ws]: ids.map(session) } });
+    useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, slots, focused, ratios: [] }));
+  }
+
+  beforeEach(() => resetStore());
+
+  it("derives activeByWs from the focused slot", () => {
+    seed(["a", "b", "c"], ["a", "b"], 1);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
+  });
+
+  it("setActive focuses a shown session's pane without moving it", () => {
+    seed(["a", "b", "c"], ["a", "b"], 0);
+    useTerminalsStore.getState().setActive(ws, "b");
+    expect(run().slots).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
+  });
+
+  it("setActive puts a session not on screen in the focused pane", () => {
+    seed(["a", "b", "c"], ["a", "b"], 1);
+    useTerminalsStore.getState().setActive(ws, "c");
+    expect(run().slots).toEqual(["a", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
+  });
+
+  it("tracks the most recently used sessions", () => {
+    seed(["a", "b", "c"], ["a"]);
+    useTerminalsStore.getState().setActive(ws, "b");
+    useTerminalsStore.getState().setActive(ws, "c");
+    expect(useTerminalLayoutStore.getState().getMru(ws)).toEqual(["c", "b", "a"]);
+    expect(useTerminalLayoutStore.getState().recentNotShown(ws, () => true)).toBe("b");
+  });
+
+  it("createTerminal seats a new session in its target slot, not the focused pane", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    mockIpc.createTerminal.mockResolvedValueOnce(makeRecord(ws, "Terminal 3", 2));
+    const t = await useTerminalsStore.getState().createTerminal(ws, undefined, 2);
+    expect(run().slots).toEqual(["a", "b", t.id]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe(t.id);
+  });
+
+  it("createTerminal fills an empty seat", async () => {
+    seed(["a"], ["a", null], 0);
+    mockIpc.createTerminal.mockResolvedValueOnce(makeRecord(ws, "Terminal 2", 1));
+    const t = await useTerminalsStore.getState().createTerminal(ws, undefined, 1);
+    expect(run().slots).toEqual(["a", t.id]);
+  });
+
+  it("a setup terminal never replaces a shown session while paired", () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    useTerminalsStore.getState().trackSetup(ws, "setup");
+    expect(run().slots).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+    expect(useTerminalsStore.getState().setupByTerminal["setup"].status).toBe("running");
+  });
+
+  it("deleting a shown session removes its slot and focuses the next pane", async () => {
+    seed(["a", "b", "c"], ["a", "b", "c"], 1);
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "b");
+    expect(run().slots).toEqual(["a", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
+  });
+
+  it("deleting a session that is not shown leaves the panes alone", async () => {
+    seed(["a", "b", "c"], ["a", "b"], 0);
+    mockIpc.deleteTerminal.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().deleteTerminal(ws, "c");
+    expect(run().slots).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+  });
+
+  it("a reload prunes panes whose sessions are gone", async () => {
+    seed(["a", "b", "c"], ["a", "b"], 1);
+    mockIpc.listTerminals.mockResolvedValueOnce([
+      { id: "a", workspaceId: ws, label: "a", position: 0, createdAt: 0 },
+      { id: "c", workspaceId: ws, label: "c", position: 1, createdAt: 0 },
+    ]);
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(run().slots).toEqual(["a"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
   });
 });

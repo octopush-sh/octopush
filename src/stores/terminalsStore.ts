@@ -5,6 +5,15 @@ import { roleForCommand, type SessionRole } from "../lib/sessionRole";
 import type { SetupRun } from "../lib/setupRun";
 import { navigate } from "../lib/tour/surfaces";
 import { useAttentionStore } from "./attentionStore";
+import {
+  EMPTY_RUN_LAYOUT,
+  assign,
+  focusedId,
+  leave,
+  prune,
+  useTerminalLayoutStore,
+  type RunLayout,
+} from "./terminalLayoutStore";
 
 // ─── State shape ──────────────────────────────────────────────────
 
@@ -87,6 +96,8 @@ function saveSetupTerminals(ids: string[]) {
 
 interface TerminalsStore {
   terminalsByWs: Record<string, TerminalState[]>;
+  /** The focused Run slot's session, derived from `terminalLayoutStore`.
+   *  Written only by `updateLayout`. */
   activeByWs: Record<string, string | null>;
   /** Setup-script runs by terminal id (src/lib/setupRun.ts). Live state: after
    *  a restart the replayed exit marker restores it, without a toast. */
@@ -98,10 +109,20 @@ interface TerminalsStore {
 
   // Actions
   loadTerminals: (workspaceId: string) => Promise<void>;
-  createTerminal: (workspaceId: string, label?: string) => Promise<TerminalState>;
+  /** Create a session. It goes in the focused pane, or in `targetSlot` when
+   *  given (`slots.length` appends a new slot); a slot that can't take it
+   *  leaves it unseated. */
+  createTerminal: (
+    workspaceId: string,
+    label?: string,
+    targetSlot?: number,
+  ) => Promise<TerminalState>;
   renameTerminal: (workspaceId: string, id: string, label: string) => Promise<void>;
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
+  /** Focus `id`'s pane if it is on screen; otherwise put it in the focused pane. */
   setActive: (workspaceId: string, id: string | null) => void;
+  /** The one path that changes Run's layout; derives `activeByWs` from it. */
+  updateLayout: (workspaceId: string, fn: (layout: RunLayout) => RunLayout) => void;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
@@ -119,7 +140,7 @@ interface TerminalsStore {
   /** Clear the transient `restored` badge for a given terminal. */
   clearRestored: (workspaceId: string, id: string) => void;
   /** A workspace's setup script just started in terminal `id`; it becomes the
-   *  workspace's active session. */
+   *  workspace's active session unless more than one pane is open. */
   trackSetup: (workspaceId: string, id: string) => void;
   /** The setup runner in terminal `id` reported `code`. A run seen starting
    *  that fails raises a toast that opens the terminal. */
@@ -214,19 +235,19 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         };
       });
 
-      // Preserve the active selection only if it still exists in the fresh
-      // list; otherwise fall back to the first terminal (or null).
-      const currentActive = s.activeByWs[workspaceId] ?? null;
-      const newActive =
-        currentActive !== null && terminals.some((t) => t.id === currentActive)
-          ? currentActive
-          : terminals.length > 0
-            ? terminals[0].id
-            : null;
       return {
         terminalsByWs: { ...s.terminalsByWs, [workspaceId]: terminals },
-        activeByWs: { ...s.activeByWs, [workspaceId]: newActive },
       };
+    });
+
+    // Keep the panes whose sessions still exist; an empty single pane falls
+    // back to the first terminal (or stays empty).
+    const fresh = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+    get().updateLayout(workspaceId, (layout) => {
+      const kept = prune(layout, (id) => fresh.some((t) => t.id === id));
+      return kept.slots.length === 1 && focusedId(kept) === null && fresh.length > 0
+        ? assign(kept, 0, fresh[0].id)
+        : kept;
     });
 
     // Auto-expire `restored` badges after 5s — store-level so the badge
@@ -243,7 +264,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     }
   },
 
-  createTerminal: async (workspaceId, labelOverride) => {
+  createTerminal: async (workspaceId, labelOverride, targetSlot) => {
     const existing = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const label =
       labelOverride ??
@@ -269,9 +290,11 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           ...s.terminalsByWs,
           [workspaceId]: [...prev, newTerminal],
         },
-        activeByWs: { ...s.activeByWs, [workspaceId]: newTerminal.id },
       };
     });
+    get().updateLayout(workspaceId, (layout) =>
+      assign(layout, targetSlot ?? layout.focused, newTerminal.id),
+    );
 
     return newTerminal;
   },
@@ -315,16 +338,6 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const remaining = prev.filter((t) => t.id !== id);
 
-    // Determine next active: pick neighbor, or null if list empties.
-    const currentActive = get().activeByWs[workspaceId] ?? null;
-    let nextActive: string | null = currentActive;
-    if (currentActive === id) {
-      const idx = prev.findIndex((t) => t.id === id);
-      // Prefer the item that comes after; fall back to the one before.
-      nextActive =
-        remaining[idx]?.id ?? remaining[idx - 1]?.id ?? null;
-    }
-
     const knownSetup = loadSetupTerminals();
     if (knownSetup.includes(id)) saveSetupTerminals(knownSetup.filter((x) => x !== id));
 
@@ -332,16 +345,42 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const { [id]: _gone, ...setupByTerminal } = s.setupByTerminal;
       return {
         terminalsByWs: { ...s.terminalsByWs, [workspaceId]: remaining },
-        activeByWs: { ...s.activeByWs, [workspaceId]: nextActive },
         setupByTerminal,
       };
+    });
+    useTerminalLayoutStore.getState().forget(workspaceId, id);
+
+    // A shown session's slot goes exactly as leaving it would. The last pane
+    // takes a neighbour instead — the one after, else the one before — and
+    // never one that is already on screen.
+    get().updateLayout(workspaceId, (layout) => {
+      const slot = layout.slots.indexOf(id);
+      if (slot === -1) return layout;
+      if (layout.slots.length > 1) return leave(layout, slot);
+      const idx = prev.findIndex((t) => t.id === id);
+      const order = [...remaining.slice(idx), ...remaining.slice(0, idx).reverse()];
+      const next = order.find((t) => !layout.slots.includes(t.id));
+      return assign(layout, slot, next?.id ?? null);
     });
   },
 
   setActive: (workspaceId, id) =>
-    set((s) => ({
-      activeByWs: { ...s.activeByWs, [workspaceId]: id },
-    })),
+    get().updateLayout(workspaceId, (layout) => assign(layout, layout.focused, id)),
+
+  updateLayout: (workspaceId, fn) => {
+    const layouts = useTerminalLayoutStore.getState();
+    // A workspace seen for the first time starts as one pane holding
+    // whatever was active.
+    const current =
+      layouts.runByWs[workspaceId] ??
+      { ...EMPTY_RUN_LAYOUT, slots: [get().activeByWs[workspaceId] ?? null] };
+    const next = fn(current);
+    layouts.commitRun(workspaceId, next);
+    const id = focusedId(next);
+    const byWs = get().activeByWs;
+    if (workspaceId in byWs && byWs[workspaceId] === id) return;
+    set((s) => ({ activeByWs: { ...s.activeByWs, [workspaceId]: id } }));
+  },
 
   markRunning: (workspaceId, id, running) =>
     set((s) => {
@@ -431,8 +470,12 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         ...s.setupByTerminal,
         [id]: { workspaceId, status: "running", exitCode: null },
       },
-      activeByWs: { ...s.activeByWs, [workspaceId]: id },
     }));
+    // Never replaces a session on screen: with more than one pane open it
+    // starts unseated, and its rail cell marks it as usual.
+    get().updateLayout(workspaceId, (layout) =>
+      layout.slots.length > 1 ? layout : assign(layout, layout.focused, id),
+    );
   },
 
   reportSetupExit: (workspaceId, id, code) => {

@@ -74,6 +74,7 @@ import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore } from "./stores/terminalsStore";
+import { useTerminalLayoutStore } from "./stores/terminalLayoutStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
@@ -257,6 +258,8 @@ function App() {
   const markRunning = useTerminalsStore((s) => s.markRunning);
   const markFailed = useTerminalsStore((s) => s.markFailed);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
+  // The sessions Run puts on screen; the focused one is `activeTerminalId`.
+  const runSlots = useTerminalLayoutStore((s) => s.getRun(activeWorkspaceId ?? "").slots);
 
   // Flat list of every (workspace, terminal) pair so the Run panel can mount
   // every TerminalPane simultaneously. This is the only way to keep PTYs and
@@ -2098,6 +2101,11 @@ function App() {
                   {allTerminalRefs.map((t) => {
                     const ws = workspaces.find((w) => w.id === t.workspaceId);
                     const wsPath = ws?.worktreePath || project.path;
+                    const shown =
+                      activeMode === "run" &&
+                      !!activeWorkspaceId &&
+                      t.workspaceId === activeWorkspaceId &&
+                      (t.id === activeTerminalId || runSlots.includes(t.id));
                     return (
                       <TerminalPane
                         key={t.id}
@@ -2106,12 +2114,8 @@ function App() {
                         workspacePath={wsPath}
                         workspaceName={ws?.name}
                         label={t.label}
-                        visible={
-                          activeMode === "run" &&
-                          !!activeWorkspaceId &&
-                          t.workspaceId === activeWorkspaceId &&
-                          t.id === activeTerminalId
-                        }
+                        shown={shown}
+                        focused={shown && t.id === activeTerminalId}
                         layoutVersion={layoutVersion}
                         onSpawn={() => markRunning(t.workspaceId, t.id, true)}
                         onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
