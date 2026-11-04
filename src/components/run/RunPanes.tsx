@@ -106,8 +106,10 @@ export function RunPanes({ workspaceId }: Props) {
               onPointerCancel={() => drag(false)}
               onKeyDown={onDividerKey}
               onDoubleClick={() => setSplit(evenRatios(2)[0])}
-              // A 1px hairline with a wider, invisible grip around it.
-              className="group relative w-px shrink-0 cursor-col-resize bg-octo-border focus-visible:outline-none"
+              // A 1px hairline with a wider, invisible grip around it. The
+              // TerminalHost frames paint over the Run canvas, so the divider
+              // lifts itself (and its grip) above them, as the rail does.
+              className="group relative z-10 w-px shrink-0 cursor-col-resize bg-octo-border focus-visible:outline-none"
             >
               <span
                 aria-hidden

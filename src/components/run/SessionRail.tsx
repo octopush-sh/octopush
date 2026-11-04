@@ -65,6 +65,8 @@ export function SessionRail({ workspaceId }: Props) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editValue, setEditValue] = useState("");
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  // The element the open flyout was measured against.
+  const anchorRef = useRef<HTMLElement | null>(null);
   const peek = useModifierPeek();
 
   const openFlyout = useCallback((id: string, anchor: HTMLElement) => {
@@ -72,6 +74,7 @@ export function SessionRail({ workspaceId }: Props) {
       clearTimeout(closeTimer.current);
       closeTimer.current = undefined;
     }
+    anchorRef.current = anchor;
     const r = anchor.getBoundingClientRect();
     setHover({ id, top: r.top - 2, left: r.right + 8 });
   }, []);
@@ -147,8 +150,13 @@ export function SessionRail({ workspaceId }: Props) {
         aria-orientation="vertical"
         className="flex min-h-0 w-full flex-1 flex-col items-center gap-1 overflow-y-auto"
         // Scrolling moves the cells out from under a measured flyout, so the
-        // flyout goes rather than drifting off its anchor.
-        onScroll={() => setHover(null)}
+        // flyout goes rather than drifting off its anchor. A scroll that leaves
+        // the anchored cell where it was measured (a scrollIntoView elsewhere
+        // in the list, a zero-distance scroll) keeps it.
+        onScroll={() => {
+          const r = anchorRef.current?.getBoundingClientRect();
+          setHover((h) => (h && r && Math.abs(r.top - 2 - h.top) < 0.5 ? h : null));
+        }}
       >
       {terminals.map((t, i) => {
         const active = t.id === activeId;

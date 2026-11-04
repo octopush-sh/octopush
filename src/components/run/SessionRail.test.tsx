@@ -195,6 +195,39 @@ describe("SessionRail", () => {
     expect(screen.queryByTestId("session-flyout-a")).toBeNull();
   });
 
+  it("keeps the flyout through a scroll that leaves its cell in place, and drops it when the cell moves", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    render(<SessionRail workspaceId={WS} />);
+
+    const wrapper = screen.getByTestId("session-cell-a").parentElement!;
+    let top = 100;
+    wrapper.getBoundingClientRect = () => ({ top, bottom: top + 32, left: 0, right: 32, width: 32, height: 32, x: 0, y: top, toJSON: () => ({}) });
+    fireEvent.mouseEnter(wrapper);
+    expect(screen.getByTestId("session-flyout-a")).toBeTruthy();
+
+    // A tour step's scrollIntoView on the flyout scrolls the list without
+    // moving this cell: closing here detached the button it was about to click.
+    const list = screen.getByRole("tablist");
+    fireEvent.scroll(list);
+    expect(screen.getByTestId("session-flyout-a")).toBeTruthy();
+
+    top = 60;
+    fireEvent.scroll(list);
+    expect(screen.queryByTestId("session-flyout-a")).toBeNull();
+  });
+
+  it("lets the cell's rise-in let go of its transform, so the fixed flyout measures against the viewport", async () => {
+    // @ts-expect-error node:fs is untyped in this project
+    const fs = await import("node:fs");
+    const css: string = fs.readFileSync("src/styles.css", "utf8");
+    const rule = css.match(/\.octo-rise-in\s*\{([^}]*)\}/)?.[1] ?? "";
+    expect(rule).toMatch(/\bbackwards\b/);
+    expect(rule).not.toMatch(/\b(both|forwards)\b/);
+    seed([{ id: "a", label: "main" }]);
+    render(<SessionRail workspaceId={WS} />);
+    expect(screen.getByTestId("session-cell-a").parentElement!.className).toContain("octo-rise-in");
+  });
+
   it("keeps a rename alive when the pointer wanders off the cell", () => {
     seed([{ id: "a", label: "main" }]);
     render(<SessionRail workspaceId={WS} />);
