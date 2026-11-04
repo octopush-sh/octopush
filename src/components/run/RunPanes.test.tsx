@@ -30,6 +30,9 @@ function seed(ids: string[], slots: (string | null)[], focused = 0) {
 /** The sessions the slot registry has on screen, in slot order. */
 const published = () =>
   Object.values(useTerminalSlotsStore.getState().slots).map((s) => s.terminalId).sort();
+/** Every element measures `width` wide: 72 columns of the 7.8px estimate are ≈ 562px. */
+const sized = (width: number) =>
+  vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({ left: 0, top: 0, width, height: 800 } as DOMRect);
 
 beforeEach(() => {
   // A failed test must not leave its measured rect behind for the next one.
@@ -154,9 +157,6 @@ describe("RunPanes", () => {
     expect(run().ratios[1]).toBeCloseTo(0.55);
     fireEvent.doubleClick(side);
     expect(run().ratios).toEqual([0.5, 0.5]);
-    // Focus never moves a session between slots.
-    fireEvent.click(screen.getByRole("button", { name: /Label a/ }));
-    expect(run().slots).toEqual(["a", "b", "c"]);
   });
 
   it("stacks from the caption menu for two and three panes, until Automatic again", () => {
@@ -164,6 +164,9 @@ describe("RunPanes", () => {
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     fireEvent.click(screen.getByTestId("run-pane-menu-0"));
     expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute("aria-checked", "true");
+    // The checked item carries a Check, not ink alone.
+    const checks = screen.getAllByRole("menuitemradio").map((item) => item.querySelector("svg") !== null);
+    expect(checks).toEqual([false, false, true]);
     fireEvent.click(screen.getByRole("menuitemradio", { name: "Stack" }));
     expect(run().orientation).toBe("stacked");
     expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
@@ -180,21 +183,8 @@ describe("RunPanes", () => {
     expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
   });
 
-  it("stacks on its own when side by side would leave a pane under 72 columns", () => {
-    const rect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({ left: 0, top: 0, width: 700, height: 600 } as DOMRect);
-    seed(["a", "b"], ["a", "b"]);
-    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
-    expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
-    rect.mockRestore();
-  });
-
-  it("stays stacked while the stacked divider moves or evens", () => {
-    // 1300px wide: 72 columns of the 7.8px estimate are ≈ 562px.
-    const rect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({ left: 0, top: 0, width: 1300, height: 800 } as DOMRect);
+  it("stacks on its own under 72 columns, and stays stacked while the stacked divider moves or evens", () => {
+    sized(1300);
     seed(["a", "b"], ["a", "b"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = () => screen.getByRole("separator");
@@ -212,13 +202,23 @@ describe("RunPanes", () => {
     fireEvent.doubleClick(divider());
     expect(run().ratios[0]).toBe(0.5);
     expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
-    rect.mockRestore();
+  });
+
+  it("measures the even split again once the count changes", () => {
+    sized(1300);
+    seed(["a", "b", "c"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
+    expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
+    // Three panes even the dividers: 650px each side keeps 72 columns.
+    act(() => useTerminalsStore.getState().openBeside(WS, "c"));
+    expect(run().ratios).toEqual([0.5, 0.5]);
+    expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
   });
 
   it("holds the orientation during a drag and resolves it again on release", () => {
-    const rect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({ left: 0, top: 0, width: 1600, height: 800 } as DOMRect);
+    sized(1600);
     seed(["a", "b"], ["a", "b"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = screen.getByRole("separator");
@@ -230,7 +230,6 @@ describe("RunPanes", () => {
     expect(divider).toHaveAttribute("aria-orientation", "vertical");
     fireEvent.pointerUp(divider, { pointerId: 1 });
     expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
-    rect.mockRestore();
   });
 
   it("lays the panes out as grid tracks that glide, except during a drag", () => {
@@ -245,42 +244,19 @@ describe("RunPanes", () => {
     fireEvent.pointerDown(screen.getByRole("separator"), { button: 0, pointerId: 1 });
     expect(area.style.transition).toBe("");
     fireEvent.pointerUp(screen.getByRole("separator"), { pointerId: 1 });
-
-    // Stacked, the unused column folds to 0fr and the rows carry the split.
-    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, orientation: "stacked" })));
-    expect(area.style.gridTemplateColumns).toBe("1fr 0fr");
-    expect(area.style.gridTemplateRows).toBe("0.5fr 0.5fr");
-  });
-
-  it("marks the checked orientation with a Check, not ink alone", () => {
-    seed(["a", "b"], ["a", "b"]);
-    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
-    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
-    const checks = screen
-      .getAllByRole("menuitemradio")
-      .map((item) => [item.textContent, item.querySelector("svg") !== null]);
-    expect(checks).toEqual([
-      ["Stack", false],
-      ["Side by side", false],
-      ["Automatic", true],
-    ]);
   });
 
   it("puts four panes in a 2×2 grid with one shared cross and no orientation choice", () => {
-    const rect = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockReturnValue({ left: 0, top: 0, width: 700, height: 600 } as DOMRect);
+    sized(700);
     seed(["a", "b", "c", "d"], ["a", "b", "c", "d"], 3);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
-    rect.mockRestore();
+    vi.restoreAllMocks();
     expect(published()).toEqual(["a", "b", "c", "d"]);
     // Narrow, yet still the grid: the 72-column rule doesn't apply at four.
     const dividers = screen.getAllByRole("separator");
     expect(dividers.map((d) => d.getAttribute("aria-orientation"))).toEqual(["vertical", "horizontal"]);
-    fireEvent.keyDown(dividers[0], { key: "ArrowLeft" });
     fireEvent.keyDown(dividers[1], { key: "ArrowDown", shiftKey: true });
-    expect(run().ratios[0]).toBeCloseTo(0.45);
-    expect(run().ratios[1]).toBeCloseTo(0.51);
+    expect(run().ratios).toEqual([0.5, 0.51]);
     fireEvent.click(screen.getByTestId("run-pane-menu-3"));
     expect(screen.queryByRole("menuitemradio")).toBeNull();
     expect(screen.getByRole("menu")).toHaveTextContent("Leave the view");

@@ -36,36 +36,28 @@ describe("xtermTheme", () => {
     expect(theme.foreground).not.toBe(theme.background);
   });
 
-  it("keeps a column width only once the terminal font has loaded", () => {
+  it("keeps a column width only once the terminal font has loaded, never the estimate", () => {
     let advance = 7;
     let loaded = false;
     const ctx = { font: "", measureText: () => ({ width: advance * 10 }) };
-    const canvas = vi
-      .spyOn(HTMLCanvasElement.prototype, "getContext")
-      .mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
+    const canvas = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
     Object.defineProperty(document, "fonts", { configurable: true, value: { check: () => loaded } });
     try {
+      // No canvas: the 0.6em estimate, not kept.
+      expect(terminalCellWidth(20)).toBe(12);
+      canvas.mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
       // A fallback face is measured, used, but not kept.
-      expect(terminalCellWidth(21)).toBe(7);
+      expect(terminalCellWidth(20)).toBe(7);
       advance = 9;
       loaded = true;
-      expect(terminalCellWidth(21)).toBe(9);
+      expect(terminalCellWidth(20)).toBe(9);
       // Once loaded, the measurement is kept.
       advance = 11;
-      expect(terminalCellWidth(21)).toBe(9);
+      expect(terminalCellWidth(20)).toBe(9);
     } finally {
       canvas.mockRestore();
       delete (document as { fonts?: unknown }).fonts;
     }
-  });
-
-  it("estimates 0.6em without a canvas, and doesn't keep the estimate", () => {
-    const canvas = vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue(null);
-    expect(terminalCellWidth(20)).toBe(12);
-    const ctx = { font: "", measureText: () => ({ width: 130 }) };
-    canvas.mockReturnValue(ctx as unknown as CanvasRenderingContext2D);
-    expect(terminalCellWidth(20)).toBe(13);
-    canvas.mockRestore();
   });
 
   it("tints xterm's own scrollbar from the border tokens", () => {

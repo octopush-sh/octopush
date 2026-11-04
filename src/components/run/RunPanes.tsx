@@ -5,14 +5,13 @@ import {
   evenRatios,
   focus,
   leaveView,
-  paneGeometry,
   paneGrid,
   resolveOrientation,
   setOrientation,
   setRatios,
   swap,
   useTerminalLayoutStore,
-  type Frac,
+  type GridArea,
   type Orientation,
 } from "../../stores/terminalLayoutStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
@@ -34,9 +33,8 @@ const FINE_STEP = 0.01;
 
 /**
  * Run's panes (docs/superpowers/specs/2026-11-03-run-session-pair-design.md).
- * One pane is today's full canvas. Two to four sit in fixed positions
- * (`paneGrid` places them in one 2×2 grid, `paneGeometry` the dividers), each
- * under a caption naming its session, split by 1px
+ * One pane is today's full canvas. Two to four sit in fixed positions in one
+ * 2×2 grid (`paneGrid`), each under a caption naming its session, split by 1px
  * dividers; two and three side by side or stacked (`resolveOrientation`), four
  * a 2×2 grid around one shared cross. Each pane is only a
  * `TerminalSlot`: `TerminalHost` draws the session's terminal over it. An
@@ -51,9 +49,9 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const areaRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
   // What each workspace last drew: a drag holds that orientation, and while
-  // stacked `auto` measures the side-by-side split last drawn, which the
-  // stacked dividers never move.
-  const drawn = useRef(new Map<string, { orientation: "side" | "stacked"; sideSplit: number }>());
+  // stacked at the same count `auto` measures the side-by-side split last
+  // drawn, which the stacked dividers never move.
+  const drawn = useRef(new Map<string, { orientation: "side" | "stacked"; sideSplit: number; count: number }>());
 
   const slots = layout?.slots ?? [activeId];
   const paired = slots.length > 1 && !!layout;
@@ -83,15 +81,16 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
     return <TerminalSlot mode="run" terminalId={slots[0] ?? null} />;
   }
 
+  const count = slots.length;
   const last = drawn.current.get(workspaceId);
-  const sideSplit = last?.orientation === "stacked" ? last.sideSplit : (layout.ratios[0] ?? 0.5);
+  // A new count evens the dividers, so a split kept for the old one is void.
+  const kept = last?.orientation === "stacked" && last.count === count;
+  const sideSplit = kept ? last.sideSplit : (layout.ratios[0] ?? 0.5);
   const orientation =
     resizing && last
       ? last.orientation
       : resolveOrientation(layout, width, terminalCellWidth(), sideSplit);
-  drawn.current.set(workspaceId, { orientation, sideSplit });
-  const count = slots.length;
-  const { panes, dividers } = paneGeometry(count, orientation, layout.ratios);
+  drawn.current.set(workspaceId, { orientation, sideSplit, count });
   const grid = paneGrid(count, orientation, layout.ratios);
 
   const setRatio = (index: number, r: number) =>
@@ -125,7 +124,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
         transition: glide(["grid-template-columns", "grid-template-rows"]),
       }}
     >
-      {dividers.map((d) => {
+      {grid.dividers.map((d) => {
         const at = layout.ratios[d.ratio] ?? 0.5;
         const x = d.axis === "x";
         const onKey = (e: React.KeyboardEvent) => {
@@ -196,7 +195,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
           style={{
             gridColumn: grid.areas[i].column.join(" / "),
             gridRow: grid.areas[i].row.join(" / "),
-            ...paneInset(panes[i]),
+            ...paneInset(grid.areas[i]),
           }}
         >
           <PaneCaption
@@ -233,17 +232,12 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
 }
 
 const pct = (f: number) => `${f * 100}%`;
-const EDGE = 1e-6;
 
-/** A pane's margins in its grid area: half a pixel to each divider it touches. */
-function paneInset(f: Frac): React.CSSProperties {
-  const px = (touches: boolean) => (touches ? "0.5px" : 0);
-  return {
-    marginLeft: px(f.left > EDGE),
-    marginTop: px(f.top > EDGE),
-    marginRight: px(f.left + f.width < 1 - EDGE),
-    marginBottom: px(f.top + f.height < 1 - EDGE),
-  };
+/** A pane's margins in its grid area: half a pixel to each divider it touches
+ *  (any grid line but the outer ones, 1 and 3). */
+function paneInset({ column, row }: GridArea): React.CSSProperties {
+  const px = (line: number) => (line === 2 ? "0.5px" : 0);
+  return { marginLeft: px(column[0]), marginRight: px(column[1]), marginTop: px(row[0]), marginBottom: px(row[1]) };
 }
 
 /**

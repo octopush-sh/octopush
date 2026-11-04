@@ -179,14 +179,6 @@ export function setRatios(layout: RunLayout, ratios: number[]): RunLayout {
 /** Narrowest pane, in terminal columns, that `auto` still puts side by side. */
 export const MIN_SIDE_COLUMNS = 72;
 
-/** A box in fractions (0–1) of the panes' area. */
-export interface Frac {
-  left: number;
-  top: number;
-  width: number;
-  height: number;
-}
-
 /** A divider: the line at `at` across `axis` (`"x"` splits left from right),
  *  spanning `from`–`to` of the other axis, set by `ratios[ratio]`. */
 export interface Divider {
@@ -202,10 +194,7 @@ export interface Divider {
  * columns: side by side while every pane in the row keeps 72 columns, else
  * stacked. An override wins; one and four panes have no choice (four are
  * always a 2×2 grid), so they report `"side"`. An unmeasured width stays side by side.
- * `split` is the side-by-side main split to measure: `ratios[0]` while the view
- * is side by side, but once stacked `ratios[0]` is the top pane's height, so the
- * caller passes the split it last drew side by side (a stacked divider must
- * never un-stack the view).
+ * `split` is the side-by-side split to measure (stacked, `ratios[0]` is a height).
  */
 export function resolveOrientation(
   layout: RunLayout,
@@ -221,64 +210,6 @@ export function resolveOrientation(
   return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
 }
 
-const box = (left: number, top: number, width: number, height: number): Frac => ({
-  left,
-  top,
-  width,
-  height,
-});
-
-/**
- * Each slot's box and the dividers for `count` panes (spec "Slots and
- * layout"). Three panes: slot 0 is the large pane, the main divider sits
- * between it and the pair, the side divider between the pair. Four: one
- * shared cross, `[colSplit, rowSplit]`.
- */
-export function paneGeometry(
-  count: number,
-  orientation: "side" | "stacked",
-  ratios: number[],
-): { panes: Frac[]; dividers: Divider[] } {
-  const a = ratios[0] ?? 0.5;
-  const b = ratios[1] ?? 0.5;
-  if (count <= 1) return { panes: [box(0, 0, 1, 1)], dividers: [] };
-  if (count === 2) {
-    return orientation === "side"
-      ? {
-          panes: [box(0, 0, a, 1), box(a, 0, 1 - a, 1)],
-          dividers: [{ ratio: 0, axis: "x", at: a, from: 0, to: 1 }],
-        }
-      : {
-          panes: [box(0, 0, 1, a), box(0, a, 1, 1 - a)],
-          dividers: [{ ratio: 0, axis: "y", at: a, from: 0, to: 1 }],
-        };
-  }
-  if (count === 3) {
-    return orientation === "side"
-      ? {
-          panes: [box(0, 0, a, 1), box(a, 0, 1 - a, b), box(a, b, 1 - a, 1 - b)],
-          dividers: [
-            { ratio: 0, axis: "x", at: a, from: 0, to: 1 },
-            { ratio: 1, axis: "y", at: b, from: a, to: 1 },
-          ],
-        }
-      : {
-          panes: [box(0, 0, 1, a), box(0, a, b, 1 - a), box(b, a, 1 - b, 1 - a)],
-          dividers: [
-            { ratio: 0, axis: "y", at: a, from: 0, to: 1 },
-            { ratio: 1, axis: "x", at: b, from: a, to: 1 },
-          ],
-        };
-  }
-  return {
-    panes: [box(0, 0, a, b), box(a, 0, 1 - a, b), box(0, b, a, 1 - b), box(a, b, 1 - a, 1 - b)],
-    dividers: [
-      { ratio: 0, axis: "x", at: a, from: 0, to: 1 },
-      { ratio: 1, axis: "y", at: b, from: 0, to: 1 },
-    ],
-  };
-}
-
 /** A slot's place in `paneGrid`: 1-based grid lines, `[start, end]`. */
 export interface GridArea {
   column: [number, number];
@@ -286,35 +217,43 @@ export interface GridArea {
 }
 
 /**
- * The same layout as `paneGeometry`, as one 2×2 grid: two column and two row
- * tracks in `fr` (each pair sums to 1) and each slot's area. Every count and
- * orientation uses two tracks per axis, an unused one at `0fr`, so a change
- * between any two layouts interpolates the tracks: the grid-rows `0fr↔1fr`
- * idiom (spec "Motion").
+ * The slots and dividers for `count` panes (spec "Slots and layout") as one
+ * 2×2 grid: two column and two row tracks in `fr` (each pair sums to 1), each
+ * slot's area and the dividers. Three panes: slot 0 is the large pane, the
+ * main divider between it and the pair, the side divider between the pair.
+ * Four: one shared cross. Every layout uses two tracks per axis, an unused one
+ * at `0fr`, so a change between any two interpolates the tracks: the
+ * grid-rows `0fr↔1fr` idiom (spec "Motion").
  */
 export function paneGrid(
   count: number,
   orientation: "side" | "stacked",
   ratios: number[],
-): { columns: [number, number]; rows: [number, number]; areas: GridArea[] } {
+): { columns: [number, number]; rows: [number, number]; areas: GridArea[]; dividers: Divider[] } {
   const a = ratios[0] ?? 0.5;
   const b = ratios[1] ?? 0.5;
   const at = (c0: number, c1: number, r0: number, r1: number): GridArea => ({ column: [c0, c1], row: [r0, r1] });
-  if (count <= 1) return { columns: [1, 0], rows: [1, 0], areas: [at(1, 3, 1, 3)] };
+  const main = orientation === "side" ? "x" : "y";
+  const cross = main === "x" ? "y" : "x";
+  if (count <= 1) return { columns: [1, 0], rows: [1, 0], areas: [at(1, 3, 1, 3)], dividers: [] };
+  const first: Divider = { ratio: 0, axis: count === 4 ? "x" : main, at: a, from: 0, to: 1 };
   if (count === 2) {
+    const dividers: Divider[] = [first];
     return orientation === "side"
-      ? { columns: [a, 1 - a], rows: [1, 0], areas: [at(1, 2, 1, 3), at(2, 3, 1, 3)] }
-      : { columns: [1, 0], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 3, 2, 3)] };
+      ? { columns: [a, 1 - a], rows: [1, 0], areas: [at(1, 2, 1, 3), at(2, 3, 1, 3)], dividers }
+      : { columns: [1, 0], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 3, 2, 3)], dividers };
   }
   if (count === 3) {
+    const dividers: Divider[] = [first, { ratio: 1, axis: cross, at: b, from: a, to: 1 }];
     return orientation === "side"
-      ? { columns: [a, 1 - a], rows: [b, 1 - b], areas: [at(1, 2, 1, 3), at(2, 3, 1, 2), at(2, 3, 2, 3)] }
-      : { columns: [b, 1 - b], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)] };
+      ? { columns: [a, 1 - a], rows: [b, 1 - b], areas: [at(1, 2, 1, 3), at(2, 3, 1, 2), at(2, 3, 2, 3)], dividers }
+      : { columns: [b, 1 - b], rows: [a, 1 - a], areas: [at(1, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)], dividers };
   }
   return {
     columns: [a, 1 - a],
     rows: [b, 1 - b],
     areas: [at(1, 2, 1, 2), at(2, 3, 1, 2), at(1, 2, 2, 3), at(2, 3, 2, 3)],
+    dividers: [first, { ratio: 1, axis: "y", at: b, from: 0, to: 1 }],
   };
 }
 

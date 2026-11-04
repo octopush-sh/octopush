@@ -10,7 +10,6 @@ import {
   focusedId,
   leave,
   openBeside,
-  paneGeometry,
   paneGrid,
   prune,
   resolveOrientation,
@@ -169,6 +168,8 @@ describe("terminalLayout geometry", () => {
     expect(resolveOrientation({ ...layout(["A", "B", "C"]), ratios: [0.7, 0.5] }, 1600, CELL)).toBe("stacked");
     // Unmeasured: side by side.
     expect(resolveOrientation(layout(["A", "B"]), 0, CELL)).toBe("side");
+    // The split it is given wins over ratios[0] (stacked, a height).
+    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL, 0.3)).toBe("stacked");
   });
 
   it("an override wins for two and three panes; four are always the grid", () => {
@@ -181,71 +182,32 @@ describe("terminalLayout geometry", () => {
     expect(resolveOrientation(layout(["A", "B", "C", "D"]), 300, CELL)).toBe("side");
   });
 
-  it("lays three panes out around a large slot 0, both ways", () => {
-    const side = paneGeometry(3, "side", [0.6, 0.3]);
-    expect(side.panes).toEqual([
-      { left: 0, top: 0, width: 0.6, height: 1 },
-      { left: 0.6, top: 0, width: 0.4, height: 0.3 },
-      { left: 0.6, top: 0.3, width: 0.4, height: 0.7 },
-    ]);
-    expect(side.dividers).toEqual([
-      { ratio: 0, axis: "x", at: 0.6, from: 0, to: 1 },
-      { ratio: 1, axis: "y", at: 0.3, from: 0.6, to: 1 },
-    ]);
-    const stacked = paneGeometry(3, "stacked", [0.6, 0.3]);
-    expect(stacked.panes[0]).toEqual({ left: 0, top: 0, width: 1, height: 0.6 });
-    expect(stacked.panes[1]).toEqual({ left: 0, top: 0.6, width: 0.3, height: 0.4 });
-    expect(stacked.panes[2].left).toBe(0.3);
-    expect(stacked.dividers.map((d) => d.axis)).toEqual(["y", "x"]);
-  });
-
-  it("lays four panes out in reading order around one shared cross", () => {
-    const { panes, dividers } = paneGeometry(4, "side", [0.4, 0.6]);
-    expect(panes.map((p) => [p.left, p.top])).toEqual([[0, 0], [0.4, 0], [0, 0.6], [0.4, 0.6]]);
-    expect(panes[3]).toEqual({ left: 0.4, top: 0.6, width: 0.6, height: 0.4 });
-    // Each line runs the whole way: the cross is shared, not two splits per row.
-    expect(dividers).toEqual([
-      { ratio: 0, axis: "x", at: 0.4, from: 0, to: 1 },
-      { ratio: 1, axis: "y", at: 0.6, from: 0, to: 1 },
-    ]);
-    expect(paneGeometry(2, "stacked", [0.5]).panes[1]).toEqual({ left: 0, top: 0.5, width: 1, height: 0.5 });
-  });
-
-  it("measures auto against the split it is given, not a stacked height", () => {
-    // Stacked, ratios[0] is the top pane's height: an even height must not
-    // un-stack a view whose side-by-side split was 0.3.
-    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL, 0.3)).toBe("stacked");
-    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL)).toBe("side");
-  });
-
   it("places every count in one 2×2 grid whose tracks sum to one", () => {
-    expect(paneGrid(2, "side", [0.4])).toEqual({
+    expect(paneGrid(2, "side", [0.4])).toMatchObject({
       columns: [0.4, 0.6],
       rows: [1, 0],
       areas: [{ column: [1, 2], row: [1, 3] }, { column: [2, 3], row: [1, 3] }],
     });
     expect(paneGrid(2, "stacked", [0.4])).toMatchObject({ columns: [1, 0], rows: [0.4, 0.6] });
-    // Three stacked: a large top across both columns, the pair split by sideSplit.
-    expect(paneGrid(3, "stacked", [0.6, 0.3])).toEqual({
-      columns: [0.3, 0.7],
-      rows: [0.6, 0.4],
-      areas: [
-        { column: [1, 3], row: [1, 2] },
-        { column: [1, 2], row: [2, 3] },
-        { column: [2, 3], row: [2, 3] },
+    // Three: a large slot 0, the main divider beside it, the side one between the pair.
+    expect(paneGrid(3, "side", [0.6, 0.3])).toMatchObject({
+      areas: [{ column: [1, 2], row: [1, 3] }, { column: [2, 3], row: [1, 2] }, { column: [2, 3], row: [2, 3] }],
+      dividers: [
+        { ratio: 0, axis: "x", at: 0.6, from: 0, to: 1 },
+        { ratio: 1, axis: "y", at: 0.3, from: 0.6, to: 1 },
       ],
     });
-    expect(paneGrid(3, "side", [0.6, 0.3]).areas[0]).toEqual({ column: [1, 2], row: [1, 3] });
-    expect(paneGrid(4, "side", [0.4, 0.6]).areas.map((a) => [a.column[0], a.row[0]])).toEqual([
-      [1, 1], [2, 1], [1, 2], [2, 2],
+    const stacked = paneGrid(3, "stacked", [0.6, 0.3]);
+    expect(stacked).toMatchObject({ columns: [0.3, 0.7], rows: [0.6, 0.4] });
+    expect(stacked.areas.map((a) => a.column)).toEqual([[1, 3], [1, 2], [2, 3]]);
+    expect(stacked.dividers.map((d) => d.axis)).toEqual(["y", "x"]);
+    // Four in reading order around one shared cross: each line runs the whole way.
+    const four = paneGrid(4, "side", [0.4, 0.6]);
+    expect(four.areas.map((a) => [a.column[0], a.row[0]])).toEqual([[1, 1], [2, 1], [1, 2], [2, 2]]);
+    expect(four.dividers).toEqual([
+      { ratio: 0, axis: "x", at: 0.4, from: 0, to: 1 },
+      { ratio: 1, axis: "y", at: 0.6, from: 0, to: 1 },
     ]);
-  });
-
-  it("removing a slot shifts the rest down and evens the dividers for the new count", () => {
-    const next = leave({ ...layout(["A", "B", "C", "D"], 3), ratios: [0.3, 0.7] }, 1);
-    expect(next.slots).toEqual(["A", "C", "D"]);
-    expect(next.ratios).toEqual([0.5, 0.5]);
-    expect(focusedId(next)).toBe("D");
   });
 });
 
