@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
-vi.mock("../../lib/ipc", () => ({ ipc: {} }));
+const mockIpc = { createTerminal: vi.fn() };
+vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
+const noop = () => {};
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
@@ -38,7 +40,7 @@ beforeEach(() => {
 describe("RunPanes", () => {
   it("is today's full canvas with one pane: one slot, no captions, no divider", () => {
     seed(["a", "b"], ["a"]);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     expect(published()).toEqual(["a"]);
     expect(screen.queryByTestId("run-pane-caption-0")).toBeNull();
     expect(screen.queryByRole("separator")).toBeNull();
@@ -46,7 +48,7 @@ describe("RunPanes", () => {
 
   it("puts two sessions side by side under captions, the focused one ivory; a click focuses", () => {
     seed(["a", "b"], ["a", "b"], 1);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     expect(published()).toEqual(["a", "b"]);
     expect(screen.getByTestId("run-pane-caption-0")).toHaveTextContent("Label a");
     expect(screen.getByTestId("run-pane-caption-0").dataset.focused).toBe("false");
@@ -61,7 +63,7 @@ describe("RunPanes", () => {
 
   it("leaves the view with ×, back to one pane, and keeps the session", () => {
     seed(["a", "b"], ["a", "b"], 0);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const leave = screen.getByTestId("run-pane-leave-0");
     expect(leave).toHaveAttribute("title", "Leave the view · the session keeps running");
     fireEvent.click(leave);
@@ -73,7 +75,7 @@ describe("RunPanes", () => {
 
   it("swaps from the caption menu (focus stays with its session), and leaves from it", () => {
     seed(["a", "b"], ["a", "b"], 0);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     fireEvent.click(screen.getByTestId("run-pane-menu-0"));
     expect(screen.getByRole("menu")).toHaveTextContent("Swap with…");
     fireEvent.click(screen.getByRole("menuitem", { name: "Label b" }));
@@ -88,7 +90,7 @@ describe("RunPanes", () => {
 
   it("resizes from the keyboard, evens on double-click, and stays within 20–80%", () => {
     seed(["a", "b"], ["a", "b"]);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = screen.getByRole("separator", { name: "Resize the panes" });
     expect(divider).toHaveAttribute("title", "Drag to resize · Double-click to even");
     fireEvent.keyDown(divider, { key: "ArrowRight" });
@@ -103,7 +105,7 @@ describe("RunPanes", () => {
 
   it("drags the divider, refitting on frames and telling the PTY only on release", () => {
     seed(["a", "b"], ["a", "b"]);
-    render(<RunPanes workspaceId={WS} />);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = screen.getByRole("separator");
     const row = divider.parentElement!.parentElement!;
     vi.spyOn(row, "getBoundingClientRect").mockReturnValue({ left: 100, width: 1000 } as DOMRect);
@@ -115,9 +117,30 @@ describe("RunPanes", () => {
     expect(useTerminalLayoutStore.getState().resizing).toBe(false);
   });
 
+  it("an empty seat invites a session: a click opens the switcher, its CTA opens one here", async () => {
+    seed(["a"], ["a", null], 0);
+    mockIpc.createTerminal.mockResolvedValue({ id: "n", label: "Terminal 2", position: 1 });
+    const onOpenBeside = vi.fn();
+    render(<RunPanes workspaceId={WS} onOpenBeside={onOpenBeside} />);
+    const seat = screen.getByTestId("run-empty-seat");
+    expect(seat).toHaveTextContent("Beside");
+    expect(seat).toHaveTextContent("Bring a session alongside.");
+    expect(published()).toEqual(["a"]);
+
+    fireEvent.click(seat);
+    expect(onOpenBeside).toHaveBeenCalledTimes(1);
+    expect(run().focused).toBe(1);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Open a new session here" }));
+    });
+    expect(onOpenBeside).toHaveBeenCalledTimes(1);
+    expect(run().slots).toEqual(["a", "n"]);
+  });
+
   it("ends a drag the divider never saw released, so the PTYs get their size again", () => {
     seed(["a", "b"], ["a", "b"]);
-    const { unmount } = render(<RunPanes workspaceId={WS} />);
+    const { unmount } = render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     fireEvent.pointerDown(screen.getByRole("separator"), { button: 0, pointerId: 1 });
     expect(document.body.style.cursor).toBe("col-resize");
     // The view drops to one pane mid-drag.

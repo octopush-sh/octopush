@@ -8,6 +8,9 @@ import { useAttentionStore } from "./attentionStore";
 import {
   EMPTY_RUN_LAYOUT,
   assign,
+  besideAction,
+  besideReplaces,
+  besideSlot,
   focusedId,
   leave,
   openBeside,
@@ -114,13 +117,14 @@ interface TerminalsStore {
 
   // Actions
   loadTerminals: (workspaceId: string) => Promise<void>;
-  /** Create a session. It goes in the focused pane, or in `targetSlot` when
-   *  given (`slots.length` appends a new slot); a slot that can't take it
-   *  leaves it unseated. */
+  /** Create a session. It goes in the focused pane, or in the slot
+   *  `targetSlot` picks from the layout once the session exists (so a layout
+   *  that changed meanwhile is respected; `slots.length` appends a new slot).
+   *  A slot that can't take it (e.g. -1) leaves it unseated. */
   createTerminal: (
     workspaceId: string,
     label?: string,
-    targetSlot?: number,
+    targetSlot?: (layout: RunLayout) => number,
   ) => Promise<TerminalState>;
   renameTerminal: (workspaceId: string, id: string, label: string) => Promise<void>;
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
@@ -128,12 +132,19 @@ interface TerminalsStore {
   setActive: (workspaceId: string, id: string | null) => void;
   /** The one path that changes Run's layout; derives `activeByWs` from it. */
   updateLayout: (workspaceId: string, fn: (layout: RunLayout) => RunLayout) => void;
-  /** The session *Open beside* would seat: the most recently used one that
-   *  is not on screen (else the first such in rail order), or null when
-   *  there is none or Run already shows `RUN_PANES` panes. */
-  besideCandidate: (workspaceId: string) => string | null;
-  /** Seat `besideCandidate` beside the focused pane and focus it. */
-  openBeside: (workspaceId: string) => void;
+  /** What Open beside does now: open the pairing switcher (`"pair"`), leave
+   *  an empty seat because every session is on screen (`"seat"`), or nothing. */
+  besideAction: (workspaceId: string) => "pair" | "seat" | null;
+  /** True when Run has no room and no empty seat: a pick from the pairing
+   *  switcher replaces the session in the focused pane. */
+  besideReplaces: (workspaceId: string) => boolean;
+  /** Put `id` beside the panes — in the empty seat, else a new slot, else the
+   *  focused pane — and focus it. `null` leaves an empty seat. */
+  openBeside: (workspaceId: string, id: string | null) => void;
+  /** Open a new session straight into the slot Open beside fills, chosen
+   *  when the session exists; never over a shown session it wasn't asked to
+   *  replace. */
+  createBeside: (workspaceId: string) => Promise<TerminalState>;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
@@ -159,6 +170,15 @@ interface TerminalsStore {
 }
 
 // ─── Store implementation ─────────────────────────────────────────
+
+/** Run's layout for a workspace. One seen for the first time starts as one
+ *  pane holding whatever was active. */
+function runOf(workspaceId: string): RunLayout {
+  return (
+    useTerminalLayoutStore.getState().runByWs[workspaceId] ??
+    { ...EMPTY_RUN_LAYOUT, slots: [useTerminalsStore.getState().activeByWs[workspaceId] ?? null] }
+  );
+}
 
 export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
   terminalsByWs: {},
@@ -304,7 +324,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       };
     });
     get().updateLayout(workspaceId, (layout) =>
-      assign(layout, targetSlot ?? layout.focused, newTerminal.id),
+      assign(layout, targetSlot ? targetSlot(layout) : layout.focused, newTerminal.id),
     );
 
     return newTerminal;
@@ -361,17 +381,19 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     });
     useTerminalLayoutStore.getState().forget(workspaceId, id);
 
-    // A shown session's slot goes exactly as leaving it would. The last pane
-    // takes a neighbour instead — the one after, else the one before — and
-    // never one that is already on screen.
+    // A shown session's slot goes exactly as leaving it would, and a focused
+    // one hands focus to the next pane. With no pane left showing a session
+    // (it was alone, or beside only an empty seat), one pane takes a
+    // neighbour — the one after, else the one before — never one on screen.
     get().updateLayout(workspaceId, (layout) => {
       const slot = layout.slots.indexOf(id);
       if (slot === -1) return layout;
-      if (layout.slots.length > 1) return leave(layout, slot);
+      const left = leave(layout, slot);
+      if (left.slots.some((s) => s !== null)) return left;
       const idx = prev.findIndex((t) => t.id === id);
       const order = [...remaining.slice(idx), ...remaining.slice(0, idx).reverse()];
       const next = order.find((t) => !layout.slots.includes(t.id));
-      return assign(layout, slot, next?.id ?? null);
+      return assign(left, 0, next?.id ?? null);
     });
   },
 
@@ -379,38 +401,34 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     get().updateLayout(workspaceId, (layout) => assign(layout, layout.focused, id)),
 
   updateLayout: (workspaceId, fn) => {
-    const layouts = useTerminalLayoutStore.getState();
-    // A workspace seen for the first time starts as one pane holding
-    // whatever was active.
-    const current =
-      layouts.runByWs[workspaceId] ??
-      { ...EMPTY_RUN_LAYOUT, slots: [get().activeByWs[workspaceId] ?? null] };
-    const next = fn(current);
-    layouts.commitRun(workspaceId, next);
+    const next = fn(runOf(workspaceId));
+    useTerminalLayoutStore.getState().commitRun(workspaceId, next);
     const id = focusedId(next);
     const byWs = get().activeByWs;
     if (workspaceId in byWs && byWs[workspaceId] === id) return;
     set((s) => ({ activeByWs: { ...s.activeByWs, [workspaceId]: id } }));
   },
 
-  besideCandidate: (workspaceId) => {
+  besideAction: (workspaceId) => {
+    const layout = runOf(workspaceId);
     const terminals = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
-    const layouts = useTerminalLayoutStore.getState();
-    const shown = workspaceId in layouts.runByWs
-      ? layouts.getRun(workspaceId).slots
-      : [get().activeByWs[workspaceId] ?? null];
-    if (shown.length >= RUN_PANES || shown.every((id) => id === null)) return null;
-    const exists = (id: string) => terminals.some((t) => t.id === id);
-    return (
-      layouts.recentNotShown(workspaceId, exists) ??
-      terminals.find((t) => !shown.includes(t.id))?.id ??
-      null
-    );
+    const hasHidden = terminals.some((t) => !layout.slots.includes(t.id));
+    return besideAction(layout, hasHidden, RUN_PANES);
   },
 
-  openBeside: (workspaceId) => {
-    const id = get().besideCandidate(workspaceId);
-    if (id) get().updateLayout(workspaceId, (layout) => openBeside(layout, id));
+  besideReplaces: (workspaceId) => besideReplaces(runOf(workspaceId), RUN_PANES),
+
+  openBeside: (workspaceId, id) =>
+    get().updateLayout(workspaceId, (layout) => openBeside(layout, id, RUN_PANES)),
+
+  // The slot is picked when the session exists. If the seat or the room went
+  // while it was being created, it stays off screen rather than replace a
+  // shown session — unless replacing was what the user asked for.
+  createBeside: (workspaceId) => {
+    const replaces = besideReplaces(runOf(workspaceId), RUN_PANES);
+    return get().createTerminal(workspaceId, undefined, (layout) =>
+      besideReplaces(layout, RUN_PANES) && !replaces ? -1 : besideSlot(layout, RUN_PANES),
+    );
   },
 
   markRunning: (workspaceId, id, running) =>

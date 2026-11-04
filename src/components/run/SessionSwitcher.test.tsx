@@ -3,7 +3,7 @@
  * session do I want" when the rail's icons aren't enough.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import type { SessionRole } from "../../lib/sessionRole";
 
 const mockIpc = {
@@ -16,6 +16,7 @@ const mockIpc = {
 vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
+const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
 const { SessionSwitcher } = await import("./SessionSwitcher");
 
 const WS = "ws-switcher";
@@ -43,7 +44,123 @@ function seed(
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {} });
   vi.clearAllMocks();
+});
+
+/** Put `slots` on screen, focusing `focused`. */
+function show(slots: (string | null)[], focused = 0) {
+  useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots, focused }));
+}
+const slots = () => useTerminalLayoutStore.getState().getRun(WS).slots;
+
+describe("SessionSwitcher — pairing", () => {
+  it("asks which session sits beside and lists only sessions not on screen", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    expect(screen.getByPlaceholderText("Which session sits beside this one?")).toBeTruthy();
+    expect(screen.queryByTestId("session-switcher-row-a")).toBeNull();
+    // Rows keep their rail number.
+    expect(screen.getByTestId("session-switcher-row-c").textContent).toContain("3");
+    expect(screen.getByTestId("session-switcher-new").textContent).toBe("Open a new session beside");
+    expect(screen.queryByTestId("session-switcher-replaces")).toBeNull();
+  });
+
+  it("puts the pick in a new pane beside, then closes", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} pairing />);
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Enter" });
+    expect(slots()).toEqual(["a", "b"]);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("b");
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("says a pick replaces the focused pane when there is no room left", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a", "b"], 0);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    expect(screen.getByTestId("session-switcher-replaces").textContent).toBe(
+      "Replaces the session in the focused pane",
+    );
+    fireEvent.click(screen.getByTestId("session-switcher-row-c"));
+    expect(slots()).toEqual(["c", "b"]);
+  });
+
+  it("opens a new session straight into the empty seat", async () => {
+    seed([{ id: "a", label: "main" }]);
+    show(["a", null]);
+    mockIpc.createTerminal.mockResolvedValue({ id: "new", label: "Terminal 2", position: 1 });
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByTestId("session-switcher-new"));
+    });
+    expect(mockIpc.createTerminal).toHaveBeenCalledWith(WS, "Terminal 2");
+    // The seat takes it; the pane that was focused still shows "a".
+    expect(slots()).toEqual(["a", "new"]);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("new");
+  });
+
+  it("Escape closes the pairing switcher and leaves the layout alone", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} pairing />);
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(slots()).toEqual(["a"]);
+    expect(useTerminalLayoutStore.getState().getRun(WS).focused).toBe(0);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("a");
+  });
+
+  it("still closes the selected session with Backspace on an empty query", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    mockIpc.deleteTerminal.mockResolvedValue(undefined);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
+  });
+
+  it("⌥⏎ in ⌘⌥K opens the selected session beside instead of switching", () => {
+    const onClose = vi.fn();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }]);
+    show(["a"]);
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} />);
+
+    const input = screen.getByTestId("session-switcher-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter", altKey: true });
+    expect(slots()).toEqual(["a", "b"]);
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  it("the ⌘⌥K footer says ⌥⏎ replaces once there is no room left", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    show(["a"]);
+    const { unmount } = render(<SessionSwitcher workspaceId={WS} onClose={() => {}} />);
+    expect(screen.getByTestId("session-switcher-alt-hint").textContent).toBe("⌥⏎ · Beside");
+    unmount();
+
+    show(["a", "b"], 0);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} />);
+    expect(screen.getByTestId("session-switcher-alt-hint").textContent).toBe("⌥⏎ · Replace");
+    // The header line stays a pairing-mode thing.
+    expect(screen.queryByTestId("session-switcher-replaces")).toBeNull();
+    const input = screen.getByTestId("session-switcher-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter", altKey: true });
+    expect(slots()).toEqual(["c", "b"]);
+  });
 });
 
 describe("SessionSwitcher", () => {
