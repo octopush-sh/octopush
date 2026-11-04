@@ -16,6 +16,7 @@ import type {
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useTerminalsStore } from "../stores/terminalsStore";
+import { useTerminalLayoutStore } from "../stores/terminalLayoutStore";
 import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
 import { isMac } from "../lib/platform";
@@ -48,7 +49,11 @@ interface Props {
   workspaceName?: string;
   /** Human label shown in the session name. */
   label: string;
-  visible: boolean;
+  /** On screen in the active mode. A shown pane never pings for attention. */
+  shown: boolean;
+  /** The pane the user works in: takes keyboard focus and OSC 52 copies.
+   *  Only meaningful while shown. */
+  focused: boolean;
   /** Incremented by parent when layout changes (sidebar/tokens/split toggle). */
   layoutVersion?: number;
   /** Called once the PTY session has been successfully spawned. */
@@ -78,7 +83,8 @@ export function TerminalPane({
   workspacePath,
   workspaceName,
   label,
-  visible,
+  shown,
+  focused,
   layoutVersion,
   onSpawn,
   onSpawnError,
@@ -101,11 +107,18 @@ export function TerminalPane({
   // latest callback without re-registering on every prop change.
   const onOpenFileRef = useRef(onOpenFile);
   onOpenFileRef.current = onOpenFile;
-  // Keep the latest `visible` flag accessible inside the BEL handler,
-  // which is registered once and would otherwise capture the mount-time
-  // value.
-  const visibleRef = useRef(visible);
-  visibleRef.current = visible;
+  // Keep the latest `shown`/`focused` flags accessible inside the BEL and
+  // OSC 52 handlers, which are registered once and would otherwise capture
+  // the mount-time value.
+  const shownRef = useRef(shown);
+  shownRef.current = shown;
+  const focusedRef = useRef(shown && focused);
+  focusedRef.current = shown && focused;
+  // While a divider is dragged, refit on animation frames but hold the PTY's
+  // size (no SIGWINCH storm) until pointer-up.
+  const resizing = useTerminalLayoutStore((s) => s.resizing);
+  const resizingRef = useRef(resizing);
+  resizingRef.current = resizing;
   const workspaceIdRef = useRef(workspaceId);
   workspaceIdRef.current = workspaceId;
   // Outer wrapper — stable size, observed by ResizeObserver.
@@ -146,6 +159,8 @@ export function TerminalPane({
     } catch {
       return;
     }
+    // Mid-drag: the pane refits, the PTY hears about it on pointer-up.
+    if (resizingRef.current) return;
     const { rows, cols } = term;
     const last = lastSizeRef.current;
     // Only send resize to PTY if dimensions actually changed.
@@ -279,10 +294,10 @@ export function TerminalPane({
     // lib/osc52.ts; the backend tags replayed scrollback on `pty://data` so
     // history can never reach the clipboard. This pane only sets the policy.
     const osc52 = attachOsc52Clipboard(term, {
-      // Only the pane the user is looking at, in a focused window: a hidden
-      // workspace, or an Octopush sitting behind another app, must not swap
-      // the clipboard under them.
-      canCopy: () => visibleRef.current && document.hasFocus(),
+      // Only the pane the user works in, in a focused window: a hidden or
+      // unfocused pane, or an Octopush sitting behind another app, must not
+      // swap the clipboard under them.
+      canCopy: () => focusedRef.current && document.hasFocus(),
       // Announced, unlike the user's own Cmd-C: nothing was pressed in
       // Octopush, so the toast is how they learn their clipboard changed.
       copy: (text) => void copyToClipboard(text, "Copied from the terminal"),
@@ -386,26 +401,23 @@ export function TerminalPane({
 
     // Debounced ResizeObserver — observe the WRAPPER (stable outer box),
     // not the xterm container (whose dimensions shift as content flows).
+    // While a divider is dragged it refits once per animation frame instead.
     let resizeTimer: ReturnType<typeof setTimeout> | null = null;
+    let resizeFrame = 0;
+    let framePending = false;
     const ro = new ResizeObserver(() => {
       if (resizeTimer) clearTimeout(resizeTimer);
-      resizeTimer = setTimeout(() => {
-        const w = wrapperRef.current;
-        const ptyId = ptySessionIdRef.current;
-        if (w && w.clientWidth > 0 && w.clientHeight > 0 && ptyId) {
-          try {
-            fit.fit();
-          } catch {
-            return;
-          }
-          const { rows, cols } = term;
-          const last = lastSizeRef.current;
-          if (rows !== last.rows || cols !== last.cols) {
-            lastSizeRef.current = { rows, cols };
-            ipc.resizeSession(ptyId, rows, cols).catch(() => {});
-          }
+      if (resizingRef.current) {
+        if (!framePending) {
+          framePending = true;
+          resizeFrame = requestAnimationFrame(() => {
+            framePending = false;
+            syncSize();
+          });
         }
-      }, 100); // 100ms debounce
+        return;
+      }
+      resizeTimer = setTimeout(syncSize, 100); // 100ms debounce
     });
     if (wrapperRef.current) {
       ro.observe(wrapperRef.current);
@@ -434,12 +446,12 @@ export function TerminalPane({
 
     // Daemon-driven attention: when the daemon decides the PTY went
     // idle after a meaningful burst, it emits `pty://attention`.
-    // We forward it to the attention store unless this pane is the
-    // one the user is currently looking at.
+    // We forward it to the attention store unless this pane is on
+    // screen, where the user can already see it.
     let unlistenAttention: UnlistenFn | undefined;
     listen<PtyAttentionEvent>("pty://attention", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
-      if (visibleRef.current) return;
+      if (shownRef.current) return;
       // Carry the terminal id so the Run rail can mark the session that rang
       // rather than the whole workspace.
       useAttentionStore
@@ -523,7 +535,7 @@ export function TerminalPane({
     // otherwise it'd just nag the user about a terminal they're already
     // looking at. xterm emits onBell for every \x07 it processes.
     const bellDisp = term.onBell(() => {
-      if (visibleRef.current) return;
+      if (shownRef.current) return;
       useAttentionStore.getState().ping(workspaceIdRef.current, "terminal", terminalId);
     });
 
@@ -545,7 +557,7 @@ export function TerminalPane({
     // Propagate xterm resize events to PTY (handles manual terminal resize).
     const resizeDisp = term.onResize(({ rows, cols }) => {
       const ptyId = ptySessionIdRef.current;
-      if (!ptyId) return;
+      if (!ptyId || resizingRef.current) return;
       const last = lastSizeRef.current;
       if (rows !== last.rows || cols !== last.cols) {
         lastSizeRef.current = { rows, cols };
@@ -591,6 +603,7 @@ export function TerminalPane({
       cancelled = true;
       spawnRef.current = () => {};
       if (resizeTimer) clearTimeout(resizeTimer);
+      if (framePending) cancelAnimationFrame(resizeFrame);
       dataDisp.dispose();
       resizeDisp.dispose();
       bellDisp.dispose();
@@ -622,13 +635,14 @@ export function TerminalPane({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [terminalId]);
 
-  // Refit + focus when becoming visible.
+  // Refit when shown; take keyboard focus only as the focused pane.
+  const takesFocus = shown && focused;
   useEffect(() => {
-    if (visible) {
+    if (shown) {
       const t1 = requestAnimationFrame(() => syncSize());
       const t2 = setTimeout(() => {
         syncSize();
-        termRef.current?.focus();
+        if (takesFocus) termRef.current?.focus();
       }, 50);
       const t3 = setTimeout(() => syncSize(), 200);
       return () => {
@@ -637,11 +651,19 @@ export function TerminalPane({
         clearTimeout(t3);
       };
     }
-  }, [visible, syncSize]);
+  }, [shown, takesFocus, syncSize]);
+
+  // The divider was let go: tell the PTY the size the pane settled on.
+  const wasResizingRef = useRef(resizing);
+  useEffect(() => {
+    const wasResizing = wasResizingRef.current;
+    wasResizingRef.current = resizing;
+    if (wasResizing && !resizing && shownRef.current) syncSize();
+  }, [resizing, syncSize]);
 
   // Refit when parent layout changes (sidebar/tokens/split toggled).
   useEffect(() => {
-    if (!visible || layoutVersion === undefined) return;
+    if (!shown || layoutVersion === undefined) return;
     // Give the browser time to recalculate the flex layout.
     const t1 = requestAnimationFrame(() => syncSize());
     const t2 = setTimeout(() => syncSize(), 100);
@@ -651,7 +673,7 @@ export function TerminalPane({
       clearTimeout(t2);
       clearTimeout(t3);
     };
-  }, [layoutVersion, visible, syncSize]);
+  }, [layoutVersion, shown, syncSize]);
 
   const retrySpawn = useCallback(() => {
     setSpawnError(null);
@@ -663,7 +685,7 @@ export function TerminalPane({
     <div
       ref={wrapperRef}
       className="relative h-full w-full overflow-hidden"
-      style={{ display: visible ? "block" : "none" }}
+      style={{ display: shown ? "block" : "none" }}
     >
       <div
         ref={containerRef}

@@ -6,7 +6,7 @@
  * This lets us verify:
  *   - onSpawn fires after the PTY session is created.
  *   - onExit fires when the pty://exit event matches this terminal's session.
- *   - The wrapper div has display:none when visible===false and display:block when true.
+ *   - The wrapper div has display:none unless shown; only the focused pane takes focus.
  *
  * NOTE: xterm DOM-rendering behaviour (canvas, scroll, font) is skipped here
  * because it requires a real browser environment. Verify those in Playwright/e2e.
@@ -186,7 +186,7 @@ describe("TerminalPane — clipboard", () => {
     const writeText = vi.fn();
     Object.assign(navigator, { clipboard: { writeText } });
     const { container } = render(
-      <TerminalPane terminalId="tc" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+      <TerminalPane terminalId="tc" workspaceId="ws" workspacePath="/p" label="L" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
 
@@ -205,7 +205,7 @@ describe("TerminalPane — clipboard", () => {
     const writeText = vi.fn();
     Object.assign(navigator, { clipboard: { writeText } });
     const { container } = render(
-      <TerminalPane terminalId="tc2" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+      <TerminalPane terminalId="tc2" workspaceId="ws" workspacePath="/p" label="L" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
 
@@ -235,12 +235,12 @@ function osc52(text: string, pc = "c"): string {
   return `${pc};${btoa(bin)}`;
 }
 
-async function mountForOsc(id: string, visible = true) {
+async function mountForOsc(id: string, shown = true, focused = shown) {
   const writeText = vi.fn();
   Object.assign(navigator, { clipboard: { writeText } });
   vi.spyOn(document, "hasFocus").mockReturnValue(true);
   render(
-    <TerminalPane terminalId={id} workspaceId="ws" workspacePath="/p" label="L" visible={visible} />,
+    <TerminalPane terminalId={id} workspaceId="ws" workspacePath="/p" label="L" shown={shown} focused={focused} />,
   );
   await act(async () => { await Promise.resolve(); });
   const term = xtermHoisted.last!;
@@ -318,6 +318,12 @@ describe("TerminalPane — OSC 52", () => {
     expect(writeText).not.toHaveBeenCalled();
   });
 
+  it("ignores OSC 52 from a pane that is shown but not focused", async () => {
+    const { writeText, handler } = await mountForOsc("osc5b", true, false);
+    expect(handler(osc52("beside"))).toBe(true);
+    expect(writeText).not.toHaveBeenCalled();
+  });
+
   it("hands the setup runner's exit report (OSC 6973) to the terminals store", async () => {
     const { useTerminalsStore } = await import("../stores/terminalsStore");
     useTerminalsStore.setState({ setupByTerminal: {} });
@@ -355,7 +361,7 @@ describe("TerminalPane — OSC 52", () => {
 describe("TerminalPane — native selection override", () => {
   it("lets Option-drag force a native xterm selection while a program owns the mouse", async () => {
     render(
-      <TerminalPane terminalId="sel1" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+      <TerminalPane terminalId="sel1" workspaceId="ws" workspacePath="/p" label="L" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
     expect(xtermHoisted.last!.ctorOptions.macOptionClickForcesSelection).toBe(true);
@@ -363,7 +369,7 @@ describe("TerminalPane — native selection override", () => {
 
   it("switches alt-click cursor moves off only while a program tracks the mouse", async () => {
     const { container } = render(
-      <TerminalPane terminalId="sel2" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+      <TerminalPane terminalId="sel2" workspaceId="ws" workspacePath="/p" label="L" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
     const term = xtermHoisted.last!;
@@ -391,7 +397,7 @@ describe("TerminalPane — zoom", () => {
 
   async function mounted() {
     const { container } = render(
-      <TerminalPane terminalId="tz" workspaceId="ws" workspacePath="/p" label="L" visible={true} />,
+      <TerminalPane terminalId="tz" workspaceId="ws" workspacePath="/p" label="L" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
     return container;
@@ -477,7 +483,7 @@ describe("TerminalPane — spawn callback", () => {
         workspaceId="ws-test"
         workspacePath="/path/to/ws"
         label="Main"
-        visible={true}
+        shown focused
         onSpawn={onSpawn}
       />,
     );
@@ -510,7 +516,7 @@ describe("TerminalPane — spawn callback", () => {
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Temp"
-        visible={true}
+        shown focused
         onSpawn={onSpawn}
       />,
     );
@@ -538,7 +544,7 @@ describe("TerminalPane — spawn failure", () => {
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
-        visible={true}
+        shown focused
         onSpawn={onSpawn}
         onSpawnError={onSpawnError}
       />,
@@ -602,7 +608,7 @@ describe("TerminalPane — spawn failure", () => {
     );
     const onSpawn = vi.fn();
     const { queryByTestId } = render(
-      <TerminalPane terminalId="t-null" workspaceId="ws" workspacePath="/ws" label="L" visible={true} onSpawn={onSpawn} />,
+      <TerminalPane terminalId="t-null" workspaceId="ws" workspacePath="/ws" label="L" shown focused onSpawn={onSpawn} />,
     );
     await act(async () => {
       await Promise.resolve();
@@ -628,7 +634,7 @@ describe("TerminalPane — starting line", () => {
         workspacePath="/repos/octopush/.worktrees/x"
         workspaceName="run-history-sync"
         label="Main"
-        visible={true}
+        shown focused
       />,
     );
     // Spawn still in flight: never a blank pane.
@@ -651,7 +657,7 @@ describe("TerminalPane — starting line", () => {
 
   it("ignores output from other sessions and falls back to the folder name", async () => {
     const { getByTestId, getByText } = render(
-      <TerminalPane terminalId="t-start2" workspaceId="ws" workspacePath="/repos/my-app/" label="Main" visible={true} />,
+      <TerminalPane terminalId="t-start2" workspaceId="ws" workspacePath="/repos/my-app/" label="Main" shown focused />,
     );
     await act(async () => { await Promise.resolve(); });
     expect(getByText("Starting shell in my-app…")).toBeTruthy();
@@ -662,7 +668,7 @@ describe("TerminalPane — starting line", () => {
   it("gives way to the error state when the spawn is rejected", async () => {
     mockIpc.spawnOrAttachTerminal.mockRejectedValueOnce("boom");
     const { queryByTestId, getByTestId } = render(
-      <TerminalPane terminalId="t-start3" workspaceId="ws" workspacePath="/ws" label="Main" visible={true} />,
+      <TerminalPane terminalId="t-start3" workspaceId="ws" workspacePath="/ws" label="Main" shown focused />,
     );
     await act(async () => {
       await Promise.resolve();
@@ -682,7 +688,7 @@ describe("TerminalPane — exit callback", () => {
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
-        visible={true}
+        shown focused
         onExit={onExit}
       />,
     );
@@ -709,7 +715,7 @@ describe("TerminalPane — exit callback", () => {
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
-        visible={true}
+        shown focused
         onExit={onExit}
       />,
     );
@@ -727,29 +733,87 @@ describe("TerminalPane — exit callback", () => {
   });
 });
 
-describe("TerminalPane — visibility", () => {
-  it("wrapper has display:none when visible is false", async () => {
+describe("TerminalPane — shown and focused", () => {
+  it("wrapper has display:none when not shown", async () => {
     const { container } = render(
       <TerminalPane
         terminalId="t-hidden"
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
-        visible={false}
+        shown={false}
+        focused={false}
       />,
     );
     const wrapper = container.firstChild as HTMLElement;
     expect(wrapper.style.display).toBe("none");
   });
 
-  it("wrapper has display:block when visible is true", async () => {
+  it("takes keyboard focus only as the focused pane", async () => {
+    const props = { terminalId: "t-focus", workspaceId: "ws", workspacePath: "/ws", label: "L" };
+    const { rerender } = render(<TerminalPane {...props} shown focused={false} />);
+    await act(async () => { await new Promise((r) => setTimeout(r, 80)); });
+    const term = xtermHoisted.last! as unknown as { focus: ReturnType<typeof vi.fn> };
+    expect(term.focus).not.toHaveBeenCalled();
+    rerender(<TerminalPane {...props} shown focused />);
+    await act(async () => { await new Promise((r) => setTimeout(r, 80)); });
+    expect(term.focus).toHaveBeenCalled();
+  });
+
+  it("rings the bell only for a pane that is not on screen", async () => {
+    const { useAttentionStore } = await import("../stores/attentionStore");
+    const ping = vi.spyOn(useAttentionStore.getState(), "ping");
+    const props = { terminalId: "t-bell", workspaceId: "ws", workspacePath: "/ws", label: "L" };
+    const { rerender } = render(<TerminalPane {...props} shown focused={false} />);
+    const term = xtermHoisted.last! as unknown as { onBell: ReturnType<typeof vi.fn> };
+    const bell = term.onBell.mock.calls[0][0] as () => void;
+    bell();
+    expect(ping).not.toHaveBeenCalled();
+    rerender(<TerminalPane {...props} shown={false} focused={false} />);
+    bell();
+    expect(ping).toHaveBeenCalledWith("ws", "terminal", "t-bell");
+    ping.mockRestore();
+  });
+
+  it("holds the PTY's size while a divider is dragged and sends it on release", async () => {
+    const { useTerminalLayoutStore } = await import("../stores/terminalLayoutStore");
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(600);
+    try {
+      render(<TerminalPane terminalId="t-drag" workspaceId="ws" workspacePath="/ws" label="L" shown focused />);
+      await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
+      const term = xtermHoisted.last! as unknown as {
+        onResize: ReturnType<typeof vi.fn>;
+        rows: number;
+        cols: number;
+      };
+      const onResize = term.onResize.mock.calls[0][0] as (s: { rows: number; cols: number }) => void;
+      mockIpc.resizeSession.mockClear();
+
+      act(() => useTerminalLayoutStore.getState().setResizing(true));
+      term.rows = 30;
+      term.cols = 90;
+      onResize({ rows: 30, cols: 90 });
+      expect(mockIpc.resizeSession).not.toHaveBeenCalled();
+
+      act(() => useTerminalLayoutStore.getState().setResizing(false));
+      expect(mockIpc.resizeSession).toHaveBeenCalledTimes(1);
+      expect(mockIpc.resizeSession).toHaveBeenCalledWith("t-drag", 30, 90);
+    } finally {
+      width.mockRestore();
+      height.mockRestore();
+      useTerminalLayoutStore.setState({ resizing: false });
+    }
+  });
+
+  it("wrapper has display:block when shown", async () => {
     const { container } = render(
       <TerminalPane
         terminalId="t-visible"
         workspaceId="ws-test"
         workspacePath="/ws"
         label="Main"
-        visible={true}
+        shown focused
       />,
     );
     const wrapper = container.firstChild as HTMLElement;
