@@ -191,21 +191,21 @@ export interface Divider {
 
 /**
  * Where `auto` lands for this layout `width` pixels wide with `cellWidth`-pixel
- * columns: side by side while every pane in the row keeps 72 columns, else
- * stacked. An override wins; one and four panes have no choice (four are
- * always a 2×2 grid), so they report `"side"`. An unmeasured width stays side by side.
- * `split` is the side-by-side split to measure (stacked, `ratios[0]` is a height).
+ * columns: side by side when every pane of an EVEN side-by-side layout for the
+ * current count would keep 72 columns, else stacked. The dividers never enter
+ * into it, so dragging or evening one never changes the orientation; only the
+ * width and the pane count do. An override wins; one and four panes have no
+ * choice (four are always a 2×2 grid), so they report `"side"`. An unmeasured
+ * width stays side by side.
  */
-export function resolveOrientation(
-  layout: RunLayout,
-  width: number,
-  cellWidth: number,
-  split = layout.ratios[0] ?? 0.5,
-): "side" | "stacked" {
+export function resolveOrientation(layout: RunLayout, width: number, cellWidth: number): "side" | "stacked" {
   const count = layout.slots.length;
   if (count !== 2 && count !== 3) return "side";
   if (layout.orientation !== "auto") return layout.orientation;
   if (width <= 0 || cellWidth <= 0) return "side";
+  // Even, two panes are halves; three are a half beside a stacked pair, so
+  // the narrowest pane is half the width either way.
+  const split = evenRatios(count)[0];
   const narrowest = width * Math.min(split, 1 - split);
   return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
 }

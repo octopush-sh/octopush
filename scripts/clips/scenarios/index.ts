@@ -5,10 +5,12 @@ import { defaultScenario } from "./default";
 import { empty } from "./empty";
 import { stress } from "./stress";
 import { runTwoSessions } from "./run-two-sessions";
+import { runFourSessions } from "./run-four-sessions";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
   empty,
   stress,
   "run-two-sessions": runTwoSessions,
+  "run-four-sessions": runFourSessions,
 };

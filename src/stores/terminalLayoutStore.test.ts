@@ -159,17 +159,20 @@ describe("terminalLayout reducers", () => {
 describe("terminalLayout geometry", () => {
   const CELL = 8; // 72 columns = 576px
 
-  it("auto stays side by side while the narrowest pane keeps 72 columns", () => {
+  it("auto decides from the width at even splits, never from the dividers", () => {
+    // 72 columns = 576px, so two or three even panes need 1152px.
     expect(resolveOrientation(layout(["A", "B"]), 1200, CELL)).toBe("side");
     expect(resolveOrientation(layout(["A", "B"]), 1100, CELL)).toBe("stacked");
-    // The narrowest pane counts, not the even split.
-    expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [0.7] }, 1600, CELL)).toBe("stacked");
-    expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [0.7] }, 2000, CELL)).toBe("side");
-    expect(resolveOrientation({ ...layout(["A", "B", "C"]), ratios: [0.7, 0.5] }, 1600, CELL)).toBe("stacked");
+    expect(resolveOrientation(layout(["A", "B", "C"]), 1152, CELL)).toBe("side");
+    expect(resolveOrientation(layout(["A", "B", "C"]), 1151, CELL)).toBe("stacked");
+    // A divider moved anywhere changes nothing: wide stays side by side, narrow stays stacked.
+    for (const r of [0.2, 0.45, 0.5, 0.7, 0.8]) {
+      expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [r] }, 1600, CELL)).toBe("side");
+      expect(resolveOrientation({ ...layout(["A", "B", "C"]), ratios: [r, 0.5] }, 1600, CELL)).toBe("side");
+      expect(resolveOrientation({ ...layout(["A", "B"]), ratios: [r] }, 1000, CELL)).toBe("stacked");
+    }
     // Unmeasured: side by side.
     expect(resolveOrientation(layout(["A", "B"]), 0, CELL)).toBe("side");
-    // The split it is given wins over ratios[0] (stacked, a height).
-    expect(resolveOrientation(layout(["A", "B"]), 1300, CELL, 0.3)).toBe("stacked");
   });
 
   it("an override wins for two and three panes; four are always the grid", () => {

@@ -19,6 +19,7 @@ interface Props {
 export function TerminalSlot({ mode, terminalId, className }: Props) {
   const key = useId();
   const ref = useRef<HTMLDivElement>(null);
+  const measureRef = useRef<(() => void) | null>(null);
 
   // Layout effect: the rect lands in the store before paint, so switching the
   // session in a slot never paints a frame with the old pane in it.
@@ -38,6 +39,7 @@ export function TerminalSlot({ mode, terminalId, className }: Props) {
       });
     };
     measure();
+    measureRef.current = measure;
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     window.addEventListener("resize", measure);
@@ -67,9 +69,20 @@ export function TerminalSlot({ mode, terminalId, className }: Props) {
       document.removeEventListener("transitionrun", onRun, true);
       document.removeEventListener("transitionend", onEnd, true);
       cancelAnimationFrame(frame);
+      measureRef.current = null;
       withdraw(key);
     };
   }, [key, mode, terminalId]);
+
+  // Every render of the layout around it (a divider step, a change of count
+  // or orientation) is measured at commit, before paint: the pane follows in
+  // the same frame, and when the ResizeObserver reports the new size later in
+  // that frame the rect is already published, so it re-renders nothing. A
+  // publish from inside the observer would resize the panes (observed
+  // themselves, higher in the tree) mid-delivery: a ResizeObserver loop.
+  useLayoutEffect(() => {
+    measureRef.current?.();
+  });
 
   return <div ref={ref} data-terminal-slot={mode} className={className ?? "h-full w-full"} />;
 }

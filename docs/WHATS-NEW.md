@@ -114,7 +114,7 @@ opening the step's surface, then skips the step.
 
 `open` takes a name from the surface registry in `src/lib/tour/surfaces.ts` (e.g.
 `settings/account`, `settings/privacy`, `mode/run`, `mode/direct`, `mode/review`,
-`palette`, `file-finder`). Each entry is a function that navigates the real app there. The tour runner and
+`palette`, `file-finder`, `run/open-beside`: Run's Open beside, as `⌘D` does it). Each entry is a function that navigates the real app there. The tour runner and
 the clip recorder both call it, so a demo never depends on clicking through menus.
 
 ## 4. Scenarios

@@ -3,23 +3,28 @@ title: Three and four sessions side by side in Run
 kind: feature
 area: app
 highlight: true
-scenario: run-two-sessions
+scenario: run-four-sessions
 steps:
   - open: mode/run
     target: run-session-cell
-    caption: Hover a session on the rail; Open beside now adds up to four panes.
+    caption: Hover a session on the rail to reach Open beside.
     action: hover
   - target: run-open-beside
     caption: Open beside asks which session sits beside this one.
     action: click
   - target: run-pair-pick
-    caption: The pick opens in a pane of its own. ⌘D again adds a third, then a fourth in a 2×2 grid.
+    caption: The pick gets its own pane. Too narrow for 72 columns each, the two stack.
     action: click
-  - target: run-pane-menu
-    caption: Each pane's menu can stack the panes or put them side by side.
+  - open: run/open-beside
+    target: run-pair-pick
+    caption: Open beside again (⌘D) adds a third, one large pane above two.
     action: click
-  - target: run-pane-orientation
-    caption: Automatic stacks them when a pane would get fewer than 72 columns.
+  - open: run/open-beside
+    target: run-pair-pick
+    caption: A fourth makes a 2×2 grid around one shared cross.
+    action: click
+  - target: run-pane-divider
+    caption: Drag a divider to resize; double-click to even it.
     action: none
 ---
 Run now shows up to **four** sessions at once: three put a large pane beside two smaller ones, four

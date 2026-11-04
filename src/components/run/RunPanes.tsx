@@ -48,10 +48,6 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const createBeside = useTerminalsStore((s) => s.createBeside);
   const areaRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
-  // What each workspace last drew: a drag holds that orientation, and while
-  // stacked at the same count `auto` measures the side-by-side split last
-  // drawn, which the stacked dividers never move.
-  const drawn = useRef(new Map<string, { orientation: "side" | "stacked"; sideSplit: number; count: number }>());
 
   const slots = layout?.slots ?? [activeId];
   const paired = slots.length > 1 && !!layout;
@@ -82,15 +78,8 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   }
 
   const count = slots.length;
-  const last = drawn.current.get(workspaceId);
-  // A new count evens the dividers, so a split kept for the old one is void.
-  const kept = last?.orientation === "stacked" && last.count === count;
-  const sideSplit = kept ? last.sideSplit : (layout.ratios[0] ?? 0.5);
-  const orientation =
-    resizing && last
-      ? last.orientation
-      : resolveOrientation(layout, width, terminalCellWidth(), sideSplit);
-  drawn.current.set(workspaceId, { orientation, sideSplit, count });
+  // From the width and the count alone: a divider drag never flips it.
+  const orientation = resolveOrientation(layout, width, terminalCellWidth());
   const grid = paneGrid(count, orientation, layout.ratios);
 
   const setRatio = (index: number, r: number) =>

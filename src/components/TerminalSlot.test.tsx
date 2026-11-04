@@ -28,4 +28,13 @@ describe("TerminalSlot", () => {
     act(() => void pane.dispatchEvent(new Event("transitionend", { bubbles: true })));
     expect(rectOf()).toEqual({ left: 400, top: 0, width: 300, height: 200 });
   });
+
+  it("measures on every render of its layout, before the ResizeObserver reports it", () => {
+    const { container, rerender } = render(<TerminalSlot mode="run" terminalId="a" />);
+    const slot = container.querySelector("[data-terminal-slot]")!;
+    vi.spyOn(slot, "getBoundingClientRect").mockReturnValue({ left: 0, top: 0, width: 640, height: 400 } as DOMRect);
+    // A parent re-render (a divider step) lands the new rect at commit.
+    rerender(<TerminalSlot mode="run" terminalId="a" />);
+    expect(rectOf()).toEqual({ left: 0, top: 0, width: 640, height: 400 });
+  });
 });

@@ -6,7 +6,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 const noop = () => {};
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
-const { useTerminalLayoutStore, evenRatios } = await import("../../stores/terminalLayoutStore");
+const { useTerminalLayoutStore, evenRatios, leaveView } = await import("../../stores/terminalLayoutStore");
 const { useTerminalSlotsStore } = await import("../../stores/terminalSlotsStore");
 const { RunPanes } = await import("./RunPanes");
 
@@ -183,53 +183,49 @@ describe("RunPanes", () => {
     expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
   });
 
-  it("stacks on its own under 72 columns, and stays stacked while the stacked divider moves or evens", () => {
-    sized(1300);
+  it("never changes orientation on a drag or an even: wide stays side by side", () => {
+    sized(1600);
     seed(["a", "b"], ["a", "b"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const divider = () => screen.getByRole("separator");
     expect(divider()).toHaveAttribute("aria-orientation", "vertical");
-    fireEvent.keyDown(divider(), { key: "ArrowLeft" });
-    fireEvent.keyDown(divider(), { key: "ArrowLeft" });
-    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
-
-    // The stacked divider is the top pane's height, not a side-by-side split.
-    fireEvent.keyDown(divider(), { key: "ArrowDown" });
+    fireEvent.pointerDown(divider(), { button: 0, pointerId: 1 });
+    // 480px is under 72 columns (≈ 562px): the split doesn't decide, the width does.
+    fireEvent.pointerMove(divider(), { clientX: 480, pointerId: 1 });
+    expect(run().ratios[0]).toBeCloseTo(0.3);
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+    fireEvent.pointerMove(divider(), { clientX: 720, pointerId: 1 });
+    fireEvent.pointerUp(divider(), { pointerId: 1 });
     expect(run().ratios[0]).toBeCloseTo(0.45);
-    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
-    fireEvent.keyDown(divider(), { key: "ArrowUp" });
-    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
     fireEvent.doubleClick(divider());
     expect(run().ratios[0]).toBe(0.5);
+    expect(divider()).toHaveAttribute("aria-orientation", "vertical");
+  });
+
+  it("stacks under 72 columns at an even split, and a divider never un-stacks it", () => {
+    sized(1100);
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const divider = () => screen.getByRole("separator");
+    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.keyDown(divider(), { key: "ArrowDown" });
+    expect(run().ratios[0]).toBeCloseTo(0.55);
+    expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
+    fireEvent.doubleClick(divider());
     expect(divider()).toHaveAttribute("aria-orientation", "horizontal");
   });
 
-  it("measures the even split again once the count changes", () => {
-    sized(1300);
-    seed(["a", "b", "c"], ["a", "b"]);
+  it("decides again when the count changes: narrow three stack, four are the grid", () => {
+    sized(1000);
+    seed(["a", "b", "c", "d"], ["a", "b", "c"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowLeft" });
-    expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
-    // Three panes even the dividers: 650px each side keeps 72 columns.
-    act(() => useTerminalsStore.getState().openBeside(WS, "c"));
-    expect(run().ratios).toEqual([0.5, 0.5]);
-    expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
-  });
-
-  it("holds the orientation during a drag and resolves it again on release", () => {
-    sized(1600);
-    seed(["a", "b"], ["a", "b"]);
-    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
-    const divider = screen.getByRole("separator");
-    expect(divider).toHaveAttribute("aria-orientation", "vertical");
-    fireEvent.pointerDown(divider, { button: 0, pointerId: 1 });
-    // 480px is under 72 columns (≈ 562px), yet the drag keeps the panes side by side.
-    fireEvent.pointerMove(divider, { clientX: 480, pointerId: 1 });
-    expect(run().ratios[0]).toBeCloseTo(0.3);
-    expect(divider).toHaveAttribute("aria-orientation", "vertical");
-    fireEvent.pointerUp(divider, { pointerId: 1 });
-    expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
+    const orientations = () => screen.getAllByRole("separator").map((d) => d.getAttribute("aria-orientation"));
+    expect(orientations()).toEqual(["horizontal", "vertical"]);
+    act(() => useTerminalsStore.getState().openBeside(WS, "d"));
+    expect(orientations()).toEqual(["vertical", "horizontal"]);
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => leaveView(l, 3)));
+    expect(orientations()).toEqual(["horizontal", "vertical"]);
   });
 
   it("lays the panes out as grid tracks that glide, except during a drag", () => {

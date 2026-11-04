@@ -70,6 +70,7 @@ with `scenario:` (default: `default`).
 | `default` | Signed-in Pro user · project "octopush" with workspaces `main` and `run-history-sync` (active, Talk mode) · a finished 4-stage Direct run ($0.41 vs $1.87 baseline) · a 3-message Talk thread · Anthropic, OpenAI and Ollama configured. |
 | `empty` | Fresh install — no projects (Welcome screen), signed out, free plan. |
 | `run-two-sessions` | `default` with two sessions (`zsh`, `claude`) in the active workspace, so Run offers Open beside. |
+| `run-four-sessions` | `default` with four sessions (`zsh`, `claude`, `tests`, `dev`) in the active workspace, so Run can show three and four panes. |
 
 Adding one: create `scenarios/<name>.ts` exporting a `Scenario` (`types.ts`), register
 it in `scenarios/index.ts`, and run a recording with `--verbose` to see which commands

@@ -25,6 +25,7 @@ describe("tour surfaces", () => {
     expect(capture(() => openSurface("mode/direct"))).toEqual([{ kind: "mode", mode: "direct" }]);
     expect(capture(() => openSurface("palette"))).toEqual([{ kind: "palette" }]);
     expect(capture(() => openSurface("file-finder"))).toEqual([{ kind: "file-finder" }]);
+    expect(capture(() => openSurface("run/open-beside"))).toEqual([{ kind: "open-beside" }]);
   });
 
   it("returns false for an unknown surface and dispatches nothing", () => {
