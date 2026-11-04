@@ -21,6 +21,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useAttentionStore } = await import("../../stores/attentionStore");
+const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
 const { SessionRail } = await import("./SessionRail");
 
 const WS = "ws-rail";
@@ -298,5 +299,44 @@ describe("SessionRail", () => {
     render(<SessionRail workspaceId={WS} />);
 
     expect(screen.getByTestId("session-cell-a")).toHaveAttribute("tabindex", "0");
+  });
+});
+
+describe("SessionRail — sessions side by side", () => {
+  beforeEach(() => useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false }));
+
+  it("marks a session shown in another pane with an ivory hairline and aria-current", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev", busy: true }, { id: "c", label: "tests" }]);
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b"], ratios: [0.5] })));
+    render(<SessionRail workspaceId={WS} />);
+
+    const a = screen.getByTestId("session-cell-a");
+    const b = screen.getByTestId("session-cell-b");
+    expect(a).toHaveAttribute("aria-selected", "true");
+    expect(b).toHaveAttribute("aria-selected", "false");
+    expect(a).toHaveAttribute("aria-current", "true");
+    expect(b).toHaveAttribute("aria-current", "true");
+    expect(screen.getByTestId("session-cell-c")).not.toHaveAttribute("aria-current");
+    // Watched, so the quiet hairline instead of the sage marching edge.
+    expect(screen.getByTestId("session-shown-b").className).toContain("bg-octo-ivory");
+    expect(screen.queryByTestId("session-busy-b")).toBeNull();
+    expect(screen.queryByTestId("session-shown-a")).toBeNull();
+  });
+
+  it("the flyout's Open beside seats the most recent session not on screen", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    act(() => {
+      useTerminalsStore.getState().setActive(WS, "c");
+      useTerminalsStore.getState().setActive(WS, "a");
+    });
+    render(<SessionRail workspaceId={WS} />);
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
+    fireEvent.click(screen.getByTestId("session-beside-b"));
+    expect(useTerminalLayoutStore.getState().getRun(WS).slots).toEqual(["a", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("c");
+
+    // Two panes are the most for now: the item goes.
+    fireEvent.mouseEnter(screen.getByTestId("session-cell-b").parentElement!);
+    expect(screen.queryByTestId("session-beside-b")).toBeNull();
   });
 });

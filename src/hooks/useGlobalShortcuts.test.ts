@@ -48,12 +48,14 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     openPrComposer: vi.fn(),
     activeBranch: () => "feat/x",
     openSearch: vi.fn(),
-    bumpLayout: vi.fn(),
+    toggleCompanion: vi.fn(),
     openSettings: vi.fn(),
     toggleSessionSwitcher: vi.fn(),
     terminalIds: () => ["t1", "t2", "t3"],
+    shownTerminalIds: () => ["t1"],
     activeTerminalId: () => "t1",
     setActiveTerminal: vi.fn(),
+    stepPaneFocus: vi.fn(),
     ...rest,
   };
 }
@@ -95,6 +97,12 @@ describe("matchShortcut", () => {
     [{ key: "¡", code: "Digit1", alt: true }, "session-n"],
     [{ key: "3", alt: true }, "session-n"],
     [{ key: "1", alt: true, shift: true }, "mode-talk-run-review"],
+    [{ key: "[", code: "BracketLeft" }, "pane-focus"],
+    // Spanish layout: the physical key prints a grave accent.
+    [{ key: "`", code: "BracketLeft" }, "pane-focus"],
+    [{ key: "+", code: "BracketRight" }, "pane-focus"],
+    // ⌘⌥[ / ⌘⌥] stay the editor's fold keys.
+    [{ key: "[", code: "BracketLeft", alt: true }, null],
   ])("%o → %s", (p, id) => {
     expect(idOf(p)).toBe(id);
   });
@@ -156,7 +164,7 @@ describe("handleShortcut", () => {
     handleShortcut(press({ key: "f", shift: true }), c);
     expect(c.openSearch).toHaveBeenCalledWith("text");
     handleShortcut(press({ key: "\\" }), c);
-    expect(c.bumpLayout).toHaveBeenCalled();
+    expect(c.toggleCompanion).toHaveBeenCalled();
     handleShortcut(press({ key: "," }), c);
     expect(c.openSettings).toHaveBeenCalledWith("general");
     handleShortcut(press({ key: "t", shift: true }), c);
@@ -257,9 +265,34 @@ describe("handleShortcut", () => {
       handleShortcut(press({ key: "ArrowRight", alt: true }), c);
       expect(c.setActiveTerminal).toHaveBeenLastCalledWith("t2");
 
-      const last = ctx({ modeNow: "run", activeTerminalId: () => "t3" });
+      const last = ctx({ modeNow: "run", activeTerminalId: () => "t3", shownTerminalIds: () => ["t3"] });
       handleShortcut(press({ key: "ArrowRight", alt: true }), last);
       expect(last.setActiveTerminal).toHaveBeenLastCalledWith("t1");
+    });
+
+    it("⌘⌥←/→ skip sessions shown in another pane", () => {
+      const c = ctx({ modeNow: "run", shownTerminalIds: () => ["t1", "t2"] });
+      handleShortcut(press({ key: "ArrowRight", alt: true }), c);
+      expect(c.setActiveTerminal).toHaveBeenLastCalledWith("t3");
+      const both = ctx({ modeNow: "run", terminalIds: () => ["t1", "t2"], shownTerminalIds: () => ["t1", "t2"] });
+      handleShortcut(press({ key: "ArrowRight", alt: true }), both);
+      expect(both.setActiveTerminal).not.toHaveBeenCalled();
+    });
+
+    it("⌘[ / ⌘] move focus between panes, only with two or more", () => {
+      const c = ctx({ modeNow: "run", shownTerminalIds: () => ["t1", "t2"] });
+      handleShortcut(press({ key: "[", code: "BracketLeft" }), c);
+      expect(c.stepPaneFocus).toHaveBeenLastCalledWith(-1);
+      const e = press({ key: "]", code: "BracketRight" });
+      handleShortcut(e, c);
+      expect(c.stepPaneFocus).toHaveBeenLastCalledWith(1);
+      expect(e.preventDefault).toHaveBeenCalled();
+
+      const one = ctx({ modeNow: "run" });
+      const e1 = press({ key: "]", code: "BracketRight" });
+      handleShortcut(e1, one);
+      expect(one.stepPaneFocus).not.toHaveBeenCalled();
+      expect(e1.preventDefault).not.toHaveBeenCalled();
     });
 
     it("⌘⌥←/→ leave the key alone with fewer than two sessions", () => {

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
+import { useTerminalLayoutStore } from "../../stores/terminalLayoutStore";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { ROLE_WORD } from "../../lib/sessionRole";
@@ -41,6 +42,15 @@ export function SessionRail({ workspaceId }: Props) {
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
   const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
+  // Re-render when the MRU moves: it decides what Open beside would seat.
+  useTerminalLayoutStore((s) => s.mruByWs[workspaceId]);
+  const openBeside = useTerminalsStore((s) => s.openBeside);
+  const besideCandidate = useTerminalsStore((s) => s.besideCandidate);
+  const canOpenBeside = besideCandidate(workspaceId) !== null;
+  // With more than one pane, the sessions on screen besides the focused one.
+  const paired = (layout?.slots.length ?? 1) > 1;
+  const shownIds = paired ? (layout?.slots ?? []) : [];
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
 
@@ -120,6 +130,7 @@ export function SessionRail({ workspaceId }: Props) {
 
   return (
     <div
+      data-tour={tourId("run-session-rail")}
       // Same geometry as Review's collapsed navigator rail (w-44px, one right
       // hairline, panel ground) — one canonical chrome per concept.
       className="octo-fade-in flex w-[44px] shrink-0 flex-col items-center border-r border-octo-hairline bg-octo-panel py-2"
@@ -140,6 +151,9 @@ export function SessionRail({ workspaceId }: Props) {
       >
       {terminals.map((t, i) => {
         const active = t.id === activeId;
+        const shown = shownIds.includes(t.id);
+        // On screen in another pane: watched, so never the sage edge.
+        const beside = shown && !active;
         const Icon = iconForSessionRole(t.role);
         const isEditing = t.id === editingId;
         const jump = i < 9 ? `⌘⌥${i + 1}` : null;
@@ -185,6 +199,7 @@ export function SessionRail({ workspaceId }: Props) {
               type="button"
               role="tab"
               aria-selected={active}
+              aria-current={shown ? "true" : undefined}
               tabIndex={active || (activeId === null && i === 0) ? 0 : -1}
               data-testid={`session-cell-${t.id}`}
               // No native `title`: the flyout opens on the same hover (and on
@@ -209,8 +224,15 @@ export function SessionRail({ workspaceId }: Props) {
 
             {/* Identity edge — a reserved slot, so selection never shifts the
                 cell by a pixel. Marching segments while a command runs, the
-                same idiom (and class) as the workspace rail's activity bar. */}
-            {t.busy ? (
+                same idiom (and class) as the workspace rail's activity bar.
+                A session shown in another pane gets a quiet ivory hairline. */}
+            {beside ? (
+              <span
+                aria-hidden
+                data-testid={`session-shown-${t.id}`}
+                className="octo-fade-in absolute bottom-1 left-[-3px] top-1 w-px bg-octo-ivory"
+              />
+            ) : t.busy ? (
               <span
                 data-testid={`session-busy-${t.id}`}
                 className="rail-bar-running"
@@ -315,6 +337,21 @@ export function SessionRail({ workspaceId }: Props) {
                   >
                     Close
                   </button>
+                  {canOpenBeside && (
+                    <button
+                      type="button"
+                      data-testid={`session-beside-${t.id}`}
+                      data-tour={tourId("run-open-beside")}
+                      title="Seat the session you used last beside this one"
+                      onClick={() => {
+                        closeFlyout(t.id);
+                        openBeside(workspaceId);
+                      }}
+                      className="font-mono text-[9px] uppercase tracking-[0.14em] text-octo-mute transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                    >
+                      Open beside
+                    </button>
+                  )}
                   {jump && (
                     <span className="ml-auto font-mono text-[9px] text-octo-mute">{jump}</span>
                   )}

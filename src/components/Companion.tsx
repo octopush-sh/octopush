@@ -66,6 +66,8 @@ interface Props {
    *  control — the modes live in the band above the canvas, which stays put
    *  either way, so the strip has nothing else to hold. */
   collapsed: boolean;
+  /** Collapsed because Run shows more than one pane, not by the user's choice. */
+  foldedForPanes?: boolean;
   onToggleCollapsed: () => void;
   /** Opens the Logbook Room (⌘⇧L) from the Companion Logbook card. */
   onOpenLogbook?: () => void;
@@ -86,6 +88,7 @@ export function Companion({
   reviewProps,
   onJumpToFile,
   collapsed,
+  foldedForPanes = false,
   onToggleCollapsed,
   onOpenLogbook,
   onMakeProject,
@@ -138,7 +141,7 @@ export function Companion({
           type="button"
           onClick={onToggleCollapsed}
           aria-label="Expand companion"
-          title="Expand companion"
+          title={foldedForPanes ? "Folded to make room for the panes · ⌘\\" : "Expand companion"}
           className="flex h-7 w-7 items-center justify-center rounded text-octo-mute transition-colors hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           <PanelRightOpen size={16} />
