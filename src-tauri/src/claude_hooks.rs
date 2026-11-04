@@ -87,7 +87,18 @@ pub fn remove_for_workspace(db: &Mutex<Db>, workspace_id: &str, worktree_path: O
 /// touched). Idempotent; never removes anything.
 pub fn ensure_local_settings_excluded(worktree: &Path) -> std::io::Result<()> {
     let repo = git2::Repository::open(worktree).map_err(std::io::Error::other)?;
-    append_exclude(&repo.commondir().join("info").join("exclude"))
+    append_exclude(&common_dir(repo.path())?.join("info").join("exclude"))
+}
+
+/// The shared git dir for `git_dir`, resolved as git resolves
+/// `--git-common-dir`: a linked worktree's git dir has a `commondir` file
+/// naming it (usually `../..`); any other git dir is its own.
+fn common_dir(git_dir: &Path) -> std::io::Result<PathBuf> {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(text) => Ok(git_dir.join(text.trim_end())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(git_dir.to_path_buf()),
+        Err(e) => Err(e),
+    }
 }
 
 fn append_exclude(file: &Path) -> std::io::Result<()> {
@@ -206,6 +217,21 @@ mod tests {
         std::fs::write(&file, "*.log").unwrap();
         append_exclude(&file).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("*.log\n{EXCLUDE_COMMENT}\n{EXCLUDE_LINE}\n"));
+    }
+
+    #[test]
+    fn common_dir_follows_a_worktrees_commondir_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let main_git = dir.path().join(".git");
+        let wt_git = main_git.join("worktrees/feat");
+        std::fs::create_dir_all(&wt_git).unwrap();
+        assert_eq!(common_dir(&main_git).unwrap(), main_git, "a main git dir is its own");
+        std::fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let resolved = common_dir(&wt_git).unwrap();
+        assert_eq!(resolved, wt_git.join("../.."));
+        assert_eq!(resolved.canonicalize().unwrap(), main_git.canonicalize().unwrap());
+        std::fs::write(wt_git.join("commondir"), format!("{}\n", main_git.display())).unwrap();
+        assert_eq!(common_dir(&wt_git).unwrap(), main_git, "an absolute commondir is used as is");
     }
 
     #[test]
