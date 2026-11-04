@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
+import { isModalOpen } from "../components/ModalShell";
 import { roleForCommand, type SessionRole } from "../lib/sessionRole";
 import type { SetupRun } from "../lib/setupRun";
 import { navigate } from "../lib/tour/surfaces";
@@ -17,6 +18,8 @@ import {
   openBeside,
   prune,
   pruneTalk,
+  seatTalk,
+  toggleTalk,
   useTerminalLayoutStore,
   type RunLayout,
 } from "./terminalLayoutStore";
@@ -149,6 +152,12 @@ interface TerminalsStore {
   /** Open a new session straight into Talk's seat. Run leaves it unseated,
    *  unless Run has no session on screen at all. */
   createInTalkSeat: (workspaceId: string) => Promise<TerminalState>;
+  /** Talk's seat toggle (the icon, `×`, ⌘D): close an open seat; reopen a
+   *  closed one on its session while that still exists (or while the list
+   *  isn't loaded yet); else open it empty. Returns `"pick"` when the
+   *  pairing switcher should open, null (nothing done) while a dialog owns
+   *  the screen. Run's layout and `activeByWs` are never touched. */
+  toggleTalkSeat: (workspaceId: string) => "closed" | "opened" | "pick" | null;
   markRunning: (workspaceId: string, id: string, running: boolean) => void;
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
@@ -443,6 +452,24 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     );
     useTerminalLayoutStore.getState().seatTalkSession(workspaceId, t.id);
     return t;
+  },
+
+  toggleTalkSeat: (workspaceId) => {
+    if (isModalOpen()) return null;
+    const layout = useTerminalLayoutStore.getState();
+    const seat = layout.getTalk(workspaceId);
+    if (seat.open) {
+      layout.updateTalk(workspaceId, toggleTalk);
+      return "closed";
+    }
+    const id = seat.terminalId;
+    const known = workspaceId in get().terminalsByWs;
+    if (id && (!known || get().getTerminals(workspaceId).some((t) => t.id === id))) {
+      layout.seatTalkSession(workspaceId, id);
+      return "opened";
+    }
+    layout.updateTalk(workspaceId, (s) => seatTalk(s, null));
+    return "pick";
   },
 
   markRunning: (workspaceId, id, running) =>

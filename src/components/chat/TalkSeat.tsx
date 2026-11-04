@@ -1,9 +1,10 @@
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { SquareTerminal, X } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { EMPTY_TALK_SEAT, setTalkWidth, useTerminalLayoutStore } from "../../stores/terminalLayoutStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { tourId } from "../../lib/tour/ids";
+import { prefersReducedMotion } from "../../lib/motion";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { EmptySeat } from "../run/RunPanes";
@@ -26,17 +27,36 @@ const FINE_STEP = 0.01;
  * (docs/superpowers/specs/2026-11-03-run-session-pair-design.md, "Talk"). The
  * seat holds one of Run's sessions, the same PTY: it is only a `TerminalSlot`,
  * and `TerminalHost` draws the pane over it. Focus in the seat is Talk's own
- * (`talkFocused`); it never changes `activeByWs` or Run's focused slot.
+ * (`talkFocusedByWs`); it never changes `activeByWs` or Run's focused slot.
  */
 export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
   const seat = useTerminalLayoutStore((s) => s.talkByWs[workspaceId] ?? EMPTY_TALK_SEAT);
   const resizing = useTerminalLayoutStore((s) => s.resizing);
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
+  // Before the first `loadTerminals` a restored session isn't listed yet:
+  // the seat stays blank rather than flash an empty seat.
+  const known = useTerminalsStore((s) => workspaceId in s.terminalsByWs);
   const createInTalkSeat = useTerminalsStore((s) => s.createInTalkSeat);
   const areaRef = useRef<HTMLDivElement>(null);
   const session = terminals.find((t) => t.id === seat.terminalId) ?? null;
   const Icon = iconForSessionRole(session?.role ?? "shell");
   const { updateTalk, setTalkFocused, setResizing } = useTerminalLayoutStore.getState();
+
+  // The contents stay mounted through the closing width glide and go at its
+  // `transitionend` (at once with reduced motion, or with no glide mid-drag).
+  const [mounted, setMounted] = useState(seat.open);
+  useEffect(() => {
+    if (seat.open) setMounted(true);
+    // `resizing` as rendered: the drag cleanup below may already have reset it.
+    else if (prefersReducedMotion() || resizing) setMounted(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [seat.open]);
+  // A workspace switch is not a close: the other seat shows as it is.
+  const [shownWs, setShownWs] = useState(workspaceId);
+  if (shownWs !== workspaceId) {
+    setShownWs(workspaceId);
+    setMounted(seat.open);
+  }
 
   const setWidth = (w: number) => updateTalk(workspaceId, (s) => setTalkWidth(s, w));
   const drag = (on: boolean) => {
@@ -61,7 +81,7 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
   return (
     <div ref={areaRef} className="flex h-full min-h-0 w-full">
       {/* Typing in the conversation takes keyboard focus back from the seat. */}
-      <div className="relative min-w-0 flex-1" onFocusCapture={() => setTalkFocused(false)}>
+      <div className="relative min-w-0 flex-1" onFocusCapture={() => setTalkFocused(workspaceId, false)}>
         {children}
         <button
           type="button"
@@ -84,8 +104,12 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
           width: seat.open ? `${seat.width * 100}%` : 0,
           transition: resizing ? undefined : "width var(--dur-standard) var(--ease-octo)",
         }}
+        onTransitionEnd={(e) => {
+          // Only the seat's own width glides; its children's colour fades bubble here too.
+          if (e.target === e.currentTarget && !seat.open) setMounted(false);
+        }}
       >
-        {seat.open && (
+        {mounted && (
           <>
             <div
               role="separator"
@@ -98,7 +122,7 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
               title="Drag to resize · Double-click to even"
               data-testid="talk-seat-divider"
               onPointerDown={(e) => {
-                if (e.button !== 0) return;
+                if (e.button !== 0 || !seat.open) return;
                 e.preventDefault();
                 e.currentTarget.setPointerCapture?.(e.pointerId);
                 drag(true);
@@ -153,7 +177,7 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
                 </button>
               </div>
               <div className="relative min-h-0 flex-1">
-                {session ? (
+                {!known ? null : session ? (
                   <TerminalSlot mode="talk" terminalId={session.id} />
                 ) : (
                   <EmptySeat

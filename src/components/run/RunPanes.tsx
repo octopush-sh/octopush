@@ -247,7 +247,8 @@ export function EmptySeat({
     <div
       data-testid={`${mode}-empty-seat`}
       data-tour={mode === "run" ? tourId("run-empty-seat") : undefined}
-      title="Choose a session for this seat · ⌘D"
+      // In Talk, ⌘D closes the seat rather than filling it.
+      title={mode === "run" ? "Choose a session for this seat · ⌘D" : "Choose a session for this seat"}
       onClick={onOpen}
       className="octo-fade-in flex h-full w-full cursor-pointer flex-col items-center justify-center gap-3 px-6 text-center"
     >

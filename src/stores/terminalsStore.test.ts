@@ -52,6 +52,10 @@ vi.mock("../components/Toasts", () => ({
   pushToast: (t: unknown) => mockPushToast(t),
 }));
 
+// Whether a dialog owns the screen, for Talk's seat toggle.
+let modalOpen = false;
+vi.mock("../components/ModalShell", () => ({ isModalOpen: () => modalOpen }));
+
 const { useTerminalsStore } = await import("./terminalsStore");
 const { useAttentionStore } = await import("./attentionStore");
 const { useTerminalLayoutStore } = await import("./terminalLayoutStore");
@@ -60,7 +64,8 @@ const { useTerminalLayoutStore } = await import("./terminalLayoutStore");
 
 function resetStore() {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false, resizing: false });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocusedByWs: {}, resizing: false });
+  modalOpen = false;
   localStorage.removeItem("octopush.setupTerminals");
   nextId = 0;
   vi.clearAllMocks();
@@ -928,13 +933,65 @@ describe("the single setActive path", () => {
     const before = run();
     useTerminalLayoutStore.getState().seatTalkSession(ws, "c");
     useTerminalLayoutStore.getState().seatTalkSession(ws, "a");
-    useTerminalLayoutStore.getState().setTalkFocused(true);
+    useTerminalLayoutStore.getState().setTalkFocused(ws, true);
     mockIpc.createTerminal.mockResolvedValueOnce(makeRecord(ws, "Terminal 4", 3));
     const t = await useTerminalsStore.getState().createInTalkSeat(ws);
     expect(run()).toBe(before);
     expect(useTerminalsStore.getState().getActiveId(ws)).toBe("b");
     expect(useTerminalLayoutStore.getState().getTalk(ws)).toMatchObject({ terminalId: t.id, open: true });
-    expect(useTerminalLayoutStore.getState().talkFocused).toBe(true);
+    expect(useTerminalLayoutStore.getState().talkFocusedByWs[ws]).toBe(true);
+  });
+
+  describe("Talk's seat toggle", () => {
+    const talk = () => useTerminalLayoutStore.getState().getTalk(ws);
+    const toggle = () => useTerminalsStore.getState().toggleTalkSeat(ws);
+    const setSeat = (terminalId: string | null, open: boolean) =>
+      useTerminalLayoutStore.setState({ talkByWs: { [ws]: { terminalId, width: 0.5, open } } });
+
+    it("closes an open seat, keeping its session and dropping its focus", () => {
+      seed(["a", "b"], ["a"]);
+      useTerminalLayoutStore.getState().seatTalkSession(ws, "b");
+      const before = run();
+      expect(toggle()).toBe("closed");
+      expect(talk()).toMatchObject({ terminalId: "b", open: false });
+      expect(useTerminalLayoutStore.getState().talkFocusedByWs[ws]).toBe(false);
+      expect(run()).toBe(before);
+      expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+    });
+
+    it("reopens on its last session while it still exists", () => {
+      seed(["a", "b"], ["a"]);
+      setSeat("b", false);
+      expect(toggle()).toBe("opened");
+      expect(talk()).toMatchObject({ terminalId: "b", open: true });
+      expect(useTerminalsStore.getState().getActiveId(ws)).toBe("a");
+    });
+
+    it("opens empty, asking for the switcher, when its session is gone", () => {
+      seed(["a"], ["a"]);
+      setSeat("gone", false);
+      expect(toggle()).toBe("pick");
+      expect(talk()).toMatchObject({ terminalId: null, open: true });
+      setSeat(null, false);
+      expect(toggle()).toBe("pick");
+    });
+
+    it("keeps a restored session before the list has loaded", () => {
+      setSeat("b", false);
+      expect(toggle()).toBe("opened");
+      expect(talk()).toMatchObject({ terminalId: "b", open: true });
+    });
+
+    it("does nothing while a dialog owns the screen", () => {
+      seed(["a", "b"], ["a"]);
+      setSeat("b", false);
+      modalOpen = true;
+      expect(toggle()).toBeNull();
+      expect(talk().open).toBe(false);
+      setSeat("b", true);
+      expect(toggle()).toBeNull();
+      expect(talk().open).toBe(true);
+    });
   });
 
   it("Open beside puts the picked session in a new pane and focuses it", () => {

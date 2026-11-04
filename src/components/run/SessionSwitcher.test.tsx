@@ -44,7 +44,7 @@ function seed(
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocusedByWs: {} });
   vi.clearAllMocks();
 });
 

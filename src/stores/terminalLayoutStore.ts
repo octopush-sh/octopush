@@ -410,15 +410,17 @@ interface TerminalLayoutStore {
   setResizing: (resizing: boolean) => void;
 
   talkByWs: Record<string, TalkSeat>;
-  /** True while Talk's seat holds keyboard focus (the user clicked into it or
-   *  just picked its session); the conversation taking focus clears it.
-   *  Separate from Run's focused slot, and never written to `activeByWs`. */
-  talkFocused: boolean;
+  /** Per workspace, true while Talk's seat holds keyboard focus (the user
+   *  clicked into it or just picked its session); the conversation taking
+   *  focus, or the seat closing, clears it. Separate from Run's focused slot,
+   *  and never written to `activeByWs`. */
+  talkFocusedByWs: Record<string, boolean>;
   getTalk: (workspaceId: string) => TalkSeat;
+  /** Change a seat. A seat that closes gives up keyboard focus. */
   updateTalk: (workspaceId: string, fn: (seat: TalkSeat) => TalkSeat) => void;
   /** Put `id` in Talk's seat, open it and give it keyboard focus. */
   seatTalkSession: (workspaceId: string, id: string) => void;
-  setTalkFocused: (focused: boolean) => void;
+  setTalkFocused: (workspaceId: string, focused: boolean) => void;
 }
 
 export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => ({
@@ -426,25 +428,32 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
   mruByWs: {},
   resizing: false,
   talkByWs: stored.talk,
-  talkFocused: false,
+  talkFocusedByWs: {},
 
   getRun: (workspaceId) => get().runByWs[workspaceId] ?? EMPTY_RUN_LAYOUT,
 
   getTalk: (workspaceId) => get().talkByWs[workspaceId] ?? EMPTY_TALK_SEAT,
 
-  updateTalk: (workspaceId, fn) =>
+  updateTalk: (workspaceId, fn) => {
     set((s) => {
       const prev = s.talkByWs[workspaceId] ?? EMPTY_TALK_SEAT;
       const next = fn(prev);
       return next === prev ? s : { talkByWs: { ...s.talkByWs, [workspaceId]: next } };
-    }),
+    });
+    if (!get().getTalk(workspaceId).open) get().setTalkFocused(workspaceId, false);
+  },
 
   seatTalkSession: (workspaceId, id) => {
     get().updateTalk(workspaceId, (seat) => seatTalk(seat, id));
-    get().setTalkFocused(true);
+    get().setTalkFocused(workspaceId, true);
   },
 
-  setTalkFocused: (talkFocused) => set((s) => (s.talkFocused === talkFocused ? s : { talkFocused })),
+  setTalkFocused: (workspaceId, focused) =>
+    set((s) =>
+      (s.talkFocusedByWs[workspaceId] ?? false) === focused
+        ? s
+        : { talkFocusedByWs: { ...s.talkFocusedByWs, [workspaceId]: focused } },
+    ),
 
   getMru: (workspaceId) => get().mruByWs[workspaceId] ?? EMPTY_MRU,
 
@@ -479,7 +488,8 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
       const { [workspaceId]: _run, ...runByWs } = s.runByWs;
       const { [workspaceId]: _mru, ...mruByWs } = s.mruByWs;
       const { [workspaceId]: _talk, ...talkByWs } = s.talkByWs;
-      return { runByWs, mruByWs, talkByWs };
+      const { [workspaceId]: _focused, ...talkFocusedByWs } = s.talkFocusedByWs;
+      return { runByWs, mruByWs, talkByWs, talkFocusedByWs };
     }),
 
   setResizing: (resizing) => set((s) => (s.resizing === resizing ? s : { resizing })),

@@ -37,9 +37,13 @@ function renderSeat(on: { onToggle?: () => void; onPick?: () => void } = {}) {
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false, resizing: false });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocusedByWs: {}, resizing: false });
   useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
+  vi.unstubAllGlobals();
 });
+
+const closeSeat = () =>
+  act(() => useTerminalLayoutStore.getState().updateTalk(WS, (s) => ({ ...s, open: false })));
 
 describe("TalkSeat", () => {
   it("closed: only the SquareTerminal toggle, with its tooltip, and no slot", () => {
@@ -69,8 +73,58 @@ describe("TalkSeat", () => {
     seed(["a"], { terminalId: null, open: true });
     renderSeat({ onPick });
     expect(published()).toEqual([]);
-    fireEvent.click(screen.getByTestId("talk-empty-seat"));
+    const empty = screen.getByTestId("talk-empty-seat");
+    // In Talk, ⌘D closes the seat: the tooltip doesn't offer it.
+    expect(empty.getAttribute("title")).toBe("Choose a session for this seat");
+    fireEvent.click(empty);
     expect(onPick).toHaveBeenCalledTimes(1);
+  });
+
+  it("closing keeps the contents and the slot through the width glide", () => {
+    seed(["a"], { terminalId: "a", open: true });
+    renderSeat();
+    closeSeat();
+    expect(screen.getByTestId("talk-seat").style.width).toBe("0px");
+    expect(screen.getByTestId("talk-seat-divider")).toBeTruthy();
+    expect(screen.getByText("Label a")).toBeTruthy();
+    expect(published().map((s) => [s.mode, s.terminalId])).toEqual([["talk", "a"]]);
+    // A child's transition ending is not the glide.
+    fireEvent.transitionEnd(screen.getByTestId("talk-seat-leave"));
+    expect(published()).toHaveLength(1);
+    fireEvent.transitionEnd(screen.getByTestId("talk-seat"));
+    expect(screen.queryByTestId("talk-seat-divider")).toBeNull();
+    expect(published()).toEqual([]);
+  });
+
+  it("closing with reduced motion unmounts at once", () => {
+    vi.stubGlobal("matchMedia", (q: string) => ({ matches: q.includes("reduce"), media: q }));
+    seed(["a"], { terminalId: "a", open: true });
+    renderSeat();
+    closeSeat();
+    expect(screen.queryByTestId("talk-seat-divider")).toBeNull();
+    expect(published()).toEqual([]);
+  });
+
+  it("switching to a workspace whose seat is closed shows no closing seat", () => {
+    seed(["a"], { terminalId: "a", open: true });
+    const { rerender } = renderSeat();
+    rerender(
+      <TalkSeat workspaceId="ws-other" onToggle={() => {}} onPick={() => {}}>
+        <textarea data-testid="composer" />
+      </TalkSeat>,
+    );
+    expect(screen.queryByTestId("talk-seat-divider")).toBeNull();
+    expect(published()).toEqual([]);
+  });
+
+  it("at launch, a restored session never flashes as an empty seat", () => {
+    seed([], { terminalId: "a", open: true });
+    useTerminalsStore.setState({ terminalsByWs: {} });
+    renderSeat();
+    expect(screen.queryByTestId("talk-empty-seat")).toBeNull();
+    expect(published()).toEqual([]);
+    act(() => seed(["a"], { terminalId: "a", open: true }));
+    expect(published().map((s) => [s.mode, s.terminalId])).toEqual([["talk", "a"]]);
   });
 
   it("the divider steps the seat's width, clamped, and evens on double-click", () => {
@@ -88,10 +142,10 @@ describe("TalkSeat", () => {
 
   it("the conversation taking focus takes it from the seat, never touching Run", () => {
     seed(["a"], { terminalId: "a", open: true });
-    useTerminalLayoutStore.setState({ talkFocused: true });
+    useTerminalLayoutStore.setState({ talkFocusedByWs: { [WS]: true, other: true } });
     renderSeat();
     act(() => screen.getByTestId("composer").focus());
-    expect(useTerminalLayoutStore.getState().talkFocused).toBe(false);
+    expect(useTerminalLayoutStore.getState().talkFocusedByWs).toEqual({ [WS]: false, other: true });
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("a");
   });
 });

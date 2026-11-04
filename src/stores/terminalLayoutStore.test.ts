@@ -246,8 +246,22 @@ describe("terminalLayoutStore", () => {
 
 describe("Talk's seat", () => {
   beforeEach(() =>
-    useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocused: false, resizing: false }),
+    useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocusedByWs: {}, resizing: false }),
   );
+
+  it("keeps the seat's focus per workspace and drops it when the seat closes", () => {
+    const s = useTerminalLayoutStore.getState();
+    s.seatTalkSession("A", "a1");
+    s.seatTalkSession("B", "b1");
+    s.setTalkFocused("B", false);
+    // Focus in A's seat says nothing about B's.
+    expect(useTerminalLayoutStore.getState().talkFocusedByWs).toEqual({ A: true, B: false });
+    s.updateTalk("A", toggleTalk);
+    expect(useTerminalLayoutStore.getState().talkFocusedByWs.A).toBe(false);
+    s.seatTalkSession("A", "a1");
+    s.forgetWorkspace("A");
+    expect(useTerminalLayoutStore.getState().talkFocusedByWs).toEqual({ B: false });
+  });
 
   it("toggles keeping its session, clamps its width and prunes a gone session", () => {
     const seat = seatTalk(EMPTY_TALK_SEAT, "A");

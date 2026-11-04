@@ -77,7 +77,8 @@ import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
-import { focus as focusPane, seatTalk, toggleTalk, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
+import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
+import { useTerminalSlotsStore } from "./stores/terminalSlotsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
@@ -711,7 +712,14 @@ function App() {
   const talkSeatOpen = useTerminalLayoutStore((s) =>
     activeWorkspaceId ? (s.talkByWs[activeWorkspaceId]?.open ?? false) : false,
   );
-  const talkSeatFocused = useTerminalLayoutStore((s) => s.talkFocused);
+  const talkSeatFocused = useTerminalLayoutStore((s) =>
+    activeWorkspaceId ? (s.talkFocusedByWs[activeWorkspaceId] ?? false) : false,
+  );
+  // The seat keeps its slot through its closing glide; the host keeps
+  // drawing Talk until the slot goes.
+  const talkSlotShown = useTerminalSlotsStore((s) =>
+    Object.values(s.slots).some((slot) => slot.mode === "talk"),
+  );
   const panesFold = (activeMode === "run" && runPaneCount > 1) || (activeMode === "talk" && talkSeatOpen);
   const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
   const toggleCompanionFold = companionFold.toggle;
@@ -1006,25 +1014,13 @@ function App() {
         else if (action === "seat") store.openBeside(activeWorkspaceId, null);
         return action !== null;
       },
-      // Talk's seat: open it on its session when it still has one, else
-      // with the pairing switcher; or close it. Run's layout and
-      // `activeByWs` are never touched.
+      // Talk's seat: open or close it (terminalsStore.toggleTalkSeat);
+      // an empty seat opens with the pairing switcher.
       toggleTalkSeat: () => {
-        if (!activeWorkspaceId || isModalOpen()) return false;
-        const layout = useTerminalLayoutStore.getState();
-        const seat = layout.getTalk(activeWorkspaceId);
-        if (seat.open) {
-          layout.updateTalk(activeWorkspaceId, toggleTalk);
-          return true;
-        }
-        const id = seat.terminalId;
-        if (id && useTerminalsStore.getState().getTerminals(activeWorkspaceId).some((t) => t.id === id)) {
-          layout.seatTalkSession(activeWorkspaceId, id);
-        } else {
-          layout.updateTalk(activeWorkspaceId, (s) => seatTalk(s, null));
-          setSessionSwitcher("talk");
-        }
-        return true;
+        if (!activeWorkspaceId) return false;
+        const result = useTerminalsStore.getState().toggleTalkSeat(activeWorkspaceId);
+        if (result === "pick") setSessionSwitcher("talk");
+        return result !== null;
       },
       terminalIds: () =>
         activeWorkspaceId
@@ -2306,19 +2302,20 @@ function App() {
                     ? null
                     : activeMode === "run"
                       ? "run"
-                      : activeMode === "talk" && talkSeatOpen
+                      : activeMode === "talk" && (talkSeatOpen || talkSlotShown)
                         ? "talk"
                         : null
                 }
                 terminalIds={allTerminalIds}
                 onPaneFocus={(id) => {
                   // Focus in Talk's seat is Talk's own: never `activeByWs`.
+                  const t = allTerminalRefs.get(id);
+                  if (!t) return;
                   if (activeMode === "talk") {
-                    useTerminalLayoutStore.getState().setTalkFocused(true);
+                    useTerminalLayoutStore.getState().setTalkFocused(t.workspaceId, true);
                     return;
                   }
-                  const t = allTerminalRefs.get(id);
-                  if (t) setActiveTerminal(t.workspaceId, id);
+                  setActiveTerminal(t.workspaceId, id);
                 }}
                 renderPane={(id, shown) => {
                   const t = allTerminalRefs.get(id);
