@@ -53,6 +53,7 @@ function show(slots: (string | null)[], focused = 0) {
   useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots, focused }));
 }
 const slots = () => useTerminalLayoutStore.getState().getRun(WS).slots;
+const FIVE = ["a", "b", "c", "d", "e"].map((id) => ({ id, label: `Label ${id}` }));
 
 describe("SessionSwitcher — pairing", () => {
   it("asks which session sits beside and lists only sessions not on screen", () => {
@@ -81,15 +82,20 @@ describe("SessionSwitcher — pairing", () => {
   });
 
   it("says a pick replaces the focused pane when there is no room left", () => {
-    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
-    show(["a", "b"], 0);
-    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+    seed(FIVE);
+    show(["a", "b", "c"], 0);
+    const { unmount } = render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
+    // Three panes still have room for a fourth.
+    expect(screen.queryByTestId("session-switcher-replaces")).toBeNull();
+    unmount();
 
+    show(["a", "b", "c", "d"], 0);
+    render(<SessionSwitcher workspaceId={WS} onClose={() => {}} pairing />);
     expect(screen.getByTestId("session-switcher-replaces").textContent).toBe(
       "Replaces the session in the focused pane",
     );
-    fireEvent.click(screen.getByTestId("session-switcher-row-c"));
-    expect(slots()).toEqual(["c", "b"]);
+    fireEvent.click(screen.getByTestId("session-switcher-row-e"));
+    expect(slots()).toEqual(["e", "b", "c", "d"]);
   });
 
   it("opens a new session straight into the empty seat", async () => {
@@ -144,22 +150,21 @@ describe("SessionSwitcher — pairing", () => {
   });
 
   it("the ⌘⌥K footer says ⌥⏎ replaces once there is no room left", () => {
-    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }]);
+    seed(FIVE);
     show(["a"]);
     const { unmount } = render(<SessionSwitcher workspaceId={WS} onClose={() => {}} />);
     expect(screen.getByTestId("session-switcher-alt-hint").textContent).toBe("⌥⏎ · Beside");
     unmount();
 
-    show(["a", "b"], 0);
+    show(["a", "b", "c", "d"], 0);
     render(<SessionSwitcher workspaceId={WS} onClose={() => {}} />);
     expect(screen.getByTestId("session-switcher-alt-hint").textContent).toBe("⌥⏎ · Replace");
     // The header line stays a pairing-mode thing.
     expect(screen.queryByTestId("session-switcher-replaces")).toBeNull();
     const input = screen.getByTestId("session-switcher-input");
-    fireEvent.keyDown(input, { key: "ArrowDown" });
-    fireEvent.keyDown(input, { key: "ArrowDown" });
+    for (let i = 0; i < 4; i++) fireEvent.keyDown(input, { key: "ArrowDown" });
     fireEvent.keyDown(input, { key: "Enter", altKey: true });
-    expect(slots()).toEqual(["c", "b"]);
+    expect(slots()).toEqual(["e", "b", "c", "d"]);
   });
 });
 

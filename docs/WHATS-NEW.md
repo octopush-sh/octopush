@@ -72,7 +72,8 @@ Current anchors:
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the focused session's rail cell · a rail cell flyout's "Open beside" / "Replace in the focused pane" (on hover, while Open beside can do something) | `run/SessionRail.tsx` |
-| `run-pane-caption` · `run-pane-divider` · `run-empty-seat` | Run canvas, only with two panes: the first pane's caption · the divider between the panes · the empty seat (only while there is one) | `run/RunPanes.tsx` |
+| `run-pane-caption` · `run-pane-menu` · `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first pane's caption · its "Pane options" button · the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
+| `run-pane-orientation` | The first pane's options menu, while open with two or three panes: "Automatic" | `run/RunPanes.tsx` |
 | `run-pair-input` · `run-pair-pick` | Pairing switcher (Open beside), while open: its query input · its first session row (only when a session is off screen) | `run/SessionSwitcher.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |

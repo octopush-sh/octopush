@@ -17,6 +17,31 @@ import type { ITheme } from "@xterm/xterm";
 export const XTERM_FONT_FAMILY =
   '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace';
 
+/** The size a terminal opens at (⌘= / ⌘− zoom from there). */
+export const XTERM_FONT_SIZE = 13;
+
+const cellWidths = new Map<number, number>();
+
+/** One terminal column's width in pixels at `fontSize`: measured off the font
+ *  once per size, or 0.6em (JetBrains Mono's advance) where there is no canvas. */
+export function terminalCellWidth(fontSize = XTERM_FONT_SIZE): number {
+  const known = cellWidths.get(fontSize);
+  if (known) return known;
+  let width = fontSize * 0.6;
+  try {
+    const ctx = document.createElement("canvas").getContext("2d");
+    if (ctx) {
+      ctx.font = `${fontSize}px ${XTERM_FONT_FAMILY}`;
+      const measured = ctx.measureText("W".repeat(10)).width / 10;
+      if (measured > 0) width = measured;
+    }
+  } catch {
+    // No canvas (tests): keep the estimate.
+  }
+  cellWidths.set(fontSize, width);
+  return width;
+}
+
 // Static fallbacks (canonical Onyx & Brass / atelier) — used before the
 // theme store has applied its tokens to :root (first paint) and in
 // non-DOM test environments. Mirrors components/editor/atelierTheme.ts's

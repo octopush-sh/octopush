@@ -17,7 +17,7 @@ import type {
 import { useAttentionStore } from "../stores/attentionStore";
 import { useTerminalsStore } from "../stores/terminalsStore";
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore";
-import { XTERM_FONT_FAMILY, getXtermTheme } from "../lib/xtermTheme";
+import { XTERM_FONT_FAMILY, XTERM_FONT_SIZE, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
 import { isMac } from "../lib/platform";
 import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
@@ -29,7 +29,7 @@ import { OctoMark } from "./icons/OctoMark";
 // pane opens at ZOOM_DEFAULT and resets on remount.
 const ZOOM_MIN = 8;
 const ZOOM_MAX = 28;
-const ZOOM_DEFAULT = 13;
+const ZOOM_DEFAULT = XTERM_FONT_SIZE;
 
 // How long a foreground "idle" lingers before the rail bar stops marching, so a
 // brief mid-task quiet gap doesn't flicker it off. A re-busy within the window

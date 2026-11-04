@@ -174,6 +174,107 @@ export function setRatios(layout: RunLayout, ratios: number[]): RunLayout {
   return { ...layout, ratios: ratios.map((r) => Math.max(RATIO_MIN, Math.min(RATIO_MAX, r))) };
 }
 
+// ─── Geometry ─────────────────────────────────────────────────────
+
+/** Narrowest pane, in terminal columns, that `auto` still puts side by side. */
+export const MIN_SIDE_COLUMNS = 72;
+
+/** A box in fractions (0–1) of the panes' area. */
+export interface Frac {
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+}
+
+/** A divider: the line at `at` across `axis` (`"x"` splits left from right),
+ *  spanning `from`–`to` of the other axis, set by `ratios[ratio]`. */
+export interface Divider {
+  ratio: number;
+  axis: "x" | "y";
+  at: number;
+  from: number;
+  to: number;
+}
+
+/**
+ * Where `auto` lands for this layout `width` pixels wide with `cellWidth`-pixel
+ * columns: side by side while every pane in the row keeps 72 columns, else
+ * stacked. An override wins; one and four panes have no choice (four are
+ * always a 2×2 grid), so they report `"side"`. An unmeasured width stays side by side.
+ */
+export function resolveOrientation(
+  layout: RunLayout,
+  width: number,
+  cellWidth: number,
+): "side" | "stacked" {
+  const count = layout.slots.length;
+  if (count !== 2 && count !== 3) return "side";
+  if (layout.orientation !== "auto") return layout.orientation;
+  if (width <= 0 || cellWidth <= 0) return "side";
+  const split = layout.ratios[0] ?? 0.5;
+  const narrowest = width * Math.min(split, 1 - split);
+  return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
+}
+
+const box = (left: number, top: number, width: number, height: number): Frac => ({
+  left,
+  top,
+  width,
+  height,
+});
+
+/**
+ * Each slot's box and the dividers for `count` panes (spec "Slots and
+ * layout"). Three panes: slot 0 is the large pane, the main divider sits
+ * between it and the pair, the side divider between the pair. Four: one
+ * shared cross, `[colSplit, rowSplit]`.
+ */
+export function paneGeometry(
+  count: number,
+  orientation: "side" | "stacked",
+  ratios: number[],
+): { panes: Frac[]; dividers: Divider[] } {
+  const a = ratios[0] ?? 0.5;
+  const b = ratios[1] ?? 0.5;
+  if (count <= 1) return { panes: [box(0, 0, 1, 1)], dividers: [] };
+  if (count === 2) {
+    return orientation === "side"
+      ? {
+          panes: [box(0, 0, a, 1), box(a, 0, 1 - a, 1)],
+          dividers: [{ ratio: 0, axis: "x", at: a, from: 0, to: 1 }],
+        }
+      : {
+          panes: [box(0, 0, 1, a), box(0, a, 1, 1 - a)],
+          dividers: [{ ratio: 0, axis: "y", at: a, from: 0, to: 1 }],
+        };
+  }
+  if (count === 3) {
+    return orientation === "side"
+      ? {
+          panes: [box(0, 0, a, 1), box(a, 0, 1 - a, b), box(a, b, 1 - a, 1 - b)],
+          dividers: [
+            { ratio: 0, axis: "x", at: a, from: 0, to: 1 },
+            { ratio: 1, axis: "y", at: b, from: a, to: 1 },
+          ],
+        }
+      : {
+          panes: [box(0, 0, 1, a), box(0, a, b, 1 - a), box(b, a, 1 - b, 1 - a)],
+          dividers: [
+            { ratio: 0, axis: "y", at: a, from: 0, to: 1 },
+            { ratio: 1, axis: "x", at: b, from: a, to: 1 },
+          ],
+        };
+  }
+  return {
+    panes: [box(0, 0, a, b), box(a, 0, 1 - a, b), box(0, b, a, 1 - b), box(a, b, 1 - a, 1 - b)],
+    dividers: [
+      { ratio: 0, axis: "x", at: a, from: 0, to: 1 },
+      { ratio: 1, axis: "y", at: b, from: 0, to: 1 },
+    ],
+  };
+}
+
 /** Drop every slot whose session no longer exists, exactly as leaving it. */
 export function prune(layout: RunLayout, exists: (id: string) => boolean): RunLayout {
   let next = layout;

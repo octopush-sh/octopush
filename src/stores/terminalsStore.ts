@@ -7,6 +7,7 @@ import { navigate } from "../lib/tour/surfaces";
 import { useAttentionStore } from "./attentionStore";
 import {
   EMPTY_RUN_LAYOUT,
+  MAX_SLOTS,
   assign,
   besideAction,
   besideReplaces,
@@ -60,9 +61,8 @@ export interface TerminalState {
 // Stable empty list — returning a new array per call would bust React memo.
 const EMPTY_TERMINALS: TerminalState[] = [];
 
-/** Panes Run lays out for now: two side by side. Three and four come with the
- *  grid (spec "PR plan", row 4). */
-export const RUN_PANES = 2;
+/** Most panes Run lays out: four, a 2×2 grid. */
+export const RUN_PANES = MAX_SLOTS;
 
 // ─── Module-level bookkeeping ─────────────────────────────────────
 
