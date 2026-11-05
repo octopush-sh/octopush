@@ -4001,10 +4001,25 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
     // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
     // from a settings pane must never flip them — carried over from disk.
+    let hooks_before = crate::settings::load_settings().ok().and_then(|s| s.claude_hooks_enabled);
+    let hooks_flipped = crate::claude_hooks::toggled(hooks_before, settings.claude_hooks_enabled);
     crate::settings::save_settings_from_ui(settings)?;
     // A key or base URL may have changed: re-detect gateways on the next read.
     state.gateways.invalidate();
+    if hooks_flipped {
+        sync_claude_hooks_later(&state.db);
+    }
     Ok(())
+}
+
+/// Install or strip the Claude Code hooks in every active managed worktree
+/// to match the setting (#533), off the caller's path (CLI version probe).
+pub fn sync_claude_hooks_later(db: &std::sync::Arc<parking_lot::Mutex<crate::db::Db>>) {
+    let db = std::sync::Arc::clone(db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let bin = crate::mcp_setup::resolve_mcp_binary().ok();
+        crate::claude_hooks::sync_all_workspaces(&db, bin.as_deref());
+    });
 }
 
 // ─── Updater (channels + launch alert) ────────────────────────────

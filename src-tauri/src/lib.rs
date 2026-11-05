@@ -473,6 +473,8 @@ pub fn run() {
 
             // Claude Code hook signals from Run terminals → attention events.
             claude_hooks::spawn_poller(app.handle().clone(), std::sync::Arc::clone(&state.db));
+            // Existing worktrees follow the setting too, not only new ones.
+            commands::sync_claude_hooks_later(&state.db);
 
             // Pricing: give $0 ledger rows a price if their model has one now
             // (e.g. a model this release added to the table) and mark the
