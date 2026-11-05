@@ -7,7 +7,10 @@ import {
   rgba,
   solveMatchWashAlpha,
   solveTintAlpha,
+  WORD_DIFF_ADD_ALPHA,
+  WORD_DIFF_DEL_ALPHA,
 } from "../lib/contrast";
+import { stateInks } from "../lib/tokens";
 import type { ThemeConfig } from "../lib/types";
 
 /** localStorage key holding a mirror of the applied theme.
@@ -171,6 +174,19 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
   const dark = isDarkBackground(t.bg);
   root.style.setProperty("color-scheme", dark ? "dark" : "light");
 
+  // State hues have no ThemeConfig field, so they follow the ground instead:
+  // the Onyx values were 2.5:1 on cream. The editor inks types and constants
+  // with them (lib/syntaxPalette.ts).
+  const { stateBlue, statePurple } = stateInks(dark);
+  root.style.setProperty("--color-octo-state-blue", stateBlue);
+  root.style.setProperty("--color-octo-state-purple", statePurple);
+  root.style.setProperty("--color-state-blue", stateBlue);
+  root.style.setProperty("--color-state-purple", statePurple);
+  root.style.setProperty("--state-blue-dim", rgba(stateBlue, 0.4));
+  root.style.setProperty("--state-blue-ghost", rgba(stateBlue, 0.08));
+  root.style.setProperty("--state-purple-dim", rgba(statePurple, 0.4));
+  root.style.setProperty("--state-purple-ghost", rgba(statePurple, 0.1));
+
   // xterm.js can't read CSS variables directly, so terminal surfaces
   // (TerminalPane, TerminalView) resolve this token themselves off :root
   // via lib/xtermTheme.ts's getXtermTheme() — see that file for why.
@@ -198,9 +214,9 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
   // so under vellum a "deleted line" row was tinted with the DARK theme's
   // rouge, at an alpha tuned against near-black.
   root.style.setProperty("--verdigris-ghost", rgba(t.success, 0.08));
-  root.style.setProperty("--verdigris-strong", rgba(t.success, 0.3));
+  root.style.setProperty("--verdigris-strong", rgba(t.success, WORD_DIFF_ADD_ALPHA));
   root.style.setProperty("--rouge-ghost", rgba(t.danger, 0.08));
-  root.style.setProperty("--rouge-strong", rgba(t.danger, 0.28));
+  root.style.setProperty("--rouge-strong", rgba(t.danger, WORD_DIFF_DEL_ALPHA));
   root.style.setProperty("--rouge-active-bg", rgba(t.danger, 0.1));
   root.style.setProperty("--rouge-disabled-bg", rgba(t.danger, 0.05));
   root.style.setProperty("--rouge-border", rgba(t.danger, 0.3));

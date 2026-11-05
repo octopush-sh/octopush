@@ -196,9 +196,10 @@ describe("highlightFile: Go", () => {
     expect(clsOf(row("\tn := 42"), "42")).toBe("tok-num");
     expect(clsOf(row("\tn := 41"), "41")).toBe("tok-num");
     expect(clsOf(row("\tif n > 0 && true {"), "if")).toBe("tok-kw");
-    expect(clsOf(row("\tif n > 0 && true {"), "true")).toBe("tok-kw");
+    // Booleans and nil are constants, not keywords or comments.
+    expect(clsOf(row("\tif n > 0 && true {"), "true")).toBe("tok-num");
     expect(clsOf(row('\t\tprintln("hi", nil)'), '"hi"')).toBe("tok-str");
-    expect(clsOf(row('\t\tprintln("hi", nil)'), "nil")).toBe("tok-cmt");
+    expect(clsOf(row('\t\tprintln("hi", nil)'), "nil")).toBe("tok-num");
     expect(clsOf(row('\t\tprintln("hi", nil)'), "println")).toBe("tok-fn");
   });
   it("round-trips every row", () => {
@@ -210,11 +211,11 @@ describe("highlightFile: Go", () => {
 describe("highlightLines: new grammars style what they emit", () => {
   const SAMPLES: [LangId, string[], [text: string, cls: string][]][] = [
     ["go", ["// c", "type T struct{ N int }"], [["// c", "tok-cmt"], ["type", "tok-kw"], ["int", "tok-type"]]],
-    ["cpp", ["#include <a.h>", "bool f() { return nullptr == 0; }"], [["#include", "tok-cmt"], ["bool", "tok-type"], ["return", "tok-kw"], ["nullptr", "tok-cmt"], ["0", "tok-num"]]],
+    ["cpp", ["#include <a.h>", "bool f() { return nullptr == 0; }"], [["#include", "tok-punct"], ["bool", "tok-type"], ["return", "tok-kw"], ["nullptr", "tok-num"], ["0", "tok-num"]]],
     ["c", ["/* c */ int x = 'a';"], [["/* c */", "tok-cmt"], ["int", "tok-type"]]],
     ["sql", ["SELECT 'a', 1 FROM t; -- c"], [["SELECT", "tok-kw"], ["'a'", "tok-str"], ["1", "tok-num"], ["-- c", "tok-cmt"]]],
-    ["scss", ["@mixin m { .card { color: red; } }"], [["@mixin", "tok-kw"], ["card", "tok-type"], ["color", "tok-var"]]],
-    ["sass", ["@mixin m", "  color: red"], [["@mixin", "tok-kw"], ["color", "tok-var"]]],
+    ["scss", ["@mixin m { .card { color: red; } }"], [["@mixin", "tok-kw"], ["card", "tok-type"], ["color", "tok-prop"]]],
+    ["sass", ["@mixin m", "  color: red"], [["@mixin", "tok-kw"], ["color", "tok-prop"]]],
     ["php", ["<?php", "function f() { return 'a' . 1; }"], [["function", "tok-kw"], ["'a'", "tok-str"], ["1", "tok-num"]]],
   ];
   it.each(SAMPLES)("%s", (lang, lines, expected) => {

@@ -51,6 +51,27 @@ The `vellum` theme is not atelier inverted. Seven rules govern it, and they gene
 
 **The one exclusion: `solarized-dark`.** Solarized is a published, named palette whose dark variant does not carry an AA-capable text ramp. On *upstream's own* surfaces, body text (base0) is 4.75:1 on base03 but 4.11:1 on base02, and the comment tone (base01) is 2.79:1 / 2.42:1 — below AA wherever it sits. Lifting `text_muted` alone would invert the hierarchy; lifting the whole ramp would mean it is no longer Solarized. It stays verbatim and `NOT_AA_CAPABLE` names it rather than leaving a silent hole. The exclusion covers the text ramp only — `border_strong` is an Octopush token with no upstream counterpart, so every theme without exception must clear 3:1 on it.
 
+### 1.2 Syntax palette (2026-11-04, issue #436)
+
+Code highlighting uses palette inks only, no syntax-only hues. One table, `src/lib/syntaxPalette.ts`, maps every highlighting tag to a kind; the editor (`atelierTheme.ts`) and the Review diff (`.tok-*` in `styles.css`) both read it.
+
+| Kind | Ink | Diff class |
+|---|---|---|
+| Keywords, modifiers, `this` | brass (the one accent, kept surgical) | `tok-kw` |
+| Types, classes, tags | `--color-octo-state-blue` | `tok-type` |
+| Function and method names, call and definition | `--color-octo-state-purple` | `tok-fn` |
+| Strings | `--color-octo-verdigris` | `tok-str` |
+| Numbers and constants | sage | `tok-num` |
+| Annotations, decorators, macros | `--color-octo-warning` (amber; rare, so it still reads as an exception) | `tok-meta` |
+| Properties, plain text | ivory | `tok-prop` · `tok-var` |
+| Comments, punctuation | mute, upright, never italic | `tok-cmt` · `tok-punct` |
+
+State-blue and state-purple have no `ThemeConfig` field, so `themeStore` switches them with the ground: the Onyx values on a dark theme, `vellumInks` from `tokens.ts` on a light one (`#2f5a7e` / `#6a4682`, AA on every Vellum surface). Verdigris and amber are ThemeConfig inks already. `contrast.test.ts` holds both themes' syntax inks to 4.5:1, and `syntaxPalette.coverage.test.ts` fails if a supported language emits a tag with no rule.
+
+Strings are verdigris rather than sage because sage (the theme's `textDim`) and mute are near twins: on Vellum `#6d5e4b` against `#6f5f4a`. Strings and comments sit side by side constantly, so they need inks that read apart; sage goes to numbers and constants instead.
+
+A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris, the string ink, falls below 4.5:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
+
 ---
 
 ## 2. Typography

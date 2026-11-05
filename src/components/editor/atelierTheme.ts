@@ -17,9 +17,9 @@ import {
   HighlightStyle,
   syntaxHighlighting,
 } from "@codemirror/language";
-import { tags } from "@lezer/highlight";
 import type { Extension } from "@codemirror/state";
 import { isDarkBackground } from "../../lib/contrast";
+import { SYNTAX_KINDS, SYNTAX_RULES } from "../../lib/syntaxPalette";
 
 // ── Static fallbacks (canonical Onyx & Brass) ─────────────────────
 const FALLBACK = {
@@ -32,6 +32,9 @@ const FALLBACK = {
   mute:       "#8c7f6c",
   rouge:      "#d18b8b",
   verdigris:  "#8fc9a8",
+  stateBlue:   "#7a9cb8",
+  statePurple: "#a888b8",
+  warning:     "#dfae4a",
   brassGhost: "rgba(212, 165, 116, 0.08)",
   brassFaint: "rgba(212, 165, 116, 0.04)",
   brassGlow:  "rgba(212, 165, 116, 0.12)",
@@ -59,6 +62,12 @@ export interface EditorTokens {
   mute: string;
   rouge: string;
   verdigris: string;
+  /** Types and classes. */
+  stateBlue: string;
+  /** Numbers and constants. */
+  statePurple: string;
+  /** Annotations, decorators and macros (amber — never the accent). */
+  warning: string;
   brassGhost: string;
   brassFaint: string;
   brassGlow: string;
@@ -105,6 +114,9 @@ export function resolveEditorTokens(): EditorTokens {
     mute:       readVar("--color-octo-mute", FALLBACK.mute),
     rouge:      readVar("--color-octo-rouge", FALLBACK.rouge),
     verdigris:  readVar("--color-octo-verdigris", FALLBACK.verdigris),
+    stateBlue:   readVar("--color-octo-state-blue", FALLBACK.stateBlue),
+    statePurple: readVar("--color-octo-state-purple", FALLBACK.statePurple),
+    warning:     readVar("--color-octo-warning", FALLBACK.warning),
     brassGhost: readVar("--brass-ghost", FALLBACK.brassGhost),
     brassFaint: readVar("--brass-faint", FALLBACK.brassFaint),
     brassGlow:  readVar("--brass-glow", FALLBACK.brassGlow),
@@ -321,73 +333,15 @@ export const editorThemeSpec = makeEditorThemeSpec(FALLBACK);
 
 // ── Syntax highlighting ───────────────────────────────────────────
 
-function makeHighlightStyle(t: EditorTokens): HighlightStyle {
-  return HighlightStyle.define([
-    // Keywords: brass
-    { tag: tags.keyword,            color: t.brass, fontWeight: "500" },
-    { tag: tags.controlKeyword,     color: t.brass },
-    { tag: tags.definitionKeyword,  color: t.brass },
-    { tag: tags.moduleKeyword,      color: t.brass },
-    { tag: tags.operatorKeyword,    color: t.brass },
-
-    // Strings: sage
-    { tag: tags.string,             color: t.sage },
-    { tag: tags.special(tags.string), color: t.sage },
-    { tag: tags.regexp,             color: t.sage },
-    { tag: tags.escape,             color: t.sage },
-
-    // Numbers: rouge (distinctive)
-    { tag: tags.number,             color: t.rouge },
-    { tag: tags.integer,            color: t.rouge },
-    { tag: tags.float,              color: t.rouge },
-
-    // Comments: mute (upright — no cursive type anywhere in the app)
-    { tag: tags.comment,            color: t.mute },
-    { tag: tags.lineComment,        color: t.mute },
-    { tag: tags.blockComment,       color: t.mute },
-
-    // Functions: ivory
-    { tag: tags.function(tags.variableName), color: t.ivory },
-    { tag: tags.function(tags.propertyName), color: t.ivory },
-
-    // Types / classes: brass
-    { tag: tags.typeName,           color: t.brass },
-    { tag: tags.className,          color: t.brass },
-    { tag: tags.namespace,          color: t.brass },
-    { tag: tags.definition(tags.typeName), color: t.brass },
-
-    // Operators & punctuation: sage
-    { tag: tags.operator,           color: t.sage },
-    { tag: tags.punctuation,        color: t.sage },
-    { tag: tags.separator,          color: t.sage },
-    { tag: tags.bracket,            color: t.sage },
-
-    // HTML tags: brass
-    { tag: tags.tagName,            color: t.brass },
-    { tag: tags.angleBracket,       color: t.sage },
-
-    // HTML attributes: sage
-    { tag: tags.attributeName,      color: t.sage },
-    { tag: tags.attributeValue,     color: t.sage },
-
-    // Variables / properties: ivory (base)
-    { tag: tags.variableName,       color: t.ivory },
-    { tag: tags.propertyName,       color: t.ivory },
-
-    // Boolean / null / undefined: brass
-    { tag: tags.bool,               color: t.brass },
-    { tag: tags.null,               color: t.mute },
-
-    // Headings (Markdown): brass
-    { tag: tags.heading,            color: t.brass, fontWeight: "600" },
-
-    // Links (Markdown): sage
-    { tag: tags.link,               color: t.sage },
-
-    // Special / meta: mute
-    { tag: tags.meta,               color: t.mute },
-    { tag: tags.processingInstruction, color: t.mute },
-  ]);
+/** The editor's syntax colours: `lib/syntaxPalette.ts`'s kinds, inked from the
+ *  live tokens. Comments stay upright — no cursive type anywhere in the app. */
+export function makeHighlightStyle(t: EditorTokens): HighlightStyle {
+  return HighlightStyle.define(
+    SYNTAX_RULES.map(({ tag, kind }) => {
+      const { ink, fontWeight } = SYNTAX_KINDS[kind];
+      return fontWeight ? { tag, color: t[ink], fontWeight } : { tag, color: t[ink] };
+    }),
+  );
 }
 
 // ── Exported extensions ───────────────────────────────────────────

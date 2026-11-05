@@ -1,5 +1,6 @@
 import type { Extension } from "@codemirror/state";
-import { StreamLanguage, type Language, type LanguageSupport, type StreamParser } from "@codemirror/language";
+import { LanguageSupport, StreamLanguage, type Language, type LRLanguage, type StreamParser, type StringStream } from "@codemirror/language";
+import { styleTags, tags } from "@lezer/highlight";
 import type { LangId } from "./editorLang";
 
 /**
@@ -21,8 +22,92 @@ interface Grammar {
 }
 
 const lezer = (s: LanguageSupport): Grammar => ({ support: s, language: s.language });
-const stream = <T>(parser: StreamParser<T>): Grammar => {
-  const l = StreamLanguage.define(parser);
+
+/** A Lezer grammar with extra highlighting rules for nodes its package leaves
+ *  untagged. The package's support extensions are kept: their language data
+ *  is keyed on the same facet the configured language uses.
+ *
+ *  Only usable for nodes the package gives no context-free rule: when rules
+ *  merge, `@lezer/highlight` keeps the package's context-free rule ahead of
+ *  any contextual one added here, so e.g. `MethodDeclaration/Definition`
+ *  could never beat Java's plain `Definition`. */
+const refined = (s: LanguageSupport, lang: LRLanguage, rules: Parameters<typeof styleTags>[0]): Grammar => {
+  const l = lang.configure({ props: [styleTags(rules)] });
+  return lezer(new LanguageSupport(l, s.support));
+};
+
+/** Java: `@Override`, `@Foo(…)` and `@a.B` take the annotation ink, `@`
+ *  included — the package tags their name as a plain identifier and leaves the
+ *  `@` (an anonymous token, so the annotation node's own text) untagged. The
+ *  node rule doesn't inherit, so an argument list keeps its own inks. */
+const JAVA_RULES = {
+  "MarkerAnnotation Annotation": tags.annotation,
+  "MarkerAnnotation/Identifier Annotation/Identifier": tags.annotation,
+  // A qualified name nests ScopedIdentifiers over Identifiers that keep the
+  // package's `variableName`; opaque, so the whole `a.B` is amber (as Rust's
+  // `MetaItem!`).
+  "MarkerAnnotation/ScopedIdentifier! Annotation/ScopedIdentifier!": tags.annotation,
+};
+
+/** Rust: an attribute (`#[derive(Debug)]`, `#![allow(x)]`) is amber as a
+ *  whole. The package marks `Attribute/...` as `meta`, but the identifiers
+ *  inside keep their own `variableName`, which then decides the colour; and
+ *  an `Identifier` rule can't win (see `refined`). `MetaItem` has no rule of
+ *  its own, so an opaque one keeps its children from being tagged at all. */
+const RUST_RULES = {
+  "MetaItem!": tags.annotation,
+  "InnerAttribute/...": tags.meta,
+};
+
+/** What StreamLanguage's own table makes of `def`: a declared name, plain. */
+const DEF = "variableName.definition";
+const DEF_FUNCTION = "variableName.function.definition";
+
+/**
+ * Legacy-mode token names → highlighting tag paths. StreamLanguage's own table
+ * maps `builtin` to `standard(variableName)` and knows no `variable-3` at all,
+ * so Go-like modes read uncoloured. Renaming before the table sees the name
+ * puts each on a category of the syntax palette (`lib/syntaxPalette.ts`):
+ * `builtin` → builtin call, `variable-3` → type, `qualifier` → modifier
+ * (keyword). `def` is any declared name (`val x`, `class K`, `let s`), so it
+ * stays plain unless it names a function (see `isFunctionDef`). `atom`, `meta`
+ * and `variable-2` already resolve to tags the palette styles (constant,
+ * annotation, special variable).
+ */
+const LEGACY_NAMES: Record<string, string> = {
+  def: DEF,
+  builtin: "variableName.function.standard",
+  "variable-3": "typeName",
+  qualifier: "modifier",
+};
+
+/** Shell's `def` is a variable (`FOO=`, `$FOO`, `${FOO}`), never a function. */
+const SHELL_NAMES: Record<string, string> = { ...LEGACY_NAMES, def: "variableName.special" };
+
+/** The keywords that make the name after them a function: Kotlin `fun`,
+ *  Swift `func`, Scala/Ruby `def`, Lua `function`. */
+const FUNCTION_KEYWORD = /\b(?:fun|func|def|function)\s+$/;
+
+/** A `def` token names a function when a function keyword precedes it or a
+ *  `(` follows it (C#/Dart `String f(`, C++ constructors). */
+const isFunctionDef = (s: StringStream) =>
+  FUNCTION_KEYWORD.test(s.string.slice(0, s.start)) || !!s.match(/^\s*\(/, false);
+
+const stream = <T>(parser: StreamParser<T>, names: Record<string, string> = LEGACY_NAMES): Grammar => {
+  const l = StreamLanguage.define<T>({
+    ...parser,
+    token(s, state) {
+      const style = parser.token(s, state);
+      if (!style) return style;
+      // An identifier followed by `(` is a call or a definition: `fun f(`,
+      // `foo(x)`. Modes like clike's Kotlin tag both as a plain variable.
+      if (style === "variable" && s.peek() === "(") return "variableName.function";
+      return style
+        .split(" ")
+        .map((part) => (part === "def" && names.def === DEF && isFunctionDef(s) ? DEF_FUNCTION : names[part] ?? part))
+        .join(" ");
+    },
+  });
   return { support: l, language: l };
 };
 
@@ -38,9 +123,9 @@ const LOADERS: Record<Exclude<LangId, NoLoader>, () => Promise<Grammar>> = {
   jsx:        () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ jsx: true }))),
   typescript: () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ typescript: true }))),
   tsx:        () => import("@codemirror/lang-javascript").then((m) => lezer(m.javascript({ typescript: true, jsx: true }))),
-  rust:       () => import("@codemirror/lang-rust").then((m) => lezer(m.rust())),
+  rust:       () => import("@codemirror/lang-rust").then((m) => refined(m.rust(), m.rustLanguage, RUST_RULES)),
   python:     () => import("@codemirror/lang-python").then((m) => lezer(m.python())),
-  java:       () => import("@codemirror/lang-java").then((m) => lezer(m.java())),
+  java:       () => import("@codemirror/lang-java").then((m) => refined(m.java(), m.javaLanguage, JAVA_RULES)),
   json:       () => import("@codemirror/lang-json").then((m) => lezer(m.json())),
   markdown:   () => import("@codemirror/lang-markdown").then((m) => lezer(m.markdown())),
   html:       () => import("@codemirror/lang-html").then((m) => lezer(m.html())),
@@ -55,7 +140,7 @@ const LOADERS: Record<Exclude<LangId, NoLoader>, () => Promise<Grammar>> = {
   sass:       () => import("@codemirror/lang-sass").then((m) => lezer(m.sass({ indented: true }))),
   scss:       () => import("@codemirror/lang-sass").then((m) => lezer(m.sass())),
   php:        () => import("@codemirror/lang-php").then((m) => lezer(m.php())),
-  shell:      () => import("@codemirror/legacy-modes/mode/shell").then((m) => stream(m.shell)),
+  shell:      () => import("@codemirror/legacy-modes/mode/shell").then((m) => stream(m.shell, SHELL_NAMES)),
   toml:       () => import("@codemirror/legacy-modes/mode/toml").then((m) => stream(m.toml)),
   dockerfile: () => import("@codemirror/legacy-modes/mode/dockerfile").then((m) => stream(m.dockerFile)),
   properties: () => import("@codemirror/legacy-modes/mode/properties").then((m) => stream(m.properties)),

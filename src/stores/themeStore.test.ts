@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { ThemeConfig } from "../lib/types";
+import { tokens, vellumInks } from "../lib/tokens";
 
 const { ipcMock } = vi.hoisted(() => ({
   ipcMock: {
@@ -241,6 +242,21 @@ describe("themeStore · applyThemeToDom", () => {
     expect(read("--warning-ghost")).toBe("rgba(127, 83, 0, 0.08)");
     // The scrim composites over the canvas, so it must be the theme's own bg.
     expect(read("--onyx-40")).toBe("rgba(242, 236, 224, 0.4)");
+  });
+
+  it("switches the state hues (editor types and constants) with the ground", async () => {
+    // They have no ThemeConfig field; the Onyx values sat at ~2.5:1 on cream.
+    await useThemeStore.getState().apply(VELLUM);
+    expect(read("--color-octo-state-blue")).toBe(vellumInks.stateBlue);
+    expect(read("--color-octo-state-purple")).toBe(vellumInks.statePurple);
+    expect(read("--color-state-blue")).toBe(vellumInks.stateBlue);
+    // #2f5a7e -> 47, 90, 126
+    expect(read("--state-blue-ghost")).toBe("rgba(47, 90, 126, 0.08)");
+
+    await useThemeStore.getState().apply(ATELIER);
+    expect(read("--color-octo-state-blue")).toBe(tokens.stateBlue);
+    expect(read("--color-octo-state-purple")).toBe(tokens.statePurple);
+    expect(read("--state-purple-dim")).toBe("rgba(168, 136, 184, 0.4)");
   });
 
   it("thickens --brass-line on light themes so The Octo's back arms survive", async () => {

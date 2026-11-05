@@ -64,6 +64,21 @@ The result should feel closer to a beautifully bound notebook than to a producti
 
 Also: `--brass-dim: rgba(212, 165, 116, 0.4)` for hairline accents and `--brass-ghost: rgba(212, 165, 116, 0.08)` for active fills.
 
+**Syntax inks (2026-11-04, #436).** Editor and diff highlighting draw only on palette hues; no syntax-only colour exists. The hues are:
+
+- keywords: brass;
+- types: state-blue;
+- function names: state-purple;
+- strings: verdigris;
+- numbers and constants: sage;
+- annotations and macros: amber (`--color-octo-warning`);
+- properties and plain text: ivory;
+- comments: mute, upright.
+
+Strings are not sage: sage and mute are near twins (on Vellum `#6d5e4b` vs `#6f5f4a`), and strings and comments must read apart.
+
+On the Vellum (light) theme, state-blue and state-purple switch to `#2f5a7e` and `#6a4682`, which pass AA on every Vellum surface. The full table is in `docs/design-system.md` §1.2.
+
 ### 2.2 Typography
 
 Three families, six roles.

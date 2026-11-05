@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { tokens, fonts, ease, dur } from "./tokens";
+import { tokens, fonts, ease, dur, stateInks, vellumInks } from "./tokens";
 
 describe("design tokens — Onyx & Brass", () => {
   it("exports the canonical color tokens with spec hex values", () => {
@@ -17,6 +17,11 @@ describe("design tokens — Onyx & Brass", () => {
     // Warning is amber — deliberately NOT the brass hex.
     expect(tokens.warning).toBe("#dfae4a");
     expect(tokens.warning).not.toBe(tokens.brass);
+  });
+
+  it("picks the state hues by ground: Onyx values on dark, Vellum values on light", () => {
+    expect(stateInks(true)).toEqual({ stateBlue: "#7a9cb8", statePurple: "#a888b8" });
+    expect(stateInks(false)).toEqual({ stateBlue: vellumInks.stateBlue, statePurple: vellumInks.statePurple });
   });
 
   it("exposes brass alpha utilities", () => {
