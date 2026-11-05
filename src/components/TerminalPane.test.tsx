@@ -806,6 +806,46 @@ describe("TerminalPane — shown and focused", () => {
     }
   });
 
+  it("holds the PTY's size while a mode switch's fold settles: one resize at the end", async () => {
+    const { useTerminalLayoutStore } = await import("../stores/terminalLayoutStore");
+    const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
+    const height = vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockReturnValue(600);
+    try {
+      render(
+        <TerminalPane terminalId="t-fold" workspaceId="ws" workspacePath="/ws" label="L" shown focused layoutVersion={0} />,
+      );
+      await act(async () => { await new Promise((r) => setTimeout(r, 250)); });
+      const term = xtermHoisted.last! as unknown as {
+        onResize: ReturnType<typeof vi.fn>;
+        rows: number;
+        cols: number;
+      };
+      const onResize = term.onResize.mock.calls[0][0] as (s: { rows: number; cols: number }) => void;
+      mockIpc.resizeSession.mockClear();
+
+      act(() => useTerminalLayoutStore.getState().setSettling(true));
+      // Each step of the glide refits the pane; none reaches the PTY.
+      for (const cols of [100, 95, 91]) {
+        term.rows = 30;
+        term.cols = cols;
+        onResize({ rows: 30, cols });
+      }
+      await act(async () => { await new Promise((r) => setTimeout(r, 350)); });
+      expect(mockIpc.resizeSession).not.toHaveBeenCalled();
+
+      act(() => useTerminalLayoutStore.getState().setSettling(false));
+      expect(mockIpc.resizeSession).toHaveBeenCalledTimes(1);
+      expect(mockIpc.resizeSession).toHaveBeenCalledWith("t-fold", 30, 91);
+      // The pane's own later refits find nothing new to send.
+      await act(async () => { await new Promise((r) => setTimeout(r, 350)); });
+      expect(mockIpc.resizeSession).toHaveBeenCalledTimes(1);
+    } finally {
+      width.mockRestore();
+      height.mockRestore();
+      useTerminalLayoutStore.setState({ settling: false });
+    }
+  });
+
   it("wrapper has display:block when shown", async () => {
     const { container } = render(
       <TerminalPane

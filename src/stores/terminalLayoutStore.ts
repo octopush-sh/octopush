@@ -287,6 +287,9 @@ export interface TalkSeat {
 
 export const EMPTY_TALK_SEAT: TalkSeat = { terminalId: null, width: 0.5, open: false };
 
+/** True while every PTY's size is held: a divider drag or a fold settling. */
+export const ptySizeHeld = (s: { resizing: boolean; settling: boolean }) => s.resizing || s.settling;
+
 const clampRatio = (r: number) => Math.max(RATIO_MIN, Math.min(RATIO_MAX, r));
 
 /** Open the seat, or close it. Closing keeps its session for next time. */
@@ -396,6 +399,10 @@ interface TerminalLayoutStore {
   /** True while a divider is being dragged: panes refit on animation frames
    *  and only tell the PTY their size on pointer-up. */
   resizing: boolean;
+  /** True while a mode switch's Companion fold glides (`useFoldSettle`):
+   *  like `resizing`, panes refit on frames and tell the PTY their size once,
+   *  when it settles. Separate from `resizing`, which also stills the glides. */
+  settling: boolean;
 
   getRun: (workspaceId: string) => RunLayout;
   getMru: (workspaceId: string) => string[];
@@ -408,6 +415,7 @@ interface TerminalLayoutStore {
   /** Forget a deleted workspace's layouts and MRU. */
   forgetWorkspace: (workspaceId: string) => void;
   setResizing: (resizing: boolean) => void;
+  setSettling: (settling: boolean) => void;
 
   talkByWs: Record<string, TalkSeat>;
   /** Per workspace, true while Talk's seat holds keyboard focus (the user
@@ -427,6 +435,7 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
   runByWs: stored.run,
   mruByWs: {},
   resizing: false,
+  settling: false,
   talkByWs: stored.talk,
   talkFocusedByWs: {},
 
@@ -493,6 +502,7 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
     }),
 
   setResizing: (resizing) => set((s) => (s.resizing === resizing ? s : { resizing })),
+  setSettling: (settling) => set((s) => (s.settling === settling ? s : { settling })),
 }));
 
 // Every layout change is written through: a restart reopens the same panes.

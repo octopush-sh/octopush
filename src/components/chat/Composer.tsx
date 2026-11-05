@@ -697,8 +697,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         />
         </div>
 
-        {/* Control bar — model + effort on the left, cost + send/stop on the right. */}
-        <div className="flex items-center gap-3 px-3 pb-2.5">
+        {/* Control bar — model + effort on the left, cost + send/stop on the right.
+            It wraps rather than overflow when the column is narrower than its
+            natural width (Talk's seat at its 40-column minimum). */}
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5">
           <ModelPicker activeModel={model} onSelectModel={setModel} autoOption />
           <EffortSelector />
           <button
@@ -723,7 +725,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
           {inlineCost !== null && (
             <div
-              className="octo-tabular ml-auto font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
+              className="octo-tabular ml-auto whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
               title={`Estimate for ${activeModelInfo!.displayName || activeModelInfo!.id}; assumes 30% output ratio`}
             >
               <span className="text-octo-brass">{formatPerMessageCost(inlineCost)}</span>

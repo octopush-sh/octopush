@@ -95,6 +95,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { useGlobalShortcuts, type ShortcutContext } from "./hooks/useGlobalShortcuts";
 import { useCompanionFold } from "./hooks/useCompanionFold";
+import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -722,6 +723,10 @@ function App() {
   );
   const panesFold = (activeMode === "run" && runPaneCount > 1) || (activeMode === "talk" && talkSeatOpen);
   const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
+  // A mode switch that glides the Companion to or from its strip holds every
+  // PTY's size until the glide ends: one resize per visible session.
+  const companionStrip = isCompanionCollapsed || panesFold;
+  const onCompanionGlideEnd = useFoldSettle(activeMode, companionStrip);
   const toggleCompanionFold = companionFold.toggle;
   const toggleCompanion = useCallback(() => {
     toggleCompanionFold();
@@ -2429,8 +2434,9 @@ function App() {
       <div
         className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
         style={{
-          width: isCompanionCollapsed || panesFold ? COMPANION_COLLAPSED_WIDTH : companionWidth,
+          width: companionStrip ? COMPANION_COLLAPSED_WIDTH : companionWidth,
         }}
+        onTransitionEnd={onCompanionGlideEnd}
       >
           {/* The resize handle only makes sense when expanded in place. */}
           {!isCompanionCollapsed && !panesFold && (

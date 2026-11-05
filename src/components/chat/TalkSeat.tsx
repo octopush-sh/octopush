@@ -23,6 +23,16 @@ const STEP = 0.05;
 const FINE_STEP = 0.01;
 
 /**
+ * The most the seat may take of the canvas: what leaves the conversation its
+ * `--talk-chat-min` (the composer at its natural size). When that would leave
+ * the terminal under `--talk-seat-min` (about 40 columns), the seat keeps that
+ * much instead and the conversation narrows, never past `--talk-chat-floor`;
+ * the composer's control bar wraps there, so nothing of it is ever covered.
+ */
+const SEAT_CAP =
+  "max(100% - var(--talk-chat-min), min(var(--talk-seat-min), 100% - var(--talk-chat-floor)))";
+
+/**
  * Talk with one terminal beside the conversation
  * (docs/superpowers/specs/2026-11-03-run-session-pair-design.md, "Talk"). The
  * seat holds one of Run's sessions, the same PTY: it is only a `TerminalSlot`,
@@ -38,6 +48,7 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
   const known = useTerminalsStore((s) => workspaceId in s.terminalsByWs);
   const createInTalkSeat = useTerminalsStore((s) => s.createInTalkSeat);
   const areaRef = useRef<HTMLDivElement>(null);
+  const seatRef = useRef<HTMLDivElement>(null);
   const session = terminals.find((t) => t.id === seat.terminalId) ?? null;
   const Icon = iconForSessionRole(session?.role ?? "shell");
   const { updateTalk, setTalkFocused, setResizing } = useTerminalLayoutStore.getState();
@@ -59,9 +70,21 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
   }
 
   const setWidth = (w: number) => updateTalk(workspaceId, (s) => setTalkWidth(s, w));
+  // The share the seat shows: its width can be capped below `seat.width`.
+  const shownWidth = () => {
+    const area = areaRef.current?.getBoundingClientRect().width ?? 0;
+    const own = seatRef.current?.getBoundingClientRect().width ?? 0;
+    return area > 0 && own > 0 ? Math.min(seat.width, own / area) : seat.width;
+  };
   const drag = (on: boolean) => {
     setResizing(on);
     document.body.style.cursor = on ? "col-resize" : "";
+    // A drag past the cap keeps what it showed, so the next drag or arrow key
+    // moves the seat at once instead of first crossing the capped stretch.
+    if (!on) {
+      const shown = shownWidth();
+      if (shown < seat.width - 0.005) setWidth(shown);
+    }
   };
 
   // A drag that never sees its release (the seat closes mid-drag) must not
@@ -98,10 +121,11 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
       </div>
 
       <div
+        ref={seatRef}
         data-testid="talk-seat"
         className="relative flex min-h-0 shrink-0 flex-col"
         style={{
-          width: seat.open ? `${seat.width * 100}%` : 0,
+          width: seat.open ? `min(${seat.width * 100}%, ${SEAT_CAP})` : 0,
           transition: resizing ? undefined : "width var(--dur-standard) var(--ease-octo)",
         }}
         onTransitionEnd={(e) => {
@@ -136,8 +160,8 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
               onKeyDown={(e) => {
                 // The seat is on the right: moving the divider left widens it.
                 const step = e.shiftKey ? FINE_STEP : STEP;
-                if (e.key === "ArrowLeft") setWidth(seat.width + step);
-                else if (e.key === "ArrowRight") setWidth(seat.width - step);
+                if (e.key === "ArrowLeft") setWidth(shownWidth() + step);
+                else if (e.key === "ArrowRight") setWidth(shownWidth() - step);
                 else return;
                 e.preventDefault();
               }}

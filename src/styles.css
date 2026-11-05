@@ -180,6 +180,16 @@
   --warning-ghost:     rgba(223, 174, 74, 0.08);
   --warning-border:    rgba(223, 174, 74, 0.3);
 
+  /* Talk's terminal seat (TalkSeat). The conversation keeps `--talk-chat-min`,
+     the composer at its natural width (model · effort · attach · estimate ·
+     Send on one line, measured at 703px); when the canvas can't also give
+     the seat `--talk-seat-min` (about 40 columns of the 13px terminal), the
+     seat keeps that and the conversation narrows to at most
+     `--talk-chat-floor`, where the composer's control bar wraps. */
+  --talk-chat-min:   44rem;
+  --talk-seat-min:   21rem;
+  --talk-chat-floor: 18rem;
+
   /* Motion */
   --ease-octo:    cubic-bezier(0.2, 0.8, 0.3, 1);
   --dur-quick:    220ms;

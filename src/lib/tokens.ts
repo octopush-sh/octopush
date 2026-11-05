@@ -44,6 +44,13 @@ export const ease = {
   octo: "cubic-bezier(0.2, 0.8, 0.3, 1)",
 } as const;
 
+/** Talk's terminal seat (mirrors `--talk-*` in styles.css; see TalkSeat). */
+export const talkSeat = {
+  chatMin: "44rem",
+  seatMin: "21rem",
+  chatFloor: "18rem",
+} as const;
+
 export const dur = {
   quick: 220,
   standard: 280,

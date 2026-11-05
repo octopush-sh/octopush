@@ -16,7 +16,7 @@ import type {
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useTerminalsStore } from "../stores/terminalsStore";
-import { useTerminalLayoutStore } from "../stores/terminalLayoutStore";
+import { ptySizeHeld, useTerminalLayoutStore } from "../stores/terminalLayoutStore";
 import { XTERM_FONT_FAMILY, XTERM_FONT_SIZE, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
 import { isMac } from "../lib/platform";
@@ -114,9 +114,10 @@ export function TerminalPane({
   shownRef.current = shown;
   const focusedRef = useRef(shown && focused);
   focusedRef.current = shown && focused;
-  // While a divider is dragged, refit on animation frames but hold the PTY's
-  // size (no SIGWINCH storm) until pointer-up.
-  const resizing = useTerminalLayoutStore((s) => s.resizing);
+  // While a divider is dragged, or a mode switch's Companion fold glides,
+  // refit on animation frames but hold the PTY's size (no SIGWINCH storm)
+  // until pointer-up or the glide's end: one resize per change.
+  const resizing = useTerminalLayoutStore(ptySizeHeld);
   const resizingRef = useRef(resizing);
   resizingRef.current = resizing;
   const workspaceIdRef = useRef(workspaceId);
@@ -653,7 +654,8 @@ export function TerminalPane({
     }
   }, [shown, takesFocus, syncSize]);
 
-  // The divider was let go: tell the PTY the size the pane settled on.
+  // The divider was let go (or the fold settled): tell the PTY the size the
+  // pane settled on.
   const wasResizingRef = useRef(resizing);
   useEffect(() => {
     const wasResizing = wasResizingRef.current;
