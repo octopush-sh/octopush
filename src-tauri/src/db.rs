@@ -1051,6 +1051,21 @@ impl Db {
             "#,
         )?;
 
+        // Claude Code hook signals (#287): written by `octopush-mcp hook` from
+        // inside a Run terminal, drained by the app's poller. A queue, not a
+        // history — rows are deleted once read. No message text is stored.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS hook_signals (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                terminal_id TEXT NOT NULL,
+                signal      TEXT NOT NULL,   -- permission | input | settled
+                session_id  TEXT,
+                created_at  TEXT NOT NULL
+            );
+            "#,
+        )?;
+
         // Reconcile each run's retired/looped DIRECT history into the ledger. The
         // Slice-1 backfill only captured the CURRENT run_stages, so a run that
         // looped/rejected before that shipped is missing its retired attempts,
@@ -3211,6 +3226,43 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(exists)
+    }
+
+    // ─── Claude Code hook signals ──────────────────────────────────
+
+    /// Queue one hook signal for the app's poller (`claude_hooks`).
+    pub fn insert_hook_signal(&self, terminal_id: &str, signal: &str, session_id: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO hook_signals (terminal_id, signal, session_id, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![terminal_id, signal, session_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Every queued hook signal, oldest first, removed from the queue in the
+    /// same transaction so a row is delivered once.
+    pub fn drain_hook_signals(&self) -> AppResult<Vec<HookSignalRow>> {
+        let tx = self.conn.unchecked_transaction()?;
+        let rows = {
+            let mut stmt = tx.prepare(
+                "SELECT id, terminal_id, signal, session_id, created_at FROM hook_signals ORDER BY id",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(HookSignalRow {
+                    id: r.get(0)?,
+                    terminal_id: r.get(1)?,
+                    signal: r.get(2)?,
+                    session_id: r.get(3)?,
+                    created_at: r.get(4)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        if let Some(last) = rows.last() {
+            tx.execute("DELETE FROM hook_signals WHERE id <= ?1", params![last.id])?;
+        }
+        tx.commit()?;
+        Ok(rows)
     }
 
     // ─── Terminals ────────────────────────────────────────────────
@@ -6333,6 +6385,17 @@ pub struct WorkspaceRow {
     /// The resolved base branch this workspace was created from. None for
     /// rows predating the column and for the auto-created default-branch row.
     pub from_branch: Option<String>,
+}
+
+/// One queued Claude Code hook signal (`hook_signals`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct HookSignalRow {
+    pub id: i64,
+    pub terminal_id: String,
+    /// `agent_adapter::HookSignal::as_str`.
+    pub signal: String,
+    pub session_id: Option<String>,
+    pub created_at: String,
 }
 
 /// A mission — the first-level unit of intent (build/fix/review/probe/design/

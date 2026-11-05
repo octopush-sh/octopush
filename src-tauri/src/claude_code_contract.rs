@@ -17,6 +17,7 @@
 //! | `Total cost:` PTY tail | `token_engine::scan_pty_output` (via `agent_adapter`) |
 //! | `SKILL.md` / `.claude/agents/*.md` frontmatter (incl. `effort:`) | `skills`, `skills::agents` |
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
+//! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -781,6 +782,36 @@ fn notification_events_journal_their_message() {
     let mut th = RetryThrottle::default();
     let t0 = std::time::Instant::now();
     assert!(notes.iter().all(|e| th.allow(e, t0) && th.allow(e, t0)), "[{fx}]");
+}
+
+#[test]
+fn hook_payloads_map_to_attention_signals() {
+    use crate::agent_adapter::{parse_hook_event, HookSignal};
+    // Synthetic fixtures (see the README) — pinned to the recording that has them.
+    let rec = recording("2.1.314");
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db = crate::db::Db::open(tmp.path()).unwrap();
+    for (rel, want) in [
+        ("hooks/notification-permission.json", HookSignal::NeedsPermission),
+        ("hooks/notification-idle.json", HookSignal::NeedsInput),
+        ("hooks/stop.json", HookSignal::Settled),
+    ] {
+        let fx = rec.label(rel);
+        let payload = rec.json(rel);
+        let session = require_str(&fx, &payload, "session_id");
+        require_str(&fx, &payload, "cwd");
+        let event = parse_hook_event(&payload).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
+        assert_eq!(event.signal, want, "[{fx}]");
+        assert_eq!(event.session_id.as_deref(), Some(session), "[{fx}]");
+        // The hook binary's path: queued for the terminal, message text dropped.
+        assert!(crate::claude_hooks::record_hook(&db, Some("term-1"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!((rows[0].terminal_id.as_str(), rows[0].signal.as_str()), ("term-1", want.as_str()), "[{fx}]");
+        if let Some(message) = payload["message"].as_str() {
+            assert!(!format!("{rows:?}").contains(message), "[{fx}] message text must not be stored");
+        }
+    }
 }
 
 #[test]
