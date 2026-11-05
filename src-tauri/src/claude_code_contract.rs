@@ -791,20 +791,28 @@ fn hook_payloads_map_to_attention_signals() {
     let rec = recording("2.1.314");
     let tmp = tempfile::NamedTempFile::new().unwrap();
     let db = crate::db::Db::open(tmp.path()).unwrap();
-    for (rel, want) in [
-        ("hooks/notification-permission.json", HookSignal::NeedsPermission),
-        ("hooks/notification-idle.json", HookSignal::NeedsInput),
-        ("hooks/stop.json", HookSignal::Settled),
+    // `kind` is the `--kind` the hook is registered with: one per
+    // `Notification` matcher, none for `Stop`.
+    for (rel, kind, want) in [
+        ("hooks/notification-permission.json", Some("permission"), HookSignal::NeedsPermission),
+        ("hooks/notification-idle.json", Some("input"), HookSignal::NeedsInput),
+        ("hooks/stop.json", None, HookSignal::Settled),
     ] {
         let fx = rec.label(rel);
         let payload = rec.json(rel);
         let session = require_str(&fx, &payload, "session_id");
         require_str(&fx, &payload, "cwd");
-        let event = parse_hook_event(&payload).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
+        let event = parse_hook_event(&payload, kind).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
         assert_eq!(event.signal, want, "[{fx}]");
         assert_eq!(event.session_id.as_deref(), Some(session), "[{fx}]");
+        // Without `--kind` (a hook installed before it), `notification_type` still maps.
+        assert_eq!(parse_hook_event(&payload, None).map(|e| e.signal), Some(want), "[{fx}] without --kind");
+        // With `--kind`, the signal doesn't depend on `notification_type` at all.
+        let mut untyped = payload.clone();
+        untyped.as_object_mut().unwrap().remove("notification_type");
+        assert_eq!(parse_hook_event(&untyped, kind).map(|e| e.signal), Some(want), "[{fx}] without notification_type");
         // The hook binary's path: queued for the terminal, message text dropped.
-        assert!(crate::claude_hooks::record_hook(&db, Some("term-1"), &rec.text(rel)), "[{fx}]");
+        assert!(crate::claude_hooks::record_hook(&db, Some("term-1"), kind, &rec.text(rel)), "[{fx}]");
         let rows = db.drain_hook_signals().unwrap();
         assert_eq!(rows.len(), 1, "[{fx}]");
         assert_eq!((rows[0].terminal_id.as_str(), rows[0].signal.as_str()), ("term-1", want.as_str()), "[{fx}]");

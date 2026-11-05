@@ -20,6 +20,7 @@ import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
+import { claudeWaitReason, claudeWaitingCopy, type ClaudeWaitReason } from "../lib/claudeWaiting";
 import { stageTitle } from "../lib/stageMeta";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 import { StageDots } from "./direct/StageDots";
@@ -47,6 +48,8 @@ type AttentionItem = {
   workspaceId: string;
   missionTitle: string | null;
   flag: "chat" | "terminal";
+  /** For a terminal: what Claude Code is waiting on, when its hooks said. */
+  waiting: ClaudeWaitReason | null;
   at: number;
 };
 /** The board renders a discriminated union so runs and attention surfaces share
@@ -82,6 +85,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
       workspaceId,
       missionTitle: missionByWorkspaceId[workspaceId]?.title ?? null,
       flag: flag.kind,
+      waiting: flag.kind === "terminal" ? claudeWaitReason(flag.reason) : null,
       at: flag.at,
     }));
     const itemSince = (it: BoardItem) => (it.kind === "run" ? runSince(it.run) : it.at);
@@ -281,9 +285,7 @@ function AttentionCard({
   const inState = useTimeInState(new Date(item.at).toISOString());
   const title = item.missionTitle || wsName || "mission";
   const Icon = item.flag === "chat" ? MessageSquare : Terminal;
-  const word = item.flag === "chat" ? "waiting in Talk" : "terminal bell";
-  const brief =
-    item.flag === "chat" ? "A conversation finished — your move." : "A terminal is asking for input.";
+  const { word, brief } = attentionCopy(item);
   const isLongestWaiting = index === 0;
   // Mirror CrewCard's guard: a workspace whose project is closed still shows,
   // but jump-to is disabled — we can't navigate to an unloaded workspace.
@@ -334,6 +336,15 @@ function AttentionCard({
       <span className="block h-4 truncate text-[12px] leading-4 text-octo-sage">{brief}</span>
     </div>
   );
+}
+
+/** An attention card's status word and brief. A terminal whose Claude Code
+ *  hooks said what it waits on gets that copy; a bell or idle ping keeps the
+ *  generic one. */
+export function attentionCopy(item: Pick<AttentionItem, "flag" | "waiting">): { word: string; brief: string } {
+  if (item.flag === "chat") return { word: "waiting in Talk", brief: "A conversation finished — your move." };
+  if (item.waiting) return { word: claudeWaitingCopy(item.waiting), brief: `Claude Code is ${claudeWaitingCopy(item.waiting)}.` };
+  return { word: "terminal bell", brief: "A terminal is asking for input." };
 }
 
 function CrewCard({

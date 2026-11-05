@@ -95,6 +95,7 @@ Current anchors:
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` | Settings › Integrations: the Claude Code card · its installed-CLI version line | `settings/IntegrationsPane.tsx` |
 | `settings-readiness-card` · `settings-readiness-again` | Settings › General: the Readiness card · its "Check again" | `settings/ReadinessCard.tsx` |
+| `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |

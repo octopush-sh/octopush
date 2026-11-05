@@ -287,7 +287,9 @@ fn probe_claude_version() -> Option<String> {
 // In a worktree Octopush created, `Notification` (`permission_prompt`,
 // `idle_prompt`) and `Stop` hooks go into `.claude/settings.local.json`,
 // merged with whatever the user keeps there. Each runs `octopush-mcp hook`,
-// which reads the payload below from stdin.
+// which reads the payload below from stdin. A `Notification` hook also passes
+// `--kind <signal>` for the matcher it is registered under, so the matcher
+// Claude Code fired on decides the signal, not a payload field name.
 
 /// The worktree-local Claude Code settings file the hooks live in.
 pub const LOCAL_SETTINGS_FILE: &str = ".claude/settings.local.json";
@@ -297,7 +299,11 @@ pub const LOCAL_SETTINGS_FILE: &str = ".claude/settings.local.json";
 /// Claude Code drops a settings file whose keys it doesn't know.
 pub const HOOK_MARKER: &str = "--octopush-hook";
 
-const NOTIFICATION_MATCHERS: [&str; 2] = ["permission_prompt", "idle_prompt"];
+/// Precedes the signal a `Notification` hook was registered for.
+pub const HOOK_KIND_FLAG: &str = "--kind";
+
+const NOTIFICATION_MATCHERS: [(&str, HookSignal); 2] =
+    [("permission_prompt", HookSignal::NeedsPermission), ("idle_prompt", HookSignal::NeedsInput)];
 
 /// What a hook payload means for the attention beacon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,14 +344,18 @@ pub struct HookEvent {
     pub cwd: Option<String>,
 }
 
-/// Read a hook's stdin payload. Keyed on `hook_event_name` and, for a
-/// `Notification`, `notification_type`; anything else is `None`.
-pub fn parse_hook_event(payload: &serde_json::Value) -> Option<HookEvent> {
+/// Read a hook's stdin payload. Keyed on `hook_event_name`; for a
+/// `Notification`, the `--kind` the hook was registered with (`kind`) wins,
+/// and only without one is `notification_type` read. Anything else is `None`.
+pub fn parse_hook_event(payload: &serde_json::Value, kind: Option<&str>) -> Option<HookEvent> {
     let signal = match payload.get("hook_event_name")?.as_str()? {
-        "Notification" => match payload.get("notification_type")?.as_str()? {
-            "permission_prompt" => HookSignal::NeedsPermission,
-            "idle_prompt" => HookSignal::NeedsInput,
-            _ => return None,
+        "Notification" => match kind.and_then(HookSignal::parse) {
+            Some(s @ (HookSignal::NeedsPermission | HookSignal::NeedsInput)) => s,
+            _ => match payload.get("notification_type")?.as_str()? {
+                "permission_prompt" => HookSignal::NeedsPermission,
+                "idle_prompt" => HookSignal::NeedsInput,
+                _ => return None,
+            },
         },
         "Stop" => HookSignal::Settled,
         _ => return None,
@@ -354,10 +364,14 @@ pub fn parse_hook_event(payload: &serde_json::Value) -> Option<HookEvent> {
     Some(HookEvent { signal, session_id: text("session_id"), cwd: text("cwd") })
 }
 
-/// The command each hook runs: the quoted `octopush-mcp` path, then the marker.
-pub fn hook_command(hook_bin: &Path) -> String {
+/// The command each hook runs: the quoted `octopush-mcp` path, `--kind` for a
+/// `Notification` matcher, then the marker.
+pub fn hook_command(hook_bin: &Path, kind: Option<HookSignal>) -> String {
     let bin = hook_bin.to_string_lossy().replace('\'', r"'\''");
-    format!("'{bin}' hook {HOOK_MARKER}")
+    match kind {
+        Some(k) => format!("'{bin}' hook {HOOK_KIND_FLAG} {} {HOOK_MARKER}", k.as_str()),
+        None => format!("'{bin}' hook {HOOK_MARKER}"),
+    }
 }
 
 fn is_octopush_hook(hook: &serde_json::Value) -> bool {
@@ -398,22 +412,24 @@ pub fn strip_claude_hooks(mut settings: serde_json::Value) -> serde_json::Value 
     settings
 }
 
-/// `settings` with Octopush's hooks (re)installed for `hook_cmd`, or `None`
+/// `settings` with Octopush's hooks (re)installed for `hook_bin`, or `None`
 /// when its shape isn't one we can merge into (then the file is left alone).
-pub fn merge_claude_hooks(settings: serde_json::Value, hook_cmd: &str) -> Option<serde_json::Value> {
+pub fn merge_claude_hooks(settings: serde_json::Value, hook_bin: &Path) -> Option<serde_json::Value> {
     use serde_json::json;
     let mut settings = strip_claude_hooks(settings);
     let hooks = settings.as_object_mut()?.entry("hooks").or_insert_with(|| json!({}));
     let hooks = hooks.as_object_mut()?;
-    let ours = json!({ "type": "command", "command": hook_cmd, "async": true });
+    let ours = |kind: Option<HookSignal>| {
+        json!({ "type": "command", "command": hook_command(hook_bin, kind), "async": true })
+    };
     let mut add = |event: &str, group: serde_json::Value| -> Option<()> {
         hooks.entry(event).or_insert_with(|| json!([])).as_array_mut()?.push(group);
         Some(())
     };
-    for matcher in NOTIFICATION_MATCHERS {
-        add("Notification", json!({ "matcher": matcher, "hooks": [ours.clone()] }))?;
+    for (matcher, kind) in NOTIFICATION_MATCHERS {
+        add("Notification", json!({ "matcher": matcher, "hooks": [ours(Some(kind))] }))?;
     }
-    add("Stop", json!({ "hooks": [ours] }))?;
+    add("Stop", json!({ "hooks": [ours(None)] }))?;
     Some(settings)
 }
 
@@ -449,7 +465,7 @@ pub fn install_claude_hooks(worktree: &Path, hook_bin: &Path) -> std::io::Result
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e),
     };
-    let Some(next) = merge_claude_hooks(current.clone(), &hook_command(hook_bin)) else {
+    let Some(next) = merge_claude_hooks(current.clone(), hook_bin) else {
         return Ok(false);
     };
     if next != current {
@@ -595,13 +611,20 @@ mod tests {
 
     #[test]
     fn hook_command_quotes_the_binary_and_ends_with_the_marker() {
-        assert_eq!(hook_command(Path::new(BIN)), format!("'{BIN}' hook --octopush-hook"));
-        assert_eq!(hook_command(Path::new("/a b/it's/octopush-mcp")), r"'/a b/it'\''s/octopush-mcp' hook --octopush-hook");
+        assert_eq!(hook_command(Path::new(BIN), None), format!("'{BIN}' hook --octopush-hook"));
+        assert_eq!(
+            hook_command(Path::new(BIN), Some(HookSignal::NeedsPermission)),
+            format!("'{BIN}' hook --kind permission --octopush-hook")
+        );
+        assert_eq!(
+            hook_command(Path::new("/a b/it's/octopush-mcp"), Some(HookSignal::NeedsInput)),
+            r"'/a b/it'\''s/octopush-mcp' hook --kind input --octopush-hook"
+        );
     }
 
     #[test]
     fn merge_into_an_empty_file_registers_three_async_hooks() {
-        let merged = merge_claude_hooks(serde_json::json!({}), &hook_command(Path::new(BIN))).unwrap();
+        let merged = merge_claude_hooks(serde_json::json!({}), Path::new(BIN)).unwrap();
         assert_eq!(our_commands(&merged), [
             ("Notification".to_string(), Some("permission_prompt".to_string())),
             ("Notification".to_string(), Some("idle_prompt".to_string())),
@@ -610,6 +633,11 @@ mod tests {
         let hook = &merged["hooks"]["Stop"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["async"], true);
+        assert_eq!(hook["command"], hook_command(Path::new(BIN), None));
+        // Each matcher passes its own kind, so the matcher decides the signal.
+        let command = |i: usize| merged["hooks"]["Notification"][i]["hooks"][0]["command"].clone();
+        assert_eq!(command(0), hook_command(Path::new(BIN), Some(HookSignal::NeedsPermission)));
+        assert_eq!(command(1), hook_command(Path::new(BIN), Some(HookSignal::NeedsInput)));
     }
 
     #[test]
@@ -621,9 +649,9 @@ mod tests {
                 "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "./guard.sh" }] }]
             }
         });
-        let once = merge_claude_hooks(user.clone(), &hook_command(Path::new("/old/octopush-mcp"))).unwrap();
+        let once = merge_claude_hooks(user.clone(), Path::new("/old/octopush-mcp")).unwrap();
         // Re-installing from a moved app replaces ours instead of adding more.
-        let twice = merge_claude_hooks(once, &hook_command(Path::new(BIN))).unwrap();
+        let twice = merge_claude_hooks(once, Path::new(BIN)).unwrap();
         assert_eq!(our_commands(&twice).len(), 3);
         assert!(!twice.to_string().contains("/old/octopush-mcp"));
         assert_eq!(twice["permissions"], user["permissions"]);
@@ -637,12 +665,17 @@ mod tests {
     fn strip_leaves_a_users_hook_that_shares_a_group_with_ours() {
         let shared = serde_json::json!({ "hooks": { "Stop": [{ "hooks": [
             { "type": "command", "command": "say done" },
-            { "type": "command", "command": hook_command(Path::new(BIN)) }
+            { "type": "command", "command": hook_command(Path::new(BIN), None) }
         ] }] } });
         let stripped = strip_claude_hooks(shared);
         assert_eq!(stripped, serde_json::json!({ "hooks": { "Stop": [{ "hooks": [
             { "type": "command", "command": "say done" }
         ] }] } }));
+        // A `Notification` hook installed before `--kind` (no kind) is still ours.
+        let old = serde_json::json!({ "hooks": { "Notification": [{ "matcher": "idle_prompt", "hooks": [
+            { "type": "command", "command": format!("'{BIN}' hook --octopush-hook") }
+        ] }] } });
+        assert_eq!(strip_claude_hooks(old), serde_json::json!({}));
         // The user's own empty containers are theirs to keep.
         let empty = serde_json::json!({ "hooks": { "Stop": [] } });
         assert_eq!(strip_claude_hooks(empty.clone()), empty);
@@ -650,10 +683,10 @@ mod tests {
 
     #[test]
     fn merge_refuses_shapes_it_cannot_merge_into() {
-        let cmd = hook_command(Path::new(BIN));
-        assert_eq!(merge_claude_hooks(serde_json::json!([]), &cmd), None);
-        assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": "nope" }), &cmd), None);
-        assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": { "Stop": {} } }), &cmd), None);
+        let bin = Path::new(BIN);
+        assert_eq!(merge_claude_hooks(serde_json::json!([]), bin), None);
+        assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": "nope" }), bin), None);
+        assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": { "Stop": {} } }), bin), None);
     }
 
     #[cfg(unix)]
@@ -710,7 +743,7 @@ mod tests {
 
     #[test]
     fn hook_payloads_map_to_signals() {
-        let p = |v: serde_json::Value| parse_hook_event(&v).map(|e| e.signal);
+        let p = |v: serde_json::Value| parse_hook_event(&v, None).map(|e| e.signal);
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt" })), Some(HookSignal::NeedsPermission));
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt" })), Some(HookSignal::NeedsInput));
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Stop" })), Some(HookSignal::Settled));
@@ -721,6 +754,27 @@ mod tests {
         for s in [HookSignal::NeedsPermission, HookSignal::NeedsInput, HookSignal::Settled] {
             assert_eq!(HookSignal::parse(s.as_str()), Some(s));
         }
+    }
+
+    #[test]
+    fn the_hooks_kind_wins_over_the_payloads_notification_type() {
+        let k = |v: serde_json::Value, kind: &str| parse_hook_event(&v, Some(kind)).map(|e| e.signal);
+        let bare = serde_json::json!({ "hook_event_name": "Notification", "session_id": "s1" });
+        // No `notification_type` at all (the field name is not confirmed upstream).
+        assert_eq!(k(bare.clone(), "permission"), Some(HookSignal::NeedsPermission));
+        assert_eq!(k(bare.clone(), "input"), Some(HookSignal::NeedsInput));
+        assert_eq!(parse_hook_event(&bare, Some("input")).unwrap().session_id.as_deref(), Some("s1"));
+        // The matcher Claude Code fired on is authoritative over the field.
+        let idle = serde_json::json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt" });
+        assert_eq!(k(idle.clone(), "permission"), Some(HookSignal::NeedsPermission));
+        // A kind that isn't a notification signal falls back to the field.
+        assert_eq!(k(idle.clone(), "settled"), Some(HookSignal::NeedsInput));
+        assert_eq!(k(idle, "bogus"), Some(HookSignal::NeedsInput));
+        assert_eq!(k(bare, "settled"), None);
+        // `Stop` is `Stop`, whatever kind; other events stay unmapped.
+        assert_eq!(k(serde_json::json!({ "hook_event_name": "Stop" }), "permission"), Some(HookSignal::Settled));
+        assert_eq!(k(serde_json::json!({ "hook_event_name": "PreToolUse" }), "permission"), None);
+        assert_eq!(k(serde_json::json!({}), "permission"), None);
     }
 
     #[test]

@@ -36,3 +36,21 @@ describe("attentionStore — how long a workspace has been waiting", () => {
     expect(useAttentionStore.getState().flagsByWs["ws-a"].since).toBe(42);
   });
 });
+
+describe("attentionStore — why a terminal wants you", () => {
+  beforeEach(() => {
+    useAttentionStore.setState({ flagsByWs: {}, lastChimeAt: 0, soundEnabled: false });
+  });
+
+  it("keeps the reason of the latest ping, and none for a bell or a chat", () => {
+    const { ping } = useAttentionStore.getState();
+    ping("ws-a", "terminal", "t1", "permission");
+    expect(useAttentionStore.getState().flagsByWs["ws-a"].reason).toBe("permission");
+    ping("ws-a", "terminal", "t1", "input");
+    expect(useAttentionStore.getState().flagsByWs["ws-a"].reason).toBe("input");
+    ping("ws-a", "terminal", "t1");
+    expect(useAttentionStore.getState().flagsByWs["ws-a"].reason).toBeNull();
+    ping("ws-b", "chat");
+    expect(useAttentionStore.getState().flagsByWs["ws-b"].reason).toBeNull();
+  });
+});

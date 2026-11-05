@@ -246,11 +246,19 @@ export interface PtyReattachedEvent {
   sessionId: string;
 }
 
+/** Why a terminal wants the user: `idle` from the daemon's heuristic, or from
+ *  Claude Code's own hooks (#287) `permission` (a tool use to approve) or
+ *  `input` (it finished and is waiting on you). */
+export type PtyAttentionReason = "idle" | "permission" | "input";
+
 /** Payload of the `pty://attention` Tauri event. Emitted by the
  *  daemon when a session has been idle long enough after a
- *  meaningful burst of output to count as "waiting on the user". */
+ *  meaningful burst of output to count as "waiting on the user", and
+ *  by the Claude Code hook poller. */
 export interface PtyAttentionEvent {
   sessionId: string;
+  /** Absent only from a daemon older than the field. */
+  reason?: PtyAttentionReason;
 }
 
 /** Payload of the `pty://foreground` Tauri event. Emitted when the PTY's
@@ -502,7 +510,7 @@ export interface AppSettings {
    *  answer with what it has. Unset/null → **no limit**. */
   talkMaxIterations?: number | null;
   /** Run-mode attention from Claude Code's lifecycle hooks instead of the
-   *  terminal bell (#287). Unset/null → off. */
+   *  terminal bell (#287). Unset/null → **on**; only `false` turns it off. */
   claudeHooksEnabled?: boolean | null;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's

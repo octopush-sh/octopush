@@ -83,13 +83,49 @@ export function GeneralPane() {
           />
           <ToggleRow
             label="Notify when a crew needs you"
-            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused. So a fleet can work unattended."
+            description="A native notification when a crew needs a decision (gate, halt, budget) — always — or finishes while Octopush isn't focused, and when Claude Code in a terminal you can't see waits on permission or your input. So a fleet can work unattended."
             checked={crewNotifications}
             onChange={setCrewNotifications}
           />
+          <ClaudeHooksRow />
         </div>
       </div>
     </>
+  );
+}
+
+/** `claudeHooksEnabled` — **on unless saved as `false`** (#287). Read-modify-
+ *  write on `settings.json` so the other fields aren't clobbered. */
+function ClaudeHooksRow() {
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    ipc
+      .getSettings()
+      .then((s) => setEnabled(s.claudeHooksEnabled ?? true))
+      .catch(() => {});
+  }, []);
+
+  async function persist(on: boolean) {
+    setEnabled(on);
+    try {
+      const s = await ipc.getSettings();
+      await ipc.saveSettings({ ...s, claudeHooksEnabled: on });
+    } catch {
+      // Leave the switch where the user put it; the next change retries.
+    }
+  }
+
+  return (
+    <div data-tour="settings-claude-hooks">
+      <ToggleRow
+        label="Let Claude Code say what it's waiting on"
+        description="Octopush adds hook entries to the workspace's .claude/settings.local.json and keeps that file out of git."
+        checked={enabled}
+        onChange={(on) => void persist(on)}
+        testId="claude-hooks-switch"
+      />
+    </div>
   );
 }
 
