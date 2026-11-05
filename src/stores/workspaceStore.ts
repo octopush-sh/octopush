@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
 import { useTerminalsStore } from "./terminalsStore";
+import { useTerminalLayoutStore } from "./terminalLayoutStore";
 import { pushToast } from "../components/Toasts";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
 
@@ -263,6 +264,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   remove: async (workspaceId, projectPath, branch, worktreePath) => {
     await ipc.deleteWorkspace(workspaceId, projectPath, branch, worktreePath);
+    // Its sessions are gone with it: so are its Run and Talk layouts.
+    useTerminalLayoutStore.getState().forgetWorkspace(workspaceId);
     set((s) => {
       // Drop the workspace from every project's group too — the rail renders
       // from `workspacesByProjectId`, so leaving a stale entry there keeps the

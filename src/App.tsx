@@ -26,6 +26,7 @@ import { ProjectPickerModal } from "./components/ProjectPickerModal";
 import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
 import { EmptyProjectState } from "./components/EmptyProjectState";
 import { ChatView } from "./components/ChatView";
+import { TalkSeat } from "./components/chat/TalkSeat";
 import { ReviewSidebar } from "./components/ReviewSidebar";
 import { EditorWithPreview } from "./components/editor/EditorWithPreview";
 import { EditorTabs } from "./components/EditorTabs";
@@ -77,6 +78,7 @@ import { useThemeStore } from "./stores/themeStore";
 import { useTokenStore } from "./stores/tokenStore";
 import { useTerminalsStore, type TerminalState } from "./stores/terminalsStore";
 import { focus as focusPane, useTerminalLayoutStore } from "./stores/terminalLayoutStore";
+import { useTerminalSlotsStore } from "./stores/terminalSlotsStore";
 import { useChatStore } from "./stores/chatStore";
 import { useRunsStore } from "./stores/runsStore";
 import { usePipelineStore } from "./stores/pipelineStore";
@@ -93,6 +95,7 @@ import { resolveMonogram } from "./lib/monogram";
 import { type WorkspaceMode } from "./lib/modes";
 import { useGlobalShortcuts, type ShortcutContext } from "./hooks/useGlobalShortcuts";
 import { useCompanionFold } from "./hooks/useCompanionFold";
+import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -706,8 +709,24 @@ function App() {
   const runPaneCount = useTerminalLayoutStore((s) =>
     activeWorkspaceId ? (s.runByWs[activeWorkspaceId]?.slots.length ?? 1) : 1,
   );
-  const panesFold = activeMode === "run" && runPaneCount > 1;
+  // Talk's terminal seat folds it the same way.
+  const talkSeatOpen = useTerminalLayoutStore((s) =>
+    activeWorkspaceId ? (s.talkByWs[activeWorkspaceId]?.open ?? false) : false,
+  );
+  const talkSeatFocused = useTerminalLayoutStore((s) =>
+    activeWorkspaceId ? (s.talkFocusedByWs[activeWorkspaceId] ?? false) : false,
+  );
+  // The seat keeps its slot through its closing glide; the host keeps
+  // drawing Talk until the slot goes.
+  const talkSlotShown = useTerminalSlotsStore((s) =>
+    Object.values(s.slots).some((slot) => slot.mode === "talk"),
+  );
+  const panesFold = (activeMode === "run" && runPaneCount > 1) || (activeMode === "talk" && talkSeatOpen);
   const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
+  // A mode switch that glides the Companion to or from its strip holds every
+  // PTY's size until the glide ends: one resize per visible session.
+  const companionStrip = isCompanionCollapsed || panesFold;
+  const onCompanionGlideEnd = useFoldSettle(activeMode, companionStrip);
   const toggleCompanionFold = companionFold.toggle;
   const toggleCompanion = useCallback(() => {
     toggleCompanionFold();
@@ -1000,6 +1019,14 @@ function App() {
         else if (action === "seat") store.openBeside(activeWorkspaceId, null);
         return action !== null;
       },
+      // Talk's seat: open or close it (terminalsStore.toggleTalkSeat);
+      // an empty seat opens with the pairing switcher.
+      toggleTalkSeat: () => {
+        if (!activeWorkspaceId) return false;
+        const result = useTerminalsStore.getState().toggleTalkSeat(activeWorkspaceId);
+        if (result === "pick") setSessionSwitcher("talk");
+        return result !== null;
+      },
       terminalIds: () =>
         activeWorkspaceId
           ? useTerminalsStore.getState().getTerminals(activeWorkspaceId).map((t) => t.id)
@@ -1190,18 +1217,22 @@ function App() {
   // also the only mode whose tail reads it.
   // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too;
   // "pair" is its Open beside mode (⌘D, the rail flyout, an empty seat).
-  const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | null>(null);
+  // "talk" is the same pairing, for Talk's seat.
+  const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | "talk" | null>(null);
   const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
-  // The `run/open-beside` tour surface: Open beside exactly as ⌘D does it,
-  // in Run only.
+  // The `run/open-beside` tour surface: the pairing switcher, in Run only.
+  // Only the "pair" action: a tour runs on the user's real data, and an empty
+  // seat it left behind would stay open after it.
   useEffect(() => {
     const onNavigate = (e: Event) => {
       const d = (e as CustomEvent<NavigateDetail>).detail;
-      if (d?.kind === "open-beside" && shortcutCtx.mode() === "run") openBeside();
+      if (d?.kind !== "open-beside" || shortcutCtx.mode() !== "run") return;
+      if (!activeWorkspaceId || isModalOpen()) return;
+      if (useTerminalsStore.getState().besideAction(activeWorkspaceId) === "pair") setSessionSwitcher("pair");
     };
     window.addEventListener(NAVIGATE_EVENT, onNavigate);
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
-  }, [openBeside, shortcutCtx]);
+  }, [activeWorkspaceId, shortcutCtx]);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
   const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
   const modeMetaText = useMemo(
@@ -2115,13 +2146,19 @@ function App() {
                     shows an inline "Try again" card, and the others keep working. */}
                 <ErrorBoundary surface="Talk" resetKey={activeWorkspaceId}>
                 {activeWorkspace && (
-                  <ChatView
-                    workspaceId={activeChatId!}
-                    workspacePath={activeWorkspace.worktreePath || project.path}
-                    onOpenSettings={() => setSettingsTab("general")}
-                    onOpenInEditor={(p) => navigateToFile(p, "editor")}
-                    onRunInTerminal={handleRunInTerminal}
-                  />
+                  <TalkSeat
+                    workspaceId={activeWorkspace.id}
+                    onToggle={() => void shortcutCtx.toggleTalkSeat()}
+                    onPick={() => setSessionSwitcher("talk")}
+                  >
+                    <ChatView
+                      workspaceId={activeChatId!}
+                      workspacePath={activeWorkspace.worktreePath || project.path}
+                      onOpenSettings={() => setSettingsTab("general")}
+                      onOpenInEditor={(p) => navigateToFile(p, "editor")}
+                      onRunInTerminal={handleRunInTerminal}
+                    />
+                  </TalkSeat>
                 )}
                 {/* One-shot first-run invite — floats over the Talk canvas
                     (where every new user lands); eligibility gated inside. */}
@@ -2265,11 +2302,25 @@ function App() {
                   panes, but their PTYs live in the daemon and reattach when
                   Try again remounts them. */}
               <TerminalHost
-                mode={activeWorkspace && activeMode === "run" ? "run" : null}
+                mode={
+                  !activeWorkspace
+                    ? null
+                    : activeMode === "run"
+                      ? "run"
+                      : activeMode === "talk" && (talkSeatOpen || talkSlotShown)
+                        ? "talk"
+                        : null
+                }
                 terminalIds={allTerminalIds}
                 onPaneFocus={(id) => {
+                  // Focus in Talk's seat is Talk's own: never `activeByWs`.
                   const t = allTerminalRefs.get(id);
-                  if (t) setActiveTerminal(t.workspaceId, id);
+                  if (!t) return;
+                  if (activeMode === "talk") {
+                    useTerminalLayoutStore.getState().setTalkFocused(t.workspaceId, true);
+                    return;
+                  }
+                  setActiveTerminal(t.workspaceId, id);
                 }}
                 renderPane={(id, shown) => {
                   const t = allTerminalRefs.get(id);
@@ -2283,7 +2334,7 @@ function App() {
                       workspaceName={ws?.name}
                       label={t.label}
                       shown={shown}
-                      focused={shown && t.id === activeTerminalId}
+                      focused={shown && (activeMode === "talk" ? talkSeatFocused : t.id === activeTerminalId)}
                       layoutVersion={layoutVersion}
                       onSpawn={() => markRunning(t.workspaceId, t.id, true)}
                       onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
@@ -2383,8 +2434,9 @@ function App() {
       <div
         className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
         style={{
-          width: isCompanionCollapsed || panesFold ? COMPANION_COLLAPSED_WIDTH : companionWidth,
+          width: companionStrip ? COMPANION_COLLAPSED_WIDTH : companionWidth,
         }}
+        onTransitionEnd={onCompanionGlideEnd}
       >
           {/* The resize handle only makes sense when expanded in place. */}
           {!isCompanionCollapsed && !panesFold && (
@@ -2495,7 +2547,8 @@ function App() {
         <ErrorBoundary surface="Session switcher" variant="overlay" onDismiss={() => setSessionSwitcher(null)}>
         <SessionSwitcher
           workspaceId={activeWorkspaceId}
-          pairing={sessionSwitcher === "pair"}
+          pairing={sessionSwitcher !== "switch"}
+          talk={sessionSwitcher === "talk"}
           onClose={() => setSessionSwitcher(null)}
         />
         </ErrorBoundary>
@@ -3024,7 +3077,7 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
         Start a new terminal.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
-        A terminal opens in the workspace's worktree directory. You can keep multiple terminals open and switch via the Companion panel.
+        A terminal opens in the workspace's worktree directory. You can keep several sessions open, switch from the rail, or open them side by side.
       </p>
       <button
         type="button"

@@ -132,6 +132,21 @@ describe("workspaceStore — remove", () => {
     // Active untouched — we deleted a different project's workspace.
     expect(s.activeId).toBe(a.id);
   });
+
+  it("forgets the deleted workspace's Run and Talk layouts and its MRU", async () => {
+    const { useTerminalLayoutStore } = await import("./terminalLayoutStore");
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.setState({ workspaces: [a], activeId: a.id, workspacesByProjectId: { "proj-1": [a] } });
+    const l = useTerminalLayoutStore.getState();
+    l.commitRun(a.id, { slots: ["t1"], orientation: "auto", ratios: [], focused: 0 });
+    l.seatTalkSession(a.id, "t1");
+    mockIpc.deleteWorkspace.mockResolvedValueOnce(undefined);
+
+    await useWorkspaceStore.getState().remove(a.id, "/repo", a.branch, a.worktreePath);
+
+    const after = useTerminalLayoutStore.getState();
+    expect([after.runByWs[a.id], after.mruByWs[a.id], after.talkByWs[a.id]]).toEqual([undefined, undefined, undefined]);
+  });
 });
 
 describe("workspaceStore — load activation", () => {

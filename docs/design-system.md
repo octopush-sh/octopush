@@ -103,6 +103,7 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 
 - **Spacing scale (base 4):** `4 · 8 · 12 · 16 · 24 · 32 · 48`. Default gaps: 12 / 16 / 24. Premium breath: 24 / 32.
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
+- **Layout minimums (Talk's terminal seat):** `--talk-chat-min: 44rem` (the conversation keeps the composer at its natural width), `--talk-seat-min: 21rem` (about 40 terminal columns), `--talk-chat-floor: 18rem` (the narrowest the conversation goes, its composer bar wrapped). Mirrored in `tokens.ts` as `talkSeat`.
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
 - **Brass rule: fully deleted (2026-07-11).** The 28px gradient divider (`linear-gradient(90deg, var(--brass), transparent)`), `.animate-brass-grow`, and `@keyframes brassgrow` are **removed from the codebase**, not just retired-for-new-surfaces — there is no legacy allowance left; `grep -rn "linear-gradient" src` returns only non-divider uses (a repeating-stripe running-bar texture, a scrim fade behind tool output, and `mask-image` edge-fades — none of them a rule/line). Use `--hairline` borders or spacing for visual separation; use the solid `--brass-line` token where an *active* connector is needed (see §6, §8).
 

@@ -13,6 +13,9 @@ interface Props {
   /** Pairing mode (Open beside): lists only the sessions not on screen and
    *  puts the pick beside the panes instead of switching the focused one. */
   pairing?: boolean;
+  /** Pairing for Talk's seat: lists every session but the seat's own, and a
+   *  pick goes in the seat. Run's layout and focus are never touched. */
+  talk?: boolean;
 }
 
 /**
@@ -32,28 +35,37 @@ interface Props {
  * Design records: docs/superpowers/plans/2026-08-15-run-terminal-navigation-design.md,
  * docs/superpowers/specs/2026-11-03-run-session-pair-design.md
  */
-export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props) {
+export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = false, talk = false }: Props) {
+  const pairing = pairingProp || talk;
   const allTerminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
-  const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
+  const runActiveId = useTerminalsStore((s) => s.getActiveId(workspaceId));
+  const seatId = useTerminalLayoutStore((s) => s.talkByWs[workspaceId]?.terminalId ?? null);
+  const seatTalkSession = useTerminalLayoutStore((s) => s.seatTalkSession);
+  // "here" is the session in the place the pick goes.
+  const activeId = talk ? seatId : runActiveId;
   const setActive = useTerminalsStore((s) => s.setActive);
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const createBeside = useTerminalsStore((s) => s.createBeside);
+  const createInTalkSeat = useTerminalsStore((s) => s.createInTalkSeat);
   const openBeside = useTerminalsStore((s) => s.openBeside);
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   // With no room left, a beside pick (⏎ when pairing, ⌥⏎ when switching)
   // replaces the focused pane's session.
-  const replaces = !!layout && besideReplaces(layout, RUN_PANES);
+  const replaces = !talk && !!layout && besideReplaces(layout, RUN_PANES);
   const full = replaces;
   // A new session never lands in the focused pane from here (spec): when Run
   // is full, pairing mode drops the "Open a new session beside" row.
   const showNew = !(pairing && full);
+  // Talk's seat may hold a session Run also shows (only one mode is visible).
   const terminals = useMemo(
     () =>
-      pairing
-        ? allTerminals.filter((t) => !(layout?.slots ?? [activeId]).includes(t.id))
-        : allTerminals,
-    [allTerminals, pairing, layout, activeId],
+      talk
+        ? allTerminals.filter((t) => t.id !== seatId)
+        : pairing
+          ? allTerminals.filter((t) => !(layout?.slots ?? [runActiveId]).includes(t.id))
+          : allTerminals,
+    [allTerminals, pairing, talk, seatId, layout, runActiveId],
   );
 
   const [query, setQuery] = useState("");
@@ -82,6 +94,14 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
 
   /** Open row `index`: beside the panes, or (switching) in the focused one. */
   const choose = (index: number, beside = pairing) => {
+    if (talk) {
+      const row = matches[index];
+      if (row) seatTalkSession(workspaceId, row.t.id);
+      else if (index === matches.length) createInTalkSeat(workspaceId).catch(console.error);
+      else return;
+      onClose();
+      return;
+    }
     if (showNew && index === matches.length) {
       (beside && !full ? createBeside(workspaceId) : createTerminal(workspaceId)).catch(console.error);
       onClose();
@@ -136,7 +156,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
           <input
             autoFocus
             data-testid="session-switcher-input"
-            data-tour={pairing ? tourId("run-pair-input") : undefined}
+            data-tour={pairing && !talk ? tourId("run-pair-input") : undefined}
             value={query}
             onChange={(e) => {
               setQuery(e.target.value);
@@ -175,7 +195,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing = false }: Props
                 type="button"
                 role="option"
                 data-testid={`session-switcher-row-${t.id}`}
-                data-tour={pairing && i === 0 ? tourId("run-pair-pick") : undefined}
+                data-tour={pairing && !talk && i === 0 ? tourId("run-pair-pick") : undefined}
                 aria-selected={i === selected}
                 onMouseEnter={() => setSel(i)}
                 onClick={() => choose(i)}

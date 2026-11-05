@@ -4,7 +4,8 @@ import { create } from "zustand";
 // (docs/superpowers/specs/2026-11-03-run-session-pair-design.md). The reducers
 // below are pure; `terminalsStore.updateLayout` is the one path that commits a
 // layout, so `activeByWs` (the focused slot's session) can never drift from it.
-// In memory only for now.
+// Run and Talk layouts persist in localStorage; deleted sessions are pruned on
+// load (`terminalsStore.loadTerminals`) and on delete (`forget`).
 
 /** Most panes Run shows at once (a 2×2 grid). */
 export const MAX_SLOTS = 4;
@@ -272,9 +273,124 @@ export function touchMru(mru: string[], id: string): string[] {
   return mru[0] === id ? mru : [id, ...mru.filter((x) => x !== id)];
 }
 
+// ─── Talk's seat ──────────────────────────────────────────────────
+
+/** Talk's one terminal beside the conversation. It has no focus of its own
+ *  in Run's sense: nothing here ever changes `activeByWs`. */
+export interface TalkSeat {
+  /** The session in the seat, or null (an empty seat). */
+  terminalId: string | null;
+  /** The seat's share of the canvas width, 0.2–0.8. */
+  width: number;
+  open: boolean;
+}
+
+export const EMPTY_TALK_SEAT: TalkSeat = { terminalId: null, width: 0.5, open: false };
+
+/** True while every PTY's size is held: a divider drag or a fold settling. */
+export const ptySizeHeld = (s: { resizing: boolean; settling: boolean }) => s.resizing || s.settling;
+
+const clampRatio = (r: number) => Math.max(RATIO_MIN, Math.min(RATIO_MAX, r));
+
+/** Open the seat, or close it. Closing keeps its session for next time. */
+export function toggleTalk(seat: TalkSeat): TalkSeat {
+  return { ...seat, open: !seat.open };
+}
+
+/** Put `id` in the seat and open it. */
+export function seatTalk(seat: TalkSeat, id: string | null): TalkSeat {
+  return seat.open && seat.terminalId === id ? seat : { ...seat, terminalId: id, open: true };
+}
+
+export function setTalkWidth(seat: TalkSeat, width: number): TalkSeat {
+  return Number.isFinite(width) ? { ...seat, width: clampRatio(width) } : seat;
+}
+
+/** Empty the seat when its session no longer exists. */
+export function pruneTalk(seat: TalkSeat, exists: (id: string) => boolean): TalkSeat {
+  return seat.terminalId !== null && !exists(seat.terminalId) ? { ...seat, terminalId: null } : seat;
+}
+
+// ─── Persistence ──────────────────────────────────────────────────
+
+export const LAYOUTS_KEY = "octopush.terminalLayouts";
+
+interface Persisted {
+  run: Record<string, RunLayout>;
+  talk: Record<string, TalkSeat>;
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** A stored Run layout, or null when it isn't one (a session twice, a bad
+ *  count): a layout that breaks the one-pane-per-session rule is dropped. */
+function readRun(v: unknown): RunLayout | null {
+  if (!isRecord(v) || !Array.isArray(v.slots)) return null;
+  const slots = v.slots as unknown[];
+  if (slots.length < 1 || slots.length > MAX_SLOTS) return null;
+  if (!slots.every((s) => s === null || typeof s === "string")) return null;
+  const ids = slots.filter((s) => s !== null);
+  // At most one empty seat.
+  if (new Set(ids).size !== ids.length || slots.length - ids.length > 1) return null;
+  const orientation: Orientation =
+    v.orientation === "side" || v.orientation === "stacked" ? v.orientation : "auto";
+  const base: RunLayout = {
+    slots: slots as (string | null)[],
+    orientation,
+    ratios: evenRatios(slots.length),
+    focused: clampIndex(Number.isInteger(v.focused) ? (v.focused as number) : 0, slots.length),
+  };
+  return Array.isArray(v.ratios) ? setRatios(base, v.ratios as number[]) : base;
+}
+
+function readTalk(v: unknown): TalkSeat | null {
+  if (!isRecord(v)) return null;
+  return setTalkWidth(
+    {
+      terminalId: typeof v.terminalId === "string" ? v.terminalId : null,
+      width: EMPTY_TALK_SEAT.width,
+      open: v.open === true,
+    },
+    typeof v.width === "number" ? v.width : EMPTY_TALK_SEAT.width,
+  );
+}
+
+/** The layouts in a stored value, keeping only the well-formed ones. Pure. */
+export function readLayouts(raw: unknown): Persisted {
+  const out: Persisted = { run: {}, talk: {} };
+  if (!isRecord(raw)) return out;
+  for (const [key, read] of [["run", readRun], ["talk", readTalk]] as const) {
+    const byWs = raw[key];
+    if (!isRecord(byWs)) continue;
+    for (const [ws, v] of Object.entries(byWs)) {
+      const layout = read(v);
+      if (layout) (out[key] as Record<string, unknown>)[ws] = layout;
+    }
+  }
+  return out;
+}
+
+function loadLayouts(): Persisted {
+  try {
+    return readLayouts(JSON.parse(localStorage.getItem(LAYOUTS_KEY) ?? "null"));
+  } catch {
+    return { run: {}, talk: {} };
+  }
+}
+
+function saveLayouts(layouts: Persisted) {
+  try {
+    localStorage.setItem(LAYOUTS_KEY, JSON.stringify(layouts));
+  } catch (err) {
+    console.error("Failed to persist terminal layouts:", err);
+  }
+}
+
 // ─── Store ────────────────────────────────────────────────────────
 
 const EMPTY_MRU: string[] = [];
+const stored = loadLayouts();
 
 interface TerminalLayoutStore {
   runByWs: Record<string, RunLayout>;
@@ -283,6 +399,10 @@ interface TerminalLayoutStore {
   /** True while a divider is being dragged: panes refit on animation frames
    *  and only tell the PTY their size on pointer-up. */
   resizing: boolean;
+  /** True while a mode switch's Companion fold glides (`useFoldSettle`):
+   *  like `resizing`, panes refit on frames and tell the PTY their size once,
+   *  when it settles. Separate from `resizing`, which also stills the glides. */
+  settling: boolean;
 
   getRun: (workspaceId: string) => RunLayout;
   getMru: (workspaceId: string) => string[];
@@ -290,17 +410,59 @@ interface TerminalLayoutStore {
   recentNotShown: (workspaceId: string, exists: (id: string) => boolean) => string | null;
   /** Commit a layout. Called only by `terminalsStore.updateLayout`. */
   commitRun: (workspaceId: string, layout: RunLayout) => void;
-  /** Forget a deleted session's MRU entry. */
+  /** Forget a deleted session: its MRU entry, and Talk's seat if it held it. */
   forget: (workspaceId: string, id: string) => void;
+  /** Forget a deleted workspace's layouts and MRU. */
+  forgetWorkspace: (workspaceId: string) => void;
   setResizing: (resizing: boolean) => void;
+  setSettling: (settling: boolean) => void;
+
+  talkByWs: Record<string, TalkSeat>;
+  /** Per workspace, true while Talk's seat holds keyboard focus (the user
+   *  clicked into it or just picked its session); the conversation taking
+   *  focus, or the seat closing, clears it. Separate from Run's focused slot,
+   *  and never written to `activeByWs`. */
+  talkFocusedByWs: Record<string, boolean>;
+  getTalk: (workspaceId: string) => TalkSeat;
+  /** Change a seat. A seat that closes gives up keyboard focus. */
+  updateTalk: (workspaceId: string, fn: (seat: TalkSeat) => TalkSeat) => void;
+  /** Put `id` in Talk's seat, open it and give it keyboard focus. */
+  seatTalkSession: (workspaceId: string, id: string) => void;
+  setTalkFocused: (workspaceId: string, focused: boolean) => void;
 }
 
 export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => ({
-  runByWs: {},
+  runByWs: stored.run,
   mruByWs: {},
   resizing: false,
+  settling: false,
+  talkByWs: stored.talk,
+  talkFocusedByWs: {},
 
   getRun: (workspaceId) => get().runByWs[workspaceId] ?? EMPTY_RUN_LAYOUT,
+
+  getTalk: (workspaceId) => get().talkByWs[workspaceId] ?? EMPTY_TALK_SEAT,
+
+  updateTalk: (workspaceId, fn) => {
+    set((s) => {
+      const prev = s.talkByWs[workspaceId] ?? EMPTY_TALK_SEAT;
+      const next = fn(prev);
+      return next === prev ? s : { talkByWs: { ...s.talkByWs, [workspaceId]: next } };
+    });
+    if (!get().getTalk(workspaceId).open) get().setTalkFocused(workspaceId, false);
+  },
+
+  seatTalkSession: (workspaceId, id) => {
+    get().updateTalk(workspaceId, (seat) => seatTalk(seat, id));
+    get().setTalkFocused(workspaceId, true);
+  },
+
+  setTalkFocused: (workspaceId, focused) =>
+    set((s) =>
+      (s.talkFocusedByWs[workspaceId] ?? false) === focused
+        ? s
+        : { talkFocusedByWs: { ...s.talkFocusedByWs, [workspaceId]: focused } },
+    ),
 
   getMru: (workspaceId) => get().mruByWs[workspaceId] ?? EMPTY_MRU,
 
@@ -321,12 +483,31 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
       };
     }),
 
-  forget: (workspaceId, id) =>
+  forget: (workspaceId, id) => {
     set((s) => {
       const mru = s.mruByWs[workspaceId];
       if (!mru?.includes(id)) return s;
       return { mruByWs: { ...s.mruByWs, [workspaceId]: mru.filter((x) => x !== id) } };
+    });
+    get().updateTalk(workspaceId, (seat) => pruneTalk(seat, (x) => x !== id));
+  },
+
+  forgetWorkspace: (workspaceId) =>
+    set((s) => {
+      const { [workspaceId]: _run, ...runByWs } = s.runByWs;
+      const { [workspaceId]: _mru, ...mruByWs } = s.mruByWs;
+      const { [workspaceId]: _talk, ...talkByWs } = s.talkByWs;
+      const { [workspaceId]: _focused, ...talkFocusedByWs } = s.talkFocusedByWs;
+      return { runByWs, mruByWs, talkByWs, talkFocusedByWs };
     }),
 
   setResizing: (resizing) => set((s) => (s.resizing === resizing ? s : { resizing })),
+  setSettling: (settling) => set((s) => (s.settling === settling ? s : { settling })),
 }));
+
+// Every layout change is written through: a restart reopens the same panes.
+useTerminalLayoutStore.subscribe((s, prev) => {
+  if (s.runByWs !== prev.runByWs || s.talkByWs !== prev.talkByWs) {
+    saveLayouts({ run: s.runByWs, talk: s.talkByWs });
+  }
+});

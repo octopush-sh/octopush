@@ -52,6 +52,7 @@ function ctx(over: Partial<ShortcutContext> & { modeNow?: WorkspaceMode } = {}):
     openSettings: vi.fn(),
     toggleSessionSwitcher: vi.fn(),
     openBeside: vi.fn(() => true),
+    toggleTalkSeat: vi.fn(() => true),
     terminalIds: () => ["t1", "t2", "t3"],
     shownTerminalIds: () => ["t1"],
     activeTerminalId: () => "t1",
@@ -280,11 +281,12 @@ describe("handleShortcut", () => {
       expect(both.setActiveTerminal).not.toHaveBeenCalled();
     });
 
-    it("⌘D opens beside in Run by physical key, and leaves the key alone elsewhere", () => {
+    it("⌘D opens beside in Run and toggles the seat in Talk, by physical key, and leaves the key alone elsewhere", () => {
       const c = ctx({ modeNow: "run" });
       const e = press({ key: "d", code: "KeyD" });
       handleShortcut(e, c);
       expect(c.openBeside).toHaveBeenCalledTimes(1);
+      expect(c.toggleTalkSeat).not.toHaveBeenCalled();
       expect(e.preventDefault).toHaveBeenCalled();
       // ⌘⇧D stays Direct.
       expect(idOf({ key: "D", code: "KeyD", shift: true })).toBe("mode-direct");
@@ -292,8 +294,18 @@ describe("handleShortcut", () => {
       const talk = ctx({ modeNow: "talk" });
       const t = press({ key: "d", code: "KeyD" });
       handleShortcut(t, talk);
+      expect(talk.toggleTalkSeat).toHaveBeenCalledTimes(1);
       expect(talk.openBeside).not.toHaveBeenCalled();
-      expect(t.preventDefault).not.toHaveBeenCalled();
+      expect(t.preventDefault).toHaveBeenCalled();
+
+      for (const modeNow of ["review", "direct"] as const) {
+        const other = ctx({ modeNow });
+        const o = press({ key: "d", code: "KeyD" });
+        handleShortcut(o, other);
+        expect(other.openBeside).not.toHaveBeenCalled();
+        expect(other.toggleTalkSeat).not.toHaveBeenCalled();
+        expect(o.preventDefault).not.toHaveBeenCalled();
+      }
 
       // Nothing to open beside: the key is left alone.
       const none = ctx({ modeNow: "run", openBeside: vi.fn(() => false) });
