@@ -438,15 +438,16 @@ fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// Whether the hooks file can be written without leaving the worktree: none
-/// of `<worktree>/.claude`, the settings file or its temp sibling may be a
-/// symlink. A repo that commits `.claude` as a link (to `~/.claude`, say)
-/// would otherwise have the install write — and the removal delete — a file
-/// outside the worktree.
+/// Whether the hooks file can be written without leaving the worktree:
+/// neither `<worktree>/.claude` nor the settings file may be a symlink. A repo
+/// that commits `.claude` as a link (to `~/.claude`, say) would otherwise have
+/// the install write — and the removal delete — a file outside the worktree.
+/// The temp sibling is created fresh (see [`write_settings`]), never through a
+/// link.
 fn local_settings_in_worktree(worktree: &Path) -> bool {
     let path = worktree.join(LOCAL_SETTINGS_FILE);
     let dir_ok = path.parent().is_none_or(|d| !is_symlink(d));
-    dir_ok && !is_symlink(&path) && !is_symlink(&path.with_extension("json.octopush-tmp"))
+    dir_ok && !is_symlink(&path)
 }
 
 /// Install the hooks into `<worktree>/.claude/settings.local.json`. A missing
@@ -500,15 +501,28 @@ pub fn remove_claude_hooks(worktree: &Path) -> std::io::Result<()> {
 }
 
 /// Write via a sibling temp file + rename, so Claude Code never reads half a file.
+/// Each write gets its own temp name, created new (an existing path or link
+/// there fails it), so two writes never share or clobber one temp file.
 fn write_settings(path: &Path, value: &serde_json::Value) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WRITES: AtomicU64 = AtomicU64::new(0);
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let mut text = serde_json::to_string_pretty(value).map_err(std::io::Error::other)?;
     text.push('\n');
-    let tmp = path.with_extension("json.octopush-tmp");
-    std::fs::write(&tmp, text)?;
-    std::fs::rename(&tmp, path)
+    let n = WRITES.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("json.octopush-tmp-{}-{n}", std::process::id()));
+    // Not ours to clean up when it couldn't be created.
+    let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+    let written = file.write_all(text.as_bytes());
+    drop(file);
+    if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
 }
 
 /// Run `cmd` to completion and return its stdout, or `None` when it can't
@@ -711,6 +725,31 @@ mod tests {
         remove_claude_hooks(wt.path()).unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
         assert!(outside.path().read_dir().unwrap().count() == 1, "nothing else written outside");
+    }
+
+    #[test]
+    fn each_write_uses_its_own_temp_file_and_leaves_none_behind() {
+        let wt = tempfile::tempdir().unwrap();
+        let file = wt.path().join(LOCAL_SETTINGS_FILE);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        // A leftover from the old fixed temp name doesn't block or get written.
+        let old_tmp = file.with_extension("json.octopush-tmp");
+        std::fs::write(&old_tmp, "stale").unwrap();
+        let user = serde_json::json!({ "permissions": { "deny": ["Read(.env)"] } });
+        std::fs::write(&file, user.to_string()).unwrap();
+
+        assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
+        assert!(install_claude_hooks(wt.path(), Path::new("/moved/octopush-mcp")).unwrap());
+        remove_claude_hooks(wt.path()).unwrap();
+        let mut names: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["settings.local.json", "settings.local.json.octopush-tmp"]);
+        assert_eq!(std::fs::read_to_string(&old_tmp).unwrap(), "stale");
+        let back: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(back, user);
     }
 
     #[test]

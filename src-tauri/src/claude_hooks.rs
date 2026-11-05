@@ -19,6 +19,7 @@
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -109,17 +110,58 @@ pub fn toggled(before: Option<bool>, after: Option<bool>) -> bool {
     enabled_from(before) != enabled_from(after)
 }
 
-/// Bring every active workspace Octopush made in line with the setting, read
-/// now: on launch, and when the toggle flips. On, the hooks are installed with
-/// the same guards as for a new workspace (needs `hook_bin`); off, our entries
-/// are stripped. Probes the CLI version, so call it off the UI path.
+/// Bring every active workspace Octopush made in line with the setting: on
+/// launch, and when the toggle flips. On, the hooks are installed with the
+/// same guards as for a new workspace (needs `hook_bin`); off, our entries are
+/// stripped. Probes the CLI version, so call it off the UI path.
+///
+/// Sweeps run one at a time, and a newer sweep cancels an older one at its
+/// next workspace (#539): a quick off-then-on can't have the stale off-sweep
+/// strip what the on-sweep just installed. The setting is re-read for every
+/// workspace, so whichever sweep runs last applies the saved value.
 pub fn sync_all_workspaces(db: &Mutex<Db>, hook_bin: Option<&Path>) {
-    sync_workspaces(db, hooks_enabled(), hook_bin);
+    let sweep = sweeps().begin();
+    let _one_at_a_time = sweeps().running.lock();
+    sync_workspaces(db, hooks_enabled, || sweeps().is_latest(sweep), hook_bin);
 }
 
-fn sync_workspaces(db: &Mutex<Db>, enabled: bool, hook_bin: Option<&Path>) {
+/// The sweep generation counter and the lock that serializes sweeps.
+#[derive(Default)]
+struct Sweeps {
+    latest: AtomicU64,
+    running: Mutex<()>,
+}
+
+impl Sweeps {
+    /// A new sweep's generation; every older sweep is now stale.
+    fn begin(&self) -> u64 {
+        self.latest.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    fn is_latest(&self, sweep: u64) -> bool {
+        self.latest.load(Ordering::SeqCst) == sweep
+    }
+}
+
+fn sweeps() -> &'static Sweeps {
+    static SWEEPS: OnceLock<Sweeps> = OnceLock::new();
+    SWEEPS.get_or_init(Default::default)
+}
+
+/// One sweep. `enabled` (a settings read) runs before each workspace; the
+/// sweep stops as soon as `is_latest` says a newer one has started, which then
+/// covers every workspace itself.
+fn sync_workspaces(
+    db: &Mutex<Db>,
+    enabled: impl Fn() -> bool,
+    is_latest: impl Fn() -> bool,
+    hook_bin: Option<&Path>,
+) {
     for ws in active_workspaces(db) {
-        if !enabled {
+        if !is_latest() {
+            return;
+        }
+        if !enabled() {
             remove_for_workspace(db, &ws.id, ws.worktree_path.as_deref());
         } else if let Some(bin) = hook_bin {
             install_for_workspace(db, &ws, bin);
@@ -497,13 +539,69 @@ mod tests {
         }
 
         // On, without a hook binary to install: nothing is touched.
-        sync_workspaces(&db, true, None);
+        sync_workspaces(&db, || true, || true, None);
         assert!(mine.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file());
 
-        sync_workspaces(&db, false, None);
+        // An off-sweep a newer sweep has superseded strips nothing.
+        sync_workspaces(&db, || false, || false, None);
+        assert!(mine.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file(), "a stale sweep stops");
+
+        sync_workspaces(&db, || false, || true, None);
         assert!(!mine.join(agent_adapter::LOCAL_SETTINGS_FILE).exists(), "ours, active: stripped");
         assert!(adopted.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file(), "an adopted checkout is never touched");
         assert!(archived.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file(), "archived rows are skipped");
+    }
+
+    #[test]
+    fn a_sweep_re_reads_the_setting_and_stops_once_superseded_mid_way() {
+        let (_tmp, db) = test_db();
+        let db = Mutex::new(db);
+        let root = tempfile::tempdir().unwrap();
+        let s = |p: &Path| p.to_string_lossy().to_string();
+        db.lock().insert_project("p", "p", &s(root.path())).unwrap();
+        let wts: Vec<PathBuf> = (0..3)
+            .map(|i| {
+                let wt = root.path().join(".octopus-worktrees").join(format!("w{i}"));
+                std::fs::create_dir_all(&wt).unwrap();
+                agent_adapter::install_claude_hooks(&wt, Path::new("/x/octopush-mcp")).unwrap();
+                let id = format!("w{i}");
+                db.lock().insert_workspace_managed(&id, "p", &id, "", &id, Some(&s(&wt)), "", None, true, true).unwrap();
+                wt
+            })
+            .collect();
+        let hooked = |wt: &PathBuf| wt.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file();
+
+        // The toggle comes back on after the first strip: the rest are kept.
+        let reads = std::cell::Cell::new(0);
+        let enabled = || {
+            reads.set(reads.get() + 1);
+            reads.get() > 1
+        };
+        sync_workspaces(&db, enabled, || true, None);
+        assert_eq!(reads.get(), 3, "read once per workspace");
+        assert_eq!(wts.iter().filter(|wt| hooked(wt)).count(), 2);
+
+        // A newer sweep starts after the first workspace: the old one stops there.
+        for wt in &wts {
+            agent_adapter::install_claude_hooks(wt, Path::new("/x/octopush-mcp")).unwrap();
+        }
+        let checks = std::cell::Cell::new(0);
+        let is_latest = || {
+            checks.set(checks.get() + 1);
+            checks.get() == 1
+        };
+        sync_workspaces(&db, || false, is_latest, None);
+        assert_eq!(wts.iter().filter(|wt| hooked(wt)).count(), 2, "one stripped, then cancelled");
+    }
+
+    #[test]
+    fn only_the_newest_sweep_is_latest() {
+        let sweeps = Sweeps::default();
+        let off = sweeps.begin();
+        assert!(sweeps.is_latest(off));
+        let on = sweeps.begin();
+        assert!(!sweeps.is_latest(off), "the older sweep is cancelled");
+        assert!(sweeps.is_latest(on));
     }
 
     #[test]
