@@ -12,7 +12,9 @@
 //! on a known Claude Code version at or above the tested floor; otherwise the
 //! terminal bell/idle heuristic is unchanged. Once a terminal has delivered a
 //! hook signal, the daemon's idle heuristic stays quiet for it while the
-//! setting is on.
+//! setting is on. On launch and whenever the toggle flips, every active
+//! managed worktree is brought in line: hooks installed while on, stripped
+//! while off.
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -100,6 +102,47 @@ pub fn remove_for_workspace(db: &Mutex<Db>, workspace_id: &str, worktree_path: O
             tracing::warn!(workspace = %workspace_id, error = %e, "Claude Code hooks not removed");
         }
     }
+}
+
+/// Whether a settings save from `before` to `after` flips the toggle.
+pub fn toggled(before: Option<bool>, after: Option<bool>) -> bool {
+    enabled_from(before) != enabled_from(after)
+}
+
+/// Bring every active workspace Octopush made in line with the setting, read
+/// now: on launch, and when the toggle flips. On, the hooks are installed with
+/// the same guards as for a new workspace (needs `hook_bin`); off, our entries
+/// are stripped. Probes the CLI version, so call it off the UI path.
+pub fn sync_all_workspaces(db: &Mutex<Db>, hook_bin: Option<&Path>) {
+    sync_workspaces(db, hooks_enabled(), hook_bin);
+}
+
+fn sync_workspaces(db: &Mutex<Db>, enabled: bool, hook_bin: Option<&Path>) {
+    for ws in active_workspaces(db) {
+        if !enabled {
+            remove_for_workspace(db, &ws.id, ws.worktree_path.as_deref());
+        } else if let Some(bin) = hook_bin {
+            install_for_workspace(db, &ws, bin);
+        }
+    }
+}
+
+/// Every non-archived workspace with a worktree path; [`octopush_worktree`]
+/// still decides which of them are ours.
+fn active_workspaces(db: &Mutex<Db>) -> Vec<WorkspaceRow> {
+    let d = db.lock();
+    let paths = match d.list_workspace_paths() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "workspaces not listed; Claude Code hooks not synced");
+            return Vec::new();
+        }
+    };
+    paths
+        .into_iter()
+        .filter_map(|(id, _, _)| d.get_workspace(&id).ok().flatten())
+        .filter(|ws| ws.status != "archived")
+        .collect()
 }
 
 /// Append [`EXCLUDE_LINE`] to the repo's shared `info/exclude` (the common
@@ -201,12 +244,10 @@ fn deliverable(rows: Vec<HookSignalRow>, enabled: bool, now: DateTime<Utc>) -> V
         .collect()
 }
 
-/// One poll. With the toggle off the queue isn't even drained: rows queued
-/// meanwhile stay put and, once it's back on, age out as stale.
+/// One poll. The queue is drained with the toggle off too, and those rows are
+/// dropped: hooks still in a worktree keep queuing, and the table would
+/// otherwise grow without bound.
 fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(String, HookSignal)>> {
-    if !enabled {
-        return Ok(Vec::new());
-    }
     Ok(deliverable(db.drain_hook_signals()?, enabled, now))
 }
 
@@ -408,20 +449,61 @@ mod tests {
     }
 
     #[test]
-    fn the_poller_drains_nothing_while_the_setting_is_off() {
+    fn the_poller_drops_rows_while_the_setting_is_off() {
         let (_tmp, db) = test_db();
         db.insert_hook_signal("t1", "permission", None).unwrap();
+        db.insert_hook_signal("t2", "input", None).unwrap();
         assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
-        // Still queued: off means not drained, not drained-and-dropped.
-        assert_eq!(poll_once(&db, true, Utc::now()).unwrap(), [("t1".to_string(), HookSignal::NeedsPermission)]);
-        assert!(poll_once(&db, true, Utc::now()).unwrap().is_empty(), "drained once");
+        // Drained and dropped: nothing piles up, nothing replays once it's back on.
+        assert!(db.drain_hook_signals().unwrap().is_empty(), "the queue is empty while off");
+        assert!(poll_once(&db, true, Utc::now()).unwrap().is_empty());
 
-        // Rows queued while off are stale by the time it's back on.
-        db.insert_hook_signal("t1", "input", None).unwrap();
-        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
-        let later = Utc::now() + chrono::Duration::seconds(STALE_AFTER_SECS + 1);
-        assert!(poll_once(&db, true, later).unwrap().is_empty());
-        assert!(db.drain_hook_signals().unwrap().is_empty(), "the stale row left the queue");
+        db.insert_hook_signal("t1", "settled", None).unwrap();
+        assert_eq!(poll_once(&db, true, Utc::now()).unwrap(), [("t1".to_string(), HookSignal::Settled)]);
+        assert!(poll_once(&db, true, Utc::now()).unwrap().is_empty(), "drained once");
+    }
+
+    #[test]
+    fn only_a_flip_of_the_effective_setting_counts_as_a_toggle() {
+        assert!(!toggled(None, Some(true)), "unset is already on");
+        assert!(!toggled(Some(false), Some(false)));
+        assert!(toggled(None, Some(false)));
+        assert!(toggled(Some(true), Some(false)));
+        assert!(toggled(Some(false), Some(true)));
+        assert!(toggled(Some(false), None));
+    }
+
+    #[test]
+    fn turning_the_setting_off_strips_our_hooks_from_active_managed_worktrees_only() {
+        let (_tmp, db) = test_db();
+        let db = Mutex::new(db);
+        let root = tempfile::tempdir().unwrap();
+        let mk = |name: &str| {
+            let wt = root.path().join(".octopus-worktrees").join(name);
+            std::fs::create_dir_all(&wt).unwrap();
+            agent_adapter::install_claude_hooks(&wt, Path::new("/x/octopush-mcp")).unwrap();
+            assert!(wt.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file());
+            wt
+        };
+        let (mine, adopted, archived) = (mk("mine"), mk("adopted"), mk("archived"));
+        let s = |p: &Path| p.to_string_lossy().to_string();
+        {
+            let d = db.lock();
+            d.insert_project("p", "p", &s(root.path())).unwrap();
+            d.insert_workspace_managed("mine", "p", "mine", "", "a", Some(&s(&mine)), "", None, true, true).unwrap();
+            d.insert_workspace_managed("adopted", "p", "adopted", "", "b", Some(&s(&adopted)), "", None, false, false).unwrap();
+            d.insert_workspace_managed("archived", "p", "archived", "", "c", Some(&s(&archived)), "", None, true, true).unwrap();
+            d.archive_workspace("archived").unwrap();
+        }
+
+        // On, without a hook binary to install: nothing is touched.
+        sync_workspaces(&db, true, None);
+        assert!(mine.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file());
+
+        sync_workspaces(&db, false, None);
+        assert!(!mine.join(agent_adapter::LOCAL_SETTINGS_FILE).exists(), "ours, active: stripped");
+        assert!(adopted.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file(), "an adopted checkout is never touched");
+        assert!(archived.join(agent_adapter::LOCAL_SETTINGS_FILE).is_file(), "archived rows are skipped");
     }
 
     #[test]
