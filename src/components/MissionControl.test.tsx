@@ -492,6 +492,23 @@ describe("MissionControl", () => {
     expect(screen.getByText("terminal bell")).toBeInTheDocument();
   });
 
+  it("an interactive Claude Code session says what it is waiting on", () => {
+    useAttentionStore.setState({
+      flagsByWs: {
+        "ws-p": { kind: "terminal", at: 1_000, reason: "permission" },
+        "ws-i": { kind: "terminal", at: 2_000, reason: "input" },
+        "ws-d": { kind: "terminal", at: 3_000, reason: "idle" },
+      },
+    });
+    renderRoom();
+    expect(screen.getByText("waiting on permission")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code is waiting on permission.")).toBeInTheDocument();
+    expect(screen.getByText("waiting on your input")).toBeInTheDocument();
+    expect(screen.getByText("Claude Code is waiting on your input.")).toBeInTheDocument();
+    // The daemon's idle heuristic doesn't know why: today's copy.
+    expect(screen.getByText("terminal bell")).toBeInTheDocument();
+  });
+
   it("clicking an attention card (loaded workspace) jumps to that mission's Talk surface", () => {
     useAttentionStore.setState({ flagsByWs: { "ws-x": { kind: "chat", at: 1_000 } } });
     useWorkspaceStore.setState({

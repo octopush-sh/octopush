@@ -20,6 +20,7 @@
  */
 
 import { create } from "zustand";
+import type { PtyAttentionReason } from "../lib/types";
 
 export type AttentionKind = "chat" | "terminal";
 
@@ -41,6 +42,13 @@ export interface AttentionFlag {
    * as it did before).
    */
   terminalId?: string | null;
+  /**
+   * For terminal pings from `pty://attention`, why the terminal wants the user
+   * (the event's `reason`): `permission` / `input` from Claude Code's hooks,
+   * `idle` from the daemon. Null for chat pings and the xterm bell. The latest
+   * ping's reason wins, like `terminalId`.
+   */
+  reason?: PtyAttentionReason | null;
 }
 
 interface AttentionState {
@@ -53,8 +61,13 @@ interface AttentionState {
 
   /** Flag `workspaceId` and (if enabled) play the chime. Idempotent
    *  within the rate-limit window. `terminalId` narrows a terminal ping to the
-   *  session that rang. */
-  ping: (workspaceId: string, kind: AttentionKind, terminalId?: string | null) => void;
+   *  session that rang; `reason` says why, when the event knows. */
+  ping: (
+    workspaceId: string,
+    kind: AttentionKind,
+    terminalId?: string | null,
+    reason?: PtyAttentionReason | null,
+  ) => void;
   /** Clear the flag for a workspace (called when the user focuses it). */
   clear: (workspaceId: string) => void;
   /** Clear the flag only if it points at this terminal — called when a session
@@ -78,7 +91,7 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
   soundEnabled: readSoundPref(),
   lastChimeAt: 0,
 
-  ping: (workspaceId, kind, terminalId) => {
+  ping: (workspaceId, kind, terminalId, reason) => {
     const now = Date.now();
     set((s) => {
       const existing = s.flagsByWs[workspaceId];
@@ -90,6 +103,7 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
             at: now,
             since: existing ? (existing.since ?? existing.at) : now,
             terminalId: terminalId ?? null,
+            reason: reason ?? null,
           },
         },
       };

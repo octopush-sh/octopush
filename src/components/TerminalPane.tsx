@@ -15,6 +15,7 @@ import type {
   PtyReattachedEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { claudeWaitReason, notifyClaudeWaiting } from "../lib/claudeWaiting";
 import { useTerminalsStore } from "../stores/terminalsStore";
 import { ptySizeHeld, useTerminalLayoutStore } from "../stores/terminalLayoutStore";
 import { XTERM_FONT_FAMILY, XTERM_FONT_SIZE, getXtermTheme } from "../lib/xtermTheme";
@@ -446,18 +447,23 @@ export function TerminalPane({
     });
 
     // Daemon-driven attention: when the daemon decides the PTY went
-    // idle after a meaningful burst, it emits `pty://attention`.
+    // idle after a meaningful burst, it emits `pty://attention`; so does
+    // the Claude Code hook poller, with the reason Claude is waiting.
     // We forward it to the attention store unless this pane is on
     // screen, where the user can already see it.
     let unlistenAttention: UnlistenFn | undefined;
     listen<PtyAttentionEvent>("pty://attention", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      const reason = ev.payload.reason ?? null;
+      // A hook signal also notifies, unless the user is looking at this pane.
+      const waiting = claudeWaitReason(reason);
+      if (waiting) notifyClaudeWaiting(workspaceIdRef.current, waiting, shownRef.current);
       if (shownRef.current) return;
       // Carry the terminal id so the Run rail can mark the session that rang
       // rather than the whole workspace.
       useAttentionStore
         .getState()
-        .ping(workspaceIdRef.current, "terminal", terminalId);
+        .ping(workspaceIdRef.current, "terminal", terminalId, reason);
     }).then((u) => {
       unlistenAttention = u;
     });

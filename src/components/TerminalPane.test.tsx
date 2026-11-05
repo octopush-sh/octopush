@@ -168,6 +168,13 @@ vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 const toastsMock = vi.hoisted(() => ({ pushToast: vi.fn() }));
 vi.mock("./Toasts", () => ({ pushToast: toastsMock.pushToast }));
 
+// ─── Mock the Claude Code waiting notification ────────────────────
+const claudeWaitingMock = vi.hoisted(() => ({ notifyClaudeWaiting: vi.fn() }));
+vi.mock("../lib/claudeWaiting", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/claudeWaiting")>()),
+  notifyClaudeWaiting: claudeWaitingMock.notifyClaudeWaiting,
+}));
+
 // ─── Import component after mocks ─────────────────────────────────
 
 const { TerminalPane } = await import("./TerminalPane");
@@ -772,6 +779,32 @@ describe("TerminalPane — shown and focused", () => {
     rerender(<TerminalPane {...props} shown={false} focused={false} />);
     bell();
     expect(ping).toHaveBeenCalledWith("ws", "terminal", "t-bell");
+    ping.mockRestore();
+  });
+
+  it("carries a hook's reason into the flag and notifies only for Claude Code's own signals", async () => {
+    const { useAttentionStore } = await import("../stores/attentionStore");
+    const ping = vi.spyOn(useAttentionStore.getState(), "ping");
+    const notify = claudeWaitingMock.notifyClaudeWaiting;
+    const props = { terminalId: "t-hook", workspaceId: "ws", workspacePath: "/ws", label: "L" };
+    const { rerender } = render(<TerminalPane {...props} shown={false} focused={false} />);
+    emitEvent("pty://attention", { sessionId: "t-hook", reason: "permission" });
+    expect(ping).toHaveBeenCalledWith("ws", "terminal", "t-hook", "permission");
+    expect(notify).toHaveBeenCalledWith("ws", "permission", false);
+
+    // The daemon's idle ping flags the terminal but sends no notification.
+    emitEvent("pty://attention", { sessionId: "t-hook", reason: "idle" });
+    expect(ping).toHaveBeenLastCalledWith("ws", "terminal", "t-hook", "idle");
+    expect(notify).toHaveBeenCalledTimes(1);
+    emitEvent("pty://attention", { sessionId: "other", reason: "input" });
+    expect(notify).toHaveBeenCalledTimes(1);
+
+    // On screen: no flag; the notification decides by window focus.
+    ping.mockClear();
+    rerender(<TerminalPane {...props} shown focused={false} />);
+    emitEvent("pty://attention", { sessionId: "t-hook", reason: "input" });
+    expect(ping).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenLastCalledWith("ws", "input", true);
     ping.mockRestore();
   });
 

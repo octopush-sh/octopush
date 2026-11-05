@@ -55,6 +55,41 @@ describe("GeneralPane — default workspace mode", () => {
   });
 });
 
+describe("GeneralPane — Claude Code hooks (on by default)", () => {
+  const toggle = () => screen.getByTestId("claude-hooks-switch");
+
+  it("is on when nothing is saved, and says what it writes", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText(/\.claude\/settings\.local\.json and keeps that file out of git/)).toBeInTheDocument();
+  });
+
+  it("reads a saved false as off", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, claudeHooksEnabled: false });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "false"));
+  });
+
+  it("switching off saves an explicit false, without clobbering other settings", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, editorCommand: "cursor" });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ editorCommand: "cursor", claudeHooksEnabled: false }),
+    );
+    expect(toggle()).toHaveAttribute("aria-checked", "false");
+  });
+});
+
 describe.each([
   {
     name: "tool turns per message",

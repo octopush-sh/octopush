@@ -7,7 +7,8 @@
 //! `OCTOPUSH_TERMINAL_ID`. The app drains that queue once a second and emits
 //! `pty://attention` (with a `reason`) or `pty://settled`.
 //!
-//! Everything is gated on Settings' `claudeHooksEnabled` (off by default) and
+//! Everything is gated on Settings' `claudeHooksEnabled` (on unless set to
+//! `false`) and
 //! on a known Claude Code version at or above the tested floor; otherwise the
 //! terminal bell/idle heuristic is unchanged. Once a terminal has delivered a
 //! hook signal, the daemon's idle heuristic stays quiet for it while the
@@ -26,6 +27,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::agent_adapter::{self, HookSignal};
 use crate::db::{Db, HookSignalRow, WorkspaceRow};
+use crate::error::AppResult;
 
 /// Set in every Run terminal's environment; the hook reads it to name the
 /// terminal its signal belongs to.
@@ -42,8 +44,14 @@ const STALE_AFTER_SECS: i64 = 10;
 /// Hook payloads are a few hundred bytes; anything past this isn't one.
 pub const MAX_PAYLOAD: u64 = 1 << 20;
 
+/// Settings › General's toggle: an unset value is on, only an explicit `false`
+/// is off.
 fn hooks_enabled() -> bool {
-    crate::settings::load_settings().ok().and_then(|s| s.claude_hooks_enabled) == Some(true)
+    enabled_from(crate::settings::load_settings().ok().and_then(|s| s.claude_hooks_enabled))
+}
+
+fn enabled_from(setting: Option<bool>) -> bool {
+    setting.unwrap_or(true)
 }
 
 /// The worktree to install into, only when Octopush made it: a managed
@@ -141,13 +149,20 @@ fn append_exclude(file: &Path) -> std::io::Result<()> {
     writeln!(out, "{sep}{EXCLUDE_COMMENT}\n{EXCLUDE_LINE}")
 }
 
+/// The value after `--kind` in `octopush-mcp hook`'s arguments, if any.
+pub fn hook_kind(args: &[String]) -> Option<&str> {
+    let at = args.iter().position(|a| a == agent_adapter::HOOK_KIND_FLAG)?;
+    args.get(at + 1).map(String::as_str)
+}
+
 /// What `octopush-mcp hook` does with one payload: queue its signal for
-/// `terminal`. `false` (nothing written) outside an Octopush terminal or for
-/// a payload we don't map. Only the signal and `session_id` are stored.
-pub fn record_hook(db: &Db, terminal: Option<&str>, payload: &str) -> bool {
+/// `terminal`. `kind` is the hook's `--kind` (see `parse_hook_event`).
+/// `false` (nothing written) outside an Octopush terminal or for a payload we
+/// don't map. Only the signal and `session_id` are stored.
+pub fn record_hook(db: &Db, terminal: Option<&str>, kind: Option<&str>, payload: &str) -> bool {
     let Some(terminal) = terminal.map(str::trim).filter(|t| !t.is_empty()) else { return false };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { return false };
-    let Some(event) = agent_adapter::parse_hook_event(&value) else { return false };
+    let Some(event) = agent_adapter::parse_hook_event(&value, kind) else { return false };
     db.insert_hook_signal(terminal, event.signal.as_str(), event.session_id.as_deref()).is_ok()
 }
 
@@ -184,6 +199,15 @@ fn deliverable(rows: Vec<HookSignalRow>, enabled: bool, now: DateTime<Utc>) -> V
         .filter(|r| is_fresh(&r.created_at, now))
         .filter_map(|r| Some((r.terminal_id, HookSignal::parse(&r.signal)?)))
         .collect()
+}
+
+/// One poll. With the toggle off the queue isn't even drained: rows queued
+/// meanwhile stay put and, once it's back on, age out as stale.
+fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(String, HookSignal)>> {
+    if !enabled {
+        return Ok(Vec::new());
+    }
+    Ok(deliverable(db.drain_hook_signals()?, enabled, now))
 }
 
 fn is_fresh(created_at: &str, now: DateTime<Utc>) -> bool {
@@ -230,7 +254,11 @@ pub fn spawn_poller(app: AppHandle, db: Arc<Mutex<Db>>) {
         loop {
             tokio::time::sleep(POLL_EVERY).await;
             let db = Arc::clone(&db);
-            let rows = match tauri::async_runtime::spawn_blocking(move || db.lock().drain_hook_signals()).await {
+            let poll = move || {
+                let enabled = hooks_enabled();
+                poll_once(&db.lock(), enabled, Utc::now())
+            };
+            let rows = match tauri::async_runtime::spawn_blocking(poll).await {
                 Ok(Ok(rows)) => rows,
                 Ok(Err(e)) => {
                     tracing::warn!(error = %e, "hook_signals drain failed");
@@ -238,10 +266,7 @@ pub fn spawn_poller(app: AppHandle, db: Arc<Mutex<Db>>) {
                 }
                 Err(_) => continue,
             };
-            if rows.is_empty() {
-                continue;
-            }
-            for (terminal, signal) in deliverable(rows, hooks_enabled(), Utc::now()) {
+            for (terminal, signal) in rows {
                 let emit = deliver_one(&mut hooked().lock(), &terminal, signal);
                 let _ = match emit {
                     HookEmit::Settled => app.emit("pty://settled", HookSettledEvent { session_id: terminal }),
@@ -343,24 +368,60 @@ mod tests {
         let (_tmp, db) = test_db();
         let stop = r#"{"hook_event_name":"Stop","session_id":"s1","cwd":"/w"}"#;
         let ask = r#"{"hook_event_name":"Notification","notification_type":"permission_prompt","message":"secret text","session_id":"s1"}"#;
-        assert!(!record_hook(&db, None, stop), "outside an Octopush terminal");
-        assert!(!record_hook(&db, Some("  "), stop));
-        assert!(!record_hook(&db, Some("t1"), "not json"));
-        assert!(!record_hook(&db, Some("t1"), r#"{"hook_event_name":"PreToolUse"}"#));
-        assert!(record_hook(&db, Some("t1"), ask));
-        assert!(record_hook(&db, Some("t1"), stop));
+        let idle_without_type = r#"{"hook_event_name":"Notification","message":"waiting","session_id":"s1"}"#;
+        assert!(!record_hook(&db, None, None, stop), "outside an Octopush terminal");
+        assert!(!record_hook(&db, Some("  "), None, stop));
+        assert!(!record_hook(&db, Some("t1"), None, "not json"));
+        assert!(!record_hook(&db, Some("t1"), Some("permission"), r#"{"hook_event_name":"PreToolUse"}"#));
+        assert!(!record_hook(&db, Some("t1"), None, idle_without_type), "no kind and no notification_type");
+        assert!(record_hook(&db, Some("t1"), None, ask));
+        assert!(record_hook(&db, Some("t1"), Some("input"), idle_without_type));
+        assert!(record_hook(&db, Some("t1"), None, stop));
 
         let rows = db.drain_hook_signals().unwrap();
         let got: Vec<_> = rows.iter().map(|r| (r.terminal_id.as_str(), r.signal.as_str(), r.session_id.as_deref())).collect();
-        assert_eq!(got, [("t1", "permission", Some("s1")), ("t1", "settled", Some("s1"))]);
+        assert_eq!(got, [("t1", "permission", Some("s1")), ("t1", "input", Some("s1")), ("t1", "settled", Some("s1"))]);
         assert!(db.drain_hook_signals().unwrap().is_empty(), "a drained row is delivered once");
         assert!(!format!("{rows:?}").contains("secret text"), "message text is never stored");
 
         assert!(deliverable(rows.clone(), false, Utc::now()).is_empty(), "toggle off delivers nothing");
         assert_eq!(deliverable(rows, true, Utc::now()), [
             ("t1".to_string(), HookSignal::NeedsPermission),
+            ("t1".to_string(), HookSignal::NeedsInput),
             ("t1".to_string(), HookSignal::Settled),
         ]);
+    }
+
+    #[test]
+    fn the_kind_is_read_from_the_hook_arguments() {
+        let args = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(hook_kind(&args(&["octopush-mcp", "hook", "--kind", "permission", "--octopush-hook"])), Some("permission"));
+        assert_eq!(hook_kind(&args(&["octopush-mcp", "hook", "--octopush-hook"])), None);
+        assert_eq!(hook_kind(&args(&["octopush-mcp", "hook", "--kind"])), None);
+    }
+
+    #[test]
+    fn the_setting_is_on_unless_turned_off() {
+        assert!(enabled_from(None), "unset is on");
+        assert!(enabled_from(Some(true)));
+        assert!(!enabled_from(Some(false)));
+    }
+
+    #[test]
+    fn the_poller_drains_nothing_while_the_setting_is_off() {
+        let (_tmp, db) = test_db();
+        db.insert_hook_signal("t1", "permission", None).unwrap();
+        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
+        // Still queued: off means not drained, not drained-and-dropped.
+        assert_eq!(poll_once(&db, true, Utc::now()).unwrap(), [("t1".to_string(), HookSignal::NeedsPermission)]);
+        assert!(poll_once(&db, true, Utc::now()).unwrap().is_empty(), "drained once");
+
+        // Rows queued while off are stale by the time it's back on.
+        db.insert_hook_signal("t1", "input", None).unwrap();
+        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
+        let later = Utc::now() + chrono::Duration::seconds(STALE_AFTER_SECS + 1);
+        assert!(poll_once(&db, true, later).unwrap().is_empty());
+        assert!(db.drain_hook_signals().unwrap().is_empty(), "the stale row left the queue");
     }
 
     #[test]

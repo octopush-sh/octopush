@@ -10,9 +10,9 @@
 //! itself and, when the Claude Code hooks setting is on (#287), one line in
 //! the repo's shared `info/exclude` and `<worktree>/.claude/settings.local.json`.
 //!
-//! Run as `octopush-mcp hook --octopush-hook` (what those hooks call), it is
-//! not an MCP server: it reads one hook payload from stdin, queues one
-//! `hook_signals` row in the database and exits.
+//! Run as `octopush-mcp hook [--kind <signal>] --octopush-hook` (what those
+//! hooks call), it is not an MCP server: it reads one hook payload from stdin,
+//! queues one `hook_signals` row in the database and exits.
 //!
 //! The loop is deliberately synchronous: stdio MCP is one JSON object per line,
 //! and a single rusqlite connection is neither needed on multiple threads nor
@@ -79,12 +79,13 @@ fn main() {
 /// migrations: only an app that already created `hook_signals` installs it.
 fn run_hook() {
     use std::io::Read;
-    use octopush_lib::claude_hooks::{record_hook, MAX_PAYLOAD, TERMINAL_ENV};
+    use octopush_lib::claude_hooks::{hook_kind, record_hook, MAX_PAYLOAD, TERMINAL_ENV};
     let mut payload = String::new();
     let _ = io::stdin().lock().take(MAX_PAYLOAD).read_to_string(&mut payload);
     let Ok(terminal) = std::env::var(TERMINAL_ENV) else { return };
+    let args: Vec<String> = std::env::args().collect();
     if let Ok(db) = Db::open_without_migrations(&Db::default_path()) {
-        record_hook(&db, Some(&terminal), &payload);
+        record_hook(&db, Some(&terminal), hook_kind(&args), &payload);
     }
 }
 
