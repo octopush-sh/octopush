@@ -57,7 +57,8 @@ pub struct AppSettings {
 
     /// Run-mode attention from Claude Code's own lifecycle hooks
     /// (`Notification`/`Stop`, #287) instead of the terminal bell. `None` =
-    /// the default, which is **off** until the frontend toggle lands.
+    /// the default, read as **on** by `claude_hooks::hooks_enabled` once the
+    /// Settings toggle ships (#527); an explicit `false` turns it off.
     #[serde(default)]
     pub claude_hooks_enabled: Option<bool>,
 
