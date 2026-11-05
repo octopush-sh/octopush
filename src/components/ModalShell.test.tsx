@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
-import { useState } from "react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
+import { useLayoutEffect, useRef, useState } from "react";
 import { ModalShell } from "./ModalShell";
 
 function Harness() {
@@ -68,6 +68,55 @@ describe("ModalShell focus management", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     expect(document.activeElement).toBe(trigger);
+  });
+
+  it("initialFocus: the input takes focus even when the opener took it back after autoFocus", () => {
+    // Focus moving away between the commit (autoFocus) and the shell's effect
+    // left the dialog div focused instead of the input.
+    const outside = document.createElement("button");
+    document.body.appendChild(outside);
+    function Steal() {
+      useLayoutEffect(() => outside.focus(), []);
+      return null;
+    }
+    function FocusHarness({ withInitial }: { withInitial: boolean }) {
+      const ref = useRef<HTMLInputElement>(null);
+      return (
+        <ModalShell onClose={() => {}} ariaLabel="Focus dialog" initialFocus={withInitial ? ref : undefined}>
+          <input ref={ref} autoFocus data-testid="query" />
+          <Steal />
+        </ModalShell>
+      );
+    }
+    const { unmount } = render(<FocusHarness withInitial={false} />);
+    expect(document.activeElement).toBe(screen.getByRole("dialog", { name: "Focus dialog" }));
+    unmount();
+
+    render(<FocusHarness withInitial />);
+    expect(document.activeElement).toBe(screen.getByTestId("query"));
+    outside.remove();
+  });
+
+  it("initialFocus: a frame later, focus left on the dialog itself goes to the input", () => {
+    vi.useFakeTimers({ toFake: ["requestAnimationFrame", "cancelAnimationFrame"] });
+    try {
+      function FocusHarness() {
+        const ref = useRef<HTMLInputElement>(null);
+        return (
+          <ModalShell onClose={() => {}} ariaLabel="Late dialog" initialFocus={ref}>
+            <input ref={ref} data-testid="query" />
+          </ModalShell>
+        );
+      }
+      render(<FocusHarness />);
+      const input = screen.getByTestId("query");
+      expect(document.activeElement).toBe(input);
+      act(() => screen.getByRole("dialog", { name: "Late dialog" }).focus());
+      act(() => void vi.advanceTimersByTime(16));
+      expect(document.activeElement).toBe(input);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("traps Tab within the dialog", () => {

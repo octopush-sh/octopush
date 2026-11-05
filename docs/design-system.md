@@ -70,6 +70,8 @@ State-blue and state-purple have no `ThemeConfig` field, so `themeStore` switche
 
 Strings are verdigris rather than sage because sage (the theme's `textDim`) and mute are near twins: on Vellum `#6d5e4b` against `#6f5f4a`. Strings and comments sit side by side constantly, so they need inks that read apart; sage goes to numbers and constants instead.
 
+**Accepted, by design (#525): on Vellum, numbers and constants (sage) and comments (mute) are near twins.** They read almost the same, and that is not a bug to fix: it is the price of strings and comments reading apart, the pair that sits side by side far more often. Don't move numbers or comments to another ink to "fix" it without updating this section.
+
 A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris, the string ink, falls below 4.5:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
 
 ---

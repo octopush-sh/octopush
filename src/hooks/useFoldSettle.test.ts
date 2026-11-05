@@ -103,6 +103,47 @@ describe("useFoldSettle", () => {
     expect(settling()).toBe(false);
   });
 
+  it("with reduced motion, an end that comes before the new width lands does not release", () => {
+    // The Companion still at its old width: the slots keep still at the stale size.
+    let width = 360;
+    const el = document.createElement("div");
+    el.getBoundingClientRect = () => ({ width }) as DOMRect;
+    const ref = { current: el };
+    const { result, rerender } = renderHook(
+      ({ mode, strip }: { mode: string; strip: boolean }) =>
+        useFoldSettle(mode, strip, { ref, width: strip ? 56 : 360 }),
+      { initialProps: { mode: "run", strip: false } },
+    );
+    rerender({ mode: "talk", strip: true });
+    act(() => result.current(glideEnd()));
+    frames();
+    frames();
+    expect(settling()).toBe(true);
+    // The width lands and the slots publish it: held until they keep still.
+    width = 56;
+    frame();
+    move(612);
+    frame();
+    expect(settling()).toBe(true);
+    frames();
+    expect(settling()).toBe(false);
+  });
+
+  it("with a width that never lands, still lets go after the frame budget", () => {
+    const el = document.createElement("div");
+    el.getBoundingClientRect = () => ({ width: 360 }) as DOMRect;
+    const ref = { current: el };
+    const { result, rerender } = renderHook(
+      ({ mode, strip }: { mode: string; strip: boolean }) =>
+        useFoldSettle(mode, strip, { ref, width: strip ? 56 : 360 }),
+      { initialProps: { mode: "run", strip: false } },
+    );
+    rerender({ mode: "talk", strip: true });
+    act(() => result.current(glideEnd()));
+    act(() => void vi.advanceTimersByTime(16 * 40));
+    expect(settling()).toBe(false);
+  });
+
   it("holds with reduced motion too, where the width still lands after the switch", () => {
     const orig = window.matchMedia;
     window.matchMedia = (() => ({ matches: true })) as unknown as typeof window.matchMedia;

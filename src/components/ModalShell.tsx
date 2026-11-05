@@ -16,6 +16,9 @@ interface Props {
   topOffset?: string;
   /** Accessible label for the dialog. */
   ariaLabel?: string;
+  /** The element that takes keyboard focus on open (a dialog's query input).
+   *  Without it, the dialog itself does, unless a child already claimed it. */
+  initialFocus?: React.RefObject<HTMLElement | null>;
 }
 
 /**
@@ -45,6 +48,7 @@ export function ModalShell({
   panelClassName = "",
   topOffset = "pt-[18vh]",
   ariaLabel,
+  initialFocus,
 }: Props) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
@@ -82,10 +86,26 @@ export function ModalShell({
   // "into view" is its TOP. So closing any dialog opened from the editor threw
   // the reader back to line 1 of the file they were reading — reported against
   // the go-to-definition picker, but every modal in the app did it.
+  //
+  // With `initialFocus`, that element takes focus here and again a frame
+  // later if it was left on the dialog itself or on nothing. An `autoFocus`
+  // alone can lose focus before this effect runs (opened from an icon, ⌘⌥K or
+  // ⌘D from a terminal), which left the dialog div focused, not its input.
   useEffect(() => {
     const root = dialogRef.current;
-    if (root && !root.contains(document.activeElement)) root.focus({ preventScroll: true });
+    const target = initialFocus?.current;
+    let frame: number | undefined;
+    if (target) {
+      if (document.activeElement !== target) target.focus({ preventScroll: true });
+      frame = requestAnimationFrame(() => {
+        const active = document.activeElement;
+        if (target.isConnected && (active === root || active === document.body || active === null)) {
+          target.focus({ preventScroll: true });
+        }
+      });
+    } else if (root && !root.contains(document.activeElement)) root.focus({ preventScroll: true });
     return () => {
+      if (frame !== undefined) cancelAnimationFrame(frame);
       if (opener instanceof HTMLElement && opener.isConnected) {
         opener.focus({ preventScroll: true });
       }

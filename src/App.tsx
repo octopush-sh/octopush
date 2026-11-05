@@ -726,7 +726,11 @@ function App() {
   // A mode switch that glides the Companion to or from its strip holds every
   // PTY's size until the glide ends: one resize per visible session.
   const companionStrip = isCompanionCollapsed || panesFold;
-  const onCompanionGlideEnd = useFoldSettle(activeMode, companionStrip);
+  const companionRef = useRef<HTMLDivElement>(null);
+  const onCompanionGlideEnd = useFoldSettle(activeMode, companionStrip, {
+    ref: companionRef,
+    width: companionStrip ? COMPANION_COLLAPSED_WIDTH : companionWidth,
+  });
   const toggleCompanionFold = companionFold.toggle;
   const toggleCompanion = useCallback(() => {
     toggleCompanionFold();
@@ -2432,6 +2436,7 @@ function App() {
           over the canvas, not here. Resizable via the 4px handle on the left
           edge: drag to widen/narrow, double-click to reset to default. */}
       <div
+        ref={companionRef}
         className="relative flex shrink-0 flex-col transition-all duration-[220ms]"
         style={{
           width: companionStrip ? COMPANION_COLLAPSED_WIDTH : companionWidth,
