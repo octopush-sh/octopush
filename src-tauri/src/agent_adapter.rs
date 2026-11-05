@@ -417,10 +417,29 @@ pub fn merge_claude_hooks(settings: serde_json::Value, hook_cmd: &str) -> Option
     Some(settings)
 }
 
+/// Whether `path` (or what's there) is a symlink. A missing path is not.
+fn is_symlink(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Whether the hooks file can be written without leaving the worktree: none
+/// of `<worktree>/.claude`, the settings file or its temp sibling may be a
+/// symlink. A repo that commits `.claude` as a link (to `~/.claude`, say)
+/// would otherwise have the install write — and the removal delete — a file
+/// outside the worktree.
+fn local_settings_in_worktree(worktree: &Path) -> bool {
+    let path = worktree.join(LOCAL_SETTINGS_FILE);
+    let dir_ok = path.parent().is_none_or(|d| !is_symlink(d));
+    dir_ok && !is_symlink(&path) && !is_symlink(&path.with_extension("json.octopush-tmp"))
+}
+
 /// Install the hooks into `<worktree>/.claude/settings.local.json`. A missing
 /// file counts as `{}`; one that isn't valid JSON (or isn't an object) is
 /// never overwritten — `Ok(false)`, the install is skipped.
 pub fn install_claude_hooks(worktree: &Path, hook_bin: &Path) -> std::io::Result<bool> {
+    if !local_settings_in_worktree(worktree) {
+        return Ok(false);
+    }
     let path = worktree.join(LOCAL_SETTINGS_FILE);
     let current = match std::fs::read_to_string(&path) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
@@ -443,6 +462,9 @@ pub fn install_claude_hooks(worktree: &Path, hook_bin: &Path) -> std::io::Result
 /// file is deleted only when nothing but ours was in it; a missing or
 /// unreadable file is left as it is.
 pub fn remove_claude_hooks(worktree: &Path) -> std::io::Result<()> {
+    if !local_settings_in_worktree(worktree) {
+        return Ok(());
+    }
     let path = worktree.join(LOCAL_SETTINGS_FILE);
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(()) };
     let Ok(current) = serde_json::from_str::<serde_json::Value>(&text) else { return Ok(()) };
@@ -632,6 +654,30 @@ mod tests {
         assert_eq!(merge_claude_hooks(serde_json::json!([]), &cmd), None);
         assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": "nope" }), &cmd), None);
         assert_eq!(merge_claude_hooks(serde_json::json!({ "hooks": { "Stop": {} } }), &cmd), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_claude_dir_or_file_is_never_written_through() {
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("settings.local.json");
+        std::fs::write(&target, "{}").unwrap();
+
+        // `.claude` committed as a link to a directory outside the worktree.
+        let wt = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), wt.path().join(".claude")).unwrap();
+        assert!(!install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
+        remove_claude_hooks(wt.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+
+        // The settings file itself a link.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt.path().join(".claude")).unwrap();
+        std::os::unix::fs::symlink(&target, wt.path().join(LOCAL_SETTINGS_FILE)).unwrap();
+        assert!(!install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
+        remove_claude_hooks(wt.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "{}");
+        assert!(outside.path().read_dir().unwrap().count() == 1, "nothing else written outside");
     }
 
     #[test]
