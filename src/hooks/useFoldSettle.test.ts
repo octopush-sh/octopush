@@ -1,8 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook } from "@testing-library/react";
 import type { TransitionEvent } from "react";
-import { FOLD_SETTLE_FALLBACK_MS, useFoldSettle } from "./useFoldSettle";
+import { FOLD_SETTLE_FALLBACK_MS, SETTLED_FRAMES, useFoldSettle } from "./useFoldSettle";
 import { useTerminalLayoutStore } from "../stores/terminalLayoutStore";
+import { useTerminalSlotsStore } from "../stores/terminalSlotsStore";
 
 const settling = () => useTerminalLayoutStore.getState().settling;
 
@@ -18,8 +19,19 @@ function glideEnd(propertyName = "width", own = true) {
   return { target: own ? el : document.createElement("span"), currentTarget: el, propertyName } as unknown as TransitionEvent<HTMLElement>;
 }
 
-/** Two animation frames, as the release waits for. */
-const frames = () => act(() => void vi.advanceTimersByTime(40));
+/** Enough animation frames for the slots to have kept still. */
+const frames = () => act(() => void vi.advanceTimersByTime(16 * (SETTLED_FRAMES + 2)));
+/** One animation frame. */
+const frame = () => act(() => void vi.advanceTimersByTime(16));
+/** A slot moving, as one does while the canvas's new width is published. */
+const move = (width: number) =>
+  act(() =>
+    useTerminalSlotsStore.getState().publish("k", {
+      mode: "run",
+      terminalId: "t",
+      rect: { left: 0, top: 0, width, height: 100 },
+    }),
+  );
 
 describe("useFoldSettle", () => {
   beforeEach(() => {
@@ -42,6 +54,21 @@ describe("useFoldSettle", () => {
     frames();
     expect(settling()).toBe(true);
     act(() => result.current(glideEnd()));
+    expect(settling()).toBe(true);
+    frames();
+    expect(settling()).toBe(false);
+  });
+
+  it("after the glide, waits for the slots to keep still before it lets go", () => {
+    const { result, rerender } = setup("talk", true);
+    rerender({ mode: "run", strip: false });
+    act(() => result.current(glideEnd()));
+    // The slots publish the new width over the next frames: still held.
+    for (const w of [700, 650, 612]) {
+      frame();
+      move(w);
+    }
+    frame();
     expect(settling()).toBe(true);
     frames();
     expect(settling()).toBe(false);
@@ -76,12 +103,15 @@ describe("useFoldSettle", () => {
     expect(settling()).toBe(false);
   });
 
-  it("never holds with reduced motion", () => {
+  it("holds with reduced motion too, where the width still lands after the switch", () => {
     const orig = window.matchMedia;
     window.matchMedia = (() => ({ matches: true })) as unknown as typeof window.matchMedia;
     try {
-      const { rerender } = setup("run", false);
+      const { result, rerender } = setup("run", false);
       rerender({ mode: "talk", strip: true });
+      expect(settling()).toBe(true);
+      act(() => result.current(glideEnd()));
+      frames();
       expect(settling()).toBe(false);
     } finally {
       window.matchMedia = orig;

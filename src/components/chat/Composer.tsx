@@ -698,8 +698,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         </div>
 
         {/* Control bar — model + effort on the left, cost + send/stop on the right.
-            It wraps rather than overflow when the column is narrower than its
-            natural width (Talk's seat at its 40-column minimum). */}
+            The estimate and Send/Stop are one group held to the right: from a
+            zero basis it fills the room left on the line and the estimate
+            squeezes into it, so the bar stays on one line as long as the
+            group's narrowest form fits. Only past that (Talk's seat at its
+            40-column minimum) does the group wrap, whole, onto a second line,
+            rather than run under the seat. */}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5">
           <ModelPicker activeModel={model} onSelectModel={setModel} autoOption />
           <EffortSelector />
@@ -723,9 +727,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
             </span>
           )}
 
+          <div className="flex flex-1 basis-0 items-center justify-end gap-3">
           {inlineCost !== null && (
             <div
-              className="octo-tabular ml-auto whitespace-nowrap font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
+              className="octo-tabular font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
               title={`Estimate for ${activeModelInfo!.displayName || activeModelInfo!.id}; assumes 30% output ratio`}
             >
               <span className="text-octo-brass">{formatPerMessageCost(inlineCost)}</span>
@@ -736,7 +741,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
           {/* Send while idle, Stop while streaming — crossfades in one slot so
               the bar never shifts (stability S2). */}
-          <FadeSwap swapKey={streaming ? "stop" : "send"} className={clsx(inlineCost === null && "ml-auto")}>
+          <FadeSwap swapKey={streaming ? "stop" : "send"}>
             {streaming ? (
               <ComposerActionButton
                 onClick={() => stop(workspaceId)}
@@ -760,6 +765,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
               />
             )}
           </FadeSwap>
+          </div>
         </div>
       </div>
 
