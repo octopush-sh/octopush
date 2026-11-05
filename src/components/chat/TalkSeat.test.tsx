@@ -58,6 +58,18 @@ describe("TalkSeat", () => {
     expect(onToggle).toHaveBeenCalledTimes(1);
   });
 
+  it("the toggle has its own row above the conversation, not over its first message", () => {
+    seed(["a"], { terminalId: "a", open: false });
+    renderSeat();
+    const toggle = screen.getByTestId("talk-seat-toggle");
+    const row = screen.getByTestId("talk-seat-toggle-row");
+    expect(toggle.parentElement).toBe(row);
+    expect(toggle.className).not.toMatch(/\babsolute\b/);
+    // The row comes before the conversation, which holds the composer.
+    expect(row.contains(screen.getByTestId("composer"))).toBe(false);
+    expect(row.compareDocumentPosition(screen.getByTestId("composer")) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("open: the session's slot in Talk, its caption, and Leave the view", () => {
     const onToggle = vi.fn();
     seed(["a", "b"], { terminalId: "b", open: true });

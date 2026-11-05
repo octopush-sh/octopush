@@ -104,20 +104,24 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
   return (
     <div ref={areaRef} className="flex h-full min-h-0 w-full">
       {/* Typing in the conversation takes keyboard focus back from the seat. */}
-      <div className="relative min-w-0 flex-1" onFocusCapture={() => setTalkFocused(workspaceId, false)}>
-        {children}
-        <button
-          type="button"
-          data-testid="talk-seat-toggle"
-          data-tour={tourId("talk-seat-toggle")}
-          aria-pressed={seat.open}
-          aria-label="Open a terminal beside the conversation"
-          title="Open a terminal beside the conversation · ⌘D"
-          onClick={onToggle}
-          className={`absolute right-3 top-3 z-10 ${iconButton} ${seat.open ? "text-octo-ivory" : ""}`}
-        >
-          <SquareTerminal size={14} strokeWidth={1.75} aria-hidden />
-        </button>
+      <div className="flex min-w-0 flex-1 flex-col" onFocusCapture={() => setTalkFocused(workspaceId, false)}>
+        {/* The toggle's own row, level with the seat's caption: it never sits
+            over the first message, and the composer keeps its place. */}
+        <div data-testid="talk-seat-toggle-row" className="flex h-8 shrink-0 items-center justify-end px-3">
+          <button
+            type="button"
+            data-testid="talk-seat-toggle"
+            data-tour={tourId("talk-seat-toggle")}
+            aria-pressed={seat.open}
+            aria-label="Open a terminal beside the conversation"
+            title="Open a terminal beside the conversation · ⌘D"
+            onClick={onToggle}
+            className={`${iconButton} ${seat.open ? "text-octo-ivory" : ""}`}
+          >
+            <SquareTerminal size={14} strokeWidth={1.75} aria-hidden />
+          </button>
+        </div>
+        <div className="relative min-h-0 flex-1">{children}</div>
       </div>
 
       <div

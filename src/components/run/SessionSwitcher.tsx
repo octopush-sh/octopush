@@ -75,6 +75,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   // loser would raise a "couldn't close terminal" toast for a session that
   // closed perfectly well.
   const deleting = useRef(new Set<string>());
+  const inputRef = useRef<HTMLInputElement>(null);
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -147,6 +148,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
       align="top"
       topOffset="pt-[16vh]"
       ariaLabel={pairing ? "Open a session beside" : "Switch session"}
+      initialFocus={inputRef}
     >
       <div className="w-[470px] max-w-[92vw] overflow-hidden rounded-xl border border-octo-hairline bg-octo-panel">
         <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
@@ -154,6 +156,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
             {pairing ? "⌘D" : "⌘⌥K"}
           </span>
           <input
+            ref={inputRef}
             autoFocus
             data-testid="session-switcher-input"
             data-tour={pairing && !talk ? tourId("run-pair-input") : undefined}
