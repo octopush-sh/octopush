@@ -36,10 +36,17 @@ const refined = (s: LanguageSupport, lang: LRLanguage, rules: Parameters<typeof 
   return lezer(new LanguageSupport(l, s.support));
 };
 
-/** Java: `@Override`, `@Foo(…)` and `@a.B` take the annotation ink — the
- *  package tags their name as a plain identifier. */
+/** Java: `@Override`, `@Foo(…)` and `@a.B` take the annotation ink, `@`
+ *  included — the package tags their name as a plain identifier and leaves the
+ *  `@` (an anonymous token, so the annotation node's own text) untagged. The
+ *  node rule doesn't inherit, so an argument list keeps its own inks. */
 const JAVA_RULES = {
-  "MarkerAnnotation/Identifier Annotation/Identifier MarkerAnnotation/ScopedIdentifier Annotation/ScopedIdentifier": tags.annotation,
+  "MarkerAnnotation Annotation": tags.annotation,
+  "MarkerAnnotation/Identifier Annotation/Identifier": tags.annotation,
+  // A qualified name nests ScopedIdentifiers over Identifiers that keep the
+  // package's `variableName`; opaque, so the whole `a.B` is amber (as Rust's
+  // `MetaItem!`).
+  "MarkerAnnotation/ScopedIdentifier! Annotation/ScopedIdentifier!": tags.annotation,
 };
 
 /** Rust: an attribute (`#[derive(Debug)]`, `#![allow(x)]`) is amber as a

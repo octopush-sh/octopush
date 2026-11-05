@@ -50,9 +50,12 @@ export interface SyntaxKindStyle {
 export const SYNTAX_KINDS: Record<SyntaxKind, SyntaxKindStyle> = {
   keyword:     { ink: "brass",       cls: "tok-kw" },
   type:        { ink: "stateBlue",   cls: "tok-type" },
-  function:    { ink: "verdigris",   cls: "tok-fn" },
-  string:      { ink: "sage",        cls: "tok-str" },
-  constant:    { ink: "statePurple", cls: "tok-num" },
+  function:    { ink: "statePurple", cls: "tok-fn" },
+  // Strings and comments are the two quiet kinds that sit side by side most
+  // often; sage reads too close to mute (on Vellum, #6d5e4b vs #6f5f4a), so
+  // strings take verdigris and sage goes to the sparser numbers and constants.
+  string:      { ink: "verdigris",   cls: "tok-str" },
+  constant:    { ink: "sage",        cls: "tok-num" },
   // Amber is the warning ink; annotations, decorators and macros are rare
   // enough in a file that it still reads as an exception, not as a theme.
   meta:        { ink: "warning",     cls: "tok-meta" },

@@ -59,16 +59,18 @@ Code highlighting uses palette inks only, no syntax-only hues. One table, `src/l
 |---|---|---|
 | Keywords, modifiers, `this` | brass (the one accent, kept surgical) | `tok-kw` |
 | Types, classes, tags | `--color-octo-state-blue` | `tok-type` |
-| Function and method names, call and definition | `--color-octo-verdigris` | `tok-fn` |
-| Strings | sage | `tok-str` |
-| Numbers and constants | `--color-octo-state-purple` | `tok-num` |
+| Function and method names, call and definition | `--color-octo-state-purple` | `tok-fn` |
+| Strings | `--color-octo-verdigris` | `tok-str` |
+| Numbers and constants | sage | `tok-num` |
 | Annotations, decorators, macros | `--color-octo-warning` (amber; rare, so it still reads as an exception) | `tok-meta` |
 | Properties, plain text | ivory | `tok-prop` · `tok-var` |
 | Comments, punctuation | mute, upright, never italic | `tok-cmt` · `tok-punct` |
 
 State-blue and state-purple have no `ThemeConfig` field, so `themeStore` switches them with the ground: the Onyx values on a dark theme, `vellumInks` from `tokens.ts` on a light one (`#2f5a7e` / `#6a4682`, AA on every Vellum surface). Verdigris and amber are ThemeConfig inks already. `contrast.test.ts` holds both themes' syntax inks to 4.5:1, and `syntaxPalette.coverage.test.ts` fails if a supported language emits a tag with no rule.
 
-A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris falls below 4.5:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
+Strings are verdigris rather than sage because sage (the theme's `textDim`) and mute are near twins: on Vellum `#6d5e4b` against `#6f5f4a`. Strings and comments sit side by side constantly, so they need inks that read apart; sage goes to numbers and constants instead.
+
+A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, not its syntax ink: on the word fill the syntax inks fall under AA (verdigris, the string ink, falls below 4.5:1 on Vellum), the text ink doesn't. Search matches follow the same rule.
 
 ---
 

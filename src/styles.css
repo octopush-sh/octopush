@@ -205,9 +205,9 @@
    nodes.                                                           */
 .tok-kw      { color: var(--color-octo-brass); }
 .tok-type    { color: var(--color-octo-state-blue); }
-.tok-fn      { color: var(--color-octo-verdigris); }
-.tok-str     { color: var(--color-octo-sage); }
-.tok-num     { color: var(--color-octo-state-purple); }
+.tok-fn      { color: var(--color-octo-state-purple); }
+.tok-str     { color: var(--color-octo-verdigris); }
+.tok-num     { color: var(--color-octo-sage); }
 .tok-meta    { color: var(--color-octo-warning); }
 .tok-prop    { color: var(--color-octo-ivory); }
 .tok-var     { color: var(--color-octo-ivory); }
@@ -217,7 +217,8 @@
 
 /* ── Word-diff inline segments ───────────────────────────────── */
 /* A changed word owns its ink, as a search match does: on its fill the
-   syntax inks fall under AA (verdigris ~3.4:1 on Vellum), the text ink
+   syntax inks fall under AA (verdigris, the string ink, falls below 4.5:1 on
+   Vellum), the text ink
    doesn't. Declared after .tok-* so it wins (lib/contrast.ts,
    WORD_DIFF_ADD_ALPHA). */
 .wd-add { background: var(--verdigris-strong); color: var(--color-octo-ivory); border-radius: 2px; }

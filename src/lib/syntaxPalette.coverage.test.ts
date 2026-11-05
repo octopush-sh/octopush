@@ -103,6 +103,8 @@ describe("grammar shapes the extra rules rely on", () => {
     const tree = java!.parser.parse("@Override @SuppressWarnings(\"x\") class A {}").toString();
     expect(tree).toContain("MarkerAnnotation(Identifier)");
     expect(tree).toMatch(/Annotation\(Identifier,AnnotationArgumentList/);
+    // The `@` is anonymous: it is the annotation node's own text.
+    expect(java!.parser.parse("@a.B class A {}").toString()).toContain("MarkerAnnotation(ScopedIdentifier(Identifier,\".\",Identifier))");
   });
 
   it("rust: attributes parse as Attribute / InnerAttribute over a MetaItem", async () => {
@@ -118,6 +120,14 @@ describe("syntax kinds read apart", () => {
     // Java: annotations, declarations, calls, types, constants.
     ["java", "@Override public String toString() { return null; }", "Override", "tok-meta"],
     ["java", "@SuppressWarnings(\"x\") class A {}", "SuppressWarnings", "tok-meta"],
+    // The `@` is amber too, not left in the text ink; arguments keep theirs.
+    ["java", "@Override public String toString() { return null; }", "@", "tok-meta"],
+    ["java", "@SuppressWarnings(\"x\") class A {}", "@", "tok-meta"],
+    ["java", "@SuppressWarnings(\"x\") class A {}", "\"x\"", "tok-str"],
+    ["java", "@java.lang.Deprecated class A {}", "@", "tok-meta"],
+    ["java", "@java.lang.Deprecated class A {}", "Deprecated", "tok-meta"],
+    ["java", "@a.B(1) class A {}", "B", "tok-meta"],
+    ["java", "@a.B(1) class A {}", "1", "tok-num"],
     ["java", "class A { void m() { foo(1); } }", "foo", "tok-fn"],
     ["java", "class A { String s; }", "String", "tok-type"],
     ["java", "class A { boolean b = true; }", "true", "tok-num"],

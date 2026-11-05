@@ -337,7 +337,7 @@ describe("word-diff spans", () => {
     }
   });
 
-  it("shows why they own their ink: a function name (tok-fn) on Vellum's added fill fails AA", () => {
+  it("shows why they own their ink: a string (tok-str, verdigris) on Vellum's added fill fails AA", () => {
     const add = fillOf(VELLUM.bg, vellumInks.verdigris, WORD_DIFF_ADD_ALPHA);
     expect(contrastRatio(hexToRgb(vellumInks.verdigris)!, add)).toBeLessThan(4.5);
   });
@@ -349,7 +349,7 @@ describe("word-diff spans", () => {
     for (const cls of ["wd-add", "wd-del"]) {
       const rule = css.match(new RegExp(`\\.${cls}\\s*\\{([^}]*)\\}`));
       expect(rule?.[1], `.${cls}`).toMatch(/(^|;)\s*color:\s*var\(--color-octo-ivory\)/);
-      // Same specificity as `.tok-fn`, so it only wins by coming later.
+      // Same specificity as `.tok-str`, so it only wins by coming later.
       expect(css.indexOf(`.${cls} {`)).toBeGreaterThan(css.lastIndexOf(".tok-"));
     }
   });
