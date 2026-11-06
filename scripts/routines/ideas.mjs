@@ -270,7 +270,8 @@ function context(gh, now, ids, ghFor = () => gh) {
 
 export function post(gh, file, now, ids, ghFor = () => gh) {
   let raw;
-  try { raw = JSON.parse(readFileSync(file, "utf8")); } catch (e) { console.error(`ideas.json is not valid JSON: ${e.message}`); return 2; }
+  // No e.message: Node's JSON errors quote the input, and the Actions log is public.
+  try { raw = JSON.parse(readFileSync(file, "utf8")); } catch { console.error("ideas.json is not valid JSON"); return 2; }
   const { ideas, dropped, errors } = usableIdeas(raw);
   if (errors.length) { console.error(errors.join("\n")); return 2; }
   if (dropped.length) console.error(`dropped ${dropped.length} invalid entr${dropped.length === 1 ? "y" : "ies"}:\n${dropped.join("\n")}`);

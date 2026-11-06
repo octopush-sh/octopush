@@ -103,18 +103,20 @@ export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = pro
 }
 
 /**
- * A safe one-line-per-entry summary of the tool calls Claude denied: tool name
- * and file path or command only — never content (pure, tested).
+ * A safe summary of the tool calls Claude denied: tool names and counts only
+ * (pure, tested). Never a path, pattern or command — those are chosen by the
+ * agent and the Actions log is public.
  */
 export function denialSummary(resultJson) {
   let r;
   try { r = JSON.parse(resultJson); } catch { return ["(no result object — the agent didn't finish normally)"]; }
-  const lines = (r.permission_denials ?? []).map((d) => {
-    const i = d.tool_input ?? {};
-    const what = i.file_path ?? i.path ?? i.pattern ?? (typeof i.command === "string" ? i.command.split(/\s+/)[0] : "");
-    return `denied: ${d.tool_name}${what ? ` ${String(what).slice(0, 200)}` : ""}`;
-  });
-  if (r.is_error || r.subtype && r.subtype !== "success") lines.push(`result: ${r.subtype ?? "error"}`);
+  const counts = new Map();
+  for (const d of r.permission_denials ?? []) {
+    const name = /^[A-Za-z][A-Za-z0-9_]{0,40}$/.test(d.tool_name ?? "") ? d.tool_name : "(other tool)";
+    counts.set(name, (counts.get(name) ?? 0) + 1);
+  }
+  const lines = [...counts].map(([name, n]) => `denied: ${name} ×${n}`);
+  if (r.is_error || r.subtype && r.subtype !== "success") lines.push(`result: ${/^[a-z_]{1,40}$/.test(r.subtype ?? "") ? r.subtype : "error"}`);
   return lines;
 }
 

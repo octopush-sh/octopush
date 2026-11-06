@@ -82,10 +82,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
           OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
-        # A manual run goes ahead anyway: it comments on today's issue.
+        # 0 = go · 1 = already filed (a manual run still goes: it comments on
+        # today's issue) · 3 = no rulebook on octopush-web main · else = fail.
         run: |
-          if node scripts/routines/social.mjs check "$KIND"; then echo "go=1" >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi
+          rc=0; node scripts/routines/social.mjs check "$KIND" || rc=$?
+          case "$rc" in
+            0) echo "go=1" >> "$GITHUB_OUTPUT" ;;
+            1) if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi ;;
+            3) echo "::warning title=rulebook::the marketing rulebook is not on octopush-web main — nothing filed" ;;
+            *) echo "::error title=check::social.mjs check failed (exit $rc)"; exit 1 ;;
+          esac
 
       - name: Context and brief
         if: steps.check.outputs.go == '1'
@@ -189,9 +195,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
           OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
+        # 0 = go · 1 = already filed (a manual run still goes: it comments on
+        # today's issue) · 3 = no rulebook on octopush-web main · else = fail.
         run: |
-          if node scripts/routines/social.mjs check "$KIND"; then echo "go=1" >> "$GITHUB_OUTPUT"
-          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi
+          rc=0; node scripts/routines/social.mjs check "$KIND" || rc=$?
+          case "$rc" in
+            0) echo "go=1" >> "$GITHUB_OUTPUT" ;;
+            1) if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi ;;
+            3) echo "::warning title=rulebook::the marketing rulebook is not on octopush-web main — nothing filed" ;;
+            *) echo "::error title=check::social.mjs check failed (exit $rc)"; exit 1 ;;
+          esac
 
       - name: Context and brief
         if: steps.check.outputs.go == '1'
