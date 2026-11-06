@@ -162,14 +162,42 @@ pub fn gh_check(probe: Probe) -> ReadinessCheck {
     }
 }
 
+pub const CLAUDE_LOGIN: &str = "claude auth login";
+
+/// `12 Dec` in the Mac's time zone.
+pub fn day_label(epoch_secs: i64) -> String {
+    chrono::DateTime::from_timestamp(epoch_secs, 0)
+        .map(|d| d.with_timezone(&chrono::Local).format("%-d %b").to_string())
+        .unwrap_or_else(|| "an unknown date".into())
+}
+
 /// An Anthropic key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise
-/// CLI stages run on the `claude` login and API stages can't run.
-pub fn auth_check(has_anthropic_key: bool) -> ReadinessCheck {
+/// CLI stages run on the `claude` login and API stages can't run. With no
+/// key, `login_expires_at` (the sign-in end a CLI stage last reported, see
+/// `claude_login`) says how long that login lasts; without one the row
+/// stays as it was (older CLIs never report it). Never contacts the network.
+pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64) -> ReadinessCheck {
+    use crate::claude_login::{state, LoginState};
+    const ID: &str = "auth";
+    const LABEL: &str = "Claude auth";
     if has_anthropic_key {
-        ReadinessCheck::ok("auth", "Claude auth", "API key")
-    } else {
+        return ReadinessCheck::ok(ID, LABEL, "API key");
+    }
+    let Some(ends) = login_expires_at else {
         let fix = "CLI stages use your claude login. API stages need an Anthropic key in Settings › Models.";
-        ReadinessCheck::not_ok("auth", "Claude auth", CheckStatus::Warn, "Subscription", fix, None)
+        return ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, "Subscription", fix, None);
+    };
+    let day = day_label(ends);
+    match state(ends, now) {
+        LoginState::Ok => ReadinessCheck::ok(ID, LABEL, format!("Signed in · until {day}")),
+        LoginState::EndingSoon => {
+            let fix = "Sign in again before it ends so overnight crews keep running.";
+            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
+        }
+        LoginState::Ended => {
+            let fix = "CLI stages and Routines can't run on it. Sign in again, then check again.";
+            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
+        }
     }
 }
 
@@ -227,7 +255,8 @@ fn enabled_ollama_addr() -> Option<String> {
 }
 
 /// Every check, in card order. Blocking: call it off the async runtime.
-pub fn run_all() -> Vec<ReadinessCheck> {
+/// `login_expires_at` is the stored claude.ai sign-in end (`claude_login`).
+pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     let claude = std::thread::spawn(|| {
         claude_check(run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT), TESTED_CLAUDE_FLOOR)
     });
@@ -245,7 +274,11 @@ pub fn run_all() -> Vec<ReadinessCheck> {
     let lost = ReadinessCheck::failed_to_run;
     let mut checks = vec![
         claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
-        auth_check(crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty())),
+        auth_check(
+            crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty()),
+            login_expires_at,
+            chrono::Utc::now().timestamp(),
+        ),
         git.join().unwrap_or_else(|_| lost("git", "git")),
         gh.join().unwrap_or_else(|_| lost("gh", "GitHub CLI")),
     ];
@@ -326,14 +359,43 @@ mod tests {
 
     #[test]
     fn auth_mode_and_a_check_that_failed_to_run() {
-        assert_eq!(auth_check(true).value, "API key");
-        let sub = auth_check(false);
-        assert_eq!((sub.status, sub.value.as_str()), (CheckStatus::Warn, "Subscription"));
+        let now = 1_800_000_000;
+        assert_eq!(auth_check(true, None, now).value, "API key");
+        // A key wins over a stored login, even an ended one.
+        assert_eq!(auth_check(true, Some(now - 1), now).status, CheckStatus::Ok);
+        let sub = auth_check(false, None, now);
+        assert_eq!((sub.status, sub.value.as_str(), sub.command), (CheckStatus::Warn, "Subscription", None));
 
         let lost = ReadinessCheck::failed_to_run("git", "git");
         assert_eq!((lost.status, lost.value.as_str(), lost.timed_out), (CheckStatus::Warn, "Check failed to run", false));
         assert_eq!(lost.command, None);
         assert!(!lost.fix.as_deref().unwrap_or_default().contains("3 s"));
+    }
+
+    #[test]
+    fn auth_shows_the_claude_sign_in_end() {
+        let now = 1_800_000_000;
+        let far = now + 30 * 86_400;
+        let ok = auth_check(false, Some(far), now);
+        assert_eq!(ok.status, CheckStatus::Ok);
+        assert_eq!(ok.value, format!("Signed in · until {}", day_label(far)));
+        assert_eq!((ok.fix, ok.command), (None, None));
+
+        let soon = now + 3 * 86_400;
+        let warn = auth_check(false, Some(soon), now);
+        assert_eq!((warn.status, warn.value.clone()), (CheckStatus::Warn, format!("Sign-in ends {}", day_label(soon))));
+        assert_eq!(warn.fix.as_deref(), Some("Sign in again before it ends so overnight crews keep running."));
+        assert_eq!(warn.command.as_deref(), Some("claude auth login"));
+
+        let gone = now - 86_400;
+        let ended = auth_check(false, Some(gone), now);
+        assert_eq!((ended.status, ended.value.clone()), (CheckStatus::Fail, format!("Sign-in ended {}", day_label(gone))));
+        assert_eq!(ended.command.as_deref(), Some(CLAUDE_LOGIN));
+
+        // `%-d %b`: a day number and a month, no leading zero.
+        let label = day_label(far);
+        let (d, m) = label.split_once(' ').unwrap();
+        assert!(d.parse::<u32>().is_ok_and(|n| (1..=31).contains(&n)) && !d.starts_with('0') && m.len() == 3, "{label}");
     }
 
     #[test]

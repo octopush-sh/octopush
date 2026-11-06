@@ -25,6 +25,8 @@ import { stageTitle } from "../lib/stageMeta";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 import { StageDots } from "./direct/StageDots";
 import { Reveal } from "./primitives/Reveal";
+import { ClaudeLoginNote } from "./ClaudeLoginNote";
+import { tourId } from "../lib/tour/ids";
 
 interface Props {
   open: boolean;
@@ -205,6 +207,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
             <span className="octo-tabular">{away.saved}</span>
           </p>
         )}
+        <ClaudeLoginNote tourId={tourId("mission-control-login-expiry")} className="mt-2" />
       </header>
 
       {isEmpty ? (

@@ -54,6 +54,11 @@ impl<'a> LiveEmitter<'a> {
     pub fn plan_windows(&self, windows: &[crate::orchestrator::cli_runner::PlanWindow]) {
         self.events.emit(crate::claude_plan::PLAN_EVENT, json!({ "windows": windows }));
     }
+    /// When the claude.ai sign-in ends (a `result` event's
+    /// `credential_expires_at`) — `PersistingSink` keeps it (`claude_login`).
+    pub fn login_expiry(&self, expires_at: i64) {
+        self.events.emit(crate::claude_login::LOGIN_EVENT, json!({ "expiresAt": expires_at }));
+    }
 }
 
 /// A descriptive one-line hint from a tool-call input object (path/command/…),

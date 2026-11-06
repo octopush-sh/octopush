@@ -1,7 +1,8 @@
 //! `PersistingSink` — an `EventSink` decorator that mirrors every `run://log`
 //! entry into the `stage_log` table, so stage journals survive app reloads
 //! and loop-back resets (a reset becomes a `{"kind":"reset"}` marker row).
-//! It also keeps the Claude plan snapshot (`plan://updated`, see `claude_plan`).
+//! It also keeps the Claude plan snapshot (`plan://updated`, see `claude_plan`)
+//! and the claude.ai sign-in end (`claude-login://updated`, see `claude_login`).
 
 use crate::db::Db;
 use crate::orchestrator::events::EventSink;
@@ -46,6 +47,11 @@ impl EventSink for PersistingSink {
             let windows = crate::claude_plan::windows_from_payload(&payload);
             let now = chrono::Utc::now().to_rfc3339();
             let _ = crate::claude_plan::record(&self.db.lock(), &windows, &now);
+        } else if event == crate::claude_login::LOGIN_EVENT {
+            if let Some(expires_at) = payload.get("expiresAt").and_then(Value::as_i64) {
+                let now = chrono::Utc::now().to_rfc3339();
+                let _ = crate::claude_login::record(&self.db.lock(), expires_at, &now);
+            }
         }
         self.inner.emit(event, payload);
     }

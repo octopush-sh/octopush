@@ -697,6 +697,58 @@ fn rate_limit_event_missing_fields_degrade_without_panicking() {
     assert!(plan_windows_from_stream_event(&junk).is_empty());
 }
 
+// ─── `result.credential_expires_at` → claude.ai sign-in end ──────────────
+
+const LOGIN_EXPIRY_REL: &str = "stream-json/subscriber-login-expiry.jsonl";
+
+#[test]
+fn result_credential_expires_at_reports_the_sign_in_end() {
+    use crate::orchestrator::cli_runner::credential_expiry_from_result;
+    // Synthetic fixture (see the README) — pinned to the recording that has it.
+    let rec = recording("2.1.314");
+    let fx = rec.label(LOGIN_EXPIRY_REL);
+    let events = rec.jsonl(LOGIN_EXPIRY_REL);
+    check_stream_shape(&fx, &events);
+    let (_, _, outcome) = replay(&fx, &events);
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] the field must not disturb the stage: {:?}", outcome.error);
+    let r = result_event(&fx, &events);
+    require_str(&fx, r, "credential_expires_at");
+    let want = chrono::DateTime::parse_from_rfc3339("2026-12-12T09:00:00Z").unwrap().timestamp();
+    assert_eq!(credential_expiry_from_result(r), Some(want), "[{fx}]");
+    // Only the result event carries it.
+    for e in events.iter().filter(|e| !is_result_event(e)) {
+        assert_eq!(credential_expiry_from_result(e), None, "[{fx}] {e}");
+    }
+
+    // Epoch seconds or milliseconds read as the same moment.
+    let mut secs = r.clone();
+    secs["credential_expires_at"] = Value::from(want);
+    assert_eq!(credential_expiry_from_result(&secs), Some(want));
+    secs["credential_expires_at"] = Value::from(want * 1000);
+    assert_eq!(credential_expiry_from_result(&secs), Some(want));
+}
+
+#[test]
+fn result_without_credential_expires_at_reports_nothing() {
+    use crate::orchestrator::cli_runner::credential_expiry_from_result;
+    // Older CLIs (every real recording) and API-key sessions don't send it.
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl", "stream-json/error-unknown-model.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            assert_eq!(credential_expiry_from_result(result_event(&fx, &events)), None, "[{fx}]");
+        }
+    }
+    // An unreadable value is no value, never a panic.
+    let rec = recording("2.1.314");
+    let events = rec.jsonl(LOGIN_EXPIRY_REL);
+    let mut r = result_event(&rec.label(LOGIN_EXPIRY_REL), &events).clone();
+    for junk in [Value::Null, Value::from("next month"), Value::from(""), Value::from(true), serde_json::json!({}), Value::from(0)] {
+        r["credential_expires_at"] = junk.clone();
+        assert_eq!(credential_expiry_from_result(&r), None, "{junk}");
+    }
+}
+
 // ─── `system/api_retry`, `system/notification` and `system/init` load errors → journal notices ──
 
 const API_RETRY_REL: &str = "stream-json/api-retry.jsonl";

@@ -917,6 +917,10 @@ export const ipc = {
    *  subscription-authenticated stage streamed one). */
   getClaudePlan: () => invoke<PlanSnapshot[]>("get_claude_plan"),
 
+  /** When the claude.ai sign-in ends, as CLI stages last reported it (null
+   *  until a stage on Claude Code 2.1.318+ said). */
+  getClaudeLogin: () => invoke<ClaudeLoginExpiry | null>("get_claude_login"),
+
   /** The Usage page's report over a range, optionally one surface. Day
    *  buckets follow `utcOffsetMinutes` (the viewer's local offset). */
   getUsageReport: (startIso: string, endIso: string, surface: string | null, utcOffsetMinutes: number) =>
@@ -1547,6 +1551,14 @@ export interface PlanSnapshot {
   status: string | null;
   overageStatus: string | null;
   usingOverage: boolean;
+  seenAt: string;
+}
+
+/** `claude_login::LoginExpiry`: when the stored claude.ai sign-in ends. */
+export interface ClaudeLoginExpiry {
+  /** Epoch seconds. */
+  expiresAt: number;
+  /** When a stage reported it, RFC3339. */
   seenAt: string;
 }
 

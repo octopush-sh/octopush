@@ -10333,6 +10333,24 @@ mod stage_log_tests {
     }
 
     #[test]
+    fn login_expiry_is_kept_and_forwarded() {
+        let (db, rec, sink, _tmp) = harness();
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        emitter.login_expiry(1_797_000_000);
+        // Signing in again moves it forward: the latest report wins.
+        emitter.login_expiry(1_799_000_000);
+        let stored = crate::claude_login::load(&db.lock()).unwrap().expect("stored");
+        assert_eq!(stored.expires_at, 1_799_000_000);
+        assert!(chrono::DateTime::parse_from_rfc3339(&stored.seen_at).is_ok());
+        let v = serde_json::to_value(&stored).unwrap();
+        assert_eq!(v["expiresAt"], 1_799_000_000, "camelCase for the frontend: {v}");
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 2);
+        assert!(fwd.iter().all(|(e, _)| e == crate::claude_login::LOGIN_EVENT));
+        assert!(db.lock().list_stage_log("s1").unwrap().is_empty());
+    }
+
+    #[test]
     fn plan_snapshot_round_trips_an_unknown_window_kind() {
         let (db, _rec, _sink, _tmp) = harness();
         let w = crate::orchestrator::cli_runner::PlanWindow {

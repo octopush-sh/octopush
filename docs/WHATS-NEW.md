@@ -80,6 +80,7 @@ Current anchors:
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
+| `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
 | `routines-upsell-cta` | Settings › Routines, Free only: the upgrade banner's "Put your crews on a schedule with Pro" | `settings/RoutinesPane.tsx` |
 | `logbook-upsell-cta` | Logbook room, Free only: "Open the full logbook with Pro" | `LogbookRoom.tsx` |
 | `review-mode-tail` | Review: the mode band's status tail ("2 files changed · +2 −1"; only with changes) | `ReviewTail.tsx` |
