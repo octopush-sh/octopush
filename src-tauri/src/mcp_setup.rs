@@ -113,14 +113,36 @@ pub(crate) fn manual_command(binary_path: Option<&str>) -> String {
 /// Whether Claude Code already has the `octopush` server registered. Runs
 /// through the readiness probe so a slow CLI can't stall the Settings card.
 fn is_registered(claude: &Path) -> bool {
+    registered_from(probe_registration(claude))
+}
+
+fn probe_registration(claude: &Path) -> Probe {
     let mut cmd = Command::new(claude);
     cmd.args(["mcp", "get", SERVER_NAME]);
-    registered_from(run_probe(Some(cmd), CHECK_TIMEOUT))
+    run_probe(Some(cmd), CHECK_TIMEOUT)
 }
 
 /// Only a clean exit counts; a timeout or a missing CLI reads as not registered.
 fn registered_from(probe: Probe) -> bool {
-    matches!(probe, Probe::Exited { success: true, .. })
+    verification_from(probe) == Verification::Listed
+}
+
+/// What `claude mcp get octopush` said after a successful `add`.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Verification {
+    Listed,
+    /// The CLI answered, and the entry isn't there.
+    NotListed,
+    /// `mcp get` timed out or couldn't start — we don't know.
+    Unconfirmed,
+}
+
+fn verification_from(probe: Probe) -> Verification {
+    match probe {
+        Probe::Exited { success: true, .. } => Verification::Listed,
+        Probe::Exited { success: false, .. } => Verification::NotListed,
+        Probe::TimedOut | Probe::Missing => Verification::Unconfirmed,
+    }
 }
 
 /// Shown when Claude Code's config lock stays held after one retry.
@@ -139,12 +161,17 @@ enum CliFailure {
     Other,
 }
 
+/// Lock wording, matched as whole phrases so `blocked`, `clock`, `unlock` or a
+/// path like `/Users/lockhart/` don't read as a held config lock.
+const LOCK_PHRASES: [&str; 7] =
+    ["elocked", "ebusy", "acquire lock", "acquire the lock", "lock file", "is locked", "is busy"];
+
 fn classify_failure(output: &str) -> CliFailure {
     let text = output.to_lowercase();
     // Lock first: retrying a misread not-found is harmless, the reverse isn't.
     // "mcp server found" covers both "No MCP server found…" and the scoped
     // "No user-scoped MCP server found…".
-    if text.contains("lock") || text.contains("busy") {
+    if LOCK_PHRASES.iter().any(|p| text.contains(p)) {
         CliFailure::Busy
     } else if ["mcp server found", "not found", "does not exist", "no such server"]
         .iter()
@@ -212,7 +239,7 @@ impl ConnectOutcome {
 /// tested against recorded output.
 fn connect_flow(
     mut run: impl FnMut(&Step) -> Result<CliRun, String>,
-    verify: impl FnOnce() -> bool,
+    verify: impl FnOnce() -> Verification,
     mut pause: impl FnMut(),
 ) -> ConnectOutcome {
     let could_not_run = |e: String| ConnectOutcome::failed(format!("Could not run the Claude Code CLI: {e}"));
@@ -240,19 +267,19 @@ fn connect_flow(
 
     match with_lock_retry(|| run(&Step::Add), &mut pause) {
         Err(e) => could_not_run(e),
-        Ok(r) if r.success => {
-            if verify() {
-                ConnectOutcome {
-                    ok: true,
-                    registered: true,
-                    message: "Connected to Claude Code. Start a new Claude Code session to load the Octopush tools.".into(),
-                }
-            } else {
-                ConnectOutcome::failed(
-                    "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
-                )
-            }
-        }
+        Ok(r) if r.success => match verify() {
+            Verification::Listed => ConnectOutcome {
+                ok: true,
+                registered: true,
+                message: "Connected to Claude Code. Start a new Claude Code session to load the Octopush tools.".into(),
+            },
+            Verification::NotListed => ConnectOutcome::failed(
+                "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
+            ),
+            Verification::Unconfirmed => ConnectOutcome::failed(
+                "Claude Code accepted the registration but didn't confirm it in time — check the status again in a moment.",
+            ),
+        },
         Ok(r) if classify_failure(&r.output) == CliFailure::Busy => ConnectOutcome::failed(BUSY_MESSAGE),
         Ok(r) if r.output.is_empty() => {
             ConnectOutcome::failed("Claude Code rejected the registration. Try the manual command below.")
@@ -336,7 +363,7 @@ pub fn connect() -> McpConnectResult {
             Step::Remove => run_cli(&claude, &remove_args),
             Step::Add => run_cli(&claude, &add_args),
         },
-        || is_registered(&claude),
+        || verification_from(probe_registration(&claude)),
         || std::thread::sleep(LOCK_RETRY_PAUSE),
     );
 
@@ -370,7 +397,7 @@ mod tests {
             Self { remove: RefCell::new(remove), add: RefCell::new(add), calls: RefCell::new(vec![]) }
         }
 
-        fn run(&self, verified: bool) -> ConnectOutcome {
+        fn run(&self, verified: Verification) -> ConnectOutcome {
             connect_flow(
                 |step| {
                     let (name, queue) = match step {
@@ -406,13 +433,21 @@ mod tests {
         assert_eq!(classify_failure("Config file is busy"), CliFailure::Busy);
         assert_eq!(classify_failure(EXISTS), CliFailure::Other);
         assert_eq!(classify_failure("Permission denied"), CliFailure::Other);
+        // "lock" inside other words or paths is not a held config lock.
+        assert_eq!(classify_failure("Request blocked by policy"), CliFailure::Other);
+        assert_eq!(classify_failure("Error: system clock is skewed"), CliFailure::Other);
+        assert_eq!(classify_failure("Failed to unlock keychain"), CliFailure::Other);
+        assert_eq!(
+            classify_failure("EACCES: permission denied, open '/Users/lockhart/.claude.json'"),
+            CliFailure::Other
+        );
         assert_eq!(classify_failure(""), CliFailure::Other);
     }
 
     #[test]
     fn missing_server_on_remove_is_fine_and_add_is_verified() {
         let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(true, "Added stdio MCP server octopush")]);
-        let out = s.run(true);
+        let out = s.run(Verification::Listed);
         assert!(out.ok && out.registered, "{out:?}");
         assert_eq!(*s.calls.borrow(), ["remove", "add", "get"]);
     }
@@ -420,7 +455,7 @@ mod tests {
     #[test]
     fn other_remove_failure_is_surfaced_not_discarded() {
         let s = Script::new(vec![exit(false, "Permission denied: ~/.claude.json")], vec![]);
-        let out = s.run(true);
+        let out = s.run(Verification::Listed);
         assert!(!out.ok && !out.registered);
         assert!(out.message.contains("Permission denied"), "{}", out.message);
         assert_eq!(*s.calls.borrow(), ["remove"]);
@@ -429,7 +464,7 @@ mod tests {
     #[test]
     fn lock_on_remove_retries_once_then_continues() {
         let s = Script::new(vec![exit(false, LOCKED), exit(true, "")], vec![exit(true, "")]);
-        let out = s.run(true);
+        let out = s.run(Verification::Listed);
         assert!(out.ok && out.registered, "{out:?}");
         assert_eq!(*s.calls.borrow(), ["remove", "pause", "remove", "add", "get"]);
     }
@@ -437,45 +472,55 @@ mod tests {
     #[test]
     fn lock_held_through_the_retry_reports_busy() {
         let s = Script::new(vec![exit(false, LOCKED), exit(false, ELOCKED)], vec![]);
-        let out = s.run(true);
+        let out = s.run(Verification::Listed);
         assert_eq!(out, ConnectOutcome::failed(BUSY_MESSAGE));
         assert_eq!(*s.calls.borrow(), ["remove", "pause", "remove"]);
 
         let s = Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(false, LOCKED)]);
-        assert_eq!(s.run(true), ConnectOutcome::failed(BUSY_MESSAGE));
+        assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
         assert_eq!(*s.calls.borrow(), ["remove", "add", "pause", "add"]);
     }
 
     #[test]
     fn lock_on_add_retries_once() {
         let s = Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(true, "")]);
-        assert!(s.run(true).registered);
+        assert!(s.run(Verification::Listed).registered);
         assert_eq!(*s.calls.borrow(), ["remove", "add", "pause", "add", "get"]);
     }
 
     #[test]
     fn non_lock_add_failure_keeps_the_cli_error_and_does_not_retry() {
         let s = Script::new(vec![exit(true, "")], vec![exit(false, EXISTS)]);
-        let out = s.run(true);
+        let out = s.run(Verification::Listed);
         assert_eq!(out.message, format!("Claude Code error: {EXISTS}"));
         assert_eq!(*s.calls.borrow(), ["remove", "add"]);
 
         let s = Script::new(vec![exit(true, "")], vec![exit(false, "")]);
-        assert!(s.run(true).message.contains("rejected the registration"));
+        assert!(s.run(Verification::Listed).message.contains("rejected the registration"));
     }
 
     #[test]
     fn registered_comes_from_mcp_get_not_the_add_exit_code() {
         let s = Script::new(vec![exit(true, "")], vec![exit(true, "")]);
-        let out = s.run(false);
+        let out = s.run(Verification::NotListed);
         assert!(!out.ok && !out.registered, "{out:?}");
-        assert!(out.message.contains("Try again in a moment"), "{}", out.message);
+        assert!(out.message.contains("doesn't list it"), "{}", out.message);
+    }
+
+    #[test]
+    fn mcp_get_timeout_after_add_is_not_reported_as_unlisted() {
+        let s = Script::new(vec![exit(true, "")], vec![exit(true, "")]);
+        let out = s.run(Verification::Unconfirmed);
+        assert!(!out.ok && !out.registered, "{out:?}");
+        assert!(out.message.contains("didn't confirm it in time"), "{}", out.message);
+        assert!(!out.message.contains("doesn't list it"), "{}", out.message);
+        assert_eq!(*s.calls.borrow(), ["remove", "add", "get"]);
     }
 
     #[test]
     fn cli_that_cannot_start_is_reported() {
         let s = Script::new(vec![Err("No such file or directory".into())], vec![]);
-        assert!(s.run(true).message.starts_with("Could not run the Claude Code CLI"));
+        assert!(s.run(Verification::Listed).message.starts_with("Could not run the Claude Code CLI"));
     }
 
     #[test]
@@ -484,6 +529,15 @@ mod tests {
         assert!(!registered_from(Probe::Exited { success: false, output: String::new() }));
         assert!(!registered_from(Probe::TimedOut));
         assert!(!registered_from(Probe::Missing));
+    }
+
+    #[test]
+    fn mcp_get_probe_tells_not_listed_from_unconfirmed() {
+        let exited = |success| Probe::Exited { success, output: String::new() };
+        assert_eq!(verification_from(exited(true)), Verification::Listed);
+        assert_eq!(verification_from(exited(false)), Verification::NotListed);
+        assert_eq!(verification_from(Probe::TimedOut), Verification::Unconfirmed);
+        assert_eq!(verification_from(Probe::Missing), Verification::Unconfirmed);
     }
 
     #[test]
