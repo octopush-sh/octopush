@@ -55,7 +55,7 @@ function seed(sessions: Seed[], activeId?: string) {
 
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
-  useAttentionStore.setState({ flagsByWs: {} });
+  useAttentionStore.setState({ flagsByWs: {}, waitsByTerminal: {}, soundEnabled: false });
   vi.clearAllMocks();
 });
 
@@ -169,6 +169,28 @@ describe("SessionRail", () => {
 
     expect(screen.getByTestId("session-bell-b")).toBeTruthy();
     expect(screen.queryByTestId("session-bell-a")).toBeNull();
+  });
+
+  it("marks every session Claude Code's hooks say is waiting, not only the latest", () => {
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }], "a");
+    act(() => {
+      useAttentionStore.getState().ping(WS, "terminal", "b", "permission");
+      useAttentionStore.getState().ping(WS, "terminal", "c", "input");
+    });
+    render(<SessionRail workspaceId={WS} onOpenBeside={noop} />);
+
+    expect(screen.getByTestId("session-bell-b")).toHaveAttribute(
+      "title",
+      "Claude Code is waiting on you in this session",
+    );
+    expect(screen.getByTestId("session-bell-c")).toBeTruthy();
+    expect(screen.getByTestId("session-cell-b")).toHaveAttribute("aria-label", "dev — waiting on permission (⌘⌥2)");
+    expect(screen.getByTestId("session-cell-c")).toHaveAttribute("aria-label", "tests — waiting on your input (⌘⌥3)");
+
+    // Answering one clears its mark only.
+    act(() => useAttentionStore.getState().clearWait("c"));
+    expect(screen.getByTestId("session-bell-b")).toBeTruthy();
+    expect(screen.queryByTestId("session-bell-c")).toBeNull();
   });
 
   it("never marks the session you are already looking at", () => {

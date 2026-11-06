@@ -53,6 +53,16 @@ export type ShownWaitingEvent =
   | { type: "hidden" };
 
 /**
+ * True when `event` ends an off-screen session's wait (`waitsByTerminal`):
+ * the user focused the session or typed into it, or Claude Code's turn ended.
+ * Applied per session, so answering one prompt never clears another's. A pane
+ * leaving the screen or a new attention ping keeps the wait.
+ */
+export function clearsWait(event: ShownWaitingEvent): boolean {
+  return event.type === "focus" || event.type === "input" || event.type === "settled";
+}
+
+/**
  * What an on-screen session is waiting on after `event`, given `current`.
  *
  * Only Claude Code's own hook reasons (`permission`, `input`) mark a pane on

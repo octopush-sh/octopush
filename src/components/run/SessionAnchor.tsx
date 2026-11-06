@@ -22,16 +22,22 @@ export function SessionAnchor({ workspaceId, onOpen }: Props) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
   const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
   const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  const otherWaits = useAttentionStore((s) =>
+    Object.entries(s.waitsByTerminal).some(
+      ([id, w]) => w.workspaceId === workspaceId && id !== activeId,
+    ),
+  );
 
   const active = terminals.find((t) => t.id === activeId) ?? null;
   if (!active) return null;
 
   const Icon = iconForSessionRole(active.role);
-  // `attentionStore` holds ONE flag per workspace (a newer ping replaces the
-  // older), so this is a boolean, not a count — printing "1 waiting" would
-  // promise a counter the store cannot keep.
+  // A boolean, not a count: bell and idle pings keep ONE flag per workspace (a
+  // newer ping replaces the older), so "1 waiting" would promise a counter the
+  // store cannot keep. Claude Code's hook waits are per session (`waitsByTerminal`).
   const waiting =
-    flag?.kind === "terminal" && !!flag.terminalId && flag.terminalId !== activeId;
+    otherWaits ||
+    (flag?.kind === "terminal" && !!flag.terminalId && flag.terminalId !== activeId);
   const doing = active.busy ? (active.command ?? "running") : ROLE_WORD[active.role];
 
   return (
