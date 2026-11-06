@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
-use crate::readiness::{run_probe, Probe, CHECK_TIMEOUT};
+use crate::readiness::{run_status_probe, Probe, CHECK_TIMEOUT};
 
 const MCP_BIN: &str = "octopush-mcp";
 /// The MCP server name registered with the client. Tools then surface as
@@ -119,7 +119,8 @@ fn is_registered(claude: &Path) -> bool {
 fn probe_registration(claude: &Path) -> Probe {
     let mut cmd = Command::new(claude);
     cmd.args(["mcp", "get", SERVER_NAME]);
-    run_probe(Some(cmd), CHECK_TIMEOUT)
+    // Only the exit status matters; output goes to /dev/null so a large listing can't fill a pipe.
+    run_status_probe(Some(cmd), CHECK_TIMEOUT)
 }
 
 /// Only a clean exit counts; a timeout or a missing CLI reads as not registered.
@@ -277,7 +278,7 @@ fn connect_flow(
                 "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
             ),
             Verification::Unconfirmed => ConnectOutcome::failed(
-                "Claude Code accepted the registration but didn't confirm it in time — check the status again in a moment.",
+                "Claude Code accepted the registration but didn't confirm it in time — press Connect to Claude Code again in a moment to check.",
             ),
         },
         Ok(r) if classify_failure(&r.output) == CliFailure::Busy => ConnectOutcome::failed(BUSY_MESSAGE),
@@ -513,6 +514,9 @@ mod tests {
         let out = s.run(Verification::Unconfirmed);
         assert!(!out.ok && !out.registered, "{out:?}");
         assert!(out.message.contains("didn't confirm it in time"), "{}", out.message);
+        // The card has no status check of its own; pressing Connect again re-runs the verify.
+        assert!(out.message.contains("press Connect to Claude Code again"), "{}", out.message);
+        assert!(!out.message.contains("check the status"), "{}", out.message);
         assert!(!out.message.contains("doesn't list it"), "{}", out.message);
         assert_eq!(*s.calls.borrow(), ["remove", "add", "get"]);
     }
