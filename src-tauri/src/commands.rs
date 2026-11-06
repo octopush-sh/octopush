@@ -3716,6 +3716,15 @@ pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate:
     crate::claude_plan::load(&state.db.lock())
 }
 
+/// When the claude.ai sign-in ends, as CLI stages last reported it
+/// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said, and
+/// `None` while an Anthropic key is set (Readiness then says "API key").
+#[tauri::command]
+pub async fn get_claude_login(state: State<'_, AppState>) -> AppResult<Option<crate::claude_login::LoginExpiry>> {
+    let stored = crate::claude_login::load(&state.db.lock())?;
+    Ok(crate::claude_login::shown(stored, crate::claude_login::has_anthropic_key()))
+}
+
 // ─── Pricing refresh from LiteLLM ────────────────────────────────
 
 /// Shape of a single entry in the LiteLLM pricing dataset.
@@ -6401,8 +6410,10 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 /// Settings › General readiness card: local checks (claude, auth mode, git,
 /// gh, Ollama), each bounded at 3 s, re-probed on every call.
 #[tauri::command]
-pub async fn readiness_check() -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
-    tokio::task::spawn_blocking(crate::readiness::run_all)
+pub async fn readiness_check(state: State<'_, AppState>) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
+    // The stored sign-in end, read before the blocking probes (no network).
+    let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
+    tokio::task::spawn_blocking(move || crate::readiness::run_all(login))
         .await
         .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))
 }

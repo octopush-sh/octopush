@@ -7,6 +7,7 @@ pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
 pub mod claude_hooks;
+pub mod claude_login;
 pub mod claude_plan;
 mod commands;
 pub mod context_guard;
@@ -294,6 +295,7 @@ pub fn run() {
             // Usage breakdown
             commands::get_usage_breakdown,
             commands::get_claude_plan,
+            commands::get_claude_login,
             // Pricing refresh
             commands::refresh_pricing,
             commands::reprice_spend,

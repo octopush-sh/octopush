@@ -13,6 +13,8 @@ import { useEntitlementStore } from "../../stores/entitlementStore";
 import { ipc, type Routine } from "../../lib/ipc";
 import type { Workspace } from "../../lib/types";
 import { pushToast } from "../Toasts";
+import { ClaudeLoginNote } from "../ClaudeLoginNote";
+import { tourId } from "../../lib/tour/ids";
 import { formatRelTime } from "../../lib/relTime";
 import {
   draftFromRoutine,
@@ -125,6 +127,8 @@ export function RoutinesPane() {
                 </button>
               )}
             </div>
+
+            <ClaudeLoginNote tourId={tourId("routines-login-expiry")} />
 
             {routines.length === 0 ? (
               <p className="rounded-xl border border-dashed border-octo-hairline px-6 py-10 text-center text-[13px] text-octo-mute">

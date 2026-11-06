@@ -220,6 +220,22 @@ pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
     }
 }
 
+/// When the stored claude.ai sign-in ends, epoch seconds, from the `result`
+/// event's `credential_expires_at` (Claude Code 2.1.318+). `None` for other
+/// events, for older CLIs that don't send it and for a value it can't read.
+/// The changelog doesn't give the format, so RFC 3339 text and epoch
+/// seconds or milliseconds are all accepted.
+pub(crate) fn credential_expiry_from_result(v: &Value) -> Option<i64> {
+    if !is_result_event(v) {
+        return None;
+    }
+    let raw = v.get("credential_expires_at")?;
+    match raw.as_str() {
+        Some(s) => chrono::DateTime::parse_from_rfc3339(s.trim()).ok().map(|d| d.timestamp()),
+        None => epoch_secs(Some(raw)).filter(|s| *s > 0),
+    }
+}
+
 /// Merge PATH-like dir lists into one, de-duplicating while preserving
 /// first-seen order and dropping empty segments.
 pub fn merge_path_dirs(parts: &[&str]) -> String {
@@ -1537,6 +1553,10 @@ impl AgentRunner for CliRunner {
                     if !windows.is_empty() {
                         // `PersistingSink` keeps the snapshot.
                         emitter.plan_windows(&windows);
+                    }
+                    if let Some(expires_at) = credential_expiry_from_result(value) {
+                        // `PersistingSink` keeps it for Readiness and the notes.
+                        emitter.login_expiry(expires_at);
                     }
                 }
             }
