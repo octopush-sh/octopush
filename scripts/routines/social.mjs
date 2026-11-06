@@ -142,7 +142,7 @@ export function aiRuleOk(rule) {
 /** The disclosure every mention of Octopush carries (marketing/README.md). */
 export const DISCLOSURE = /\bI build Octopush\b/i;
 /** Self-references that make a draft promotional even without the name: they need the disclosure. */
-const SELF_REF = /\b(?:octopush|my (?:own )?(?:app|tool|project|product|ide)|I built|I made|I'm building|I am building|I build|we built|we made|DM me|PM me)\b/i;
+const SELF_REF = /\b(?:octopush|my (?:own )?(?:app|tool|product|ide)|I'm building|I am building|we built|DM me|PM me)\b/i;
 /** Parallel/background wording; it presents a Pro feature only near "Direct" or "pipeline" (free-vs-pro.md). */
 const PARALLEL = /\b(?:parallel|concurren\w*|background|simultaneous\w*|at the same time|side[- ]by[- ]side)\b/gi;
 const FREE_BOUNDARY = /\bone (?:run )?at a time\b/i;
@@ -165,8 +165,13 @@ export function presentsProRuns(text) {
 const SHORTENERS = new Set(["bit.ly", "tinyurl.com", "t.co", "goo.gl", "ow.ly", "is.gd", "buff.ly", "rebrand.ly", "cutt.ly", "shorturl.at", "rb.gy", "lnkd.in", "t.ly", "tiny.cc", "s.id", "bl.ink", "short.io", "v.gd", "tr.im", "shorte.st", "adf.ly", "surl.li", "dub.sh", "trib.al", "fb.me", "youtu.be", "redd.it", "amzn.to", "git.io"]);
 const URL_ANY = /\bhttps?:\/\/[^\s<>()[\]"'`]+/gi;
 const MD_TARGET = /\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
-const BARE = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)+[a-z]{2,24}\/[^\s<>()[\]"'`]*/gi;
-const BARE_OCTO = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)*octopush\.sh\b(?!\/)/gi;
+// A host may end in a dot (`octopush.sh./x` is octopush.sh): both patterns accept one before the path.
+const BARE = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)+[a-z]{2,24}\.?\/[^\s<>()[\]"'`]*/gi;
+const BARE_OCTO = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)*octopush\.sh(?!\.?[\w/-])/gi;
+/** A markdown link with its visible text: `[text](target)`. */
+const MD_LINK = /\[([^\]\n]{1,300})\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
+/** Visible text that reads as a URL or a domain. */
+const LOOKS_LIKE_URL = /^(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,24}\.?(?:[/?#]\S*)?$/i;
 const trailing = (s) => s.replace(/[.,;:!?*_~]+$/, "");
 
 /** Every link in a text: scheme URLs, markdown/masked link targets and bare domains with a path (pure). */
@@ -179,6 +184,22 @@ export function extractUrls(text) {
   return [...found].filter(Boolean);
 }
 
+/** A hostname for comparisons: lowercased, trailing dots stripped (`octopush.sh.` is octopush.sh). */
+export const hostOf = (u) => u.hostname.toLowerCase().replace(/\.+$/, "");
+const parseUrl = (raw) => { try { return new URL(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`); } catch { return null; } };
+const canon = (u) => `${u.protocol}//${hostOf(u).replace(/^www\./, "")}${u.port ? `:${u.port}` : ""}${u.pathname.replace(/\/+$/, "")}${u.search}${u.hash}`;
+/** Masked links: visible text that reads as a URL or domain must be the target itself (pure). */
+export function maskedLinkProblems(text) {
+  for (const m of String(text).matchAll(MD_LINK)) {
+    const shown = m[1].trim().replace(/^[`<]+|[`>]+$/g, "");
+    if (!LOOKS_LIKE_URL.test(shown)) continue;
+    const a = parseUrl(trailing(shown)), b = parseUrl(trailing(m[2]));
+    if (!a || !b || canon(a) !== canon(b)) return ["a link whose visible text is a different URL or domain than its target"];
+  }
+  return [];
+}
+
+// The allow-list is literal: no trailing dot on octopush.sh itself.
 const okOcto = (u) => u.protocol === "https:" && u.hostname === "octopush.sh" && !u.username && !u.password && !u.port && (
   (u.pathname === "/" && !u.search && !u.hash)
   || (/^\/docs\/[A-Za-z0-9_\-/]*$/.test(u.pathname) && !u.search)
@@ -188,14 +209,16 @@ const okOcto = (u) => u.protocol === "https:" && u.hostname === "octopush.sh" &&
 export function linkProblems(text) {
   const out = new Set();
   for (const raw of extractUrls(text)) {
-    let u;
-    try { u = new URL(/^[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : `https://${raw}`); } catch { out.add("a link can't be parsed"); continue; }
-    const host = u.hostname.toLowerCase().replace(/^www\./, "");
+    const u = parseUrl(raw);
+    if (!u) { out.add("a link can't be parsed"); continue; }
+    // Trailing dots are stripped before any check: `octopush.sh.` and `bit.ly.` are those hosts.
+    const full = hostOf(u), host = full.replace(/^www\./, "");
     if (!["http:", "https:"].includes(u.protocol)) out.add("a link that is not http(s)");
     else if (SHORTENERS.has(host)) out.add("a link shortener (link the page itself)");
-    else if (/(^|\.)octopush\.sh$/.test(u.hostname.toLowerCase()) && !okOcto(u)) out.add("an octopush.sh link other than https://octopush.sh/, https://octopush.sh/docs/… or https://octopush.sh/download?src=reddit");
+    else if (/(^|\.)octopush\.sh$/.test(full) && !okOcto(u)) out.add("an octopush.sh link other than https://octopush.sh/, https://octopush.sh/docs/… or https://octopush.sh/download?src=reddit");
     else if (host === "github.com" && /^\/octopush-sh\/octopush\/releases/i.test(u.pathname)) out.add("links the raw GitHub releases page (use https://octopush.sh/download?src=reddit)");
   }
+  for (const p of maskedLinkProblems(text)) out.add(p);
   return [...out];
 }
 

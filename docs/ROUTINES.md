@@ -83,12 +83,14 @@ anything else fails the job.
   - records the subreddit's AI-content rule as anything but exactly `no rule` or
     `allowed: "<quoted rule>"` whose quote restricts nothing (fail closed: any ban, removal,
     disclosure or flair requirement drops the draft);
-  - mentions Octopush, or "my app", "I built", "I made", "DM me" and the like, without
-    "I build Octopush";
+  - mentions Octopush, or "my app/tool/product/IDE", "I'm building", "we built", "DM me" or
+    "PM me", without "I build Octopush";
   - links a shortener, the raw GitHub releases page, or any octopush.sh URL other than
     `https://octopush.sh/`, `https://octopush.sh/docs/…` and
     `https://octopush.sh/download?src=reddit` (every link, masked or bare, is extracted and listed
-    in the draft's metadata);
+    in the draft's metadata; hostnames are compared with trailing dots stripped, and
+    `octopush.sh.` itself is never allowed), or shows a URL or domain as a masked link's text
+    that differs from its target;
   - presents Direct or pipeline runs in parallel or in the background without
     "one run at a time";
   - repeats an earlier draft's text, or its thread (subreddit + post id);

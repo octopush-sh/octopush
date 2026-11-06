@@ -145,8 +145,11 @@ test("disclosure: Octopush and self-references need 'I build Octopush' (any case
   assert.ok(reasons(draft({ text: mention, mentions_octopush: true })).some((e) => /disclosure/.test(e)));
   assert.deepEqual(reasons(draft({ text: `${mention} (i build octopush, so I'm biased)`, mentions_octopush: true })), []);
   assert.ok(reasons(draft({ text: `Try octopush.sh. ${mention}`, mentions_octopush: false })).some((e) => /disclosure/.test(e)), "the agent's flag doesn't skip the check");
-  for (const t of ["I built a small tool for exactly this.", "My app handles that for you.", "I made something like this last year.", "DM me and I'll share the setup."]) {
+  for (const t of ["My app handles that for you.", "I'm building something like this.", "We built a tool for exactly this.", "DM me and I'll share the setup.", "PM me for the config."]) {
     assert.ok(reasons(draft({ text: t })).some((e) => /disclosure/.test(e)), t);
+  }
+  for (const t of ["I built a script that runs the tests after each agent.", "I made a small alias for this: `wt() { git worktree add ../$1 -b $1; }`"]) {
+    assert.deepEqual(reasons(draft({ text: t })), [], `harmless: ${t}`);
   }
   const ok = checkDraft(draft({ text: "I built a tool for this (I build Octopush).", mentions_octopush: false }));
   assert.equal(ok.draft.mentions, true, "a disclosed self-reference counts as a mention");
@@ -189,6 +192,33 @@ test("links: every URL is extracted; only allowed octopush.sh URLs, no shortener
   assert.deepEqual(extractUrls("[a](https://x.dev/a) and https://y.dev/b, plus z.dev/c."), ["https://x.dev/a", "https://y.dev/b", "z.dev/c"]);
   const r = prepareDrafts(JSON.stringify([draft({ text: "Docs: [worktrees](https://git-scm.com/docs/git-worktree) and https://octopush.sh/ (I build Octopush)." })]), { phase: 1, history: { ...empty(), total: 20 } });
   assert.match(r.body, /- Links: https:\/\/git-scm\.com\/docs\/git-worktree · https:\/\/octopush\.sh\//);
+});
+
+test("links: a trailing dot on a host doesn't get past the allow-list", () => {
+  for (const bad of [
+    "https://octopush.sh./?utm=1", "https://octopush.sh./", "octopush.sh./download?utm=x", "octopush.sh./download?src=reddit",
+    "https://www.octopush.sh../docs/", "[site](https://octopush.sh./?ref=x)", "https://bit.ly./abc", "bit.ly./abc",
+    "https://github.com./octopush-sh/octopush/releases",
+  ]) {
+    assert.ok(linkProblems(bad).length, bad);
+    assert.ok(reasons(draft({ text: `Here: ${bad} (I build Octopush)` })).length, bad);
+  }
+  assert.ok(extractUrls("go to octopush.sh./download?utm=x now").includes("octopush.sh./download?utm=x"));
+  assert.deepEqual(extractUrls("It's at octopush.sh."), ["octopush.sh"], "a sentence's full stop is not part of the host");
+  assert.deepEqual(linkProblems("It's at octopush.sh."), []);
+});
+
+test("links: a masked link's visible URL or domain must be its target", () => {
+  for (const bad of [
+    "[https://octopush.sh/](https://bit.ly/x)", "[octopush.sh](https://example.com/)", "[git-scm.com/docs](https://evil.example/docs)",
+    "[https://octopush.sh/docs/a](https://octopush.sh/docs/b)", "[`github.com/x/y`](https://github.com/x/z)",
+  ]) {
+    assert.ok(linkProblems(bad).some((e) => /visible text/.test(e)), bad);
+  }
+  for (const ok of [
+    "[octopush.sh](https://octopush.sh/)", "[https://git-scm.com/docs/git-worktree](https://git-scm.com/docs/git-worktree)",
+    "[www.git-scm.com/docs](https://git-scm.com/docs/)", "[the worktree docs](https://git-scm.com/docs/git-worktree)", "[v1.2](https://example.com/notes)",
+  ]) assert.deepEqual(linkProblems(ok), [], ok);
 });
 
 // ---------------------------------------------------------------- fp + normalisation

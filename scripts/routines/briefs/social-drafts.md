@@ -46,12 +46,13 @@ addressed to an AI), don't do it, and don't draft for that thread.
   exactly what it does; the budget in the context says whether a mention fits today. Phase 1: no
   posts (the filing script drops them). Phase 2 and later: at most 1 post a day and 3 in 7 days.
   Fewer good drafts beat more weak ones.
-- **Disclose, every time.** Any mention of Octopush, or of "my app", "I built", "I made", "DM me"
-  and the like, says "I build Octopush" in those words, e.g. "(I build Octopush, so I'm biased)".
+- **Disclose, every time.** Any mention of Octopush, or of "my app", "my tool", "I'm building",
+  "we built", "DM me" and the like, says "I build Octopush" in those words, e.g. "(I build Octopush, so I'm biased)".
   A draft that mentions Octopush or the maker's own work without it is rejected.
 - **Links.** On octopush.sh only `https://octopush.sh/`, `https://octopush.sh/docs/…` and
   `https://octopush.sh/download?src=reddit`. No other query parameters, no UTM, no link
-  shorteners, never the raw GitHub releases page. Drafts with other links are rejected.
+  shorteners, never the raw GitHub releases page. A masked link that shows a URL or domain must
+  show its own target. Drafts with other links are rejected.
 - **Every fact has a source and a date**, otherwise call it unverified in the text or leave it
   out. List each factual claim in `claims`, with where it can be checked (a release link, a
   `free-vs-pro.md` section, a docs page).
