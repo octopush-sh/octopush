@@ -6,6 +6,8 @@ import { ipc, type ReadinessCheck } from "../lib/ipc";
 interface ReadinessState {
   /** null = not checked yet this session. */
   checks: ReadinessCheck[] | null;
+  /** When the last successful check answered (epoch ms); null = never. */
+  checkedAt: number | null;
   loading: boolean;
   /** The command itself failed (not a check). */
   error: string | null;
@@ -14,6 +16,7 @@ interface ReadinessState {
 
 export const useReadinessStore = create<ReadinessState>()((set, get) => ({
   checks: null,
+  checkedAt: null,
   loading: false,
   error: null,
 
@@ -21,7 +24,11 @@ export const useReadinessStore = create<ReadinessState>()((set, get) => ({
     if (get().loading) return;
     set({ loading: true, error: null });
     try {
-      set({ checks: await ipc.readinessCheck(), loading: false });
+      const result: unknown = await ipc.readinessCheck();
+      // A backend that answers with anything but a list reports no checks
+      // rather than leaving the card blank.
+      const checks = Array.isArray(result) ? (result as ReadinessCheck[]) : [];
+      set({ checks, checkedAt: Date.now(), loading: false });
     } catch (e) {
       set({ error: String(e), loading: false });
     }
