@@ -9,6 +9,7 @@ const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useTerminalLayoutStore, evenRatios, leaveView } = await import("../../stores/terminalLayoutStore");
 const { useTerminalSlotsStore } = await import("../../stores/terminalSlotsStore");
 const { RunPanes } = await import("./RunPanes");
+const { useAttentionStore } = await import("../../stores/attentionStore");
 
 const WS = "ws-panes";
 const run = () => useTerminalLayoutStore.getState().getRun(WS);
@@ -40,6 +41,7 @@ beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
   useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false });
   useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
+  useAttentionStore.setState({ waitingByTerminal: {} });
 });
 
 describe("RunPanes", () => {
@@ -64,6 +66,28 @@ describe("RunPanes", () => {
     fireEvent.click(screen.getByRole("button", { name: /Label a/ }));
     expect(run().slots).toEqual(["a", "b"]);
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("a");
+  });
+
+  it("marks only the caption of the on-screen pane Claude Code is waiting on", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    act(() => useAttentionStore.getState().setShownWaiting("b", "permission"));
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const marked = screen.getByTestId("run-pane-caption-1");
+    expect(marked).toHaveTextContent("waiting on permission");
+    // Mute ink with one static brass dot — no pulse.
+    const suffix = marked.querySelector("[data-testid='pane-waiting']")!;
+    expect(suffix.className).toContain("text-octo-mute");
+    expect(suffix.querySelectorAll(".bg-octo-brass")).toHaveLength(1);
+    expect(marked.innerHTML).not.toMatch(/pulse|beacon/);
+    expect(screen.getByTestId("run-pane-caption-0")).not.toHaveTextContent("waiting");
+
+    // A new reason crossfades in; clearing fades the suffix out.
+    act(() => useAttentionStore.getState().setShownWaiting("b", "input"));
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)); });
+    expect(screen.getByTestId("run-pane-caption-1")).toHaveTextContent("waiting on your input");
+    act(() => useAttentionStore.getState().setShownWaiting("b", null));
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)); });
+    expect(screen.getByTestId("run-pane-caption-1")).not.toHaveTextContent("waiting");
   });
 
   it("leaves the view with ×, back to one pane, and keeps the session", () => {

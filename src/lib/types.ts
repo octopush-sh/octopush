@@ -261,6 +261,12 @@ export interface PtyAttentionEvent {
   reason?: PtyAttentionReason;
 }
 
+/** Payload of the `pty://settled` Tauri event: Claude Code's `Stop` hook
+ *  reported that the session's turn ended. Never sent without the hooks. */
+export interface PtySettledEvent {
+  sessionId: string;
+}
+
 /** Payload of the `pty://foreground` Tauri event. Emitted when the PTY's
  *  foreground process flips between the shell (idle) and a running command —
  *  `busy` is true while a command executes. Drives the rail's processing bar. */

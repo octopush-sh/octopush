@@ -21,6 +21,7 @@ import { tourId } from "../../lib/tour/ids";
 import { MenuSurface } from "../MenuSurface";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
+import { PaneWaiting } from "./PaneWaiting";
 
 interface Props {
   workspaceId: string;
@@ -334,6 +335,10 @@ function PaneCaption({
             <span className="min-w-0 truncate">{session?.label}</span>
           </span>
         </FadeSwap>
+        <PaneWaiting
+          terminalId={terminalId}
+          tour={slot === 0 ? tourId("run-pane-waiting") : undefined}
+        />
       </button>
       <button
         type="button"

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { modeForFlag, shouldClearAttention } from "./attentionFocus";
+import { modeForFlag, nextShownWaiting, shouldClearAttention } from "./attentionFocus";
 import type { AttentionFlag } from "../stores/attentionStore";
 
 const terminalFlag = (terminalId: string | null): AttentionFlag => ({
@@ -35,5 +35,37 @@ describe("shouldClearAttention", () => {
   it("maps each flag kind to the surface it is asking for", () => {
     expect(modeForFlag(chatFlag)).toBe("talk");
     expect(modeForFlag(terminalFlag("t1"))).toBe("run");
+  });
+});
+
+describe("nextShownWaiting", () => {
+  const attention = (reason: "idle" | "permission" | "input" | null, shown = true) =>
+    ({ type: "attention", reason, shown }) as const;
+
+  it("marks a pane on screen with Claude Code's own hook reason", () => {
+    expect(nextShownWaiting(null, attention("permission"))).toBe("permission");
+    expect(nextShownWaiting(null, attention("input"))).toBe("input");
+    // The latest reason wins.
+    expect(nextShownWaiting("permission", attention("input"))).toBe("input");
+  });
+
+  it("never marks a pane that is off screen: the rail flag points at it", () => {
+    expect(nextShownWaiting(null, attention("permission", false))).toBeNull();
+    expect(nextShownWaiting("input", attention("permission", false))).toBeNull();
+  });
+
+  it("leaves the mark alone for the idle guess and for an event with no reason", () => {
+    // `idle` is the daemon's heuristic; a missing reason is an older daemon or CLI.
+    expect(nextShownWaiting(null, attention("idle"))).toBeNull();
+    expect(nextShownWaiting(null, attention(null))).toBeNull();
+    expect(nextShownWaiting("permission", attention("idle"))).toBe("permission");
+    expect(nextShownWaiting("permission", attention(null))).toBe("permission");
+  });
+
+  it("clears on input, focus, the end of the turn and leaving the screen", () => {
+    for (const type of ["input", "focus", "settled", "hidden"] as const) {
+      expect(nextShownWaiting("permission", { type })).toBeNull();
+      expect(nextShownWaiting(null, { type })).toBeNull();
+    }
   });
 });

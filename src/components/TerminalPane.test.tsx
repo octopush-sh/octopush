@@ -808,6 +808,52 @@ describe("TerminalPane — shown and focused", () => {
     ping.mockRestore();
   });
 
+  it("marks an on-screen pane Claude Code waits on, and clears it when the user answers", async () => {
+    const { useAttentionStore } = await import("../stores/attentionStore");
+    useAttentionStore.setState({ waitingByTerminal: {} });
+    const waiting = () => useAttentionStore.getState().waitingByTerminal["t-wait"];
+    const props = { terminalId: "t-wait", workspaceId: "ws", workspacePath: "/ws", label: "L" };
+    const { rerender, unmount } = render(<TerminalPane {...props} shown focused={false} />);
+
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "permission" }));
+    expect(waiting()).toBe("permission");
+    // The idle guess and a reason-less event (older daemon) change nothing.
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "idle" }));
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait" }));
+    expect(waiting()).toBe("permission");
+
+    // A keystroke answers it.
+    const term = xtermHoisted.last!;
+    act(() => term.dataHandler?.("y"));
+    expect(waiting()).toBeUndefined();
+
+    // Claude Code's Stop hook ends the wait; another session's does not.
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "input" }));
+    act(() => emitEvent("pty://settled", { sessionId: "other" }));
+    expect(waiting()).toBe("input");
+    act(() => emitEvent("pty://settled", { sessionId: "t-wait" }));
+    expect(waiting()).toBeUndefined();
+
+    // Focusing the pane clears it.
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "permission" }));
+    rerender(<TerminalPane {...props} shown focused />);
+    expect(waiting()).toBeUndefined();
+
+    // Leaving the screen clears it, and a hidden pane is never marked.
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "permission" }));
+    rerender(<TerminalPane {...props} shown={false} focused={false} />);
+    expect(waiting()).toBeUndefined();
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "permission" }));
+    expect(waiting()).toBeUndefined();
+
+    // Closing the session drops it too.
+    rerender(<TerminalPane {...props} shown focused={false} />);
+    act(() => emitEvent("pty://attention", { sessionId: "t-wait", reason: "input" }));
+    expect(waiting()).toBe("input");
+    unmount();
+    expect(waiting()).toBeUndefined();
+  });
+
   it("holds the PTY's size while a divider is dragged and sends it on release", async () => {
     const { useTerminalLayoutStore } = await import("../stores/terminalLayoutStore");
     const width = vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(800);
