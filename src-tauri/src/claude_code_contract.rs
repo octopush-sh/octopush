@@ -1186,6 +1186,12 @@ fn mcp_add_argv_matches_the_recorded_registration() {
         // recorded output names the server at user scope.
         let get = rec.text("mcp/mcp-get.txt");
         assert!(get.contains("octopush:") && get.contains("Scope: User"), "[{}] {get}", rec.label("mcp/mcp-get.txt"));
+        // Connect skips remove → add when `mcp get` already shows this exact registration.
+        assert!(
+            crate::mcp_setup::registered_with(&get, Path::new(MCP_BINARY)),
+            "[{}] recorded `mcp get` no longer parses as our registration: {get}",
+            rec.label("mcp/mcp-get.txt")
+        );
     }
 }
 
