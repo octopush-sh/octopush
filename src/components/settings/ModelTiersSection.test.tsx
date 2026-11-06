@@ -50,6 +50,23 @@ describe("ModelTiersSection", () => {
     expect(screen.queryByLabelText("Clear fast tier")).toBeNull();
   });
 
+  it("renders tier identifiers in mono, never as literal backticks", async () => {
+    await act(async () => {
+      render(<ModelTiersSection />);
+    });
+    for (const [t, ids] of [
+      ["fast", ["haiku", "fast"]],
+      ["balanced", ["sonnet", "balanced"]],
+      ["strong", ["opus", "strong"]],
+    ] as const) {
+      const row = screen.getByTestId(`tier-${t}`);
+      expect(row.textContent).not.toContain("`");
+      for (const id of ids) {
+        expect(within(row).getByText(id, { selector: "span.font-mono" })).toBeInTheDocument();
+      }
+    }
+  });
+
   it("shows the persisted mapping and clears a tier without touching other settings", async () => {
     getSettings.mockResolvedValue({ ...BASE, modelTiers: { fast: "gpt-4o-mini", strong: "gpt-4o" } });
     await act(async () => {
