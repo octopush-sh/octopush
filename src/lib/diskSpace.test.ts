@@ -10,6 +10,10 @@ describe("lowDiskLine", () => {
       "Only 1.4 GB free — this run may fail when the disk fills",
     );
     expect(lowDiskLine({ freeBytes: LOW_DISK_BYTES - 1, totalBytes: TOTAL })).not.toBeNull();
+    // Under 1 GB it reads in MB, like the Readiness row (`format_bytes` in readiness.rs).
+    expect(lowDiskLine({ freeBytes: 600 * 1024 ** 2, totalBytes: TOTAL })).toBe(
+      "Only 600 MB free — this run may fail when the disk fills",
+    );
   });
 
   it("stays quiet at 2 GB and above", () => {

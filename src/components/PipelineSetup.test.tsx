@@ -408,7 +408,7 @@ describe("PipelineSetup Claude Code version preflight", () => {
       render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
       const line = screen.getByTestId("launcher-low-disk");
       expect(line).toHaveTextContent("Only 1.4 GB free — this run may fail when the disk fills");
-      expect(line).toHaveClass("text-octo-warning");
+      expect(line).toHaveClass("text-octo-warning", "octo-tabular");
       fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
       expect(onBegin).toHaveBeenCalled();
 

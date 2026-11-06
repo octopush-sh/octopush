@@ -455,7 +455,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                     data-tour="direct-launcher-low-disk"
                     data-testid="launcher-low-disk"
                     title="Each crew gets its own worktree, and its setup script may install dependencies into it. The run can still begin."
-                    className="octo-pop-in m-0 font-mono text-[10px] text-octo-warning"
+                    className="octo-pop-in octo-tabular m-0 font-mono text-[10px] text-octo-warning"
                   >
                     {lowDisk}
                   </p>

@@ -209,10 +209,20 @@ pub const DISK_WARN_BYTES: u64 = 10 * GIB;
 /// (`LOW_DISK_BYTES` in `src/lib/diskSpace.ts`).
 pub const DISK_FAIL_BYTES: u64 = 2 * GIB;
 
-/// `18 GB`, `1.4 GB`: whole numbers from 10 up, like the footer's `formatBytes`.
-pub fn format_gb(bytes: u64) -> String {
-    let gb = bytes as f64 / GIB as f64;
-    let (v, unit) = if gb >= 1024.0 { (gb / 1024.0, "TB") } else { (gb, "GB") };
+/// `18 GB`, `1.4 GB`, `600 MB`, `0 B`: the footer's `formatBytes`
+/// (`src/lib/formatBytes.ts`), whole numbers from 10 of a unit up.
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    let unit = UNITS[i];
     let one = (v * 10.0).round() / 10.0;
     if one < 10.0 { format!("{one:.1} {unit}") } else { format!("{} {unit}", v.round()) }
 }
@@ -227,7 +237,7 @@ pub fn disk_check(disk: &crate::perf::DiskInfo) -> Option<ReadinessCheck> {
         return None;
     }
     let free = disk.free_bytes;
-    let value = format!("{} free", format_gb(free));
+    let value = format!("{} free", format_bytes(free));
     Some(if free < DISK_FAIL_BYTES {
         let fix = "A crew will likely fail when the disk fills. Free some space or archive old workspaces before a run.";
         ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &value, fix, None)
@@ -464,11 +474,14 @@ mod tests {
 
     #[test]
     fn disk_sizes_read_like_the_footer() {
-        assert_eq!(format_gb(0), "0.0 GB");
-        assert_eq!(format_gb(14 * GIB / 10), "1.4 GB");
-        assert_eq!(format_gb(10 * GIB), "10 GB");
-        assert_eq!(format_gb(460 * GIB), "460 GB");
-        assert_eq!(format_gb(2048 * GIB), "2.0 TB");
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(600 * 1024 * 1024), "600 MB");
+        assert_eq!(format_bytes(14 * GIB / 10), "1.4 GB");
+        assert_eq!(format_bytes(10 * GIB), "10 GB");
+        assert_eq!(format_bytes(460 * GIB), "460 GB");
+        assert_eq!(format_bytes(2048 * GIB), "2.0 TB");
     }
 
     #[test]
