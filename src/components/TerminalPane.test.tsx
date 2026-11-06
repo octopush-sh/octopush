@@ -822,8 +822,12 @@ describe("TerminalPane — shown and focused", () => {
     act(() => emitEvent("pty://attention", { sessionId: "t-wait" }));
     expect(waiting()).toBe("permission");
 
-    // A keystroke answers it.
+    // A mouse report or one of xterm's own query replies is not an answer.
     const term = xtermHoisted.last!;
+    act(() => term.dataHandler?.("\x1b[<64;10;5M"));
+    act(() => term.dataHandler?.("\x1b[?1;2c"));
+    expect(waiting()).toBe("permission");
+    // A keystroke answers it.
     act(() => term.dataHandler?.("y"));
     expect(waiting()).toBeUndefined();
 

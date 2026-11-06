@@ -22,6 +22,7 @@ import { useTerminalsStore } from "../stores/terminalsStore";
 import { ptySizeHeld, useTerminalLayoutStore } from "../stores/terminalLayoutStore";
 import { XTERM_FONT_FAMILY, XTERM_FONT_SIZE, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
+import { isTypedInput } from "../lib/xtermReports";
 import { isMac } from "../lib/platform";
 import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
 import { SETUP_EXIT_OSC, parseSetupExit } from "../lib/setupRun";
@@ -583,7 +584,9 @@ export function TerminalPane({
     const dataDisp = term.onData((data) => {
       const ptyId = ptySessionIdRef.current;
       if (!ptyId) return;
-      applyShownWaiting({ type: "input" });
+      // Only a key or paste answers a prompt — not xterm's own query replies
+      // or mouse reports, which arrive here too.
+      if (isTypedInput(data)) applyShownWaiting({ type: "input" });
       ipc.writeTextToSession(ptyId, data).catch(() => {});
     });
 
