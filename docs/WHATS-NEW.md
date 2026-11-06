@@ -77,6 +77,7 @@ Current anchors:
 | `run-pane-caption` · `run-pane-menu` · `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first pane's caption · its "Pane options" button · the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
 | `run-pane-orientation` | The first pane's options menu, while open with two or three panes: "Automatic" | `run/RunPanes.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
+| `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-pair-input` · `run-pair-pick` | Pairing switcher (Open beside), while open: its query input · its first session row (only when a session is off screen) | `run/SessionSwitcher.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
