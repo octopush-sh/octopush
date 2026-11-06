@@ -49,18 +49,80 @@ describe("StageFocus live journal", () => {
     expect(screen.getByText("Read")).toBeInTheDocument();          // tool name
     expect(screen.getByText("src/auth.rs")).toBeInTheDocument();   // hint
     expect(screen.getByText(/142 lines/)).toBeInTheDocument();     // result detail
-    // The old role-verb pulse is retired — the pinned Player narrates instead
+    // The old role-verb pulse is retired — the inline Player narrates instead
     // (last entry is a settled tool_result → back to thought).
     expect(screen.getByText("Thinking…")).toBeInTheDocument();
     expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
-  it("shows the pinned Player even when there are no entries yet", () => {
+  it("holds the journal slot with a waiting row and the inline Player before the first entry", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    expect(screen.getByText("Thinking…")).toBeInTheDocument();
+    const waiting = screen.getByText("Waiting for the first tool call…");
+    const player = screen.getByText("Thinking…").closest("[data-placement]")!;
+    expect(player.getAttribute("data-placement")).toBe("inline");
+    // Docked at the journal's tail, in the same scroll flow — not pinned to the canvas bottom.
+    const scroller = waiting.closest(".overflow-auto")!;
+    expect(scroller.contains(player)).toBe(true);
+    expect(scroller.lastElementChild).toBe(player);
+    expect(player.className).not.toMatch(/\babsolute\b/);
+    // No bottom wash or Player padding left behind.
+    expect(scroller.className).not.toContain("pb-[96px]");
   });
 
-  it("narrates the live tool in the pinned Player while running", () => {
+  it("keeps the gate's Waiting for you under the header, not below the artifact's diff", async () => {
+    vi.mocked(ipc.getGitDiff).mockResolvedValue(
+      ["diff --git a/src/a.ts b/src/a.ts", "--- a/src/a.ts", "+++ b/src/a.ts", "@@ -1 +1 @@", "-old line", "+new line"].join("\n"),
+    );
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Edit", hint: "src/a.ts" }] } });
+    const artifact = JSON.stringify({ kind: "note", text: "hand-off text", refsWorktree: true });
+    render(
+      <StageFocus
+        stage={{ ...baseStage, status: "awaiting_checkpoint", checkpoint: true, artifact }}
+        workspacePath="/tmp"
+      />,
+    );
+    const diffLine = await screen.findByText("+new line");
+    const scroller = screen.getByText(/hand-off text/).closest(".overflow-auto")!;
+    expect(scroller.contains(diffLine)).toBe(true); // the live diff renders in the scroller
+    vi.mocked(ipc.getGitDiff).mockResolvedValue("");
+    const player = screen.getByText("Waiting for you").closest("[data-placement]")!;
+    // Outside the scroller, ahead of it — never its last child after the diff, never pinned.
+    expect(scroller.contains(player)).toBe(false);
+    expect(player.compareDocumentPosition(scroller) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(player.className).not.toMatch(/\babsolute\b/);
+  });
+
+  it("puts a budget-parked stage's Player under the header too", () => {
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "notice", text: "budget reached" }] } });
+    render(<StageFocus stage={{ ...baseStage, status: "awaiting_checkpoint" }} workspacePath="/tmp" />);
+    const scroller = screen.getByText(/budget reached/).closest(".overflow-auto")!;
+    expect(scroller.contains(screen.getByText("Waiting for you"))).toBe(false);
+  });
+
+  it("plays the done beat where the Player was when the stage finishes with an artifact", () => {
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "text", text: "wrapping up" }] } });
+    const { container, rerender } = render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
+    const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
+    rerender(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
+    const beat = container.querySelector(".octo-mascot--pushed-beat");
+    expect(beat).not.toBeNull();
+    expect(beat!.closest(".overflow-auto")).not.toBeNull();
+  });
+
+  it("drops the waiting row once the first entry lands", () => {
+    useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Read", hint: "src/a.ts" }] } });
+    render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
+    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
+    expect(screen.getByText("src/a.ts")).toBeInTheDocument();
+  });
+
+  it("shows no waiting row on a stage that isn't running", () => {
+    render(<StageFocus stage={{ ...baseStage, status: "pending" }} workspacePath="/tmp" />);
+    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
+    expect(screen.getByText("Nothing produced yet.")).toBeInTheDocument();
+  });
+
+  it("narrates the live tool in the inline Player while running", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Grep", hint: "" }] } });
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
     expect(screen.getByText("Searching…")).toBeInTheDocument();

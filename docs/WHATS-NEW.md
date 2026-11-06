@@ -69,6 +69,7 @@ Current anchors:
 | `direct-launcher-begin` | Direct launcher: "Begin the run" | `PipelineSetup.tsx` |
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
+| `direct-focus-waiting` | Direct stage focus, only while a running stage has no journal entry yet: the "Waiting for the first tool call…" row | `StageFocus.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the focused session's rail cell · a rail cell flyout's "Open beside" / "Replace in the focused pane" (on hover, while Open beside can do something) | `run/SessionRail.tsx` |

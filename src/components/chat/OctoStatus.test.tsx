@@ -65,6 +65,13 @@ describe("OctoStatus", () => {
     expect(container.querySelector(".octo-mascot--search")).not.toBeNull();
   });
 
+  it("stays pinned bottom-center in TALK", () => {
+    const { container } = render(<OctoStatus {...base} streaming />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.dataset.placement).toBe("pinned");
+    expect(root.className).toMatch(/\babsolute\b/);
+  });
+
   it("waiting label renders in brass", () => {
     const { getByText } = render(<OctoStatus {...base} streaming approvals={2} />);
     expect(getByText("Waiting for you").className).toContain("text-octo-brass");

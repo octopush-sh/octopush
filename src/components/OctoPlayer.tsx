@@ -53,14 +53,18 @@ interface Props {
   /** True when this deactivation must not be celebrated (error, user abort,
    *  failed stage). Reduced motion also skips the beat. */
   skipBeat: boolean;
+  /** "pinned" (default, TALK): bottom-center over the canvas, stacked.
+   *  "inline" (DIRECT): a row in the flow at the journal's tail — the
+   *  octopus leads and the label follows, so its width still can't move it. */
+  placement?: "pinned" | "inline";
 }
 
-/** The Player — the pinned bottom-center figure that acts out live work
- *  (spec 2026-07-19 §4). Mode-agnostic: TALK (OctoStatus) and DIRECT
- *  (StageOctoStatus) feed it identity/active/role/skipBeat. Stacked on one
- *  axis so the label's width can never move the octopus; manages its own
- *  exit (✓ beat then fade). */
-export function OctoPlayer({ identity, active, role, skipBeat }: Props) {
+/** The Player — the figure that acts out live work (spec 2026-07-19 §4).
+ *  Mode-agnostic: TALK (OctoStatus) and DIRECT (StageOctoStatus) feed it
+ *  identity/active/role/skipBeat. Pinned, it is stacked on one axis so the
+ *  label's width can never move the octopus; manages its own exit (✓ beat
+ *  then fade). */
+export function OctoPlayer({ identity, active, role, skipBeat, placement = "pinned" }: Props) {
   const reduced = useReducedMotion();
   const [phase, setPhase] = useState<"hidden" | "live" | "beat" | "fading">(
     active ? "live" : "hidden",
@@ -152,9 +156,12 @@ export function OctoPlayer({ identity, active, role, skipBeat }: Props) {
   return (
     <div
       aria-live="polite"
-      className={`pointer-events-none absolute bottom-3 left-1/2 z-10 flex -translate-x-1/2 flex-col items-center gap-[5px] ${
-        phase === "fading" ? "octo-fade-out" : "octo-rise-in"
-      }`}
+      data-placement={placement}
+      className={`pointer-events-none flex ${
+        placement === "inline"
+          ? "items-center gap-2"
+          : "absolute bottom-3 left-1/2 z-10 -translate-x-1/2 flex-col items-center gap-[5px]"
+      } ${phase === "fading" ? "octo-fade-out" : "octo-rise-in"}`}
     >
       <svg
         width="22"
