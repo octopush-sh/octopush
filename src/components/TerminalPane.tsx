@@ -16,7 +16,7 @@ import type {
   PtySettledEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
-import { nextShownWaiting, type ShownWaitingEvent } from "../lib/attentionFocus";
+import { clearsWait, nextShownWaiting, type ShownWaitingEvent } from "../lib/attentionFocus";
 import { claudeWaitReason, notifyClaudeWaiting } from "../lib/claudeWaiting";
 import { useTerminalsStore } from "../stores/terminalsStore";
 import { ptySizeHeld, useTerminalLayoutStore } from "../stores/terminalLayoutStore";
@@ -158,6 +158,8 @@ export function TerminalPane({
       const current = store.waitingByTerminal[terminalId] ?? null;
       const next = nextShownWaiting(current, event);
       if (next !== current) store.setShownWaiting(terminalId, next);
+      // The same answers end the wait the rail marks while it is off screen.
+      if (clearsWait(event)) store.clearWait(terminalId);
     },
     [terminalId],
   );

@@ -6,6 +6,48 @@ import { besideReplaces, useTerminalLayoutStore } from "../../stores/terminalLay
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { ROLE_WORD } from "../../lib/sessionRole";
 import { tourId } from "../../lib/tour/ids";
+import { useAttentionStore, type TerminalWait } from "../../stores/attentionStore";
+import { claudeWaitingCopy, type ClaudeWaitReason } from "../../lib/claudeWaiting";
+
+/** What a session is waiting on, for ordering: `since` is null when the wait
+ *  started on screen (a pane caption's mark keeps no start time). */
+export interface SessionWait {
+  reason: ClaudeWaitReason;
+  since: number | null;
+}
+
+/** A session's wait: off screen (`waitsByTerminal`) first, else on screen. */
+export function sessionWait(
+  terminalId: string,
+  waits: Record<string, TerminalWait>,
+  shownWaiting: Record<string, ClaudeWaitReason>,
+): SessionWait | null {
+  const off = waits[terminalId];
+  if (off) return { reason: off.reason, since: off.since };
+  const shown = shownWaiting[terminalId];
+  return shown ? { reason: shown, since: null } : null;
+}
+
+/**
+ * Waiting sessions first, oldest wait first — the prompt that has cost the most
+ * idle time is the first row, so ⏎ answers it. Waits with no start time (on
+ * screen) follow the timed ones; everything else keeps its rail order. Rows
+ * keep their own `index`, so ⌘⌥N numbers don't move with the sort.
+ */
+export function orderWaitingFirst<R extends { t: { id: string } }>(
+  rows: R[],
+  waitOf: (id: string) => SessionWait | null,
+): Array<R & { wait: SessionWait | null }> {
+  const rank = (w: SessionWait | null) => (w ? (w.since ?? Number.MAX_SAFE_INTEGER) : Infinity);
+  // Array.prototype.sort is stable, so equal ranks keep the rail order.
+  return rows
+    .map((r) => ({ ...r, wait: waitOf(r.t.id) }))
+    .sort((a, b) => {
+      const ra = rank(a.wait);
+      const rb = rank(b.wait);
+      return ra === rb ? 0 : ra < rb ? -1 : 1;
+    });
+}
 
 interface Props {
   workspaceId: string;
@@ -77,16 +119,21 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   const deleting = useRef(new Set<string>());
   const inputRef = useRef<HTMLInputElement>(null);
 
+  const waits = useAttentionStore((s) => s.waitsByTerminal);
+  const shownWaiting = useAttentionStore((s) => s.waitingByTerminal);
+
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
     // The number is the session's rail address (⌘⌥N), also when pairing
     // leaves some sessions out.
     const rows = terminals.map((t) => ({ t, index: allTerminals.indexOf(t) }));
-    if (!q) return rows;
-    return rows.filter(({ t }) =>
-      `${t.label} ${ROLE_WORD[t.role]} ${t.command ?? ""}`.toLowerCase().includes(q),
-    );
-  }, [terminals, allTerminals, query]);
+    const found = q
+      ? rows.filter(({ t }) =>
+          `${t.label} ${ROLE_WORD[t.role]} ${t.command ?? ""}`.toLowerCase().includes(q),
+        )
+      : rows;
+    return orderWaitingFirst(found, (id) => sessionWait(id, waits, shownWaiting));
+  }, [terminals, allTerminals, query, waits, shownWaiting]);
 
   // The "open a new session" row sits one past the matches, so the selection
   // range is [0, matches.length].
@@ -189,7 +236,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
           )}
 
           {matches.map((row, i) => {
-            const { t, index } = row;
+            const { t, index, wait } = row;
             const Icon = iconForSessionRole(t.role);
             const state = t.busy ? (t.command ?? "running") : ROLE_WORD[t.role];
             return (
@@ -228,8 +275,22 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
                       </span>
                     )}
                   </span>
-                  <span className="mt-0.5 block truncate font-mono text-[10px] text-octo-mute">
-                    {state}
+                  <span className="mt-0.5 flex min-w-0 items-center font-mono text-[10px] text-octo-mute">
+                    <span className="min-w-0 truncate">{state}</span>
+                    {wait && (
+                      // The pane caption's suffix: mute mono, one static brass dot.
+                      <span
+                        data-testid={`session-switcher-waiting-${t.id}`}
+                        // Waiting rows sort first, so row 0 is the oldest wait.
+                        data-tour={i === 0 ? tourId("run-switcher-waiting") : undefined}
+                        title="Claude Code is waiting on you in this session"
+                        className="octo-fade-in flex shrink-0 items-center gap-1.5 whitespace-nowrap pl-1.5"
+                      >
+                        <span aria-hidden>·</span>
+                        <span aria-hidden className="h-1.5 w-1.5 shrink-0 rounded-full bg-octo-brass" />
+                        {claudeWaitingCopy(wait.reason)}
+                      </span>
+                    )}
                   </span>
                 </span>
               </button>

@@ -17,7 +17,8 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useTerminalLayoutStore } = await import("../../stores/terminalLayoutStore");
-const { SessionSwitcher } = await import("./SessionSwitcher");
+const { useAttentionStore } = await import("../../stores/attentionStore");
+const { SessionSwitcher, orderWaitingFirst } = await import("./SessionSwitcher");
 
 const WS = "ws-switcher";
 
@@ -45,7 +46,51 @@ function seed(
 beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
   useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, talkByWs: {}, talkFocusedByWs: {} });
+  useAttentionStore.setState({ flagsByWs: {}, waitsByTerminal: {}, waitingByTerminal: {}, soundEnabled: false });
   vi.clearAllMocks();
+});
+
+describe("SessionSwitcher — waiting sessions first", () => {
+  it("orders waits oldest first, then on-screen waits, then the rest in rail order", () => {
+    const rows = ["a", "b", "c", "d", "e"].map((id, index) => ({ t: { id }, index }));
+    const waits: Record<string, { reason: "permission" | "input"; since: number | null }> = {
+      d: { reason: "input", since: 200 },
+      b: { reason: "permission", since: 100 },
+      e: { reason: "input", since: null },
+    };
+    const out = orderWaitingFirst(rows, (id) => waits[id] ?? null);
+    expect(out.map((r) => r.t.id)).toEqual(["b", "d", "e", "a", "c"]);
+    // Each row keeps its own ⌘⌥N address.
+    expect(out.map((r) => r.index)).toEqual([1, 3, 4, 0, 2]);
+  });
+
+  it("lists the oldest waiting session first with its number, suffix and 'here' intact", () => {
+    vi.useFakeTimers();
+    seed([{ id: "a", label: "main" }, { id: "b", label: "dev" }, { id: "c", label: "tests" }], "a");
+    vi.setSystemTime(1_000);
+    useAttentionStore.getState().ping(WS, "terminal", "c", "permission");
+    vi.setSystemTime(2_000);
+    useAttentionStore.getState().ping(WS, "terminal", "b", "input");
+    vi.useRealTimers();
+    const onClose = vi.fn();
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} />);
+
+    const rows = screen.getAllByRole("option").filter((r) => r.dataset.testid?.startsWith("session-switcher-row-"));
+    expect(rows.map((r) => r.dataset.testid)).toEqual([
+      "session-switcher-row-c",
+      "session-switcher-row-b",
+      "session-switcher-row-a",
+    ]);
+    expect(rows[0].textContent).toContain("3");
+    expect(screen.getByTestId("session-switcher-waiting-c").textContent).toContain("waiting on permission");
+    expect(screen.getByTestId("session-switcher-waiting-b").textContent).toContain("waiting on your input");
+    expect(screen.queryByTestId("session-switcher-waiting-a")).toBeNull();
+    expect(rows[2].textContent).toContain("here");
+
+    // ⏎ goes to the longest wait.
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Enter" });
+    expect(useTerminalsStore.getState().getActiveId(WS)).toBe("c");
+  });
 });
 
 describe("SessionSwitcher — Talk's seat", () => {

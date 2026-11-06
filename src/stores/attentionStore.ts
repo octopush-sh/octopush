@@ -52,6 +52,18 @@ export interface AttentionFlag {
   reason?: PtyAttentionReason | null;
 }
 
+/**
+ * An off-screen session that Claude Code's hooks say is blocked on the user.
+ * Kept per terminal, not per workspace: two sessions waiting on permission are
+ * two prompts to answer, and a newer one must not hide the older.
+ */
+export interface TerminalWait {
+  workspaceId: string;
+  reason: ClaudeWaitReason;
+  /** ms timestamp of the first hook ping of this wait — oldest waits list first. */
+  since: number;
+}
+
 interface AttentionState {
   /** Per-workspace flag. Absent = no attention needed. */
   flagsByWs: Record<string, AttentionFlag>;
@@ -63,6 +75,15 @@ interface AttentionState {
    * (lib/attentionFocus.ts).
    */
   waitingByTerminal: Record<string, ClaudeWaitReason>;
+  /**
+   * Off-screen sessions waiting on the user, from Claude Code's hooks
+   * (`permission` / `input` pings). Bell and idle pings stay one per workspace
+   * in `flagsByWs`; hook pings land in both, so Mission Control and the mode
+   * pulse read `flagsByWs` as before while the session rail and the ⌘⌥K
+   * switcher mark every waiting session. Absent = not waiting. Cleared per
+   * session by `clearWait` (rule: `clearsWait`, lib/attentionFocus.ts).
+   */
+  waitsByTerminal: Record<string, TerminalWait>;
   /** User preference — defaults to on; toggle in Settings → General. */
   soundEnabled: boolean;
   /** Internal: last chime timestamp, used for rate-limiting. */
@@ -79,9 +100,13 @@ interface AttentionState {
   ) => void;
   /** Clear the flag for a workspace (called when the user focuses it). */
   clear: (workspaceId: string) => void;
-  /** Clear the flag only if it points at this terminal — called when a session
-   *  is closed, so a marker can't outlive the thing that raised it. */
+  /** Clear the flag only if it points at this terminal, and the terminal's
+   *  wait — called when a session is closed, so a marker can't outlive the
+   *  thing that raised it. */
   clearForTerminal: (workspaceId: string, terminalId: string) => void;
+  /** Clear one session's wait without touching any other session's — and the
+   *  workspace flag, only when that flag is this same hook wait. */
+  clearWait: (terminalId: string) => void;
   /** Set (or, with null, clear) what an on-screen session is waiting on. */
   setShownWaiting: (terminalId: string, reason: ClaudeWaitReason | null) => void;
   /** Persisted toggle. */
@@ -100,6 +125,7 @@ const readSoundPref = (): boolean => {
 export const useAttentionStore = create<AttentionState>((set, get) => ({
   flagsByWs: {},
   waitingByTerminal: {},
+  waitsByTerminal: {},
   soundEnabled: readSoundPref(),
   lastChimeAt: 0,
 
@@ -107,7 +133,22 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
     const now = Date.now();
     set((s) => {
       const existing = s.flagsByWs[workspaceId];
+      // Only Claude Code's own hook reasons open a per-session wait; a bell or
+      // the daemon's idle guess leaves any wait as it was.
+      const waitReason =
+        kind === "terminal" && terminalId && (reason === "permission" || reason === "input")
+          ? reason
+          : null;
+      const prevWait = terminalId ? s.waitsByTerminal[terminalId] : undefined;
       return {
+        ...(waitReason && terminalId
+          ? {
+              waitsByTerminal: {
+                ...s.waitsByTerminal,
+                [terminalId]: { workspaceId, reason: waitReason, since: prevWait?.since ?? now },
+              },
+            }
+          : {}),
         flagsByWs: {
           ...s.flagsByWs,
           [workspaceId]: {
@@ -142,10 +183,32 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
   clearForTerminal: (workspaceId, terminalId) =>
     set((s) => {
       const flag = s.flagsByWs[workspaceId];
-      if (!flag || flag.terminalId !== terminalId) return s;
-      const next = { ...s.flagsByWs };
-      delete next[workspaceId];
-      return { flagsByWs: next };
+      const ownsFlag = !!flag && flag.terminalId === terminalId;
+      if (!ownsFlag && !(terminalId in s.waitsByTerminal)) return s;
+      const flags = { ...s.flagsByWs };
+      if (ownsFlag) delete flags[workspaceId];
+      const waits = { ...s.waitsByTerminal };
+      delete waits[terminalId];
+      return { flagsByWs: flags, waitsByTerminal: waits };
+    }),
+
+  clearWait: (terminalId) =>
+    set((s) => {
+      const wait = s.waitsByTerminal[terminalId];
+      if (!wait) return s;
+      const waits = { ...s.waitsByTerminal };
+      delete waits[terminalId];
+      // The workspace flag this same wait raised ends with it; a bell or idle
+      // ping that came later, or another session's, stays.
+      const flag = s.flagsByWs[wait.workspaceId];
+      const sameWait =
+        flag?.kind === "terminal" &&
+        flag.terminalId === terminalId &&
+        (flag.reason === "permission" || flag.reason === "input");
+      if (!sameWait) return { waitsByTerminal: waits };
+      const flags = { ...s.flagsByWs };
+      delete flags[wait.workspaceId];
+      return { waitsByTerminal: waits, flagsByWs: flags };
     }),
 
   setShownWaiting: (terminalId, reason) =>

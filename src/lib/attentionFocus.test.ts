@@ -1,6 +1,19 @@
 import { describe, it, expect } from "vitest";
-import { modeForFlag, nextShownWaiting, shouldClearAttention } from "./attentionFocus";
+import { clearsWait, modeForFlag, nextShownWaiting, shouldClearAttention } from "./attentionFocus";
 import type { AttentionFlag } from "../stores/attentionStore";
+
+describe("clearsWait", () => {
+  it("ends a session's wait when it is focused, typed into or its turn ends", () => {
+    expect(clearsWait({ type: "focus" })).toBe(true);
+    expect(clearsWait({ type: "input" })).toBe(true);
+    expect(clearsWait({ type: "settled" })).toBe(true);
+  });
+
+  it("keeps it when the pane leaves the screen or rings again", () => {
+    expect(clearsWait({ type: "hidden" })).toBe(false);
+    expect(clearsWait({ type: "attention", reason: "permission", shown: false })).toBe(false);
+  });
+});
 
 const terminalFlag = (terminalId: string | null): AttentionFlag => ({
   kind: "terminal",

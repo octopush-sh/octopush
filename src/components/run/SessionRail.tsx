@@ -6,6 +6,7 @@ import { useAttentionStore } from "../../stores/attentionStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { ROLE_WORD } from "../../lib/sessionRole";
 import { describeSetup } from "../../lib/setupRun";
+import { claudeWaitingCopy } from "../../lib/claudeWaiting";
 import { tourId } from "../../lib/tour/ids";
 
 interface Props {
@@ -44,6 +45,9 @@ export function SessionRail({ workspaceId, onOpenBeside }: Props) {
   const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
   const flag = useAttentionStore((s) => s.flagsByWs[workspaceId]);
+  // Hook waits are per session, so every blocked cell is marked, not only the
+  // one that pinged last.
+  const waits = useAttentionStore((s) => s.waitsByTerminal);
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   // Read on every render: `terminals` and `layout` above re-render the rail
   // whenever either answer can change.
@@ -54,6 +58,8 @@ export function SessionRail({ workspaceId, onOpenBeside }: Props) {
   const shownIds = paired ? (layout?.slots ?? []) : [];
 
   const ringingId = flag?.kind === "terminal" ? (flag.terminalId ?? null) : null;
+  // The tour points at the first marked waiting cell.
+  const firstWaitingId = terminals.find((t) => waits[t.id] && t.id !== activeId)?.id ?? null;
 
   // The open flyout, with the viewport coordinates of the cell that owns it.
   // The cell list scrolls (a workspace can hold any number of sessions), and an
@@ -174,9 +180,12 @@ export function SessionRail({ workspaceId, onOpenBeside }: Props) {
         // while a build runs. Same wording as the switcher and the anchor.
         // A setup run speaks for its session until it succeeds; after that the
         // session is an ordinary shell.
+        // A Claude Code session blocked on the user says so first.
         const setup = setupByTerminal[t.id];
-        const doing =
-          setup && setup.status !== "ok"
+        const wait = waits[t.id];
+        const doing = wait
+          ? claudeWaitingCopy(wait.reason)
+          : setup && setup.status !== "ok"
             ? describeSetup(setup)
             : t.busy ? (t.command ?? "running") : ROLE_WORD[t.role];
 
@@ -275,11 +284,16 @@ export function SessionRail({ workspaceId, onOpenBeside }: Props) {
             {/* Rang-while-hidden marker. Static, not pulsing: inside Run the
                 mode switcher's pulse has already handed off, and Law 2 allows
                 exactly one pulsing element per attention scope. */}
-            {ringingId === t.id && t.id !== activeId && (
+            {(wait || ringingId === t.id) && t.id !== activeId && (
               <span
                 data-testid={`session-bell-${t.id}`}
+                data-tour={t.id === firstWaitingId ? tourId("run-session-waiting") : undefined}
                 className="octo-pop-in pointer-events-none absolute right-0.5 top-0.5 h-1.5 w-1.5 rounded-full bg-octo-brass"
-                title="This session rang while you were elsewhere"
+                title={
+                  wait
+                    ? "Claude Code is waiting on you in this session"
+                    : "This session rang while you were elsewhere"
+                }
               />
             )}
 
