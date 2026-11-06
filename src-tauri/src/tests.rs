@@ -8997,6 +8997,25 @@ mod cli_dialect_tests {
     }
 
     #[test]
+    fn claude_stages_hand_their_effort_to_subagents_too() {
+        use crate::providers::Effort;
+        // Subagents on another model no longer inherit --effort; the stage's
+        // level rides CLAUDE_CODE_SUBAGENT_EFFORT, and nothing is set without one.
+        assert_eq!(
+            CliDialect::Claude.stage_effort_env(Some(Effort::High)),
+            vec![("CLAUDE_CODE_SUBAGENT_EFFORT", "high".to_string())]
+        );
+        assert_eq!(
+            CliDialect::Claude.stage_effort_env(Some(Effort::Low)),
+            vec![("CLAUDE_CODE_SUBAGENT_EFFORT", "low".to_string())]
+        );
+        assert!(CliDialect::Claude.stage_effort_env(None).is_empty(), "no effort ⇒ the CLI's own default");
+        assert!(CliDialect::Codex.stage_effort_env(Some(Effort::High)).is_empty());
+        // The always-on stage env never names a subagent effort on its own.
+        assert!(!CliDialect::Claude.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_SUBAGENT_EFFORT"));
+    }
+
+    #[test]
     fn effort_applies_to_api_and_claude_cli_only() {
         use crate::orchestrator::cli_runner::effort_applies;
         assert!(effort_applies("api", "gpt-5"));

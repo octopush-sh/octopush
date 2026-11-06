@@ -836,6 +836,19 @@ impl CliDialect {
         }
     }
 
+    /// Effort environment for the stage's CLI process. Claude Code (2.1.317+)
+    /// no longer carries `--effort` to subagents on another model, so the
+    /// stage's level also rides `CLAUDE_CODE_SUBAGENT_EFFORT` (2.1.316+; an
+    /// older CLI ignores the unknown variable). A subagent's own `effort`
+    /// frontmatter still wins. Set over any inherited export, and only when
+    /// the stage passes an effort — otherwise the CLI keeps its defaults.
+    pub fn stage_effort_env(&self, effort: Option<crate::providers::Effort>) -> Vec<(&'static str, String)> {
+        match effort {
+            Some(e) if self.takes_effort() => vec![("CLAUDE_CODE_SUBAGENT_EFFORT", e.as_str().to_string())],
+            _ => Vec::new(),
+        }
+    }
+
     fn not_found_message(&self) -> String {
         match self {
             CliDialect::Claude => "Claude Code CLI (`claude`) was not found. Octopush searched your PATH, \
@@ -1437,6 +1450,9 @@ impl AgentRunner for CliRunner {
         // After the login-shell env, which may carry the user's own export.
         for k in dialect.stage_env_remove(effort) {
             command.env_remove(k);
+        }
+        for (k, v) in dialect.stage_effort_env(effort) {
+            command.env(k, v);
         }
         command
             .env("PATH", &path_env)
