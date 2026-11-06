@@ -3717,10 +3717,12 @@ pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate:
 }
 
 /// When the claude.ai sign-in ends, as CLI stages last reported it
-/// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said.
+/// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said, and
+/// `None` while an Anthropic key is set (Readiness then says "API key").
 #[tauri::command]
 pub async fn get_claude_login(state: State<'_, AppState>) -> AppResult<Option<crate::claude_login::LoginExpiry>> {
-    crate::claude_login::load(&state.db.lock())
+    let stored = crate::claude_login::load(&state.db.lock())?;
+    Ok(crate::claude_login::shown(stored, crate::claude_login::has_anthropic_key()))
 }
 
 // ─── Pricing refresh from LiteLLM ────────────────────────────────

@@ -82,6 +82,16 @@ describe("ClaudeLoginNote", () => {
     expect(note.getAttribute("data-tone")).toBe("ended");
   });
 
+  it("hides an ended note once an Anthropic key is set, like Readiness", async () => {
+    getClaudeLogin.mockResolvedValue(login(-2));
+    render(<ClaudeLoginNote tourId="x" />);
+    await screen.findByTestId("claude-login-note");
+    // With a key, `get_claude_login` answers null (`claude_login::shown`).
+    getClaudeLogin.mockResolvedValue(null);
+    await act(async () => useClaudeLoginStore.getState().load());
+    expect(screen.queryByTestId("claude-login-note")).toBeNull();
+  });
+
   it("reloads when a stage reports a new date, and a failed read shows nothing", async () => {
     getClaudeLogin.mockResolvedValue(login(4));
     render(<ClaudeLoginNote tourId="x" />);

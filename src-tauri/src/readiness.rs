@@ -195,7 +195,7 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
         }
         LoginState::Ended => {
-            let fix = "CLI stages and Routines can't run on it. Sign in again, then check again.";
+            let fix = "CLI stages and Routines can't run on it. Sign in again; this clears after the next Claude Code stage reports the new date.";
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
         }
     }
@@ -275,7 +275,7 @@ pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     let mut checks = vec![
         claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
         auth_check(
-            crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty()),
+            crate::claude_login::has_anthropic_key(),
             login_expires_at,
             chrono::Utc::now().timestamp(),
         ),
@@ -391,6 +391,8 @@ mod tests {
         let ended = auth_check(false, Some(gone), now);
         assert_eq!((ended.status, ended.value.clone()), (CheckStatus::Fail, format!("Sign-in ended {}", day_label(gone))));
         assert_eq!(ended.command.as_deref(), Some(CLAUDE_LOGIN));
+        // Check again only re-reads the stored date; it clears on the next report.
+        assert!(ended.fix.as_deref().is_some_and(|f| f.contains("clears after the next Claude Code stage") && !f.contains("check again")));
 
         // `%-d %b`: a day number and a month, no leading zero.
         let label = day_label(far);
