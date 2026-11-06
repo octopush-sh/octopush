@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 const PIPE = { pipeline: { id: "p1", name: "Feature Factory", description: "d", isBuiltin: true, createdAt: "t" },
   stages: [
@@ -396,6 +396,27 @@ describe("PipelineSetup Claude Code version preflight", () => {
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     await vi.waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
     expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
+  });
+
+  it("warns above Begin when under 2 GB is free, and the run can still begin", async () => {
+    const { usePerfStore } = await import("../stores/perfStore");
+    const GB = 1024 ** 3;
+    const g = { rssBytes: 0, cpuPct: 0, processCount: 0 };
+    usePerfStore.setState({ stats: { app: g, daemon: g, total: g, disk: { freeBytes: 1.4 * GB, totalBytes: 500 * GB }, ts: 1 } });
+    const onBegin = vi.fn();
+    try {
+      render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+      const line = screen.getByTestId("launcher-low-disk");
+      expect(line).toHaveTextContent("Only 1.4 GB free — this run may fail when the disk fills");
+      expect(line).toHaveClass("text-octo-warning", "octo-tabular");
+      fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+      expect(onBegin).toHaveBeenCalled();
+
+      act(() => usePerfStore.setState({ stats: { app: g, daemon: g, total: g, disk: { freeBytes: 18 * GB, totalBytes: 500 * GB }, ts: 2 } }));
+      expect(screen.queryByTestId("launcher-low-disk")).not.toBeInTheDocument();
+    } finally {
+      usePerfStore.setState({ stats: null });
+    }
   });
 
   it("does not probe for crews without a Claude Code CLI stage", async () => {

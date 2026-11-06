@@ -3,6 +3,8 @@ import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RunEstimate }
 import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
+import { usePerfStore } from "../stores/perfStore";
+import { lowDiskLine } from "../lib/diskSpace";
 import { beaconAnchor } from "../lib/beacon";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
@@ -73,6 +75,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const load = usePipelineStore((s) => s.load);
   const error = usePipelineStore((s) => s.error);
   const { usage } = useEntitlement();
+  // The footer's reading (polled every 2 s); warns, never blocks.
+  const lowDisk = usePerfStore((s) => lowDiskLine(s.stats?.disk));
 
   const [task, setTask] = useState(defaultTask);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -446,6 +450,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
               {workspaceId && <UnattendedReadiness workspaceId={workspaceId} />}
 
               <div className="ml-auto flex flex-col items-end gap-1.5">
+                {lowDisk && (
+                  <p
+                    data-tour="direct-launcher-low-disk"
+                    data-testid="launcher-low-disk"
+                    title="Each crew gets its own worktree, and its setup script may install dependencies into it. The run can still begin."
+                    className="octo-pop-in octo-tabular m-0 font-mono text-[10px] text-octo-warning"
+                  >
+                    {lowDisk}
+                  </p>
+                )}
                 <button
                   type="button"
                   data-tour="direct-launcher-begin"

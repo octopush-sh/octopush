@@ -19,7 +19,7 @@ const SAMPLE: PerfStats = {
 beforeEach(() => {
   vi.useFakeTimers();
   usePerfStore.getState().stop();
-  usePerfStore.setState({ stats: null });
+  usePerfStore.setState({ stats: null, detailsOpen: false });
   mockIpc.getPerfStats.mockReset();
   mockIpc.getPerfStats.mockResolvedValue(SAMPLE);
   Object.defineProperty(document, "hidden", { value: false, configurable: true });
@@ -65,5 +65,19 @@ describe("perfStore", () => {
     await vi.advanceTimersByTimeAsync(0);
     await vi.advanceTimersByTimeAsync(2000);
     expect(mockIpc.getPerfStats).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores opening the details before the first sample", async () => {
+    usePerfStore.getState().setDetailsOpen(true);
+    expect(usePerfStore.getState().detailsOpen).toBe(false);
+    // The sample landing doesn't pop the details open on its own.
+    usePerfStore.getState().start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(usePerfStore.getState().detailsOpen).toBe(false);
+
+    usePerfStore.getState().setDetailsOpen(true);
+    expect(usePerfStore.getState().detailsOpen).toBe(true);
+    usePerfStore.getState().setDetailsOpen(false);
+    expect(usePerfStore.getState().detailsOpen).toBe(false);
   });
 });

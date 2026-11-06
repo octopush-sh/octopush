@@ -128,6 +128,31 @@ describe("ReadinessCard", () => {
     expect(screen.queryByTestId("readiness-loading")).toBeNull();
   });
 
+  it("links a low disk row to the footer's workspace caches", async () => {
+    const fix = "Crews create worktrees and run setup scripts; free some space or archive old workspaces.";
+    readinessCheck.mockResolvedValue([
+      row({ id: "disk", label: "Disk space", status: "warn", value: "6.2 GB free", fix }),
+      row({ id: "gh", label: "GitHub CLI", status: "warn", value: "Not signed in", fix: "Sign gh in." }),
+    ]);
+    const onShowCaches = vi.fn();
+    render(<ReadinessCard onShowCaches={onShowCaches} />);
+    const r = await screen.findByTestId("readiness-row-disk");
+    expect(r).toHaveAttribute("data-tour", "settings-readiness-disk");
+    expect(within(r).getByText(fix)).toBeInTheDocument();
+    fireEvent.click(within(r).getByRole("button", { name: "See what this workspace caches" }));
+    expect(onShowCaches).toHaveBeenCalledTimes(1);
+    // Only the disk row carries the link.
+    expect(within(screen.getByTestId("readiness-row-gh")).queryByRole("button")).toBeNull();
+  });
+
+  it("shows an ok disk row with no link", async () => {
+    readinessCheck.mockResolvedValue([row({ id: "disk", label: "Disk space", value: "84 GB free" })]);
+    render(<ReadinessCard onShowCaches={vi.fn()} />);
+    const r = await screen.findByTestId("readiness-row-disk");
+    expect(within(r).getByText("84 GB free")).toBeInTheDocument();
+    expect(within(r).queryByRole("button")).toBeNull();
+  });
+
   it("shows a status it doesn't know as a mute 'Unknown', not a verdict", async () => {
     readinessCheck.mockResolvedValue([
       row({ id: "git", label: "git", status: "later" as unknown as ReadinessCheck["status"] }),

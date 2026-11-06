@@ -1,6 +1,7 @@
 //! "Is this Mac ready for a crew?" — the Settings › General readiness card.
 //! Each check runs one local command (Ollama: a TCP connect to a loopback
-//! port) within 3 s, in parallel, never cached and with no telemetry.
+//! port; disk space: the footer's volume reading) within 3 s, in parallel,
+//! never cached and with no telemetry.
 
 use crate::agent_adapter::{parse_claude_version, ClaudeCliVersion, TESTED_CLAUDE_FLOOR};
 use serde::Serialize;
@@ -26,7 +27,7 @@ pub enum CheckStatus {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadinessCheck {
-    /// `claude` | `auth` | `git` | `gh` | `ollama`.
+    /// `claude` | `auth` | `git` | `gh` | `disk` | `ollama`.
     pub id: String,
     pub label: String,
     pub status: CheckStatus,
@@ -201,6 +202,53 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
     }
 }
 
+const GIB: u64 = 1024 * 1024 * 1024;
+/// Under this much free space the disk row turns amber.
+pub const DISK_WARN_BYTES: u64 = 10 * GIB;
+/// Under this much it turns rouge, and the Direct launcher warns
+/// (`LOW_DISK_BYTES` in `src/lib/diskSpace.ts`).
+pub const DISK_FAIL_BYTES: u64 = 2 * GIB;
+
+/// `18 GB`, `1.4 GB`, `600 MB`, `0 B`: the footer's `formatBytes`
+/// (`src/lib/formatBytes.ts`), whole numbers from 10 of a unit up.
+pub fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    let mut v = bytes as f64 / 1024.0;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    let unit = UNITS[i];
+    let one = (v * 10.0).round() / 10.0;
+    if one < 10.0 { format!("{one:.1} {unit}") } else { format!("{} {unit}", v.round()) }
+}
+
+/// Free space on the home volume (`perf::home_disk`, the footer's reading).
+/// Each workspace is a worktree its setup script may fill with gigabytes.
+/// `None` when the volume couldn't be read (total 0): no row, never a guess.
+pub fn disk_check(disk: &crate::perf::DiskInfo) -> Option<ReadinessCheck> {
+    const ID: &str = "disk";
+    const LABEL: &str = "Disk space";
+    if disk.total_bytes == 0 {
+        return None;
+    }
+    let free = disk.free_bytes;
+    let value = format!("{} free", format_bytes(free));
+    Some(if free < DISK_FAIL_BYTES {
+        let fix = "A crew will likely fail when the disk fills. Free some space or archive old workspaces before a run.";
+        ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &value, fix, None)
+    } else if free < DISK_WARN_BYTES {
+        let fix = "Crews create worktrees and run setup scripts; free some space or archive old workspaces.";
+        ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &value, fix, None)
+    } else {
+        ReadinessCheck::ok(ID, LABEL, value)
+    })
+}
+
 /// `host:port` of a loopback base URL; `None` (never probed) otherwise.
 pub fn loopback_addr(base_url: &str) -> Option<String> {
     let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
@@ -282,6 +330,7 @@ pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
         git.join().unwrap_or_else(|_| lost("git", "git")),
         gh.join().unwrap_or_else(|_| lost("gh", "GitHub CLI")),
     ];
+    checks.extend(disk_check(&crate::perf::home_disk()));
     if let Ok(Some(c)) = ollama.join() {
         checks.push(c);
     }
@@ -398,6 +447,41 @@ mod tests {
         let label = day_label(far);
         let (d, m) = label.split_once(' ').unwrap();
         assert!(d.parse::<u32>().is_ok_and(|n| (1..=31).contains(&n)) && !d.starts_with('0') && m.len() == 3, "{label}");
+    }
+
+    #[test]
+    fn disk_space_ok_warn_and_fail() {
+        use crate::perf::DiskInfo;
+        let disk = |free| DiskInfo { free_bytes: free, total_bytes: 500 * GIB };
+
+        let ok = disk_check(&disk(18 * GIB)).unwrap();
+        assert_eq!((ok.id.as_str(), ok.status, ok.value.as_str(), ok.fix), ("disk", CheckStatus::Ok, "18 GB free", None));
+        assert_eq!(disk_check(&disk(DISK_WARN_BYTES)).unwrap().status, CheckStatus::Ok);
+
+        let warn = disk_check(&disk(DISK_WARN_BYTES - 1)).unwrap();
+        assert_eq!(warn.status, CheckStatus::Warn);
+        assert!(warn.fix.as_deref().is_some_and(|f| f.contains("archive old workspaces")));
+        assert_eq!(disk_check(&disk(DISK_FAIL_BYTES)).unwrap().status, CheckStatus::Warn);
+
+        let fail = disk_check(&disk(DISK_FAIL_BYTES - 1)).unwrap();
+        assert_eq!(fail.status, CheckStatus::Fail);
+        let low = disk_check(&disk(14 * GIB / 10)).unwrap();
+        assert_eq!((low.status, low.value.as_str(), low.command), (CheckStatus::Fail, "1.4 GB free", None));
+
+        // An unreadable volume reports zeros: no row rather than a false alarm.
+        assert_eq!(disk_check(&DiskInfo { free_bytes: 0, total_bytes: 0 }), None);
+    }
+
+    #[test]
+    fn disk_sizes_read_like_the_footer() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(600 * 1024 * 1024), "600 MB");
+        assert_eq!(format_bytes(14 * GIB / 10), "1.4 GB");
+        assert_eq!(format_bytes(10 * GIB), "10 GB");
+        assert_eq!(format_bytes(460 * GIB), "460 GB");
+        assert_eq!(format_bytes(2048 * GIB), "2.0 TB");
     }
 
     #[test]

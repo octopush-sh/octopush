@@ -23,7 +23,7 @@ export const TALK_TURNS_MIN = 5;
 export const TALK_TURNS_MAX = 200;
 export const TALK_TURNS_STEP = 5;
 
-export function GeneralPane() {
+export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}) {
   const crewNotifications = useNotifyPrefs((s) => s.crewNotifications);
   const setCrewNotifications = useNotifyPrefs((s) => s.setCrewNotifications);
   const soundEnabled = useAttentionStore((s) => s.soundEnabled);
@@ -40,7 +40,7 @@ export function GeneralPane() {
       />
 
       <div className="max-w-[640px] space-y-8">
-        <ReadinessCard />
+        <ReadinessCard onShowCaches={onShowCaches} />
 
         <div className="space-y-4">
           <SectionLabel>Workspace defaults</SectionLabel>
