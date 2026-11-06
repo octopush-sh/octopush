@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -113,14 +113,14 @@ pub(crate) fn manual_command(binary_path: Option<&str>) -> String {
 /// Whether Claude Code already has the `octopush` server registered. Runs
 /// through the readiness probe so a slow CLI can't stall the Settings card.
 fn is_registered(claude: &Path) -> bool {
-    registered_from(probe_registration(claude))
+    registered_from(probe_registration(claude, CHECK_TIMEOUT))
 }
 
-fn probe_registration(claude: &Path) -> Probe {
+fn probe_registration(claude: &Path, timeout: Duration) -> Probe {
     let mut cmd = Command::new(claude);
     cmd.args(["mcp", "get", SERVER_NAME]);
-    // Only the exit status matters; output goes to /dev/null so a large listing can't fill a pipe.
-    run_status_probe(Some(cmd), CHECK_TIMEOUT)
+    // Only the exit status matters, so the output is never read.
+    run_status_probe(Some(cmd), timeout)
 }
 
 /// Whether `claude mcp get octopush` output shows a user-scope stdio entry that
@@ -144,10 +144,10 @@ pub(crate) fn registered_with(get_output: &str, binary: &Path) -> bool {
 
 /// Whether Claude Code already lists our server with exactly this binary, so
 /// Connect can skip the remove → add. A slow or failing `mcp get` reads as no.
-fn already_registered_with(claude: &Path, binary: &Path) -> bool {
+fn already_registered_with(claude: &Path, binary: &Path, timeout: Duration) -> bool {
     let mut cmd = Command::new(claude);
     cmd.args(["mcp", "get", SERVER_NAME]);
-    match run_probe(Some(cmd), CHECK_TIMEOUT) {
+    match run_probe(Some(cmd), timeout) {
         Probe::Exited { success: true, output } => registered_with(&output, binary),
         _ => false,
     }
@@ -185,6 +185,10 @@ const BUSY_MESSAGE: &str =
 const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 /// Pause before the one retry on a lock failure.
 const LOCK_RETRY_PAUSE: Duration = Duration::from_secs(1);
+/// One deadline for a whole Connect press: the pre-check, `remove`, `add`,
+/// their retries and the verify. Each call gets what is left, capped at its
+/// own timeout; with nothing left a call isn't started.
+const CONNECT_BUDGET: Duration = Duration::from_secs(30);
 
 /// Why a `claude mcp remove`/`add` exited non-zero, from its output.
 #[derive(Debug, PartialEq, Eq)]
@@ -249,13 +253,15 @@ fn run_cli(claude: &Path, args: &[std::ffi::OsString], timeout: Duration) -> Res
     }
 }
 
-/// Run once; on a lock failure (or a timeout), `pause` and run once more.
+/// Run once; on a lock failure (or a timeout), `pause` and run once more —
+/// unless the pause would use up what is `left` of the Connect budget.
 fn with_lock_retry(
     mut run: impl FnMut() -> Result<CliRun, String>,
     pause: &mut impl FnMut(),
+    left: &impl Fn() -> Duration,
 ) -> Result<CliRun, String> {
     let first = run()?;
-    if first.success || first.failure() != CliFailure::Busy {
+    if first.success || first.failure() != CliFailure::Busy || left() <= LOCK_RETRY_PAUSE {
         return Ok(first);
     }
     pause();
@@ -292,23 +298,39 @@ fn removed_then_failed(reason: &str) -> ConnectOutcome {
     ))
 }
 
+/// The verify after `add`, within what is `left` (at most the probe timeout).
+/// With nothing left it isn't run: unconfirmed.
+fn verify_within(verify: impl FnOnce(Duration) -> Verification, left: Duration) -> Verification {
+    match left.min(CHECK_TIMEOUT) {
+        t if t.is_zero() => Verification::Unconfirmed,
+        t => verify(t),
+    }
+}
+
 /// The check → remove → add → verify flow, with the CLI calls injected so it
-/// can be tested against recorded output.
+/// can be tested against recorded output. Each call is handed its timeout:
+/// its own cap or what is `left` of the Connect budget, whichever is less.
 fn connect_flow(
-    already_registered: impl FnOnce() -> bool,
-    mut run: impl FnMut(&Step) -> Result<CliRun, String>,
-    verify: impl FnOnce() -> Verification,
+    already_registered: impl FnOnce(Duration) -> bool,
+    mut run: impl FnMut(&Step, Duration) -> Result<CliRun, String>,
+    verify: impl FnOnce(Duration) -> Verification,
     mut pause: impl FnMut(),
+    left: impl Fn() -> Duration,
 ) -> ConnectOutcome {
     // Already pointing at this exact binary: nothing to change, nothing to risk.
-    if already_registered() {
+    if already_registered(left().min(CHECK_TIMEOUT)) {
         return ConnectOutcome { ok: true, registered: true, message: CONNECTED_MESSAGE.into() };
     }
 
     let could_not_run = |e: String| ConnectOutcome::failed(format!("Could not run the Claude Code CLI: {e}"));
+    // Out of budget reads like a call killed at its timeout: busy.
+    let mut attempt = |step: &Step| match left().min(CLI_TIMEOUT) {
+        t if t.is_zero() => Ok(CliRun { success: false, timed_out: true, output: String::new() }),
+        t => run(step, t),
+    };
 
     // Remove-then-add makes the operation idempotent. "Not registered" is fine.
-    let removed = match with_lock_retry(|| run(&Step::Remove), &mut pause) {
+    let removed = match with_lock_retry(|| attempt(&Step::Remove), &mut pause, &left) {
         Err(e) => return could_not_run(e),
         Ok(r) if r.success => true,
         Ok(r) => match r.failure() {
@@ -328,10 +350,10 @@ fn connect_flow(
         },
     };
 
-    match with_lock_retry(|| run(&Step::Add), &mut pause) {
+    match with_lock_retry(|| attempt(&Step::Add), &mut pause, &left) {
         Err(e) if removed => removed_then_failed(&format!("could not run the Claude Code CLI: {e}")),
         Err(e) => could_not_run(e),
-        Ok(r) if r.success => match verify() {
+        Ok(r) if r.success => match verify_within(verify, left()) {
             Verification::Listed => ConnectOutcome { ok: true, registered: true, message: CONNECTED_MESSAGE.into() },
             Verification::NotListed => ConnectOutcome::failed(
                 "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
@@ -423,14 +445,16 @@ pub fn connect() -> McpConnectResult {
 
     let remove_args: Vec<std::ffi::OsString> = MCP_REMOVE_ARGS.iter().map(Into::into).collect();
     let add_args = mcp_add_args(&binary);
+    let deadline = Instant::now() + CONNECT_BUDGET;
     let outcome = connect_flow(
-        || already_registered_with(&claude, &binary),
-        |step| match step {
-            Step::Remove => run_cli(&claude, &remove_args, CLI_TIMEOUT),
-            Step::Add => run_cli(&claude, &add_args, CLI_TIMEOUT),
+        |timeout| already_registered_with(&claude, &binary, timeout),
+        |step, timeout| match step {
+            Step::Remove => run_cli(&claude, &remove_args, timeout),
+            Step::Add => run_cli(&claude, &add_args, timeout),
         },
-        || verification_from(probe_registration(&claude)),
+        |timeout| verification_from(probe_registration(&claude, timeout)),
         || std::thread::sleep(LOCK_RETRY_PAUSE),
+        || deadline.saturating_duration_since(Instant::now()),
     );
 
     McpConnectResult {
@@ -445,49 +469,88 @@ pub fn connect() -> McpConnectResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
-    fn exit(success: bool, output: &str) -> Result<CliRun, String> {
-        Ok(CliRun { success, timed_out: false, output: output.into() })
+    /// A scripted CLI call: its result and how long it takes (at most the
+    /// timeout it is given).
+    type Scripted = (Result<CliRun, String>, Duration);
+
+    fn exit(success: bool, output: &str) -> Scripted {
+        (Ok(CliRun { success, timed_out: false, output: output.into() }), Duration::ZERO)
     }
 
-    fn timed_out() -> Result<CliRun, String> {
-        Ok(CliRun { success: false, timed_out: true, output: String::new() })
+    /// Runs until it is killed at the timeout it was given.
+    fn timed_out() -> Scripted {
+        (Ok(CliRun { success: false, timed_out: true, output: String::new() }), Duration::MAX)
     }
 
-    /// Plays back scripted results per step; records every call and pause.
+    fn cannot_start(reason: &str) -> Scripted {
+        (Err(reason.into()), Duration::ZERO)
+    }
+
+    fn after(takes: f64, (result, _): Scripted) -> Scripted {
+        (result, Duration::from_secs_f64(takes))
+    }
+
+    /// Plays back scripted results per step on a fake clock that starts with
+    /// the whole Connect budget; records every call, pause and timeout given.
     struct Script {
         /// What the pre-check (`mcp get` shows exactly our binary) answers.
         current: bool,
-        remove: RefCell<Vec<Result<CliRun, String>>>,
-        add: RefCell<Vec<Result<CliRun, String>>>,
+        remove: RefCell<Vec<Scripted>>,
+        add: RefCell<Vec<Scripted>>,
         calls: RefCell<Vec<&'static str>>,
+        /// The timeout each check, remove, add and get was handed, in order.
+        timeouts: RefCell<Vec<Duration>>,
+        left: Cell<Duration>,
     }
 
     impl Script {
-        fn new(remove: Vec<Result<CliRun, String>>, add: Vec<Result<CliRun, String>>) -> Self {
-            Self { current: false, remove: RefCell::new(remove), add: RefCell::new(add), calls: RefCell::new(vec![]) }
+        fn new(remove: Vec<Scripted>, add: Vec<Scripted>) -> Self {
+            Self {
+                current: false,
+                remove: RefCell::new(remove),
+                add: RefCell::new(add),
+                calls: RefCell::new(vec![]),
+                timeouts: RefCell::new(vec![]),
+                left: Cell::new(CONNECT_BUDGET),
+            }
+        }
+
+        fn spend(&self, d: Duration) {
+            self.left.set(self.left.get().saturating_sub(d));
+        }
+
+        fn call(&self, name: &'static str, timeout: Duration) {
+            self.calls.borrow_mut().push(name);
+            self.timeouts.borrow_mut().push(timeout);
         }
 
         fn run(&self, verified: Verification) -> ConnectOutcome {
             connect_flow(
-                || {
-                    self.calls.borrow_mut().push("check");
+                |t| {
+                    self.call("check", t);
                     self.current
                 },
-                |step| {
+                |step, t| {
                     let (name, queue) = match step {
                         Step::Remove => ("remove", &self.remove),
                         Step::Add => ("add", &self.add),
                     };
-                    self.calls.borrow_mut().push(name);
-                    queue.borrow_mut().remove(0)
+                    self.call(name, t);
+                    let (result, takes) = queue.borrow_mut().remove(0);
+                    self.spend(takes.min(t));
+                    result
                 },
-                || {
-                    self.calls.borrow_mut().push("get");
+                |t| {
+                    self.call("get", t);
                     verified
                 },
-                || self.calls.borrow_mut().push("pause"),
+                || {
+                    self.calls.borrow_mut().push("pause");
+                    self.spend(LOCK_RETRY_PAUSE);
+                },
+                || self.left.get(),
             )
         }
     }
@@ -598,7 +661,7 @@ mod tests {
 
     #[test]
     fn cli_that_cannot_start_is_reported() {
-        let s = Script::new(vec![Err("No such file or directory".into())], vec![]);
+        let s = Script::new(vec![cannot_start("No such file or directory")], vec![]);
         assert!(s.run(Verification::Listed).message.starts_with("Could not run the Claude Code CLI"));
     }
 
@@ -651,7 +714,7 @@ mod tests {
         let s = Script::new(vec![exit(true, "")], vec![exit(false, "")]);
         assert_says_removed(&s.run(Verification::Listed));
 
-        let s = Script::new(vec![exit(true, "")], vec![Err("No such file or directory".into())]);
+        let s = Script::new(vec![exit(true, "")], vec![cannot_start("No such file or directory")]);
         assert_says_removed(&s.run(Verification::Listed));
 
         // Nothing was removed: the plain messages stand.
@@ -731,13 +794,14 @@ mod tests {
 
         // Through the whole flow: remove hangs twice (one retry), then busy.
         let out = connect_flow(
-            || false,
-            |step| {
+            |_| false,
+            |step, _| {
                 assert_eq!(*step, Step::Remove, "add must not run after a busy remove");
                 run_stub(&script, &MCP_REMOVE_ARGS, Duration::from_millis(150))
             },
-            || panic!("no verify after a busy remove"),
+            |_| panic!("no verify after a busy remove"),
             || {},
+            || CONNECT_BUDGET,
         );
         assert_eq!(out, ConnectOutcome::failed(BUSY_MESSAGE));
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
@@ -764,6 +828,62 @@ mod tests {
     #[test]
     fn cli_timeout_outlasts_claude_codes_lock_wait() {
         assert!(CLI_TIMEOUT >= Duration::from_secs(15), "{CLI_TIMEOUT:?}");
+        assert!(CONNECT_BUDGET >= CHECK_TIMEOUT + CLI_TIMEOUT, "{CONNECT_BUDGET:?}");
+    }
+
+    const fn secs(s: u64) -> Duration {
+        Duration::from_secs(s)
+    }
+
+    /// The case from the #563 review: a slow remove, then an add that times
+    /// out twice. Each call used to get its full timeout (about 64 s in all).
+    #[test]
+    fn the_whole_connect_stays_within_one_deadline() {
+        let s = Script::new(vec![after(19.5, exit(true, ""))], vec![timed_out(), timed_out()]);
+        s.spend(CHECK_TIMEOUT); // a pre-check that ran to its timeout
+        let out = s.run(Verification::Listed);
+        assert_says_removed(&out);
+        assert!(out.message.contains("config is busy"), "{}", out.message);
+        // The add gets the 7.5 s left, and with nothing left there is no retry.
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add"]);
+        assert_eq!(*s.timeouts.borrow(), [CHECK_TIMEOUT, CLI_TIMEOUT, Duration::from_millis(7500)]);
+        assert_eq!(s.left.get(), Duration::ZERO);
+
+        // A lock error late in the budget: the retry gets what the pause leaves.
+        let s = Script::new(vec![exit(true, "")], vec![after(18.0, exit(false, ELOCKED)), timed_out()]);
+        s.spend(CHECK_TIMEOUT);
+        assert_says_removed(&s.run(Verification::Listed));
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "pause", "add"]);
+        assert_eq!(*s.timeouts.borrow(), [CHECK_TIMEOUT, CLI_TIMEOUT, CLI_TIMEOUT, secs(8)]);
+        assert_eq!(s.left.get(), Duration::ZERO);
+    }
+
+    #[test]
+    fn no_retry_when_the_pause_would_use_up_the_budget() {
+        let s = Script::new(vec![after(20.0, exit(false, ELOCKED))], vec![]);
+        s.spend(Duration::from_secs_f64(9.5));
+        assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
+        assert_eq!(*s.calls.borrow(), ["check", "remove"]);
+    }
+
+    #[test]
+    fn out_of_budget_skips_the_remaining_calls() {
+        // Nothing left for the add: it isn't started, and reads as busy.
+        let s = Script::new(vec![after(20.0, exit(false, NOT_FOUND))], vec![]);
+        s.spend(secs(10));
+        assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
+        assert_eq!(*s.calls.borrow(), ["check", "remove"]);
+
+        // Nothing left for the verify: unconfirmed, never claimed missing.
+        let s = Script::new(vec![after(10.0, exit(true, ""))], vec![after(20.0, exit(true, ""))]);
+        let out = s.run(Verification::NotListed);
+        assert!(out.message.contains("didn't confirm it in time"), "{}", out.message);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add"]);
+
+        // A little left: the verify gets that, not its full 3 s.
+        let s = Script::new(vec![after(10.0, exit(true, ""))], vec![after(19.0, exit(true, ""))]);
+        assert!(s.run(Verification::Listed).registered);
+        assert_eq!(*s.timeouts.borrow(), [CHECK_TIMEOUT, CLI_TIMEOUT, CLI_TIMEOUT, secs(1)]);
     }
 
     #[test]

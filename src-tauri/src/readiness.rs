@@ -7,10 +7,14 @@ use crate::agent_adapter::{parse_claude_version, ClaudeCliVersion, TESTED_CLAUDE
 use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
+/// After a probed command exits, how long its output may still take to
+/// arrive even when the deadline has passed.
+const DRAIN_FLOOR: Duration = Duration::from_millis(250);
 pub const INSTALL_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code";
 pub const UPDATE_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code@latest";
 
@@ -71,7 +75,8 @@ pub enum Probe {
     Exited { success: bool, output: String },
 }
 
-/// Run `cmd` within `timeout` (killed after it), joining stdout and stderr.
+/// Run `cmd` within `timeout`, joining stdout and stderr. At the timeout its
+/// whole process group is killed, so whatever it spawned dies with it.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
     probe_with(cmd, timeout, true)
 }
@@ -84,30 +89,66 @@ pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
 fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
     let io = || if capture { Stdio::piped() } else { Stdio::null() };
-    let Ok(mut child) = cmd.stdin(Stdio::null()).stdout(io()).stderr(io()).spawn() else {
+    cmd.stdin(Stdio::null()).stdout(io()).stderr(io());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let Ok(mut child) = cmd.spawn() else {
         return Probe::Missing;
     };
+    // Read while it runs: a reply bigger than the pipe buffer would otherwise
+    // block the command until the timeout.
+    let out = child.stdout.take().map(drain);
+    let err = child.stderr.take().map(drain);
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
+                // Bounded too: something it left running may still hold a pipe
+                // open. The floor lets a command that exits at the deadline
+                // still hand over what it printed.
                 let mut output = String::new();
-                if let Some(mut out) = child.stdout.take() {
-                    let _ = out.read_to_string(&mut output);
-                }
-                if let Some(mut err) = child.stderr.take() {
-                    let _ = err.read_to_string(&mut output);
+                for rx in [out, err].into_iter().flatten() {
+                    let left = deadline.saturating_duration_since(Instant::now()).max(DRAIN_FLOOR);
+                    if let Ok(text) = rx.recv_timeout(left) {
+                        output.push_str(&text);
+                    }
                 }
                 return Probe::Exited { success: status.success(), output };
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_process_group(&mut child);
                 return Probe::TimedOut;
             }
         }
     }
+}
+
+/// Read `pipe` to its end on a thread; the text arrives on the channel.
+fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
+    });
+    rx
+}
+
+/// Kill `child` and everything in its process group (spawned with
+/// `process_group(0)`), then reap it.
+fn kill_process_group(child: &mut Child) {
+    #[cfg(unix)]
+    // SAFETY: kill(-pid, SIGKILL) signals the group `process_group(0)` gave the
+    // child; it touches no memory.
+    unsafe {
+        libc::kill(-(child.id() as i32), libc::SIGKILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// `claude --version` against the tested floor (#278).
@@ -365,6 +406,38 @@ mod tests {
         let quiet = run_status_probe(sh("echo gho_secret; echo err >&2"), Duration::from_secs(5));
         assert_eq!(quiet, Probe::Exited { success: true, output: String::new() });
         assert_eq!(run_status_probe(sh("sleep 5"), Duration::from_millis(100)), Probe::TimedOut);
+    }
+
+    #[test]
+    fn output_past_the_pipe_buffer_is_read_while_the_command_runs() {
+        // 200 KB on each stream: read only after exit, the command would block
+        // on a full pipe and time out.
+        let big = "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2";
+        let started = Instant::now();
+        let Probe::Exited { success: true, output } = run_probe(sh(big), Duration::from_secs(3)) else {
+            panic!("a large reply must not read as a timeout");
+        };
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(output.len(), 400_000);
+        assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_kills_what_the_command_spawned() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("grandchild.pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
+        assert_eq!(run_probe(sh(&script), Duration::from_millis(300)), Probe::TimedOut);
+        let grandchild: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        // Orphaned by the kill and reaped by init shortly after; poll so a
+        // not-yet-reaped zombie doesn't flake the test.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        // SAFETY: kill(pid, 0) performs no action — existence probe only.
+        while unsafe { libc::kill(grandchild, 0) } == 0 {
+            assert!(Instant::now() < deadline, "the background sleep must die with the group");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     #[test]
