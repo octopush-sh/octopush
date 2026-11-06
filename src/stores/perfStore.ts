@@ -4,6 +4,10 @@ import type { PerfStats } from "../lib/types";
 
 interface PerfState {
   stats: PerfStats | null;
+  /** The footer's details popover (with Workspace Caches) is open. Lives here
+   *  so the Readiness card's disk row can open it. */
+  detailsOpen: boolean;
+  setDetailsOpen: (open: boolean) => void;
   start: () => void;
   stop: () => void;
 }
@@ -26,6 +30,8 @@ export const usePerfStore = create<PerfState>((set) => {
 
   return {
     stats: null,
+    detailsOpen: false,
+    setDetailsOpen: (detailsOpen) => set({ detailsOpen }),
     start: () => {
       if (timer) return;
       void tick();

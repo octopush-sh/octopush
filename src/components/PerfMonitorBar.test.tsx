@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import { PerfMonitorBar } from "./PerfMonitorBar";
 import { usePerfStore } from "../stores/perfStore";
 
@@ -27,7 +27,7 @@ const STATS_FIXTURE = {
 };
 
 beforeEach(() => {
-  usePerfStore.setState({ stats: null });
+  usePerfStore.setState({ stats: null, detailsOpen: false });
   vi.clearAllMocks();
 });
 
@@ -58,6 +58,15 @@ describe("PerfMonitorBar", () => {
     expect(screen.getByText("App")).toBeInTheDocument();
     expect(screen.getByText("Daemon")).toBeInTheDocument();
     expect(screen.getByText("318 MB")).toBeInTheDocument();
+  });
+
+  it("opens from the store, as the Readiness card's disk row does", () => {
+    usePerfStore.setState({ stats: STATS_FIXTURE });
+    render(<PerfMonitorBar />);
+    expect(screen.queryByText("Workspace Caches")).not.toBeInTheDocument();
+    act(() => usePerfStore.getState().setDetailsOpen(true));
+    expect(screen.getByText("Workspace Caches")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /performance/i })).toHaveAttribute("aria-expanded", "true");
   });
 
   it("shows a quiet dash in caches when there is no workspace path", () => {

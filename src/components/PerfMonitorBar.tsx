@@ -31,7 +31,8 @@ export function PerfMonitorBar({
   onToggleRail,
 }: PerfMonitorBarProps) {
   const stats = usePerfStore((s) => s.stats);
-  const [open, setOpen] = useState(false);
+  const open = usePerfStore((s) => s.detailsOpen);
+  const setOpen = usePerfStore((s) => s.setDetailsOpen);
   const [caches, setCaches] = useState<WorkspaceCacheSizes | null>(null);
   const [scanning, setScanning] = useState(false);
   const [fetchError, setFetchError] = useState(false);
@@ -72,7 +73,7 @@ export function PerfMonitorBar({
         <>
           <button
             type="button"
-            onClick={() => setOpen((v) => !v)}
+            onClick={() => setOpen(!open)}
             aria-label="Performance details"
             aria-expanded={open}
             className="flex items-center gap-2 hover:text-octo-sage"

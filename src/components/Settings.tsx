@@ -20,6 +20,7 @@ import { IntegrationsPane } from "./settings/IntegrationsPane";
 import { AboutPane } from "./settings/AboutPane";
 import { AccountPane } from "./settings/AccountPane";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
+import { usePerfStore } from "../stores/perfStore";
 
 interface Props {
   open: boolean;
@@ -76,7 +77,14 @@ export function Settings({ open, initialTab = "general", onClose, onIssueTracker
         {/* Pane — keyed so the active pane crossfades when the tab changes, and
             scroll resets to top on switch. */}
         <main key={tab} className="octo-fade-in flex-1 overflow-y-auto px-10 py-8">
-          {tab === "general" && <GeneralPane />}
+          {tab === "general" && (
+            <GeneralPane
+              onShowCaches={() => {
+                usePerfStore.getState().setDetailsOpen(true);
+                onClose();
+              }}
+            />
+          )}
           {tab === "editor" && <EditorPane />}
           {tab === "models" && <ModelsPane />}
           {tab === "routines" && <RoutinesPane />}

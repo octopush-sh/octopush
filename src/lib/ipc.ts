@@ -1443,7 +1443,7 @@ export const ipc = {
 
 /** One row of the readiness card (mirrors Rust `readiness::ReadinessCheck`). */
 export interface ReadinessCheck {
-  id: "claude" | "auth" | "git" | "gh" | "ollama";
+  id: "claude" | "auth" | "git" | "gh" | "disk" | "ollama";
   label: string;
   status: "ok" | "warn" | "fail";
   /** The live value: a version, "Token found", "No answer in 3 s"… */

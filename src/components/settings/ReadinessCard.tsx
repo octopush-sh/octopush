@@ -6,6 +6,7 @@ import { AlertTriangle, CheckCircle, Circle, Clock, Copy, Loader2, XCircle } fro
 import type { ReadinessCheck } from "../../lib/ipc";
 import { copyToClipboard } from "../../lib/clipboard";
 import { useReadinessStore } from "../../stores/readinessStore";
+import { tourId } from "../../lib/tour/ids";
 import { SectionLabel, formatRelative } from "./shared";
 
 type StatusStyle = { word: string; tone: string; Icon: typeof CheckCircle };
@@ -19,7 +20,9 @@ const STATUS: Record<ReadinessCheck["status"], StatusStyle> = {
 /** A status this build doesn't know (an older or newer backend): mute, never a verdict. */
 const PENDING: StatusStyle = { word: "Unknown", tone: "text-octo-mute", Icon: Circle };
 
-export function ReadinessCard() {
+/** `onShowCaches` closes Settings and opens the footer's Workspace Caches;
+ *  the disk row links to it when space runs low. */
+export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = {}) {
   const checks = useReadinessStore((s) => s.checks);
   const checkedAt = useReadinessStore((s) => s.checkedAt);
   const loading = useReadinessStore((s) => s.loading);
@@ -92,7 +95,7 @@ export function ReadinessCard() {
         {checks && checks.length > 0 && (
           <ul className="mt-3 divide-y divide-octo-hairline">
             {checks.map((c, i) => (
-              <ReadinessRow key={c.id ?? i} check={c} index={i} />
+              <ReadinessRow key={c.id ?? i} check={c} index={i} onShowCaches={c.id === "disk" ? onShowCaches : undefined} />
             ))}
           </ul>
         )}
@@ -112,7 +115,7 @@ export function ReadinessCard() {
   );
 }
 
-function ReadinessRow({ check, index }: { check: ReadinessCheck; index: number }) {
+function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; index: number; onShowCaches?: () => void }) {
   const [copied, setCopied] = useState(false);
   const { word, tone, Icon: StatusIcon } = STATUS[check.status] ?? PENDING;
   const Icon = check.timedOut ? Clock : StatusIcon;
@@ -127,6 +130,7 @@ function ReadinessRow({ check, index }: { check: ReadinessCheck; index: number }
 
   return (
     <li
+      data-tour={check.id === "disk" ? tourId("settings-readiness-disk") : undefined}
       data-testid={`readiness-row-${check.id}`}
       data-status={check.status}
       className="octo-rise-in py-2.5"
@@ -160,6 +164,15 @@ function ReadinessRow({ check, index }: { check: ReadinessCheck; index: number }
                 <Copy size={12} aria-hidden />
               </button>
             </div>
+          )}
+          {onShowCaches && (
+            <button
+              type="button"
+              onClick={onShowCaches}
+              className="mt-1 font-serif text-[12px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
+            >
+              See what this workspace caches
+            </button>
           )}
         </div>
       )}
