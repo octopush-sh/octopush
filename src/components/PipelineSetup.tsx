@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RunEstimate } from "../lib/ipc";
-import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
+import { CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
 import { usePerfStore } from "../stores/perfStore";
@@ -182,6 +182,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     return () => { alive = false; };
   }, [usesClaudeCode]);
   const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
+  const cliSecurity = usesClaudeCode ? claudeSecurityLabel(cli) : null;
+  const cliNote = cliUpdate ?? cliSecurity;
 
   const estimateRange = estimate ? estimateRangeText(estimate) : "";
   const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
@@ -482,17 +484,17 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 </p>
               </div>
             </div>
-            {cliUpdate && cli?.version && (
+            {cliNote && cli?.version && (
               <div
                 data-tour="direct-launcher-cli-version"
                 data-testid="launcher-claude-cli-update"
                 className="octo-rise-in mt-4 rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2"
               >
                 <div className="font-mono text-[11px] text-octo-warning">
-                  {cliUpdate} · installed <span className="octo-tabular">{cli.version}</span>
+                  {cliNote} · installed <span className="octo-tabular">{cli.version}</span>
                 </div>
                 <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">
-                  {CLAUDE_UPDATE_REASON} The run can still begin.
+                  {cliUpdate ? `${CLAUDE_UPDATE_REASON} ` : ""}The run can still begin.
                 </p>
               </div>
             )}

@@ -4,6 +4,7 @@ const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("./ipc", () => ({ ipc: { claudeCliVersion: cliVersionMock } }));
 
 const {
+  claudeSecurityLabel,
   claudeUpdateLabel,
   cliTooOldForEffort,
   crewUsesClaudeCode,
@@ -26,6 +27,26 @@ describe("claudeUpdateLabel", () => {
     expect(claudeUpdateLabel({ version: "2.1.316", floor: "2.1.314", belowFloor: false })).toBeNull();
     expect(claudeUpdateLabel({ version: null, floor: "2.1.314", belowFloor: false })).toBeNull();
     expect(claudeUpdateLabel(null)).toBeNull();
+  });
+});
+
+describe("claudeSecurityLabel", () => {
+  const fix = { version: "2.1.319", reason: "fixes a sandbox escape when creating a worktree" };
+
+  it("names the missing fix for a known version at or above the floor", () => {
+    expect(claudeSecurityLabel({ version: "2.1.316", floor: "2.1.314", belowFloor: false, securityFix: fix })).toBe(
+      "Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree",
+    );
+    expect(claudeSecurityLabel({ version: "2.1.319", floor: "2.1.314", belowFloor: false, securityFix: null })).toBeNull();
+    expect(claudeSecurityLabel({ version: "2.1.319", floor: "2.1.314", belowFloor: false })).toBeNull();
+  });
+
+  it("yields to the tested-floor label, and never warns on an unknown version", () => {
+    const old = { version: "2.1.307", floor: "2.1.314", belowFloor: true, securityFix: fix };
+    expect(claudeUpdateLabel(old)).not.toBeNull();
+    expect(claudeSecurityLabel(old)).toBeNull();
+    expect(claudeSecurityLabel({ version: null, floor: "2.1.314", belowFloor: false, securityFix: fix })).toBeNull();
+    expect(claudeSecurityLabel(null)).toBeNull();
   });
 });
 

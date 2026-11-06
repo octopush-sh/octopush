@@ -183,6 +183,14 @@ pub fn adapter_info_list() -> Vec<AdapterInfo> {
 /// keeps it naming a recorded version.
 pub const TESTED_CLAUDE_FLOOR: &str = "2.1.314";
 
+/// Claude Code releases that fix a sandbox or permission escape, oldest
+/// first: (version, why it matters in one line). Separate from
+/// [`TESTED_CLAUDE_FLOOR`] so adding a row never forces a fixture re-record.
+/// The release-watch routine adds a row when a changelog entry fixes one.
+pub const CLAUDE_SECURITY_FIXES: &[(&str, &str)] = &[
+    ("2.1.319", "fixes a sandbox escape when creating a worktree"),
+];
+
 /// How long `claude --version` may take before the version counts as unknown.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -197,12 +205,41 @@ pub struct ClaudeCliVersion {
     pub floor: String,
     /// True only when the version is known AND older than the floor.
     pub below_floor: bool,
+    /// The newest [`CLAUDE_SECURITY_FIXES`] row the known version is below;
+    /// `None` when it has them all or the version is unknown.
+    pub security_fix: Option<ClaudeSecurityFix>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeSecurityFix {
+    pub version: String,
+    pub reason: String,
 }
 
 impl ClaudeCliVersion {
     pub fn new(version: Option<String>, floor: &str) -> Self {
+        Self::with_fixes(version, floor, CLAUDE_SECURITY_FIXES)
+    }
+
+    /// [`ClaudeCliVersion::new`] against an explicit fix table (tests).
+    pub fn with_fixes(version: Option<String>, floor: &str, fixes: &[(&str, &str)]) -> Self {
         let below_floor = version.as_deref().is_some_and(|v| version_below(v, floor));
-        Self { version, floor: floor.to_string(), below_floor }
+        let security_fix = version.as_deref().and_then(|v| {
+            fixes
+                .iter()
+                .filter(|(fix, _)| version_below(v, fix))
+                .max_by_key(|(fix, _)| version_key(fix))
+                .map(|(fix, reason)| ClaudeSecurityFix { version: fix.to_string(), reason: reason.to_string() })
+        });
+        Self { version, floor: floor.to_string(), below_floor, security_fix }
+    }
+
+    /// "Update Claude Code: 2.1.319 fixes …" when the known version lacks a
+    /// security fix; `None` otherwise. Never blocks a run.
+    pub fn security_notice(&self) -> Option<String> {
+        let fix = self.security_fix.as_ref()?;
+        Some(format!("Update Claude Code: {} {}", fix.version, fix.reason))
     }
 
     /// Whether Run-mode attention may come from Claude Code's hooks: only a
@@ -221,6 +258,15 @@ impl ClaudeCliVersion {
              sessions. Update Claude Code ({floor} or newer recommended); the run continues.",
             floor = self.floor
         ))
+    }
+
+    /// What a Claude Code CLI stage journals before it starts, once each: the
+    /// tested-floor notice, then the security one.
+    pub fn stage_notices(&self) -> Vec<String> {
+        let security = self.security_notice().zip(self.version.as_deref()).map(|(note, v)| {
+            format!("{note} (installed: {v}); the run continues.")
+        });
+        self.update_notice().into_iter().chain(security).collect()
     }
 }
 
@@ -819,6 +865,49 @@ mod tests {
     #[test]
     fn tested_floor_is_a_version() {
         assert_eq!(parse_claude_version(TESTED_CLAUDE_FLOOR).as_deref(), Some(TESTED_CLAUDE_FLOOR));
+    }
+
+    #[test]
+    fn every_security_fix_is_a_version_with_a_reason() {
+        assert!(!CLAUDE_SECURITY_FIXES.is_empty());
+        for (v, reason) in CLAUDE_SECURITY_FIXES {
+            assert_eq!(parse_claude_version(v).as_deref(), Some(*v), "{v} must be x.y.z");
+            assert!(!reason.trim().is_empty() && !reason.ends_with('.'), "{v}: one line, no full stop");
+        }
+    }
+
+    #[test]
+    fn security_notice_below_at_and_above_the_fix() {
+        let at = |v: Option<&str>| ClaudeCliVersion::new(v.map(Into::into), "2.1.314");
+        let below = at(Some("2.1.316"));
+        assert!(!below.below_floor, "independent of the tested floor");
+        assert_eq!(
+            below.security_notice().as_deref(),
+            Some("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree")
+        );
+        assert_eq!(below.security_fix.as_ref().map(|f| f.version.as_str()), Some("2.1.319"));
+        assert_eq!(at(Some("2.1.319")).security_notice(), None);
+        assert_eq!(at(Some("2.2.0")).security_notice(), None);
+        assert_eq!(at(None).security_notice(), None, "an unknown version never warns");
+        // Below the floor too: both notes exist; surfaces pick which to show.
+        assert!(at(Some("2.1.307")).below_floor && at(Some("2.1.307")).security_notice().is_some());
+
+        // A stage journals each notice once.
+        let notes = below.stage_notices();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("2.1.319 fixes a sandbox escape") && notes[0].contains("installed: 2.1.316"), "{notes:?}");
+        assert_eq!(at(Some("2.1.307")).stage_notices().len(), 2);
+        assert!(at(Some("2.1.319")).stage_notices().is_empty());
+        assert!(at(None).stage_notices().is_empty());
+    }
+
+    #[test]
+    fn security_notice_names_the_newest_fix_still_missing() {
+        let fixes = [("2.1.319", "fixes a"), ("2.1.330", "fixes b"), ("2.1.325", "fixes c")];
+        let fix = |v: &str| ClaudeCliVersion::with_fixes(Some(v.into()), "2.1.314", &fixes).security_fix.map(|f| f.reason);
+        assert_eq!(fix("2.1.300").as_deref(), Some("fixes b"));
+        assert_eq!(fix("2.1.326").as_deref(), Some("fixes b"));
+        assert_eq!(fix("2.1.330"), None);
     }
 
     #[test]
