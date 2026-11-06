@@ -204,6 +204,11 @@ test("links: a trailing dot on a host doesn't get past the allow-list", () => {
     assert.ok(reasons(draft({ text: `Here: ${bad} (I build Octopush)` })).length, bad);
   }
   assert.ok(extractUrls("go to octopush.sh./download?utm=x now").includes("octopush.sh./download?utm=x"));
+  // No slash: the query (or fragment) right after a bare octopush.sh is part of the link.
+  for (const bad of ["octopush.sh?utm=1", "see octopush.sh.?utm=1 there", "octopush.sh#x", "(octopush.sh?ref=me)"]) {
+    assert.ok(extractUrls(bad).some((u) => /[?#]/.test(u)), bad);
+    assert.ok(linkProblems(bad).some((e) => /octopush\.sh link other than/.test(e)), bad);
+  }
   assert.deepEqual(extractUrls("It's at octopush.sh."), ["octopush.sh"], "a sentence's full stop is not part of the host");
   assert.deepEqual(linkProblems("It's at octopush.sh."), []);
 });
@@ -215,7 +220,20 @@ test("links: a masked link's visible URL or domain must be its target", () => {
   ]) {
     assert.ok(linkProblems(bad).some((e) => /visible text/.test(e)), bad);
   }
+  // As a reader sees it: emphasis, nested brackets, zero-width and fullwidth characters don't hide the domain.
+  for (const bad of [
+    "[**octopush.sh**](https://evil.example/)", "[_octopush.sh_](https://evil.example/)", "[~~octopush.sh~~](https://evil.example/)",
+    "[[octopush.sh]](https://evil.example/)", "[[git-scm.com]/docs](https://evil.example/docs)", "[octo\u200bpush.sh](https://evil.example/)",
+    "[octopush\u2060.sh](https://evil.example/)", "[\ufeffoctopush.sh](https://evil.example/)", "[ｏｃｔｏｐｕｓｈ．ｓｈ](https://evil.example/)",
+  ]) assert.ok(linkProblems(bad).some((e) => /visible text/.test(e)), bad);
+  // Reference-style links are refused outright; brackets in code are not links.
+  for (const bad of ["[site][1]\n\n[1]: https://octopush.sh/", "[site][]\n\n[site]: https://example.com/", "[site]\n\n  [site]: https://example.com/", "See [the docs][docs]."]) {
+    assert.ok(linkProblems(bad).some((e) => /reference-style/.test(e)), bad);
+    assert.ok(reasons(draft({ text: bad })).length, bad);
+  }
+  for (const ok of ["Index it as `grid[i][j]`.", "```\nlet v = grid[i][j];\n[x]: y\n```", "    let v = grid[i][j];"]) assert.deepEqual(linkProblems(ok), [], ok);
   for (const ok of [
+    "[**git-scm.com/docs**](https://git-scm.com/docs)",
     "[octopush.sh](https://octopush.sh/)", "[https://git-scm.com/docs/git-worktree](https://git-scm.com/docs/git-worktree)",
     "[www.git-scm.com/docs](https://git-scm.com/docs/)", "[the worktree docs](https://git-scm.com/docs/git-worktree)", "[v1.2](https://example.com/notes)",
   ]) assert.deepEqual(linkProblems(ok), [], ok);

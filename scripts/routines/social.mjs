@@ -167,9 +167,17 @@ const URL_ANY = /\bhttps?:\/\/[^\s<>()[\]"'`]+/gi;
 const MD_TARGET = /\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
 // A host may end in a dot (`octopush.sh./x` is octopush.sh): both patterns accept one before the path.
 const BARE = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)+[a-z]{2,24}\.?\/[^\s<>()[\]"'`]*/gi;
-const BARE_OCTO = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)*octopush\.sh(?!\.?[\w/-])/gi;
-/** A markdown link with its visible text: `[text](target)`. */
-const MD_LINK = /\[([^\]\n]{1,300})\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
+// Bare octopush.sh with no path: a query or fragment right after it (`octopush.sh?utm=1`,
+// `octopush.sh.?utm=1`) is captured too, so the whole link goes through the allow-list.
+const BARE_OCTO = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)*octopush\.sh(?:\.?[?#][^\s<>()[\]"'`]*|(?!\.?[\w/-]))/gi;
+/** A markdown link with its visible text, one level of nested brackets allowed: `[text](target)`. */
+const MD_LINK = /\[((?:[^[\]\n]|\[[^[\]\n]*\]){1,300})\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
+/** Zero-width characters that could split a domain in a link's visible text. */
+const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
+/** A link's visible text as a reader sees it: NFKC, no emphasis marks, brackets or zero-width characters. */
+export const visibleText = (t) => String(t).normalize("NFKC").replace(ZERO_WIDTH, "").replace(/[*_~[\]]/g, "").trim().replace(/^[`<]+|[`>]+$/g, "").trim();
+/** Markdown with code blocks and code spans removed (reference syntax inside code is harmless). */
+const withoutCode = (t) => String(t).replace(/^(`{3,}|~{3,})[^\n]*\n[\s\S]*?^\1[^\n]*$/gm, "").replace(/^(?: {4}|\t).*$/gm, "").replace(/`+[^`\n]*`+/g, "");
 /** Visible text that reads as a URL or a domain. */
 const LOOKS_LIKE_URL = /^(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,24}\.?(?:[/?#]\S*)?$/i;
 const trailing = (s) => s.replace(/[.,;:!?*_~]+$/, "");
@@ -190,8 +198,11 @@ const parseUrl = (raw) => { try { return new URL(/^[a-z][a-z0-9+.-]*:/i.test(raw
 const canon = (u) => `${u.protocol}//${hostOf(u).replace(/^www\./, "")}${u.port ? `:${u.port}` : ""}${u.pathname.replace(/\/+$/, "")}${u.search}${u.hash}`;
 /** Masked links: visible text that reads as a URL or domain must be the target itself (pure). */
 export function maskedLinkProblems(text) {
-  for (const m of String(text).matchAll(MD_LINK)) {
-    const shown = m[1].trim().replace(/^[`<]+|[`>]+$/g, "");
+  // Reference-style links ([text][1] with "[1]: url", collapsed or shortcut forms) are refused outright.
+  const prose = withoutCode(text);
+  if (/^ {0,3}\[[^\]\n]+\]:/m.test(prose) || /\[[^\]\n]+\]\[[^\]\n]*\]/.test(prose)) return ["a reference-style link (use [text](url))"];
+  for (const m of String(text).normalize("NFKC").replace(ZERO_WIDTH, "").matchAll(MD_LINK)) {
+    const shown = visibleText(m[1]);
     if (!LOOKS_LIKE_URL.test(shown)) continue;
     const a = parseUrl(trailing(shown)), b = parseUrl(trailing(m[2]));
     if (!a || !b || canon(a) !== canon(b)) return ["a link whose visible text is a different URL or domain than its target"];
@@ -208,7 +219,9 @@ const okOcto = (u) => u.protocol === "https:" && u.hostname === "octopush.sh" &&
 /** Problems with the links in a draft (pure). Messages are fixed: they never echo agent text. */
 export function linkProblems(text) {
   const out = new Set();
-  for (const raw of extractUrls(text)) {
+  // Also as a reader sees it: fullwidth characters folded (NFKC) and zero-width characters gone.
+  const folded = String(text).normalize("NFKC").replace(ZERO_WIDTH, "");
+  for (const raw of new Set([...extractUrls(text), ...extractUrls(folded)])) {
     const u = parseUrl(raw);
     if (!u) { out.add("a link can't be parsed"); continue; }
     // Trailing dots are stripped before any check: `octopush.sh.` and `bit.ly.` are those hosts.

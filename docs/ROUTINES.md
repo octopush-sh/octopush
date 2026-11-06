@@ -89,8 +89,10 @@ anything else fails the job.
     `https://octopush.sh/`, `https://octopush.sh/docs/…` and
     `https://octopush.sh/download?src=reddit` (every link, masked or bare, is extracted and listed
     in the draft's metadata; hostnames are compared with trailing dots stripped, and
-    `octopush.sh.` itself is never allowed), or shows a URL or domain as a masked link's text
-    that differs from its target;
+    `octopush.sh.` itself is never allowed; a bare `octopush.sh?…` or `octopush.sh#…` is checked
+    with its query), shows a URL or domain as a masked link's text that differs from its target
+    (the text is read as a reader sees it: NFKC, without emphasis marks, brackets or zero-width
+    characters), or uses a reference-style link (`[text][1]` with `[1]: url`);
   - presents Direct or pipeline runs in parallel or in the background without
     "one run at a time";
   - repeats an earlier draft's text, or its thread (subreddit + post id);
