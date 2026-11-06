@@ -21,6 +21,7 @@
 
 import { create } from "zustand";
 import type { PtyAttentionReason } from "../lib/types";
+import type { ClaudeWaitReason } from "../lib/claudeWaiting";
 
 export type AttentionKind = "chat" | "terminal";
 
@@ -54,6 +55,14 @@ export interface AttentionFlag {
 interface AttentionState {
   /** Per-workspace flag. Absent = no attention needed. */
   flagsByWs: Record<string, AttentionFlag>;
+  /**
+   * What a session that is ON SCREEN is waiting on, from Claude Code's hooks.
+   * A shown pane never raises a flag (the user can see it), but in a grid of
+   * panes the one blocked on a prompt still needs pointing at: its caption
+   * reads this. Absent = not waiting. The rule is `nextShownWaiting`
+   * (lib/attentionFocus.ts).
+   */
+  waitingByTerminal: Record<string, ClaudeWaitReason>;
   /** User preference — defaults to on; toggle in Settings → General. */
   soundEnabled: boolean;
   /** Internal: last chime timestamp, used for rate-limiting. */
@@ -73,6 +82,8 @@ interface AttentionState {
   /** Clear the flag only if it points at this terminal — called when a session
    *  is closed, so a marker can't outlive the thing that raised it. */
   clearForTerminal: (workspaceId: string, terminalId: string) => void;
+  /** Set (or, with null, clear) what an on-screen session is waiting on. */
+  setShownWaiting: (terminalId: string, reason: ClaudeWaitReason | null) => void;
   /** Persisted toggle. */
   setSoundEnabled: (v: boolean) => void;
 }
@@ -88,6 +99,7 @@ const readSoundPref = (): boolean => {
 
 export const useAttentionStore = create<AttentionState>((set, get) => ({
   flagsByWs: {},
+  waitingByTerminal: {},
   soundEnabled: readSoundPref(),
   lastChimeAt: 0,
 
@@ -134,6 +146,15 @@ export const useAttentionStore = create<AttentionState>((set, get) => ({
       const next = { ...s.flagsByWs };
       delete next[workspaceId];
       return { flagsByWs: next };
+    }),
+
+  setShownWaiting: (terminalId, reason) =>
+    set((s) => {
+      if ((s.waitingByTerminal[terminalId] ?? null) === reason) return s;
+      const next = { ...s.waitingByTerminal };
+      if (reason) next[terminalId] = reason;
+      else delete next[terminalId];
+      return { waitingByTerminal: next };
     }),
 
   setSoundEnabled: (v) => {

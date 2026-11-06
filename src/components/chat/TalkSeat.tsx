@@ -8,6 +8,7 @@ import { prefersReducedMotion } from "../../lib/motion";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { EmptySeat } from "../run/RunPanes";
+import { PaneWaiting } from "../run/PaneWaiting";
 
 interface Props {
   workspaceId: string;
@@ -192,6 +193,7 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
                       <span className="min-w-0 truncate">{session?.label}</span>
                     </span>
                   </FadeSwap>
+                  <PaneWaiting terminalId={session?.id ?? null} />
                 </button>
                 <button
                   type="button"

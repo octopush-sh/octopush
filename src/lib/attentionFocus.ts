@@ -7,7 +7,9 @@
 // part and App is not a testable place to keep it.
 
 import type { AttentionFlag } from "../stores/attentionStore";
+import type { ClaudeWaitReason } from "./claudeWaiting";
 import type { WorkspaceMode } from "./modes";
+import type { PtyAttentionReason } from "./types";
 
 /** The mode a flag is asking the user to visit. */
 export function modeForFlag(flag: AttentionFlag): WorkspaceMode {
@@ -35,4 +37,37 @@ export function shouldClearAttention(
     return flag.terminalId === activeTerminalId;
   }
   return true;
+}
+
+/** Something that happened to one session's pane. */
+export type ShownWaitingEvent =
+  /** `pty://attention` arrived; `shown` is whether the pane is on screen. */
+  | { type: "attention"; reason: PtyAttentionReason | null; shown: boolean }
+  /** The user typed into the pane. */
+  | { type: "input" }
+  /** The pane became the one the user works in. */
+  | { type: "focus" }
+  /** `pty://settled`: Claude Code's `Stop` hook — the turn is over. */
+  | { type: "settled" }
+  /** The pane left the screen (left the view, mode switch, closed). */
+  | { type: "hidden" };
+
+/**
+ * What an on-screen session is waiting on after `event`, given `current`.
+ *
+ * Only Claude Code's own hook reasons (`permission`, `input`) mark a pane on
+ * screen: the daemon's `idle` guess and an event with no reason (an older
+ * daemon or CLI) leave it as it was. A pane that is off screen is never
+ * marked — the rail's attention flag points at it instead. The user answering
+ * (typing, focusing the pane), the turn ending, or the pane leaving the
+ * screen clears the mark.
+ */
+export function nextShownWaiting(
+  current: ClaudeWaitReason | null,
+  event: ShownWaitingEvent,
+): ClaudeWaitReason | null {
+  if (event.type !== "attention") return null;
+  if (!event.shown) return null;
+  const r = event.reason;
+  return r === "permission" || r === "input" ? r : current;
 }

@@ -13,13 +13,16 @@ import type {
   PtyExitEvent,
   PtyForegroundEvent,
   PtyReattachedEvent,
+  PtySettledEvent,
 } from "../lib/types";
 import { useAttentionStore } from "../stores/attentionStore";
+import { nextShownWaiting, type ShownWaitingEvent } from "../lib/attentionFocus";
 import { claudeWaitReason, notifyClaudeWaiting } from "../lib/claudeWaiting";
 import { useTerminalsStore } from "../stores/terminalsStore";
 import { ptySizeHeld, useTerminalLayoutStore } from "../stores/terminalLayoutStore";
 import { XTERM_FONT_FAMILY, XTERM_FONT_SIZE, getXtermTheme } from "../lib/xtermTheme";
 import { legacyAltArrowSequence } from "../lib/xtermAltArrow";
+import { isTypedInput } from "../lib/xtermReports";
 import { isMac } from "../lib/platform";
 import { describeSpawnFailure, spawnErrorDetail } from "../lib/spawnFailure";
 import { SETUP_EXIT_OSC, parseSetupExit } from "../lib/setupRun";
@@ -147,6 +150,17 @@ export function TerminalPane({
   onSpawnErrorRef.current = onSpawnError;
   onExitRef.current = onExit;
   onReattachRef.current = onReattach;
+
+  // What this session, while on screen, is waiting on (its caption reads it).
+  const applyShownWaiting = useCallback(
+    (event: ShownWaitingEvent) => {
+      const store = useAttentionStore.getState();
+      const current = store.waitingByTerminal[terminalId] ?? null;
+      const next = nextShownWaiting(current, event);
+      if (next !== current) store.setShownWaiting(terminalId, next);
+    },
+    [terminalId],
+  );
 
   const syncSize = useCallback(() => {
     const fit = fitRef.current;
@@ -450,7 +464,9 @@ export function TerminalPane({
     // idle after a meaningful burst, it emits `pty://attention`; so does
     // the Claude Code hook poller, with the reason Claude is waiting.
     // We forward it to the attention store unless this pane is on
-    // screen, where the user can already see it.
+    // screen, where the user can already see it — there a hook reason
+    // marks the pane's caption instead, so the one blocked pane in a grid
+    // still stands out.
     let unlistenAttention: UnlistenFn | undefined;
     listen<PtyAttentionEvent>("pty://attention", (ev) => {
       if (ev.payload.sessionId !== ptySessionIdRef.current) return;
@@ -458,6 +474,7 @@ export function TerminalPane({
       // A hook signal also notifies, unless the user is looking at this pane.
       const waiting = claudeWaitReason(reason);
       if (waiting) notifyClaudeWaiting(workspaceIdRef.current, waiting, shownRef.current);
+      applyShownWaiting({ type: "attention", reason, shown: shownRef.current });
       if (shownRef.current) return;
       // Carry the terminal id so the Run rail can mark the session that rang
       // rather than the whole workspace.
@@ -466,6 +483,15 @@ export function TerminalPane({
         .ping(workspaceIdRef.current, "terminal", terminalId, reason);
     }).then((u) => {
       unlistenAttention = u;
+    });
+
+    // Claude Code's `Stop` hook: the turn ended, so it is no longer waiting.
+    let unlistenSettled: UnlistenFn | undefined;
+    listen<PtySettledEvent>("pty://settled", (ev) => {
+      if (ev.payload.sessionId !== ptySessionIdRef.current) return;
+      applyShownWaiting({ type: "settled" });
+    }).then((u) => {
+      unlistenSettled = u;
     });
 
     // Daemon-driven foreground state: a command started or stopped running in
@@ -558,6 +584,9 @@ export function TerminalPane({
     const dataDisp = term.onData((data) => {
       const ptyId = ptySessionIdRef.current;
       if (!ptyId) return;
+      // Only a key or paste answers a prompt — not xterm's own query replies
+      // or mouse reports, which arrive here too.
+      if (isTypedInput(data)) applyShownWaiting({ type: "input" });
       ipc.writeTextToSession(ptyId, data).catch(() => {});
     });
 
@@ -621,7 +650,10 @@ export function TerminalPane({
       unlistenExit?.();
       unlistenReattached?.();
       unlistenAttention?.();
+      unlistenSettled?.();
       unlistenForeground?.();
+      // The session left (closed, or its pane unmounted): nothing to mark.
+      applyShownWaiting({ type: "hidden" });
       if (busyOffTimerRef.current) clearTimeout(busyOffTimerRef.current);
       window.removeEventListener("octo:theme", onThemeChange);
       copyEl.removeEventListener("contextmenu", onContextMenu);
@@ -659,6 +691,13 @@ export function TerminalPane({
       };
     }
   }, [shown, takesFocus, syncSize]);
+
+  // Focusing the pane is answering its caption's "waiting on …"; leaving the
+  // screen drops it (the rail flags whatever the session asks for next).
+  useEffect(() => {
+    if (!shown) applyShownWaiting({ type: "hidden" });
+    else if (takesFocus) applyShownWaiting({ type: "focus" });
+  }, [shown, takesFocus, applyShownWaiting]);
 
   // The divider was let go (or the fold settled): tell the PTY the size the
   // pane settled on.

@@ -380,6 +380,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     // at — without this it would keep the workspace in Mission Control's
     // needs-you band and pulsing on the rail forever.
     useAttentionStore.getState().clearForTerminal(workspaceId, id);
+    useAttentionStore.getState().setShownWaiting(id, null);
 
     const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
     const remaining = prev.filter((t) => t.id !== id);
