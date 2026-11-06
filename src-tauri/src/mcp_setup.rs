@@ -142,9 +142,11 @@ enum CliFailure {
 fn classify_failure(output: &str) -> CliFailure {
     let text = output.to_lowercase();
     // Lock first: retrying a misread not-found is harmless, the reverse isn't.
+    // "mcp server found" covers both "No MCP server found…" and the scoped
+    // "No user-scoped MCP server found…".
     if text.contains("lock") || text.contains("busy") {
         CliFailure::Busy
-    } else if ["no mcp server found", "not found", "does not exist", "no such server"]
+    } else if ["mcp server found", "not found", "does not exist", "no such server"]
         .iter()
         .any(|p| text.contains(p))
     {
