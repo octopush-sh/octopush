@@ -398,6 +398,31 @@ describe("PipelineSetup Claude Code version preflight", () => {
     expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
   });
 
+  const escapeFix = { version: "2.1.319", reason: "fixes a sandbox escape when creating a worktree" };
+
+  it("names a missing security fix on a tested CLI, and the run can still begin", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-4-6")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false, securityFix: escapeFix });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-claude-cli-update");
+    expect(note.textContent).toContain("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree");
+    expect(note.textContent).toContain("installed 2.1.316");
+    expect(note.textContent).not.toContain("wrong token usage");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("shows the tested-floor note instead of the security one below the floor", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-4-6")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true, securityFix: escapeFix });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-claude-cli-update");
+    expect(note.textContent).toContain("Update Claude Code (2.1.314 or newer recommended)");
+    expect(note.textContent).not.toContain("sandbox escape");
+    expect(screen.getAllByTestId("launcher-claude-cli-update")).toHaveLength(1);
+  });
+
   it("warns above Begin when under 2 GB is free, and the run can still begin", async () => {
     const { usePerfStore } = await import("../stores/perfStore");
     const GB = 1024 ** 3;

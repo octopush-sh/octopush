@@ -1472,7 +1472,7 @@ impl AgentRunner for CliRunner {
         let emitter = crate::orchestrator::live::LiveEmitter::new(
             ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id,
         );
-        if let Some(note) = cli_version.as_ref().and_then(|v| v.update_notice()) {
+        for note in cli_version.as_ref().map(|v| v.stage_notices()).unwrap_or_default() {
             emitter.notice(&note);
         }
         if let (Some(e), true) = (stage.effort, old_cli) {

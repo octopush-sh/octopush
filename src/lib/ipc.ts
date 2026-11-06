@@ -1514,6 +1514,9 @@ export interface ClaudeCliVersion {
   floor: string;
   /** True only when the version is known and older than the floor. */
   belowFloor: boolean;
+  /** The newest sandbox/permission fix (`agent_adapter::CLAUDE_SECURITY_FIXES`)
+   *  the known version lacks; null when it has them all or is unknown. */
+  securityFix?: { version: string; reason: string } | null;
 }
 
 /** Result of a one-click "Connect to Claude Code". */

@@ -202,6 +202,8 @@ Claude Code release watch. Read VISION.md §6 and §8 first.
 2. For every changelog entry, decide whether it can affect a fragile surface in VISION.md §6
    (stream-json events, transcript JSONL, --resume, `claude mcp add`, skills/agents frontmatter,
    the `Total cost:` line, CLI flags Octopush passes). Open the source files to check — don't guess.
+   If an entry fixes a sandbox or permission escape, add a (VERSION, one-line reason) row to
+   `CLAUDE_SECURITY_FIXES` in src-tauri/src/agent_adapter.rs in the fix PR.
 3. If scripts/record-claude-fixtures.sh exists, OCTOPUSH_FIXTURE_ANTHROPIC_KEY is set and
    `claude --version` is VERSION, run `bash scripts/record-claude-fixtures.sh`, then
    `cd src-tauri && cargo test claude_code_contract`, and record the results. Otherwise say in the

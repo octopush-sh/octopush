@@ -168,7 +168,10 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
                 Some(v) if info.below_floor => {
                     not_ok(CheckStatus::Warn, &format!("{v} · tested with {floor}"), &format!("Update to {floor} or newer; {old}"), UPDATE_CLAUDE)
                 }
-                Some(v) => ReadinessCheck::ok(ID, LABEL, v),
+                Some(v) => match info.security_notice() {
+                    Some(note) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
+                    None => ReadinessCheck::ok(ID, LABEL, v),
+                },
             }
         }
     }
@@ -442,8 +445,16 @@ mod tests {
 
     #[test]
     fn claude_found_missing_old_timeout_and_broken() {
-        let ok = claude_check(probe("echo '2.1.316 (Claude Code)'"), "2.1.314");
-        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.316", None));
+        let ok = claude_check(probe("echo '2.1.319 (Claude Code)'"), "2.1.314");
+        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.319", None));
+        // At the floor but without a security fix: amber, never blocked.
+        let unsafe_cli = claude_check(probe("echo '2.1.316 (Claude Code)'"), "2.1.314");
+        assert_eq!((unsafe_cli.status, unsafe_cli.value.as_str()), (CheckStatus::Warn, "2.1.316"));
+        assert_eq!(
+            unsafe_cli.fix.as_deref(),
+            Some("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree.")
+        );
+        assert_eq!(unsafe_cli.command.as_deref(), Some(UPDATE_CLAUDE));
         let missing = claude_check(Probe::Missing, "2.1.314");
         assert_eq!((missing.status, missing.command.as_deref()), (CheckStatus::Fail, Some(INSTALL_CLAUDE)));
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");

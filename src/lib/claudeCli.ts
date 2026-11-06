@@ -1,6 +1,7 @@
 // The installed Claude Code CLI's version against the floor Octopush is
-// tested with (`agent_adapter::TESTED_CLAUDE_FLOOR`). An old CLI is a warning
-// in Settings › Integrations and the Direct launcher — it never blocks a run.
+// tested with (`agent_adapter::TESTED_CLAUDE_FLOOR`) and the security fixes it
+// may lack (`CLAUDE_SECURITY_FIXES`). An old CLI is a warning in Settings ›
+// Integrations and the Direct launcher — it never blocks a run.
 import { ipc, type ClaudeCliVersion } from "./ipc";
 
 /** Why an old CLI matters, in one line (shared by every surface that warns). */
@@ -12,6 +13,14 @@ export const CLAUDE_UPDATE_REASON =
 export function claudeUpdateLabel(info: ClaudeCliVersion | null): string | null {
   if (!info || !info.version || !info.belowFloor) return null;
   return `Update Claude Code (${info.floor} or newer recommended)`;
+}
+
+/** "Update Claude Code: 2.1.319 fixes a sandbox escape when creating a
+ *  worktree" — only when the tested-floor label doesn't already show, and
+ *  never for an unknown version. */
+export function claudeSecurityLabel(info: ClaudeCliVersion | null): string | null {
+  if (!info?.version || !info.securityFix || claudeUpdateLabel(info)) return null;
+  return `Update Claude Code: ${info.securityFix.version} ${info.securityFix.reason}`;
 }
 
 /** Mirrors `cli_runner::dialect_for_model`: OpenAI-family ids run on Codex
