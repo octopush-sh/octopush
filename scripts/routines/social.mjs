@@ -173,7 +173,7 @@ const BARE_OCTO = /(?<![\w@/.:-])(?:[a-z0-9-]+\.)*octopush\.sh(?:\.?[?#][^\s<>()
 /** A markdown link with its visible text, one level of nested brackets allowed: `[text](target)`. */
 const MD_LINK = /\[((?:[^[\]\n]|\[[^[\]\n]*\]){1,300})\]\(\s*<?([^)\s>]+)>?(?:\s+"[^"]*")?\s*\)/g;
 /** Zero-width characters that could split a domain in a link's visible text. */
-const ZERO_WIDTH = /[\u200B-\u200D\u2060\uFEFF]/g;
+const ZERO_WIDTH = /[\u00AD\u200B-\u200D\u2060\uFEFF]/g;
 /** A link's visible text as a reader sees it: NFKC, no emphasis marks, brackets or zero-width characters. */
 export const visibleText = (t) => String(t).normalize("NFKC").replace(ZERO_WIDTH, "").replace(/[*_~[\]]/g, "").trim().replace(/^[`<]+|[`>]+$/g, "").trim();
 /** Markdown with code blocks and code spans removed (reference syntax inside code is harmless). */
@@ -208,6 +208,54 @@ export function maskedLinkProblems(text) {
     if (!a || !b || canon(a) !== canon(b)) return ["a link whose visible text is a different URL or domain than its target"];
   }
   return [];
+}
+
+// ------------------------------------------------------------------ encodings (fail closed)
+
+/**
+ * Encodings that can hide a link from the checks above. A draft carrying any
+ * of them is rejected outright (pure, fixed messages): HTML entities, a
+ * backslash escape outside code, and invisible formatting characters
+ * (Unicode Cf: soft hyphen, zero-width, bidi controls such as U+202E, …).
+ */
+export function encodingProblems(text) {
+  const out = [];
+  const t = String(text);
+  if (/&(?:#\d+|#x[0-9a-f]+|[a-z][a-z0-9]{1,31});/i.test(t)) out.push("an HTML entity (write the character itself)");
+  if (/\\[!-/:-@[-`{-~]/.test(withoutCode(t))) out.push("a backslash escape outside code");
+  if (/[\u202A-\u202E\u2066-\u2069]/.test(t)) out.push("a bidi control character");
+  if (/[\u00AD\p{Cf}]/u.test(t.replace(/[\u202A-\u202E\u2066-\u2069]/g, ""))) out.push("an invisible formatting character (soft hyphen, zero-width…)");
+  return out;
+}
+
+/** Look-alike dots and slashes, mapped to ASCII in the canonical copy. */
+const HOMO_DOTS = /[\u3002\uFF61\uFF0E\uFE52\u2024\u2027\u00B7\u30FB\u2219\u22C5\u0701\u0702\u06D4\u2E33\u2E31]/g;
+const HOMO_SLASHES = /[\u2215\u2044\uFF0F\u29F8\u2571\u29C4\u2CC6\u3033\u30CE\u4E3F]/g;
+/**
+ * The text as any parser might read it (pure): entities decoded, NFKC, invisible and bidi
+ * characters gone, look-alike dots and slashes as ASCII, %2e/%2f decoded,
+ * backslashes gone, lowercased.
+ */
+const fromEntity = (n) => (n > 0 && n <= 0x10FFFF ? String.fromCodePoint(n) : "");
+export const canonical = (text) => String(text)
+  .replace(/&#(\d{1,7});/g, (_, n) => fromEntity(Number(n))).replace(/&#x([0-9a-f]{1,6});/gi, (_, h) => fromEntity(parseInt(h, 16)))
+  .replace(/&(?:period|sol|bsol|colon);/gi, (m) => ({ "&period;": ".", "&sol;": "/", "&bsol;": "\\", "&colon;": ":" })[m.toLowerCase()])
+  .normalize("NFKC").replace(/[\u00AD\p{Cf}]/gu, "")
+  .replace(HOMO_DOTS, ".").replace(HOMO_SLASHES, "/").replace(/%2e/gi, ".").replace(/%2f/gi, "/").replace(/\\/g, "").toLowerCase();
+
+/** The only octopush.sh links a draft may carry, byte for byte, each ending at a boundary. */
+const OCTO_LITERAL = /https:\/\/octopush\.sh\/(?:docs\/[a-z0-9/-]+|download\?src=reddit)?(?=$|[\s)\]>"'`]|[.,;:!?]+(?:$|[\s)\]]))/g;
+/** A bare mention: octopush.sh followed by whitespace, the end, sentence punctuation or a closing bracket — never / ? #. */
+const OCTO_BARE = /(?<![\w./:@-])octopush\.sh(?=$|[\s)\]]|[.,;:!?]+(?:$|[\s)\]]))/gi;
+/**
+ * Every "octopush<dots/space>sh" in the canonical copy must be one of the
+ * allowed literal links (or a bare octopush.sh) in the raw text (pure).
+ */
+export function octoMentionProblems(text) {
+  const t = String(text);
+  const seen = (canonical(t).match(/octopush[\s.]*sh(?![a-z0-9])/g) ?? []).length;
+  const allowed = (t.match(OCTO_LITERAL) ?? []).length + (t.match(OCTO_BARE) ?? []).length;
+  return seen > allowed ? ["an octopush.sh mention that isn't one of the allowed literal links (https://octopush.sh/, https://octopush.sh/docs/…, https://octopush.sh/download?src=reddit) or a bare octopush.sh"] : [];
 }
 
 // The allow-list is literal: no trailing dot on octopush.sh itself.
@@ -299,7 +347,7 @@ export function checkDraft(d) {
   // The script decides whether the draft promotes Octopush, not the agent's flag.
   const mentions = SELF_REF.test(all);
   if (mentions && !DISCLOSURE.test(text)) e.push(`mentions Octopush or the maker's own work without the disclosure "I build Octopush"`);
-  e.push(...linkProblems(all));
+  e.push(...linkProblems(all), ...encodingProblems(all), ...octoMentionProblems(all));
   const pro = presentsProRuns(all);
   if (pro && !FREE_BOUNDARY.test(text)) e.push(`presents Direct runs in parallel or in the background without the Free boundary ("one run at a time", free-vs-pro.md)`);
   let flags = Array.isArray(d.flags) ? [...new Set(d.flags)] : [];

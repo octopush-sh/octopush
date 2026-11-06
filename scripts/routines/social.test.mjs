@@ -7,6 +7,7 @@ import {
   checkDraft, prepareDrafts, prepareIntel, applyCadence, historyFrom, parseDrafts, parsePosted, lastDraftNumber, fingerprint,
   linkProblems, extractUrls, aiRuleOk, secretProblems, secretValues, isEnglish, phaseOf, fence, post, buildContext, todaysIssue,
   vision, quote, unquote, normText, oneLine, threadKey, presentsProRuns, planWording, MARKETING_FILES, MAX_BODY, FOOTER,
+  canonical, octoMentionProblems,
 } from "./social.mjs";
 import { claudeArgs, ROLES } from "./agent.mjs";
 import { localDate } from "./ideas.mjs";
@@ -237,6 +238,41 @@ test("links: a masked link's visible URL or domain must be its target", () => {
     "[octopush.sh](https://octopush.sh/)", "[https://git-scm.com/docs/git-worktree](https://git-scm.com/docs/git-worktree)",
     "[www.git-scm.com/docs](https://git-scm.com/docs/)", "[the worktree docs](https://git-scm.com/docs/git-worktree)", "[v1.2](https://example.com/notes)",
   ]) assert.deepEqual(linkProblems(ok), [], ok);
+});
+
+test("encodings fail closed: entities, escapes, invisible and bidi characters, one canonical octopush.sh", () => {
+  const rejects = (t) => reasons(draft({ text: `${t} (I build Octopush)` }));
+  const cases = {
+    "https://octopush&#46;sh/?utm=1": /HTML entity/,
+    "[site](https://octopush&#46;sh/?utm=1)": /HTML entity/,
+    "[site](https://octopush\\.sh/?utm=1)": /backslash escape/,
+    "https://octo\u00ADpush.sh/?utm=1": /invisible formatting/,
+    "\u202Ehttps://octopush.sh/": /bidi control/,
+    "Check \u2066this\u2069 out.": /bidi control/,
+    "https://octopush.sh\u2215?utm=1": /allowed literal links/,
+    "octopush.sh\u2044download?src=x": /allowed literal links/,
+    "octopush\u3002sh/?ref=me": /allowed literal links/,
+    "octopush%2Esh/?x=1": /allowed literal links/,
+    "`octopush\\.sh/?utm=1`": /allowed literal links/,
+    "https://octopush.sh/docs/A?x=1": /allowed literal links/,
+    "Tom &amp; Jerry use worktrees.": /HTML entity/,
+    "Written as &#x41;gents.": /HTML entity/,
+    "Escape it like \\*this\\*.": /backslash escape/,
+  };
+  for (const [t, re] of Object.entries(cases)) assert.ok(rejects(t).some((e) => re.test(e)), JSON.stringify(t));
+  // Even without the literal-link check, the canonical copy sees through the entity.
+  assert.equal(octoMentionProblems("https://octopush&#46;sh/?utm=1").length, 1);
+  assert.equal(canonical("Ｏｃｔｏｐｕｓｈ\u2024sh\u2215x"), "octopush.sh/x");
+  // Legitimate drafts still pass.
+  for (const ok of [
+    "Docs: https://octopush.sh/docs/worktrees/ and https://octopush.sh/download?src=reddit. Or just octopush.sh.",
+    "See https://octopush.sh/. It does this per workspace.",
+    "[octopush.sh](https://octopush.sh/) does this per workspace.",
+    "Octopush shows cost per stage.",
+    "Escape the glob in code: `ls \\*.md`, or in a block:\n\n    rm \\*.tmp",
+    "Docs at (https://octopush.sh/docs/review-mode) cover it.",
+  ]) assert.deepEqual(rejects(ok), [], JSON.stringify(ok));
+  assert.deepEqual(reasons(draft()), []);
 });
 
 // ---------------------------------------------------------------- fp + normalisation

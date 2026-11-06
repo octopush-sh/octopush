@@ -93,6 +93,12 @@ anything else fails the job.
     with its query), shows a URL or domain as a masked link's text that differs from its target
     (the text is read as a reader sees it: NFKC, without emphasis marks, brackets or zero-width
     characters), or uses a reference-style link (`[text][1]` with `[1]: url`);
+  - carries an encoding that could hide a link (fail closed): an HTML entity, a backslash escape
+    outside code, a bidi control or any invisible formatting character (soft hyphen, zero-width…);
+    or mentions `octopush.sh` in any form (checked on a canonical copy: entities decoded, NFKC,
+    invisible characters dropped, look-alike dots and slashes as ASCII, `%2e`/`%2f` decoded,
+    backslashes dropped, lowercased) that isn't one of the three allowed links, byte for byte, or a
+    bare `octopush.sh` with no `/`, `?` or `#` after it;
   - presents Direct or pipeline runs in parallel or in the background without
     "one run at a time";
   - repeats an earlier draft's text, or its thread (subreddit + post id);
