@@ -90,7 +90,7 @@ jobs:
       - name: release helpers and the nightly beta routine
         run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs scripts/web-version.test.mjs scripts/rerun-starved.test.mjs
       - name: routine scripts
-        run: node --test scripts/routines/routines.test.mjs
+        run: node --test scripts/routines/routines.test.mjs scripts/routines/social.test.mjs
       - name: visual audit logic
         # Pure parts only (merging, fingerprints, issue filing). The audit itself runs nightly (visual-audit.yml).
         run: node --test scripts/visual-audit/visual-audit.test.mjs

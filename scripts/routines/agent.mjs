@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Run one headless Claude Code agent for a nightly workflow (docs/ROUTINES.md).
 //
-//   agent.mjs <builder|reviewer|ideas> <prompt-file>
+//   agent.mjs <builder|reviewer|ideas|social> <prompt-file>
 //
 // The agent gets NO GitHub credential and only the tools its role needs:
 //   - its environment is rebuilt from scratch: PATH, HOME, a scratch TMPDIR and
@@ -53,6 +53,13 @@ export const ROLES = {
     tools: ["Read", "Glob", "Grep", "Write", "WebSearch", "WebFetch"],
     allow: (cwd) => [...readHere(cwd), `Edit(/${cwd}/${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
   },
+  // The community routines (social.yml): research only, like ideas — the web,
+  // the checkout read-only, and one output file. No Bash, no GitHub.
+  social: {
+    model: "claude-opus-5-5",
+    tools: ["Read", "Glob", "Grep", "Write", "WebSearch", "WebFetch"],
+    allow: (cwd) => [...readHere(cwd), `Edit(/${cwd}/${OUT_DIR}/**)`, "WebSearch", "WebFetch"],
+  },
 };
 
 /**
@@ -80,7 +87,7 @@ export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
  */
 export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd()) {
   const r = ROLES[role];
-  if (!r) throw new Error(`unknown role "${role}" (builder | reviewer | ideas)`);
+  if (!r) throw new Error(`unknown role "${role}" (${Object.keys(ROLES).join(" | ")})`);
   const settings = { permissions: { allow: r.allow(cwd), deny: denyRules(runnerTemp) } };
   return [
     "-p",
@@ -127,7 +134,7 @@ export function agentEnv(env = process.env) {
 
 function main() {
   const [role, promptFile] = process.argv.slice(2);
-  if (!role || !promptFile) { console.error("usage: agent.mjs <builder|reviewer|ideas> <prompt-file>"); return 64; }
+  if (!role || !promptFile) { console.error(`usage: agent.mjs <${Object.keys(ROLES).join("|")}> <prompt-file>`); return 64; }
   const env = agentEnv();
   mkdirSync(env.TMPDIR, { recursive: true, mode: 0o700 });
   mkdirSync(OUT_DIR, { recursive: true });

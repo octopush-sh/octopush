@@ -1,0 +1,255 @@
+# Daily community routines for octopush-web's marketing work (docs/ROUTINES.md).
+# 06:47 Bogotá, after the ideas digest.
+#
+#   intel   a Claude agent researches the market and competitors and writes
+#           social-intel.json → issue "Market report YYYY-MM-DD" in octopush-web
+#   drafts  a Claude agent reads today's report and the marketing rulebook,
+#           reads Reddit threads and writes social-drafts.json → issue
+#           "Social drafts YYYY-MM-DD" in octopush-web
+#
+# The agents have no GitHub access (agent.mjs role `social`): web search, the
+# checkout read-only and one file under .agent-out/. social.mjs validates the
+# file and files it with an installation token of the "Octopush Cycle" GitHub
+# App, so the issue is authored by the App's bot, never by the owner's account
+# (VISION.md §8). A read-only token builds the context and is revoked before the
+# agent starts; a fresh issues-write one files the result. Nothing is posted to
+# Reddit or anywhere else: the owner approves each draft in his PM chat.
+name: social
+
+on:
+  schedule:
+    - cron: "47 11 * * *"
+  workflow_dispatch:
+    inputs:
+      kind:
+        description: Which routine to run
+        type: choice
+        options: [both, intel, drafts]
+        default: both
+
+permissions:
+  contents: read   # the checkout and the app's public stable release
+
+concurrency:
+  group: social
+  cancel-in-progress: false
+
+env:
+  OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+  OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+  CLAUDE_CODE_VERSION: "2.1.314"
+  TZ: America/Bogota   # issues are titled with the owner's date
+
+jobs:
+  intel:
+    if: github.event_name != 'workflow_dispatch' || inputs.kind != 'drafts'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      KIND: intel
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Web token (check and context — revoked before the agent)
+        id: read-token
+        # The web lane is optional: if the App isn't installed on octopush-web
+        # (or its key is missing), there is nowhere to file — skip the run.
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true
+          permission-issues: read
+          permission-contents: read
+
+      - name: Web lane offline?
+        if: steps.read-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — the social routine has nowhere to file, skipping"
+
+      - name: Already filed today?
+        id: check
+        if: steps.read-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
+        # A manual run goes ahead anyway: it comments on today's issue.
+        run: |
+          if node scripts/routines/social.mjs check "$KIND"; then echo "go=1" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Context and brief
+        if: steps.check.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
+        run: |
+          set -euo pipefail
+          cp -R scripts/routines "$RUNNER_TEMP/routines"
+          { cat "scripts/routines/briefs/social-$KIND.md"; echo; node scripts/routines/social.mjs context "$KIND"; } > "$RUNNER_TEMP/prompt.md"
+
+      - name: Revoke the context token
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
+
+      - name: Install Claude Code (no token in this step)
+        if: steps.check.outputs.go == '1'
+        run: npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+
+      - name: Research (Claude agent, no GitHub access)
+        if: steps.check.outputs.go == '1'
+        timeout-minutes: 35
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node "$RUNNER_TEMP/routines/agent.mjs" social "$RUNNER_TEMP/prompt.md"
+
+      - name: Web token (file the issue)
+        id: post-token
+        continue-on-error: true
+        if: steps.check.outputs.go == '1'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+          permission-contents: read
+
+      - name: Web lane offline?
+        if: steps.post-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token to file with (does the Octopush Cycle App have Issues write on octopush-web?) — nothing filed"
+
+      - name: File the issue
+        if: steps.check.outputs.go == '1' && steps.post-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.post-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.post-token.outputs.app-slug && format('{0}[bot]', steps.post-token.outputs.app-slug) || '' }}
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          f=".agent-out/social-$KIND.json"
+          [ -f "$f" ] || { echo "::error::the agent wrote no $f"; exit 1; }
+          if node -e 'const s=process.env.OCTOPUSH_SECRETS.trim(); process.exit(s.length>=8 && require("fs").readFileSync(process.argv[1],"utf8").includes(s)?0:1)' "$f"; then
+            echo "::error::social-$KIND.json contains a secret value — not filed"; exit 1
+          fi
+          node "$RUNNER_TEMP/routines/social.mjs" post "$KIND" "$f"
+
+  drafts:
+    # After the report (it reads it), but also when the report failed or was not asked for.
+    needs: intel
+    if: ${{ !cancelled() && (github.event_name != 'workflow_dispatch' || inputs.kind != 'intel') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      KIND: drafts
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Web token (check and context — revoked before the agent)
+        id: read-token
+        continue-on-error: true
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          skip-token-revoke: true
+          permission-issues: read
+          permission-contents: read
+
+      - name: Web lane offline?
+        if: steps.read-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token (is the Octopush Cycle App installed on octopush-web?) — the social routine has nowhere to file, skipping"
+
+      - name: Already filed today?
+        id: check
+        if: steps.read-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
+        run: |
+          if node scripts/routines/social.mjs check "$KIND"; then echo "go=1" >> "$GITHUB_OUTPUT"
+          elif [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then echo "manual run: adding to today's issue"; echo "go=1" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Context and brief
+        if: steps.check.outputs.go == '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.read-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.read-token.outputs.app-slug && format('{0}[bot]', steps.read-token.outputs.app-slug) || '' }}
+        run: |
+          set -euo pipefail
+          cp -R scripts/routines "$RUNNER_TEMP/routines"
+          { cat "scripts/routines/briefs/social-$KIND.md"; echo; node scripts/routines/social.mjs context "$KIND"; } > "$RUNNER_TEMP/prompt.md"
+
+      - name: Revoke the context token
+        if: always() && steps.read-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.read-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
+
+      - name: Install Claude Code (no token in this step)
+        if: steps.check.outputs.go == '1'
+        run: npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+
+      - name: Draft (Claude agent, no GitHub access)
+        if: steps.check.outputs.go == '1'
+        timeout-minutes: 35
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node "$RUNNER_TEMP/routines/agent.mjs" social "$RUNNER_TEMP/prompt.md"
+
+      - name: Web token (file the issue)
+        id: post-token
+        continue-on-error: true
+        if: steps.check.outputs.go == '1'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: octopush-web
+          permission-issues: write
+          permission-contents: read
+
+      - name: Web lane offline?
+        if: steps.post-token.outcome == 'failure'
+        run: echo "::warning title=web lane::no octopush-web token to file with (does the Octopush Cycle App have Issues write on octopush-web?) — nothing filed"
+
+      - name: File the issue
+        if: steps.check.outputs.go == '1' && steps.post-token.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OCTOPUSH_WEB_TOKEN: ${{ steps.post-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.post-token.outputs.app-slug && format('{0}[bot]', steps.post-token.outputs.app-slug) || '' }}
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: |
+          set -euo pipefail
+          f=".agent-out/social-$KIND.json"
+          [ -f "$f" ] || { echo "::error::the agent wrote no $f"; exit 1; }
+          if node -e 'const s=process.env.OCTOPUSH_SECRETS.trim(); process.exit(s.length>=8 && require("fs").readFileSync(process.argv[1],"utf8").includes(s)?0:1)' "$f"; then
+            echo "::error::social-$KIND.json contains a secret value — not filed"; exit 1
+          fi
+          node "$RUNNER_TEMP/routines/social.mjs" post "$KIND" "$f"

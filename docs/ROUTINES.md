@@ -30,6 +30,7 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | every 2 h (even hours, :07) | [`web-review.yml`](../.github/workflows/web-review.yml) | an independent Claude reviewer judges each green web PR (up to 3) against octopush-web's CLAUDE.md, the truth rule (the app's `FEATURES.md` at its latest **stable** release), the design rules and the human-only areas, and posts the verdict. It never merges: approved web PRs are listed in the digest for your `merge web#N` |
 | 05:13, 17:13 | [`nightly-release.yml`](../.github/workflows/nightly-release.yml) | if `main` moved and CI is green: notes, What's new tips, clips, version bump, release PR, CI, merge, tag → `release.yml` publishes a **beta** |
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
+| 06:47 | [`social.yml`](../.github/workflows/social.yml) | the community routines for octopush-web's `marketing/` work, two jobs (see [Community routines](#community-routines)): `intel` — a Claude agent researches the market and competitors → issue **Market report YYYY-MM-DD**; then `drafts` (also when `intel` failed) — a Claude agent reads that report and the Reddit threads → issue **Social drafts YYYY-MM-DD** with comment drafts. Both issues land in **octopush-web**, label `social`, filed by the App's bot. Nothing is posted anywhere: you approve each draft in your PM chat |
 | any time | [`answers.yml`](../.github/workflows/answers.yml) | the moment you comment on the digest, your answers are applied and confirmed in a reply |
 
 Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedules sit off the hour on purpose: GitHub delays (and sometimes drops) scheduled runs at :00 under load.
@@ -54,6 +55,39 @@ One instruction per line (or several on one line), Spanish or English, accents o
 Only your comments count, and the reply echoes what was applied — including your notes — so a
 misread shows at once.
 
+### Community routines
+
+[`social.yml`](../.github/workflows/social.yml) runs two jobs a day around [`scripts/routines/social.mjs`](../scripts/routines/social.mjs):
+`intel`, then `drafts`. **Run workflow** takes `kind`
+(`both`, `intel` or `drafts`); a manual run on a day whose issue exists adds a comment to it
+instead of a second issue. The rulebook is octopush-web's `marketing/` folder (`README.md`,
+`strategy.md`, `competitors.md`, `drafts/TEMPLATE.md`, read from `main`, else from branch
+`pm/marketing-social`).
+
+- **The agents** (role `social` in `agent.mjs`, briefs `briefs/social-intel.md` and
+  `briefs/social-drafts.md`) have web search, the checkout read-only and one output file —
+  `.agent-out/social-intel.json` or `.agent-out/social-drafts.json`. No GitHub access, no shell.
+  Their context (`social.mjs context`) is the rulebook, `free-vs-pro.md`, the app's stable
+  release (tag and notes), VISION §2, §3 and §5 and, for drafts, today's market report and the
+  last 7 days of drafts issues with comments by you and the routine — all fenced as untrusted
+  data. It is read with a read-only App token that is revoked before the agent starts.
+- **`social.mjs post`** validates the file and files it with a fresh issues-write App token, so
+  the issue is the App's bot's, never your account's. It refuses the whole file if it carries a
+  secret value or a credential shape, and leaves out (listing the reason in the issue) any draft
+  that: breaks the strict schema or the length caps; isn't English; is for a subreddit whose
+  recorded AI-content rule bans AI content; mentions Octopush without "I build Octopush"; links
+  octopush.sh with any query other than `/download?src=reddit` (or links the raw GitHub releases
+  page); presents parallel or background runs without "one run at a time"; repeats an earlier
+  draft's text or thread; or breaks the current phase from `strategy.md` (phase 1: no posts, at
+  most 4 comments a day, at most 1 in 10 drafts of the last 7 days mentions Octopush; unknown
+  phase counts as 1). Drafts that mention a Pro-only feature are flagged `plan-boundary`. Each
+  draft's `fp` (first 8 hex of sha256 of the quoted text) is computed by the script, never taken
+  from the agent. Market report facts without a source URL and a date (or `unverified`) are left
+  out.
+- **Approvals happen only in your PM chat** (`marketing/README.md`). Every drafts issue says so
+  in its footer: a GitHub comment, `ok` included, is never an approval, and no routine posts to
+  Reddit.
+
 ### What keeps it safe
 
 The repos are public: anyone can write an issue, a comment or a PR, and an agent reading that text
@@ -65,7 +99,7 @@ trusted:
   (`--permission-mode dontAsk`). File tools are allowed only inside the working directory (so not
   the runner's action code or tool cache, which run later with a token), and the process table,
   system and credential paths, the runner's temp dir and git config are denied on top. The
-  reviewer, the design reviewer (`visual-audit.yml`) and the ideas agent can only write their output file; only the ideas agent can use the
+  reviewer, the design reviewer (`visual-audit.yml`), the ideas agent and the social agents can only write their output file; only the ideas and social agents can use the
   web. Transcripts stay on the runner — public Actions logs show only the exit code.
 - **The builder runs code only through `octo-check`** (typecheck, tests, changeset check) — a
   root-owned copy of `scripts/routines/agent-check.sh` that runs the checks as a separate user with
@@ -100,7 +134,7 @@ trusted:
   `OCTOPUSH_APP_PRIVATE_KEY`) is used only by `actions/create-github-app-token` to mint an
   installation token **scoped to octopush-web alone**, with the fewest permissions the step needs,
   valid for an hour at most and revoked at the end of the job. It goes only to fixed steps of
-  `web-build`, `web-review`, `web-audit`, `ideas` and `answers` (as `OCTOPUSH_WEB_TOKEN`), never to
+  `web-build`, `web-review`, `web-audit`, `ideas`, `answers` and `social` (as `OCTOPUSH_WEB_TOKEN`), never to
   an agent step or an environment an agent inherits: a token used before an agent runs (to pick a
   job, read PRs, build context, check out) is **revoked before the agent starts**, and a fresh one
   is minted afterwards to publish. **No job that runs the website's own code ever holds the App's
@@ -161,7 +195,7 @@ cycle itself keeps the repo active.
 
 Claude usage comes from your subscription's limits (no API billing). Runner minutes are free on
 public repositories — the website lane runs here for that reason, even though it works on the
-private octopush-web. Per run: one build, up to three reviews per lane; one ideas run a day.
+private octopush-web. Per run: one build, up to three reviews per lane; one ideas run and one social run (two agents) a day.
 
 ---
 
