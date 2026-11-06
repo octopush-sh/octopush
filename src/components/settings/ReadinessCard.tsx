@@ -1,20 +1,27 @@
 // Settings › General — "Is this Mac ready for a crew?". One row per local
-// check, run when the pane opens and on "Check again".
+// check, run when the pane opens and on "Check again". The result slot always
+// answers: not checked yet, checking, the rows, or that no checks came back.
 import { useEffect, useState } from "react";
-import { AlertTriangle, CheckCircle, Clock, Copy, Loader2, XCircle } from "lucide-react";
+import { AlertTriangle, CheckCircle, Circle, Clock, Copy, Loader2, XCircle } from "lucide-react";
 import type { ReadinessCheck } from "../../lib/ipc";
 import { copyToClipboard } from "../../lib/clipboard";
 import { useReadinessStore } from "../../stores/readinessStore";
-import { SectionLabel } from "./shared";
+import { SectionLabel, formatRelative } from "./shared";
 
-const STATUS: Record<ReadinessCheck["status"], { word: string; tone: string; Icon: typeof CheckCircle }> = {
+type StatusStyle = { word: string; tone: string; Icon: typeof CheckCircle };
+
+const STATUS: Record<ReadinessCheck["status"], StatusStyle> = {
   ok: { word: "Ready", tone: "text-octo-verdigris", Icon: CheckCircle },
   warn: { word: "Warning", tone: "text-octo-warning", Icon: AlertTriangle },
   fail: { word: "Failed", tone: "text-octo-rouge", Icon: XCircle },
 };
 
+/** A status this build doesn't know (an older or newer backend): mute, never a verdict. */
+const PENDING: StatusStyle = { word: "Unknown", tone: "text-octo-mute", Icon: Circle };
+
 export function ReadinessCard() {
   const checks = useReadinessStore((s) => s.checks);
+  const checkedAt = useReadinessStore((s) => s.checkedAt);
   const loading = useReadinessStore((s) => s.loading);
   const error = useReadinessStore((s) => s.error);
   const check = useReadinessStore((s) => s.check);
@@ -23,6 +30,16 @@ export function ReadinessCard() {
   useEffect(() => {
     void check();
   }, [check]);
+
+  // Keep "Checked 2m ago" honest while the pane stays open.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    if (checkedAt === null) return;
+    const id = setInterval(() => setTick((t) => t + 1), 30_000);
+    return () => clearInterval(id);
+  }, [checkedAt]);
+
+  const neverChecked = !checks && !loading && !error;
 
   return (
     <div className="space-y-4">
@@ -47,11 +64,17 @@ export function ReadinessCard() {
             disabled={loading}
             className="shrink-0 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:opacity-50"
           >
-            {loading ? "Checking…" : "Check again"}
+            {loading ? "Checking…" : neverChecked ? "Run the check" : "Check again"}
           </button>
         </div>
 
         {error && <p className="octo-pop-in mt-3 text-[12px] text-octo-rouge">Couldn't run the checks: {error}</p>}
+
+        {neverChecked && (
+          <p data-testid="readiness-unchecked" className="octo-fade-in mt-3 text-[12px] text-octo-mute">
+            Not checked yet.
+          </p>
+        )}
 
         {!checks && loading && (
           <div data-testid="readiness-loading" className="octo-fade-in mt-3 flex items-center gap-2 text-[12px] text-octo-mute">
@@ -60,12 +83,29 @@ export function ReadinessCard() {
           </div>
         )}
 
-        {checks && (
+        {checks && checks.length === 0 && (
+          <p data-testid="readiness-empty" className="octo-fade-in mt-3 text-[12px] text-octo-mute">
+            No checks came back from this Mac. Check again, or update Octopush if it keeps happening.
+          </p>
+        )}
+
+        {checks && checks.length > 0 && (
           <ul className="mt-3 divide-y divide-octo-hairline">
             {checks.map((c, i) => (
-              <ReadinessRow key={c.id} check={c} index={i} />
+              <ReadinessRow key={c.id ?? i} check={c} index={i} />
             ))}
           </ul>
+        )}
+
+        {checks && checkedAt !== null && (
+          <div
+            data-tour="settings-readiness-checked"
+            data-testid="readiness-checked"
+            className="octo-fade-in mt-2 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute"
+            title={new Date(checkedAt).toLocaleString()}
+          >
+            Checked {formatRelative(checkedAt)}
+          </div>
         )}
       </div>
     </div>
@@ -74,7 +114,7 @@ export function ReadinessCard() {
 
 function ReadinessRow({ check, index }: { check: ReadinessCheck; index: number }) {
   const [copied, setCopied] = useState(false);
-  const { word, tone, Icon: StatusIcon } = STATUS[check.status];
+  const { word, tone, Icon: StatusIcon } = STATUS[check.status] ?? PENDING;
   const Icon = check.timedOut ? Clock : StatusIcon;
   const statusWord = check.timedOut ? "Timed out" : word;
 

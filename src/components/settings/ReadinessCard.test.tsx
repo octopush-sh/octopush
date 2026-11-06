@@ -22,8 +22,10 @@ function row(over: Partial<ReadinessCheck> & Pick<ReadinessCheck, "id">): Readin
   return { label: over.id, status: "ok", value: "", fix: null, command: null, timedOut: false, ...over };
 }
 
+const realCheck = useReadinessStore.getState().check;
+
 beforeEach(() => {
-  useReadinessStore.setState({ checks: null, loading: false, error: null });
+  useReadinessStore.setState({ checks: null, checkedAt: null, loading: false, error: null, check: realCheck });
   readinessCheck.mockReset();
   copyToClipboard.mockReset().mockResolvedValue(true);
 });
@@ -90,5 +92,49 @@ describe("ReadinessCard", () => {
     await screen.findByTestId("readiness-row-git");
     expect(readinessCheck).toHaveBeenCalledTimes(2);
     expect(screen.queryByText(/Couldn't run the checks/)).toBeNull();
+  });
+
+  it("says 'Not checked yet' and offers 'Run the check' before the first run", () => {
+    const check = vi.fn().mockResolvedValue(undefined);
+    useReadinessStore.setState({ check });
+    render(<ReadinessCard />);
+    expect(screen.getByTestId("readiness-unchecked")).toHaveTextContent("Not checked yet.");
+    expect(screen.getByTestId("readiness-unchecked")).toHaveClass("text-octo-mute");
+    expect(screen.queryByTestId("readiness-checked")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Run the check" }));
+    expect(check).toHaveBeenCalledTimes(2);
+  });
+
+  it("never leaves the card blank when the backend answers with no list", async () => {
+    readinessCheck.mockResolvedValue(undefined);
+    render(<ReadinessCard />);
+    expect(await screen.findByTestId("readiness-empty")).toHaveTextContent(/No checks came back/);
+    expect(screen.getByTestId("readiness-checked")).toHaveTextContent("Checked just now");
+    expect(screen.getByRole("button", { name: "Check again" })).toBeEnabled();
+  });
+
+  it("shows when it last checked and keeps the rows while re-checking", async () => {
+    readinessCheck.mockResolvedValueOnce([row({ id: "git", value: "2.39.3" })]);
+    render(<ReadinessCard />);
+    await screen.findByTestId("readiness-row-git");
+    const meta = screen.getByTestId("readiness-checked");
+    expect(meta).toHaveTextContent("Checked just now");
+    expect(meta).toHaveClass("font-mono", "text-octo-mute");
+
+    readinessCheck.mockReturnValueOnce(new Promise(() => {}));
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    expect(screen.getByRole("button", { name: "Checking…" })).toBeDisabled();
+    expect(screen.getByTestId("readiness-row-git")).toBeInTheDocument();
+    expect(screen.queryByTestId("readiness-loading")).toBeNull();
+  });
+
+  it("shows a status it doesn't know as a mute 'Unknown', not a verdict", async () => {
+    readinessCheck.mockResolvedValue([
+      row({ id: "git", label: "git", status: "later" as unknown as ReadinessCheck["status"] }),
+    ]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-git");
+    expect(within(r).getByText("Unknown")).toHaveClass("text-octo-mute");
+    expect(within(r).getByTitle("git: Unknown")).toBeInTheDocument();
   });
 });
