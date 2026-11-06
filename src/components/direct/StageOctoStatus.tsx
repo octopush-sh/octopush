@@ -14,8 +14,10 @@ export function roleForStage(entries: LiveEntry[], status: RunStageStatus): Octo
 }
 
 /** DIRECT adapter over the shared OctoPlayer: narrates the focused stage's
- *  work journal. A `done` stage earns the ✓ beat; a `failed` one leaves
- *  quietly; switching focused stages hard-resets (identity = stage id). */
+ *  work journal, docked inline at the journal's tail (not pinned to the
+ *  canvas bottom, where it read as a stalled stage). A `done` stage earns
+ *  the ✓ beat; a `failed` one leaves quietly; switching focused stages
+ *  hard-resets (identity = stage id). */
 export function StageOctoStatus({
   stage,
   entries,
@@ -30,6 +32,7 @@ export function StageOctoStatus({
       active={status === "running" || status === "awaiting_checkpoint"}
       role={roleForStage(entries, status)}
       skipBeat={status === "failed"}
+      placement="inline"
     />
   );
 }

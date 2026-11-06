@@ -39,6 +39,12 @@ describe("StageOctoStatus", () => {
     expect(getByText("Searching…")).toBeTruthy();
     expect(container.querySelector(".octo-mascot--search")).not.toBeNull();
   });
+  it("docks inline instead of pinning to the canvas bottom", () => {
+    const { container } = render(<StageOctoStatus stage={stage("running")} entries={[]} />);
+    const root = container.firstElementChild as HTMLElement;
+    expect(root.dataset.placement).toBe("inline");
+    expect(root.className).not.toMatch(/\babsolute\b/);
+  });
   it("a failed stage leaves without the ✓ beat", () => {
     const { container, rerender } = render(
       <StageOctoStatus stage={stage("running")} entries={[]} />,

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { ChevronLeft, ChevronRight, SlidersHorizontal, RotateCcw } from "lucide-react";
+import { ChevronLeft, ChevronRight, Hourglass, SlidersHorizontal, RotateCcw } from "lucide-react";
 import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
@@ -281,22 +281,6 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     [viewedRow, logSegments, attemptN],
   );
 
-  // Player visibility with a linger (same contract as ChatCanvas): the pinned
-  // figure stays mounted ~640ms for its beat+fade exit, so the wash and the
-  // journal's bottom padding must track that window, not the raw status.
-  const playerOn =
-    viewedRow == null &&
-    (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
-  const [playerVisible, setPlayerVisible] = useState(playerOn);
-  useEffect(() => {
-    if (playerOn) {
-      setPlayerVisible(true);
-      return;
-    }
-    const t = setTimeout(() => setPlayerVisible(false), 700);
-    return () => clearTimeout(t);
-  }, [playerOn]);
-
   if (!stage) {
     return (
       <div className="flex flex-1 items-center justify-center font-serif text-sm text-octo-mute">
@@ -427,9 +411,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       <div className="relative flex min-h-0 flex-1 flex-col">
       <div
         ref={scrollRef}
-        className={`octo-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 pt-3 font-mono text-[12px] leading-relaxed text-octo-sage ${
-          playerVisible ? "pb-[96px]" : "pb-3"
-        }`}
+        className="octo-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
       >
         <FadeSwap swapKey={swapKey} className="flex flex-col gap-2">
           {viewedRow ? (
@@ -509,28 +491,33 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
             </>
           ) : mode === "running" ? (
-            /* The scroll-away running marker (brass dot + role verb) retired —
-               the pinned Player below narrates the live work instead. */
-            <>{journal}</>
+            /* The live journal slot sits right under the header in every
+               state: before the first entry lands it holds a mute waiting
+               row, so a just-started stage never reads as a blank canvas. */
+            journal.length > 0 ? (
+              <>{journal}</>
+            ) : (
+              <div
+                data-tour="direct-focus-waiting"
+                className="octo-rise-in flex items-baseline gap-2 font-mono text-[12px] text-octo-mute"
+              >
+                <span className="translate-y-[1px] shrink-0" title="Waiting">
+                  <Hourglass size={11} strokeWidth={1.75} />
+                </span>
+                <span>Waiting for the first tool call…</span>
+              </div>
+            )
           ) : journal.length > 0 ? (
             <div className="flex flex-col gap-2">{journal}</div>
           ) : (
             <span className="text-octo-mute">Nothing produced yet.</span>
           )}
         </FadeSwap>
+        {/* The Player — narrates the focused stage (spec 2026-07-19 §4,
+            extended to DIRECT), docked inline at the journal's tail so it
+            follows the newest line. Hidden while viewing an archived attempt. */}
+        {viewedRow == null && <StageOctoStatus stage={stage} entries={liveEntries} />}
       </div>
-      {/* Bottom exit wash — keeps the pinned Player legible over the journal
-          while it's on stage (a surface, not a line; design-system §3). */}
-      {playerVisible && (
-        <div
-          aria-hidden
-          className="octo-fade-in pointer-events-none absolute inset-x-0 bottom-0 h-[88px]"
-          style={{ background: "linear-gradient(transparent, var(--color-octo-bg) 76%)" }}
-        />
-      )}
-      {/* The Player — narrates the focused stage (spec 2026-07-19 §4,
-          extended to DIRECT). Hidden while viewing an archived attempt. */}
-      {viewedRow == null && <StageOctoStatus stage={stage} entries={liveEntries} />}
       </div>
     </div>
     {editOpen && (
