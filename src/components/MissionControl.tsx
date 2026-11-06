@@ -568,6 +568,8 @@ function LiveSlot({
     text = (entries && lastActivity(entries)) || (running ? `${stageTitle(running)} at work` : "");
     cls = "text-octo-sage";
   } else if (band === "needs-you") {
+    // The live line is state text: sage like the in-flight ticker. The card's
+    // border and glyph already carry the brass, so the beacon card stands out.
     if (stalled && failed) {
       text = "stalled — resume when ready";
       cls = "text-octo-warning";
@@ -577,11 +579,11 @@ function LiveSlot({
     } else if (gate && gate.blockedQuestions) {
       // The escape valve: an answer form is waiting, not an approval.
       text = `${stageTitle(gate)} asked you · waiting on your answer`;
-      cls = "text-octo-brass";
+      cls = "text-octo-sage";
     } else if (gate) {
       const loop = gate.loopTargetPosition !== null ? ` · loop ${gate.loopIterations}/${gate.loopMaxIterations}` : "";
       text = `${stageTitle(gate)} holds the gate${loop}`;
-      cls = "text-octo-brass";
+      cls = "text-octo-sage";
     } else {
       text = "paused at the boundary";
     }
@@ -753,7 +755,10 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
       {settledJustNow && (
         <span aria-hidden className="octo-sweep absolute -top-1 left-0 h-px w-full bg-octo-brass" />
       )}
-      <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>
+      {/* Per-card spend is quiet; brass spend belongs to the header's fleet ledger. */}
+      <span data-tour="mission-control-card-spent" className="octo-tabular text-octo-mute">
+        ${run.costUsd.toFixed(2)}
+      </span>
       {run.baselineUsd > run.costUsd && band !== "settled" && (
         <span className="octo-tabular text-octo-verdigris">
           saved ${(run.baselineUsd - run.costUsd).toFixed(2)}

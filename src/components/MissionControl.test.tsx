@@ -330,6 +330,24 @@ describe("MissionControl", () => {
     expect(screen.getByText(/holds the gate/)).toBeTruthy();
   });
 
+  it("keeps a needs-you card's brass to its border and glyph: the ticker is sage, the spend mute", () => {
+    const run = mkRun("a", "paused", { costUsd: 0.41 });
+    const stages = [mkStage("s1", "a", 0, "done"), mkStage("s2", "a", 1, "awaiting_checkpoint")];
+    useRunsStore.setState({
+      runsByWs: { "ws-a": [run] },
+      detailByRun: { a: { run, stages } },
+    });
+    const { container } = renderRoom();
+    const ticker = screen.getByText(/holds the gate/);
+    expect(ticker.className).toContain("text-octo-sage");
+    expect(ticker.className).not.toContain("brass");
+    const spent = container.querySelector('[data-tour="mission-control-card-spent"]');
+    expect(spent?.textContent).toBe("$0.41");
+    expect(spent?.className).toContain("text-octo-mute");
+    expect(spent?.className).not.toContain("brass");
+    expect(screen.getByText("⟜").className).toContain("text-octo-brass");
+  });
+
   it("a question-block reads distinctly from an approval gate (asked you, not the gate)", () => {
     // The escape valve: a stage parked via ask_director shows an answer-form
     // indicator, NOT the approval-gate wording — the director must see one is waiting.
@@ -348,7 +366,8 @@ describe("MissionControl", () => {
       detailByRun: { a: { run, stages } },
     });
     renderRoom();
-    expect(screen.getByText(/asked you · waiting on your answer/)).toBeTruthy();
+    const asked = screen.getByText(/asked you · waiting on your answer/);
+    expect(asked.className).toContain("text-octo-sage");
     expect(screen.queryByText(/holds the gate/)).toBeNull();
   });
 
