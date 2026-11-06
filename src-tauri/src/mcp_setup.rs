@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
-use crate::readiness::{run_status_probe, Probe, CHECK_TIMEOUT};
+use crate::readiness::{run_probe, run_status_probe, Probe, CHECK_TIMEOUT};
 
 const MCP_BIN: &str = "octopush-mcp";
 /// The MCP server name registered with the client. Tools then surface as
@@ -123,6 +123,36 @@ fn probe_registration(claude: &Path) -> Probe {
     run_status_probe(Some(cmd), CHECK_TIMEOUT)
 }
 
+/// Whether `claude mcp get octopush` output shows a user-scope stdio entry that
+/// runs exactly `binary` with no args — i.e. what `mcp_add_args(binary)` writes.
+/// Anything else (another path, args, another scope, unparseable) reads as no.
+pub(crate) fn registered_with(get_output: &str, binary: &Path) -> bool {
+    let field = |name: &str| {
+        get_output
+            .lines()
+            .map(str::trim)
+            .find_map(|l| l.strip_prefix(name).and_then(|rest| rest.strip_prefix(':')))
+            .map(str::trim)
+    };
+    let (binary, header) = (binary.to_string_lossy(), format!("{SERVER_NAME}:"));
+    get_output.lines().any(|l| l.trim() == header)
+        && field("Scope").is_some_and(|v| v.starts_with("User"))
+        && field("Type") == Some("stdio")
+        && field("Command") == Some(binary.as_ref())
+        && field("Args") == Some("")
+}
+
+/// Whether Claude Code already lists our server with exactly this binary, so
+/// Connect can skip the remove → add. A slow or failing `mcp get` reads as no.
+fn already_registered_with(claude: &Path, binary: &Path) -> bool {
+    let mut cmd = Command::new(claude);
+    cmd.args(["mcp", "get", SERVER_NAME]);
+    match run_probe(Some(cmd), CHECK_TIMEOUT) {
+        Probe::Exited { success: true, output } => registered_with(&output, binary),
+        _ => false,
+    }
+}
+
 /// Only a clean exit counts; a timeout or a missing CLI reads as not registered.
 fn registered_from(probe: Probe) -> bool {
     verification_from(probe) == Verification::Listed
@@ -149,6 +179,10 @@ fn verification_from(probe: Probe) -> Verification {
 /// Shown when Claude Code's config lock stays held after one retry.
 const BUSY_MESSAGE: &str =
     "Claude Code's config is busy — try again in a moment, or run the command below.";
+/// Bound on one `claude mcp remove`/`add`. Claude Code 2.1.318+ waits on its
+/// config lock before giving up; this sits comfortably past that wait, and a
+/// call still running at it is killed and treated as a held lock (busy).
+const CLI_TIMEOUT: Duration = Duration::from_secs(20);
 /// Pause before the one retry on a lock failure.
 const LOCK_RETRY_PAUSE: Duration = Duration::from_secs(1);
 
@@ -184,33 +218,44 @@ fn classify_failure(output: &str) -> CliFailure {
     }
 }
 
-/// One finished CLI call: exit status and its output (stderr, then stdout).
+/// One finished (or timed-out) CLI call: exit status and its output.
 #[derive(Debug, Clone)]
 struct CliRun {
     success: bool,
+    /// Killed at the timeout — read as a held config lock.
+    timed_out: bool,
     output: String,
 }
 
-fn run_cli(claude: &Path, args: &[std::ffi::OsString]) -> Result<CliRun, String> {
-    let o = Command::new(claude).args(args).output().map_err(|e| e.to_string())?;
-    let mut output = String::from_utf8_lossy(&o.stderr).trim().to_string();
-    let stdout = String::from_utf8_lossy(&o.stdout);
-    if !stdout.trim().is_empty() {
-        if !output.is_empty() {
-            output.push('\n');
+impl CliRun {
+    fn failure(&self) -> CliFailure {
+        if self.timed_out {
+            CliFailure::Busy
+        } else {
+            classify_failure(&self.output)
         }
-        output.push_str(stdout.trim());
     }
-    Ok(CliRun { success: o.status.success(), output })
 }
 
-/// Run once; on a lock failure, `pause` and run once more.
+/// Run `claude <args>` through the readiness module's bounded spawn: killed
+/// once `timeout` passes, so a CLI stuck on its config lock can't hang Connect.
+fn run_cli(claude: &Path, args: &[std::ffi::OsString], timeout: Duration) -> Result<CliRun, String> {
+    let mut cmd = Command::new(claude);
+    cmd.args(args);
+    match run_probe(Some(cmd), timeout) {
+        Probe::Missing => Err(format!("{} could not be started", claude.display())),
+        Probe::TimedOut => Ok(CliRun { success: false, timed_out: true, output: String::new() }),
+        Probe::Exited { success, output } => Ok(CliRun { success, timed_out: false, output: output.trim().to_string() }),
+    }
+}
+
+/// Run once; on a lock failure (or a timeout), `pause` and run once more.
 fn with_lock_retry(
     mut run: impl FnMut() -> Result<CliRun, String>,
     pause: &mut impl FnMut(),
 ) -> Result<CliRun, String> {
     let first = run()?;
-    if first.success || classify_failure(&first.output) != CliFailure::Busy {
+    if first.success || first.failure() != CliFailure::Busy {
         return Ok(first);
     }
     pause();
@@ -236,21 +281,38 @@ impl ConnectOutcome {
     }
 }
 
-/// The remove → add → verify flow, with the CLI calls injected so it can be
-/// tested against recorded output.
+const CONNECTED_MESSAGE: &str =
+    "Connected to Claude Code. Start a new Claude Code session to load the Octopush tools.";
+
+/// The add failed after a successful remove: the user's old entry is gone.
+fn removed_then_failed(reason: &str) -> ConnectOutcome {
+    ConnectOutcome::failed(format!(
+        "The previous Octopush registration was removed, but adding it back failed: {}. Press Connect to Claude Code again to restore it, or run the command below.",
+        reason.trim_end_matches('.')
+    ))
+}
+
+/// The check → remove → add → verify flow, with the CLI calls injected so it
+/// can be tested against recorded output.
 fn connect_flow(
+    already_registered: impl FnOnce() -> bool,
     mut run: impl FnMut(&Step) -> Result<CliRun, String>,
     verify: impl FnOnce() -> Verification,
     mut pause: impl FnMut(),
 ) -> ConnectOutcome {
+    // Already pointing at this exact binary: nothing to change, nothing to risk.
+    if already_registered() {
+        return ConnectOutcome { ok: true, registered: true, message: CONNECTED_MESSAGE.into() };
+    }
+
     let could_not_run = |e: String| ConnectOutcome::failed(format!("Could not run the Claude Code CLI: {e}"));
 
     // Remove-then-add makes the operation idempotent. "Not registered" is fine.
-    match with_lock_retry(|| run(&Step::Remove), &mut pause) {
+    let removed = match with_lock_retry(|| run(&Step::Remove), &mut pause) {
         Err(e) => return could_not_run(e),
-        Ok(r) if r.success => {}
-        Ok(r) => match classify_failure(&r.output) {
-            CliFailure::NotFound => {}
+        Ok(r) if r.success => true,
+        Ok(r) => match r.failure() {
+            CliFailure::NotFound => false,
             CliFailure::Busy => return ConnectOutcome::failed(BUSY_MESSAGE),
             CliFailure::Other if r.output.is_empty() => {
                 return ConnectOutcome::failed(
@@ -264,16 +326,13 @@ fn connect_flow(
                 ))
             }
         },
-    }
+    };
 
     match with_lock_retry(|| run(&Step::Add), &mut pause) {
+        Err(e) if removed => removed_then_failed(&format!("could not run the Claude Code CLI: {e}")),
         Err(e) => could_not_run(e),
         Ok(r) if r.success => match verify() {
-            Verification::Listed => ConnectOutcome {
-                ok: true,
-                registered: true,
-                message: "Connected to Claude Code. Start a new Claude Code session to load the Octopush tools.".into(),
-            },
+            Verification::Listed => ConnectOutcome { ok: true, registered: true, message: CONNECTED_MESSAGE.into() },
             Verification::NotListed => ConnectOutcome::failed(
                 "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
             ),
@@ -281,7 +340,12 @@ fn connect_flow(
                 "Claude Code accepted the registration but didn't confirm it in time — press Connect to Claude Code again in a moment to check.",
             ),
         },
-        Ok(r) if classify_failure(&r.output) == CliFailure::Busy => ConnectOutcome::failed(BUSY_MESSAGE),
+        Ok(r) if removed => removed_then_failed(&match r.failure() {
+            CliFailure::Busy => "Claude Code's config is busy".to_string(),
+            _ if r.output.is_empty() => "Claude Code rejected the registration".to_string(),
+            _ => format!("Claude Code error: {}", r.output),
+        }),
+        Ok(r) if r.failure() == CliFailure::Busy => ConnectOutcome::failed(BUSY_MESSAGE),
         Ok(r) if r.output.is_empty() => {
             ConnectOutcome::failed("Claude Code rejected the registration. Try the manual command below.")
         }
@@ -360,9 +424,10 @@ pub fn connect() -> McpConnectResult {
     let remove_args: Vec<std::ffi::OsString> = MCP_REMOVE_ARGS.iter().map(Into::into).collect();
     let add_args = mcp_add_args(&binary);
     let outcome = connect_flow(
+        || already_registered_with(&claude, &binary),
         |step| match step {
-            Step::Remove => run_cli(&claude, &remove_args),
-            Step::Add => run_cli(&claude, &add_args),
+            Step::Remove => run_cli(&claude, &remove_args, CLI_TIMEOUT),
+            Step::Add => run_cli(&claude, &add_args, CLI_TIMEOUT),
         },
         || verification_from(probe_registration(&claude)),
         || std::thread::sleep(LOCK_RETRY_PAUSE),
@@ -383,11 +448,17 @@ mod tests {
     use std::cell::RefCell;
 
     fn exit(success: bool, output: &str) -> Result<CliRun, String> {
-        Ok(CliRun { success, output: output.into() })
+        Ok(CliRun { success, timed_out: false, output: output.into() })
+    }
+
+    fn timed_out() -> Result<CliRun, String> {
+        Ok(CliRun { success: false, timed_out: true, output: String::new() })
     }
 
     /// Plays back scripted results per step; records every call and pause.
     struct Script {
+        /// What the pre-check (`mcp get` shows exactly our binary) answers.
+        current: bool,
         remove: RefCell<Vec<Result<CliRun, String>>>,
         add: RefCell<Vec<Result<CliRun, String>>>,
         calls: RefCell<Vec<&'static str>>,
@@ -395,11 +466,15 @@ mod tests {
 
     impl Script {
         fn new(remove: Vec<Result<CliRun, String>>, add: Vec<Result<CliRun, String>>) -> Self {
-            Self { remove: RefCell::new(remove), add: RefCell::new(add), calls: RefCell::new(vec![]) }
+            Self { current: false, remove: RefCell::new(remove), add: RefCell::new(add), calls: RefCell::new(vec![]) }
         }
 
         fn run(&self, verified: Verification) -> ConnectOutcome {
             connect_flow(
+                || {
+                    self.calls.borrow_mut().push("check");
+                    self.current
+                },
                 |step| {
                     let (name, queue) = match step {
                         Step::Remove => ("remove", &self.remove),
@@ -450,7 +525,7 @@ mod tests {
         let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(true, "Added stdio MCP server octopush")]);
         let out = s.run(Verification::Listed);
         assert!(out.ok && out.registered, "{out:?}");
-        assert_eq!(*s.calls.borrow(), ["remove", "add", "get"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "get"]);
     }
 
     #[test]
@@ -459,7 +534,7 @@ mod tests {
         let out = s.run(Verification::Listed);
         assert!(!out.ok && !out.registered);
         assert!(out.message.contains("Permission denied"), "{}", out.message);
-        assert_eq!(*s.calls.borrow(), ["remove"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove"]);
     }
 
     #[test]
@@ -467,7 +542,7 @@ mod tests {
         let s = Script::new(vec![exit(false, LOCKED), exit(true, "")], vec![exit(true, "")]);
         let out = s.run(Verification::Listed);
         assert!(out.ok && out.registered, "{out:?}");
-        assert_eq!(*s.calls.borrow(), ["remove", "pause", "remove", "add", "get"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "pause", "remove", "add", "get"]);
     }
 
     #[test]
@@ -475,28 +550,28 @@ mod tests {
         let s = Script::new(vec![exit(false, LOCKED), exit(false, ELOCKED)], vec![]);
         let out = s.run(Verification::Listed);
         assert_eq!(out, ConnectOutcome::failed(BUSY_MESSAGE));
-        assert_eq!(*s.calls.borrow(), ["remove", "pause", "remove"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "pause", "remove"]);
 
-        let s = Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(false, LOCKED)]);
+        let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(false, ELOCKED), exit(false, LOCKED)]);
         assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
-        assert_eq!(*s.calls.borrow(), ["remove", "add", "pause", "add"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "pause", "add"]);
     }
 
     #[test]
     fn lock_on_add_retries_once() {
         let s = Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(true, "")]);
         assert!(s.run(Verification::Listed).registered);
-        assert_eq!(*s.calls.borrow(), ["remove", "add", "pause", "add", "get"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "pause", "add", "get"]);
     }
 
     #[test]
     fn non_lock_add_failure_keeps_the_cli_error_and_does_not_retry() {
-        let s = Script::new(vec![exit(true, "")], vec![exit(false, EXISTS)]);
+        let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(false, EXISTS)]);
         let out = s.run(Verification::Listed);
         assert_eq!(out.message, format!("Claude Code error: {EXISTS}"));
-        assert_eq!(*s.calls.borrow(), ["remove", "add"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add"]);
 
-        let s = Script::new(vec![exit(true, "")], vec![exit(false, "")]);
+        let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(false, "")]);
         assert!(s.run(Verification::Listed).message.contains("rejected the registration"));
     }
 
@@ -518,7 +593,7 @@ mod tests {
         assert!(out.message.contains("press Connect to Claude Code again"), "{}", out.message);
         assert!(!out.message.contains("check the status"), "{}", out.message);
         assert!(!out.message.contains("doesn't list it"), "{}", out.message);
-        assert_eq!(*s.calls.borrow(), ["remove", "add", "get"]);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "get"]);
     }
 
     #[test]
@@ -542,6 +617,153 @@ mod tests {
         assert_eq!(verification_from(exited(false)), Verification::NotListed);
         assert_eq!(verification_from(Probe::TimedOut), Verification::Unconfirmed);
         assert_eq!(verification_from(Probe::Missing), Verification::Unconfirmed);
+    }
+
+    fn assert_says_removed(out: &ConnectOutcome) {
+        assert!(!out.ok && !out.registered, "{out:?}");
+        assert!(out.message.contains("previous Octopush registration was removed"), "{}", out.message);
+        assert!(out.message.contains("Press Connect to Claude Code again to restore it"), "{}", out.message);
+        assert!(out.message.contains("run the command below"), "{}", out.message);
+    }
+
+    #[test]
+    fn add_failing_after_a_real_remove_says_the_old_registration_is_gone() {
+        // Busy through the retry.
+        let s = Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(false, LOCKED)]);
+        let out = s.run(Verification::Listed);
+        assert_says_removed(&out);
+        assert!(out.message.contains("config is busy"), "{}", out.message);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "pause", "add"]);
+
+        // Timed out through the retry.
+        let s = Script::new(vec![exit(true, "")], vec![timed_out(), timed_out()]);
+        let out = s.run(Verification::Listed);
+        assert_says_removed(&out);
+        assert!(out.message.contains("config is busy"), "{}", out.message);
+
+        // A non-lock error keeps the CLI's words.
+        let s = Script::new(vec![exit(true, "")], vec![exit(false, EXISTS)]);
+        let out = s.run(Verification::Listed);
+        assert_says_removed(&out);
+        assert!(out.message.contains(EXISTS), "{}", out.message);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add"]);
+
+        let s = Script::new(vec![exit(true, "")], vec![exit(false, "")]);
+        assert_says_removed(&s.run(Verification::Listed));
+
+        let s = Script::new(vec![exit(true, "")], vec![Err("No such file or directory".into())]);
+        assert_says_removed(&s.run(Verification::Listed));
+
+        // Nothing was removed: the plain messages stand.
+        let s = Script::new(vec![exit(false, NOT_FOUND)], vec![timed_out(), timed_out()]);
+        assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
+    }
+
+    #[test]
+    fn timeout_on_remove_reads_as_busy_and_is_retried_once() {
+        let s = Script::new(vec![timed_out(), timed_out()], vec![]);
+        assert_eq!(s.run(Verification::Listed), ConnectOutcome::failed(BUSY_MESSAGE));
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "pause", "remove"]);
+
+        let s = Script::new(vec![timed_out(), exit(true, "")], vec![exit(true, "")]);
+        assert!(s.run(Verification::Listed).registered);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "pause", "remove", "add", "get"]);
+    }
+
+    #[test]
+    fn already_registered_with_our_binary_skips_remove_and_add() {
+        let s = Script { current: true, ..Script::new(vec![], vec![]) };
+        let out = s.run(Verification::Listed);
+        assert!(out.ok && out.registered, "{out:?}");
+        assert_eq!(out.message, CONNECTED_MESSAGE);
+        assert_eq!(*s.calls.borrow(), ["check"]);
+    }
+
+    const BIN: &str = "/Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp";
+    /// Shape of a recorded `claude mcp get octopush` (2.1.314 fixture).
+    const GET_OURS: &str = "octopush:\n  Scope: User config (available in all your projects)\n  Status: \u{2717} Failed to connect\n  Type: stdio\n  Command: /Users/dev/Applications/Octopush.app/Contents/MacOS/octopush-mcp\n  Args:\n  Environment:\n\nTo remove this server, run: claude mcp remove octopush -s user\n";
+
+    #[test]
+    fn mcp_get_output_matches_only_our_exact_registration() {
+        assert!(registered_with(GET_OURS, Path::new(BIN)));
+        assert!(!registered_with(GET_OURS, Path::new("/Applications/Octopush.app/Contents/MacOS/octopush-mcp")));
+        assert!(!registered_with(&GET_OURS.replace("Args:", "Args: --verbose"), Path::new(BIN)));
+        assert!(!registered_with(&GET_OURS.replace("Scope: User", "Scope: Local"), Path::new(BIN)));
+        assert!(!registered_with(&GET_OURS.replace("Type: stdio", "Type: http"), Path::new(BIN)));
+        assert!(!registered_with(&GET_OURS.replace("octopush:", "other:"), Path::new(BIN)));
+        assert!(!registered_with("", Path::new(BIN)));
+    }
+
+    /// A stub `claude` that logs each call, then hangs past the timeout; it
+    /// would touch `finished` if it were allowed to run to the end.
+    #[cfg(unix)]
+    fn hanging_stub(dir: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let (script, log, finished) = (dir.join("claude"), dir.join("calls.log"), dir.join("finished"));
+        let body = format!(
+            "echo \"$@\" >> '{}'\nsleep 1\ntouch '{}'\n",
+            log.display(),
+            finished.display()
+        );
+        std::fs::write(&script, body).unwrap();
+        (script, log, finished)
+    }
+
+    /// Run the stub through `/bin/sh` (not exec'd directly) so a freshly
+    /// written script can't hit ETXTBSY while other tests fork.
+    #[cfg(unix)]
+    fn run_stub(script: &Path, args: &[&str], timeout: Duration) -> Result<CliRun, String> {
+        let mut argv: Vec<std::ffi::OsString> = vec![script.as_os_str().to_owned()];
+        argv.extend(args.iter().map(Into::into));
+        run_cli(Path::new("/bin/sh"), &argv, timeout)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hung_cli_is_killed_at_the_timeout_and_reads_as_busy() {
+        let dir = tempfile::tempdir().unwrap();
+        let (script, log, finished) = hanging_stub(dir.path());
+
+        let started = std::time::Instant::now();
+        let run = run_stub(&script, &MCP_REMOVE_ARGS, Duration::from_millis(150)).unwrap();
+        assert!(started.elapsed() < Duration::from_millis(900), "must not wait the stub out");
+        assert!(run.timed_out && !run.success, "{run:?}");
+        assert_eq!(run.failure(), CliFailure::Busy);
+
+        // Through the whole flow: remove hangs twice (one retry), then busy.
+        let out = connect_flow(
+            || false,
+            |step| {
+                assert_eq!(*step, Step::Remove, "add must not run after a busy remove");
+                run_stub(&script, &MCP_REMOVE_ARGS, Duration::from_millis(150))
+            },
+            || panic!("no verify after a busy remove"),
+            || {},
+        );
+        assert_eq!(out, ConnectOutcome::failed(BUSY_MESSAGE));
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
+
+        // Had any of the three runs survived, it would have finished by now.
+        std::thread::sleep(Duration::from_millis(1300));
+        assert!(!finished.exists(), "the timed-out CLI was left running");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_output_and_exit_status_come_back_through_the_bounded_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("claude");
+        std::fs::write(&script, format!("echo '{NOT_FOUND}' >&2\nexit 1\n")).unwrap();
+        let run = run_stub(&script, &MCP_REMOVE_ARGS, CLI_TIMEOUT).unwrap();
+        assert!(!run.success && !run.timed_out, "{run:?}");
+        assert_eq!(run.output, NOT_FOUND);
+        assert_eq!(run.failure(), CliFailure::NotFound);
+
+        assert!(run_cli(Path::new("/nonexistent/claude"), &[], CLI_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn cli_timeout_outlasts_claude_codes_lock_wait() {
+        assert!(CLI_TIMEOUT >= Duration::from_secs(15), "{CLI_TIMEOUT:?}");
     }
 
     #[test]
