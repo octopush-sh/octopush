@@ -28,11 +28,16 @@ export function formatPerMessageCost(cost: number): string {
   return `≈ $${cost.toFixed(1)}`;
 }
 
+/** The bare compact count: "12k", "1.2M" or "850". */
+export function formatTokenCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1000) return `${Math.round(n / 1000)}k`;
+  return `${n}`;
+}
+
 /** Compact token count: "12k tokens" or "850 tokens". */
 export function formatTokens(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M tokens`;
-  if (n >= 1000) return `${Math.round(n / 1000)}k tokens`;
-  return `${n} tokens`;
+  return `${formatTokenCount(n)} tokens`;
 }
 
 /**

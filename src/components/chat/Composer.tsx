@@ -3,12 +3,7 @@ import { clsx } from "clsx";
 import { useChatStore } from "../../stores/chatStore";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useProvidersStore } from "../../stores/providersStore";
-import {
-  estimateNextTurnTokens,
-  estimatePerMessageCost,
-  formatPerMessageCost,
-  formatTokens,
-} from "../../lib/cost";
+import { estimateNextTurnTokens, estimatePerMessageCost } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
 import type { ModelInfo, SkillMeta } from "../../lib/types";
 import {
@@ -21,6 +16,7 @@ import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
 import { SlashMenu } from "./SlashMenu";
+import { ComposerEstimate } from "./ComposerEstimate";
 import { CommandHistoryPopover } from "./CommandHistoryPopover";
 import { AttachmentTray } from "./AttachmentTray";
 import { fileToAttachment } from "../../lib/attachments";
@@ -699,12 +695,13 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
         {/* Control bar — model + effort on the left, cost + send/stop on the right.
             The estimate and Send/Stop are one group held to the right: from a
-            zero basis it fills the room left on the line and the estimate
-            squeezes into it, so the bar stays on one line as long as the
-            group's narrowest form fits. Only past that (Talk's seat at its
+            zero basis it fills the room left on the line; the estimate never
+            squeezes or wraps, it sheds by rungs as the bar narrows, so the bar
+            stays on one line as long as the group's narrowest form fits. Only past that (Talk's seat at its
             40-column minimum) does the group wrap, whole, onto a second line,
-            rather than run under the seat. */}
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5">
+            rather than run under the seat. The bar is the query container of
+            the estimate's own demotion ladder (ComposerEstimate). */}
+        <div className="octo-composerbar flex flex-wrap items-center gap-x-3 gap-y-2 px-3 pb-2.5">
           <ModelPicker activeModel={model} onSelectModel={setModel} autoOption />
           <EffortSelector />
           <button
@@ -728,16 +725,11 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           )}
 
           <div className="flex flex-1 basis-0 items-center justify-end gap-3">
-          {inlineCost !== null && (
-            <div
-              className="octo-tabular font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute"
-              title={`Estimate for ${activeModelInfo!.displayName || activeModelInfo!.id}; assumes 30% output ratio`}
-            >
-              <span className="text-octo-brass">{formatPerMessageCost(inlineCost)}</span>
-              <span className="px-1 opacity-50">·</span>
-              <span>{formatTokens(estimatedTokens)}</span>
-            </div>
-          )}
+          <ComposerEstimate
+            cost={inlineCost}
+            tokens={estimatedTokens}
+            modelName={activeModelInfo ? activeModelInfo.displayName || activeModelInfo.id : ""}
+          />
 
           {/* Send while idle, Stop while streaming — crossfades in one slot so
               the bar never shifts (stability S2). */}

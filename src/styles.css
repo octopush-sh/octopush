@@ -572,6 +572,41 @@
   }
 }
 
+/* The composer's cost estimate (ComposerEstimate.tsx) is a fixed slot on its
+   own ladder (S1/S2). It is one nowrap line whose width is counted in
+   characters (each one `1ch` plus the 0.2em tracking), sized for its longest
+   form at each rung, so the figures changing never move or wrap anything. As
+   the control bar narrows it sheds:
+
+     ≤ 640px   the word "tokens"   → `≈ $0.02 · 3k`
+     ≤ 520px   the token count     → `≈ $0.02`
+     floor     the cost; the full line stays in the slot's tooltip
+
+   The slot is `flex: none`, so below the floor the Send group wraps, whole,
+   onto its own line (Composer.tsx) and the estimate still never breaks. */
+.octo-composerbar { container-type: inline-size; container-name: octo-composerbar; }
+.octo-estimate {
+  --estimate-chars: 22;   /* "≈ <$0.01 · 1.2M tokens" */
+  display: inline-flex; align-items: center; justify-content: flex-end; flex: none;
+  white-space: nowrap; overflow: hidden;
+  width: calc(var(--estimate-chars) * (1ch + 0.2em));
+  transition: width var(--dur-standard) var(--ease-octo);
+}
+.octo-estimate-rung {
+  display: inline-flex; align-items: center; flex: none;
+  white-space: nowrap; overflow: hidden; max-width: 24ch; opacity: 1;
+  transition: max-width var(--dur-standard) var(--ease-octo),
+              opacity var(--dur-quick) var(--ease-octo);
+}
+@container octo-composerbar (max-width: 640px) {
+  .octo-estimate { --estimate-chars: 15; }   /* "≈ <$0.01 · 1.2M" */
+  .octo-estimate-unit { max-width: 0; opacity: 0; }
+}
+@container octo-composerbar (max-width: 520px) {
+  .octo-estimate { --estimate-chars: 8; }    /* "≈ <$0.01" */
+  .octo-estimate-count { max-width: 0; opacity: 0; }
+}
+
 .octo-status { display: inline-flex; align-items: center; }
 .octo-status-dot {
   flex: none; width: 6px; height: 6px; border-radius: 999px;
