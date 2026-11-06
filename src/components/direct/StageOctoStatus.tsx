@@ -14,8 +14,9 @@ export function roleForStage(entries: LiveEntry[], status: RunStageStatus): Octo
 }
 
 /** DIRECT adapter over the shared OctoPlayer: narrates the focused stage's
- *  work journal, docked inline at the journal's tail (not pinned to the
- *  canvas bottom, where it read as a stalled stage). A `done` stage earns
+ *  work journal as an inline row (not pinned to the canvas bottom, where it
+ *  read as a stalled stage). StageFocus docks it at the live journal's tail,
+ *  or right under the header in any other active state. A `done` stage earns
  *  the ✓ beat; a `failed` one leaves quietly; switching focused stages
  *  hard-resets (identity = stage id). */
 export function StageOctoStatus({

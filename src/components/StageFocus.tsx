@@ -268,6 +268,17 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
 
   const journal = useMemo(() => buildJournalItems(liveEntries), [liveEntries]);
 
+  // Where the Player sits. While the live journal is shown it docks at the
+  // journal's tail; in every other active state (a checkpoint gate over an
+  // artifact and its diff, a budget park) it sits right under the header, so
+  // "Waiting for you" never drops below the diff. Held while the stage is
+  // inactive so its exit (✓ beat, fade) plays where it was instead of
+  // remounting, hidden, in the other slot.
+  const playerLive = stage?.status === "running" || stage?.status === "awaiting_checkpoint";
+  const playerWantsTail = stage?.status === "running" && !artifact;
+  const [playerAtTail, setPlayerAtTail] = useState(playerWantsTail);
+  if (playerLive && playerAtTail !== playerWantsTail) setPlayerAtTail(playerWantsTail);
+
   const totalAttempts = iterations.length + 1;
   // Guard against a stale index if the archive list shrinks under us.
   const viewedRow =
@@ -408,10 +419,17 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
           {directorError}
         </div>
       )}
-      <div className="relative flex min-h-0 flex-1 flex-col">
+      {/* The Player outside the live journal (spec 2026-07-19 §4, extended to
+          DIRECT): right under the header, outside the scroller, so the gate's
+          "Waiting for you" stays in view however long the diff is. */}
+      {viewedRow == null && !playerAtTail && (
+        <div className="px-4 pt-2.5 empty:hidden">
+          <StageOctoStatus stage={stage} entries={liveEntries} />
+        </div>
+      )}
       <div
         ref={scrollRef}
-        className="octo-selectable flex flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
+        className="octo-selectable flex min-h-0 flex-1 flex-col gap-2 overflow-auto px-4 py-3 font-mono text-[12px] leading-relaxed text-octo-sage"
       >
         <FadeSwap swapKey={swapKey} className="flex flex-col gap-2">
           {viewedRow ? (
@@ -513,11 +531,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             <span className="text-octo-mute">Nothing produced yet.</span>
           )}
         </FadeSwap>
-        {/* The Player — narrates the focused stage (spec 2026-07-19 §4,
-            extended to DIRECT), docked inline at the journal's tail so it
-            follows the newest line. Hidden while viewing an archived attempt. */}
-        {viewedRow == null && <StageOctoStatus stage={stage} entries={liveEntries} />}
-      </div>
+        {/* The Player while the live journal runs: docked inline at its tail
+            so it follows the newest line. Hidden while viewing an archived attempt. */}
+        {viewedRow == null && playerAtTail && <StageOctoStatus stage={stage} entries={liveEntries} />}
       </div>
     </div>
     {editOpen && (
