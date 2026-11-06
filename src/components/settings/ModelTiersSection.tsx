@@ -18,6 +18,24 @@ export const MODEL_TIERS: Array<{ tier: ModelTier; label: string; description: s
   { tier: "strong", label: "Strong", description: "Deepest reasoning, highest cost — `opus` / `strong`." },
 ];
 
+// A description's `backticked` spans are identifiers: render them in mono, as
+// the intro above does, never as literal backticks.
+function TierDescription({ text }: { text: string }) {
+  return (
+    <>
+      {text.split("`").map((part, i) =>
+        i % 2 === 1 ? (
+          <span key={i} className="font-mono">
+            {part}
+          </span>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
 export function ModelTiersSection() {
   const [tiers, setTiers] = useState<Record<string, string>>({});
   const [saved, setSaved] = useState(false);
@@ -67,7 +85,9 @@ export function ModelTiersSection() {
           >
             <div className="min-w-0 flex-1">
               <div className="font-serif text-[14px] leading-tight text-octo-ivory">{label}</div>
-              <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">{description}</div>
+              <div className="mt-1 text-[12px] leading-[1.55] text-octo-sage">
+                <TierDescription text={description} />
+              </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
               <ModelPicker activeModel={tiers[tier] ?? ""} onSelectModel={(m) => setTier(tier, m)} />
