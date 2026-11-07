@@ -5,7 +5,7 @@
  * answering what a 44px cell cannot.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { act, render, screen, fireEvent } from "@testing-library/react";
 import type { SessionRole } from "../lib/sessionRole";
 
 const mockIpc = {
@@ -32,6 +32,7 @@ function seed(
     running?: boolean;
     restored?: boolean;
     failed?: boolean;
+    starting?: boolean;
   }>,
   activeId?: string,
 ) {
@@ -43,6 +44,7 @@ function seed(
         position: i,
         running: s.running ?? true,
         failed: s.failed ?? false,
+        starting: s.starting ?? false,
         busy: s.busy ?? false,
         restored: s.restored ?? false,
         role: s.role ?? ("shell" as SessionRole),
@@ -100,6 +102,29 @@ describe("CompanionSession", () => {
     expect(state.textContent).toBe("failed");
     expect(state.className).toContain("text-octo-rouge");
     expect(screen.queryByText("shell idle")).toBeNull();
+  });
+
+  it("reads starting in mute until the shell draws its prompt, never shell idle", () => {
+    seed([{ id: "a", label: "main", running: true, starting: true }]);
+    const { rerender } = render(<CompanionSession workspaceId={WS} />);
+    const state = screen.getByTestId("session-detail-state");
+    expect(state.textContent).toBe("starting");
+    expect(state.className).toContain("text-octo-mute");
+    expect(screen.getByTestId("session-detail-doing").textContent).toBe("—");
+    expect(screen.queryByText("shell idle")).toBeNull();
+    expect(screen.queryByText("shell at the prompt")).toBeNull();
+
+    // The first output reached the pane.
+    act(() => useTerminalsStore.getState().markStarted(WS, "a"));
+    rerender(<CompanionSession workspaceId={WS} />);
+    expect(screen.getByTestId("session-detail-state").textContent).toBe("shell idle");
+    expect(screen.getByTestId("session-detail-doing").textContent).toBe("shell at the prompt");
+  });
+
+  it("reads failed, not starting, when a starting session didn't start", () => {
+    seed([{ id: "a", label: "main", running: false, failed: true, starting: true }]);
+    render(<CompanionSession workspaceId={WS} />);
+    expect(screen.getByTestId("session-detail-state").textContent).toBe("failed");
   });
 
   it("keeps the restored badge", () => {

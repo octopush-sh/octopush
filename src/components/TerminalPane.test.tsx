@@ -662,6 +662,28 @@ describe("TerminalPane — starting line", () => {
     expect(line.getAttribute("aria-hidden")).toBe("true");
   });
 
+  it("reports the first output once, so the Companion stops reading starting", async () => {
+    const onFirstOutput = vi.fn();
+    render(
+      <TerminalPane
+        terminalId="t-first"
+        workspaceId="ws"
+        workspacePath="/ws"
+        label="Main"
+        shown
+        focused
+        onFirstOutput={onFirstOutput}
+      />,
+    );
+    await act(async () => { await Promise.resolve(); });
+    emitData({ sessionId: "someone-else", bytes: [0x41] });
+    expect(onFirstOutput).not.toHaveBeenCalled();
+
+    emitData({ sessionId: "t-first", bytes: [0x24, 0x20] });
+    emitData({ sessionId: "t-first", bytes: [0x6c, 0x73] });
+    expect(onFirstOutput).toHaveBeenCalledTimes(1);
+  });
+
   it("ignores output from other sessions and falls back to the folder name", async () => {
     const { getByTestId, getByText } = render(
       <TerminalPane terminalId="t-start2" workspaceId="ws" workspacePath="/repos/my-app/" label="Main" shown focused />,

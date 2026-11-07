@@ -30,6 +30,9 @@ export function CompanionSession({ workspaceId }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
 
   const session = terminals.find((t) => t.id === activeId) ?? null;
+  // Until the pane draws its first output the canvas reads "Starting shell
+  // in …"; the inspector says the same rather than claim an idle prompt.
+  const starting = !!session && !session.failed && !!session.starting;
 
   const startEdit = useCallback((label: string) => {
     setEditValue(label);
@@ -117,22 +120,29 @@ export function CompanionSession({ workspaceId }: Props) {
 
           <dl className="grid grid-cols-[58px_minmax(0,1fr)] gap-x-3 gap-y-1 font-mono text-[10px]">
             <dt className="uppercase tracking-[0.12em] text-octo-mute">Doing</dt>
-            <dd className="m-0 truncate text-octo-sage" title={ROLE_WORD[session.role]}>
-              {ROLE_WORD[session.role]}
+            <dd
+              data-testid="session-detail-doing"
+              className="m-0 truncate text-octo-sage"
+              title={starting ? undefined : ROLE_WORD[session.role]}
+            >
+              {starting ? "—" : ROLE_WORD[session.role]}
             </dd>
 
             <dt className="uppercase tracking-[0.12em] text-octo-mute">State</dt>
             <dd
               data-testid="session-detail-state"
-              className={`m-0 truncate ${session.failed ? "text-octo-rouge" : session.busy ? "text-octo-brass" : session.running ? "text-octo-verdigris" : "text-octo-mute"}`}
+              data-tour="companion-session-state"
+              className={`m-0 truncate ${session.failed ? "text-octo-rouge" : starting ? "text-octo-mute" : session.busy ? "text-octo-brass" : session.running ? "text-octo-verdigris" : "text-octo-mute"}`}
             >
               {session.failed
                 ? "failed"
-                : session.busy
-                  ? "running"
-                  : session.running
-                    ? "shell idle"
-                    : "stopped"}
+                : starting
+                  ? "starting"
+                  : session.busy
+                    ? "running"
+                    : session.running
+                      ? "shell idle"
+                      : "stopped"}
             </dd>
 
             <dt className="uppercase tracking-[0.12em] text-octo-mute">Command</dt>

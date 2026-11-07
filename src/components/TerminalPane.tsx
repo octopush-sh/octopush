@@ -65,6 +65,9 @@ interface Props {
   /** Called when spawn-or-attach is rejected (no shell, sandbox denial,
    *  daemon down). The pane shows its own error state with a retry. */
   onSpawnError?: () => void;
+  /** Called once, when the PTY's first output reaches xterm and the
+   *  "Starting shell in …" line gives way to the prompt. */
+  onFirstOutput?: () => void;
   /** Called when the PTY process exits. */
   onExit?: () => void;
   /**
@@ -92,6 +95,7 @@ export function TerminalPane({
   layoutVersion,
   onSpawn,
   onSpawnError,
+  onFirstOutput,
   onExit,
   onReattach,
   onOpenFile,
@@ -144,10 +148,12 @@ export function TerminalPane({
   // Stable ref wrappers so effect cleanup sees up-to-date callbacks.
   const onSpawnRef = useRef(onSpawn);
   const onSpawnErrorRef = useRef(onSpawnError);
+  const onFirstOutputRef = useRef(onFirstOutput);
   const onExitRef = useRef(onExit);
   const onReattachRef = useRef(onReattach);
   onSpawnRef.current = onSpawn;
   onSpawnErrorRef.current = onSpawnError;
+  onFirstOutputRef.current = onFirstOutput;
   onExitRef.current = onExit;
   onReattachRef.current = onReattach;
 
@@ -450,6 +456,8 @@ export function TerminalPane({
       if (hasOutputRef.current) return;
       hasOutputRef.current = true;
       setHasOutput(true);
+      // The Companion's State reads the same moment: "starting" until now.
+      onFirstOutputRef.current?.();
     };
 
     listen<PtyDataEvent>("pty://data", (ev) => {

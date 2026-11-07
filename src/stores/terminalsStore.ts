@@ -37,6 +37,10 @@ export interface TerminalState {
    *  sandbox denial, daemon down). Cleared by the next successful spawn.
    *  Absent is the same as false. */
   failed?: boolean;
+  /** true until the PTY's first output (the prompt, or replayed scrollback)
+   *  reaches the pane — exactly while the canvas reads "Starting shell in …".
+   *  Absent is the same as false. */
+  starting?: boolean;
   /** true while a non-shell command is executing in this PTY (foreground
    *  process != shell). Distinct from `running` (= shell session alive);
    *  driven by the daemon's `pty://foreground` events. */
@@ -162,6 +166,8 @@ interface TerminalsStore {
   /** Record that a terminal's PTY failed to start (or, with `false`, that
    *  the failure was cleared). A failed session is never running. */
   markFailed: (workspaceId: string, id: string, failed: boolean) => void;
+  /** The terminal's pane drew its first output: it is no longer starting. */
+  markStarted: (workspaceId: string, id: string) => void;
   /** Set whether a command is currently executing in a terminal (foreground
    *  busy), from the daemon's `pty://foreground` events. `command` is the
    *  daemon's argv summary when it could resolve one; it updates the session's
@@ -242,7 +248,12 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       const prevLiveById = new Map(
         (prev ?? []).map((t) => [
           t.id,
-          { role: t.role, command: t.command, failed: t.failed ?? false },
+          {
+            role: t.role,
+            command: t.command,
+            failed: t.failed ?? false,
+            starting: t.starting ?? false,
+          },
         ]),
       );
 
@@ -272,6 +283,9 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           // A spawn failure is live state too; a session that is running
           // after all is no longer failed.
           failed: !running && (live?.failed ?? false),
+          // A session new to the store gets its pane now, which shows
+          // "Starting shell in …" until the first output.
+          starting: live ? live.starting : true,
           busy: false,
           restored,
           role: live?.role ?? ("shell" as SessionRole),
@@ -323,6 +337,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       label: record.label,
       position: record.position,
       running: false,
+      starting: true,
       busy: false,
       restored: false,
       role: "shell",
@@ -509,6 +524,18 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
                 : { ...t, failed: false }
               : t,
           ),
+        },
+      };
+    }),
+
+  markStarted: (workspaceId, id) =>
+    set((s) => {
+      const prev = s.terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+      if (!prev.some((t) => t.id === id && t.starting)) return s;
+      return {
+        terminalsByWs: {
+          ...s.terminalsByWs,
+          [workspaceId]: prev.map((t) => (t.id === id ? { ...t, starting: false } : t)),
         },
       };
     }),
