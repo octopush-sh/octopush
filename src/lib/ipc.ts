@@ -1517,6 +1517,8 @@ export interface ClaudeCliVersion {
   /** The newest sandbox/permission fix (`agent_adapter::CLAUDE_SECURITY_FIXES`)
    *  the known version lacks; null when it has them all or is unknown. */
   securityFix?: { version: string; reason: string } | null;
+  /** The version to update to: the higher of the floor and `securityFix`. */
+  recommended?: string;
 }
 
 /** Result of a one-click "Connect to Claude Code". */

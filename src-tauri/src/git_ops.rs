@@ -19,7 +19,7 @@ pub struct GitStatus {
     /// Count of files with an unresolved merge conflict.
     pub conflicted: usize,
     /// False when ahead/behind couldn't be computed in time (huge-graph timeout);
-    /// the UI hides the ↑/↓ badge rather than showing a misleading 0.
+    /// the Review Companion shows "—" rather than a misleading "Up to date".
     pub ahead_behind_known: bool,
     /// The in-progress multi-step operation, if any: "merge" or "rebase".
     /// None when the repo is in its normal state.

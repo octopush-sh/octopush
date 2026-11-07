@@ -28,6 +28,12 @@ describe("claudeUpdateLabel", () => {
     expect(claudeUpdateLabel({ version: null, floor: "2.1.314", belowFloor: false })).toBeNull();
     expect(claudeUpdateLabel(null)).toBeNull();
   });
+
+  it("names the backend's recommended version when the floor still lacks a security fix", () => {
+    expect(claudeUpdateLabel({ version: "2.1.307", floor: "2.1.314", belowFloor: true, recommended: "2.1.319" })).toBe(
+      "Update Claude Code (2.1.319 or newer recommended)",
+    );
+  });
 });
 
 describe("claudeSecurityLabel", () => {

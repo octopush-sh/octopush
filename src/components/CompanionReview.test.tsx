@@ -53,6 +53,22 @@ describe("CompanionReview", () => {
     expect(screen.getByText(/1 file/i)).toBeInTheDocument();
   });
 
+  it("shows — rather than 'Up to date' when ahead/behind is unknown", () => {
+    const { rerender } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ aheadBehindKnown: false })} gitDiff={DIFF} />,
+    );
+    expect(screen.queryByText("Up to date with origin")).not.toBeInTheDocument();
+    expect(screen.getByText("—")).toHaveAttribute("title", expect.stringContaining("Ahead/behind unknown"));
+
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} gitDiff={DIFF} />);
+    expect(screen.getByText("Up to date with origin")).toBeInTheDocument();
+    // Unpublished wins: there is nothing to compare with.
+    rerender(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false, aheadBehindKnown: false })} gitDiff={DIFF} />,
+    );
+    expect(screen.getByText("Not published yet")).toBeInTheDocument();
+  });
+
   it("flags conflicts in the verdict", () => {
     render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ conflicted: 2 })} gitDiff={DIFF} />);
     expect(screen.getByText(/resolve 2 conflicts first/i)).toBeInTheDocument();

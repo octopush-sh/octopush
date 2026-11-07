@@ -415,10 +415,13 @@ describe("PipelineSetup Claude Code version preflight", () => {
 
   it("shows the tested-floor note instead of the security one below the floor", async () => {
     storeState.pipelines = [cliPipe("claude-sonnet-4-6")];
-    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true, securityFix: escapeFix });
+    cliVersionMock.mockResolvedValue({
+      version: "2.1.307", floor: "2.1.314", belowFloor: true, securityFix: escapeFix, recommended: "2.1.319",
+    });
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     const note = await screen.findByTestId("launcher-claude-cli-update");
-    expect(note.textContent).toContain("Update Claude Code (2.1.314 or newer recommended)");
+    // 2.1.314 still lacks the fix: the note names the version that has both.
+    expect(note.textContent).toContain("Update Claude Code (2.1.319 or newer recommended)");
     expect(note.textContent).not.toContain("sandbox escape");
     expect(screen.getAllByTestId("launcher-claude-cli-update")).toHaveLength(1);
   });

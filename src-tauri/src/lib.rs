@@ -611,6 +611,8 @@ pub fn run() {
             // A Routine's setup script or condition still running would
             // otherwise outlive the app (with its whole process group).
             routines::kill_live_groups();
+            // Same for a Readiness or Connect probe (each in its own group).
+            readiness::kill_in_flight();
             if let Err(e) = app.state::<AppState>().db.lock().mark_quit(chrono::Utc::now()) {
                 tracing::warn!(error = %e, "failed to record last_quit_at");
             }
