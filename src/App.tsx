@@ -263,6 +263,7 @@ function App() {
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const markRunning = useTerminalsStore((s) => s.markRunning);
   const markFailed = useTerminalsStore((s) => s.markFailed);
+  const markStarted = useTerminalsStore((s) => s.markStarted);
   const setActiveTerminal = useTerminalsStore((s) => s.setActive);
   // Every (workspace, terminal) pair, by id, so the TerminalHost can mount
   // every TerminalPane simultaneously. This is the only way to keep PTYs and
@@ -2342,6 +2343,7 @@ function App() {
                       layoutVersion={layoutVersion}
                       onSpawn={() => markRunning(t.workspaceId, t.id, true)}
                       onSpawnError={() => markFailed(t.workspaceId, t.id, true)}
+                      onFirstOutput={() => markStarted(t.workspaceId, t.id)}
                       onExit={() => markRunning(t.workspaceId, t.id, false)}
                       onReattach={() => {
                         // Mark as running (it already was, but be explicit).

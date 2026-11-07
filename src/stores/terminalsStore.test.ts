@@ -593,6 +593,37 @@ describe("terminalsStore — markFailed", () => {
   });
 });
 
+describe("terminalsStore — markStarted", () => {
+  beforeEach(() => resetStore());
+
+  it("a loaded session is starting until its pane's first output, across reloads", async () => {
+    const ws = "ws-starting";
+    const rec = makeRecord(ws, "Main", 0);
+    mockIpc.listTerminals.mockResolvedValue([rec]);
+    mockIpc.listPtySessions.mockResolvedValue([]);
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(true);
+
+    // The PTY spawned, but nothing is drawn yet: still starting.
+    useTerminalsStore.getState().markRunning(ws, rec.id, true);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(true);
+
+    useTerminalsStore.getState().markStarted(ws, rec.id);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(false);
+
+    // A reload keeps it started: the prompt is still on the canvas.
+    await useTerminalsStore.getState().loadTerminals(ws);
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].starting).toBe(false);
+  });
+
+  it("a created session is starting", async () => {
+    const ws = "ws-starting-new";
+    mockIpc.createTerminal.mockResolvedValue(makeRecord(ws, "Main", 0));
+    const t = await useTerminalsStore.getState().createTerminal(ws);
+    expect(t.starting).toBe(true);
+  });
+});
+
 describe("terminalsStore — workspace isolation", () => {
   beforeEach(() => resetStore());
 
