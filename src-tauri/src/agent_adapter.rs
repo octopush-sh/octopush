@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 /// Trait for pluggable agent adapters.
@@ -332,8 +332,9 @@ pub fn forget_claude_cli_version() {
 static CLAUDE_VERSION_CACHE: VersionCache = VersionCache::new();
 
 /// The lock is only ever held to read or write these fields, never across a
-/// probe, so the run loop's [`VersionCache::peek`] can't wait on one.
-struct VersionCache(Mutex<VersionState>);
+/// probe, so the run loop's [`VersionCache::peek`] can't wait on one. The
+/// condvar wakes callers waiting for another caller's probe.
+struct VersionCache(Mutex<VersionState>, Condvar);
 
 /// `None` = not probed; `Some(None)` = probed, no version found.
 struct VersionState {
@@ -346,26 +347,40 @@ struct VersionState {
     /// Bumped by each forget, so a probe that started before one doesn't
     /// store a possibly stale answer as current.
     generation: u64,
+    /// The generation a probe is running in right now, if any.
+    probing: Option<u64>,
 }
 
 impl VersionCache {
     const fn new() -> Self {
-        Self(Mutex::new(VersionState { current: None, last: None, last_generation: 0, generation: 0 }))
+        let state = VersionState { current: None, last: None, last_generation: 0, generation: 0, probing: None };
+        Self(Mutex::new(state), Condvar::new())
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VersionState> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Probes outside the lock: concurrent first callers may each probe.
+    /// Probes outside the lock, one probe per generation: a caller that
+    /// arrives while one runs waits for its answer (letting go of the lock
+    /// meanwhile). After a forget, the next caller probes afresh.
     fn get_or_probe(&self, probe: impl FnOnce() -> Option<String>) -> Option<String> {
         let generation = {
-            let state = self.lock();
-            if let Some(v) = &state.current {
-                return v.clone();
+            let mut state = self.lock();
+            loop {
+                if let Some(v) = &state.current {
+                    return v.clone();
+                }
+                if state.probing != Some(state.generation) {
+                    break;
+                }
+                state = self.1.wait(state).unwrap_or_else(|e| e.into_inner());
             }
+            state.probing = Some(state.generation);
             state.generation
         };
+        // Clears `probing` and wakes the waiters even if the probe panics.
+        let _probing = ProbingGuard { cache: self, generation };
         let found = probe();
         let mut state = self.lock();
         if state.generation == generation {
@@ -392,6 +407,24 @@ impl VersionCache {
         let mut state = self.lock();
         state.current = None;
         state.generation += 1;
+    }
+}
+
+/// Held across a [`VersionCache::get_or_probe`] probe; dropped after the
+/// answer is stored.
+struct ProbingGuard<'a> {
+    cache: &'a VersionCache,
+    generation: u64,
+}
+
+impl Drop for ProbingGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.cache.lock();
+        if state.probing == Some(self.generation) {
+            state.probing = None;
+        }
+        drop(state);
+        self.cache.1.notify_all();
     }
 }
 
@@ -1067,6 +1100,59 @@ mod tests {
         assert_eq!(cache.peek(), Some(Some("2.1.319".into())));
         // Forgotten mid-probe: that answer isn't kept as current.
         assert_eq!(cache.get_or_probe(|| Some("2.1.320".into())).as_deref(), Some("2.1.320"));
+    }
+
+    #[test]
+    fn concurrent_first_callers_share_one_probe() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let cache = VersionCache::new();
+        let probes = AtomicUsize::new(0);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let (shared, count) = (&cache, &probes);
+        std::thread::scope(|s| {
+            let first = s.spawn(move || {
+                shared.get_or_probe(|| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some("2.1.319".into())
+                })
+            });
+            started_rx.recv().unwrap();
+            // Each of these would answer at once with its own probe.
+            let later: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(move || {
+                        shared.get_or_probe(|| {
+                            count.fetch_add(1, Ordering::SeqCst);
+                            Some("2.1.320".into())
+                        })
+                    })
+                })
+                .collect();
+            std::thread::sleep(Duration::from_millis(100));
+            // Waiting callers don't hold the lock.
+            let started = Instant::now();
+            assert_eq!(cache.peek(), None);
+            assert!(started.elapsed() < Duration::from_millis(100));
+            release_tx.send(()).unwrap();
+            assert_eq!(first.join().unwrap().as_deref(), Some("2.1.319"));
+            for t in later {
+                assert_eq!(t.join().unwrap().as_deref(), Some("2.1.319"), "a later caller waits for the first probe");
+            }
+        });
+        assert_eq!(probes.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_probe_that_panics_lets_the_next_caller_probe() {
+        let cache = VersionCache::new();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            cache.get_or_probe(|| panic!("probe failed"));
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(cache.get_or_probe(|| Some("2.1.319".into())).as_deref(), Some("2.1.319"));
     }
 
     #[test]

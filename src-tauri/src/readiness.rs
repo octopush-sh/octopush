@@ -8,7 +8,7 @@ use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -77,20 +77,38 @@ pub enum Probe {
     Exited { success: bool, output: String },
 }
 
+/// What `kill_in_flight` does at quit to a probe that is still running.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OnQuit {
+    /// Killed at once, with its group.
+    Kill,
+    /// Given up to [`QUIT_GRACE`] to finish, then killed: a `claude mcp add`
+    /// killed after its `remove` succeeded leaves Connect unregistered.
+    Finish,
+}
+
+/// How long quitting waits for an [`OnQuit::Finish`] probe.
+pub const QUIT_GRACE: Duration = Duration::from_secs(2);
+
 /// Run `cmd` within `timeout`, joining stdout and stderr (the first
 /// [`OUTPUT_CAP`] bytes of each). Its whole process group is killed at the
 /// timeout or when it exits, so whatever it spawned dies with it unless it
 /// left the group.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
-    probe_with(cmd, timeout, true)
+    run_probe_on_quit(cmd, timeout, OnQuit::Kill)
+}
+
+/// [`run_probe`], with what quitting does to it while it runs.
+pub fn run_probe_on_quit(cmd: Option<Command>, timeout: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, true, on_quit)
 }
 
 /// Like [`run_probe`], but output goes to `/dev/null` and is never read.
 pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
-    probe_with(cmd, timeout, false)
+    probe_with(cmd, timeout, false, OnQuit::Kill)
 }
 
-fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
+fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
     let io = || if capture { Stdio::piped() } else { Stdio::null() };
     cmd.stdin(Stdio::null()).stdout(io()).stderr(io());
@@ -103,7 +121,7 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
         return Probe::Missing;
     };
     let pid = child.id();
-    track(pid);
+    IN_FLIGHT.track(pid, on_quit);
     // Read while it runs: a reply bigger than the pipe buffer would otherwise
     // block the command until the timeout.
     let mut pipes: Vec<Pipe> = [child.stdout.take().map(Pipe::read), child.stderr.take().map(Pipe::read)]
@@ -111,20 +129,29 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
         .flatten()
         .collect();
     let deadline = Instant::now() + timeout;
-    while !has_exited(&mut child) {
+    let reaped = loop {
+        match exit_status(&mut child) {
+            Exit::Running => {}
+            Exit::Unreaped => break false,
+            Exit::Reaped => break true,
+        }
         if Instant::now() >= deadline {
-            untrack(pid);
+            IN_FLIGHT.untrack(pid);
             kill_process_group(&mut child);
             return Probe::TimedOut;
         }
         std::thread::sleep(Duration::from_millis(25));
+    };
+    if !reaped {
+        // Not reaped yet, so its zombie still holds the pid and with it the
+        // group id: kill what it left in its group (holding its output or
+        // not) before the reap, when neither can belong to another process
+        // yet. Untracked first, so `kill_in_flight` can't signal it after the
+        // reap either. A reaped one was untracked as it was reaped, and its
+        // pid may already be another process's: nothing signals it.
+        kill_group(pid);
+        IN_FLIGHT.untrack(pid);
     }
-    // Not reaped yet, so its zombie still holds the pid and with it the group
-    // id: kill what it left running (holding its output or not) before the
-    // reap, when neither can belong to another process yet. Untracked first,
-    // so `kill_in_flight` can't signal it after the reap either.
-    kill_group(pid);
-    untrack(pid);
     let success = child.wait().is_ok_and(|s| s.success());
     // What it printed is already in the pipes; the floor gives the readers
     // time to take it.
@@ -133,9 +160,40 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     Probe::Exited { success, output }
 }
 
-/// True once `child` has exited, without reaping it.
+/// Where a probed command stands.
+#[derive(Debug, PartialEq, Eq)]
+enum Exit {
+    Running,
+    /// Exited, not reaped: its zombie still holds the pid and group id.
+    Unreaped,
+    /// Exited and reaped by the fallback, and untracked in the same step.
+    Reaped,
+}
+
+fn exit_status(child: &mut Child) -> Exit {
+    match exited_unreaped(child) {
+        Some(true) => Exit::Unreaped,
+        Some(false) => Exit::Running,
+        None => reap_untracked(&IN_FLIGHT, child),
+    }
+}
+
+/// The fallback when `waitid` can't tell: `try_wait`, which reaps. It runs
+/// under the tracker's lock and the pid is untracked before the lock is let
+/// go, so `kill_in_flight` never signals a pid that may have been reused.
+fn reap_untracked(in_flight: &InFlight, child: &mut Child) -> Exit {
+    let pid = child.id();
+    if in_flight.untrack_if(pid, || !matches!(child.try_wait(), Ok(None))) {
+        Exit::Reaped
+    } else {
+        Exit::Running
+    }
+}
+
+/// Whether `child` has exited, without reaping it; `None` when that can't be
+/// told this way.
 #[cfg(unix)]
-fn has_exited(child: &mut Child) -> bool {
+fn exited_unreaped(child: &Child) -> Option<bool> {
     // `si_code` values, the same on macOS and Linux.
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
@@ -148,18 +206,17 @@ fn has_exited(child: &mut Child) -> bool {
     if rc == 0 {
         // Still zeroed when nothing changed; macOS also reports a stopped
         // child despite WEXITED, so only an exit counts.
-        return matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
+        return Some(matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED));
     }
     if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-        return false;
+        return Some(false);
     }
-    // waitid unusable: reap the plain way (the pid is then no longer pinned).
-    !matches!(child.try_wait(), Ok(None))
+    None
 }
 
 #[cfg(not(unix))]
-fn has_exited(child: &mut Child) -> bool {
-    !matches!(child.try_wait(), Ok(None))
+fn exited_unreaped(_child: &Child) -> Option<bool> {
+    None
 }
 
 /// One stdout/stderr pipe, read on its own thread: chunks arrive as they are
@@ -229,25 +286,84 @@ fn collect(pipes: &mut [Pipe], until: Instant) {
 /// The process groups of the probes running right now. Each has its own
 /// group, so quitting doesn't take them down: `kill_in_flight` (on
 /// `RunEvent::Exit`) does.
-static IN_FLIGHT: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+static IN_FLIGHT: InFlight = InFlight::new();
 
-fn track(pid: u32) {
-    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+struct InFlight {
+    probes: Mutex<Vec<(u32, OnQuit)>>,
+    /// Notified whenever a probe is untracked.
+    untracked: Condvar,
 }
 
-/// Called before the child is reaped. `kill_in_flight` signals under the same
-/// lock, so it either sees the pid while the unreaped child still holds it,
-/// or not at all: never a pid that may have been handed out again.
-fn untrack(pid: u32) {
-    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != pid);
-}
-
-/// SIGKILL every probe still running, with what it spawned (the app is quitting).
-pub fn kill_in_flight() {
-    let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-    for pid in in_flight.drain(..) {
-        kill_group(pid);
+impl InFlight {
+    const fn new() -> Self {
+        Self { probes: Mutex::new(Vec::new()), untracked: Condvar::new() }
     }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<(u32, OnQuit)>> {
+        self.probes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn track(&self, pid: u32, on_quit: OnQuit) {
+        self.lock().push((pid, on_quit));
+    }
+
+    /// Called before the child is reaped. `kill_all` signals under the same
+    /// lock, so it either sees the pid while the unreaped child still holds
+    /// it, or not at all: never a pid that may have been handed out again.
+    fn untrack(&self, pid: u32) {
+        self.untrack_if(pid, || true);
+    }
+
+    /// Runs `reaped` under the lock and, when it says the child is gone,
+    /// untracks `pid` before the lock is let go.
+    fn untrack_if(&self, pid: u32, reaped: impl FnOnce() -> bool) -> bool {
+        let mut probes = self.lock();
+        let done = reaped();
+        if done {
+            probes.retain(|&(p, _)| p != pid);
+        }
+        drop(probes);
+        if done {
+            self.untracked.notify_all();
+        }
+        done
+    }
+
+    #[cfg(test)]
+    fn tracked(&self, pid: u32) -> Option<OnQuit> {
+        self.lock().iter().find(|&&(p, _)| p == pid).map(|&(_, on_quit)| on_quit)
+    }
+
+    /// `kill` every tracked probe under the lock: an [`OnQuit::Kill`] one at
+    /// once, an [`OnQuit::Finish`] one once `grace` has passed without it
+    /// untracking itself. Waiting lets go of the lock, so a probe that
+    /// finishes can untrack.
+    fn kill_all(&self, grace: Duration, mut kill: impl FnMut(u32)) {
+        let deadline = Instant::now() + grace;
+        let mut probes = self.lock();
+        loop {
+            probes.retain(|&(pid, on_quit)| {
+                if on_quit == OnQuit::Kill {
+                    kill(pid);
+                }
+                on_quit != OnQuit::Kill
+            });
+            let left = deadline.saturating_duration_since(Instant::now());
+            if probes.is_empty() || left.is_zero() {
+                break;
+            }
+            probes = self.untracked.wait_timeout(probes, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+        for (pid, _) in probes.drain(..) {
+            kill(pid);
+        }
+    }
+}
+
+/// SIGKILL every probe still running, with what it spawned (the app is
+/// quitting); one that should finish first gets [`QUIT_GRACE`].
+pub fn kill_in_flight() {
+    IN_FLIGHT.kill_all(QUIT_GRACE, kill_group);
 }
 
 /// SIGKILL the process group `process_group(0)` gave the child `pid`.
@@ -655,17 +771,105 @@ mod tests {
         let pid = read_pid(&pidfile);
         // The shell can write its pid before the probe thread tracks it.
         let deadline = Instant::now() + Duration::from_secs(3);
-        while !IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
+        while IN_FLIGHT.tracked(pid).is_none() {
             assert!(Instant::now() < deadline, "the running probe must be tracked");
             std::thread::sleep(Duration::from_millis(20));
         }
+        assert_eq!(IN_FLIGHT.tracked(pid), Some(OnQuit::Kill));
         // What `kill_in_flight` does to each one (not called here: it would
         // kill the probes of tests running alongside).
         let started = Instant::now();
         kill_group(pid);
         assert!(matches!(running.join().unwrap(), Probe::Exited { success: false, .. }));
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert!(!IN_FLIGHT.lock().unwrap().contains(&pid));
+        assert_eq!(IN_FLIGHT.tracked(pid), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_can_ask_to_finish_on_quit() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("add.pid");
+        let script = format!("echo $$ > '{}'; sleep 30", pidfile.display());
+        let running = std::thread::spawn(move || run_probe_on_quit(sh(&script), Duration::from_secs(20), OnQuit::Finish));
+        let pid = read_pid(&pidfile);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while IN_FLIGHT.tracked(pid).is_none() {
+            assert!(Instant::now() < deadline, "the running probe must be tracked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(IN_FLIGHT.tracked(pid), Some(OnQuit::Finish));
+        kill_group(pid);
+        running.join().unwrap();
+        assert_eq!(IN_FLIGHT.tracked(pid), None);
+    }
+
+    // `kill_all` on a tracker of its own with made-up pids: `kill` only
+    // records, nothing is signalled.
+    #[test]
+    fn quitting_kills_at_once_but_lets_a_finishing_probe_end_first() {
+        let in_flight = InFlight::new();
+        in_flight.track(101, OnQuit::Kill);
+        in_flight.track(102, OnQuit::Finish);
+        let killed = Mutex::new(Vec::new());
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(Duration::from_millis(150));
+                in_flight.untrack(102);
+            });
+            in_flight.kill_all(Duration::from_secs(2), |pid| killed.lock().unwrap().push((pid, started.elapsed())));
+        });
+        let took = started.elapsed();
+        let killed = killed.into_inner().unwrap();
+        assert_eq!(killed.iter().map(|&(p, _)| p).collect::<Vec<_>>(), [101], "the finished add is never killed");
+        assert!(killed[0].1 < Duration::from_millis(100), "a plain probe is killed at once: {:?}", killed[0].1);
+        assert!(took >= Duration::from_millis(150) && took < Duration::from_secs(1), "waits only until it ends: {took:?}");
+        assert_eq!(in_flight.tracked(102), None);
+    }
+
+    #[test]
+    fn quitting_kills_a_finishing_probe_once_the_grace_runs_out() {
+        let in_flight = InFlight::new();
+        in_flight.track(201, OnQuit::Finish);
+        let mut killed = Vec::new();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_millis(200), |pid| killed.push(pid));
+        let took = started.elapsed();
+        assert_eq!(killed, [201]);
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "{took:?}");
+        assert_eq!(in_flight.tracked(201), None);
+
+        // Nothing to wait for: no wait at all.
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_secs(2), |_| panic!("nothing is tracked"));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_fallback_reports_a_reaped_child_and_untracks_it_as_it_reaps() {
+        let in_flight = InFlight::new();
+        let mut done = Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+        in_flight.track(done.id(), OnQuit::Kill);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            match reap_untracked(&in_flight, &mut done) {
+                Exit::Running => assert!(Instant::now() < deadline, "the shell must exit"),
+                other => break other,
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        // Reaped: the caller must not signal its group, and quitting can't either.
+        assert_eq!(status, Exit::Reaped);
+        assert_eq!(in_flight.tracked(done.id()), None);
+
+        let mut running = Command::new("/bin/sh").args(["-c", "sleep 30"]).spawn().unwrap();
+        in_flight.track(running.id(), OnQuit::Kill);
+        assert_eq!(reap_untracked(&in_flight, &mut running), Exit::Running);
+        assert_eq!(in_flight.tracked(running.id()), Some(OnQuit::Kill), "still running: still tracked");
+        let _ = running.kill();
+        let _ = running.wait();
     }
 
     #[test]
