@@ -26,6 +26,32 @@ export const SYNC_COPY = {
   offOnly: "Requires Pro to turn on. You can still turn it off.",
 } as const;
 
+/** How one Sync row renders. A row dims only when it is truly unavailable:
+ *  the account can't sync it (signed out, or no Pro entitlement) AND it is
+ *  off. Off-but-available rows stay at full ink, with the off state carried by
+ *  the switch alone. Turning OFF is always allowed (the backend agrees) — a
+ *  user who lost Pro or signed out must still be able to stop uploads. A write
+ *  in flight only blocks clicks (`busy`); it never dims. */
+export function syncRowState({
+  signedIn,
+  entitled,
+  on,
+  saving,
+}: {
+  signedIn: boolean;
+  entitled: boolean;
+  on: boolean;
+  saving: boolean;
+}): { disabled: boolean; busy: boolean; title: string | undefined } {
+  const available = signedIn && entitled;
+  const lockedTitle = signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
+  return {
+    disabled: !available && !on,
+    busy: saving,
+    title: available ? undefined : on ? SYNC_COPY.offOnly : lockedTitle,
+  };
+}
+
 export function AccountPane() {
   const { status, signingIn, error, signIn, cancelSignIn, signOut, refresh } = useAuth();
   const { plan, reload, hasFeature } = useEntitlement();
@@ -36,13 +62,18 @@ export function AccountPane() {
   const syncError = useSyncPrefsStore((s) => s.error);
   const loadSyncPrefs = useSyncPrefsStore((s) => s.load);
   const setSyncPref = useSyncPrefsStore((s) => s.setPref);
-  const canHistorySync = status.signedIn && hasFeature("history.sync");
-  const canLibrarySync = status.signedIn && hasFeature("library.sync");
-  const lockedTitle = status.signedIn ? SYNC_COPY.requiresPro : SYNC_COPY.requiresSignIn;
-  // Turning OFF is always allowed (the backend agrees) — a user who lost Pro or
-  // signed out must still be able to stop uploads before re-subscribing.
-  const titleFor = (can: boolean, on: boolean) =>
-    can ? undefined : on ? SYNC_COPY.offOnly : lockedTitle;
+  const historyRow = syncRowState({
+    signedIn: status.signedIn,
+    entitled: hasFeature("history.sync"),
+    on: historySync,
+    saving: syncSaving === "history",
+  });
+  const libraryRow = syncRowState({
+    signedIn: status.signedIn,
+    entitled: hasFeature("library.sync"),
+    on: librarySync,
+    saving: syncSaving === "library",
+  });
 
   useEffect(() => {
     void loadSyncPrefs();
@@ -182,8 +213,9 @@ export function AccountPane() {
             label={SYNC_COPY.historyLabel}
             description={SYNC_COPY.historyDescription}
             checked={historySync}
-            disabled={(!canHistorySync && !historySync) || syncSaving === "history"}
-            title={titleFor(canHistorySync, historySync)}
+            disabled={historyRow.disabled}
+            busy={historyRow.busy}
+            title={historyRow.title}
             onChange={(v) => void setSyncPref("history", v)}
             testId="sync-history-toggle"
           />
@@ -191,8 +223,9 @@ export function AccountPane() {
             label={SYNC_COPY.libraryLabel}
             description={SYNC_COPY.libraryDescription}
             checked={librarySync}
-            disabled={(!canLibrarySync && !librarySync) || syncSaving === "library"}
-            title={titleFor(canLibrarySync, librarySync)}
+            disabled={libraryRow.disabled}
+            busy={libraryRow.busy}
+            title={libraryRow.title}
             onChange={(v) => void setSyncPref("library", v)}
             testId="sync-library-toggle"
           />

@@ -45,6 +45,7 @@ export function ToggleRow({
   onChange,
   testId,
   disabled = false,
+  busy = false,
   title,
 }: {
   label: string;
@@ -55,14 +56,18 @@ export function ToggleRow({
   /** Not actionable right now (e.g. a Pro-only setting on Free) — dimmed,
    *  the switch ignores clicks; pair with `title` to say why. */
   disabled?: boolean;
+  /** A write is in flight: the switch ignores clicks, but the row stays at
+   *  full ink — it isn't unavailable, so it must not read as disabled. */
+  busy?: boolean;
   title?: string;
 }) {
   return (
     <label
       title={title}
       aria-disabled={disabled || undefined}
+      aria-busy={busy || undefined}
       className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[var(--dur-quick)] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
-        disabled ? "cursor-default opacity-55" : "cursor-pointer"
+        disabled ? "cursor-default opacity-55" : busy ? "cursor-progress" : "cursor-pointer"
       }`}
       style={{
         border: "1px solid var(--color-octo-hairline)",
@@ -83,7 +88,7 @@ export function ToggleRow({
         checked={checked}
         onChange={onChange}
         testId={testId}
-        disabled={disabled}
+        disabled={disabled || busy}
         ariaLabel={label}
         title={title}
       />

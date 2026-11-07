@@ -5,7 +5,7 @@
  */
 import { describe, it, expect } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { PrivacyPane, OUTBOUND, AGENT_CLI_NOTE } from "./PrivacyPane";
+import { PrivacyPane, OUTBOUND, AGENT_CLI_NOTE, PATH_CHIP_CLASS } from "./PrivacyPane";
 
 describe("PrivacyPane", () => {
   it("lists every outbound destination", () => {
@@ -47,5 +47,19 @@ describe("PrivacyPane", () => {
     expect(screen.getByTestId("privacy-agent-cli")).toHaveTextContent(AGENT_CLI_NOTE);
     expect(AGENT_CLI_NOTE).toContain("Claude Code");
     expect(AGENT_CLI_NOTE).toContain("Codex");
+  });
+});
+
+describe("PrivacyPane — inline paths (#560)", () => {
+  it("sets file paths in ivory mono on the code chip, never brass", () => {
+    const { container } = render(<PrivacyPane />);
+    for (const path of ["~/Library/Application Support/octopush/octopush.db", "~/.octopush/settings.json"]) {
+      const chip = screen.getByText(path);
+      expect(chip.tagName).toBe("CODE");
+      expect(chip).toHaveClass(...PATH_CHIP_CLASS.split(" "));
+      expect(chip).not.toHaveClass("text-octo-brass");
+    }
+    // Brass survives only on the eyebrow.
+    expect(Array.from(container.querySelectorAll(".text-octo-brass")).map((e) => e.textContent)).toEqual(["Privacy"]);
   });
 });

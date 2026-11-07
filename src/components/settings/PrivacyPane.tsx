@@ -4,6 +4,11 @@
 // quotes this copy).
 import { PaneHeader } from "./shared";
 
+/** Inline file path inside body copy: plain content, so ivory mono on the
+ *  onyx code chip (as in What's New) — never brass, which stays on the
+ *  eyebrow and the active nav row. Exported for the test. */
+export const PATH_CHIP_CLASS = "rounded bg-octo-onyx px-0.5 font-mono text-[12px] text-octo-ivory";
+
 /** Every place this app sends traffic. Exported for the copy test. */
 export const OUTBOUND: readonly string[] = [
   "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models.",
@@ -31,14 +36,14 @@ export function PrivacyPane() {
         <li>
           · <span className="font-serif text-octo-ivory">Stored on this Mac:</span> projects,
           workspaces, chats, tool executions, Direct runs, token usage — in{" "}
-          <span className="font-mono text-octo-brass">
+          <code className={PATH_CHIP_CLASS}>
             ~/Library/Application Support/octopush/octopush.db
-          </span>
+          </code>
           . Runs and custom pipelines leave it only if you turn on sync.
         </li>
         <li>
           · <span className="font-serif text-octo-ivory">API keys:</span> stored in{" "}
-          <span className="font-mono text-octo-brass">~/.octopush/settings.json</span>. Your
+          <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. Your
           account session lives in the macOS Keychain.
         </li>
         <li>

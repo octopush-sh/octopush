@@ -51,4 +51,21 @@ describe("ToggleRow", () => {
     expect(sw).toHaveAttribute("title", "Available on Pro");
     expect(sw).toBeDisabled();
   });
+
+  it("dims only an unavailable row; a busy row blocks clicks at full ink", () => {
+    const { rerender } = render(
+      <ToggleRow label="Sync" checked={false} onChange={vi.fn()} testId="t" />,
+    );
+    const row = () => screen.getByTestId("t").closest("label")!;
+    expect(row()).not.toHaveClass("opacity-55");
+    rerender(<ToggleRow label="Sync" checked={false} onChange={vi.fn()} testId="t" busy />);
+    expect(row()).not.toHaveClass("opacity-55");
+    expect(row()).toHaveAttribute("aria-busy", "true");
+    expect(row()).toHaveClass("cursor-progress");
+    expect(row()).not.toHaveClass("cursor-pointer");
+    expect(screen.getByTestId("t")).toBeDisabled();
+    rerender(<ToggleRow label="Sync" checked={false} onChange={vi.fn()} testId="t" disabled />);
+    expect(row()).toHaveClass("opacity-55");
+    expect(row()).toHaveAttribute("aria-disabled", "true");
+  });
 });
