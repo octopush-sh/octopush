@@ -340,6 +340,9 @@ struct VersionState {
     current: Option<Option<String>>,
     /// The last answer, kept through [`VersionCache::forget`].
     last: Option<Option<String>>,
+    /// The generation `last`'s probe started in, so an overtaken probe that
+    /// finishes late never replaces a newer answer.
+    last_generation: u64,
     /// Bumped by each forget, so a probe that started before one doesn't
     /// store a possibly stale answer as current.
     generation: u64,
@@ -347,7 +350,7 @@ struct VersionState {
 
 impl VersionCache {
     const fn new() -> Self {
-        Self(Mutex::new(VersionState { current: None, last: None, generation: 0 }))
+        Self(Mutex::new(VersionState { current: None, last: None, last_generation: 0, generation: 0 }))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, VersionState> {
@@ -368,7 +371,10 @@ impl VersionCache {
         if state.generation == generation {
             state.current = Some(found.clone());
         }
-        state.last = Some(found.clone());
+        if generation >= state.last_generation {
+            state.last = Some(found.clone());
+            state.last_generation = generation;
+        }
         found
     }
 
@@ -1061,6 +1067,33 @@ mod tests {
         assert_eq!(cache.peek(), Some(Some("2.1.319".into())));
         // Forgotten mid-probe: that answer isn't kept as current.
         assert_eq!(cache.get_or_probe(|| Some("2.1.320".into())).as_deref(), Some("2.1.320"));
+    }
+
+    #[test]
+    fn an_overtaken_probe_never_replaces_a_newer_answer() {
+        let cache = VersionCache::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let shared = &cache;
+        std::thread::scope(|s| {
+            // Probe A starts on the old CLI...
+            let stale = s.spawn(move || {
+                shared.get_or_probe(|| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some("2.1.316".into())
+                })
+            });
+            started_rx.recv().unwrap();
+            // ...Readiness forgets, and probe B stores the updated CLI.
+            cache.forget();
+            assert_eq!(cache.get_or_probe(|| Some("2.1.319".into())).as_deref(), Some("2.1.319"));
+            release_tx.send(()).unwrap();
+            assert_eq!(stale.join().unwrap().as_deref(), Some("2.1.316"));
+        });
+        // A finished last, but B's answer stays both current and last.
+        assert_eq!(cache.peek(), Some(Some("2.1.319".into())));
+        assert_eq!(cache.get_or_probe(|| Some("2.1.320".into())).as_deref(), Some("2.1.319"));
     }
 
     #[test]
