@@ -335,19 +335,21 @@ pub fn day_label(epoch_secs: i64) -> String {
         .unwrap_or_else(|| "an unknown date".into())
 }
 
-/// An Anthropic key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise
-/// CLI stages run on the `claude` login and API stages can't run. With no
-/// key, `login_expires_at` (the sign-in end a CLI stage last reported, see
-/// `claude_login`) says how long that login lasts; without one the row
-/// stays as it was (older CLIs never report it). Never contacts the network.
+/// `login_expires_at` (the sign-in end a CLI stage last reported, see
+/// `claude_login`) means CLI stages run on a stored claude.ai sign-in, so the
+/// row says how long it lasts, key or not: the Settings key never signs
+/// Claude Code in (`cli_runner` doesn't pass it). Without one, an Anthropic
+/// key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise CLI stages run
+/// on the `claude` login and API stages can't run (older CLIs never report
+/// the end). Never contacts the network.
 pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64) -> ReadinessCheck {
     use crate::claude_login::{state, LoginState};
     const ID: &str = "auth";
     const LABEL: &str = "Claude auth";
-    if has_anthropic_key {
-        return ReadinessCheck::ok(ID, LABEL, "API key");
-    }
     let Some(ends) = login_expires_at else {
+        if has_anthropic_key {
+            return ReadinessCheck::ok(ID, LABEL, "API key");
+        }
         let fix = "CLI stages use your claude login. API stages need an Anthropic key in Settings › Models.";
         return ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, "Subscription", fix, None);
     };
@@ -719,8 +721,14 @@ mod tests {
     fn auth_mode_and_a_check_that_failed_to_run() {
         let now = 1_800_000_000;
         assert_eq!(auth_check(true, None, now).value, "API key");
-        // A key wins over a stored login, even an ended one.
-        assert_eq!(auth_check(true, Some(now - 1), now).status, CheckStatus::Ok);
+        // The key never signs Claude Code in: a stored sign-in end still shows.
+        let soon = now + 3 * 86_400;
+        let both = auth_check(true, Some(soon), now);
+        assert_eq!((both.status, both.value.clone()), (CheckStatus::Warn, format!("Sign-in ends {}", day_label(soon))));
+        assert_eq!(both.command.as_deref(), Some(CLAUDE_LOGIN));
+        assert_eq!(auth_check(true, Some(now - 1), now).status, CheckStatus::Fail);
+        let far = now + 30 * 86_400;
+        assert_eq!(auth_check(true, Some(far), now).value, format!("Signed in · until {}", day_label(far)));
         let sub = auth_check(false, None, now);
         assert_eq!((sub.status, sub.value.as_str(), sub.command), (CheckStatus::Warn, "Subscription", None));
 
