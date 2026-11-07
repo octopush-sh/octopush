@@ -7,7 +7,7 @@ import { PaneHeader } from "./shared";
 /** Inline file path inside body copy: plain content, so ivory mono on the
  *  onyx code chip (as in What's New) — never brass, which stays on the
  *  eyebrow and the active nav row. Exported for the test. */
-export const PATH_CHIP_CLASS = "rounded bg-octo-onyx px-1 font-mono text-[12px] text-octo-ivory";
+export const PATH_CHIP_CLASS = "rounded bg-octo-onyx px-0.5 font-mono text-[12px] text-octo-ivory";
 
 /** Every place this app sends traffic. Exported for the copy test. */
 export const OUTBOUND: readonly string[] = [

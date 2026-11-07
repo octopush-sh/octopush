@@ -61,6 +61,8 @@ describe("ToggleRow", () => {
     rerender(<ToggleRow label="Sync" checked={false} onChange={vi.fn()} testId="t" busy />);
     expect(row()).not.toHaveClass("opacity-55");
     expect(row()).toHaveAttribute("aria-busy", "true");
+    expect(row()).toHaveClass("cursor-progress");
+    expect(row()).not.toHaveClass("cursor-pointer");
     expect(screen.getByTestId("t")).toBeDisabled();
     rerender(<ToggleRow label="Sync" checked={false} onChange={vi.fn()} testId="t" disabled />);
     expect(row()).toHaveClass("opacity-55");

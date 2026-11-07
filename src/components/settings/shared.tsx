@@ -67,7 +67,7 @@ export function ToggleRow({
       aria-disabled={disabled || undefined}
       aria-busy={busy || undefined}
       className={`flex items-start justify-between gap-4 rounded-lg px-4 py-3 transition-opacity duration-[var(--dur-quick)] ease-[cubic-bezier(0.2,0.8,0.3,1)] ${
-        disabled ? "cursor-default opacity-55" : "cursor-pointer"
+        disabled ? "cursor-default opacity-55" : busy ? "cursor-progress" : "cursor-pointer"
       }`}
       style={{
         border: "1px solid var(--color-octo-hairline)",

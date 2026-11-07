@@ -198,6 +198,24 @@ describe("AccountPane — Sync rows render at full ink for Pro", () => {
     }
   });
 
+  it("a second click while the first write is pending sends nothing more", async () => {
+    setup("pro");
+    let resolve!: (v: { historySync: boolean; librarySync: boolean }) => void;
+    setSyncPref.mockImplementation(() => new Promise((r) => { resolve = r; }));
+    render(<AccountPane />);
+    await waitFor(() => expect(getSyncPrefs).toHaveBeenCalled());
+    const toggle = screen.getByTestId("sync-history-toggle");
+    fireEvent.click(toggle);
+    await waitFor(() => expect(toggle).toBeDisabled());
+    expect(toggle.closest("label")).toHaveAttribute("aria-busy", "true");
+    expect(toggle.closest("label")).not.toHaveClass("opacity-55");
+    fireEvent.click(toggle);
+    expect(setSyncPref).toHaveBeenCalledTimes(1);
+    resolve({ historySync: true, librarySync: false });
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-checked", "true"));
+    expect(setSyncPref).toHaveBeenCalledTimes(1);
+  });
+
   it("Free users' off rows stay dimmed", async () => {
     setup("free");
     render(<AccountPane />);
