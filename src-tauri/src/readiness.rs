@@ -8,13 +8,15 @@ use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// After a probed command exits, how long its output may still take to
-/// arrive, before and after what it left running is killed.
+/// arrive (only something that left its group can hold it open that long).
 const DRAIN_FLOOR: Duration = Duration::from_millis(250);
+/// What a probe keeps of each stream; the rest is read and dropped.
+const OUTPUT_CAP: usize = 64 * 1024;
 pub const INSTALL_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code";
 pub const UPDATE_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code@latest";
 
@@ -75,9 +77,10 @@ pub enum Probe {
     Exited { success: bool, output: String },
 }
 
-/// Run `cmd` within `timeout`, joining stdout and stderr. At the timeout its
-/// whole process group is killed, so whatever it spawned dies with it; so is
-/// anything it leaves running that still holds its output open after it exits.
+/// Run `cmd` within `timeout`, joining stdout and stderr (the first
+/// [`OUTPUT_CAP`] bytes of each). Its whole process group is killed at the
+/// timeout or when it exits, so whatever it spawned dies with it unless it
+/// left the group.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
     probe_with(cmd, timeout, true)
 }
@@ -99,7 +102,8 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     let Ok(mut child) = cmd.spawn() else {
         return Probe::Missing;
     };
-    track(child.id());
+    let pid = child.id();
+    track(pid);
     // Read while it runs: a reply bigger than the pipe buffer would otherwise
     // block the command until the timeout.
     let mut pipes: Vec<Pipe> = [child.stdout.take().map(Pipe::read), child.stderr.take().map(Pipe::read)]
@@ -107,65 +111,113 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
         .flatten()
         .collect();
     let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                untrack(child.id());
-                // What it printed is already in the pipes; the floor gives
-                // the readers time to take it.
-                collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
-                // A pipe still open means something it left running holds it,
-                // alive and in its group: kill the group so the pipe closes
-                // and nothing outlives the probe.
-                if pipes.iter().any(|p| p.open) {
-                    kill_group(child.id());
-                    collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
-                }
-                let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
-                return Probe::Exited { success: status.success(), output };
-            }
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
-            _ => {
-                untrack(child.id());
-                kill_process_group(&mut child);
-                return Probe::TimedOut;
-            }
+    while !has_exited(&mut child) {
+        if Instant::now() >= deadline {
+            untrack(pid);
+            kill_process_group(&mut child);
+            return Probe::TimedOut;
         }
+        std::thread::sleep(Duration::from_millis(25));
     }
+    // Not reaped yet, so its zombie still holds the pid and with it the group
+    // id: kill what it left running (holding its output or not) before the
+    // reap, when neither can belong to another process yet. Untracked first,
+    // so `kill_in_flight` can't signal it after the reap either.
+    kill_group(pid);
+    untrack(pid);
+    let success = child.wait().is_ok_and(|s| s.success());
+    // What it printed is already in the pipes; the floor gives the readers
+    // time to take it.
+    collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
+    let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
+    Probe::Exited { success, output }
+}
+
+/// True once `child` has exited, without reaping it.
+#[cfg(unix)]
+fn has_exited(child: &mut Child) -> bool {
+    // `si_code` values, the same on macOS and Linux.
+    const CLD_EXITED: i32 = 1;
+    const CLD_KILLED: i32 = 2;
+    const CLD_DUMPED: i32 = 3;
+    // SAFETY: a zeroed siginfo_t is valid; waitid only writes into it.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let flags = libc::WEXITED | libc::WNOWAIT | libc::WNOHANG;
+    // SAFETY: `info` is a live, writable siginfo_t; WNOWAIT leaves the child waitable.
+    let rc = unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, flags) };
+    if rc == 0 {
+        // Still zeroed when nothing changed; macOS also reports a stopped
+        // child despite WEXITED, so only an exit counts.
+        return matches!(info.si_code, CLD_EXITED | CLD_KILLED | CLD_DUMPED);
+    }
+    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        return false;
+    }
+    // waitid unusable: reap the plain way (the pid is then no longer pinned).
+    !matches!(child.try_wait(), Ok(None))
+}
+
+#[cfg(not(unix))]
+fn has_exited(child: &mut Child) -> bool {
+    !matches!(child.try_wait(), Ok(None))
 }
 
 /// One stdout/stderr pipe, read on its own thread: chunks arrive as they are
-/// read, so whatever came before a kill is kept.
+/// read, so whatever came before a kill is kept. Only the first
+/// [`OUTPUT_CAP`] bytes are sent; the reader drains the rest so the command
+/// never blocks on a full pipe, and stops once the probe has returned.
 struct Pipe {
     rx: mpsc::Receiver<Vec<u8>>,
     bytes: Vec<u8>,
     /// False once the reader hit end of file.
     open: bool,
+    /// Dropped with the pipe: tells a reader past the cap to stop.
+    _alive: Arc<()>,
 }
 
 impl Pipe {
     fn read(mut pipe: impl Read + Send + 'static) -> Self {
         let (tx, rx) = mpsc::channel();
+        let alive = Arc::new(());
+        let watch = Arc::downgrade(&alive);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
+            let mut room = OUTPUT_CAP;
             loop {
                 match pipe.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) if tx.send(buf[..n].to_vec()).is_ok() => {}
+                    Ok(n) if room > 0 => {
+                        let keep = n.min(room);
+                        if tx.send(buf[..keep].to_vec()).is_err() {
+                            break;
+                        }
+                        room -= keep;
+                    }
+                    Ok(_) if watch.strong_count() > 0 => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     _ => break,
                 }
             }
         });
-        Self { rx, bytes: Vec::new(), open: true }
+        Self { rx, bytes: Vec::new(), open: true, _alive: alive }
     }
 }
 
-/// Take what each pipe delivers until it closes or `until` passes.
+/// Take what each pipe delivers until it closes or `until` passes; after
+/// `until`, only what has already arrived (at most [`OUTPUT_CAP`]).
 fn collect(pipes: &mut [Pipe], until: Instant) {
     for pipe in pipes {
         while pipe.open {
-            match pipe.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            let left = until.saturating_duration_since(Instant::now());
+            let next = if left.is_zero() {
+                pipe.rx.try_recv().map_err(|e| match e {
+                    mpsc::TryRecvError::Empty => mpsc::RecvTimeoutError::Timeout,
+                    mpsc::TryRecvError::Disconnected => mpsc::RecvTimeoutError::Disconnected,
+                })
+            } else {
+                pipe.rx.recv_timeout(left)
+            };
+            match next {
                 Ok(chunk) => pipe.bytes.extend(chunk),
                 Err(mpsc::RecvTimeoutError::Timeout) => break,
                 Err(mpsc::RecvTimeoutError::Disconnected) => pipe.open = false,
@@ -183,15 +235,17 @@ fn track(pid: u32) {
     IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
 }
 
-/// Called the moment the child is reaped or about to be killed, so
-/// `kill_in_flight` never signals a pid that may be handed out again.
+/// Called before the child is reaped. `kill_in_flight` signals under the same
+/// lock, so it either sees the pid while the unreaped child still holds it,
+/// or not at all: never a pid that may have been handed out again.
 fn untrack(pid: u32) {
     IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != pid);
 }
 
 /// SIGKILL every probe still running, with what it spawned (the app is quitting).
 pub fn kill_in_flight() {
-    for pid in std::mem::take(&mut *IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())) {
+    let mut in_flight = IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+    for pid in in_flight.drain(..) {
         kill_group(pid);
     }
 }
@@ -480,17 +534,49 @@ mod tests {
     }
 
     #[test]
-    fn output_past_the_pipe_buffer_is_read_while_the_command_runs() {
-        // 200 KB on each stream: read only after exit, the command would block
-        // on a full pipe and time out.
-        let big = "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2";
+    fn output_past_the_pipe_buffer_is_read_while_the_command_runs_and_capped() {
+        // 2 MB on each stream: read only after exit, the command would block
+        // on a full pipe and time out; kept whole, a chatty CLI grows without bound.
+        let big = "head -c 2000000 /dev/zero | tr '\\0' o; head -c 2000000 /dev/zero | tr '\\0' e >&2";
         let started = Instant::now();
-        let Probe::Exited { success: true, output } = run_probe(sh(big), Duration::from_secs(3)) else {
+        let Probe::Exited { success: true, output } = run_probe(sh(big), Duration::from_secs(5)) else {
             panic!("a large reply must not read as a timeout");
         };
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert_eq!(output.len(), 400_000);
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert_eq!(output.len(), 2 * OUTPUT_CAP, "the first {OUTPUT_CAP} bytes of each stream");
         assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
+    }
+
+    /// Endless output until `stop` is set.
+    struct Endless(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Read for Endless {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.load(std::sync::atomic::Ordering::Relaxed) {
+                return Ok(0);
+            }
+            buf.fill(b'y');
+            Ok(buf.len())
+        }
+    }
+
+    #[test]
+    fn collecting_an_endless_stream_keeps_the_cap_and_stops_on_time() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut pipes = [Pipe::read(Endless(stop.clone()))];
+        std::thread::sleep(Duration::from_millis(100));
+        let started = Instant::now();
+        collect(&mut pipes, started + Duration::from_millis(200));
+        let took = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(took < Duration::from_secs(1), "collect must return at `until`: {took:?}");
+        assert_eq!(pipes[0].bytes.len(), OUTPUT_CAP);
+        assert!(pipes[0].open, "the stream never ended");
+        // Already past `until`: takes nothing more, at once.
+        let started = Instant::now();
+        collect(&mut pipes, started);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_eq!(pipes[0].bytes.len(), OUTPUT_CAP);
     }
 
     #[cfg(unix)]
@@ -542,13 +628,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn an_exit_kills_what_it_left_running_even_off_the_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        // Output to /dev/null: nothing keeps the probe's pipe open.
+        let pidfile = dir.path().join("detached.pid");
+        let script = format!("echo hi; sleep 30 >/dev/null 2>&1 & echo $! > '{}'", pidfile.display());
+        assert_eq!(run_probe(sh(&script), Duration::from_secs(5)), Probe::Exited { success: true, output: "hi\n".into() });
+        assert_dies(read_pid(&pidfile), "a leftover off the pipe must die with its group");
+
+        // The status probe has no pipes at all.
+        let pidfile = dir.path().join("status.pid");
+        let script = format!("sleep 30 & echo $! > '{}'", pidfile.display());
+        assert_eq!(run_status_probe(sh(&script), Duration::from_secs(5)), Probe::Exited { success: true, output: String::new() });
+        assert_dies(read_pid(&pidfile), "a status probe's leftover must die with its group");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_running_probe_is_tracked_for_kill_in_flight_until_it_returns() {
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("probe.pid");
         let script = format!("echo $$ > '{}'; sleep 30", pidfile.display());
         let running = std::thread::spawn(move || run_probe(sh(&script), Duration::from_secs(20)));
         let pid = read_pid(&pidfile);
-        assert!(IN_FLIGHT.lock().unwrap().contains(&pid));
+        // The shell can write its pid before the probe thread tracks it.
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
+            assert!(Instant::now() < deadline, "the running probe must be tracked");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         // What `kill_in_flight` does to each one (not called here: it would
         // kill the probes of tests running alongside).
         let started = Instant::now();

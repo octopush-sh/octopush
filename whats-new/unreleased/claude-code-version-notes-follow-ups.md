@@ -3,10 +3,11 @@ title: Claude Code update notes clear without a restart
 kind: fix
 area: app
 highlight: true
+scenario: default
 steps:
   - open: settings/integrations
-    target: settings-claude-cli-update
-    caption: Integrations now shows the same Claude Code update note as Readiness and the launcher.
+    target: settings-claude-code-card
+    caption: On an old Claude Code, this card now shows the same update note as Readiness and the launcher.
   - open: settings/general
     target: settings-readiness-again
     caption: After you update Claude Code, check again here. The launcher stops warning on its next open.

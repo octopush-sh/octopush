@@ -48,8 +48,9 @@ pub(crate) fn cap_diff(text: &str) -> String {
 /// reaches the agent (see [`cli_runner::effort_applies`]), judged on the model
 /// the stage escalates to. Shared by failure and loop-cap escalation. A Claude
 /// Code CLI older than the tested floor gets no `--effort`, so there an
-/// effort-only change is inert; the version comes from the session cache (the
-/// failed attempt already probed it), never a fresh probe.
+/// effort-only change is inert; the version is the last one probed (the
+/// failed attempt already probed it, and a Readiness check doesn't clear it),
+/// read without waiting and never a fresh probe.
 pub(crate) fn escalation_changes_tier(stage: &RunStageRow) -> bool {
     let old_cli = crate::agent_adapter::claude_cli_version_cached().is_some_and(|v| v.below_floor);
     escalation_changes_tier_on(stage, old_cli)
