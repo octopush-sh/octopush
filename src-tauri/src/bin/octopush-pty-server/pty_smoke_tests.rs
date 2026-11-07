@@ -64,6 +64,33 @@ impl Output {
         &self.text
     }
 
+    /// Reads until `needle` shows up after the first `marker`.
+    fn expect_after(&mut self, marker: &str, needle: &str) -> &str {
+        let deadline = Instant::now() + OUTPUT_TIMEOUT;
+        loop {
+            if let Some((_, rest)) = self.text.split_once(marker) {
+                if rest.contains(needle) {
+                    return &self.text;
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.rx.recv_timeout(left) {
+                Ok(chunk) => self.text.push_str(&String::from_utf8_lossy(&chunk)),
+                Err(e) => panic!(
+                    "waiting for {needle:?} after {marker:?} failed ({e}); output so far: {:?}",
+                    self.text
+                ),
+            }
+        }
+    }
+
+    /// Collects whatever output has already arrived, without waiting.
+    fn drain(&mut self) {
+        while let Ok(chunk) = self.rx.try_recv() {
+            self.text.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    }
+
     /// Drains until the reader thread exits (EOF/EIO after the child died).
     fn wait_reader_done(&mut self) {
         let deadline = Instant::now() + OUTPUT_TIMEOUT;
@@ -178,13 +205,17 @@ impl Pty {
 
     /// Polls the PTY's foreground process group (`tcgetpgrp` on the master,
     /// the attention checker's signal) until `pred` holds.
-    fn wait_fg(&self, what: &str, pred: impl Fn(Option<i32>) -> bool) {
+    fn wait_fg(&mut self, what: &str, pred: impl Fn(Option<i32>) -> bool) {
         let deadline = Instant::now() + OUTPUT_TIMEOUT;
         while !pred(self.master.process_group_leader()) {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for foreground group: {what}"
-            );
+            if Instant::now() >= deadline {
+                self.out.drain();
+                panic!(
+                    "timed out waiting for foreground group: {what}; fg={:?}; output so far: {:?}",
+                    self.master.process_group_leader(),
+                    self.out.text
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
     }
@@ -205,7 +236,12 @@ fn is_killed_by_sigint(status: &portable_pty::ExitStatus) -> bool {
 fn login_shell_runs_with_non_empty_path() {
     // The daemon's own default: the client's shell, else $SHELL, else zsh.
     let shell = resolve_shell(None);
-    if !std::path::Path::new(&shell).exists() {
+    let exists = std::path::Path::new(&shell).exists();
+    // macOS always ships /bin/zsh, so a missing shell there is a real
+    // failure; elsewhere (Linux CI without zsh) it is a skip.
+    if cfg!(target_os = "macos") {
+        assert!(exists, "resolved shell {shell} does not exist");
+    } else if !exists {
         eprintln!("skipping: resolved shell {shell} does not exist here");
         return;
     }
@@ -253,12 +289,30 @@ fn bare_name_is_not_resolved_from_the_cwd() {
     let mut cmd = direct(name, &[]);
     cmd.cwd(dir.path());
     let pair = native_pty_system().openpty(size(24, 80)).unwrap();
-    let res = pair.slave.spawn_command(cmd);
-    if let Ok(mut child) = res {
-        let _ = child.kill();
-        let _ = child.wait();
-        panic!("bare name {name} was resolved from the cwd");
+    match pair.slave.spawn_command(cmd) {
+        Ok(mut child) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("bare name {name} was resolved from the cwd");
+        }
+        // The refusal must come from PATH resolution, not from some other
+        // spawn failure (bad cwd, openpty trouble...).
+        Err(err) => {
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("No viable candidates found in PATH"),
+                "spawn failed, but not because PATH lookup missed: {msg}"
+            );
+        }
     }
+
+    // Control: the same probe, named explicitly relative to the cwd, does
+    // resolve and run, so the refusal above is about bare-name lookup.
+    let mut cmd = direct(&format!("./{name}"), &[]);
+    cmd.cwd(dir.path());
+    let mut pty = spawn(cmd);
+    pty.expect("HIJACKED");
+    assert!(pty.wait_exit(EXIT_TIMEOUT).success());
 }
 
 // ---------------------------------------------------------------------------
@@ -365,13 +419,31 @@ fn ctrl_z_suspends_and_fg_resumes() {
     let mut pty = spawn(cmd);
     let shell = pty.pid();
     pty.wait_fg("shell owns the terminal", |fg| fg == Some(shell));
+    // Wait until the shell has finished starting up and is reading commands:
+    // typed-ahead input can otherwise race the login profile.
+    pty.send(b"echo PROMPT_$((1+1))\n");
+    pty.expect("PROMPT_2");
 
     pty.send(b"sleep 30\n");
     pty.wait_fg("sleep in the foreground", |fg| {
         fg.is_some_and(|g| g != shell)
     });
-    pty.send(b"\x1a");
-    pty.wait_fg("shell back after Ctrl-Z", |fg| fg == Some(shell));
+    // The shell hands the terminal to the forked child before it execs
+    // sleep, and until then the child still ignores SIGTSTP, so a single
+    // Ctrl-Z can be lost. Resend it until the shell owns the terminal again.
+    let deadline = Instant::now() + OUTPUT_TIMEOUT;
+    while pty.master.process_group_leader() != Some(shell) {
+        if Instant::now() >= deadline {
+            pty.out.drain();
+            panic!(
+                "Ctrl-Z never suspended sleep; fg={:?}; output so far: {:?}",
+                pty.master.process_group_leader(),
+                pty.out.text
+            );
+        }
+        pty.send(b"\x1a");
+        std::thread::sleep(Duration::from_millis(200));
+    }
     // The shell is reading again: prove it with a computed marker (the echo
     // of the typed line itself can't match).
     pty.send(b"echo SUSPENDED_$((40+2))\n");
@@ -426,7 +498,8 @@ fn resize_is_seen_by_stty() {
 #[serial]
 fn tty_reports_dev_path_matching_master_tty_name() {
     let mut pty = spawn(shell_script("/bin/sh", "echo TTY=[$(tty)]"));
-    let out = pty.expect("]").to_string();
+    // Wait for the closing bracket after the marker, not just any `]`.
+    let out = pty.out.expect_after("TTY=[", "]").to_string();
     let tty = out
         .split("TTY=[")
         .nth(1)
@@ -476,6 +549,13 @@ fn kill_and_drop_reaps_child_and_releases_fds() {
     for _ in 0..CYCLES {
         let mut pty = spawn(shell_script("/bin/sh", "echo READY; exec sleep 30"));
         pty.expect("READY");
+        // Non-vacuous: while this PTY is open its master fd must be visible
+        // to the counter, or the growth check below could never fail.
+        let during = open_tty_fds();
+        assert!(
+            during > before,
+            "open PTY not visible to the fd counter ({during} open vs {before} before)"
+        );
         let pid = pty.pid();
         // Same kill as `cmd_remove`: SIGKILL to the shell's process group
         // (the shell is a session leader, so -pid is its group).
