@@ -98,19 +98,67 @@ describe("GenesisPrompt pre-flight", () => {
     expect(m.saveProviders).not.toHaveBeenCalled(); // nothing to save
   });
 
-  it("the key CTA speaks in the serif voice and takes its brass-ghost fill only once a key is typed", async () => {
+  it("a cold user gets ONE primary CTA: outlined until it has a key and a brief, then brass-ghost", async () => {
     m.listProviders.mockResolvedValue([anthropic(false)] as never);
     m.getSettings.mockResolvedValue(settings());
-    render(<GenesisPrompt onSubmit={vi.fn()} />);
+    render(<GenesisPrompt onSubmit={vi.fn()} onSketch={vi.fn()} />);
     await screen.findByLabelText("Anthropic API key");
-    const cta = screen.getByRole("button", { name: "Wake the crew" });
+    // Exactly one action button beside the field and the brief (the sketch link aside).
+    const buttons = () =>
+      screen.getAllByRole("button").filter((b) => !/think it through first/i.test(b.textContent ?? ""));
+    expect(buttons()).toHaveLength(1);
+    const cta = buttons()[0];
+    expect(cta).toHaveTextContent("Set a crew on it");
     expect(cta).toHaveClass("font-serif");
-    expect(cta.className).not.toMatch(/uppercase|font-mono/);
+    expect(cta.className).not.toMatch(/uppercase|font-mono|opacity/);
     expect(cta).toBeDisabled();
     expect(cta.style.background).not.toContain("--brass-ghost");
-    fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
+
+    // A brief without a key: the honest fallback stays available, but not primed.
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
+      target: { value: "a todo cli" },
+    });
     expect(cta).toBeEnabled();
+    expect(cta.style.background).not.toContain("--brass-ghost");
+
+    // Brief + key: the brass-ghost primary.
+    fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
+    expect(buttons()).toHaveLength(1);
+    expect(cta).toHaveTextContent("Set a crew on it");
     expect(cta.style.background).toContain("--brass-ghost");
+  });
+
+  it("with a key but no brief, the same CTA reads 'Wake the crew' and only saves the key", async () => {
+    m.listProviders.mockResolvedValue([anthropic(false)] as never);
+    m.getSettings.mockResolvedValue(settings());
+    const onSubmit = vi.fn();
+    render(<GenesisPrompt onSubmit={onSubmit} />);
+    await screen.findByLabelText("Anthropic API key");
+    fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
+    const cta = screen.getByRole("button", { name: "Wake the crew" });
+    expect(cta.style.background).toContain("--brass-ghost");
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-zzz"));
+    fireEvent.click(cta);
+    await waitFor(() => expect(m.saveProviders).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "Set a crew on it" })).toBeInTheDocument());
+    expect(onSubmit).not.toHaveBeenCalled();
+  });
+
+  it("host links share one quiet line with 'or think it through first'", async () => {
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
+    render(
+      <GenesisPrompt
+        onSubmit={vi.fn()}
+        onSketch={vi.fn()}
+        links={[<button key="a" type="button">Begin a new study</button>]}
+      />,
+    );
+    const sketch = screen.getByRole("button", { name: /think it through first/i });
+    const study = screen.getByRole("button", { name: "Begin a new study" });
+    expect(sketch.parentElement).toBe(study.parentElement);
+    await screen.findByLabelText("Crew model");
   });
 
   it("'or think it through first' reads as a link, like its siblings", async () => {

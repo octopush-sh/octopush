@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { useProjectStore } from "../stores/projectStore";
 import type { ProjectInfo } from "../lib/types";
 import { OctoMark } from "./icons/OctoMark";
-import { GenesisPrompt } from "./GenesisPrompt";
+import { GENESIS_LINK_CLASS, GenesisPrompt } from "./GenesisPrompt";
 
 interface Props {
   onNewProject: () => void;
@@ -105,35 +105,32 @@ export function WelcomeScreen({ onNewProject, onGenesis, onSketch }: Props) {
           loading={loading}
           onSubmit={(p, n, model) => onGenesis(p, n, model)}
           onSketch={onSketch}
+          links={[
+            // Project-first routes (unchanged), on the genesis block's one
+            // quiet secondary line. A folder can also be dropped anywhere.
+            <button
+              type="button"
+              onClick={onNewProject}
+              data-tour="welcome-new-study"
+              className={GENESIS_LINK_CLASS}
+            >
+              Begin a new study
+            </button>,
+            <button
+              type="button"
+              onClick={handleOpenClick}
+              title="Or drop a folder anywhere on this window"
+              className={GENESIS_LINK_CLASS}
+            >
+              open one from disk
+            </button>,
+          ]}
         />
       </div>
 
-      {/* Or — start from a repo instead (project-first, unchanged). */}
-      <div className="mt-6 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
-        or
-      </div>
-
-      {/* Begin a new study · drop / open path */}
-      {!showPathInput ? (
-        <div className="mt-3 text-center text-[12px] leading-[1.6] text-octo-sage">
-          <button
-            type="button"
-            onClick={onNewProject}
-            className="font-serif text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
-          >
-            Begin a new study
-          </button>
-          <span>, drop a folder, or </span>
-          <button
-            type="button"
-            onClick={handleOpenClick}
-            className="font-serif text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
-          >
-            open one from disk
-          </button>
-        </div>
-      ) : (
-        <div className="mt-3 flex w-72 items-center gap-2 octo-fade-in">
+      {/* Open from disk: the path field */}
+      {showPathInput && (
+        <div className="mt-4 flex w-72 items-center gap-2 octo-fade-in">
           <input
             autoFocus
             value={pathValue}
