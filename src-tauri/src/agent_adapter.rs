@@ -314,9 +314,10 @@ pub fn claude_cli_version() -> ClaudeCliVersion {
     ClaudeCliVersion::new(CLAUDE_VERSION_CACHE.get_or_probe(probe_claude_version), TESTED_CLAUDE_FLOOR)
 }
 
-/// The cached probe result without probing; `None` until a CLI stage, the
-/// preflight or Settings has run [`claude_cli_version`] since the last
-/// Readiness check.
+/// The last probe result without probing and without waiting; `None` until a
+/// CLI stage, the preflight or Settings has run [`claude_cli_version`]. A
+/// Readiness check doesn't clear it: until the next probe answers, the
+/// version it had is still the best guess.
 pub fn claude_cli_version_cached() -> Option<ClaudeCliVersion> {
     CLAUDE_VERSION_CACHE.peek().map(|v| ClaudeCliVersion::new(v, TESTED_CLAUDE_FLOOR))
 }
@@ -330,29 +331,67 @@ pub fn forget_claude_cli_version() {
 
 static CLAUDE_VERSION_CACHE: VersionCache = VersionCache::new();
 
+/// The lock is only ever held to read or write these fields, never across a
+/// probe, so the run loop's [`VersionCache::peek`] can't wait on one.
+struct VersionCache(Mutex<VersionState>);
+
 /// `None` = not probed; `Some(None)` = probed, no version found.
-struct VersionCache(Mutex<Option<Option<String>>>);
+struct VersionState {
+    current: Option<Option<String>>,
+    /// The last answer, kept through [`VersionCache::forget`].
+    last: Option<Option<String>>,
+    /// The generation `last`'s probe started in, so an overtaken probe that
+    /// finishes late never replaces a newer answer.
+    last_generation: u64,
+    /// Bumped by each forget, so a probe that started before one doesn't
+    /// store a possibly stale answer as current.
+    generation: u64,
+}
 
 impl VersionCache {
     const fn new() -> Self {
-        Self(Mutex::new(None))
+        Self(Mutex::new(VersionState { current: None, last: None, last_generation: 0, generation: 0 }))
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Option<String>>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VersionState> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Concurrent first callers wait for one probe, as with a `OnceLock`.
+    /// Probes outside the lock: concurrent first callers may each probe.
     fn get_or_probe(&self, probe: impl FnOnce() -> Option<String>) -> Option<String> {
-        self.lock().get_or_insert_with(probe).clone()
+        let generation = {
+            let state = self.lock();
+            if let Some(v) = &state.current {
+                return v.clone();
+            }
+            state.generation
+        };
+        let found = probe();
+        let mut state = self.lock();
+        if state.generation == generation {
+            state.current = Some(found.clone());
+        }
+        if generation >= state.last_generation {
+            state.last = Some(found.clone());
+            state.last_generation = generation;
+        }
+        found
     }
 
+    /// The last answer, even one forgotten since; `None` before any, or in
+    /// the instant another thread holds the lock (never waits).
     fn peek(&self) -> Option<Option<String>> {
-        self.lock().clone()
+        match self.0.try_lock() {
+            Ok(state) => state.last.clone(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().last.clone(),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
 
     fn forget(&self) {
-        *self.lock() = None;
+        let mut state = self.lock();
+        state.current = None;
+        state.generation += 1;
     }
 }
 
@@ -988,15 +1027,73 @@ mod tests {
         assert_eq!(cache.get_or_probe(|| probe("2.1.316")).as_deref(), Some("2.1.316"));
         assert_eq!(cache.get_or_probe(|| probe("2.1.319")).as_deref(), Some("2.1.316"));
         assert_eq!((probes.get(), cache.peek()), (1, Some(Some("2.1.316".into()))));
-        // Readiness re-probed: the updated CLI is seen without a restart.
+        // Readiness re-probed: the updated CLI is seen without a restart, and
+        // until then readers (escalation) keep the last answer.
         cache.forget();
-        assert_eq!(cache.peek(), None);
+        assert_eq!(cache.peek(), Some(Some("2.1.316".into())));
         assert_eq!(cache.get_or_probe(|| probe("2.1.319")).as_deref(), Some("2.1.319"));
-        assert_eq!(probes.get(), 2);
+        assert_eq!((probes.get(), cache.peek()), (2, Some(Some("2.1.319".into()))));
         // A probe that found nothing is cached as such.
         cache.forget();
         assert_eq!(cache.get_or_probe(|| None), None);
         assert_eq!(cache.peek(), Some(None));
+    }
+
+    #[test]
+    fn the_version_cache_never_waits_on_a_running_probe() {
+        let cache = VersionCache::new();
+        assert_eq!(cache.get_or_probe(|| Some("2.1.316".into())).as_deref(), Some("2.1.316"));
+        cache.forget();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let shared = &cache;
+        std::thread::scope(|s| {
+            let probing = s.spawn(move || {
+                shared.get_or_probe(|| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some("2.1.319".into())
+                })
+            });
+            started_rx.recv().unwrap();
+            // While the probe runs, neither reader nor forget blocks on it.
+            let started = Instant::now();
+            assert_eq!(cache.peek(), Some(Some("2.1.316".into())));
+            cache.forget();
+            assert!(started.elapsed() < Duration::from_secs(1));
+            release_tx.send(()).unwrap();
+            assert_eq!(probing.join().unwrap().as_deref(), Some("2.1.319"));
+        });
+        assert_eq!(cache.peek(), Some(Some("2.1.319".into())));
+        // Forgotten mid-probe: that answer isn't kept as current.
+        assert_eq!(cache.get_or_probe(|| Some("2.1.320".into())).as_deref(), Some("2.1.320"));
+    }
+
+    #[test]
+    fn an_overtaken_probe_never_replaces_a_newer_answer() {
+        let cache = VersionCache::new();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let shared = &cache;
+        std::thread::scope(|s| {
+            // Probe A starts on the old CLI...
+            let stale = s.spawn(move || {
+                shared.get_or_probe(|| {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some("2.1.316".into())
+                })
+            });
+            started_rx.recv().unwrap();
+            // ...Readiness forgets, and probe B stores the updated CLI.
+            cache.forget();
+            assert_eq!(cache.get_or_probe(|| Some("2.1.319".into())).as_deref(), Some("2.1.319"));
+            release_tx.send(()).unwrap();
+            assert_eq!(stale.join().unwrap().as_deref(), Some("2.1.316"));
+        });
+        // A finished last, but B's answer stays both current and last.
+        assert_eq!(cache.peek(), Some(Some("2.1.319".into())));
+        assert_eq!(cache.get_or_probe(|| Some("2.1.320".into())).as_deref(), Some("2.1.319"));
     }
 
     #[test]
