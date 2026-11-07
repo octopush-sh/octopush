@@ -8,6 +8,8 @@
 //!   5. On exit: remove PID file + socket.
 
 mod protocol;
+#[cfg(test)]
+mod pty_smoke_tests;
 mod server;
 mod session;
 mod storage;
