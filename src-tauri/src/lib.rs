@@ -16,6 +16,7 @@ pub mod context_guard;
 // read-and-author surface over the same SQLite store the desktop app uses.
 pub mod db;
 pub mod entitlement;
+pub mod entitlement_token;
 pub mod error;
 mod file_open;
 pub mod gateway;
@@ -521,6 +522,12 @@ pub fn run() {
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
             }
+
+            // Signed entitlement token (#582): refresh it in the background so
+            // launch never waits on the network. No-op while no entitlement
+            // public key is compiled in, or when signed out; a failure keeps
+            // the cached token.
+            entitlement_token::spawn_refresh();
 
             Ok(())
         })

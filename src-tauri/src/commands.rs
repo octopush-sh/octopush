@@ -2334,7 +2334,11 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
 /// session in the OS keychain. Returns the resulting auth status.
 #[tauri::command]
 pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
-    crate::auth::begin_sign_in().await
+    let status = crate::auth::begin_sign_in().await?;
+    // Fetch this user's signed entitlement token in the background (no-op
+    // while no entitlement public key is compiled in).
+    crate::entitlement_token::spawn_refresh();
+    Ok(status)
 }
 
 /// Clear the stored session (sign out locally). Also drops the local run-history
@@ -2375,9 +2379,25 @@ pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
 /// Force a token refresh and return the current plan. Called right after the user
 /// returns from checkout so a freshly-minted access token reflects the new plan —
 /// lets Pro appear without a manual sign-out / sign-in.
+///
+/// Also re-fetches the signed entitlement token (awaited, so the plan is right
+/// by the time the frontend re-reads the entitlement) and then returns the
+/// token-derived plan. No-op while no entitlement public key is compiled in;
+/// a failure keeps the cached token.
 #[tauri::command]
 pub async fn auth_sync_plan() -> AppResult<Option<String>> {
-    crate::auth::sync_plan().await
+    let plan = crate::auth::sync_plan().await?;
+    if crate::entitlement_token::compiled_key().is_none() {
+        return Ok(plan);
+    }
+    // With a key compiled in, report the plan the gates will actually use, so
+    // the frontend never shows Pro while the token still says Free.
+    let _ = crate::entitlement_token::refresh().await;
+    use crate::entitlement::{Entitlement, Plan};
+    Ok(Some(match Entitlement::current().plan {
+        Plan::Pro => "pro".to_string(),
+        _ => "free".to_string(),
+    }))
 }
 
 /// URL of Clerk's hosted account portal (sign-up / profile / MFA). The frontend

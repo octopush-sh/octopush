@@ -490,7 +490,13 @@ enum SessionCache {
 static SESSION_CACHE: Mutex<SessionCache> = Mutex::new(SessionCache::Unloaded);
 
 fn keyring_entry() -> AppResult<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+    keychain_entry(KEYRING_ACCOUNT)
+}
+
+/// An entry in the app's keychain service (`octopush`) for `account`. Shared
+/// with `entitlement_token`, which keeps its token beside the session.
+pub(crate) fn keychain_entry(account: &str) -> AppResult<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, account)
         .map_err(|e| AppError::Other(format!("keychain unavailable: {e}")))
 }
 
@@ -591,6 +597,12 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
 }
 
 pub fn sign_out() -> AppResult<()> {
+    // Drop the signed entitlement token too, so whoever signs in next starts
+    // without it. A failure here must not block the sign-out the user asked for
+    // (the in-memory copy is cleared regardless).
+    if let Err(e) = crate::entitlement_token::clear_token() {
+        tracing::warn!("could not clear the entitlement token on sign-out: {e}");
+    }
     clear_session()
 }
 
