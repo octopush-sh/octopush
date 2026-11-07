@@ -55,13 +55,17 @@ describe("StageFocus live journal", () => {
     expect(document.body.textContent).not.toContain("§");          // the glyph is retired
   });
 
-  it("holds the journal slot with a waiting row and the inline Player before the first entry", () => {
+  it("shows one waiting indicator before the first entry: the inline Player", () => {
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    const waiting = screen.getByText("Waiting for the first tool call…");
+    // No second, mono waiting row — the run-track card's live line says it (#586).
+    expect(screen.queryByText(/first tool call/i)).not.toBeInTheDocument();
+    expect(document.querySelector('[data-tour="direct-focus-waiting"]')).toBeNull();
+    expect(screen.getAllByText("Thinking…")).toHaveLength(1);
     const player = screen.getByText("Thinking…").closest("[data-placement]")!;
     expect(player.getAttribute("data-placement")).toBe("inline");
     // Docked at the journal's tail, in the same scroll flow — not pinned to the canvas bottom.
-    const scroller = waiting.closest(".overflow-auto")!;
+    const scroller = player.closest(".overflow-auto")!;
+    expect(scroller).not.toBeNull();
     expect(scroller.contains(player)).toBe(true);
     expect(scroller.lastElementChild).toBe(player);
     expect(player.className).not.toMatch(/\babsolute\b/);
@@ -109,16 +113,14 @@ describe("StageFocus live journal", () => {
     expect(beat!.closest(".overflow-auto")).not.toBeNull();
   });
 
-  it("drops the waiting row once the first entry lands", () => {
+  it("fills the journal slot once the first entry lands", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "tool", tool: "Read", hint: "src/a.ts" }] } });
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
-    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
     expect(screen.getByText("src/a.ts")).toBeInTheDocument();
   });
 
-  it("shows no waiting row on a stage that isn't running", () => {
+  it("keeps the idle empty state on a stage that isn't running", () => {
     render(<StageFocus stage={{ ...baseStage, status: "pending" }} workspacePath="/tmp" />);
-    expect(screen.queryByText("Waiting for the first tool call…")).not.toBeInTheDocument();
     expect(screen.getByText("Nothing produced yet.")).toBeInTheDocument();
   });
 

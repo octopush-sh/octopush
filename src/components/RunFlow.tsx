@@ -9,6 +9,7 @@ import { effortApplies } from "../lib/claudeCli";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
+import { tourId } from "../lib/tour/ids";
 import { RunFlowNav } from "./RunFlowNav";
 
 interface Props {
@@ -125,9 +126,14 @@ function StageCard({
   const cliManaged = s.substrate === "cli";
 
   // ONE fixed-height live/meta line on the subject; content picked by status.
+  // A running stage with no activity yet says so here, the one place the
+  // waiting state lives (the focus pane keeps only its Player).
   const verdict = s.status === "done" ? lastNotice(entries) : "";
-  const live: { node: React.ReactNode; cls: string } = running
-    ? { node: lastActivity(entries), cls: "text-octo-sage" }
+  const activity = running ? lastActivity(entries) : "";
+  const live: { node: React.ReactNode; cls: string; tour?: string } = running
+    ? activity
+      ? { node: activity, cls: "text-octo-sage" }
+      : { node: "waiting for first tool call", cls: "text-octo-mute", tour: tourId("direct-stage-waiting") }
     : verdict
       ? { node: verdict, cls: "text-octo-verdigris" }
       : { node: <MetaTokens stage={s} />, cls: "text-octo-mute" };
@@ -196,6 +202,7 @@ function StageCard({
           {/* Live activity / verdict / tokens — fixed height, status-picked. */}
           <span
             key={`${s.status}-live`}
+            data-tour={live.tour}
             className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
           >
             {live.node}
