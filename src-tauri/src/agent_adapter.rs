@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Trait for pluggable agent adapters.
@@ -208,6 +208,8 @@ pub struct ClaudeCliVersion {
     /// The newest [`CLAUDE_SECURITY_FIXES`] row the known version is below;
     /// `None` when it has them all or the version is unknown.
     pub security_fix: Option<ClaudeSecurityFix>,
+    /// The version to update to: the higher of the floor and `security_fix`.
+    pub recommended: String,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -232,7 +234,11 @@ impl ClaudeCliVersion {
                 .max_by_key(|(fix, _)| version_key(fix))
                 .map(|(fix, reason)| ClaudeSecurityFix { version: fix.to_string(), reason: reason.to_string() })
         });
-        Self { version, floor: floor.to_string(), below_floor, security_fix }
+        let recommended = match &security_fix {
+            Some(fix) if version_below(floor, &fix.version) => fix.version.clone(),
+            _ => floor.to_string(),
+        };
+        Self { version, floor: floor.to_string(), below_floor, security_fix, recommended }
     }
 
     /// "Update Claude Code: 2.1.319 fixes …" when the known version lacks a
@@ -255,8 +261,9 @@ impl ClaudeCliVersion {
         Some(format!(
             "Claude Code {v} is older than {floor}, the version Octopush is tested with. \
              Older releases can record wrong token usage and skip sandbox rules on resumed \
-             sessions. Update Claude Code ({floor} or newer recommended); the run continues.",
-            floor = self.floor
+             sessions. Update Claude Code ({recommended} or newer recommended); the run continues.",
+            floor = self.floor,
+            recommended = self.recommended
         ))
     }
 
@@ -270,7 +277,9 @@ impl ClaudeCliVersion {
     }
 }
 
-/// `x.y.z` as numbers; a pre-release/build suffix (`-beta.1`, `+abc`) is ignored.
+/// `x.y.z` as numbers; a pre-release/build suffix (`-beta.1`, `+abc`) is
+/// ignored, so `2.1.319-beta.1` counts as 2.1.319: at the floor, and with
+/// that release's security fix.
 fn version_key(v: &str) -> Option<(u64, u64, u64)> {
     let core = v.split(['-', '+']).next()?;
     let mut parts = core.split('.').map(|p| p.parse::<u64>().ok());
@@ -298,22 +307,54 @@ pub fn version_below(version: &str, floor: &str) -> bool {
     }
 }
 
-/// The installed CLI's version, probed once per app session with the same
-/// login-shell PATH and environment the CLI stages run with.
+/// The installed CLI's version, probed with the same login-shell PATH and
+/// environment the CLI stages run with, then cached until the Readiness card
+/// re-probes ([`forget_claude_cli_version`]).
 pub fn claude_cli_version() -> ClaudeCliVersion {
-    let version = CLAUDE_VERSION_CACHE.get_or_init(probe_claude_version).clone();
-    ClaudeCliVersion::new(version, TESTED_CLAUDE_FLOOR)
+    ClaudeCliVersion::new(CLAUDE_VERSION_CACHE.get_or_probe(probe_claude_version), TESTED_CLAUDE_FLOOR)
 }
 
 /// The cached probe result without probing; `None` until a CLI stage, the
-/// preflight or Settings has run [`claude_cli_version`] this session.
+/// preflight or Settings has run [`claude_cli_version`] since the last
+/// Readiness check.
 pub fn claude_cli_version_cached() -> Option<ClaudeCliVersion> {
-    CLAUDE_VERSION_CACHE
-        .get()
-        .map(|v| ClaudeCliVersion::new(v.clone(), TESTED_CLAUDE_FLOOR))
+    CLAUDE_VERSION_CACHE.peek().map(|v| ClaudeCliVersion::new(v, TESTED_CLAUDE_FLOOR))
 }
 
-static CLAUDE_VERSION_CACHE: OnceLock<Option<String>> = OnceLock::new();
+/// Drop the cached version so the next [`claude_cli_version`] probes again:
+/// the Readiness card re-probes, and after an update the launcher and stage
+/// journals must stop warning without a restart.
+pub fn forget_claude_cli_version() {
+    CLAUDE_VERSION_CACHE.forget();
+}
+
+static CLAUDE_VERSION_CACHE: VersionCache = VersionCache::new();
+
+/// `None` = not probed; `Some(None)` = probed, no version found.
+struct VersionCache(Mutex<Option<Option<String>>>);
+
+impl VersionCache {
+    const fn new() -> Self {
+        Self(Mutex::new(None))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Option<String>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Concurrent first callers wait for one probe, as with a `OnceLock`.
+    fn get_or_probe(&self, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.lock().get_or_insert_with(probe).clone()
+    }
+
+    fn peek(&self) -> Option<Option<String>> {
+        self.lock().clone()
+    }
+
+    fn forget(&self) {
+        *self.lock() = None;
+    }
+}
 
 fn probe_claude_version() -> Option<String> {
     use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
@@ -634,7 +675,9 @@ mod tests {
         let old = ClaudeCliVersion::new(Some("2.1.307".into()), "2.1.314");
         assert!(old.below_floor);
         let note = old.update_notice().expect("old CLI warns");
-        assert!(note.contains("2.1.307") && note.contains("2.1.314 or newer"), "{note}");
+        // The floor still trips the 2.1.319 security fix: recommend that.
+        assert!(note.contains("2.1.307") && note.contains("older than 2.1.314"), "{note}");
+        assert!(note.contains("2.1.319 or newer recommended"), "{note}");
 
         let current = ClaudeCliVersion::new(Some("2.1.316".into()), "2.1.314");
         assert!(!current.below_floor);
@@ -908,6 +951,52 @@ mod tests {
         assert_eq!(fix("2.1.300").as_deref(), Some("fixes b"));
         assert_eq!(fix("2.1.326").as_deref(), Some("fixes b"));
         assert_eq!(fix("2.1.330"), None);
+    }
+
+    #[test]
+    fn recommended_is_the_higher_of_the_floor_and_the_missing_fix() {
+        let fixes = [("2.1.319", "fixes a")];
+        let rec = |v: Option<&str>, floor| ClaudeCliVersion::with_fixes(v.map(Into::into), floor, &fixes).recommended;
+        assert_eq!(rec(Some("2.1.307"), "2.1.314"), "2.1.319");
+        assert_eq!(rec(Some("2.1.316"), "2.1.314"), "2.1.319");
+        assert_eq!(rec(Some("2.1.319"), "2.1.314"), "2.1.314");
+        assert_eq!(rec(None, "2.1.314"), "2.1.314", "an unknown version lacks no fix");
+        // A floor already past every fix wins.
+        assert_eq!(rec(Some("2.1.300"), "2.1.320"), "2.1.320");
+    }
+
+    #[test]
+    fn a_prerelease_of_a_fix_release_counts_as_having_the_fix() {
+        let beta = parse_claude_version("2.1.319-beta.1 (Claude Code)");
+        assert_eq!(beta.as_deref(), Some("2.1.319"), "the suffix is dropped");
+        assert!(!version_below("2.1.319-beta.1", "2.1.319"));
+        let info = ClaudeCliVersion::new(beta, "2.1.314");
+        assert_eq!(info.security_notice(), None);
+        assert_eq!(info.security_fix, None);
+        assert!(version_below("2.1.318-beta.1", "2.1.319"));
+    }
+
+    #[test]
+    fn the_version_cache_probes_once_until_forgotten() {
+        let cache = VersionCache::new();
+        let probes = std::cell::Cell::new(0);
+        let probe = |v: &str| {
+            probes.set(probes.get() + 1);
+            Some(v.to_string())
+        };
+        assert_eq!(cache.peek(), None);
+        assert_eq!(cache.get_or_probe(|| probe("2.1.316")).as_deref(), Some("2.1.316"));
+        assert_eq!(cache.get_or_probe(|| probe("2.1.319")).as_deref(), Some("2.1.316"));
+        assert_eq!((probes.get(), cache.peek()), (1, Some(Some("2.1.316".into()))));
+        // Readiness re-probed: the updated CLI is seen without a restart.
+        cache.forget();
+        assert_eq!(cache.peek(), None);
+        assert_eq!(cache.get_or_probe(|| probe("2.1.319")).as_deref(), Some("2.1.319"));
+        assert_eq!(probes.get(), 2);
+        // A probe that found nothing is cached as such.
+        cache.forget();
+        assert_eq!(cache.get_or_probe(|| None), None);
+        assert_eq!(cache.peek(), Some(None));
     }
 
     #[test]

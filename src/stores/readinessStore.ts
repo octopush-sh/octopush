@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { ipc, type ReadinessCheck } from "../lib/ipc";
+import { resetClaudeCliVersionCache } from "../lib/claudeCli";
 
 /** One shared result for the Settings › General readiness card and the
  *  first-run invite. `readiness_check` never caches, so `check()` re-probes. */
@@ -31,6 +32,10 @@ export const useReadinessStore = create<ReadinessState>()((set, get) => ({
       set({ checks, checkedAt: Date.now(), loading: false });
     } catch (e) {
       set({ error: String(e), loading: false });
+    } finally {
+      // The check re-probed Claude Code and cleared the backend's cached
+      // version: after an update, the launcher stops warning on its next open.
+      resetClaudeCliVersionCache();
     }
   },
 }));

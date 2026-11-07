@@ -290,6 +290,18 @@ impl ConnectOutcome {
 const CONNECTED_MESSAGE: &str =
     "Connected to Claude Code. Start a new Claude Code session to load the Octopush tools.";
 
+/// How much of the CLI's own output a failure message quotes.
+const SHOWN_OUTPUT_CHARS: usize = 300;
+
+/// `output` cut to [`SHOWN_OUTPUT_CHARS`] with an ellipsis: a CLI can print a
+/// whole stack trace, and the card shows it verbatim.
+fn shown(output: &str) -> String {
+    match output.char_indices().nth(SHOWN_OUTPUT_CHARS) {
+        Some((cut, _)) => format!("{}…", output[..cut].trim_end()),
+        None => output.to_string(),
+    }
+}
+
 /// The add failed after a successful remove: the user's old entry is gone.
 fn removed_then_failed(reason: &str) -> ConnectOutcome {
     ConnectOutcome::failed(format!(
@@ -344,7 +356,7 @@ fn connect_flow(
             CliFailure::Other => {
                 return ConnectOutcome::failed(format!(
                     "Claude Code couldn't remove the old registration: {}",
-                    r.output
+                    shown(&r.output)
                 ))
             }
         },
@@ -365,13 +377,13 @@ fn connect_flow(
         Ok(r) if removed => removed_then_failed(&match r.failure() {
             CliFailure::Busy => "Claude Code's config is busy".to_string(),
             _ if r.output.is_empty() => "Claude Code rejected the registration".to_string(),
-            _ => format!("Claude Code error: {}", r.output),
+            _ => format!("Claude Code error: {}", shown(&r.output)),
         }),
         Ok(r) if r.failure() == CliFailure::Busy => ConnectOutcome::failed(BUSY_MESSAGE),
         Ok(r) if r.output.is_empty() => {
             ConnectOutcome::failed("Claude Code rejected the registration. Try the manual command below.")
         }
-        Ok(r) => ConnectOutcome::failed(format!("Claude Code error: {}", r.output)),
+        Ok(r) => ConnectOutcome::failed(format!("Claude Code error: {}", shown(&r.output))),
     }
 }
 
@@ -636,6 +648,22 @@ mod tests {
 
         let s = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(false, "")]);
         assert!(s.run(Verification::Listed).message.contains("rejected the registration"));
+    }
+
+    #[test]
+    fn long_cli_output_is_cut_in_every_failure_message() {
+        // Multi-byte, so a byte-indexed cut would panic mid-character.
+        let trace = format!("Error: boom é\n{}", "    at frame (/usr/lib/node/é.js:1:1)\n".repeat(200));
+        let cut = shown(&trace);
+        assert!(cut.starts_with("Error: boom é") && cut.ends_with('…') && cut.chars().count() <= SHOWN_OUTPUT_CHARS + 1);
+        assert_eq!(shown(EXISTS), EXISTS, "short output is kept whole");
+
+        let remove = Script::new(vec![exit(false, &trace)], vec![]).run(Verification::Listed);
+        let add = Script::new(vec![exit(false, NOT_FOUND)], vec![exit(false, &trace)]).run(Verification::Listed);
+        let after_remove = Script::new(vec![exit(true, "")], vec![exit(false, &trace)]).run(Verification::Listed);
+        for out in [remove, add, after_remove] {
+            assert!(out.message.contains(&cut) && out.message.chars().count() < 600, "{}", out.message);
+        }
     }
 
     #[test]

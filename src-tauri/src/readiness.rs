@@ -8,12 +8,12 @@ use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
 pub const CHECK_TIMEOUT: Duration = Duration::from_secs(3);
 /// After a probed command exits, how long its output may still take to
-/// arrive even when the deadline has passed.
+/// arrive, before and after what it left running is killed.
 const DRAIN_FLOOR: Duration = Duration::from_millis(250);
 pub const INSTALL_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code";
 pub const UPDATE_CLAUDE: &str = "npm i -g @anthropic-ai/claude-code@latest";
@@ -76,7 +76,8 @@ pub enum Probe {
 }
 
 /// Run `cmd` within `timeout`, joining stdout and stderr. At the timeout its
-/// whole process group is killed, so whatever it spawned dies with it.
+/// whole process group is killed, so whatever it spawned dies with it; so is
+/// anything it leaves running that still holds its output open after it exits.
 pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
     probe_with(cmd, timeout, true)
 }
@@ -98,28 +99,34 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     let Ok(mut child) = cmd.spawn() else {
         return Probe::Missing;
     };
+    track(child.id());
     // Read while it runs: a reply bigger than the pipe buffer would otherwise
     // block the command until the timeout.
-    let out = child.stdout.take().map(drain);
-    let err = child.stderr.take().map(drain);
+    let mut pipes: Vec<Pipe> = [child.stdout.take().map(Pipe::read), child.stderr.take().map(Pipe::read)]
+        .into_iter()
+        .flatten()
+        .collect();
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Bounded too: something it left running may still hold a pipe
-                // open. The floor lets a command that exits at the deadline
-                // still hand over what it printed.
-                let mut output = String::new();
-                for rx in [out, err].into_iter().flatten() {
-                    let left = deadline.saturating_duration_since(Instant::now()).max(DRAIN_FLOOR);
-                    if let Ok(text) = rx.recv_timeout(left) {
-                        output.push_str(&text);
-                    }
+                untrack(child.id());
+                // What it printed is already in the pipes; the floor gives
+                // the readers time to take it.
+                collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
+                // A pipe still open means something it left running holds it,
+                // alive and in its group: kill the group so the pipe closes
+                // and nothing outlives the probe.
+                if pipes.iter().any(|p| p.open) {
+                    kill_group(child.id());
+                    collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
                 }
+                let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
                 return Probe::Exited { success: status.success(), output };
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
             _ => {
+                untrack(child.id());
                 kill_process_group(&mut child);
                 return Probe::TimedOut;
             }
@@ -127,26 +134,83 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool) -> Probe {
     }
 }
 
-/// Read `pipe` to its end on a thread; the text arrives on the channel.
-fn drain(mut pipe: impl Read + Send + 'static) -> mpsc::Receiver<String> {
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = pipe.read_to_end(&mut bytes);
-        let _ = tx.send(String::from_utf8_lossy(&bytes).into_owned());
-    });
-    rx
+/// One stdout/stderr pipe, read on its own thread: chunks arrive as they are
+/// read, so whatever came before a kill is kept.
+struct Pipe {
+    rx: mpsc::Receiver<Vec<u8>>,
+    bytes: Vec<u8>,
+    /// False once the reader hit end of file.
+    open: bool,
 }
 
-/// Kill `child` and everything in its process group (spawned with
-/// `process_group(0)`), then reap it.
-fn kill_process_group(child: &mut Child) {
-    #[cfg(unix)]
-    // SAFETY: kill(-pid, SIGKILL) signals the group `process_group(0)` gave the
-    // child; it touches no memory.
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+impl Pipe {
+    fn read(mut pipe: impl Read + Send + 'static) -> Self {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) if tx.send(buf[..n].to_vec()).is_ok() => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    _ => break,
+                }
+            }
+        });
+        Self { rx, bytes: Vec::new(), open: true }
     }
+}
+
+/// Take what each pipe delivers until it closes or `until` passes.
+fn collect(pipes: &mut [Pipe], until: Instant) {
+    for pipe in pipes {
+        while pipe.open {
+            match pipe.rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
+                Ok(chunk) => pipe.bytes.extend(chunk),
+                Err(mpsc::RecvTimeoutError::Timeout) => break,
+                Err(mpsc::RecvTimeoutError::Disconnected) => pipe.open = false,
+            }
+        }
+    }
+}
+
+/// The process groups of the probes running right now. Each has its own
+/// group, so quitting doesn't take them down: `kill_in_flight` (on
+/// `RunEvent::Exit`) does.
+static IN_FLIGHT: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn track(pid: u32) {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).push(pid);
+}
+
+/// Called the moment the child is reaped or about to be killed, so
+/// `kill_in_flight` never signals a pid that may be handed out again.
+fn untrack(pid: u32) {
+    IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner()).retain(|&p| p != pid);
+}
+
+/// SIGKILL every probe still running, with what it spawned (the app is quitting).
+pub fn kill_in_flight() {
+    for pid in std::mem::take(&mut *IN_FLIGHT.lock().unwrap_or_else(|e| e.into_inner())) {
+        kill_group(pid);
+    }
+}
+
+/// SIGKILL the process group `process_group(0)` gave the child `pid`.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // SAFETY: kill(-pid, SIGKILL) only sends a signal; it touches no memory.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
+
+/// Kill `child` and everything in its process group, then reap it.
+fn kill_process_group(child: &mut Child) {
+    kill_group(child.id());
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -166,7 +230,8 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
             match info.version.as_deref() {
                 None => not_ok(CheckStatus::Warn, "Version unknown", unknown, INSTALL_CLAUDE),
                 Some(v) if info.below_floor => {
-                    not_ok(CheckStatus::Warn, &format!("{v} · tested with {floor}"), &format!("Update to {floor} or newer; {old}"), UPDATE_CLAUDE)
+                    let fix = format!("Update to {} or newer; {old}", info.recommended);
+                    not_ok(CheckStatus::Warn, &format!("{v} · tested with {floor}"), &fix, UPDATE_CLAUDE)
                 }
                 Some(v) => match info.security_notice() {
                     Some(note) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
@@ -350,6 +415,9 @@ fn enabled_ollama_addr() -> Option<String> {
 /// `login_expires_at` is the stored claude.ai sign-in end (`claude_login`).
 pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     let claude = std::thread::spawn(|| {
+        // Its answer may be newer than the session's cached version (the
+        // user just updated): the launcher and the next stage probe again.
+        crate::agent_adapter::forget_claude_cli_version();
         claude_check(run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT), TESTED_CLAUDE_FLOOR)
     });
     let git = std::thread::spawn(|| git_check(run_probe(local_command("git", &["--version"]), CHECK_TIMEOUT)));
@@ -432,15 +500,62 @@ mod tests {
         let pidfile = dir.path().join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pidfile.display());
         assert_eq!(run_probe(sh(&script), Duration::from_millis(300)), Probe::TimedOut);
-        let grandchild: libc::pid_t = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
-        // Orphaned by the kill and reaped by init shortly after; poll so a
-        // not-yet-reaped zombie doesn't flake the test.
+        assert_dies(read_pid(&pidfile), "the background sleep must die with the group");
+    }
+
+    #[cfg(unix)]
+    fn read_pid(path: &std::path::Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse().ok()) {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "no pid in {}", path.display());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Orphaned by a kill and reaped by init shortly after; poll so a
+    /// not-yet-reaped zombie doesn't flake the test.
+    #[cfg(unix)]
+    fn assert_dies(pid: u32, why: &str) {
         let deadline = Instant::now() + Duration::from_secs(3);
         // SAFETY: kill(pid, 0) performs no action — existence probe only.
-        while unsafe { libc::kill(grandchild, 0) } == 0 {
-            assert!(Instant::now() < deadline, "the background sleep must die with the group");
+        while unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+            assert!(Instant::now() < deadline, "{why}");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_exit_keeps_its_output_and_kills_what_it_left_holding_the_pipe() {
+        // `sleep` inherits stdout and keeps it open after the shell exits.
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("background.pid");
+        let script = format!("echo hi; sleep 30 & echo $! > '{}'", pidfile.display());
+        let started = Instant::now();
+        assert_eq!(run_probe(sh(&script), Duration::from_secs(5)), Probe::Exited { success: true, output: "hi\n".into() });
+        assert!(started.elapsed() < Duration::from_secs(2), "must not wait out the deadline: {:?}", started.elapsed());
+        assert_dies(read_pid(&pidfile), "what the command left running must die with its group");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_probe_is_tracked_for_kill_in_flight_until_it_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("probe.pid");
+        let script = format!("echo $$ > '{}'; sleep 30", pidfile.display());
+        let running = std::thread::spawn(move || run_probe(sh(&script), Duration::from_secs(20)));
+        let pid = read_pid(&pidfile);
+        assert!(IN_FLIGHT.lock().unwrap().contains(&pid));
+        // What `kill_in_flight` does to each one (not called here: it would
+        // kill the probes of tests running alongside).
+        let started = Instant::now();
+        kill_group(pid);
+        assert!(matches!(running.join().unwrap(), Probe::Exited { success: false, .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!IN_FLIGHT.lock().unwrap().contains(&pid));
     }
 
     #[test]
@@ -460,6 +575,8 @@ mod tests {
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
         assert_eq!((old.status, old.value.as_str()), (CheckStatus::Warn, "2.1.307 · tested with 2.1.314"));
         assert_eq!(old.command.as_deref(), Some(UPDATE_CLAUDE));
+        // 2.1.314 itself lacks the 2.1.319 fix: recommend the fix.
+        assert_eq!(old.fix.as_deref(), Some("Update to 2.1.319 or newer; older releases can record wrong token usage."));
         let hung = claude_check(run_probe(sh("sleep 5"), Duration::from_millis(100)), "2.1.314");
         assert_eq!((hung.status, hung.timed_out), (CheckStatus::Warn, true));
         let broken = claude_check(probe("echo 2.1.316; exit 1"), "2.1.314");

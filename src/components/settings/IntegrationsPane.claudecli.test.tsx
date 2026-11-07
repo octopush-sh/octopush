@@ -26,6 +26,8 @@ beforeEach(() => {
   cliVersionMock.mockReset();
 });
 
+const escapeFix = { version: "2.1.319", reason: "fixes a sandbox escape when creating a worktree" };
+
 describe("Claude Code card — CLI version", () => {
   it("shows the version and an amber update row with the reason when below the floor", async () => {
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
@@ -34,6 +36,27 @@ describe("Claude Code card — CLI version", () => {
     expect(row.textContent).toContain("Update Claude Code (2.1.314 or newer recommended)");
     expect(row.textContent).toContain("wrong token usage");
     expect(container.querySelector('[data-tour="settings-claude-cli-version"]')?.textContent).toContain("2.1.307");
+  });
+
+  it("recommends the security fix over the floor when the floor still lacks it", async () => {
+    cliVersionMock.mockResolvedValue({
+      version: "2.1.307", floor: "2.1.314", belowFloor: true, securityFix: escapeFix, recommended: "2.1.319",
+    });
+    render(<IntegrationsPane />);
+    const row = await screen.findByTestId("claude-cli-update");
+    expect(row.textContent).toContain("Update Claude Code (2.1.319 or newer recommended)");
+    expect(row.textContent).not.toContain("sandbox escape");
+  });
+
+  it("shows the security note, like Readiness and the launcher, at or above the floor", async () => {
+    cliVersionMock.mockResolvedValue({
+      version: "2.1.316", floor: "2.1.314", belowFloor: false, securityFix: escapeFix, recommended: "2.1.319",
+    });
+    const { container } = render(<IntegrationsPane />);
+    const row = await screen.findByTestId("claude-cli-update");
+    expect(row.getAttribute("data-tour")).toBe("settings-claude-cli-update");
+    expect(row.textContent).toBe("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree");
+    expect(container.querySelector('[data-tour="settings-claude-cli-version"]')?.textContent).toContain("2.1.316");
   });
 
   it("shows only the version when it is current", async () => {

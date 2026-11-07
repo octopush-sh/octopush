@@ -9,10 +9,11 @@ export const CLAUDE_UPDATE_REASON =
   "Older releases can record wrong token usage, which skews costs, and skip sandbox rules on resumed sessions.";
 
 /** "Update Claude Code (x.y.z or newer recommended)" — or null when the
- *  version is current or unknown. */
+ *  version is current or unknown. x.y.z is the higher of the floor and the
+ *  security fix the CLI lacks, so following it clears both notes. */
 export function claudeUpdateLabel(info: ClaudeCliVersion | null): string | null {
   if (!info || !info.version || !info.belowFloor) return null;
-  return `Update Claude Code (${info.floor} or newer recommended)`;
+  return `Update Claude Code (${info.recommended ?? info.floor} or newer recommended)`;
 }
 
 /** "Update Claude Code: 2.1.319 fixes a sandbox escape when creating a
@@ -55,8 +56,9 @@ export function cliTooOldForEffort(info: ClaudeCliVersion | null): boolean {
 
 let cached: Promise<ClaudeCliVersion | null> | null = null;
 
-/** The version, fetched once per app session (the backend caches the probe
- *  too). A failed call resolves to null and is retried next time. */
+/** The version, fetched once and kept until the Readiness card re-probes
+ *  (the backend caches the probe too, until then). A failed call resolves to
+ *  null and is retried next time. */
 export function loadClaudeCliVersion(): Promise<ClaudeCliVersion | null> {
   if (!cached) {
     cached = Promise.resolve().then(() => ipc.claudeCliVersion()).catch(() => {
@@ -67,7 +69,8 @@ export function loadClaudeCliVersion(): Promise<ClaudeCliVersion | null> {
   return cached;
 }
 
-/** Test hook: forget the cached version. */
+/** Forget the cached version, so the next surface that opens asks again
+ *  (after a Readiness check, which also clears the backend's cache). */
 export function resetClaudeCliVersionCache(): void {
   cached = null;
 }

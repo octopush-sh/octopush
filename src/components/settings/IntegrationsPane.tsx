@@ -4,7 +4,7 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../../lib/ipc";
 import type { ClaudeCliVersion, McpStatus } from "../../lib/ipc";
-import { CLAUDE_UPDATE_REASON, claudeUpdateLabel, loadClaudeCliVersion } from "../../lib/claudeCli";
+import { CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, loadClaudeCliVersion } from "../../lib/claudeCli";
 import { pushToast } from "../Toasts";
 import { copyToClipboard } from "../../lib/clipboard";
 import { PaneHeader, SectionLabel } from "./shared";
@@ -87,6 +87,9 @@ function ClaudeCodeCard() {
 
   const registered = status?.registered ?? false;
   const updateLabel = claudeUpdateLabel(cli);
+  // The same note as Readiness and the launcher: the tested floor first, else
+  // a security fix the CLI lacks.
+  const cliNote = updateLabel ?? claudeSecurityLabel(cli);
 
   return (
     <div className="mt-8 max-w-[640px]">
@@ -129,13 +132,16 @@ function ClaudeCodeCard() {
             CLI <span className="octo-tabular text-octo-sage">{cli.version}</span>
           </div>
         )}
-        {updateLabel && (
+        {cliNote && (
           <div
             data-testid="claude-cli-update"
+            data-tour="settings-claude-cli-update"
             className="octo-rise-in mt-2 rounded-md border-l-2 border-octo-warning bg-[var(--warning-ghost)] px-3 py-2"
           >
-            <div className="font-mono text-[11px] text-octo-warning">{updateLabel}</div>
-            <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">{CLAUDE_UPDATE_REASON}</p>
+            <div className="font-mono text-[11px] text-octo-warning">{cliNote}</div>
+            {updateLabel && (
+              <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">{CLAUDE_UPDATE_REASON}</p>
+            )}
           </div>
         )}
 

@@ -267,9 +267,15 @@ function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gi
     return () => { cancelled = true; };
   }, [workspacePath, ahead, branch]);
 
+  // git timed out (or failed) counting commits: 0/0 would read as in sync,
+  // which it may not be.
+  const aheadBehindKnown = gitStatus?.aheadBehindKnown ?? true;
+
   const sync = !hasUpstream
     ? { text: "Not published yet", tone: "text-octo-brass" }
-    : ahead === 0 && behind === 0
+    : !aheadBehindKnown
+      ? { text: "—", tone: "text-octo-mute", title: "Ahead/behind unknown: git couldn't compare with origin in time" }
+      : ahead === 0 && behind === 0
       ? { text: "Up to date with origin", tone: "text-octo-verdigris" }
       : { text: `${ahead > 0 ? `↑${ahead} ahead` : ""}${ahead > 0 && behind > 0 ? " · " : ""}${behind > 0 ? `↓${behind} behind` : ""}`, tone: "text-octo-sage" };
 
@@ -277,7 +283,7 @@ function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gi
     <Section title="Branch & publish" border={false}>
       <div className="flex items-center gap-1.5 font-mono text-[11px]">
         <GitBranch size={12} className="shrink-0 text-octo-mute" aria-hidden />
-        <span className={`octo-tabular ${sync.tone}`}>{sync.text}</span>
+        <span className={`octo-tabular ${sync.tone}`} title={"title" in sync ? sync.title : undefined}>{sync.text}</span>
       </div>
       {lastCommit && (
         <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-sage">
