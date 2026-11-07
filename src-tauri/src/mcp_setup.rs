@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 
 use crate::error::{AppError, AppResult};
-use crate::readiness::{run_probe, run_status_probe, Probe, CHECK_TIMEOUT};
+use crate::readiness::{run_probe, run_probe_on_quit, run_status_probe, OnQuit, Probe, CHECK_TIMEOUT};
 
 const MCP_BIN: &str = "octopush-mcp";
 /// The MCP server name registered with the client. Tools then surface as
@@ -243,10 +243,10 @@ impl CliRun {
 
 /// Run `claude <args>` through the readiness module's bounded spawn: killed
 /// once `timeout` passes, so a CLI stuck on its config lock can't hang Connect.
-fn run_cli(claude: &Path, args: &[std::ffi::OsString], timeout: Duration) -> Result<CliRun, String> {
+fn run_cli(claude: &Path, args: &[std::ffi::OsString], timeout: Duration, on_quit: OnQuit) -> Result<CliRun, String> {
     let mut cmd = Command::new(claude);
     cmd.args(args);
-    match run_probe(Some(cmd), timeout) {
+    match run_probe_on_quit(Some(cmd), timeout, on_quit) {
         Probe::Missing => Err(format!("{} could not be started", claude.display())),
         Probe::TimedOut => Ok(CliRun { success: false, timed_out: true, output: String::new() }),
         Probe::Exited { success, output } => Ok(CliRun { success, timed_out: false, output: output.trim().to_string() }),
@@ -272,6 +272,17 @@ fn with_lock_retry(
 enum Step {
     Remove,
     Add,
+}
+
+impl Step {
+    /// Quitting mid-`add` waits for it briefly: by then `remove` may have
+    /// succeeded, and killing the `add` would leave Octopush unregistered.
+    fn on_quit(&self) -> OnQuit {
+        match self {
+            Step::Remove => OnQuit::Kill,
+            Step::Add => OnQuit::Finish,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -461,8 +472,8 @@ pub fn connect() -> McpConnectResult {
     let outcome = connect_flow(
         |timeout| already_registered_with(&claude, &binary, timeout),
         |step, timeout| match step {
-            Step::Remove => run_cli(&claude, &remove_args, timeout),
-            Step::Add => run_cli(&claude, &add_args, timeout),
+            Step::Remove => run_cli(&claude, &remove_args, timeout, step.on_quit()),
+            Step::Add => run_cli(&claude, &add_args, timeout, step.on_quit()),
         },
         |timeout| verification_from(probe_registration(&claude, timeout)),
         || std::thread::sleep(LOCK_RETRY_PAUSE),
@@ -805,7 +816,13 @@ mod tests {
     fn run_stub(script: &Path, args: &[&str], timeout: Duration) -> Result<CliRun, String> {
         let mut argv: Vec<std::ffi::OsString> = vec![script.as_os_str().to_owned()];
         argv.extend(args.iter().map(Into::into));
-        run_cli(Path::new("/bin/sh"), &argv, timeout)
+        run_cli(Path::new("/bin/sh"), &argv, timeout, OnQuit::Kill)
+    }
+
+    #[test]
+    fn quitting_lets_only_the_add_finish() {
+        assert_eq!(Step::Add.on_quit(), OnQuit::Finish);
+        assert_eq!(Step::Remove.on_quit(), OnQuit::Kill);
     }
 
     #[cfg(unix)]
@@ -850,7 +867,7 @@ mod tests {
         assert_eq!(run.output, NOT_FOUND);
         assert_eq!(run.failure(), CliFailure::NotFound);
 
-        assert!(run_cli(Path::new("/nonexistent/claude"), &[], CLI_TIMEOUT).is_err());
+        assert!(run_cli(Path::new("/nonexistent/claude"), &[], CLI_TIMEOUT, OnQuit::Kill).is_err());
     }
 
     #[test]
