@@ -11,4 +11,4 @@ steps:
     target: routines-login-expiry
     caption: Routines warns before the sign-in ends, so overnight runs don't stop without notice.
 ---
-An Anthropic key in Settings › Models doesn't sign Claude Code in. Readiness, Mission Control and Routines now show when your Claude sign-in ends even when a key is set.
+An Anthropic key in Settings › Models doesn't sign Claude Code in, so Readiness, Mission Control and Routines now show when your Claude sign-in ends even when that key is set.
