@@ -28,7 +28,7 @@ use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 
 /// Production Octopush sync API (the same Vercel project as the billing webhook).
-const SYNC_API_BASE: &str = "https://octopush-api.vercel.app";
+pub(crate) const SYNC_API_BASE: &str = "https://octopush-api.vercel.app";
 
 /// Which cloud-sync stream a gate is about — each has its own user opt-in and
 /// its own Pro feature.

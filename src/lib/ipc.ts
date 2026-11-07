@@ -1355,6 +1355,10 @@ export const ipc = {
 
   // ─── Entitlement (premium scaffolding) ────────────────────────
   getEntitlement: () => invoke<Entitlement>("get_entitlement"),
+  /** Rust refreshed the signed entitlement token and the plan changed
+   *  (`entitlement_token::ENTITLEMENT_CHANGED_EVENT`). */
+  onEntitlementChanged: (handler: () => void) =>
+    listen("entitlement-changed", () => handler()),
   directRunUsage: () => invoke<DirectRunUsage>("direct_run_usage"),
   /** Durable "has ever started a Direct run" — the first-run invite signal. */
   hasEverStartedRun: () => invoke<boolean>("has_ever_started_run"),
