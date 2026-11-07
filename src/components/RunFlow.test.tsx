@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeAll } from "vitest";
 import { render } from "@testing-library/react";
 
+const live: { liveByStage: Record<string, unknown[]> } = vi.hoisted(() => ({ liveByStage: {} }));
 vi.mock("../stores/runsStore", () => ({
-  useRunsStore: (sel: any) => sel({ liveByStage: {} }),
+  useRunsStore: (sel: any) => sel(live),
 }));
 vi.mock("../stores/rolesStore", () => ({
   useRolesStore: { getState: () => ({ roles: [] }) },
@@ -105,6 +106,28 @@ describe("RunFlow — depth of field & the single beacon", () => {
       <RunFlow stages={[notYet]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
     );
     expect(again.container.querySelector(pill)?.textContent).toBe("high");
+  });
+
+  it("says a running stage waits for its first tool call in the card's live line", () => {
+    const { container, unmount } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    const slot = container.querySelector('[data-tour="direct-stage-waiting"]');
+    expect(slot?.textContent).toBe("waiting for first tool call");
+    expect(slot).toHaveClass("h-4", "text-octo-mute");
+    unmount();
+    // Once activity lands, the same slot carries it instead.
+    live.liveByStage = { b: [{ kind: "tool", tool: "Read", hint: "src/a.ts" }] };
+    try {
+      const again = render(
+        <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
+      );
+      expect(again.container.querySelector('[data-tour="direct-stage-waiting"]')).toBeNull();
+      expect(again.container.textContent).toContain("Read src/a.ts");
+      expect(again.container.textContent).not.toContain("waiting for first tool call");
+    } finally {
+      live.liveByStage = {};
+    }
   });
 
   // #312: a flex <button> card must hand its width to its rows in WebKit too,

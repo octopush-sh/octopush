@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type ReactElement } from "react";
-import { ChevronLeft, ChevronRight, Hourglass, SlidersHorizontal, RotateCcw } from "lucide-react";
+import { ChevronLeft, ChevronRight, SlidersHorizontal, RotateCcw } from "lucide-react";
 import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
@@ -509,22 +509,11 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               {journal.length > 0 && <JournalDrawer key={stage.id} items={journal} />}
             </>
           ) : mode === "running" ? (
-            /* The live journal slot sits right under the header in every
-               state: before the first entry lands it holds a mute waiting
-               row, so a just-started stage never reads as a blank canvas. */
-            journal.length > 0 ? (
-              <>{journal}</>
-            ) : (
-              <div
-                data-tour="direct-focus-waiting"
-                className="octo-rise-in flex items-baseline gap-2 font-mono text-[12px] text-octo-mute"
-              >
-                <span className="translate-y-[1px] shrink-0" title="Waiting">
-                  <Hourglass size={11} strokeWidth={1.75} />
-                </span>
-                <span>Waiting for the first tool call…</span>
-              </div>
-            )
+            /* The live journal slot sits right under the header. Before the
+               first entry lands it stays empty: the inline Player below is the
+               pane's one waiting indicator, and the run-track card's live line
+               says "waiting for first tool call" (S1, one chrome per concept). */
+            <>{journal}</>
           ) : journal.length > 0 ? (
             <div className="flex flex-col gap-2">{journal}</div>
           ) : (
