@@ -530,6 +530,13 @@ fn load_session() -> Option<StoredSession> {
 }
 
 fn clear_session() -> AppResult<()> {
+    // The signed entitlement token belongs to this session: drop it on every
+    // path that ends the session (sign-out, a revoked refresh token), so whoever
+    // signs in next starts without it. A failure must not block the rest (the
+    // in-memory copy is cleared regardless).
+    if let Err(e) = crate::entitlement_token::clear_token() {
+        tracing::warn!("could not clear the entitlement token: {e}");
+    }
     let entry = keyring_entry()?;
     let result = match entry.delete_credential() {
         Ok(()) => Ok(()),
@@ -597,12 +604,6 @@ pub async fn begin_sign_in() -> AppResult<AuthStatus> {
 }
 
 pub fn sign_out() -> AppResult<()> {
-    // Drop the signed entitlement token too, so whoever signs in next starts
-    // without it. A failure here must not block the sign-out the user asked for
-    // (the in-memory copy is cleared regardless).
-    if let Err(e) = crate::entitlement_token::clear_token() {
-        tracing::warn!("could not clear the entitlement token on sign-out: {e}");
-    }
     clear_session()
 }
 

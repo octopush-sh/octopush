@@ -26,7 +26,7 @@
 //! end the lease.
 
 use base64::Engine;
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 use serde::Deserialize;
 use std::sync::Mutex;
 
@@ -38,6 +38,17 @@ pub const LEASE_DAYS: i64 = 30;
 
 /// The only token/claims version this build understands.
 pub const TOKEN_VERSION: u32 = 1;
+
+/// Tokens longer than this are refused before any decoding. A real token is
+/// ~250 bytes.
+pub const MAX_TOKEN_BYTES: usize = 4096;
+
+/// How far in the future `iat` may be (clock skew allowance), in seconds.
+pub const MAX_IAT_SKEW_SECS: i64 = 5 * 60;
+
+/// Tauri event emitted when a refresh changed the effective plan, so the
+/// frontend's `entitlementStore` reloads.
+pub const ENTITLEMENT_CHANGED_EVENT: &str = "entitlement-changed";
 
 /// **THE PUBLIC KEY GOES HERE.** Base64 (standard alphabet) of the raw 32-byte
 /// Ed25519 public key matching the server's `ENTITLEMENT_SIGNING_KEY`, exactly
@@ -66,7 +77,7 @@ pub struct EntitlementClaims {
 /// Why a token was not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenRejection {
-    /// Not `v1.<claims>.<sig>`, or undecodable.
+    /// Not `v1.<claims>.<sig>`, undecodable, or over [`MAX_TOKEN_BYTES`].
     Malformed,
     /// The signature does not verify: forged, tampered, or another key.
     BadSignature,
@@ -76,9 +87,13 @@ pub enum TokenRejection {
     WrongSubject,
     /// Past its `exp`.
     Expired,
+    /// `iat` more than [`MAX_IAT_SKEW_SECS`] in the future.
+    IssuedInFuture,
 }
 
-/// Parse a base64 raw 32-byte Ed25519 public key. `None` when empty or invalid.
+/// Parse a base64 raw 32-byte Ed25519 public key. `None` when empty, invalid,
+/// or a weak (small-order) key such as the identity point, which would accept
+/// forged signatures.
 pub fn parse_public_key(b64: &str) -> Option<VerifyingKey> {
     let b64 = b64.trim();
     if b64.is_empty() {
@@ -86,7 +101,11 @@ pub fn parse_public_key(b64: &str) -> Option<VerifyingKey> {
     }
     let raw = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let bytes: [u8; 32] = raw.try_into().ok()?;
-    VerifyingKey::from_bytes(&bytes).ok()
+    let key = VerifyingKey::from_bytes(&bytes).ok()?;
+    if key.is_weak() {
+        return None;
+    }
+    Some(key)
 }
 
 /// The compiled-in key, or `None` while [`ENTITLEMENT_PUBLIC_KEY`] is empty.
@@ -101,15 +120,20 @@ fn b64url_decode(s: &str) -> Option<Vec<u8>> {
 /// Verify `token` against `key` for the signed-in user `expected_sub` at `now`.
 ///
 /// The key and the clock are parameters so tests exercise this exact function.
-/// Order: shape → signature over `"v1.<claims>"` → parse claims → `v` → `sub` →
-/// `exp`. The claims bytes are never interpreted before the signature checks out.
+/// Order: size bound → shape → strict signature over `"v1.<claims>"` → parse
+/// claims → `v` → `sub` → `exp` → `iat` not in the future. The claims bytes are
+/// never interpreted before the signature checks out.
 pub fn verify_token(
     token: &str,
     key: &VerifyingKey,
     expected_sub: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<EntitlementClaims, TokenRejection> {
-    let mut parts = token.trim().split('.');
+    let token = token.trim();
+    if token.len() > MAX_TOKEN_BYTES {
+        return Err(TokenRejection::Malformed);
+    }
+    let mut parts = token.split('.');
     let (prefix, claims_b64, sig_b64) = match (parts.next(), parts.next(), parts.next(), parts.next())
     {
         (Some(p), Some(c), Some(s), None) => (p, c, s),
@@ -123,7 +147,8 @@ pub fn verify_token(
         .try_into()
         .map_err(|_| TokenRejection::Malformed)?;
     let signed = format!("{prefix}.{claims_b64}");
-    key.verify(signed.as_bytes(), &Signature::from_bytes(&sig_bytes))
+    // `verify_strict` also refuses non-canonical signatures and weak keys.
+    key.verify_strict(signed.as_bytes(), &Signature::from_bytes(&sig_bytes))
         .map_err(|_| TokenRejection::BadSignature)?;
 
     // Only now are the claims trusted enough to parse.
@@ -138,6 +163,9 @@ pub fn verify_token(
     }
     if now.timestamp() >= claims.exp {
         return Err(TokenRejection::Expired);
+    }
+    if claims.iat > now.timestamp() + MAX_IAT_SKEW_SECS {
+        return Err(TokenRejection::IssuedInFuture);
     }
     Ok(claims)
 }
@@ -159,19 +187,25 @@ pub fn store_token(token: &str) -> AppResult<()> {
 }
 
 pub fn load_token() -> Option<String> {
-    let mut cache = TOKEN_CACHE.lock().unwrap();
-    if let Some(cached) = &*cache {
+    if let Some(cached) = &*TOKEN_CACHE.lock().unwrap() {
         return cached.clone();
     }
+    // Read the keychain WITHOUT holding the lock (it can block on an OS prompt).
     let loaded = crate::auth::keychain_entry(KEYRING_ACCOUNT)
         .ok()
         .and_then(|e| e.get_password().ok());
+    let mut cache = TOKEN_CACHE.lock().unwrap();
+    // A store/clear that landed while we were reading wins over our read.
+    if let Some(cached) = &*cache {
+        return cached.clone();
+    }
     *cache = Some(loaded.clone());
     loaded
 }
 
-/// Drop the stored token (sign-out). The in-memory copy is cleared even when
-/// the keychain delete fails, so this launch honours the sign-out regardless.
+/// Drop the stored token. Called from `auth::clear_session`, so sign-out and a
+/// revoked session both clear it. The in-memory copy is cleared even when the
+/// keychain delete fails, so this launch honours it regardless.
 pub fn clear_token() -> AppResult<()> {
     let result = match crate::auth::keychain_entry(KEYRING_ACCOUNT)?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
@@ -188,13 +222,73 @@ struct IssuedToken {
     token: String,
 }
 
+/// The Tauri app handle, set once at startup so a background refresh can tell
+/// the frontend the plan changed. Absent in tests and the headless worker.
+static APP: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();
+
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP.set(app);
+}
+
+fn emit_entitlement_changed() {
+    use tauri::Emitter;
+    if let Some(app) = APP.get() {
+        let _ = app.emit(ENTITLEMENT_CHANGED_EVENT, ());
+    }
+}
+
+/// Should `auth_refresh` also fetch a new token? Only with a key compiled in,
+/// and only when the session plan Clerk just reported (`legacy`) disagrees with
+/// the plan the gates use (`effective`): that is the post-checkout moment when
+/// the webhook has landed but the token still says the old plan. Pure, tested.
+pub fn token_lags_session(
+    key_compiled_in: bool,
+    legacy: crate::entitlement::Plan,
+    effective: crate::entitlement::Plan,
+) -> bool {
+    key_compiled_in && legacy != effective
+}
+
+/// What to do with a token the server just returned. Pure, tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefreshDecision {
+    /// Valid for the user still signed in: store it.
+    Store(EntitlementClaims),
+    /// Signed by our key but for another user: our cached token belongs to a
+    /// different principal than the session thinks, so drop it.
+    ClearCached,
+    /// Unusable, or the session changed mid-flight: keep the cached token.
+    Keep,
+}
+
+pub fn decide_refresh(
+    token: &str,
+    key: &VerifyingKey,
+    requested_sub: &str,
+    sub_now: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> RefreshDecision {
+    // Sign-out (or a different sign-in) raced the request: the token is not
+    // for whoever is signed in now. Drop it on the floor.
+    if sub_now != Some(requested_sub) {
+        return RefreshDecision::Keep;
+    }
+    match verify_token(token, key, requested_sub, now) {
+        Ok(claims) => RefreshDecision::Store(claims),
+        Err(TokenRejection::WrongSubject) => RefreshDecision::ClearCached,
+        Err(_) => RefreshDecision::Keep,
+    }
+}
+
 /// Fetch a fresh token from `POST /api/entitlement` and store it.
 ///
 /// No-op (no request at all) while no key is compiled in, or when signed out.
-/// Best-effort: every failure (offline, 401, 503 `not_provisioned`, a token
-/// that does not verify) logs and keeps the cached token, so a failed refresh
-/// never downgrades anyone before the cached token's own `exp`. Returns the
-/// verified plan on success.
+/// Best-effort: a failure (offline, 401, 503 `not_provisioned`, a token that
+/// does not verify) logs and keeps the cached token, so a failed refresh never
+/// downgrades anyone before the cached token's own `exp`. The one exception is
+/// a validly signed token for a different user, which clears the cache.
+/// Emits [`ENTITLEMENT_CHANGED_EVENT`] when the effective plan changed. Returns
+/// the verified plan on success.
 pub async fn refresh() -> Option<String> {
     let key = compiled_key()?;
     let (sub, _) = crate::auth::current_identity()?;
@@ -228,19 +322,32 @@ pub async fn refresh() -> Option<String> {
             return None;
         }
     };
-    // Never let a bad response overwrite a good cached token.
-    let claims = match verify_token(&issued.token, &key, &sub, chrono::Utc::now()) {
-        Ok(c) => c,
-        Err(why) => {
-            tracing::warn!(?why, "entitlement refresh: server token did not verify; keeping the cached token");
+    let before = crate::entitlement::Entitlement::current().plan;
+    // Re-read the identity right before storing: a sign-out during the request
+    // must not leave a token behind.
+    let sub_now = crate::auth::current_identity().map(|(s, _)| s);
+    let plan = match decide_refresh(&issued.token, &key, &sub, sub_now.as_deref(), chrono::Utc::now()) {
+        RefreshDecision::Store(claims) => {
+            if let Err(e) = store_token(&issued.token) {
+                tracing::warn!("could not store the entitlement token: {e}");
+                return None;
+            }
+            Some(claims.plan)
+        }
+        RefreshDecision::ClearCached => {
+            tracing::warn!("entitlement refresh: server token is for another user; clearing the cached token");
+            let _ = clear_token();
+            None
+        }
+        RefreshDecision::Keep => {
+            tracing::warn!("entitlement refresh: token not usable for the current session; keeping the cached token");
             return None;
         }
     };
-    if let Err(e) = store_token(&issued.token) {
-        tracing::warn!("could not store the entitlement token: {e}");
-        return None;
+    if crate::entitlement::Entitlement::current().plan != before {
+        emit_entitlement_changed();
     }
-    Some(claims.plan)
+    plan
 }
 
 /// [`refresh`] in the background, for launch and sign-in: never blocks them.
@@ -481,15 +588,103 @@ mod tests {
 
     // ── Storage ─────────────────────────────────────────────────────────────
 
+    /// What this proves: `auth::sign_out` (through `clear_session`, which also
+    /// backs the revoked-refresh-token path) clears the token this process
+    /// serves, and its keychain delete is attempted and tolerated. What it does
+    /// NOT prove: that the real macOS keychain item is gone. keyring's mock
+    /// store keeps no state across `Entry` instances, so the keychain side is
+    /// only exercised for "delete of a missing item is OK".
     #[test]
     #[serial_test::serial(keychain)]
-    fn sign_out_clears_the_token() {
-        // The mock store: never touch the real keychain from a test.
+    fn sign_out_clears_the_served_token_mock_keychain() {
+        // Never touch the real keychain from a test.
         keyring::set_default_credential_builder(keyring::mock::default_credential_builder());
         store_token(TS_PRO).expect("store");
         assert_eq!(load_token().as_deref(), Some(TS_PRO));
         crate::auth::sign_out().expect("sign out");
         assert_eq!(load_token(), None, "sign-out must drop the token");
+    }
+
+    // ── Hardening ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn weak_keys_are_rejected() {
+        // The identity point (compressed: 0x01 then 31 zero bytes) is a valid
+        // curve point but small-order: it would make forged signatures verify.
+        let mut identity = [0u8; 32];
+        identity[0] = 1;
+        assert!(VerifyingKey::from_bytes(&identity).is_ok(), "decodes as a point");
+        assert!(parse_public_key(&STANDARD.encode(identity)).is_none());
+    }
+
+    #[test]
+    fn oversized_tokens_are_refused_before_decoding() {
+        let big = format!("v1.{}.{}", "A".repeat(MAX_TOKEN_BYTES), "A".repeat(86));
+        assert!(big.len() > MAX_TOKEN_BYTES);
+        assert_eq!(verify_token(&big, &key(), "user_abc", now()), Err(TokenRejection::Malformed));
+        // A real token is far below the bound.
+        assert!(TS_PRO.len() < MAX_TOKEN_BYTES / 8);
+    }
+
+    #[test]
+    fn a_token_issued_in_the_future_is_refused() {
+        let at = |iat: i64| {
+            mint_raw(
+                &serde_json::json!({"v": 1, "sub": "user_abc", "plan": "pro", "iat": iat, "exp": iat + 30 * 86_400}),
+                &signing_key(),
+            )
+        };
+        let t = now().timestamp();
+        assert!(verify_token(&at(t + MAX_IAT_SKEW_SECS), &key(), "user_abc", now()).is_ok(), "within skew");
+        assert_eq!(
+            verify_token(&at(t + MAX_IAT_SKEW_SECS + 1), &key(), "user_abc", now()),
+            Err(TokenRejection::IssuedInFuture)
+        );
+    }
+
+    // ── Refresh decisions ───────────────────────────────────────────────────
+
+    #[test]
+    fn auth_refresh_fetches_a_token_only_when_it_lags_the_session() {
+        // The post-checkout poll: Clerk says Pro, the token still says Free.
+        assert!(token_lags_session(true, Plan::Pro, Plan::Free));
+        // A cancellation travels the same way.
+        assert!(token_lags_session(true, Plan::Free, Plan::Pro));
+        // In agreement: no request.
+        assert!(!token_lags_session(true, Plan::Pro, Plan::Pro));
+        assert!(!token_lags_session(true, Plan::Free, Plan::Free));
+        // No key compiled in: never a request.
+        assert!(!token_lags_session(false, Plan::Pro, Plan::Free));
+    }
+
+    #[test]
+    fn auth_refresh_lag_check_against_real_resolution() {
+        // Key set, webhook landed (legacy "pro"), cached token still Free.
+        let k = key();
+        let legacy = Entitlement::for_plan(Some("pro")).plan;
+        let effective = resolve(Some(&k), Some("pro"), Some("user_abc"), Some(TS_FREE)).plan;
+        assert!(token_lags_session(true, legacy, effective));
+        // After the refresh stored a Pro token, the poll stops asking.
+        let effective = resolve(Some(&k), Some("pro"), Some("user_abc"), Some(TS_PRO)).plan;
+        assert!(!token_lags_session(true, legacy, effective));
+    }
+
+    #[test]
+    fn refresh_decisions() {
+        let k = key();
+        match decide_refresh(TS_PRO, &k, "user_abc", Some("user_abc"), now()) {
+            RefreshDecision::Store(c) => assert_eq!(c.plan, "pro"),
+            other => panic!("expected Store, got {other:?}"),
+        }
+        // Validly signed for someone else: clear what we cached.
+        assert_eq!(decide_refresh(TS_PRO, &k, "user_other", Some("user_other"), now()), RefreshDecision::ClearCached);
+        // Signed out, or another user signed in, while the request was in flight.
+        assert_eq!(decide_refresh(TS_PRO, &k, "user_abc", None, now()), RefreshDecision::Keep);
+        assert_eq!(decide_refresh(TS_PRO, &k, "user_abc", Some("user_new"), now()), RefreshDecision::Keep);
+        // Unusable responses keep the cached token.
+        assert_eq!(decide_refresh("garbage", &k, "user_abc", Some("user_abc"), now()), RefreshDecision::Keep);
+        let expired = mint("pro", now().timestamp());
+        assert_eq!(decide_refresh(&expired, &k, "user_abc", Some("user_abc"), now()), RefreshDecision::Keep);
     }
 
     #[test]

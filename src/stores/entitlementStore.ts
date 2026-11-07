@@ -16,12 +16,36 @@ interface EntitlementState {
   hasFeature: (key: string) => boolean;
 }
 
+/** Subscribe once (on the first load) to Rust's `entitlement-changed` event:
+ *  a background token refresh that changed the plan reloads the store, so the
+ *  UI follows the gates without a relaunch. */
+let watching = false;
+function watchEntitlementChanges() {
+  if (watching) return;
+  watching = true;
+  try {
+    ipc
+      .onEntitlementChanged(() => void useEntitlementStore.getState().load())
+      .catch(() => {
+        watching = false; // not in a Tauri window (tests, preview): retry next load
+      });
+  } catch {
+    watching = false;
+  }
+}
+
+/** Test-only: forget the subscription so each test starts fresh. */
+export function __resetEntitlementWatchForTests() {
+  watching = false;
+}
+
 export const useEntitlementStore = create<EntitlementState>((set, get) => ({
   entitlement: FREE,
   usage: null,
   loaded: false,
 
   load: async () => {
+    watchEntitlementChanges();
     try {
       const [entitlement, usage] = await Promise.all([
         ipc.getEntitlement(),

@@ -2373,7 +2373,20 @@ pub async fn auth_status() -> AppResult<crate::auth::AuthStatus> {
 /// the token if needed. Used to pick up a plan change after the user subscribes.
 #[tauri::command]
 pub async fn auth_refresh() -> AppResult<crate::auth::AuthStatus> {
-    crate::auth::refresh_identity().await
+    let status = crate::auth::refresh_identity().await?;
+    // The post-checkout poll (`awaitPro.ts`) calls this every few seconds. Once
+    // the webhook lands, Clerk's plan moves but the signed token still holds
+    // the old one; fetch a new token then, so the poll sees Pro without a
+    // focus change or a relaunch. No-op while no key is compiled in.
+    use crate::entitlement::Entitlement;
+    if crate::entitlement_token::token_lags_session(
+        crate::entitlement_token::compiled_key().is_some(),
+        Entitlement::for_plan(crate::auth::current_plan().as_deref()).plan,
+        Entitlement::current().plan,
+    ) {
+        let _ = crate::entitlement_token::refresh().await;
+    }
+    Ok(status)
 }
 
 /// Force a token refresh and return the current plan. Called right after the user

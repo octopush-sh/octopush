@@ -527,6 +527,7 @@ pub fn run() {
             // launch never waits on the network. No-op while no entitlement
             // public key is compiled in, or when signed out; a failure keeps
             // the cached token.
+            entitlement_token::set_app_handle(app.handle().clone());
             entitlement_token::spawn_refresh();
 
             Ok(())
