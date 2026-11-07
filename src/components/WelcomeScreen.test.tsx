@@ -57,6 +57,21 @@ describe("WelcomeScreen — prompt genesis", () => {
     expect(onNewProject).toHaveBeenCalledTimes(1);
   });
 
+  it("groups every secondary route on one quiet line under the single primary CTA", () => {
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} onSketch={vi.fn()} />);
+    const line = screen.getByText(/think it through first/i).parentElement;
+    expect(screen.getByText("Begin a new study").parentElement).toBe(line);
+    expect(screen.getByText("open one from disk").parentElement).toBe(line);
+    expect(screen.queryByText(/^or$/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText("Set a crew on it")).toHaveLength(1);
+  });
+
+  it("'open one from disk' reveals the path field", () => {
+    render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} onSketch={vi.fn()} />);
+    fireEvent.click(screen.getByText("open one from disk"));
+    expect(screen.getByPlaceholderText("/path/to/project")).toBeInTheDocument();
+  });
+
   it("'think it through first' opens the Sketchbook with the typed prompt", () => {
     const onSketch = vi.fn();
     render(<WelcomeScreen onNewProject={vi.fn()} onGenesis={vi.fn()} onSketch={onSketch} />);

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { Fragment, useEffect, useState, type ReactNode } from "react";
 import { deriveProjectName, GENESIS_PROMISE } from "../lib/genesis";
 import { saveAnthropicKey } from "../lib/providerKey";
 import { shortModel } from "../lib/modelLabel";
@@ -16,6 +16,9 @@ interface Props {
   /** "Think it through first": open the Sketchbook with this prompt instead of
    *  building. A secondary action; omit to hide it. */
   onSketch?: (prompt: string) => void;
+  /** Extra secondary routes (links styled with `GENESIS_LINK_CLASS`), shown on
+   *  the same quiet line as "or think it through first". */
+  links?: ReactNode[];
 }
 
 /**
@@ -28,7 +31,7 @@ interface Props {
  * runs on) and, for a cold user with no key, an inline Anthropic-key field so
  * the whole gesture completes without a detour to Settings.
  */
-export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
+export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] }: Props) {
   const [prompt, setPrompt] = useState("");
   const [nameOverride, setNameOverride] = useState<string | null>(null);
   const effectiveName = nameOverride?.trim() ? nameOverride.trim() : deriveProjectName(prompt);
@@ -78,6 +81,29 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
     }
   }
 
+  // One primary CTA for the whole block. With a key typed but no brief yet it
+  // saves the key ("Wake the crew"); otherwise it sets the crew on the brief.
+  const hasTypedKey = keyValue.trim().length > 0;
+  const wakeOnly = ready === false && hasTypedKey && !canGenesis;
+  const primed = canGenesis ? ready !== false || hasTypedKey : wakeOnly;
+
+  const secondary: ReactNode[] = [];
+  if (onSketch) {
+    secondary.push(
+      <button
+        type="button"
+        onClick={() => canGenesis && onSketch(prompt.trim())}
+        disabled={!canGenesis}
+        data-tour="genesis-sketch"
+        title={canGenesis ? undefined : "Describe it above first"}
+        className={GENESIS_LINK_CLASS}
+      >
+        or think it through first
+      </button>,
+    );
+  }
+  secondary.push(...links);
+
   async function submit() {
     if (!canGenesis || loading || savingKey) return;
     // A cold user who typed a key but pressed Enter/the CTA (rather than "Save")
@@ -114,9 +140,12 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
           model. Geometry settles as `ready` resolves — a sub-100ms local check,
           so no ceremonial loading state. */}
       {ready === false && (
-        <div className="octo-fade-in mt-3 flex items-center gap-2">
+        <div className="octo-fade-in mt-3">
+          {/* No button of its own: the one primary CTA below saves the key
+              (and reads "Wake the crew" while there is a key but no brief). */}
           <input
             type="password"
+            data-tour="genesis-key-save"
             value={keyValue}
             onChange={(e) => setKeyValue(e.target.value)}
             onKeyDown={(e) => {
@@ -124,24 +153,8 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
             }}
             aria-label="Anthropic API key"
             placeholder="Paste an Anthropic API key to wake the crew"
-            className="min-w-0 flex-1 rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
+            className="w-full rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute focus:border-octo-brass"
           />
-          {/* Ceremonial CTA, same voice as "Set a crew on it" — the brass-ghost
-              fill arrives only once there is a key to save. */}
-          <button
-            type="button"
-            data-tour="genesis-key-save"
-            onClick={() => void saveKey()}
-            disabled={!keyValue.trim() || savingKey}
-            className="shrink-0 rounded-md px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] disabled:opacity-40"
-            style={
-              keyValue.trim()
-                ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
-                : { background: "transparent", border: "1px solid var(--color-octo-border-strong)" }
-            }
-          >
-            {savingKey ? "Waking the crew…" : "Wake the crew"}
-          </button>
         </div>
       )}
       {ready === false && (
@@ -181,31 +194,43 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch }: Props) {
             />
           </div>
         )}
+        {/* The block's one primary CTA. Outlined until it has something to
+            do with confidence (a brief plus a key, or just a key to save),
+            then the brass-ghost fill. */}
         <button
           type="button"
-          onClick={() => void submit()}
-          disabled={!canGenesis || loading || savingKey}
-          className="shrink-0 rounded-md px-4 py-2 font-serif text-[14px] text-octo-brass transition disabled:opacity-40"
-          style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+          data-tour="genesis-begin"
+          onClick={() => void (wakeOnly ? saveKey() : submit())}
+          disabled={!(canGenesis || wakeOnly) || loading || savingKey}
+          className={`shrink-0 rounded-md px-4 py-2 font-serif text-[14px] transition-colors duration-[180ms] disabled:cursor-default ${
+            primed ? "text-octo-brass" : "text-octo-sage"
+          }`}
+          style={
+            primed
+              ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
+              : { background: "transparent", border: "1px solid var(--color-octo-border-strong)" }
+          }
         >
-          Set a crew on it
+          {savingKey ? "Waking the crew…" : wakeOnly ? "Wake the crew" : "Set a crew on it"}
         </button>
       </div>
 
-      {/* Secondary: think it through first (the Sketchbook) — no build yet. */}
-      {onSketch && (
-        <div className="mt-2 text-right">
-          <button
-            type="button"
-            onClick={() => canGenesis && onSketch(prompt.trim())}
-            disabled={!canGenesis}
-            data-tour="genesis-sketch"
-            className="font-serif text-[12px] text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:decoration-octo-brass disabled:opacity-40"
-          >
-            or think it through first
-          </button>
+      {/* Secondary routes, one quiet line under the primary: think it through
+          first (the Sketchbook — no build yet), then whatever the host adds. */}
+      {secondary.length > 0 && (
+        <div className="mt-2 flex flex-wrap items-center justify-end gap-x-2 text-[12px] text-octo-mute">
+          {secondary.map((node, i) => (
+            <Fragment key={i}>
+              {i > 0 && <span aria-hidden>·</span>}
+              {node}
+            </Fragment>
+          ))}
         </div>
       )}
     </div>
   );
 }
+
+/** The quiet link style shared by every secondary route under the genesis CTA. */
+export const GENESIS_LINK_CLASS =
+  "font-serif text-[12px] text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:decoration-octo-brass disabled:cursor-default disabled:opacity-60";
