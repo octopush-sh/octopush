@@ -8,6 +8,11 @@ import { openWhatsNewForCurrentVersion } from "../../lib/whatsNewLaunch";
 import { ReleaseNotes } from "../ReleaseNotes";
 import { installedNotes } from "../../lib/releaseNotes";
 
+/** Reference links are plain content: sage ink, a quiet underline that turns
+ *  ivory on hover. Brass stays on eyebrows and active states. Exported for the test. */
+export const REFERENCE_LINK_CLASS =
+  "text-octo-sage underline decoration-octo-mute underline-offset-2 transition-[text-decoration-color] duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:decoration-octo-ivory motion-reduce:transition-none";
+
 const CHANNEL_OPTIONS: ReadonlyArray<{ value: UpdateChannel; label: string }> = [
   { value: "stable", label: "Stable" },
   { value: "beta", label: "Beta" },
@@ -179,7 +184,7 @@ export function AboutPane() {
               href="https://github.com/octopush-sh/octopush"
               target="_blank"
               rel="noopener"
-              className="text-octo-brass underline decoration-octo-brass/40 underline-offset-2 hover:decoration-octo-brass"
+              className={REFERENCE_LINK_CLASS}
             >
               github.com/octopush-sh/octopush
             </a>
@@ -190,7 +195,7 @@ export function AboutPane() {
               type="button"
               data-tour="about-whats-new"
               onClick={() => void openWhatsNewForCurrentVersion()}
-              className="font-serif text-[13px] text-octo-brass underline decoration-[var(--brass-dim)] underline-offset-2 transition-colors hover:decoration-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              className={`font-serif text-[13px] ${REFERENCE_LINK_CLASS} focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`}
             >
               What's in this version
             </button>

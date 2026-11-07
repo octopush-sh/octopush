@@ -28,7 +28,7 @@ vi.mock("../../lib/ipc", () => ({
   },
 }));
 
-import { AccountPane, SYNC_COPY } from "./AccountPane";
+import { AccountPane, SYNC_COPY, syncRowState } from "./AccountPane";
 import { useAuthStore } from "../../stores/authStore";
 import { useEntitlementStore } from "../../stores/entitlementStore";
 import { useSyncPrefsStore } from "../../stores/syncPrefsStore";
@@ -148,5 +148,61 @@ describe("AccountPane — Sync (opt-in)", () => {
     fireEvent.click(screen.getByTestId("sync-history-toggle"));
     await waitFor(() => expect(screen.getByText(/Couldn't change sync/)).toBeInTheDocument());
     expect(screen.getByTestId("sync-history-toggle")).toHaveAttribute("aria-checked", "false");
+  });
+});
+
+describe("syncRowState — dim only when truly unavailable (#561)", () => {
+  const base = { signedIn: true, entitled: true, on: false, saving: false };
+
+  it("an off row a signed-in Pro user can turn on is full ink, no reason", () => {
+    expect(syncRowState(base)).toEqual({ disabled: false, busy: false, title: undefined });
+    expect(syncRowState({ ...base, on: true })).toEqual({ disabled: false, busy: false, title: undefined });
+  });
+
+  it("a write in flight blocks clicks but never dims", () => {
+    expect(syncRowState({ ...base, saving: true })).toMatchObject({ disabled: false, busy: true });
+  });
+
+  it("dims an off row without the entitlement, with the existing Pro reason", () => {
+    expect(syncRowState({ ...base, entitled: false })).toEqual({
+      disabled: true, busy: false, title: SYNC_COPY.requiresPro,
+    });
+  });
+
+  it("dims an off row when signed out, with the existing sign-in reason", () => {
+    expect(syncRowState({ ...base, signedIn: false })).toEqual({
+      disabled: true, busy: false, title: SYNC_COPY.requiresSignIn,
+    });
+  });
+
+  it("never dims an ON row it can't re-arm: turning off stays possible", () => {
+    expect(syncRowState({ ...base, entitled: false, on: true })).toEqual({
+      disabled: false, busy: false, title: SYNC_COPY.offOnly,
+    });
+  });
+});
+
+describe("AccountPane — Sync rows render at full ink for Pro", () => {
+  it("off rows aren't dimmed or aria-disabled for a signed-in Pro user", async () => {
+    setup("pro");
+    render(<AccountPane />);
+    await waitFor(() => expect(getSyncPrefs).toHaveBeenCalled());
+    for (const id of ["sync-history-toggle", "sync-library-toggle"]) {
+      const toggle = screen.getByTestId(id);
+      expect(toggle).toHaveAttribute("aria-checked", "false");
+      expect(toggle).not.toBeDisabled();
+      const row = toggle.closest("label")!;
+      expect(row).not.toHaveClass("opacity-55");
+      expect(row).not.toHaveAttribute("aria-disabled");
+      expect(row).not.toHaveAttribute("title");
+    }
+  });
+
+  it("Free users' off rows stay dimmed", async () => {
+    setup("free");
+    render(<AccountPane />);
+    await waitFor(() => expect(getSyncPrefs).toHaveBeenCalled());
+    expect(screen.getByTestId("sync-history-toggle").closest("label")).toHaveClass("opacity-55");
+    expect(screen.getByTestId("sync-library-toggle").closest("label")).toHaveClass("opacity-55");
   });
 });

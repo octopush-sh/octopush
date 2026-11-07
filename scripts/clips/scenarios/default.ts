@@ -218,7 +218,7 @@ const RUN_DETAIL: RunDetail = { run: RUN, stages: RUN_STAGES };
 
 // ─── Account & usage ─────────────────────────────────────────────────────
 const AUTH: AuthStatus = { signedIn: true, email: "dev@example.com", name: "Demo Developer" };
-const ENTITLEMENT: Entitlement = { plan: "pro", features: ["direct_unlimited", "detached_runs", "routines", "history_sync"], directRunsPerMonth: null };
+const ENTITLEMENT: Entitlement = { plan: "pro", features: ["direct.unlimited", "runs.parallel", "history.sync", "library.sync", "runs.detached", "routines.scheduled", "logbook.reports"], directRunsPerMonth: null };
 const RUN_USAGE: DirectRunUsage = { used: 7, limit: null, remaining: null };
 
 const TOKEN_REPORT: TokenReport = {
