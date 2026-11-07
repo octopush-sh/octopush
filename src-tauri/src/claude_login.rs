@@ -61,15 +61,11 @@ pub fn load(db: &Db) -> AppResult<Option<LoginExpiry>> {
 }
 
 /// An Anthropic key (settings or `ANTHROPIC_API_KEY`) is set; Readiness then
-/// reports "API key" and ignores the stored sign-in end.
+/// reports "API key" unless a sign-in end is stored. The key never hides the
+/// end: Claude Code stages don't get the Settings key (`cli_runner`), so a
+/// stored end means they run on the claude.ai sign-in.
 pub fn has_anthropic_key() -> bool {
     crate::settings::get_anthropic_key().is_some_and(|k| !k.trim().is_empty())
-}
-
-/// The stored end as the app shows it: hidden when an Anthropic key is set,
-/// so the notes agree with Readiness.
-pub fn shown(stored: Option<LoginExpiry>, has_anthropic_key: bool) -> Option<LoginExpiry> {
-    stored.filter(|_| !has_anthropic_key)
 }
 
 #[cfg(test)]
@@ -94,13 +90,5 @@ mod tests {
         record(&db, 100, "2026-11-01T00:00:00Z").unwrap();
         record(&db, 900, "2026-11-02T00:00:00Z").unwrap();
         assert_eq!(load(&db).unwrap(), Some(LoginExpiry { expires_at: 900, seen_at: "2026-11-02T00:00:00Z".into() }));
-    }
-
-    #[test]
-    fn an_api_key_hides_the_stored_end() {
-        let stored = LoginExpiry { expires_at: 100, seen_at: "2026-11-01T00:00:00Z".into() };
-        assert_eq!(shown(Some(stored.clone()), true), None);
-        assert_eq!(shown(Some(stored.clone()), false), Some(stored));
-        assert_eq!(shown(None, false), None);
     }
 }
