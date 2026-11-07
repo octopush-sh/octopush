@@ -301,6 +301,47 @@ fn cmd_list_terminals(state: &SharedState) -> ResponsePayload {
     ResponsePayload::Terminals { terminals }
 }
 
+/// The shell a terminal runs: the client's choice, else the daemon's
+/// `$SHELL`, else zsh (the macOS default).
+pub(crate) fn resolve_shell(shell: Option<String>) -> String {
+    shell
+        .or_else(|| std::env::var("SHELL").ok())
+        .unwrap_or_else(|| "/bin/zsh".to_string())
+}
+
+/// Builds the command a terminal's PTY runs: `shell` as a login shell (`-l`)
+/// in `cwd`, with the daemon's identity/locale/PATH forwarded, xterm-256color
+/// advertised, and the client's `env` layered on top. Shared by `cmd_spawn`
+/// and the real-PTY smoke tests (`pty_smoke_tests.rs`), so the tests exercise
+/// exactly the settings the app spawns with.
+pub(crate) fn build_shell_command<K, V>(
+    shell: &str,
+    cwd: &str,
+    env: impl IntoIterator<Item = (K, V)>,
+) -> CommandBuilder
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut cmd = CommandBuilder::new(shell);
+    cmd.arg("-l");
+    cmd.cwd(cwd);
+    for key in [
+        "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SHELL", "TMPDIR",
+        "SSH_AUTH_SOCK",
+    ] {
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("COLORTERM", "truecolor");
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 fn cmd_spawn(params: SpawnParams, state: &SharedState, _tx: ClientSender) -> ResponsePayload {
     let SpawnParams {
         id,
@@ -352,26 +393,8 @@ fn cmd_spawn(params: SpawnParams, state: &SharedState, _tx: ClientSender) -> Res
         }
     };
 
-    let shell = shell
-        .or_else(|| std::env::var("SHELL").ok())
-        .unwrap_or_else(|| "/bin/zsh".to_string());
-
-    let mut cmd = CommandBuilder::new(&shell);
-    cmd.arg("-l");
-    cmd.cwd(&cwd);
-    for key in [
-        "HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "LC_CTYPE", "SHELL", "TMPDIR",
-        "SSH_AUTH_SOCK",
-    ] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    cmd.env("TERM", "xterm-256color");
-    cmd.env("COLORTERM", "truecolor");
-    for (k, v) in &env {
-        cmd.env(k, v);
-    }
+    let shell = resolve_shell(shell);
+    let cmd = build_shell_command(&shell, &cwd, &env);
 
     let child = match pair.slave.spawn_command(cmd) {
         Ok(c) => c,
