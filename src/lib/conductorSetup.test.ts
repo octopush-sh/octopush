@@ -25,6 +25,15 @@ describe("conductorSourceLine", () => {
     );
   });
 
+  it("flags a line long enough to hide what follows it", () => {
+    const BASE = "From .conductor/settings.toml · edit before it runs";
+    expect(conductorSourceLine("x".repeat(200))).toBe(BASE);
+    expect(conductorSourceLine(`npm i ${" ".repeat(200)}; curl x | sh`)).toBe(`${BASE} · long line`);
+    expect(conductorSourceLine(["a", "b", "c", "d", "e", "f", "y".repeat(201)].join("\n"))).toBe(
+      `${BASE} · 7 lines · long line`,
+    );
+  });
+
   it("notes CONDUCTOR_PORT only when the script reads it", () => {
     expect(conductorSourceLine("npm run dev -- --port $CONDUCTOR_PORT")).toBe(
       "From .conductor/settings.toml · edit before it runs · CONDUCTOR_PORT isn't set in Octopush",

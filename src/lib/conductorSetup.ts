@@ -12,14 +12,19 @@ export function wantsConductorPrefill(template: string | undefined): boolean {
 /** The setup field's visible height, in lines (its `rows`). */
 export const SETUP_FIELD_ROWS = 6;
 
+/** A line longer than this wraps far enough to bury what follows it. */
+export const LONG_LINE_CHARS = 200;
+
 /** The quiet line under a prefilled field. A script longer than the field
- *  says how long it is, so a line far below the fold can't pass unseen.
+ *  says how long it is, and one with a line over 200 characters says so, so
+ *  a payload below the fold or hidden by wrapping can't pass unseen.
  *  Octopush sets Conductor's root, workspace path and name for setup scripts,
  *  but allocates no ports, so a script that reads `CONDUCTOR_PORT` gets a note. */
 export function conductorSourceLine(script: string): string {
   const parts = ["From .conductor/settings.toml · edit before it runs"];
-  const lines = script.split("\n").length;
-  if (lines > SETUP_FIELD_ROWS) parts.push(`${lines} lines`);
+  const lines = script.split("\n");
+  if (lines.length > SETUP_FIELD_ROWS) parts.push(`${lines.length} lines`);
+  if (lines.some((line) => [...line].length > LONG_LINE_CHARS)) parts.push("long line");
   if (/\bCONDUCTOR_PORT\b/.test(script)) parts.push("CONDUCTOR_PORT isn't set in Octopush");
   return parts.join(" · ");
 }
