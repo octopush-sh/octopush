@@ -3717,11 +3717,12 @@ pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate:
 }
 
 /// When the claude.ai sign-in ends, as CLI stages last reported it
-/// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said. An
-/// Anthropic key doesn't hide it: that key never signs Claude Code in.
+/// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said, and
+/// again once a stage ran as an API-key session. An Anthropic key doesn't
+/// hide it: the Settings key never signs Claude Code in.
 #[tauri::command]
 pub async fn get_claude_login(state: State<'_, AppState>) -> AppResult<Option<crate::claude_login::LoginExpiry>> {
-    crate::claude_login::load(&state.db.lock())
+    crate::claude_login::shown(&state.db.lock())
 }
 
 // ─── Pricing refresh from LiteLLM ────────────────────────────────

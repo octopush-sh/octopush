@@ -59,6 +59,11 @@ impl<'a> LiveEmitter<'a> {
     pub fn login_expiry(&self, expires_at: i64) {
         self.events.emit(crate::claude_login::LOGIN_EVENT, json!({ "expiresAt": expires_at }));
     }
+    /// The session runs on an API key, not the sign-in: `PersistingSink`
+    /// forgets the stored end (`expiresAt: null`).
+    pub fn login_cleared(&self) {
+        self.events.emit(crate::claude_login::LOGIN_EVENT, json!({ "expiresAt": null }));
+    }
 }
 
 /// A descriptive one-line hint from a tool-call input object (path/command/…),

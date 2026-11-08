@@ -330,15 +330,21 @@ fn verify_within(verify: impl FnOnce(Duration) -> Verification, left: Duration) 
     }
 }
 
+/// Shown if Connect stopped because the app is quitting (never seen in practice).
+const QUITTING_MESSAGE: &str = "Octopush is quitting; nothing was changed.";
+
 /// The check → remove → add → verify flow, with the CLI calls injected so it
 /// can be tested against recorded output. Each call is handed its timeout:
 /// its own cap or what is `left` of the Connect budget, whichever is less.
+/// Once `quitting`, nothing new starts but an `add` that restores a removed
+/// registration; the verify is skipped.
 fn connect_flow(
     already_registered: impl FnOnce(Duration) -> bool,
     mut run: impl FnMut(&Step, Duration) -> Result<CliRun, String>,
     verify: impl FnOnce(Duration) -> Verification,
     mut pause: impl FnMut(),
     left: impl Fn() -> Duration,
+    quitting: impl Fn() -> bool,
 ) -> ConnectOutcome {
     // Already pointing at this exact binary: nothing to change, nothing to risk.
     if already_registered(left().min(CHECK_TIMEOUT)) {
@@ -349,6 +355,7 @@ fn connect_flow(
     // Out of budget reads like a call killed at its timeout: busy.
     let mut attempt = |step: &Step| match left().min(CLI_TIMEOUT) {
         t if t.is_zero() => Ok(CliRun { success: false, timed_out: true, output: String::new() }),
+        _ if *step == Step::Remove && quitting() => Err(QUITTING_MESSAGE.to_string()),
         t => run(step, t),
     };
 
@@ -376,7 +383,8 @@ fn connect_flow(
     match with_lock_retry(|| attempt(&Step::Add), &mut pause, &left) {
         Err(e) if removed => removed_then_failed(&format!("could not run the Claude Code CLI: {e}")),
         Err(e) => could_not_run(e),
-        Ok(r) if r.success => match verify_within(verify, left()) {
+        // Quitting: a verify could outlive the app, so it isn't run.
+        Ok(r) if r.success => match verify_within(verify, if quitting() { Duration::ZERO } else { left() }) {
             Verification::Listed => ConnectOutcome { ok: true, registered: true, message: CONNECTED_MESSAGE.into() },
             Verification::NotListed => ConnectOutcome::failed(
                 "Claude Code accepted the registration but doesn't list it — another save may have replaced it. Try again in a moment.",
@@ -469,6 +477,10 @@ pub fn connect() -> McpConnectResult {
     let remove_args: Vec<std::ffi::OsString> = MCP_REMOVE_ARGS.iter().map(Into::into).collect();
     let add_args = mcp_add_args(&binary);
     let deadline = Instant::now() + CONNECT_BUDGET;
+    // Quitting waits for this (within `QUIT_GRACE`), so a quit between a
+    // successful `remove` and the `add` — the retry pause included — doesn't
+    // leave the registration removed.
+    let _finishing = crate::readiness::finish_before_quit();
     let outcome = connect_flow(
         |timeout| already_registered_with(&claude, &binary, timeout),
         |step, timeout| match step {
@@ -478,6 +490,7 @@ pub fn connect() -> McpConnectResult {
         |timeout| verification_from(probe_registration(&claude, timeout)),
         || std::thread::sleep(LOCK_RETRY_PAUSE),
         || deadline.saturating_duration_since(Instant::now()),
+        crate::readiness::quitting,
     );
 
     McpConnectResult {
@@ -526,6 +539,8 @@ mod tests {
         /// The timeout each check, remove, add and get was handed, in order.
         timeouts: RefCell<Vec<Duration>>,
         left: Cell<Duration>,
+        /// The app starts quitting after this many calls and pauses.
+        quit_after: Option<usize>,
     }
 
     impl Script {
@@ -537,6 +552,7 @@ mod tests {
                 calls: RefCell::new(vec![]),
                 timeouts: RefCell::new(vec![]),
                 left: Cell::new(CONNECT_BUDGET),
+                quit_after: None,
             }
         }
 
@@ -574,6 +590,7 @@ mod tests {
                     self.spend(LOCK_RETRY_PAUSE);
                 },
                 || self.left.get(),
+                || self.quit_after.is_some_and(|n| self.calls.borrow().len() >= n),
             )
         }
     }
@@ -825,6 +842,35 @@ mod tests {
         assert_eq!(Step::Remove.on_quit(), OnQuit::Kill);
     }
 
+    #[test]
+    fn quitting_after_the_remove_still_adds_but_skips_the_verify() {
+        // Quit lands in the gap after `remove`: the add restores the entry,
+        // and no `mcp get` is started that could outlive the app.
+        let s = Script { quit_after: Some(2), ..Script::new(vec![exit(true, "")], vec![exit(true, "")]) };
+        let out = s.run(Verification::Listed);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add"]);
+        assert!(out.message.contains("didn't confirm it in time"), "{}", out.message);
+
+        // Quit during the pause before a busy add's retry: the retry still runs.
+        let s = Script { quit_after: Some(4), ..Script::new(vec![exit(true, "")], vec![exit(false, ELOCKED), exit(true, "")]) };
+        s.run(Verification::Listed);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "add", "pause", "add"]);
+    }
+
+    #[test]
+    fn quitting_before_the_remove_changes_nothing() {
+        let s = Script { quit_after: Some(1), ..Script::new(vec![exit(true, "")], vec![exit(true, "")]) };
+        let out = s.run(Verification::Listed);
+        assert!(!out.ok && !out.registered, "{out:?}");
+        assert!(out.message.contains(QUITTING_MESSAGE), "{}", out.message);
+        assert_eq!(*s.calls.borrow(), ["check"]);
+
+        // Quit during the pause before a busy remove's retry: no second remove.
+        let s = Script { quit_after: Some(3), ..Script::new(vec![exit(false, LOCKED), exit(true, "")], vec![]) };
+        s.run(Verification::Listed);
+        assert_eq!(*s.calls.borrow(), ["check", "remove", "pause"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn hung_cli_is_killed_at_the_timeout_and_reads_as_busy() {
@@ -847,6 +893,7 @@ mod tests {
             |_| panic!("no verify after a busy remove"),
             || {},
             || CONNECT_BUDGET,
+            || false,
         );
         assert_eq!(out, ConnectOutcome::failed(BUSY_MESSAGE));
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 3);
