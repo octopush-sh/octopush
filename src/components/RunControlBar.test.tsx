@@ -128,6 +128,24 @@ describe("RunControlBar", () => {
     expect(h.onReject).toHaveBeenCalledWith("fix it", 50);
   });
 
+  it("hook-deferred tool: Re-run is primary and Resume stays available", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "The resumed session was waiting to run echo (MCP server srv), which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
+      })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText(/waiting to run echo \(MCP server srv\), which isn't available anymore$/)).toBeInTheDocument();
+    const primary = screen.getByRole("button", { name: /^Re-run · 50 turns$/i });
+    expect(primary.className).toContain("octo-stage-pulse");
+    expect(screen.queryByRole("button", { name: /^Resume · /i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Resume$/i }));
+    expect(h.onResume).toHaveBeenCalledWith(50);
+    fireEvent.click(primary);
+    expect(h.onReject).toHaveBeenCalledWith("", 50);
+  });
+
   it("transient halt: offers Resume in amber, not accept/re-run", () => {
     const h = handlers();
     render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "rate limit exceeded" })}

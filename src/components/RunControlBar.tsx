@@ -260,6 +260,9 @@ function DecisionBar({
   const canResume = blockedStage.substrate === "cli" && !!blockedStage.sessionId;
   const canDiscard = !!blockedStage.baselineCommit;
   const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
+  // Resume is the primary action when it can continue the session, unless the
+  // cause says a fresh attempt is the likelier way forward (a deferred tool).
+  const resumeFirst = canResume && !cause.preferRerun;
 
   // Reset the editor whenever a new checkpoint arrives (the bar stays mounted).
   useEffect(() => {
@@ -312,14 +315,20 @@ function DecisionBar({
                 <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined}>
                   <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {cause.title}
                 </span>
-                <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                <button type="button" onClick={() => (resumeFirst ? onResume(turns) : onReject("", turns))}
                   className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]`}>
-                  {canResume ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
+                  {resumeFirst ? `Resume · ${turns} turns` : `Re-run · ${turns} turns`}
                 </button>
-                {canResume && (
+                {resumeFirst && (
                   <button type="button" onClick={() => setMode("reject")}
                     className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                     Re-run
+                  </button>
+                )}
+                {canResume && !resumeFirst && (
+                  <button type="button" onClick={() => onResume(turns)}
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Resume
                   </button>
                 )}
                 <button type="button" onClick={onAbort}
@@ -349,9 +358,9 @@ function DecisionBar({
                       turn budget
                       <Stepper value={turns} min={5} max={100} step={5} ariaLabel="Turn budget" onChange={setTurns} />
                     </span>
-                    <button type="button" onClick={() => (canResume ? onResume(turns) : onReject("", turns))}
+                    <button type="button" onClick={() => (resumeFirst ? onResume(turns) : onReject("", turns))}
                       className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
-                      {canResume ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
+                      {resumeFirst ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
                     </button>
                     <button type="button" onClick={onApprove}
                       className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
