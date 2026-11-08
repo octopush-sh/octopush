@@ -830,6 +830,7 @@ fn start_setup_terminal(
     app: &AppHandle,
     state: &AppState,
     ws: &crate::db::WorkspaceRow,
+    project_root: &str,
     script: &str,
 ) -> AppResult<String> {
     use crate::workspace_setup as setup;
@@ -839,7 +840,9 @@ fn start_setup_terminal(
         .ok_or_else(|| crate::error::AppError::Other("the workspace has no worktree".into()))?;
     let runner = setup::ensure_runner(&setup::runner_dir())?;
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
-    let env = std::collections::HashMap::from([(setup::SCRIPT_ENV.to_string(), script.to_string())]);
+    // The script, plus Conductor's variables for scripts imported from a
+    // `.conductor/settings.toml` (the runner skips any the user exports).
+    let env = setup::runner_env(script, project_root, &cwd, &ws.name);
     if let Err(e) = spawn_terminal_session(
         app.clone(),
         state,
@@ -866,6 +869,40 @@ pub async fn set_project_setup_script(
     script: String,
 ) -> AppResult<()> {
     state.db.lock().set_project_setup_script(&project_id, &script)
+}
+
+/// Which repo the wizard may read a Conductor setup script from: the
+/// project's own checkout, looked up by id (never a path the caller sends).
+/// `None` when the project has a saved setup template, or no such project.
+pub(crate) fn conductor_setup_root(db: &crate::db::Db, project_id: &str) -> AppResult<Option<String>> {
+    if !db.get_project_setup_script(project_id)?.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(db.get_project_by_id(project_id)?.map(|(_, _, path)| expand_tilde(&path)))
+}
+
+/// The setup script a Conductor repo declares in `.conductor/settings.toml`
+/// (`workspace_setup::conductor_setup_script`), offered by the new-mission
+/// wizard as a prefill — only while the project has no saved setup template.
+/// The repo is the project's path in the DB. Reading it never runs it.
+#[tauri::command]
+pub async fn conductor_setup_script(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<Option<String>> {
+    let root = {
+        let db = state.db.lock();
+        conductor_setup_root(&db, &project_id)?
+    };
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    Ok(tauri::async_runtime::spawn_blocking(move || {
+        crate::workspace_setup::conductor_setup_script(std::path::Path::new(&root))
+    })
+    .await
+    .ok()
+    .flatten())
 }
 
 #[tauri::command]
@@ -930,7 +967,7 @@ pub async fn create_workspace(
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
         if crate::workspace_setup::should_run(outcome, &setup_script) {
-            match start_setup_terminal(&app, state.inner(), &ws, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script) {
                 Ok(id) => (Some(id), None),
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");

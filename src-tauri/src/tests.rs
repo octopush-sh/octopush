@@ -6548,6 +6548,17 @@ mod orchestrator_tests {
         assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
     }
 
+    /// A Routine's headless setup gets Conductor's variables passed to it.
+    #[tokio::test]
+    async fn routine_setup_script_sees_conductor_variables() {
+        use crate::routines::run_setup_with_env;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        let script = r#"test "$CONDUCTOR_ROOT_PATH:$CONDUCTOR_WORKSPACE_PATH:$CONDUCTOR_WORKSPACE_NAME" = "/repo:/wt/a:a""#;
+        assert_eq!(run_setup_with_env(script, dir.path(), Duration::from_secs(5), "/usr/bin:/bin", &env).await, Ok(()));
+    }
+
     /// A failed setup only discards a worktree the fire just created — never an
     /// adopted, reused or restored checkout.
     #[test]
@@ -6587,6 +6598,20 @@ mod orchestrator_tests {
         assert!(tokio::time::timeout(Duration::from_millis(150), fire).await.is_err(), "still running");
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists(), "the backgrounded child must die with the group");
+    }
+
+    /// The Conductor prefill reads only the project's own checkout, by id, and
+    /// only while the project has no setup template.
+    #[test]
+    fn conductor_setup_root_comes_from_the_project_row() {
+        use crate::commands::conductor_setup_root;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-cond", "P", "/tmp/octo-cond-p").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap().as_deref(), Some("/tmp/octo-cond-p"));
+        assert_eq!(conductor_setup_root(&db, "missing").unwrap(), None);
+        db.set_project_setup_script("p-cond", "npm ci").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap(), None);
     }
 
     /// The project's setup-script template round-trips through the DB (the
