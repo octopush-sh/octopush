@@ -14,7 +14,7 @@ import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
-import { conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
+import { SETUP_FIELD_ROWS, conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
 
 interface Props {
   projectId: string;
@@ -96,9 +96,10 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [setupScript, setSetupScript] = useState(
     () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
   );
-  /** Whether the field holds the repo's `.conductor/settings.toml` script
-   *  (asked for only while the project has no saved template). */
-  const [fromConductor, setFromConductor] = useState(false);
+  /** The script read from the repo's `.conductor/settings.toml` (asked for
+   *  only while the project has no saved template). The provenance line shows
+   *  only while the field still holds exactly this. */
+  const [conductorScript, setConductorScript] = useState<string | null>(null);
   /** Set once the user types in the field: a late prefill never overwrites it. */
   const setupEditedRef = useRef(false);
   const [creating, setCreating] = useState(false);
@@ -128,17 +129,17 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     if (!wantsConductorPrefill(useCompanionPrefs.getState().setupScriptByProject[projectId])) return;
     let cancelled = false;
     ipc
-      .conductorSetupScript(projectId, projectPath)
+      .conductorSetupScript(projectId)
       .then((script) => {
         if (cancelled || !script?.trim() || setupEditedRef.current) return;
         setSetupScript(script);
-        setFromConductor(true);
+        setConductorScript(script);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [projectId, projectPath]);
+  }, [projectId]);
 
   async function handlePickPr(pr: PrInfo) {
     setPrError(null);
@@ -592,12 +593,12 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     setSetupScript(e.target.value);
                   }}
                   placeholder="npm install"
-                  rows={6}
+                  rows={SETUP_FIELD_ROWS}
                   className="w-full resize-y rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
 
-              {fromConductor && setupScript.trim() !== "" && (
+              {conductorScript !== null && setupScript === conductorScript && (
                 <div
                   data-tour="mission-setup-conductor"
                   className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute"

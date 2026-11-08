@@ -9,10 +9,17 @@ export function wantsConductorPrefill(template: string | undefined): boolean {
   return !template?.trim();
 }
 
-/** The quiet line under a prefilled field. Octopush sets Conductor's root,
- *  workspace path and name for setup scripts, but allocates no ports, so a
- *  script that reads `CONDUCTOR_PORT` gets a note. */
+/** The setup field's visible height, in lines (its `rows`). */
+export const SETUP_FIELD_ROWS = 6;
+
+/** The quiet line under a prefilled field. A script longer than the field
+ *  says how long it is, so a line far below the fold can't pass unseen.
+ *  Octopush sets Conductor's root, workspace path and name for setup scripts,
+ *  but allocates no ports, so a script that reads `CONDUCTOR_PORT` gets a note. */
 export function conductorSourceLine(script: string): string {
-  const base = "From .conductor/settings.toml · edit before it runs";
-  return /\bCONDUCTOR_PORT\b/.test(script) ? `${base} · CONDUCTOR_PORT isn't set in Octopush` : base;
+  const parts = ["From .conductor/settings.toml · edit before it runs"];
+  const lines = script.split("\n").length;
+  if (lines > SETUP_FIELD_ROWS) parts.push(`${lines} lines`);
+  if (/\bCONDUCTOR_PORT\b/.test(script)) parts.push("CONDUCTOR_PORT isn't set in Octopush");
+  return parts.join(" · ");
 }

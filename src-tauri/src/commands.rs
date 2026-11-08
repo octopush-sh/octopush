@@ -871,20 +871,32 @@ pub async fn set_project_setup_script(
     state.db.lock().set_project_setup_script(&project_id, &script)
 }
 
+/// Which repo the wizard may read a Conductor setup script from: the
+/// project's own checkout, looked up by id (never a path the caller sends).
+/// `None` when the project has a saved setup template, or no such project.
+pub(crate) fn conductor_setup_root(db: &crate::db::Db, project_id: &str) -> AppResult<Option<String>> {
+    if !db.get_project_setup_script(project_id)?.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(db.get_project_by_id(project_id)?.map(|(_, _, path)| expand_tilde(&path)))
+}
+
 /// The setup script a Conductor repo declares in `.conductor/settings.toml`
 /// (`workspace_setup::conductor_setup_script`), offered by the new-mission
 /// wizard as a prefill — only while the project has no saved setup template.
-/// Reading it never runs it.
+/// The repo is the project's path in the DB. Reading it never runs it.
 #[tauri::command]
 pub async fn conductor_setup_script(
     state: State<'_, AppState>,
     project_id: String,
-    project_path: String,
 ) -> AppResult<Option<String>> {
-    if !state.db.lock().get_project_setup_script(&project_id)?.trim().is_empty() {
+    let root = {
+        let db = state.db.lock();
+        conductor_setup_root(&db, &project_id)?
+    };
+    let Some(root) = root else {
         return Ok(None);
-    }
-    let root = expand_tilde(&project_path);
+    };
     Ok(tauri::async_runtime::spawn_blocking(move || {
         crate::workspace_setup::conductor_setup_script(std::path::Path::new(&root))
     })

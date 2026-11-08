@@ -6600,6 +6600,20 @@ mod orchestrator_tests {
         assert!(!marker.exists(), "the backgrounded child must die with the group");
     }
 
+    /// The Conductor prefill reads only the project's own checkout, by id, and
+    /// only while the project has no setup template.
+    #[test]
+    fn conductor_setup_root_comes_from_the_project_row() {
+        use crate::commands::conductor_setup_root;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-cond", "P", "/tmp/octo-cond-p").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap().as_deref(), Some("/tmp/octo-cond-p"));
+        assert_eq!(conductor_setup_root(&db, "missing").unwrap(), None);
+        db.set_project_setup_script("p-cond", "npm ci").unwrap();
+        assert_eq!(conductor_setup_root(&db, "p-cond").unwrap(), None);
+    }
+
     /// The project's setup-script template round-trips through the DB (the
     /// wizard writes it; a fresh routine reads it).
     #[test]

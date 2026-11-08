@@ -130,9 +130,14 @@ pub const CONDUCTOR_SETTINGS_MAX_BYTES: u64 = 64 * 1024;
 
 /// One Conductor settings file: `Ok(None)` when it doesn't exist, `Err` when
 /// it can't be trusted or read — it resolves outside the repo (a symlink
-/// escaping it, the `.conductor` directory included), isn't a regular file,
-/// is over [`CONDUCTOR_SETTINGS_MAX_BYTES`], isn't UTF-8 or isn't valid TOML.
-/// `root` must already be canonical.
+/// escaping it, the `.conductor` directory included), isn't a regular file
+/// (a FIFO, a device, a directory), is over [`CONDUCTOR_SETTINGS_MAX_BYTES`],
+/// isn't UTF-8 or isn't valid TOML. `root` must already be canonical.
+///
+/// The resolved path is opened with `O_NOFOLLOW | O_NONBLOCK` and the checks
+/// run on the open handle, so a file swapped for a symlink or a FIFO between
+/// the containment check and the read is refused instead of followed or
+/// blocked on.
 fn read_conductor_settings(root: &Path, rel: &str) -> Result<Option<toml::Table>, ()> {
     let path = root.join(rel);
     match std::fs::symlink_metadata(&path) {
@@ -146,20 +151,55 @@ fn read_conductor_settings(root: &Path, rel: &str) -> Result<Option<toml::Table>
     if !resolved.starts_with(root) {
         return Err(());
     }
-    let meta = std::fs::metadata(&resolved).map_err(|_| ())?;
+    let file = open_settings_file(&resolved).map_err(|_| ())?;
+    let meta = file.metadata().map_err(|_| ())?;
     if !meta.is_file() || meta.len() > CONDUCTOR_SETTINGS_MAX_BYTES {
         return Err(());
     }
     let mut text = String::new();
-    std::fs::File::open(&resolved)
-        .map_err(|_| ())?
-        .take(CONDUCTOR_SETTINGS_MAX_BYTES + 1)
+    file.take(CONDUCTOR_SETTINGS_MAX_BYTES + 1)
         .read_to_string(&mut text)
         .map_err(|_| ())?;
     if text.len() as u64 > CONDUCTOR_SETTINGS_MAX_BYTES {
         return Err(());
     }
     toml::from_str::<toml::Table>(&text).map(Some).map_err(|_| ())
+}
+
+/// Open a settings file for reading without following a final symlink and
+/// without blocking on a FIFO (unix); a plain open elsewhere.
+fn open_settings_file(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    opts.open(path)
+}
+
+/// Whether a script read from a repo hides anything from the person reading
+/// it before it runs (Trojan Source): bidi embedding/override/isolate
+/// controls (U+202A–202E, U+2066–2069), zero-width and direction marks
+/// (U+200B–200F, U+2060, U+FEFF), or a C0 control other than tab and newline
+/// (a carriage return only as part of CRLF), DEL included.
+pub fn hides_characters(script: &str) -> bool {
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
+        let hidden = match c {
+            '\t' | '\n' => false,
+            '\r' => chars.peek() != Some(&'\n'),
+            '\u{0}'..='\u{1f}' | '\u{7f}' => true,
+            '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' => true,
+            '\u{200b}'..='\u{200f}' | '\u{2060}' | '\u{feff}' => true,
+            _ => false,
+        };
+        if hidden {
+            return true;
+        }
+    }
+    false
 }
 
 /// `[scripts].setup` of one parsed settings file: `Ok(None)` when it has no
@@ -177,8 +217,9 @@ fn conductor_setup_value(table: &toml::Table) -> Result<Option<String>, ()> {
 /// `.conductor/settings.toml`, with `.conductor/settings.local.toml` on top of
 /// it when that file exists (its `setup`, when it has one, wins — an empty one
 /// clears it). `None` when `settings.toml` is missing, either file is
-/// malformed or untrusted (see [`read_conductor_settings`]), or the script is
-/// missing or blank. Only ever a prefill: nothing here runs it.
+/// malformed or untrusted (see [`read_conductor_settings`]), the script is
+/// missing or blank, or it hides characters from its reader
+/// ([`hides_characters`]). Only ever a prefill: nothing here runs it.
 pub fn conductor_setup_script(repo_root: &Path) -> Option<String> {
     let root = dunce::canonicalize(repo_root).ok()?;
     let base = read_conductor_settings(&root, CONDUCTOR_SETTINGS).ok()??;
@@ -190,7 +231,7 @@ pub fn conductor_setup_script(repo_root: &Path) -> Option<String> {
     }
     let setup = setup?;
     let setup = setup.trim_end();
-    if setup.trim().is_empty() {
+    if setup.trim().is_empty() || hides_characters(setup) {
         None
     } else {
         Some(setup.to_string())
@@ -362,6 +403,49 @@ mod tests {
         let repo = conductor_repo(&[(".conductor/shared.toml", "[scripts]\nsetup = \"make\"\n")]);
         std::os::unix::fs::symlink(repo.path().join(".conductor/shared.toml"), repo.path().join(CONDUCTOR_SETTINGS)).unwrap();
         assert_eq!(conductor_setup_script(repo.path()).as_deref(), Some("make"));
+    }
+
+    #[test]
+    fn conductor_setup_refuses_characters_that_hide_code() {
+        let script = |body: &str| {
+            let repo = conductor_repo(&[(CONDUCTOR_SETTINGS, body)]);
+            conductor_setup_script(repo.path())
+        };
+        // Literal characters inside a TOML literal string, one per class.
+        for c in [
+            '\u{202a}', '\u{202b}', '\u{202c}', '\u{202d}', '\u{202e}', '\u{2066}', '\u{2067}', '\u{2068}',
+            '\u{2069}', '\u{200b}', '\u{200c}', '\u{200d}', '\u{200e}', '\u{200f}', '\u{2060}', '\u{feff}',
+        ] {
+            let body = format!("[scripts]\nsetup = '''\nnpm i {c}&& x\n'''\n");
+            assert_eq!(script(&body), None, "U+{:04X}", c as u32);
+        }
+        // The same through TOML escapes in a basic string, C0 controls and DEL included.
+        // Each escape is built from parts, so the source never spells one out.
+        let escapes = ["202E", "2066", "200B", "FEFF", "0000", "001B", "007F"].map(|hex| format!("{}u{hex}", '\\'));
+        for esc in escapes.iter().map(String::as_str).chain([r"\b", r"\f", r"\r"]) {
+            let body = format!("[scripts]\nsetup = \"npm i {esc}rm -rf x\"\n");
+            assert_eq!(script(&body), None, "{esc}");
+        }
+        assert!(hides_characters("a\rb"));
+        assert!(hides_characters("a\x1b[2Kb"));
+        // Tabs, newlines and CRLF line ends are fine, and so is ordinary Unicode.
+        assert!(!hides_characters("a\tb\r\nc\n"));
+        assert_eq!(script("[scripts]\nsetup = \"npm i\\r\\n\\tmake\"\n").as_deref(), Some("npm i\r\n\tmake"));
+        assert_eq!(script("[scripts]\nsetup = \"echo caf\\u00e9\"\n").as_deref(), Some("echo café"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conductor_setup_refuses_a_fifo_without_blocking() {
+        let repo = conductor_repo(&[]);
+        let fifo = repo.path().join(CONDUCTOR_SETTINGS);
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let root = repo.path().to_path_buf();
+        std::thread::spawn(move || tx.send(conductor_setup_script(&root)).unwrap());
+        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("reading a FIFO must not block");
+        assert_eq!(got, None);
     }
 
     #[test]

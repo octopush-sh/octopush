@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
 import { MissionCreator } from "./MissionCreator";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
@@ -641,7 +641,7 @@ describe("MissionCreator", () => {
       render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
       const textarea = await gotoSetup();
       await waitFor(() => expect(textarea.value).toBe("cp \"$CONDUCTOR_ROOT_PATH/.env\" .env\nnpm install"));
-      expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalledWith("proj-1", "/home/user/proj");
+      expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalledWith("proj-1");
       const line = screen.getByText(CONDUCTOR_LINE);
       expect(line).toHaveAttribute("data-tour", "mission-setup-conductor");
       expect(line.className).toContain("font-mono");
@@ -649,6 +649,13 @@ describe("MissionCreator", () => {
       // Only a prefill: nothing was created or saved.
       expect(mockCreate).not.toHaveBeenCalled();
       expect(ipcModule.ipc.setProjectSetupScript).not.toHaveBeenCalled();
+    });
+
+    it("counts the lines of a script taller than the field", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue(Array(9).fill("echo ok").join("\n"));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      await gotoSetup();
+      expect(await screen.findByText(`${CONDUCTOR_LINE} · 9 lines`)).toBeInTheDocument();
     });
 
     it("notes CONDUCTOR_PORT when the script reads it", async () => {
@@ -691,23 +698,29 @@ describe("MissionCreator", () => {
       render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
       const textarea = await gotoSetup();
       fireEvent.change(textarea, { target: { value: "make setup" } });
-      resolve("npm install");
-      await Promise.resolve();
-      await Promise.resolve();
+      // The late answer is flushed (effects and state) before the assertions.
+      await act(async () => {
+        resolve("npm install");
+      });
       expect(textarea.value).toBe("make setup");
       expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
     });
 
-    it("hides the line once the field is cleared, and saves the edited script as the template", async () => {
+    it("hides the line once the field no longer holds what was read, and saves the edited script as the template", async () => {
       vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm install");
       const onCreated = vi.fn();
       render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
       const textarea = await gotoSetup();
       await screen.findByText(CONDUCTOR_LINE);
+      fireEvent.change(textarea, { target: { value: "npm install && make" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
       fireEvent.change(textarea, { target: { value: "" } });
       expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
-      fireEvent.change(textarea, { target: { value: "pnpm i" } });
+      // Back to exactly what the file says: the source is true again.
+      fireEvent.change(textarea, { target: { value: "npm install" } });
       expect(screen.getByText(CONDUCTOR_LINE)).toBeInTheDocument();
+      fireEvent.change(textarea, { target: { value: "pnpm i" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
       fireEvent.click(screen.getByText("Begin the mission"));
       await waitFor(() => expect(onCreated).toHaveBeenCalled());
       expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalledWith("proj-1", "pnpm i");
