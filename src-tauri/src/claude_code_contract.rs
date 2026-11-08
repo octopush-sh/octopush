@@ -85,14 +85,16 @@ fn semver_key(v: &str) -> Vec<u64> {
 }
 
 /// All recorded versions, oldest first. Every directory under the fixture
-/// root is a recording: one without a `VERSION` file, or whose `VERSION`
-/// disagrees with its name, is a broken recording and fails here.
+/// root is a recording, except a synthetic-only one (a `SYNTHETIC` file in
+/// place of `VERSION`, see [`synthesized`]): one without a `VERSION` file, or
+/// whose `VERSION` disagrees with its name, is a broken recording and fails here.
 fn recordings() -> Vec<Rec> {
     let root = fixture_root();
     let mut out: Vec<Rec> = std::fs::read_dir(&root)
         .unwrap_or_else(|e| panic!("fixture root {} unreadable: {e}", root.display()))
         .flatten()
         .filter(|e| e.path().is_dir())
+        .filter(|e| !e.path().join("SYNTHETIC").exists() || e.path().join("VERSION").exists())
         .map(|e| {
             let dir = e.path();
             let name = e.file_name().to_string_lossy().to_string();
@@ -115,6 +117,18 @@ fn recording(version: &str) -> Rec {
         .into_iter()
         .find(|r| r.version == version)
         .unwrap_or_else(|| panic!("[claude-code/{version}] recording not found"))
+}
+
+/// Hand-written fixtures for a CLI version with no recording yet:
+/// `tests/fixtures/claude-code/<version>/` holding a `SYNTHETIC` file (its
+/// content the version) instead of `VERSION`. Only tests that name a file
+/// read them; the recording suite skips the directory.
+fn synthesized(version: &str) -> Rec {
+    let dir = fixture_root().join(version);
+    let marker = std::fs::read_to_string(dir.join("SYNTHETIC"))
+        .unwrap_or_else(|_| panic!("[claude-code/{version}] has no SYNTHETIC file"));
+    assert_eq!(marker.trim(), version, "[claude-code/{version}/SYNTHETIC] names another version");
+    Rec { dir, version: version.to_string() }
 }
 
 #[test]
@@ -388,6 +402,105 @@ fn stream_json_api_error_with_exit_1_still_carries_the_cli_message() {
         assert!(err.contains("claude-nonexistent-model-0"), "[{fx}] {err}");
         assert!(!crate::orchestrator::cli_runner::is_session_not_saved(&err), "[{fx}] {err}");
     }
+}
+
+const DEFERRED_VERSION: &str = "2.1.319";
+const TOOL_DEFERRED_REL: &str = "stream-json/tool-deferred.jsonl";
+const DEFERRED_UNAVAILABLE_REL: &str = "stream-json/resume-deferred-tool-unavailable.jsonl";
+
+/// A deferred-tool result line through `parse_cli_result` at its exit code.
+fn deferred_outcome(rel: &str, exit_success: bool) -> (String, Value, crate::orchestrator::types::StageOutcome) {
+    let rec = synthesized(DEFERRED_VERSION);
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let r = result_event(&fx, &events).clone();
+    for f in ["subtype", "is_error", "result", "session_id", "total_cost_usd", "terminal_reason", "deferred_tool_use.name"] {
+        require(&fx, &r, f);
+    }
+    let line = serde_json::to_string(&r).unwrap();
+    let outcome = parse_cli_result(&line, exit_success, ArtifactKind::Diff, "")
+        .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+    (fx, r, outcome)
+}
+
+#[test]
+fn stream_json_hook_deferred_tool_is_a_halt_not_an_empty_success() {
+    use crate::orchestrator::cli_runner::{
+        is_budget_stop, is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred, TOOL_DEFERRED,
+    };
+    // Claude Code 2.1.319: a PreToolUse hook's `defer` ends the run as a clean
+    // `success` with no text, exit 0 — the deferred tool never ran.
+    let (fx, r, outcome) = deferred_outcome(TOOL_DEFERRED_REL, true);
+    assert_eq!(require_str(&fx, &r, "terminal_reason"), TOOL_DEFERRED, "[{fx}]");
+    assert_eq!(require(&fx, &r, "is_error"), &Value::Bool(false), "[{fx}]");
+    assert_eq!(outcome.status, StageStatus::Failed, "[{fx}] a deferred tool call is not a finished stage");
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(is_tool_deferred(err), "[{fx}] {err}");
+    assert!(!is_deferred_tool_unavailable(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+    assert!(
+        err.starts_with("A hook paused echo (MCP server fixture-srv) before it ran. Resume once it may run, or re-run the stage."),
+        "[{fx}] {err}"
+    );
+    assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
+    assert!(outcome.artifact.text.is_empty(), "[{fx}]");
+    assert!(outcome.cost_usd > 0.0, "[{fx}] the spend stays on the meter");
+}
+
+#[test]
+fn stream_json_resume_with_its_deferred_tool_gone_names_the_tool() {
+    use crate::orchestrator::cli_runner::{
+        is_budget_stop, is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred, DEFERRED_TOOL_UNAVAILABLE,
+    };
+    // Claude Code 2.1.319: `--resume` with a prompt on a session that ended on
+    // a deferred call whose tool is no longer available exits 1 — with a
+    // `success` subtype and text, the shape of an unsaved session.
+    let (fx, r, outcome) = deferred_outcome(DEFERRED_UNAVAILABLE_REL, false);
+    assert_eq!(require_str(&fx, &r, "terminal_reason"), DEFERRED_TOOL_UNAVAILABLE, "[{fx}]");
+    assert_eq!(require_str(&fx, &r, "subtype"), "success", "[{fx}]");
+    assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(is_deferred_tool_unavailable(err), "[{fx}] {err}");
+    assert!(!is_tool_deferred(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+    assert!(
+        err.starts_with(
+            "The resumed session was waiting to run echo (MCP server fixture-srv), which isn't available anymore. \
+             Reconnect it and resume, or re-run the stage fresh."
+        ),
+        "[{fx}] {err}"
+    );
+    assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
+    assert!(outcome.artifact.text.is_empty(), "[{fx}] the CLI's notice is not the stage's work");
+    // Even had it exited 0, the reason decides.
+    let (_, _, exit_0) = deferred_outcome(DEFERRED_UNAVAILABLE_REL, true);
+    assert!(is_deferred_tool_unavailable(exit_0.error.as_deref().unwrap_or_default()), "[{fx}]");
+}
+
+#[test]
+fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
+    use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl", "stream-json/resume.jsonl", "stream-json/error-unknown-model.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let r = result_event(&fx, &events);
+            if r.get("terminal_reason").is_some() {
+                continue; // a newer recording; the deferred fixtures cover the field
+            }
+            let line = serde_json::to_string(r).unwrap();
+            for exit_success in [true, false] {
+                let o = parse_cli_result(&line, exit_success, ArtifactKind::Diff, "").unwrap();
+                let err = o.error.as_deref().unwrap_or_default();
+                assert!(!is_tool_deferred(err) && !is_deferred_tool_unavailable(err), "[{fx}] {err}");
+            }
+        }
+    }
+}
+
+#[test]
+fn synthetic_fixture_directories_are_not_recordings() {
+    let names: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
+    assert!(!names.iter().any(|v| v == DEFERRED_VERSION), "{names:?}");
+    assert_eq!(synthesized(DEFERRED_VERSION).version, DEFERRED_VERSION);
 }
 
 #[test]

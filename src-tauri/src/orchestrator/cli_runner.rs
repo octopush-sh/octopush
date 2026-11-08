@@ -48,6 +48,19 @@ struct CliResult {
     /// The CLI session ID from the result event — carries forward for resume.
     #[serde(default)]
     session_id: Option<String>,
+    /// Why the run ended (Claude Code ≥ 2.1.319), e.g. [`TOOL_DEFERRED`] or
+    /// [`DEFERRED_TOOL_UNAVAILABLE`]. Older CLIs leave it unset.
+    #[serde(default)]
+    terminal_reason: Option<String>,
+    /// The tool call a PreToolUse hook deferred (`permissionDecision: "defer"`).
+    #[serde(default)]
+    deferred_tool_use: Option<CliDeferredToolUse>,
+}
+
+#[derive(Deserialize, Debug, Default)]
+struct CliDeferredToolUse {
+    #[serde(default)]
+    name: String,
 }
 
 #[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
@@ -436,6 +449,58 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
+/// The `terminal_reason` of a run that ended because a PreToolUse hook
+/// deferred a tool call (`permissionDecision: "defer"`, Claude Code ≥ 2.1.319).
+/// The CLI reports it as a clean `success` with no text and exits 0 — the tool
+/// never ran, so the stage is not done.
+pub const TOOL_DEFERRED: &str = "tool_deferred";
+
+/// The `terminal_reason` of a `--resume` whose session ended on a deferred
+/// tool call that is no longer available (an MCP server removed, a built-in
+/// tool now disallowed). Claude Code ≥ 2.1.319 exits 1 with it.
+pub const DEFERRED_TOOL_UNAVAILABLE: &str = "tool_deferred_unavailable";
+
+/// The marker line [`parse_cli_result`] puts in a stage error for a
+/// `terminal_reason` (the closing paren keeps [`TOOL_DEFERRED`] from matching
+/// [`DEFERRED_TOOL_UNAVAILABLE`]).
+fn terminal_reason_marker(reason: &str) -> String {
+    format!("(terminal_reason: {reason})")
+}
+
+/// True when a stage error is a hook-deferred tool call (see
+/// [`parse_cli_result`]): the drive must not escalate it — a stronger model
+/// meets the same hook. Its session is kept, so Resume runs the call.
+pub fn is_tool_deferred(error: &str) -> bool {
+    error.contains(&terminal_reason_marker(TOOL_DEFERRED))
+}
+
+/// True when a stage error is a resumed session whose deferred tool is gone
+/// (see [`parse_cli_result`]): the drive must not escalate it — a stronger
+/// model won't bring the tool back. Its session is kept for a Resume once the
+/// tool is reconnected.
+pub fn is_deferred_tool_unavailable(error: &str) -> bool {
+    error.contains(&terminal_reason_marker(DEFERRED_TOOL_UNAVAILABLE))
+}
+
+/// How a deferred tool is named in a halt: `mcp__‹server›__‹tool›` reads
+/// `‹tool› (MCP server ‹server›)`. Any other name — a built-in tool, or one
+/// whose server or tool part itself holds `__`, which can't be split safely —
+/// is shown whole. No name at all reads `a tool`.
+pub(crate) fn deferred_tool_label(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        return "a tool".to_string();
+    }
+    let mcp = name
+        .strip_prefix("mcp__")
+        .map(|rest| rest.split("__").collect::<Vec<_>>())
+        .filter(|parts| parts.len() == 2 && parts.iter().all(|p| !p.is_empty()));
+    match mcp.as_deref() {
+        Some([server, tool]) => format!("{tool} (MCP server {server})"),
+        _ => name.to_string(),
+    }
+}
+
 /// Free space for an unprivileged user on the volume holding `path`.
 #[allow(clippy::unnecessary_cast)] // statvfs field widths differ between macOS and Linux
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
@@ -508,6 +573,9 @@ pub fn max_budget_args(cap: Option<f64>) -> Vec<String> {
 /// A `success` result with text but a non-zero exit is a finished stage whose
 /// session could not be saved: Failed with a [`SESSION_NOT_SAVED`] error, the
 /// artifact kept and no session id ([`is_session_not_saved`]).
+/// A [`TOOL_DEFERRED`] or [`DEFERRED_TOOL_UNAVAILABLE`] `terminal_reason` is
+/// read first, whatever the exit code and `is_error` say: Failed, the session
+/// kept for Resume ([`is_tool_deferred`], [`is_deferred_tool_unavailable`]).
 /// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
@@ -523,6 +591,49 @@ pub fn parse_cli_result(
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
     let kind = artifact_kind;
     let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
+
+    // A hook-deferred tool call (Claude Code ≥ 2.1.319). Matched on the
+    // machine-readable reason, before the success-shaped branches below: a
+    // deferring run looks like a clean success with no text, and a resume
+    // whose deferred tool is gone looks like a success that exited 1.
+    let deferred = parsed
+        .terminal_reason
+        .as_deref()
+        .filter(|r| *r == TOOL_DEFERRED || *r == DEFERRED_TOOL_UNAVAILABLE);
+    if let Some(reason) = deferred {
+        let tool = deferred_tool_label(parsed.deferred_tool_use.as_ref().map_or("", |d| d.name.as_str()));
+        let copy = if reason == TOOL_DEFERRED {
+            format!("A hook paused {tool} before it ran. Resume once it may run, or re-run the stage.")
+        } else {
+            format!(
+                "The resumed session was waiting to run {tool}, which isn't available anymore. \
+                 Reconnect it and resume, or re-run the stage fresh."
+            )
+        };
+        let error = format!("{copy}\n{}", terminal_reason_marker(reason));
+        let tail = stderr_tail(stderr_text, 10);
+        let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
+        return Ok(StageOutcome {
+            artifact: StageArtifact {
+                kind: ArtifactKind::Note,
+                text: String::new(),
+                payload: None,
+                refs_worktree: false,
+            },
+            input_tokens: parsed.usage.input_tokens,
+            output_tokens: parsed.usage.output_tokens,
+            cache_read_tokens: parsed.usage.cache_read_input_tokens,
+            cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+            cost_usd: parsed.total_cost_usd,
+            status: StageStatus::Failed,
+            tool_calls: vec![],
+            error: Some(error),
+            verdict: None,
+            session_id: parsed.session_id.clone(),
+            blocked: None,
+            blocked_transcript: None,
+        });
+    }
 
     // The CLI finished the work and reported success, then exited non-zero:
     // since 2.1.317 that means it could not save its session (full disk or

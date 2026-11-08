@@ -4958,6 +4958,61 @@ mod orchestrator_tests {
         assert!(artifact.refs_worktree);
     }
 
+    /// A Claude stage that ended on a hook-deferred tool call (Claude Code ≥
+    /// 2.1.319), parsed by the real parser: `line` at exit `exit_success`.
+    struct DeferredRunner {
+        line: &'static str,
+        exit_success: bool,
+        calls: Arc<Mutex<usize>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for DeferredRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            *self.calls.lock() += 1;
+            crate::orchestrator::cli_runner::parse_cli_result(self.line, self.exit_success, ArtifactKind::Diff, "")
+        }
+    }
+
+    #[tokio::test]
+    async fn hook_deferred_stages_halt_with_their_session_and_never_escalate() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};
+        let cases: [(&'static str, bool, fn(&str) -> bool); 2] = [
+            (
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"","session_id":"sess-def",
+                    "total_cost_usd":0.03,"terminal_reason":"tool_deferred","deferred_tool_use":{"name":"Edit"}}"#,
+                true,
+                is_tool_deferred,
+            ),
+            (
+                r#"{"type":"result","subtype":"success","is_error":true,"result":"Edit isn't available.","session_id":"sess-def",
+                    "total_cost_usd":0.03,"terminal_reason":"tool_deferred_unavailable","deferred_tool_use":{"name":"Edit"}}"#,
+                false,
+                is_deferred_tool_unavailable,
+            ),
+        ];
+        for (line, exit_success, is_kind) in cases {
+            let (db, run) = esc_run(None, Some("strong-m"), None);
+            let calls = Arc::new(Mutex::new(0));
+            let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+            let orch = Orchestrator::new_with_runner(
+                Arc::clone(&db), sink, Box::new(DeferredRunner { line, exit_success, calls: Arc::clone(&calls) }));
+            let status = orch.run_to_pause(&run).await.unwrap();
+            assert_eq!(status, RunStatus::Paused, "{line}");
+            assert_eq!(*calls.lock(), 1, "a stronger model meets the same hook — no escalation");
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert_eq!(stage.status, "failed", "a deferred tool call is not a done stage");
+            assert!(!stage.escalated);
+            assert!(stage.error.as_deref().is_some_and(is_kind), "{:?}", stage.error);
+            assert_eq!(stage.session_id.as_deref(), Some("sess-def"), "Resume stays available");
+            assert!((stage.cost_usd - 0.03).abs() < 1e-9, "the spend stays on the meter");
+        }
+    }
+
     #[tokio::test]
     async fn a_blocked_stage_never_escalates_even_with_a_policy() {
         let (db, run) = esc_run(None, Some("strong-m"), None);
@@ -8675,6 +8730,67 @@ mod cli_runner_tests {
         }
         // Exit 0 is still a clean Done.
         assert_eq!(parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap().status, StageStatus::Done);
+    }
+
+    #[test]
+    fn hook_deferred_built_in_tool_halts_and_keeps_the_session() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        const DEFERRED: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"",
+            "session_id":"sess-d","total_cost_usd":0.02,"usage":{"input_tokens":50,"output_tokens":7},
+            "terminal_reason":"tool_deferred","deferred_tool_use":{"id":"toolu_1","name":"Edit","input":{}}}"#;
+        let o = parse_cli_result(DEFERRED, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(o.status, StageStatus::Failed, "not an empty success");
+        let err = o.error.as_deref().unwrap();
+        assert_eq!(err, "A hook paused Edit before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)");
+        assert!(is_tool_deferred(err) && !is_deferred_tool_unavailable(err) && !is_session_not_saved(err));
+        assert_eq!(o.session_id.as_deref(), Some("sess-d"));
+        assert_eq!(o.input_tokens, 50);
+    }
+
+    #[test]
+    fn unavailable_deferred_tool_on_exit_1_is_not_an_unsaved_session() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        const GONE: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"Edit isn't available.",
+            "session_id":"sess-u","terminal_reason":"tool_deferred_unavailable","deferred_tool_use":{"name":"Edit"}}"#;
+        let o = parse_cli_result(GONE, false, ArtifactKind::Diff, "exit 1").unwrap();
+        let err = o.error.as_deref().unwrap();
+        assert!(err.starts_with("The resumed session was waiting to run Edit, which isn't available anymore."), "{err}");
+        assert!(is_deferred_tool_unavailable(err) && !is_tool_deferred(err) && !is_session_not_saved(err), "{err}");
+        assert!(err.ends_with("— stderr —\nexit 1"), "{err}");
+        assert_eq!(o.session_id.as_deref(), Some("sess-u"));
+        assert!(o.artifact.text.is_empty());
+        // No deferred_tool_use at all still explains the halt.
+        const NAMELESS: &str = r#"{"type":"result","subtype":"success","is_error":true,"result":"x",
+            "terminal_reason":"tool_deferred_unavailable"}"#;
+        let o = parse_cli_result(NAMELESS, false, ArtifactKind::Diff, "").unwrap();
+        assert!(o.error.as_deref().unwrap().starts_with("The resumed session was waiting to run a tool, which"));
+    }
+
+    #[test]
+    fn deferred_tool_label_names_the_server_only_when_it_splits_cleanly() {
+        use crate::orchestrator::cli_runner::deferred_tool_label;
+        assert_eq!(deferred_tool_label("mcp__fixture-srv__echo"), "echo (MCP server fixture-srv)");
+        assert_eq!(deferred_tool_label("Edit"), "Edit");
+        // A `__` inside the server (or tool) name is ambiguous: name the tool whole.
+        assert_eq!(deferred_tool_label("mcp__my__srv__echo"), "mcp__my__srv__echo");
+        assert_eq!(deferred_tool_label("mcp__srv__"), "mcp__srv__");
+        assert_eq!(deferred_tool_label("mcp____echo"), "mcp____echo");
+        assert_eq!(deferred_tool_label("mcp__srv"), "mcp__srv");
+        assert_eq!(deferred_tool_label(""), "a tool");
+    }
+
+    #[test]
+    fn results_without_a_deferred_terminal_reason_read_as_before() {
+        use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_session_not_saved, is_tool_deferred};
+        // An unknown reason (or none) changes nothing: exit 0 is Done, exit 1 an unsaved session.
+        const OTHER: &str = r#"{"type":"result","subtype":"success","is_error":false,"result":"Done.",
+            "session_id":"s","terminal_reason":"completed"}"#;
+        for line in [SUCCESS, OTHER] {
+            assert_eq!(parse_cli_result(line, true, ArtifactKind::Diff, "").unwrap().status, StageStatus::Done);
+            let err = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap().error.unwrap();
+            assert!(is_session_not_saved(err.as_str()), "{err}");
+            assert!(!is_tool_deferred(&err) && !is_deferred_tool_unavailable(&err), "{err}");
+        }
     }
 
     #[test]

@@ -706,6 +706,14 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // A hook deferred a tool call, or a resumed session's deferred tool is
+        // gone: a stronger model meets the same hook and won't bring the tool back.
+        if fresh.error.as_deref().is_some_and(|e| {
+            crate::orchestrator::cli_runner::is_tool_deferred(e)
+                || crate::orchestrator::cli_runner::is_deferred_tool_unavailable(e)
+        }) {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {

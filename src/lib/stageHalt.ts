@@ -1,12 +1,26 @@
 export interface HaltCause {
   title: string;
   remedy?: string;
+  /** Re-run is the primary action even when the session can be resumed. */
+  preferRerun?: boolean;
 }
+
+/** The markers `parse_cli_result` (cli_runner.rs) puts on a hook-deferred tool call. */
+const DEFERRED_MARKERS = ["(terminal_reason: tool_deferred)", "(terminal_reason: tool_deferred_unavailable)"];
 
 /** Map a backend stage error string to a plain-English cause + remedy. */
 export function haltCause(error: string | null, maxIterations: number): HaltCause {
   const raw = (error ?? "").trim();
   if (!raw) return { title: "Stage halted" };
+  if (DEFERRED_MARKERS.some((m) => raw.includes(m))) {
+    // The backend's first line is the whole explanation: "<cause>. <remedy>"
+    // (the tool name can hold dots, the remedy can't).
+    const line = raw.split("\n")[0];
+    const cut = line.lastIndexOf(". ");
+    return cut < 0
+      ? { title: line, preferRerun: true }
+      : { title: line.slice(0, cut), remedy: line.slice(cut + 2), preferRerun: true };
+  }
   if (raw.includes("error_max_turns")) {
     return {
       title: `Claude stopped early — it reached the ${maxIterations}-turn limit`,

@@ -30,6 +30,29 @@ describe("haltCause", () => {
     expect(c.remedy).toMatch(/Re-running starts a fresh session/);
     expect(c.remedy).not.toMatch(/Resum/);
   });
+  it("explains a hook-deferred tool call and prefers Re-run", () => {
+    const c = haltCause(
+      "A hook paused echo (MCP server fixture-srv) before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      25,
+    );
+    expect(c.title).toBe("A hook paused echo (MCP server fixture-srv) before it ran");
+    expect(c.remedy).toBe("Resume once it may run, or re-run the stage.");
+    expect(c.preferRerun).toBe(true);
+  });
+  it("explains a resumed session whose deferred tool is gone", () => {
+    const c = haltCause(
+      "The resumed session was waiting to run mcp__a.b__c, which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)\n— stderr —\nexit 1",
+      25,
+    );
+    expect(c.title).toBe("The resumed session was waiting to run mcp__a.b__c, which isn't available anymore");
+    expect(c.remedy).toBe("Reconnect it and resume, or re-run the stage fresh.");
+    expect(c.preferRerun).toBe(true);
+  });
+  it("prefers Resume for other halts", () => {
+    expect(haltCause("claude stopped early (error_max_turns) — review…", 25).preferRerun).toBeFalsy();
+    // Text alone, without the backend's marker, is not a deferred halt.
+    expect(haltCause("A hook paused Edit before it ran. Resume once it may run.", 25).preferRerun).toBeFalsy();
+  });
   it("explains an idle timeout", () => {
     expect(haltCause("claude timed out — no output for 5 minutes", 25).title).toMatch(/no output/i);
   });
