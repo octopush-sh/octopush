@@ -75,7 +75,7 @@ Octopush is **BYOK‑first**. Configure providers in Settings → Models; keys l
 
 | Provider | Models (built‑in defaults) | Notes |
 |---|---|---|
-| **Anthropic** | Claude Opus 4.8 · Sonnet 4.6 · Haiku 4.5 | First‑class; powers the API substrate and Claude Code CLI stages |
+| **Anthropic** | Claude Fable 5.1 · Opus 5.5 · Sonnet 5.5 · Haiku 5.5 | First‑class; powers the API substrate and Claude Code CLI stages |
 | **OpenAI** | GPT‑4o · GPT‑4o‑mini | OpenAI‑compatible protocol |
 | **DeepSeek** | deepseek‑chat · deepseek‑reasoner | Cheapest cloud option |
 | **Ollama (local)** | llama3.3 · qwen2.5‑coder · deepseek‑r1 | **Free** — runs on your machine, no API key |
