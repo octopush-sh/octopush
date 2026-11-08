@@ -12,6 +12,7 @@ vi.mock("../lib/ipc", () => ({
     updateWorkspaceLink: vi.fn().mockResolvedValue(undefined),
     createWorkspace: vi.fn(),
     setProjectSetupScript: vi.fn().mockResolvedValue(undefined),
+    conductorSetupScript: vi.fn().mockResolvedValue(null),
     listBranches: vi.fn(),
     listPrs: vi.fn(),
     ensurePrBranch: vi.fn(),
@@ -70,6 +71,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   useCompanionPrefs.setState({ setupScriptByProject: {} });
+  vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue(null);
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
   vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
     local: ["main", "release/1.0"],
@@ -620,6 +622,95 @@ describe("MissionCreator", () => {
       fireEvent.click(screen.getByText("Begin the mission"));
       await screen.findByText(/boom/);
       expect(useCompanionPrefs.getState().setupScriptByProject["proj-1"]).toBeUndefined();
+    });
+  });
+
+  describe("Conductor setup prefill", () => {
+    const CONDUCTOR_LINE = "From .conductor/settings.toml · edit before it runs";
+
+    async function gotoSetup() {
+      const taskInput = await gotoTask();
+      fireEvent.keyDown(taskInput, { key: "Enter" });
+      return (await screen.findByPlaceholderText("npm install")) as HTMLTextAreaElement;
+    }
+
+    it("prefills from .conductor/settings.toml when the project has no template, and says so", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("cp \"$CONDUCTOR_ROOT_PATH/.env\" .env\nnpm install");
+      const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+      vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(textarea.value).toBe("cp \"$CONDUCTOR_ROOT_PATH/.env\" .env\nnpm install"));
+      expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalledWith("proj-1", "/home/user/proj");
+      const line = screen.getByText(CONDUCTOR_LINE);
+      expect(line).toHaveAttribute("data-tour", "mission-setup-conductor");
+      expect(line.className).toContain("font-mono");
+      expect(line.className).toContain("octo-rise-in");
+      // Only a prefill: nothing was created or saved.
+      expect(mockCreate).not.toHaveBeenCalled();
+      expect(ipcModule.ipc.setProjectSetupScript).not.toHaveBeenCalled();
+    });
+
+    it("notes CONDUCTOR_PORT when the script reads it", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm run dev -- --port $CONDUCTOR_PORT");
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      await gotoSetup();
+      expect(await screen.findByText(`${CONDUCTOR_LINE} · CONDUCTOR_PORT isn't set in Octopush`)).toBeInTheDocument();
+    });
+
+    it("never asks when the project has a remembered template", async () => {
+      useCompanionPrefs.setState({ setupScriptByProject: { "proj-1": "npm ci" } });
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm install");
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      expect(textarea.value).toBe("npm ci");
+      expect(ipcModule.ipc.conductorSetupScript).not.toHaveBeenCalled();
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("stays empty and quiet without a Conductor script", async () => {
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalled());
+      expect(textarea.value).toBe("");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("stays empty when the lookup fails", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockRejectedValue(new Error("no such command"));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await waitFor(() => expect(ipcModule.ipc.conductorSetupScript).toHaveBeenCalled());
+      expect(textarea.value).toBe("");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("never overwrites what the user already typed", async () => {
+      let resolve: (v: string | null) => void = () => {};
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockReturnValue(new Promise((r) => (resolve = r)));
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      fireEvent.change(textarea, { target: { value: "make setup" } });
+      resolve("npm install");
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(textarea.value).toBe("make setup");
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+    });
+
+    it("hides the line once the field is cleared, and saves the edited script as the template", async () => {
+      vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue("npm install");
+      const onCreated = vi.fn();
+      render(<MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />);
+      const textarea = await gotoSetup();
+      await screen.findByText(CONDUCTOR_LINE);
+      fireEvent.change(textarea, { target: { value: "" } });
+      expect(screen.queryByText(CONDUCTOR_LINE)).toBeNull();
+      fireEvent.change(textarea, { target: { value: "pnpm i" } });
+      expect(screen.getByText(CONDUCTOR_LINE)).toBeInTheDocument();
+      fireEvent.click(screen.getByText("Begin the mission"));
+      await waitFor(() => expect(onCreated).toHaveBeenCalled());
+      expect(ipcModule.ipc.setProjectSetupScript).toHaveBeenCalledWith("proj-1", "pnpm i");
     });
   });
 

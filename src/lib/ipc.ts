@@ -683,6 +683,11 @@ export const ipc = {
   /** Remember the project's setup-script template (read by Routines). */
   setProjectSetupScript: (projectId: string, script: string) =>
     invoke<void>("set_project_setup_script", { projectId, script }),
+  /** The setup script the repo declares in `.conductor/settings.toml` (with
+   *  `settings.local.toml` on top), or null — also null once the project has a
+   *  saved setup template. Reading it never runs it. */
+  conductorSetupScript: (projectId: string, projectPath: string) =>
+    invoke<string | null>("conductor_setup_script", { projectId, projectPath }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────

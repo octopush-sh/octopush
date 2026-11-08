@@ -212,6 +212,7 @@ pub fn run() {
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,
+            commands::conductor_setup_script,
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,

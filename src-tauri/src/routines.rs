@@ -311,7 +311,7 @@ pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) ->
 /// `NotMet`; any other exit, spawn failure or timeout ⇒ `Error` (with the last
 /// stderr lines, so the Routines list shows *why*).
 pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
-    match run_bounded("condition", command, cwd, timeout, path).await {
+    match run_bounded("condition", command, cwd, timeout, path, &[]).await {
         Ok((code, stderr)) => classify_condition_exit(code, &stderr),
         Err(msg) => ConditionEval::Error(msg),
     }
@@ -319,15 +319,28 @@ pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Du
 
 /// Run a project's setup script headless in a Routine's fresh worktree, before
 /// its crew launches: the same `bash -c` + login-shell PATH as a fire
-/// condition. `Err` carries why it failed, for `last_outcome`.
-pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration) -> Result<(), String> {
+/// condition. `env` adds variables for the script only (Conductor's, from
+/// `workspace_setup::conductor_env`). `Err` carries why it failed, for
+/// `last_outcome`.
+pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration, env: &[(&str, String)]) -> Result<(), String> {
     let path = condition_path().await;
-    run_setup_with_path(script, cwd, timeout, &path).await
+    run_setup_with_env(script, cwd, timeout, &path, env).await
 }
 
 /// See `run_setup`; `path` is the PATH the script runs with.
 pub async fn run_setup_with_path(script: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(), String> {
-    let (code, stderr) = run_bounded("setup", script, cwd, timeout, path).await?;
+    run_setup_with_env(script, cwd, timeout, path, &[]).await
+}
+
+/// See `run_setup`; `path` is the PATH, `env` the extra variables.
+pub async fn run_setup_with_env(
+    script: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> Result<(), String> {
+    let (code, stderr) = run_bounded("setup", script, cwd, timeout, path, env).await?;
     classify_setup_exit(code, &stderr)
 }
 
@@ -357,12 +370,20 @@ pub fn classify_setup_exit(code: Option<i32>, stderr: &str) -> Result<(), String
 /// on timeout the WHOLE group is killed — a pipeline like `gh … | grep -q .`
 /// leaves no orphaned `gh` reparented past the tick. `kill_on_drop` is the
 /// backstop.
-async fn run_bounded(what: &str, command: &str, cwd: &Path, timeout: Duration, path: &str) -> Result<(Option<i32>, String), String> {
+async fn run_bounded(
+    what: &str,
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> Result<(Option<i32>, String), String> {
     let mut cmd = tokio::process::Command::new("bash");
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
         .env("PATH", path)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
@@ -984,7 +1005,14 @@ impl Orchestrator {
         if !setup_script.trim().is_empty() {
             self.emit_phase(r, PHASE_SETUP);
             let result = match ws.worktree_path.as_deref() {
-                Some(wt) => run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT).await,
+                Some(wt) => {
+                    // Conductor's variables for a template imported from a
+                    // `.conductor/settings.toml`, unless the app's env sets them.
+                    let env = crate::workspace_setup::conductor_env(&project_path, wt, &ws.name, |k| {
+                        std::env::var_os(k).is_some()
+                    });
+                    run_setup(&setup_script, Path::new(wt), SETUP_TIMEOUT, &env).await
+                }
                 None => Err("the fresh workspace has no worktree".into()),
             };
             if let Err(msg) = result {

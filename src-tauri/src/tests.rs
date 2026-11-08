@@ -6548,6 +6548,17 @@ mod orchestrator_tests {
         assert_eq!(classify_setup_exit(Some(0), "warnings"), Ok(()));
     }
 
+    /// A Routine's headless setup gets Conductor's variables passed to it.
+    #[tokio::test]
+    async fn routine_setup_script_sees_conductor_variables() {
+        use crate::routines::run_setup_with_env;
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        let script = r#"test "$CONDUCTOR_ROOT_PATH:$CONDUCTOR_WORKSPACE_PATH:$CONDUCTOR_WORKSPACE_NAME" = "/repo:/wt/a:a""#;
+        assert_eq!(run_setup_with_env(script, dir.path(), Duration::from_secs(5), "/usr/bin:/bin", &env).await, Ok(()));
+    }
+
     /// A failed setup only discards a worktree the fire just created — never an
     /// adopted, reused or restored checkout.
     #[test]

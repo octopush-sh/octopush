@@ -14,6 +14,7 @@ import { useCompanionPrefs } from "../stores/companionPrefsStore";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
+import { conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
 
 interface Props {
   projectId: string;
@@ -95,6 +96,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [setupScript, setSetupScript] = useState(
     () => useCompanionPrefs.getState().setupScriptByProject[projectId] ?? "",
   );
+  /** Whether the field holds the repo's `.conductor/settings.toml` script
+   *  (asked for only while the project has no saved template). */
+  const [fromConductor, setFromConductor] = useState(false);
+  /** Set once the user types in the field: a late prefill never overwrites it. */
+  const setupEditedRef = useRef(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
@@ -114,6 +120,25 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const prevBaseRef = useRef<string | null>(null);
 
   const create = useWorkspaceStore((s) => s.create);
+
+  // A Conductor repo already declares its setup: offer it, unrun, when the
+  // project has no setup template of its own (the backend also checks
+  // `projects.setup_script`). Fails quietly — the field just stays empty.
+  useEffect(() => {
+    if (!wantsConductorPrefill(useCompanionPrefs.getState().setupScriptByProject[projectId])) return;
+    let cancelled = false;
+    ipc
+      .conductorSetupScript(projectId, projectPath)
+      .then((script) => {
+        if (cancelled || !script?.trim() || setupEditedRef.current) return;
+        setSetupScript(script);
+        setFromConductor(true);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId, projectPath]);
 
   async function handlePickPr(pr: PrInfo) {
     setPrError(null);
@@ -562,12 +587,24 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                 <textarea
                   data-tour="mission-setup-script"
                   value={setupScript}
-                  onChange={(e) => setSetupScript(e.target.value)}
+                  onChange={(e) => {
+                    setupEditedRef.current = true;
+                    setSetupScript(e.target.value);
+                  }}
                   placeholder="npm install"
                   rows={6}
                   className="w-full resize-y rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-[12px] leading-[1.6] text-octo-ivory outline-none placeholder:font-mono placeholder:not-italic placeholder:text-octo-mute focus:border-octo-brass"
                 />
               </Field>
+
+              {fromConductor && setupScript.trim() !== "" && (
+                <div
+                  data-tour="mission-setup-conductor"
+                  className="octo-rise-in mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute"
+                >
+                  {conductorSourceLine(setupScript)}
+                </div>
+              )}
 
               <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
                 {branchCollides ? (
