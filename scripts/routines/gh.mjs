@@ -40,6 +40,8 @@ export function makeGh(run = ghRun) {
   const parse = (out) => (out && out.trim() ? JSON.parse(out) : null);
   const gh = {
     get: (path) => parse(run([path])),
+    /** GET a non-JSON body as text (e.g. a job's log). */
+    raw: (path) => run([path]),
     /** GET every page of a list endpoint (per_page=100), up to `max` items. */
     list(path, max = 1000) {
       const sep = path.includes("?") ? "&" : "?";

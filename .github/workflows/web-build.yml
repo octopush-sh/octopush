@@ -150,12 +150,11 @@ jobs:
             if [ "$KIND" = app-issue ]; then node "$R/read.mjs" issue "$NUM"; else node "$R/read.mjs" "$KIND" "$NUM" "$WEB_REPO"; fi
             if [ "$KIND" = pr ]; then
               echo; echo "## Failing CI checks on the PR's head (if any)"
+              # Actions API only (actions: read): the App has no Checks
+              # permission, so the checks API is a 403 here. Never fatal —
+              # missing CI context must not stop the build.
               sha="$(git -C web rev-parse HEAD)"
-              GH_TOKEN="$OCTOPUSH_WEB_TOKEN" gh api "repos/$WEB_REPO/commits/$sha/check-runs" \
-                --jq '.check_runs[] | select(.conclusion == "failure") | .id' |
-              while read -r id; do
-                GH_TOKEN="$OCTOPUSH_WEB_TOKEN" gh api "repos/$WEB_REPO/check-runs/$id/annotations" --jq '.[] | "- \(.path):\(.start_line) \(.message)"' | head -n 40
-              done
+              node "$R/ci-failures.mjs" "$WEB_REPO" "$sha" || echo "(CI checks unavailable)"
             fi
           } > "$RUNNER_TEMP/prompt.md"
 

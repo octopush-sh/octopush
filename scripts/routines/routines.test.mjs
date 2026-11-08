@@ -1077,3 +1077,81 @@ test("octo-check web: install, site, routes; build and all fail on a dist that s
 test("web human-only: a root dynamic route could generate /download — refused", () => {
   assert.deepEqual(forbiddenPaths(["src/pages/[slug].astro", "src/pages/[...path].astro", "src/pages/blog/[...slug].astro"], WEB_REPO), ["src/pages/[slug].astro", "src/pages/[...path].astro"]);
 });
+
+// ---------------------------------------------------------------- failing CI for a builder's prompt (ci-failures.mjs)
+test("ci-failures: latest failed run per workflow, failed jobs and steps, cleaned ##[error] lines", async () => {
+  const { ciFailures, errorLines, failedRuns, NONE, MAX_LINE } = await import("./ci-failures.mjs");
+  const sha = "b10cff520e9b907956ac03e8aea995641b8be39b";
+  const runs = [
+    { id: 1, workflow_id: 7, name: "CI", status: "completed", conclusion: "success", created_at: "2026-11-07T10:00:00Z" },
+    { id: 2, workflow_id: 7, name: "CI", status: "completed", conclusion: "failure", created_at: "2026-11-07T11:00:00Z" },
+    { id: 3, workflow_id: 8, name: "Lint", status: "completed", conclusion: "failure", created_at: "2026-11-07T09:00:00Z" },
+    { id: 4, workflow_id: 8, name: "Lint", status: "completed", conclusion: "success", created_at: "2026-11-07T12:00:00Z" },
+    { id: 5, workflow_id: 9, name: "Slow", status: "in_progress", conclusion: null, created_at: "2026-11-07T12:00:00Z" },
+  ];
+  assert.deepEqual(failedRuns(runs).map((r) => r.id), [2], "a newer green run of the same workflow supersedes a red one");
+  const log = [
+    "2026-11-07T11:00:01.0Z ##[group]Run npm run build",
+    "2026-11-07T11:00:02.0Z ##[error]src/pages/index.astro:12 \x1b[31mUnexpected token\x1b[0m",
+    `2026-11-07T11:00:03.0Z ##[error]${"x".repeat(MAX_LINE + 50)}`,
+    "2026-11-07T11:00:04.0Z ##[error]Process completed with exit code 1.",
+  ].join("\n");
+  const lines = errorLines(log);
+  assert.equal(lines[0], "src/pages/index.astro:12 Unexpected token");
+  assert.equal(lines[1].length, MAX_LINE + 1);
+  assert.equal(lines.length, 2, "the exit-code line is noise");
+  const seen = [];
+  const run = (args) => {
+    const p = args[0];
+    seen.push(p);
+    if (/\/check-runs/.test(p)) throw new Error("gh: Resource not accessible by integration (HTTP 403)");
+    if (p.startsWith(`repos/${WEB_REPO}/actions/runs?head_sha=${sha}`)) return JSON.stringify({ workflow_runs: runs });
+    if (p.startsWith(`repos/${WEB_REPO}/actions/runs/2/jobs`)) return JSON.stringify({ jobs: [
+      { id: 21, name: "build", conclusion: "failure", steps: [{ name: "npm ci", conclusion: "success" }, { name: "npm run build", conclusion: "failure" }] },
+      { id: 22, name: "consistency", conclusion: "failure", steps: [] },
+      { id: 23, name: "ok", conclusion: "success", steps: [] },
+    ] });
+    if (p === `repos/${WEB_REPO}/actions/jobs/21/logs`) return log;
+    if (p === `repos/${WEB_REPO}/actions/jobs/22/logs`) throw new Error("HTTP 410: log expired");
+    throw new Error(`unexpected ${p}`);
+  };
+  const out = ciFailures(makeGh(run), WEB_REPO, sha);
+  assert.match(out, /^- CI \/ build: failure\n  - step failed: npm run build\n  - src\/pages\/index\.astro:12 Unexpected token\n/);
+  assert.match(out, /- CI \/ consistency: failure\n  - \(log unavailable\)$/, "one unreadable log is not fatal");
+  assert.doesNotMatch(out, /\bok\b/);
+  assert.ok(!seen.some((p) => p.includes("check-runs")), "never the checks API (the App has no Checks permission)");
+  assert.equal(ciFailures(makeGh((a) => (a[0].includes("head_sha") ? JSON.stringify({ workflow_runs: [runs[0]] }) : "{}")), WEB_REPO, sha), NONE);
+});
+
+test("ci-failures: an API error (403) prints a fixed note and exits 0; bad arguments exit 64", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { chmodSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const bin = mkdtempSync(join(tmpdir(), "fakegh-"));
+  writeFileSync(join(bin, "gh"), '#!/bin/sh\necho "gh: Resource not accessible by integration (HTTP 403)" >&2\nexit 1\n');
+  chmodSync(join(bin, "gh"), 0o755);
+  const script = fileURLToPath(new URL("./ci-failures.mjs", import.meta.url));
+  const env = { PATH: `${bin}:${process.env.PATH}`, OCTOPUSH_WEB_TOKEN: "t" };
+  const r = spawnSync(process.execPath, [script, WEB_REPO, "b10cff520e9b907956ac03e8aea995641b8be39b"], { encoding: "utf8", env });
+  assert.equal(r.status, 0);
+  assert.equal(r.stdout.trim(), "(CI checks unavailable)");
+  assert.match(r.stderr, /HTTP 403/);
+  assert.equal(spawnSync(process.execPath, [script, "evil/repo", "b10cff520e9b907956ac03e8aea995641b8be39b"], { encoding: "utf8", env }).status, 64);
+  assert.equal(spawnSync(process.execPath, [script, WEB_REPO, "HEAD; rm -rf /"], { encoding: "utf8", env }).status, 64);
+});
+
+test("workflows: failing-CI context in a builder's prompt is never fatal; web-build never calls the checks API", async () => {
+  const { readFileSync } = await import("node:fs");
+  const wf = (f) => readFileSync(new URL(`../../.github/workflows/${f}`, import.meta.url), "utf8");
+  const build = wf("web-build.yml");
+  const step = build.slice(build.indexOf("name: Context, references and brief"), build.indexOf("name: Revoke the pick token"));
+  assert.doesNotMatch(step, /check-runs/, "the App's installation has no Checks permission: a 403, fatal under pipefail");
+  assert.match(step, /node "\$R\/ci-failures\.mjs" "\$WEB_REPO" "\$sha" \|\| echo "\(CI checks unavailable\)"/);
+  assert.doesNotMatch(build, /permission-checks/, "requesting a permission the installation lacks makes minting fail");
+  const nightly = wf("nightly-build.yml");
+  const brief = nightly.slice(nightly.indexOf("## Failing CI checks"), nightly.indexOf('} > "$RUNNER_TEMP/prompt.md"'));
+  assert.match(brief, /if failing="\$\(gh api "repos\/\$GITHUB_REPOSITORY\/commits\/\$sha\/check-runs"/);
+  assert.match(brief, /else\n\s*echo "\(CI checks unavailable\)"/);
+  assert.match(brief, /\|\| echo "\(annotations unavailable/);
+  assert.doesNotMatch(brief, /\| head -n/, "head under pipefail can SIGPIPE the producer");
+});
