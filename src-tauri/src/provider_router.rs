@@ -306,27 +306,34 @@ impl ProviderRouter {
     }
 
     pub fn suggest_model(&self, task: &TaskType) -> ModelSuggestion {
-        match task {
-            TaskType::Architecture | TaskType::Debugging => ModelSuggestion {
-                model_id: "claude-opus-4-6".into(),
-                provider: "anthropic".into(),
-                reason: "Deep reasoning needed for complex analysis".into(),
-                estimated_cost_tier: CostTier::High,
-            },
-            TaskType::CodeReview | TaskType::Refactoring | TaskType::General => ModelSuggestion {
-                model_id: "claude-sonnet-4-6".into(),
-                provider: "anthropic".into(),
-                reason: "Fast, cost-effective for reviews and general work".into(),
-                estimated_cost_tier: CostTier::Medium,
-            },
-            TaskType::QuickFix | TaskType::Documentation | TaskType::Testing => ModelSuggestion {
-                model_id: "claude-haiku-4-5".into(),
-                provider: "anthropic".into(),
-                reason: "Simple task — minimize cost".into(),
-                estimated_cost_tier: CostTier::Low,
-            },
+        let (tag, reason, estimated_cost_tier) = match task {
+            TaskType::Architecture | TaskType::Debugging => {
+                ("best reasoning", "Deep reasoning needed for complex analysis", CostTier::High)
+            }
+            TaskType::CodeReview | TaskType::Refactoring | TaskType::General => {
+                ("balanced", "Fast, cost-effective for reviews and general work", CostTier::Medium)
+            }
+            TaskType::QuickFix | TaskType::Documentation | TaskType::Testing => {
+                ("fast", "Simple task — minimize cost", CostTier::Low)
+            }
+        };
+        ModelSuggestion {
+            model_id: builtin_anthropic_model_tagged(tag),
+            provider: "anthropic".into(),
+            reason: reason.into(),
+            estimated_cost_tier,
         }
     }
+}
+
+/// The first builtin Anthropic model carrying `tag`. The builtin list leads
+/// with the current lineup, so this follows it when a new generation ships.
+fn builtin_anthropic_model_tagged(tag: &str) -> String {
+    builtin_providers()
+        .get("anthropic")
+        .and_then(|p| p.models.iter().find(|m| m.tags.iter().any(|t| t == tag)))
+        .map(|m| m.id.clone())
+        .unwrap_or_else(|| "claude-sonnet-5-5".into())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -810,7 +817,16 @@ mod tests {
             providers: builtin_providers(),
         };
         let suggestion = router.suggest_model(&TaskType::Architecture);
-        assert_eq!(suggestion.model_id, "claude-opus-4-6");
+        assert_eq!(suggestion.model_id, "claude-opus-5-5");
+    }
+
+    #[test]
+    fn suggest_model_code_review() {
+        let router = ProviderRouter {
+            providers: builtin_providers(),
+        };
+        let suggestion = router.suggest_model(&TaskType::CodeReview);
+        assert_eq!(suggestion.model_id, "claude-sonnet-5-5");
     }
 
     #[test]
@@ -819,7 +835,34 @@ mod tests {
             providers: builtin_providers(),
         };
         let suggestion = router.suggest_model(&TaskType::QuickFix);
-        assert_eq!(suggestion.model_id, "claude-haiku-4-5");
+        assert_eq!(suggestion.model_id, "claude-haiku-5-5");
+    }
+
+    #[test]
+    fn every_suggested_model_is_a_builtin() {
+        let providers = builtin_providers();
+        let router = ProviderRouter { providers: providers.clone() };
+        for task in [
+            TaskType::CodeReview,
+            TaskType::Architecture,
+            TaskType::QuickFix,
+            TaskType::Debugging,
+            TaskType::Documentation,
+            TaskType::Testing,
+            TaskType::Refactoring,
+            TaskType::General,
+        ] {
+            let s = router.suggest_model(&task);
+            let provider = providers.get(&s.provider).unwrap_or_else(|| panic!("{task:?}: no provider {}", s.provider));
+            assert!(
+                provider.models.iter().any(|m| m.id == s.model_id),
+                "{task:?}: suggested {} is not in builtin_providers()",
+                s.model_id
+            );
+            for legacy in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
+                assert_ne!(s.model_id, legacy, "{task:?}: suggested a legacy id");
+            }
+        }
     }
 
     #[test]
