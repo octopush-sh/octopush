@@ -129,11 +129,17 @@ jobs:
             if [ "$KIND" = pr ]; then
               echo; echo "## Failing CI checks on the PR's head (if any)"
               sha="$(git rev-parse "origin/$BRANCH")"   # the PR's head, not the merge with main
-              gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
-                --jq '.check_runs[] | select(.conclusion == "failure") | .id' |
-              while read -r id; do
-                gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[] | "- \(.path):\(.start_line) \(.message)"' | head -n 40
-              done
+              # Never fatal (set -o pipefail): missing CI context must not stop
+              # the build. Capped in jq, not with `head` (SIGPIPE under pipefail).
+              if failing="$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/check-runs" \
+                  --jq '.check_runs[] | select(.conclusion == "failure") | .id')"; then
+                for id in $failing; do
+                  gh api "repos/$GITHUB_REPOSITORY/check-runs/$id/annotations" --jq '.[:40][] | "- \(.path):\(.start_line) \(.message)"' \
+                    || echo "(annotations unavailable for check run $id)"
+                done
+              else
+                echo "(CI checks unavailable)"
+              fi
             fi
           } > "$RUNNER_TEMP/prompt.md"
 
