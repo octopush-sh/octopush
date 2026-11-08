@@ -10370,6 +10370,46 @@ mod stage_log_tests {
     }
 
     #[test]
+    fn an_api_key_session_clears_a_stale_login_end() {
+        use crate::orchestrator::cli_runner::forward_plan_and_login;
+        let (db, rec, sink, _tmp) = harness();
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        let init = |source: &str| json!({ "type": "system", "subtype": "init", "apiKeySource": source });
+        let result = json!({ "type": "result", "subtype": "success", "credential_expires_at": 1_797_000_000_i64 });
+
+        // A plan session reports the end…
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &init("none"), &emitter);
+        forward_plan_and_login(&mut auth, &result, &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap().map(|l| l.expires_at), Some(1_797_000_000));
+
+        // …and a later API-key session forgets it, ignoring any end it streams.
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &init("ANTHROPIC_API_KEY"), &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap(), None);
+        forward_plan_and_login(&mut auth, &result, &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap(), None);
+
+        // The app hears it, so the notes reload and hide.
+        let fwd = rec.events.lock();
+        assert_eq!(fwd.len(), 2);
+        assert_eq!(fwd[1].0, crate::claude_login::LOGIN_EVENT);
+        assert!(fwd[1].1["expiresAt"].is_null());
+        assert!(db.lock().list_stage_log("s1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_session_whose_init_does_not_say_keeps_the_login_end() {
+        use crate::orchestrator::cli_runner::forward_plan_and_login;
+        let (db, _rec, sink, _tmp) = harness();
+        let emitter = crate::orchestrator::live::LiveEmitter::new(&sink, "r1", "s1");
+        emitter.login_expiry(1_797_000_000);
+        let mut auth = None;
+        forward_plan_and_login(&mut auth, &json!({ "type": "system", "subtype": "init" }), &emitter);
+        assert_eq!(crate::claude_login::load(&db.lock()).unwrap().map(|l| l.expires_at), Some(1_797_000_000));
+    }
+
+    #[test]
     fn plan_snapshot_round_trips_an_unknown_window_kind() {
         let (db, _rec, _sink, _tmp) = harness();
         let w = crate::orchestrator::cli_runner::PlanWindow {

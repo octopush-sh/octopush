@@ -48,9 +48,17 @@ impl EventSink for PersistingSink {
             let now = chrono::Utc::now().to_rfc3339();
             let _ = crate::claude_plan::record(&self.db.lock(), &windows, &now);
         } else if event == crate::claude_login::LOGIN_EVENT {
-            if let Some(expires_at) = payload.get("expiresAt").and_then(Value::as_i64) {
-                let now = chrono::Utc::now().to_rfc3339();
-                let _ = crate::claude_login::record(&self.db.lock(), expires_at, &now);
+            match payload.get("expiresAt") {
+                Some(Value::Null) => {
+                    let _ = crate::claude_login::clear(&self.db.lock());
+                }
+                Some(v) => {
+                    if let Some(expires_at) = v.as_i64() {
+                        let now = chrono::Utc::now().to_rfc3339();
+                        let _ = crate::claude_login::record(&self.db.lock(), expires_at, &now);
+                    }
+                }
+                None => {}
             }
         }
         self.inner.emit(event, payload);

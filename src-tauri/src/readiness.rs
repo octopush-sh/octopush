@@ -219,28 +219,76 @@ fn exited_unreaped(_child: &Child) -> Option<bool> {
     None
 }
 
+/// How often a reader with nothing to read checks whether the probe returned.
+const READER_POLL: Duration = Duration::from_millis(50);
+
+/// A pipe a reader can wait on without blocking in `read`.
+trait Pollable: Read + Send + 'static {
+    /// Whether a `read` won't block, waiting up to `timeout` for it.
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool>;
+}
+
+impl Pollable for std::process::ChildStdout {
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+        readable(self, timeout)
+    }
+}
+
+impl Pollable for std::process::ChildStderr {
+    fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+        readable(self, timeout)
+    }
+}
+
+/// `poll` for input, end of file or an error on `fd`.
+#[cfg(unix)]
+fn readable(fd: &impl std::os::fd::AsRawFd, timeout: Duration) -> std::io::Result<bool> {
+    let mut pfd = libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    let ms = timeout.as_millis().min(i32::MAX as u128) as libc::c_int;
+    // SAFETY: one live pollfd on this stack frame; poll only writes `revents`.
+    let rc = unsafe { libc::poll(&mut pfd, 1, ms) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(rc > 0)
+}
+
+#[cfg(not(unix))]
+fn readable<T>(_fd: &T, _timeout: Duration) -> std::io::Result<bool> {
+    Ok(true)
+}
+
 /// One stdout/stderr pipe, read on its own thread: chunks arrive as they are
 /// read, so whatever came before a kill is kept. Only the first
 /// [`OUTPUT_CAP`] bytes are sent; the reader drains the rest so the command
-/// never blocks on a full pipe, and stops once the probe has returned.
+/// never blocks on a full pipe. It only reads once `poll` says that won't
+/// block, so it stops once the probe has returned even while something that
+/// left the group (`setsid`) still holds the pipe open; the reader closes its
+/// end itself, so the fd can't be reused under it.
 struct Pipe {
     rx: mpsc::Receiver<Vec<u8>>,
     bytes: Vec<u8>,
     /// False once the reader hit end of file.
     open: bool,
-    /// Dropped with the pipe: tells a reader past the cap to stop.
+    /// Dropped with the pipe: tells the reader to stop.
     _alive: Arc<()>,
 }
 
 impl Pipe {
-    fn read(mut pipe: impl Read + Send + 'static) -> Self {
+    fn read(mut pipe: impl Pollable) -> Self {
         let (tx, rx) = mpsc::channel();
         let alive = Arc::new(());
         let watch = Arc::downgrade(&alive);
         std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut room = OUTPUT_CAP;
-            loop {
+            while watch.strong_count() > 0 {
+                match pipe.ready(READER_POLL) {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
                 match pipe.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) if room > 0 => {
@@ -250,9 +298,9 @@ impl Pipe {
                         }
                         room -= keep;
                     }
-                    Ok(_) if watch.strong_count() > 0 => {}
+                    Ok(_) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                    _ => break,
+                    Err(_) => break,
                 }
             }
         });
@@ -289,22 +337,68 @@ fn collect(pipes: &mut [Pipe], until: Instant) {
 static IN_FLIGHT: InFlight = InFlight::new();
 
 struct InFlight {
-    probes: Mutex<Vec<(u32, OnQuit)>>,
-    /// Notified whenever a probe is untracked.
+    probes: Mutex<Tracked>,
+    /// Notified whenever a probe is tracked or untracked, or a [`Finishing`]
+    /// mark ends.
     untracked: Condvar,
+}
+
+struct Tracked {
+    probes: Vec<(u32, OnQuit)>,
+    /// Live [`Finishing`] marks: work between probes that quitting waits for.
+    finishing: usize,
+    /// Set once `kill_all` has started.
+    quitting: bool,
+}
+
+/// Held while work quitting should let finish is under way, between its
+/// probes too (`mcp_setup::connect`: after `remove`, before `add` spawns).
+/// `kill_all` waits for it within the same grace as an [`OnQuit::Finish`]
+/// probe; dropping it ends the mark.
+pub struct Finishing(&'static InFlight);
+
+impl Drop for Finishing {
+    fn drop(&mut self) {
+        self.0.end_finishing();
+    }
+}
+
+/// Mark work quitting should wait for (see [`Finishing`]).
+pub fn finish_before_quit() -> Finishing {
+    IN_FLIGHT.begin_finishing()
+}
+
+/// The app is quitting (`kill_in_flight` has started): start nothing new.
+pub fn quitting() -> bool {
+    IN_FLIGHT.lock().quitting
 }
 
 impl InFlight {
     const fn new() -> Self {
-        Self { probes: Mutex::new(Vec::new()), untracked: Condvar::new() }
+        let tracked = Tracked { probes: Vec::new(), finishing: 0, quitting: false };
+        Self { probes: Mutex::new(tracked), untracked: Condvar::new() }
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(u32, OnQuit)>> {
+    fn lock(&self) -> MutexGuard<'_, Tracked> {
         self.probes.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     fn track(&self, pid: u32, on_quit: OnQuit) {
-        self.lock().push((pid, on_quit));
+        self.lock().probes.push((pid, on_quit));
+        // A quit waiting on a mark kills a new `Kill` probe at once.
+        self.untracked.notify_all();
+    }
+
+    fn begin_finishing(&'static self) -> Finishing {
+        self.lock().finishing += 1;
+        Finishing(self)
+    }
+
+    fn end_finishing(&self) {
+        let mut tracked = self.lock();
+        tracked.finishing = tracked.finishing.saturating_sub(1);
+        drop(tracked);
+        self.untracked.notify_all();
     }
 
     /// Called before the child is reaped. `kill_all` signals under the same
@@ -317,12 +411,12 @@ impl InFlight {
     /// Runs `reaped` under the lock and, when it says the child is gone,
     /// untracks `pid` before the lock is let go.
     fn untrack_if(&self, pid: u32, reaped: impl FnOnce() -> bool) -> bool {
-        let mut probes = self.lock();
+        let mut tracked = self.lock();
         let done = reaped();
         if done {
-            probes.retain(|&(p, _)| p != pid);
+            tracked.probes.retain(|&(p, _)| p != pid);
         }
-        drop(probes);
+        drop(tracked);
         if done {
             self.untracked.notify_all();
         }
@@ -331,37 +425,40 @@ impl InFlight {
 
     #[cfg(test)]
     fn tracked(&self, pid: u32) -> Option<OnQuit> {
-        self.lock().iter().find(|&&(p, _)| p == pid).map(|&(_, on_quit)| on_quit)
+        self.lock().probes.iter().find(|&&(p, _)| p == pid).map(|&(_, on_quit)| on_quit)
     }
 
     /// `kill` every tracked probe under the lock: an [`OnQuit::Kill`] one at
     /// once, an [`OnQuit::Finish`] one once `grace` has passed without it
-    /// untracking itself. Waiting lets go of the lock, so a probe that
-    /// finishes can untrack.
+    /// untracking itself. A live [`Finishing`] mark is waited for within the
+    /// same `grace`, killing each probe started meanwhile by the same rule.
+    /// Waiting lets go of the lock, so a probe that finishes can untrack.
     fn kill_all(&self, grace: Duration, mut kill: impl FnMut(u32)) {
         let deadline = Instant::now() + grace;
-        let mut probes = self.lock();
+        let mut tracked = self.lock();
+        tracked.quitting = true;
         loop {
-            probes.retain(|&(pid, on_quit)| {
+            tracked.probes.retain(|&(pid, on_quit)| {
                 if on_quit == OnQuit::Kill {
                     kill(pid);
                 }
                 on_quit != OnQuit::Kill
             });
             let left = deadline.saturating_duration_since(Instant::now());
-            if probes.is_empty() || left.is_zero() {
+            if (tracked.probes.is_empty() && tracked.finishing == 0) || left.is_zero() {
                 break;
             }
-            probes = self.untracked.wait_timeout(probes, left).unwrap_or_else(|e| e.into_inner()).0;
+            tracked = self.untracked.wait_timeout(tracked, left).unwrap_or_else(|e| e.into_inner()).0;
         }
-        for (pid, _) in probes.drain(..) {
+        for (pid, _) in tracked.probes.drain(..) {
             kill(pid);
         }
     }
 }
 
 /// SIGKILL every probe still running, with what it spawned (the app is
-/// quitting); one that should finish first gets [`QUIT_GRACE`].
+/// quitting); one that should finish first, and a [`Finishing`] mark, get
+/// [`QUIT_GRACE`].
 pub fn kill_in_flight() {
     IN_FLIGHT.kill_all(QUIT_GRACE, kill_group);
 }
@@ -452,7 +549,8 @@ pub fn day_label(epoch_secs: i64) -> String {
 }
 
 /// `login_expires_at` (the sign-in end a CLI stage last reported, see
-/// `claude_login`) means CLI stages run on a stored claude.ai sign-in, so the
+/// `claude_login`; an API-key session clears it) means CLI stages run on a
+/// stored claude.ai sign-in, so the
 /// row says how long it lasts, key or not: the Settings key never signs
 /// Claude Code in (`cli_runner` doesn't pass it). Without one, an Anthropic
 /// key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise CLI stages run
@@ -477,7 +575,7 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
         }
         LoginState::Ended => {
-            let fix = "CLI stages and Routines can't run on it. Sign in again; this clears after the next Claude Code stage reports the new date.";
+            let fix = "CLI stages and Routines can't run on it. Sign in again; this clears after the next Claude Code stage runs.";
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
         }
     }
@@ -678,6 +776,64 @@ mod tests {
         }
     }
 
+    impl Pollable for Endless {
+        fn ready(&self, _timeout: Duration) -> std::io::Result<bool> {
+            Ok(true)
+        }
+    }
+
+    /// A pipe that says when the reader has let go of it.
+    struct Watched<P>(P, Arc<std::sync::atomic::AtomicBool>);
+
+    impl<P: Read> Read for Watched<P> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.0.read(buf)
+        }
+    }
+
+    impl<P: Pollable> Pollable for Watched<P> {
+        fn ready(&self, timeout: Duration) -> std::io::Result<bool> {
+            self.0.ready(timeout)
+        }
+    }
+
+    impl<P> Drop for Watched<P> {
+        fn drop(&mut self) {
+            self.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reader_stops_once_the_probe_returns_while_a_leftover_holds_the_pipe() {
+        // `sleep` holds stdout open and never writes: a blocking `read` would
+        // wait for it to exit.
+        let mut leftover = Command::new("/bin/sh").args(["-c", "exec sleep 30"]).stdout(Stdio::piped()).spawn().unwrap();
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pipe = Pipe::read(Watched(leftover.stdout.take().unwrap(), released.clone()));
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!released.load(std::sync::atomic::Ordering::Relaxed), "still reading while the probe runs");
+        drop(pipe);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !released.load(std::sync::atomic::Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "the reader must let go of the pipe once the probe returned");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = leftover.kill();
+        let _ = leftover.wait();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_polled_reader_still_takes_what_arrives_and_sees_the_end() {
+        let mut child = Command::new("/bin/sh").args(["-c", "sleep 0.2; echo late"]).stdout(Stdio::piped()).spawn().unwrap();
+        let mut pipes = [Pipe::read(child.stdout.take().unwrap())];
+        collect(&mut pipes, Instant::now() + Duration::from_secs(3));
+        assert_eq!(pipes[0].bytes, b"late\n");
+        assert!(!pipes[0].open, "end of file closes it");
+        let _ = child.wait();
+    }
+
     #[test]
     fn collecting_an_endless_stream_keeps_the_cap_and_stops_on_time() {
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -846,6 +1002,41 @@ mod tests {
         assert!(started.elapsed() < Duration::from_millis(100));
     }
 
+    // A tracker of its own, leaked so a mark can borrow it for `'static`.
+    #[test]
+    fn quitting_waits_for_a_finishing_mark_between_probes() {
+        let in_flight: &'static InFlight = Box::leak(Box::new(InFlight::new()));
+        let mark = in_flight.begin_finishing();
+        assert!(!in_flight.lock().quitting);
+        let killed = Mutex::new(Vec::new());
+        let started = Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // The gap before `add`: nothing is tracked yet…
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(in_flight.lock().quitting, "work under the mark sees the quit");
+                // …then the add starts, and a plain probe that started meanwhile is killed.
+                in_flight.track(301, OnQuit::Finish);
+                in_flight.track(302, OnQuit::Kill);
+                std::thread::sleep(Duration::from_millis(100));
+                in_flight.untrack(301);
+                drop(mark);
+            });
+            in_flight.kill_all(Duration::from_secs(2), |pid| killed.lock().unwrap().push(pid));
+        });
+        let took = started.elapsed();
+        assert_eq!(killed.into_inner().unwrap(), [302]);
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "waits until the mark ends: {took:?}");
+        assert_eq!(in_flight.lock().finishing, 0);
+
+        // A mark that outlasts the grace doesn't hold the quit.
+        let _stuck = in_flight.begin_finishing();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_millis(200), |_| panic!("nothing is tracked"));
+        let took = started.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_secs(1), "{took:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_fallback_reports_a_reaped_child_and_untracks_it_as_it_reaps() {
@@ -961,8 +1152,9 @@ mod tests {
         let ended = auth_check(false, Some(gone), now);
         assert_eq!((ended.status, ended.value.clone()), (CheckStatus::Fail, format!("Sign-in ended {}", day_label(gone))));
         assert_eq!(ended.command.as_deref(), Some(CLAUDE_LOGIN));
-        // Check again only re-reads the stored date; it clears on the next report.
-        assert!(ended.fix.as_deref().is_some_and(|f| f.contains("clears after the next Claude Code stage") && !f.contains("check again")));
+        // Check again only re-reads the stored date; the next stage replaces
+        // it (a plan session) or clears it (an API-key session).
+        assert!(ended.fix.as_deref().is_some_and(|f| f.ends_with("clears after the next Claude Code stage runs.") && !f.contains("check again")));
 
         // `%-d %b`: a day number and a month, no leading zero.
         let label = day_label(far);

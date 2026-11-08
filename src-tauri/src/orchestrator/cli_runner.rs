@@ -220,6 +220,34 @@ pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
     }
 }
 
+/// Hand a Claude stream event's plan windows and sign-in end to
+/// `PersistingSink`, which keeps them for Readiness, Usage and the notes.
+/// `auth` is the session's, from its `system/init`. An API-key session's
+/// rate limits are not plan windows and it reports no sign-in end, so its
+/// init clears the stored end instead: no later stage would replace it.
+pub(crate) fn forward_plan_and_login(
+    auth: &mut Option<CliAuth>,
+    value: &Value,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+) {
+    if let Some(a) = cli_auth_from_init(value) {
+        *auth = Some(a);
+        if a == CliAuth::ApiKey {
+            emitter.login_cleared();
+        }
+    }
+    if *auth == Some(CliAuth::ApiKey) {
+        return;
+    }
+    let windows = plan_windows_from_stream_event(value);
+    if !windows.is_empty() {
+        emitter.plan_windows(&windows);
+    }
+    if let Some(expires_at) = credential_expiry_from_result(value) {
+        emitter.login_expiry(expires_at);
+    }
+}
+
 /// When the stored claude.ai sign-in ends, epoch seconds, from the `result`
 /// event's `credential_expires_at` (Claude Code 2.1.318+). `None` for other
 /// events, for older CLIs that don't send it and for a value it can't read.
@@ -1561,20 +1589,7 @@ impl AgentRunner for CliRunner {
                         emitter.emit_raw_entry(entry);
                     }
                 }
-                if let Some(a) = cli_auth_from_init(value) {
-                    auth = Some(a);
-                }
-                if auth != Some(CliAuth::ApiKey) {
-                    let windows = plan_windows_from_stream_event(value);
-                    if !windows.is_empty() {
-                        // `PersistingSink` keeps the snapshot.
-                        emitter.plan_windows(&windows);
-                    }
-                    if let Some(expires_at) = credential_expiry_from_result(value) {
-                        // `PersistingSink` keeps it for Readiness and the notes.
-                        emitter.login_expiry(expires_at);
-                    }
-                }
+                forward_plan_and_login(&mut auth, value, &emitter);
             }
             CliDialect::Codex => {
                 codex_json_lines += 1;
