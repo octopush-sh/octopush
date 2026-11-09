@@ -87,14 +87,19 @@ pub fn pick_disk_for_path(mounts: &[(PathBuf, u64, u64)], target: &Path) -> Disk
     }
 }
 
-/// Read the free/total bytes of the volume that `$HOME` lives on.
+/// Read the free/total bytes of the volume that `$HOME` lives on. Zeroes when
+/// sysinfo cannot list disks, the same as when no mount matches.
 pub fn home_disk() -> DiskInfo {
-    let disks = sysinfo::Disks::new_with_refreshed_list();
-    let mounts: Vec<(PathBuf, u64, u64)> = disks
-        .list()
-        .iter()
-        .map(|d| (d.mount_point().to_path_buf(), d.total_space(), d.available_space()))
-        .collect();
+    let mounts: Vec<(PathBuf, u64, u64)> = match sysinfo::Disks::new_with_refreshed_list() {
+        Ok(disks) => disks
+            .iter()
+            .map(|d| (d.mount_point().to_path_buf(), d.total_space(), d.available_space()))
+            .collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "perf: could not list disks");
+            Vec::new()
+        }
+    };
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     pick_disk_for_path(&mounts, &home)
 }
@@ -186,12 +191,17 @@ pub fn sum_group(pids: &HashSet<u32>, samples: &HashMap<u32, ProcSample>) -> Pro
 }
 
 /// Persistent sysinfo state so CPU% is computed between successive samples.
-/// Held in Tauri-managed state.
-pub struct PerfState(pub Mutex<System>);
+/// Held in Tauri-managed state. `None` when sysinfo cannot initialise on this
+/// OS (sysinfo 0.40 made `System::new` fallible); `get_perf_stats` then
+/// reports an error instead of panicking at startup or showing zeroes.
+pub struct PerfState(pub Mutex<Option<System>>);
 
 impl PerfState {
     pub fn new() -> Self {
-        PerfState(Mutex::new(System::new()))
+        let sys = System::new()
+            .inspect_err(|e| tracing::warn!(error = %e, "perf: sysinfo unavailable"))
+            .ok();
+        PerfState(Mutex::new(sys))
     }
 }
 
@@ -266,15 +276,23 @@ pub fn compute_app_pids(
 
 /// Refresh `sys` and flatten every process into a `ProcSample`.
 ///
-/// NOTE: the exact `refresh_processes` call is sysinfo-version specific. For
-/// sysinfo 0.32 use `sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true)`.
-/// If the pinned version differs, match its signature (the compiler will tell
-/// you). Everything else here is version-stable.
+/// The refresh kinds are spelled out rather than taken from
+/// `refresh_processes`, whose defaults change between sysinfo versions (0.33+
+/// added per-process tasks). This is the set sysinfo 0.32's
+/// `refresh_processes(All, true)` used: memory, CPU, disk usage, exe once.
 ///
 /// The first call after `System::new()` returns 0% CPU for all processes;
 /// the frontend corrects itself on the next poll.
 pub fn sample_system(sys: &mut System) -> Vec<ProcSample> {
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_cpu()
+            .with_disk_usage()
+            .with_exe(sysinfo::UpdateKind::OnlyIfNotSet),
+    );
     sys.processes()
         .iter()
         .map(|(pid, p)| ProcSample {
@@ -308,6 +326,26 @@ pub fn compute_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Live smoke tests against the real OS, so a sysinfo bump that changes
+    // what a refresh collects fails here rather than in the perf popover.
+    #[test]
+    fn sample_system_sees_this_process_with_memory() {
+        let state = PerfState::new();
+        let mut guard = state.0.lock();
+        let sys = guard.as_mut().expect("sysinfo initialises on supported OSes");
+        let samples = sample_system(sys);
+        let me = std::process::id();
+        let mine = samples.iter().find(|p| p.pid == me).expect("own pid is sampled");
+        assert!(mine.rss_bytes > 0, "RSS is collected");
+        assert!(samples.iter().any(|p| p.ppid.is_some()), "parent pids are collected");
+    }
+
+    #[test]
+    fn home_disk_reports_a_real_volume() {
+        let d = home_disk();
+        assert!(d.total_bytes > 0 && d.free_bytes <= d.total_bytes, "{d:?}");
+    }
 
     fn s(pid: u32, ppid: Option<u32>, rss: u64, cpu: f32) -> ProcSample {
         ProcSample { pid, ppid, rss_bytes: rss, cpu_pct: cpu }

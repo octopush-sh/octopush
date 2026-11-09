@@ -4,7 +4,7 @@ version = "0.4.115"
 description = "The IDE for Agentic Developers"
 authors = ["Octopush contributors"]
 edition = "2021"
-rust-version = "1.90"
+rust-version = "1.95"
 # `[[bin]]` adds octopush-pty-server below; with multiple binaries Tauri
 # needs to be told which one is the app shell.
 default-run = "octopush"
@@ -95,7 +95,7 @@ sha2 = "0.10"
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 ctrlc = "3"
-sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 # Reads a repo's `.conductor/settings.toml` to prefill the setup script
 # (`workspace_setup::conductor_setup_script`). Pinned to the toml already in
 # the lockfile (via tauri-utils), so it adds no crates.
