@@ -9,4 +9,4 @@ steps:
     caption: When an MCP server asks you something, the pane says it's waiting on your input.
     action: none
 ---
-When an MCP server asks for your input, through a form or a link, the Run pane now reads **waiting on your input**, as it does for a permission prompt. Worktrees that already have the hooks pick this up the next time Octopush starts.
+When an MCP server asks for your input, through a form or a link, the Run pane now reads **waiting on your input**, just as when Claude Code is waiting on you. Worktrees that already have the hooks pick this up the next time Octopush starts.
