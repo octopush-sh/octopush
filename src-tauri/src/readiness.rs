@@ -548,14 +548,15 @@ pub fn day_label(epoch_secs: i64) -> String {
         .unwrap_or_else(|| "an unknown date".into())
 }
 
-/// `login_expires_at` (the sign-in end a CLI stage last reported, see
-/// `claude_login`; an API-key session clears it) means CLI stages run on a
-/// stored claude.ai sign-in, so the
+/// `login_expires_at` (the sign-in end [`login_end`] picked: what
+/// `claude auth status` just reported, else what a CLI stage last reported,
+/// see `claude_login`; an API-key session clears that) means CLI stages run
+/// on a stored claude.ai sign-in, so the
 /// row says how long it lasts, key or not: the Settings key never signs
 /// Claude Code in (`cli_runner` doesn't pass it). Without one, an Anthropic
 /// key (settings or `ANTHROPIC_API_KEY`) → API key; otherwise CLI stages run
 /// on the `claude` login and API stages can't run (older CLIs never report
-/// the end). Never contacts the network.
+/// the end).
 pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64) -> ReadinessCheck {
     use crate::claude_login::{state, LoginState};
     const ID: &str = "auth";
@@ -575,7 +576,7 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
         }
         LoginState::Ended => {
-            let fix = "CLI stages and Routines can't run on it. Sign in again; this clears after the next Claude Code stage runs.";
+            let fix = "CLI stages and Routines can't run on it. Sign in again, then Check again.";
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
         }
     }
@@ -681,9 +682,20 @@ fn enabled_ollama_addr() -> Option<String> {
     loopback_addr(&base)
 }
 
-/// Every check, in card order. Blocking: call it off the async runtime.
-/// `login_expires_at` is the stored claude.ai sign-in end (`claude_login`).
-pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
+/// The sign-in end the auth row shows: what `claude auth status` just
+/// reported, else the stored one (`claude_login`), else none.
+pub fn login_end(probed: Option<i64>, stored: Option<i64>) -> Option<i64> {
+    probed.or(stored)
+}
+
+/// Every check, in card order, and the sign-in end `claude auth status`
+/// reported (`None` when not asked, or it gave none) for the caller to store.
+/// Blocking: call it off the async runtime. `stored_login` is the stored
+/// claude.ai sign-in end (`claude_login`). `ask_claude` runs
+/// `claude auth status` too: only on an explicit Check again, since whether
+/// it contacts the network isn't known.
+pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessCheck>, Option<i64>) {
+    let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login_expiry));
     let claude = std::thread::spawn(|| {
         // Its answer may be newer than the session's cached version (the
         // user just updated): the launcher and the next stage probe again.
@@ -701,12 +713,13 @@ pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     });
     let ollama = std::thread::spawn(|| enabled_ollama_addr().map(|a| ollama_check(&a, CHECK_TIMEOUT)));
 
+    let probed = login.and_then(|t| t.join().ok().flatten());
     let lost = ReadinessCheck::failed_to_run;
     let mut checks = vec![
         claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
         auth_check(
             crate::claude_login::has_anthropic_key(),
-            login_expires_at,
+            login_end(probed, stored_login),
             chrono::Utc::now().timestamp(),
         ),
         git.join().unwrap_or_else(|_| lost("git", "git")),
@@ -716,7 +729,7 @@ pub fn run_all(login_expires_at: Option<i64>) -> Vec<ReadinessCheck> {
     if let Ok(Some(c)) = ollama.join() {
         checks.push(c);
     }
-    checks
+    (checks, probed)
 }
 
 #[cfg(test)]
@@ -1152,14 +1165,26 @@ mod tests {
         let ended = auth_check(false, Some(gone), now);
         assert_eq!((ended.status, ended.value.clone()), (CheckStatus::Fail, format!("Sign-in ended {}", day_label(gone))));
         assert_eq!(ended.command.as_deref(), Some(CLAUDE_LOGIN));
-        // Check again only re-reads the stored date; the next stage replaces
-        // it (a plan session) or clears it (an API-key session).
-        assert!(ended.fix.as_deref().is_some_and(|f| f.ends_with("clears after the next Claude Code stage runs.") && !f.contains("check again")));
+        // Check again asks `claude auth status`, so it clears right after signing in.
+        assert_eq!(ended.fix.as_deref(), Some("CLI stages and Routines can't run on it. Sign in again, then Check again."));
 
         // `%-d %b`: a day number and a month, no leading zero.
         let label = day_label(far);
         let (d, m) = label.split_once(' ').unwrap();
         assert!(d.parse::<u32>().is_ok_and(|n| (1..=31).contains(&n)) && !d.starts_with('0') && m.len() == 3, "{label}");
+    }
+
+    #[test]
+    fn the_probed_sign_in_end_wins_over_the_stored_one() {
+        let now = 1_800_000_000;
+        let (stored, probed) = (now - 86_400, now + 30 * 86_400);
+        assert_eq!(login_end(Some(probed), Some(stored)), Some(probed));
+        assert_eq!(login_end(None, Some(stored)), Some(stored), "a failed probe or no field: the stored end");
+        assert_eq!(login_end(Some(probed), None), Some(probed), "a fresh install, before any stage ran");
+        assert_eq!(login_end(None, None), None);
+        // Signed in again: the row turns from rouge to verdigris on Check again.
+        assert_eq!(auth_check(false, login_end(None, Some(stored)), now).status, CheckStatus::Fail);
+        assert_eq!(auth_check(false, login_end(Some(probed), Some(stored)), now).status, CheckStatus::Ok);
     }
 
     #[test]

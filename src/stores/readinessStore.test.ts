@@ -27,6 +27,14 @@ describe("readinessStore", () => {
     expect(cliVersionMock).toHaveBeenCalledTimes(2);
   });
 
+  it("asks claude auth status only when the check is explicit", async () => {
+    readinessMock.mockResolvedValue([]);
+    await useReadinessStore.getState().check();
+    expect(readinessMock).toHaveBeenLastCalledWith(false);
+    await useReadinessStore.getState().check({ explicit: true });
+    expect(readinessMock).toHaveBeenLastCalledWith(true);
+  });
+
   it("forgets the version even when the check itself fails", async () => {
     cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
     readinessMock.mockRejectedValue(new Error("readiness task failed"));

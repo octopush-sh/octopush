@@ -11,6 +11,9 @@ recording is made, carry these files into it by hand.
 |---|---|---|
 | `stream-json/tool-deferred.jsonl` | the `result` of a `claude -p` run whose PreToolUse hook deferred a call (`permissionDecision: "defer"`): `subtype: success`, `is_error: false`, `result: ""`, `stop_reason`/`terminal_reason: "tool_deferred"`, `deferred_tool_use: {id, name, input}`; exit 0 | **synthetic** — synthesized from the 2.1.319 package text, not a live recording |
 | `stream-json/resume-deferred-tool-unavailable.jsonl` | the `result` of a `claude -p --resume` with a prompt, on that session, after the deferred tool's MCP server was removed: `subtype: success`, `is_error: true`, `terminal_reason: "tool_deferred_unavailable"`, the notice naming the tool in `result`, `deferred_tool_use`; exit 1 | **synthetic** — synthesized from the 2.1.319 package text, not a live recording |
+| `auth-status/signed-in.json` | `claude auth status` on a claude.ai sign-in: `loggedIn: true`, `authMethod`, `subscriptionType` and `loginExpiresAt` (when the stored sign-in ends); exit 0 | **synthetic** — the field arrived in Claude Code 2.1.318 (changelog: "Added the date a stored claude.ai sign-in ends to `claude auth status` (`loginExpiresAt`)"); its format isn't documented, so this file uses RFC 3339 text and the test also feeds epoch seconds and milliseconds. No account email or org is kept. Whether the command contacts the network is not known, so Readiness runs it only on an explicit Check again |
+| `auth-status/signed-out.json` | `claude auth status` with no sign-in: `loggedIn: false`; exit 1 | **synthetic** |
+| `auth-status/no-login-expires-at.json` | `claude auth status` from a CLI older than 2.1.318: signed in, no `loginExpiresAt`; exit 0 | **synthetic** |
 
-Each file is the result line only (the events before it carry nothing these
+Each `stream-json` file is the result line only (the events before it carry nothing these
 tests read). The exit codes aren't in the files; the tests pass them.

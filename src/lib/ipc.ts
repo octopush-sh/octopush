@@ -1446,9 +1446,10 @@ export const ipc = {
   /** Installed Claude Code CLI version vs the tested floor (cached per app session). */
   claudeCliVersion: () =>
     invoke<ClaudeCliVersion>("claude_cli_version"),
-  /** Settings › General readiness card: local checks, each bounded at 3 s, never cached. */
-  readinessCheck: () =>
-    invoke<ReadinessCheck[]>("readiness_check"),
+  /** Settings › General readiness card: local checks, each bounded at 3 s, never cached.
+   *  `askClaude` (an explicit Check again) also runs `claude auth status`. */
+  readinessCheck: (askClaude = false) =>
+    invoke<ReadinessCheck[]>("readiness_check", { askClaude }),
 };
 
 /** One row of the readiness card (mirrors Rust `readiness::ReadinessCheck`). */

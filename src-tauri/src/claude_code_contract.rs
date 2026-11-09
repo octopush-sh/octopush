@@ -18,6 +18,7 @@
 //! | `SKILL.md` / `.claude/agents/*.md` frontmatter (incl. `effort:`) | `skills`, `skills::agents` |
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
 //! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
+//! | `claude auth status` JSON (`loginExpiresAt`) | `agent_adapter::parse_login_expires_at` |
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -859,6 +860,56 @@ fn result_without_credential_expires_at_reports_nothing() {
     for junk in [Value::Null, Value::from("next month"), Value::from(""), Value::from(true), serde_json::json!({}), Value::from(0)] {
         r["credential_expires_at"] = junk.clone();
         assert_eq!(credential_expiry_from_result(&r), None, "{junk}");
+    }
+}
+
+// ─── `claude auth status` → `loginExpiresAt` (claude.ai sign-in end) ───────
+
+const AUTH_STATUS_VERSION: &str = "2.1.319";
+
+#[test]
+fn auth_status_signed_in_reports_the_sign_in_end() {
+    use crate::agent_adapter::parse_login_expires_at;
+    // Synthetic fixture (see the 2.1.319 README).
+    let rec = synthesized(AUTH_STATUS_VERSION);
+    let rel = "auth-status/signed-in.json";
+    let fx = rec.label(rel);
+    let mut v = rec.json(rel);
+    require_str(&fx, &v, "loginExpiresAt");
+    let want = chrono::DateTime::parse_from_rfc3339("2026-12-12T09:00:00Z").unwrap().timestamp();
+    assert_eq!(parse_login_expires_at(&rec.text(rel)), Some(want), "[{fx}]");
+    // A warning on stderr (joined after stdout) doesn't hide it.
+    assert_eq!(parse_login_expires_at(&format!("{}\nwarning: something\n", rec.text(rel))), Some(want), "[{fx}]");
+
+    // Epoch seconds or milliseconds read as the same moment.
+    v["loginExpiresAt"] = Value::from(want);
+    assert_eq!(parse_login_expires_at(&v.to_string()), Some(want));
+    v["loginExpiresAt"] = Value::from(want * 1000);
+    assert_eq!(parse_login_expires_at(&v.to_string()), Some(want));
+}
+
+#[test]
+fn auth_status_signed_out_or_without_the_field_reports_nothing() {
+    use crate::agent_adapter::parse_login_expires_at;
+    let rec = synthesized(AUTH_STATUS_VERSION);
+    for rel in ["auth-status/signed-out.json", "auth-status/no-login-expires-at.json"] {
+        let fx = rec.label(rel);
+        assert!(rec.json(rel).get("loggedIn").is_some_and(Value::is_boolean), "[{fx}] loggedIn");
+        assert_eq!(parse_login_expires_at(&rec.text(rel)), None, "[{fx}]");
+    }
+    // Signed out: a leftover date is never read as a sign-in.
+    let mut out = rec.json("auth-status/signed-out.json");
+    out["loginExpiresAt"] = Value::from(1_797_000_000_i64);
+    assert_eq!(parse_login_expires_at(&out.to_string()), None);
+
+    // An unreadable value, or output that isn't the object, is no value, never a panic.
+    let mut v = rec.json("auth-status/signed-in.json");
+    for junk in [Value::Null, Value::from("next month"), Value::from(""), Value::from(true), serde_json::json!({}), Value::from(0)] {
+        v["loginExpiresAt"] = junk.clone();
+        assert_eq!(parse_login_expires_at(&v.to_string()), None, "{junk}");
+    }
+    for text in ["", "Logged in using claude.ai", "error: unknown command 'auth'", "} {", "{not json}"] {
+        assert_eq!(parse_login_expires_at(text), None, "{text:?}");
     }
 }
 

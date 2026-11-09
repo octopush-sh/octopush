@@ -63,7 +63,7 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
           <button
             type="button"
             data-tour="settings-readiness-again"
-            onClick={() => void check()}
+            onClick={() => void check({ explicit: true })}
             disabled={loading}
             className="shrink-0 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:opacity-50"
           >
