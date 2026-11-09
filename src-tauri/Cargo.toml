@@ -56,7 +56,7 @@ dirs = "7"
 anyhow = "1"
 git2 = { version = "0.19", features = ["vendored-openssl", "vendored-libgit2"] }
 thiserror = "2"
-parking_lot = "0.12"
+parking_lot = "0.13"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
