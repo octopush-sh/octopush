@@ -4,7 +4,8 @@ import type { SyncAttempt, SyncKind } from "./types";
  *  (#518). Wording approved by the PM on the issue; keep it exact. */
 export interface SyncStatusLine {
   text: string;
-  /** `warning` renders amber (`text-octo-warning`); `mute` is the default. */
+  /** `warning` (a failed attempt) renders amber (`text-octo-warning`);
+   *  `mute` is the default. */
   tone: "mute" | "warning";
 }
 
@@ -36,9 +37,6 @@ export function syncStatusLine(
   now: Date = new Date(),
 ): SyncStatusLine | null {
   if (!enabled || !attempt) return null;
-  if (attempt.outcome === "signedOut") {
-    return { text: "Paused: sign in again to resume uploads", tone: "warning" };
-  }
   const at = new Date(attempt.at);
   if (Number.isNaN(at.getTime())) return null;
   const when = formatAttemptTime(at, now);

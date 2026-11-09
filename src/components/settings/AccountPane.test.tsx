@@ -253,12 +253,12 @@ describe("AccountPane — last sync attempt under each toggle (#518)", () => {
     );
   });
 
-  it("a failed attempt and a paused upload read amber", async () => {
+  it("a failed attempt reads amber, with or without an HTTP status", async () => {
     setup("pro");
     getSyncPrefs.mockResolvedValue({ historySync: true, librarySync: true });
     getSyncStatus.mockResolvedValue({
       history: { at: today(), outcome: "failed", count: 3, httpStatus: 503 },
-      library: { at: today(), outcome: "signedOut", count: 2 },
+      library: { at: today(), outcome: "failed", count: 2 },
     });
     render(<AccountPane />);
     const history = await screen.findByTestId("sync-history-status");
@@ -267,7 +267,9 @@ describe("AccountPane — last sync attempt under each toggle (#518)", () => {
     );
     expect(history).toHaveClass("text-octo-warning");
     const library = await screen.findByTestId("sync-library-status");
-    expect(library).toHaveTextContent("Paused: sign in again to resume uploads");
+    expect(library).toHaveTextContent(
+      "Last attempt failed 14:02 · Octopush retries with the next run",
+    );
     expect(library).toHaveClass("text-octo-warning");
   });
 

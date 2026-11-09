@@ -160,7 +160,9 @@ pub fn update_settings<R>(f: impl FnOnce(&mut AppSettings) -> R) -> AppResult<R>
     Ok(out)
 }
 
-pub fn save_settings(settings: &AppSettings) -> AppResult<()> {
+/// Overwrite the whole file. Writers outside this module go through
+/// [`update_settings`] (read-modify-write under the write lock) instead.
+pub(crate) fn save_settings(settings: &AppSettings) -> AppResult<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -239,15 +241,25 @@ impl AppSettings {
         self.last_sync_attempt = crate::sync::SyncStatus::default();
     }
 
-    /// Drop the last-attempt record of every kind whose flag is off. Returns
-    /// the kinds dropped, so the caller can forget them in memory too.
-    pub fn drop_sync_attempts_for_off_kinds(&mut self) -> Vec<crate::sync::SyncKind> {
+    /// After a toggle change, drop the last-attempt record of every kind that
+    /// is now off, just went from off to on, or changed owner (`before` /
+    /// `before_owner` are the values prior to the change) — a record never
+    /// outlives its toggle or carries over to another account. Returns the
+    /// kinds dropped, so the caller can forget them in memory too.
+    pub fn drop_stale_sync_attempts(
+        &mut self,
+        before: SyncPrefs,
+        before_owner: Option<&str>,
+    ) -> Vec<crate::sync::SyncKind> {
+        let owner_changed = self.sync_owner.as_deref() != before_owner;
         let mut dropped = Vec::new();
-        for kind in [crate::sync::SyncKind::History, crate::sync::SyncKind::Library] {
-            if !self.flag(kind) {
-                if self.last_sync_attempt.get(kind).is_some() {
-                    self.last_sync_attempt.set(kind, None);
-                }
+        for (kind, was_on) in [
+            (crate::sync::SyncKind::History, before.history_sync),
+            (crate::sync::SyncKind::Library, before.library_sync),
+        ] {
+            let on = self.flag(kind);
+            if !on || !was_on || owner_changed {
+                self.last_sync_attempt.set(kind, None);
                 dropped.push(kind);
             }
         }
@@ -332,9 +344,12 @@ pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
 /// return the new effective pair. Enabling requires a signed-in user (the
 /// opt-in is bound to their Clerk id); disabling always succeeds.
 pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
+    // The keychain read stays outside the write lock.
+    let sub = crate::auth::current_identity().map(|(sub, _)| sub);
     let _guard = SETTINGS_WRITE_LOCK.lock();
     let mut settings = load_settings()?;
-    let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    let before = settings.sync_prefs();
+    let before_owner = settings.sync_owner.clone();
     match sub.as_deref() {
         Some(me) if !me.is_empty() => settings.set_sync_opted_in_by(kind, enabled, me),
         _ if enabled => {
@@ -342,9 +357,10 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
         }
         _ => settings.set_flag(kind, false),
     }
-    // A toggle that is off shows no status, and keeps none.
-    for off in settings.drop_sync_attempts_for_off_kinds() {
-        crate::sync::status::forget(off);
+    // A toggle that is off shows no status and keeps none; one just turned on
+    // (or now owned by another account) starts with none.
+    for stale in settings.drop_stale_sync_attempts(before, before_owner.as_deref()) {
+        crate::sync::status::forget(stale);
     }
     save_settings(&settings)?;
     Ok(settings.sync_prefs_for(sub.as_deref()))
@@ -433,10 +449,9 @@ pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig)
     update_settings(|s| s.issue_tracker = Some(config))
 }
 
-/// Persist git credentials for a host.  NOTE: save_settings does a full-file
-/// overwrite (last-write-wins). Callers must read-modify-write to avoid
-/// clobbering fields they don't own. Not safe for concurrent writers, but the
-/// app is single-window so that's acceptable.
+/// Persist git credentials for a host. Goes through [`update_settings`], so it
+/// is a read-modify-write under the settings write lock and can't clobber a
+/// concurrent writer's fields.
 pub fn save_git_credentials(host: &str, username: &str, token: &str) -> AppResult<()> {
     update_settings(|s| {
         s.git_credentials.insert(

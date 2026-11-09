@@ -90,4 +90,18 @@ describe("syncPrefsStore", () => {
     await useSyncPrefsStore.getState().loadStatus();
     expect(useSyncPrefsStore.getState().status).toEqual({ history: null, library: null });
   });
+
+  it("a slower, older status load never overwrites a newer one", async () => {
+    const older = { at: "2026-11-09T14:01:00Z", outcome: "sent", count: 1 };
+    const newer = { at: "2026-11-09T14:02:00Z", outcome: "sent", count: 3 };
+    let release: (v: unknown) => void = () => {};
+    getSyncStatus
+      .mockReturnValueOnce(new Promise((r) => (release = r)))
+      .mockResolvedValueOnce({ history: newer, library: null });
+    const first = useSyncPrefsStore.getState().loadStatus();
+    await useSyncPrefsStore.getState().loadStatus();
+    release({ history: older, library: null });
+    await first;
+    expect(useSyncPrefsStore.getState().status.history).toEqual(newer);
+  });
 });

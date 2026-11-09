@@ -56,7 +56,7 @@ export function syncRowState({
 }
 
 /** The last-attempt line under one enabled Sync toggle (muted mono; amber
- *  when the last attempt failed or uploads are paused). Nothing when off. */
+ *  when the last attempt failed). Nothing when off. */
 export function SyncStatusNote({
   kind,
   enabled,

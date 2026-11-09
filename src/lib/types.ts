@@ -504,7 +504,7 @@ export interface SyncPrefs {
 export type SyncKind = "history" | "library";
 
 /** How the last push attempt for one sync kind ended. */
-export type SyncAttemptOutcome = "sent" | "failed" | "signedOut";
+export type SyncAttemptOutcome = "sent" | "failed";
 
 /** The last push attempt for one sync kind: time, outcome, count, HTTP status
  *  — nothing else is kept (#518). */

@@ -14808,18 +14808,15 @@ mod sync_status_tests {
     }
 
     #[tokio::test]
-    async fn signed_out_push_records_signed_out() {
+    async fn signed_out_push_records_nothing() {
         reset(true, true);
         test_net::set(Some(dead_base().await), Some(None));
         let client = reqwest::Client::new();
         assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::SignedOut);
+        let detail = crate::sync::SyncRunDetail { run_id: "a".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::SignedOut);
         let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
         assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::SignedOut);
-        let s = status::snapshot();
-        assert_eq!(s.history.unwrap().outcome, AttemptOutcome::SignedOut);
-        assert_eq!(s.library.unwrap().outcome, AttemptOutcome::SignedOut);
-        // Signing back in drops the "Paused" record.
-        assert!(status::forget_signed_out());
         assert!(status::snapshot().is_empty());
     }
 
@@ -14849,7 +14846,7 @@ mod sync_status_tests {
             (PushOutcome::Empty, None),
             (PushOutcome::Sent, Some(AttemptOutcome::Sent)),
             (PushOutcome::Failed, Some(AttemptOutcome::Failed)),
-            (PushOutcome::SignedOut, Some(AttemptOutcome::SignedOut)),
+            (PushOutcome::SignedOut, None),
         ] {
             reset(true, true);
             crate::sync::record_push(SyncKind::History, outcome, 4, Some(500));
@@ -14932,22 +14929,70 @@ mod sync_status_tests {
         assert_eq!(back.last_sync_attempt, s.last_sync_attempt);
     }
 
-    #[test]
-    fn turning_a_kind_off_or_signing_out_drops_its_record() {
-        let rec = SyncAttempt {
+    fn a_record() -> SyncAttempt {
+        SyncAttempt {
             at: "2026-11-09T14:02:00Z".into(),
             outcome: AttemptOutcome::Sent,
             count: 1,
             http_status: None,
-        };
+        }
+    }
+
+    /// Apply one toggle change the way `set_sync_opted_in` does.
+    fn toggle(s: &mut AppSettings, kind: SyncKind, on: bool, sub: &str) -> Vec<SyncKind> {
+        let before = s.sync_prefs();
+        let before_owner = s.sync_owner.clone();
+        s.set_sync_opted_in_by(kind, on, sub);
+        s.drop_stale_sync_attempts(before, before_owner.as_deref())
+    }
+
+    #[test]
+    fn a_record_never_outlives_its_toggle_or_its_account() {
+        let rec = a_record();
         let mut s = AppSettings::default();
-        s.set_sync_opted_in_by(SyncKind::History, true, "user_1");
-        s.set_sync_opted_in_by(SyncKind::Library, true, "user_1");
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        toggle(&mut s, SyncKind::Library, true, "user_1");
         s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
-        s.set_sync_opted_in_by(SyncKind::Library, false, "user_1");
-        s.drop_sync_attempts_for_off_kinds();
+        // Re-asserting an ON toggle keeps both records.
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        assert!(s.last_sync_attempt.history.is_some() && s.last_sync_attempt.library.is_some());
+
+        // Off drops that kind only.
+        toggle(&mut s, SyncKind::Library, false, "user_1");
         assert!(s.last_sync_attempt.history.is_some());
         assert!(s.last_sync_attempt.library.is_none());
+
+        // Off → on starts clean, even if a stale record slipped in meanwhile.
+        s.last_sync_attempt.library = Some(rec.clone());
+        toggle(&mut s, SyncKind::Library, true, "user_1");
+        assert!(s.last_sync_attempt.library.is_none());
+
+        // Another account turning a sync on never inherits the first one's record.
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
+        toggle(&mut s, SyncKind::History, true, "user_2");
+        assert!(s.last_sync_attempt.is_empty());
+    }
+
+    #[test]
+    fn persisting_never_re_adds_a_kind_turned_off_meanwhile() {
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+        crate::sync::record_push(SyncKind::Library, PushOutcome::Sent, 2, None);
+        // On disk, library was turned off after the push recorded.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_1");
+        crate::sync::merge_status_into(&mut s);
+        assert_eq!(s.last_sync_attempt.history.as_ref().map(|r| r.count), Some(3));
+        assert!(s.last_sync_attempt.library.is_none(), "kept off disk");
+        assert!(status::snapshot().library.is_none(), "and forgotten in memory");
+    }
+
+    #[test]
+    fn sign_out_and_stale_saves_handle_the_record() {
+        let rec = a_record();
+        let mut s = AppSettings::default();
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        s.last_sync_attempt = SyncStatus { history: Some(rec), library: None };
 
         // A stale whole-file save from a settings pane carries the record over.
         let mut incoming = AppSettings::default();

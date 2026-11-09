@@ -41,14 +41,6 @@ describe("syncStatusLine (#518, PM-approved strings)", () => {
     );
   });
 
-  it("signed out: amber pause note", () => {
-    const paused: SyncAttempt = { ...sent(2), outcome: "signedOut" };
-    expect(syncStatusLine("history", true, paused, NOW)).toEqual({
-      text: "Paused: sign in again to resume uploads",
-      tone: "warning",
-    });
-  });
-
   it("adds the date when the attempt wasn't today", () => {
     const yesterday = sent(3, at(2026, 10, 8, 9, 5));
     expect(syncStatusLine("history", true, yesterday, NOW)?.text).toBe(
@@ -74,7 +66,7 @@ describe("syncStatusLine (#518, PM-approved strings)", () => {
 
   it("shows nothing when the toggle is off, nothing is recorded, or the time is unreadable", () => {
     expect(syncStatusLine("history", false, sent(3), NOW)).toBeNull();
-    expect(syncStatusLine("library", false, { ...sent(1), outcome: "signedOut" }, NOW)).toBeNull();
+    expect(syncStatusLine("library", false, { ...sent(1), outcome: "failed", httpStatus: 503 }, NOW)).toBeNull();
     expect(syncStatusLine("history", true, null, NOW)).toBeNull();
     expect(syncStatusLine("history", true, undefined, NOW)).toBeNull();
     expect(syncStatusLine("history", true, { ...sent(3), at: "garbage" }, NOW)).toBeNull();

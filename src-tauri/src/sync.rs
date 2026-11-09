@@ -112,14 +112,15 @@ pub(crate) const MAX_PUSH: usize = 500;
 
 // ─── Last sync attempt (Settings › Account › Sync status line, #518) ─────────
 
-/// How the last push attempt for one kind ended. Only the outcomes the user can
-/// act on or be reassured by are kept: `Disabled` and `Empty` never record.
+/// How the last push attempt for one kind ended. Only a request that was
+/// actually made records: `Disabled`, `Empty` and `SignedOut` never do (a
+/// signed-out push only happens after the session was revoked and cleared, and
+/// the owner-bound status then reads as off anyway).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum AttemptOutcome {
     Sent,
     Failed,
-    SignedOut,
 }
 
 /// The last push attempt for one sync kind. **Exactly these four fields** —
@@ -225,34 +226,17 @@ pub mod status {
     pub(crate) fn forget(kind: SyncKind) {
         with(|s| s.set(kind, None));
     }
-
-    /// Drop every "signed out" record (after a successful sign-in, so the
-    /// "Paused" line doesn't outlive its cause). Returns whether any went.
-    pub(crate) fn forget_signed_out() -> bool {
-        with(|s| {
-            let mut changed = false;
-            for kind in [SyncKind::History, SyncKind::Library] {
-                if s.get(kind).map(|a| a.outcome) == Some(super::AttemptOutcome::SignedOut) {
-                    s.set(kind, None);
-                    changed = true;
-                }
-            }
-            changed
-        })
-    }
 }
 
-/// Record what a push did. `Disabled` and `Empty` record nothing, and neither
-/// does an attempt that finishes after the user turned the toggle off.
+/// Record what a push did. `Disabled`, `Empty` and `SignedOut` record nothing,
+/// and neither does an attempt that finishes after the user turned the toggle
+/// off (checked here, and again under the settings write lock when persisting).
 pub(crate) fn record_push(kind: SyncKind, outcome: PushOutcome, count: usize, http_status: Option<u16>) {
     let outcome = match outcome {
-        PushOutcome::Disabled | PushOutcome::Empty => return,
+        PushOutcome::Disabled | PushOutcome::Empty | PushOutcome::SignedOut => return,
         PushOutcome::Sent => AttemptOutcome::Sent,
         PushOutcome::Failed => AttemptOutcome::Failed,
-        PushOutcome::SignedOut => AttemptOutcome::SignedOut,
     };
-    // The flag alone, not the owner check: a revoked session reads as "no
-    // owner", and that is exactly the SignedOut case worth recording.
     if !crate::settings::sync_flag_on(kind) {
         return;
     }
@@ -275,13 +259,26 @@ pub(crate) fn record_push(kind: SyncKind, outcome: PushOutcome, count: usize, ht
 /// A run-detail push is the second half of one run's upload: its metadata went
 /// first (`push_runs`), so a *successful* detail push leaves an existing record
 /// alone — it never turns "3 runs" into "1 run", and never hides a metadata
-/// failure. A failed or signed-out detail push records like any other, counting
-/// the one run whose detail didn't go.
+/// failure. A failed detail push records like any other, counting the one run
+/// whose detail didn't go.
 pub(crate) fn record_detail_push(outcome: PushOutcome, http_status: Option<u16>) {
     if outcome == PushOutcome::Sent && status::with(|s| s.history.is_some()) {
         return;
     }
     record_push(SyncKind::History, outcome, 1, http_status);
+}
+
+/// Fold the in-memory record into `settings` (called under the settings write
+/// lock). A kind whose flag is off on disk is forgotten in memory and kept off
+/// disk, so an attempt racing a toggle-off can never be re-added.
+pub(crate) fn merge_status_into(settings: &mut crate::settings::AppSettings) {
+    let prefs = settings.sync_prefs();
+    for (kind, on) in [(SyncKind::History, prefs.history_sync), (SyncKind::Library, prefs.library_sync)] {
+        if !on {
+            status::forget(kind);
+        }
+    }
+    settings.last_sync_attempt = status::snapshot();
 }
 
 /// Write the in-memory record to `settings.json` off the push path. The
@@ -292,7 +289,7 @@ pub(crate) fn persist_status() {
         return; // tests never touch the real settings file
     }
     let job = || {
-        if let Err(e) = crate::settings::update_settings(|s| s.last_sync_attempt = status::snapshot()) {
+        if let Err(e) = crate::settings::update_settings(merge_status_into) {
             tracing::debug!("sync status: could not persist the last attempt: {e}");
         }
     };
@@ -577,7 +574,6 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
         return PushOutcome::Disabled;
     }
     let Some(token) = access_token().await else {
-        record_detail_push(PushOutcome::SignedOut, None);
         return PushOutcome::SignedOut; // signed out → skip silently
     };
     let body = serde_json::json!({ "run_id": detail.run_id, "data": detail });
@@ -689,7 +685,6 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
     let batch: Vec<SyncRun> = runs.into_iter().take(MAX_PUSH).collect();
     let count = batch.len();
     let Some(token) = access_token().await else {
-        record_push(SyncKind::History, PushOutcome::SignedOut, count, None);
         return PushOutcome::SignedOut; // signed out / no valid token → skip silently
     };
     let body = serde_json::json!({ "runs": batch });
@@ -837,7 +832,6 @@ pub async fn push_library_items(
     }
     let count = items.len();
     let Some(token) = access_token().await else {
-        record_push(SyncKind::Library, PushOutcome::SignedOut, count, None);
         return PushOutcome::SignedOut; // signed out → skip silently
     };
     let url = format!("{}/api/sync-library", api_base());

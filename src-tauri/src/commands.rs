@@ -2387,12 +2387,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
 /// session in the OS keychain. Returns the resulting auth status.
 #[tauri::command]
 pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
-    let status = crate::auth::begin_sign_in().await?;
-    // Signed back in: a "Paused: sign in again" sync status no longer applies.
-    if status.signed_in && crate::sync::status::forget_signed_out() {
-        crate::sync::persist_status();
-    }
-    Ok(status)
+    crate::auth::begin_sign_in().await
 }
 
 /// Clear the stored session (sign out locally). Also drops the local run-history

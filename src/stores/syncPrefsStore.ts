@@ -34,6 +34,10 @@ interface SyncPrefsState extends SyncPrefs {
 
 const NO_STATUS: SyncStatus = { history: null, library: null };
 
+/** Bumped by every status load, so an older, slower answer never overwrites
+ *  a newer one. */
+let statusSeq = 0;
+
 const OFF: SyncPrefs = { historySync: false, librarySync: false };
 
 /** Bumped by every write, so a load that started before a write can never
@@ -49,6 +53,7 @@ export const useSyncPrefsStore = create<SyncPrefsState>((set, get) => ({
   status: NO_STATUS,
 
   loadStatus: async () => {
+    const seq = ++statusSeq;
     let status: SyncStatus;
     try {
       const s = await ipc.getSyncStatus();
@@ -56,6 +61,7 @@ export const useSyncPrefsStore = create<SyncPrefsState>((set, get) => ({
     } catch {
       status = NO_STATUS;
     }
+    if (seq !== statusSeq) return; // a newer load is in flight — its answer wins
     set({ status });
   },
 
