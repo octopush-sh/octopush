@@ -133,6 +133,7 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                 <button
                   type="button"
                   onClick={() => void pickCrewFile()}
+                  title="Choose a crew file"
                   className="flex items-center gap-1.5 font-mono text-[11px] text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
                 >
                   <FileUp size={12} aria-hidden /> or choose a .octocrew.json file
@@ -222,7 +223,8 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                           {s.instructions}
                         </pre>
                       )}
-                      {s.problem && <p className="m-0 mt-1.5 font-mono text-[11px] text-octo-rouge">Stage {s.position + 1}: {s.problem}</p>}
+                      {/* The backend's message already names the stage once. */}
+                      {s.problem && <p className="m-0 mt-1.5 font-mono text-[11px] text-octo-rouge">{s.problem}</p>}
                     </li>
                   ))}
                 </ol>
@@ -270,7 +272,7 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
           <button
             type="button"
             onClick={close}
-            className="rounded-md border border-octo-hairline px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage"
+            className="rounded-md border border-octo-border-strong px-3 py-2 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage"
           >
             Cancel
           </button>

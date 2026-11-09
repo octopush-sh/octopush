@@ -2,7 +2,7 @@
 //! as a versioned, human-readable `*.octocrew.json` file:
 //!
 //! ```text
-//! { "octocrew": 1, "minApp": "0.4.115",
+//! { "octocrew": 1, "minApp": "0.4.116",
 //!   "pipeline": { "name": "…", "description": "…", "stages": [ /* StageDraft[] */ ] },
 //!   "roles": [ /* RoleDef[]: only the custom roles the stages use */ ] }
 //! ```
@@ -22,6 +22,10 @@ use std::path::Path;
 
 /// The file format this build writes and the newest it reads.
 pub const CREW_FORMAT: u32 = 1;
+/// The oldest app that reads format 1: the version that shipped portable
+/// crews. Fixed per format (never the exporting app's own version), so
+/// teammates on different patch versions can share files.
+pub const CREW_MIN_APP: &str = "0.4.116";
 /// A crew file is a few KB; anything far larger is not one.
 pub const MAX_CREW_BYTES: u64 = 512 * 1024;
 /// Where a repo keeps its committed crews, relative to the worktree.
@@ -142,7 +146,7 @@ pub fn export(db: &Db, pipeline_id: &str) -> AppResult<CrewFile> {
     }
     Ok(CrewFile {
         octocrew: CREW_FORMAT,
-        min_app: env!("CARGO_PKG_VERSION").to_string(),
+        min_app: CREW_MIN_APP.to_string(),
         pipeline: CrewPipeline { name: head.name, description: head.description, stages },
         roles,
     })
@@ -193,6 +197,17 @@ pub fn parse(text: &str) -> AppResult<CrewFile> {
         )));
     }
     Ok(crew)
+}
+
+/// A stage's validator message as one sentence that names the stage once:
+/// `stage 1 has no model` → `Stage 1 has no model`, `unknown tool 'x'` →
+/// `Stage 2: unknown tool 'x'`. `save_pipeline`'s own messages are unchanged.
+pub fn stage_message(position: usize, msg: &str) -> String {
+    let n = position + 1;
+    match msg.strip_prefix(&format!("stage {n} ")) {
+        Some(rest) => format!("Stage {n} {rest}"),
+        None => format!("Stage {n}: {msg}"),
+    }
 }
 
 /// Same definition, ignoring the key and the built-in flag (an import is
@@ -376,7 +391,7 @@ pub fn preview(db: &Db, crew: &CrewFile, model_swaps: &[(String, String)]) -> Ap
                 .or_else(|| role.as_ref().map(|r| r.default_tools.clone()))
                 .unwrap_or_default(),
             instructions: s.instructions.clone().filter(|t| !t.trim().is_empty()),
-            problem: issues.iter().find(|(p, _)| *p == i).map(|(_, m)| m.clone()),
+            problem: issues.iter().find(|(p, _)| *p == i).map(|(p, m)| stage_message(*p, m)),
         });
     }
     let ok = plan.problems.is_empty() && issues.is_empty();
@@ -399,7 +414,7 @@ pub fn import(db: &Db, crew: &CrewFile, model_swaps: &[(String, String)]) -> App
         return Err(AppError::Other(p.clone()));
     }
     if let Some((i, msg)) = db.pipeline_stage_issues(&plan.stages, &plan.resolved)?.into_iter().next() {
-        return Err(AppError::Other(format!("stage {}: {msg}", i + 1)));
+        return Err(AppError::Other(stage_message(i, &msg)));
     }
     let mut saved: Vec<&str> = Vec::new();
     for r in &plan.to_save {
@@ -436,11 +451,16 @@ pub fn read_file(path: &Path) -> AppResult<String> {
 
 /// The crews committed under `<worktree>/.octopush/crews/*.octocrew.json`,
 /// sorted by file name and re-read on every call, so an edit on disk shows the
-/// next time the launcher opens. Symlinks are skipped (a repo must not point
-/// the app at files outside it); an unreadable or invalid file is listed with
-/// its problem rather than hidden.
+/// next time the launcher opens. Symlinks are skipped — the files and the
+/// `.octopush` / `.octopush/crews` folders alike (a repo must not point the
+/// app at files outside it); an unreadable or invalid file is listed with its
+/// problem rather than hidden.
 pub fn scan_repo(worktree: &Path) -> Vec<RepoCrew> {
     let dir = worktree.join(REPO_CREWS_DIR);
+    let real_dir = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.is_dir()).unwrap_or(false);
+    if !dir.parent().is_some_and(real_dir) || !real_dir(&dir) {
+        return Vec::new();
+    }
     let Ok(entries) = std::fs::read_dir(&dir) else { return Vec::new() };
     let mut files: Vec<(String, std::path::PathBuf)> = entries
         .flatten()

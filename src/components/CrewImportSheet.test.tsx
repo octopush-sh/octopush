@@ -106,11 +106,17 @@ describe("CrewImportSheet", () => {
       ...GOOD,
       ok: false,
       problems: ["role 'odd' has an unknown tool 'teleport'"],
-      stages: [stage({ position: 0, problem: "unknown tool 'format_disk'" })],
+      stages: [
+        stage({ position: 0, problem: "Stage 1 instructions are too long (max 8000 characters)" }),
+        stage({ position: 1, problem: "Stage 2: unknown tool 'format_disk'" }),
+      ],
     });
     useCrewImportStore.getState().show("{crew}", null);
     render(<CrewImportHost />);
-    expect(await screen.findByText("Stage 1: unknown tool 'format_disk'")).toBeInTheDocument();
+    // The backend's message names the stage; the sheet doesn't add a second prefix.
+    expect(await screen.findByText("Stage 1 instructions are too long (max 8000 characters)")).toBeInTheDocument();
+    expect(screen.getByText("Stage 2: unknown tool 'format_disk'")).toBeInTheDocument();
+    expect(screen.queryByText(/Stage \d+: Stage/i)).not.toBeInTheDocument();
     expect(screen.getByText("role 'odd' has an unknown tool 'teleport'")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add this crew to my library" })).toBeDisabled();
     expect(screen.getByText(/nothing was saved/)).toBeInTheDocument();
@@ -123,6 +129,44 @@ describe("CrewImportSheet", () => {
     expect(await screen.findByText(/isn't an Octopush crew/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Try another crew" }));
     expect(await screen.findByLabelText("Crew JSON")).toBeInTheDocument();
+  });
+
+  it("Escape closes the sheet without importing", async () => {
+    previewMock.mockResolvedValue(GOOD);
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    expect(await screen.findByText("Bugfix relay")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(useCrewImportStore.getState().open).toBe(false));
+    expect(screen.queryByText("Bugfix relay")).not.toBeInTheDocument();
+    expect(importMock).not.toHaveBeenCalled();
+  });
+
+  it("shows the loading state while the preview is pending", async () => {
+    let resolve: (p: CrewPreview) => void = () => {};
+    previewMock.mockReturnValue(new Promise<CrewPreview>((r) => (resolve = r)));
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    expect(screen.getByText("Reading the crew…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Add this crew to my library" })).toBeDisabled();
+    resolve(GOOD);
+    expect(await screen.findByText("Bugfix relay")).toBeInTheDocument();
+    expect(screen.queryByText("Reading the crew…")).not.toBeInTheDocument();
+  });
+
+  it("a failed import shows its error, keeps the sheet open and re-enables the CTA", async () => {
+    previewMock.mockResolvedValue(GOOD);
+    importMock.mockRejectedValue(new Error("other: database is locked"));
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    const cta = await screen.findByRole("button", { name: "Add this crew to my library" });
+    await waitFor(() => expect(cta).toBeEnabled());
+    fireEvent.click(cta);
+    expect(await screen.findByText("database is locked")).toBeInTheDocument();
+    expect(useCrewImportStore.getState().open).toBe(true);
+    expect(screen.getByText("Bugfix relay")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("button", { name: "Add this crew to my library" })).toBeEnabled());
+    expect(createRunMock).not.toHaveBeenCalled();
   });
 
   it("pasted JSON goes to the review", async () => {

@@ -15571,6 +15571,9 @@ mod crew_tests {
 
         let p = crew::preview(&db, &file, &[]).unwrap();
         assert!(!p.ok);
+        // Each message names its stage exactly once.
+        assert_eq!(p.stages[0].problem.as_deref(), Some("Stage 1 instructions are too long (max 8000 characters)"));
+        assert_eq!(p.stages[1].problem.as_deref(), Some("Stage 2: unknown tool 'format_disk'"));
         assert!(p.stages[0].problem.as_deref().unwrap().contains("too long"));
         assert!(p.stages[1].problem.as_deref().unwrap().contains("unknown tool 'format_disk'"));
         assert!(p.stages[2].problem.as_deref().unwrap().contains("loop target"));
@@ -15578,6 +15581,14 @@ mod crew_tests {
         assert!(p.problems.iter().any(|m| m.contains("teleport")));
 
         assert!(crew::import(&db, &file, &[]).is_err());
+        let mut no_role_problem = file.clone();
+        no_role_problem.roles.clear();
+        let err = crew::import(&db, &no_role_problem, &[]).unwrap_err().to_string();
+        assert!(err.contains("Stage 1 instructions are too long"), "{err}");
+        assert!(!err.to_lowercase().contains("stage 1: stage 1"), "{err}");
+        // save_pipeline's own messages are unchanged.
+        let save_err = db.save_pipeline(None, "Broken", "", &no_role_problem.pipeline.stages).unwrap_err().to_string();
+        assert!(save_err.contains("stage 1 instructions are too long"), "{save_err}");
         assert_eq!(db.list_pipelines().unwrap().len(), pipelines_before);
         assert_eq!(db.list_roles().unwrap().len(), roles_before);
         assert!(db.get_role("odd").unwrap().is_none());
@@ -15593,6 +15604,47 @@ mod crew_tests {
         assert!(crew::parse(later).unwrap_err().to_string().contains("99.0.0"));
         let ok = r#"{"octocrew":1,"minApp":"0.1.0","pipeline":{"name":"x","stages":[]}}"#;
         assert!(crew::parse(ok).is_ok());
+    }
+
+    #[test]
+    fn a_format_1_file_carries_the_fixed_floor_and_imports() {
+        let (a, _ta) = test_db();
+        let pid = a.save_pipeline(None, "Relay", "", &[draft("plan")]).unwrap();
+        let exported = crew::export(&a, &pid).unwrap();
+        // The floor for format 1, never the exporting app's version.
+        assert_eq!(exported.min_app, crew::CREW_MIN_APP);
+        let text = format!(
+            r#"{{"octocrew":1,"minApp":"{}","pipeline":{{"name":"Floor","stages":[{}]}}}}"#,
+            crew::CREW_MIN_APP,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        let (b, _tb) = test_db();
+        let id = crew::import(&b, &crew::parse(&text).unwrap(), &[]).unwrap();
+        assert_eq!(b.pipeline_stage_drafts(&id).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_scan_skips_a_symlinked_crews_folder() {
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("crews");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let body = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"Outside","stages":[{}]}}}}"#,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        std::fs::write(elsewhere.join("a.octocrew.json"), body).unwrap();
+
+        // `.octopush/crews` itself is a link out of the worktree.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt.path().join(".octopush")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wt.path().join(crew::REPO_CREWS_DIR)).unwrap();
+        assert!(crew::scan_repo(wt.path()).is_empty());
+
+        // `.octopush` is a link out of the worktree.
+        let wt2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), wt2.path().join(".octopush")).unwrap();
+        assert!(crew::scan_repo(wt2.path()).is_empty());
     }
 
     #[test]
