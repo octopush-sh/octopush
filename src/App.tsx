@@ -2483,7 +2483,6 @@ function App() {
               activeWorkspace
                 ? {
                     gitStatus,
-                    gitDiff,
                     workspacePath: activeWorkspace.worktreePath || activeProject?.path || "",
                   }
                 : null

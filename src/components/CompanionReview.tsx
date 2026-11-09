@@ -23,28 +23,19 @@ interface Props {
   workspaceId: string;
   workspacePath: string;
   gitStatus: GitStatus | null;
-  gitDiff: string;
   /** Jump to a file in the diff (scrolls + highlights). */
   onJump?: (file: string, line: number | null) => void;
 }
 
-export function CompanionReview({ workspaceId, workspacePath, gitStatus, gitDiff, onJump }: Props) {
+export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump }: Props) {
   const files = gitStatus?.changedFiles ?? [];
   const staged = files.filter((f) => f.staged).length;
   const conflicted = gitStatus?.conflicted ?? 0;
   const fileCount = files.length;
 
-  const { addCount, delCount } = useMemo(() => {
-    if (!gitDiff) return { addCount: 0, delCount: 0 };
-    let a = 0, d = 0;
-    for (const l of gitDiff.split("\n")) {
-      if (l.startsWith("+") && !l.startsWith("+++")) a++;
-      else if (l.startsWith("-") && !l.startsWith("---")) d++;
-    }
-    return { addCount: a, delCount: d };
-  }, [gitDiff]);
-
   // ── Verdict — deliberately AI-free; the AI review lives in the diff. ──
+  // The file count and +/− stat live once, in the mode band's tail; the
+  // verdict names its unit ("files") so it reads against the diff's hunks.
   const verdict =
     fileCount === 0
       ? { text: "Working tree is clean.", tone: "text-octo-mute" }
@@ -52,22 +43,14 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, gitDiff
         ? { text: `Resolve ${conflicted} conflict${conflicted !== 1 ? "s" : ""} first.`, tone: "text-octo-rouge" }
         : staged > 0
           ? { text: `${staged} staged · ready to commit.`, tone: "text-octo-ivory" }
-          : { text: `${fileCount} change${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
+          : { text: `${fileCount} file${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
       {/* ── Readiness hero ──────────────────────────────────────── */}
       <div className="border-b border-octo-hairline px-4 py-3">
         <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Review</div>
-        <div className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
-        {fileCount > 0 && (
-          <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute octo-tabular">
-            <span>{fileCount} file{fileCount !== 1 ? "s" : ""}</span>
-            {addCount > 0 && <span className="text-octo-verdigris">+{addCount}</span>}
-            {delCount > 0 && <span className="text-octo-rouge">−{delCount}</span>}
-            {staged > 0 && <span className="text-octo-sage">{staged} staged</span>}
-          </div>
-        )}
+        <div data-tour="review-companion-verdict" className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
       </div>
 
       {/* ── Provenance ──────────────────────────────────────────── */}

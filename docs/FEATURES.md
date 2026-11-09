@@ -133,7 +133,7 @@ Terminal navigation lives on the **canvas**, not in the Companion: collapsing th
 - **Empty state** — "No sessions open." _Support:_ `CompanionSession.tsx`.
 
 ### Companion · Review cockpit (CompanionReview)
-- **Readiness verdict** — One-line AI-free verdict from working-tree state: clean / "Resolve N conflicts first" (rouge) / "N staged · ready to commit" / "N changes to review", plus a file/+adds/−dels/staged summary. _Support:_ `src/components/CompanionReview.tsx`. _Entry:_ Review Companion.
+- **Readiness verdict** — One-line AI-free verdict from working-tree state: clean / "Resolve N conflicts first" (rouge) / "N staged · ready to commit" / "N files to review" (the unit is files, matching the diff). No count line under it: the file count and +/− stat live once, in the mode band's tail (`ReviewTail`). _Support:_ `src/components/CompanionReview.tsx`. _Entry:_ Review Companion.
 - **Provenance ("How this change was built")** — Traces which agent turns shaped the changed files: "Shaped by N agent turns across M files"; each turn expandable to show its model + truncated message; file chips jump into the diff. States: tracing/loading, "likely hand-written", or the turn list. _Support:_ `CompanionReview.tsx`; `ipc.listFileEdits`, `ipc.getMessage`. _Entry:_ Review Companion.
 - **Branch & publish** — Sync line: "Not published yet" / "Up to date with origin" / "↑ahead · ↓behind", or a mute "—" (tooltip "Ahead/behind unknown…") when git couldn't count the commits in time (`aheadBehindKnown` false); plus last commit short-SHA + subject. _Support:_ `CompanionReview.tsx`; `ipc.getLastCommit`. _Entry:_ Review Companion.
 

@@ -58,7 +58,7 @@ interface Props {
   issueTrackerConfigured: boolean;
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
   /** Review-mode context for the companion cockpit (scope, provenance, sync). */
-  reviewProps?: { gitStatus: GitStatus | null; gitDiff: string; workspacePath: string } | null;
+  reviewProps?: { gitStatus: GitStatus | null; workspacePath: string } | null;
   /** Jump to a file in the diff from the companion (e.g. a provenance chip). */
   onJumpToFile?: (file: string, line: number | null) => void;
   /** Collapsed state is owned by the parent (App), mirroring the rail. When
@@ -234,7 +234,6 @@ export function Companion({
             workspaceId={workspaceId}
             workspacePath={reviewProps.workspacePath}
             gitStatus={reviewProps.gitStatus}
-            gitDiff={reviewProps.gitDiff}
             onJump={onJumpToFile}
           />
         )}
