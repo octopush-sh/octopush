@@ -95,7 +95,7 @@ sha2 = "0.11"
 keyring = { version = "3", features = ["apple-native"] }
 libc = "0.2"
 ctrlc = "3"
-sysinfo = { version = "0.32", default-features = false, features = ["system", "disk"] }
+sysinfo = { version = "0.40", default-features = false, features = ["system", "disk"] }
 # Reads a repo's `.conductor/settings.toml` to prefill the setup script
 # (`workspace_setup::conductor_setup_script`). Pinned to the toml already in
 # the lockfile (via tauri-utils), so it adds no crates.
