@@ -906,6 +906,7 @@ The flagship feature: compose pipelines of stages (each an AI agent with a role/
 - **All-premium savings baseline** — Savings computed against the priciest configured model for the tokens actually used; `savingsVsBaseline` floored at $0; `aggregateSavings` across runs. _Support:_ `lib/runStatus.ts`.
 - **TALK conversation cost** — "saved vs all-strong · $X · N%" under "spent $X", from the ledger. _Support:_ `CompanionContext.tsx`, `db::thread_cost`.
 - **Direct run ledger** — "{pct}% under all-premium"; completion "This run saved $X…". _Support:_ `RunLedger.tsx`.
+- **Grouped currency figures** — Amounts read with thousands separators ("$85,393.45", never "$85393.45") through one formatter, `formatUsd` (`Intl.NumberFormat` en-US, two decimals), in the Direct Companion (Runs ledger, run rows, current run), the run ledger strip, Mission Control (fleet ledger, card spend and saving, "While you were away") and the launcher estimate. _Support:_ `lib/cost.ts::formatUsd`.
 - **Local-model savings estimate** — `usage_breakdown` classifies cloud/local and estimates local savings at the blended (input+output)/2 rate of the **cheapest enabled non-local model in the catalog** (falls back to ~$0.21/M if none), instead of a stale hardcoded constant. _Support:_ `db.rs::usage_breakdown`.
 - **Tagline** — "The IDE for agentic developers — eight arms, zero wasted tokens." _Support:_ `settings/AboutPane.tsx`.
 

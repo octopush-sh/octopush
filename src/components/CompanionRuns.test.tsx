@@ -73,6 +73,16 @@ describe("CompanionRuns hub", () => {
     expect(screen.getByText("$0.40")).toBeInTheDocument();
   });
 
+  it("groups thousands in the ledger and the run rows", () => {
+    useRunsStore.setState({
+      runsByWs: { w1: [mkRun("a", "aborted", { baselineUsd: 85394.0, costUsd: 0.55 }), mkRun("b", "completed", { costUsd: 12843.27 })] },
+      activeRunIdByWs: {}, selectedRunIdByWs: {}, detailByRun: {}, selectedStageByRun: {},
+    });
+    render(<CompanionRuns workspaceId="w1" />);
+    expect(screen.getByText("$85,393.45")).toBeInTheDocument();
+    expect(screen.getByText("· $12,843.27")).toBeInTheDocument();
+  });
+
   it("hides the ledger when no run has a baseline", () => {
     render(<CompanionRuns workspaceId="w1" />); // default rows have baselineUsd 0
     expect(screen.queryByText(/across/)).not.toBeInTheDocument();

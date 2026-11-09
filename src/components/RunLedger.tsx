@@ -4,7 +4,7 @@ import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 import { OctoMark } from "./icons/OctoMark";
-import { budgetUnenforceableNote, unpricedTitle } from "../lib/cost";
+import { budgetUnenforceableNote, formatUsd, unpricedTitle } from "../lib/cost";
 
 interface Props {
   run: Run;
@@ -52,21 +52,21 @@ export function RunLedger({ run, stages }: Props) {
         <span className="text-octo-mute">saved</span>
         {run.baselineUsd > 0 ? (
           <>
-            <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span>
+            <span className="octo-tabular text-octo-verdigris">{formatUsd(saved)}</span>
             <span className="octo-tabular text-octo-mute">· {pct}% under all-premium</span>
           </>
         ) : (
           <span className="text-octo-mute">baseline unavailable</span>
         )}
         <span className="ml-auto text-octo-mute">spent</span>
-        <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>
+        <span className="octo-tabular text-octo-brass">{formatUsd(run.costUsd)}</span>
         {run.budgetUsd != null && (
           <span
             className={`octo-tabular ${
               run.costUsd >= run.budgetUsd ? "text-octo-rouge" : "text-octo-mute"
             }`}
           >
-            · budget ${run.budgetUsd.toFixed(2)}
+            · budget {formatUsd(run.budgetUsd)}
           </span>
         )}
         {run.budgetUsd != null && unpriced.length > 0 && (
@@ -99,7 +99,7 @@ export function RunLedger({ run, stages }: Props) {
               {s.unpricedModel && s.costUsd === 0 ? (
                 <span className="text-octo-mute" title={unpricedTitle([s.agentModel])}>unpriced</span>
               ) : (
-                <span className="octo-tabular text-octo-sage">${s.costUsd.toFixed(2)}</span>
+                <span className="octo-tabular text-octo-sage">{formatUsd(s.costUsd)}</span>
               )}
               {(s.inputTokens > 0 || s.outputTokens > 0) && (
                 <span className="octo-tabular text-octo-mute"> · ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}</span>
@@ -120,7 +120,7 @@ export function RunLedger({ run, stages }: Props) {
               <OctoMark size={20} state="pushed" className="[--octo-eye:var(--color-octo-panel)]" />
             )}
             <p className="m-0 font-serif text-sm text-octo-ivory">
-              This run saved <span className="octo-tabular text-octo-verdigris">${saved.toFixed(2)}</span> against the all-premium baseline.
+              This run saved <span className="octo-tabular text-octo-verdigris">{formatUsd(saved)}</span> against the all-premium baseline.
             </p>
           </div>
         </div>

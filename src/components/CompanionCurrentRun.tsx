@@ -5,6 +5,7 @@ import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { StageDots } from "./direct/StageDots";
 import { ClaudePlanLine } from "./ClaudePlanLine";
 import { runsClaudeCli } from "../lib/claudePlan";
+import { formatUsd } from "../lib/cost";
 
 interface Props {
   workspaceId: string;
@@ -59,7 +60,7 @@ export function CompanionCurrentRun({ workspaceId }: Props) {
       </div>
 
       <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
-        <span className="octo-tabular text-octo-brass">${run.costUsd.toFixed(2)}</span>
+        <span className="octo-tabular text-octo-brass">{formatUsd(run.costUsd)}</span>
         {(tokIn > 0 || tokOut > 0) && (
           <span className="octo-tabular" title="input / output tokens">↑{fmtTokens(tokIn)} ↓{fmtTokens(tokOut)}</span>
         )}
