@@ -441,6 +441,50 @@ fn probe_claude_version() -> Option<String> {
     parse_claude_version(&run_bounded(cmd, VERSION_TIMEOUT)?)
 }
 
+// ─── `claude auth status` → claude.ai sign-in end (2.1.318+) ──────
+
+pub const CLAUDE_AUTH_STATUS_ARGS: [&str; 2] = ["auth", "status"];
+
+/// When the stored claude.ai sign-in ends, epoch seconds, from
+/// `claude auth status`'s JSON (`loginExpiresAt`, Claude Code 2.1.318+).
+/// `None` when signed out (`loggedIn: false`), for an older CLI without the
+/// field, and for output that isn't the JSON object. The format isn't
+/// documented, so RFC 3339 text and epoch seconds or milliseconds are all
+/// accepted. Text around the object (a stderr warning) is skipped.
+pub fn parse_login_expires_at(output: &str) -> Option<i64> {
+    let start = output.find('{')?;
+    let end = output.rfind('}')?;
+    let v: serde_json::Value = serde_json::from_str(output.get(start..=end)?).ok()?;
+    if v.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(false) {
+        return None;
+    }
+    crate::orchestrator::cli_runner::expiry_secs(v.get("loginExpiresAt")?)
+}
+
+/// `claude auth status` with the login-shell PATH and environment the CLI
+/// stages use, through the Readiness probe runner (3 s, output capped, its
+/// process group killed). `None` when it is missing, hangs, or reports no
+/// sign-in end. What it prints (the account too) stays in memory: only the
+/// date is kept.
+pub fn probe_claude_login_expiry() -> Option<i64> {
+    use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
+    use crate::readiness::{run_probe, Probe, CHECK_TIMEOUT};
+    let path_env = resolved_cli_path();
+    let cmd = resolve_executable("claude", &path_env).map(|bin| {
+        let mut cmd = Command::new(bin);
+        cmd.args(CLAUDE_AUTH_STATUS_ARGS);
+        for (k, v) in login_shell_env() {
+            cmd.env(k, v);
+        }
+        cmd.env("PATH", &path_env);
+        cmd
+    });
+    match run_probe(cmd, CHECK_TIMEOUT) {
+        Probe::Exited { output, .. } => parse_login_expires_at(&output),
+        Probe::Missing | Probe::TimedOut => None,
+    }
+}
+
 // ─── Claude Code hooks (Run-mode attention, #287) ─────────────────
 //
 // In a worktree Octopush created, `Notification` (`permission_prompt`,

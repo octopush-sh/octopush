@@ -6462,14 +6462,28 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 }
 
 /// Settings › General readiness card: local checks (claude, auth mode, git,
-/// gh, Ollama), each bounded at 3 s, re-probed on every call.
+/// gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
+/// (an explicit Check again) also runs `claude auth status`; the sign-in end
+/// it reports is stored like a stage's, so the launcher and notes agree.
 #[tauri::command]
-pub async fn readiness_check(state: State<'_, AppState>) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
-    // The stored sign-in end, read before the blocking probes (no network).
+pub async fn readiness_check(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    ask_claude: Option<bool>,
+) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
+    // The stored sign-in end, read before the blocking probes.
     let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
-    tokio::task::spawn_blocking(move || crate::readiness::run_all(login))
+    let ask_claude = ask_claude.unwrap_or(false);
+    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude))
         .await
-        .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))
+        .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))?;
+    if let Some(expires_at) = probed {
+        let now = chrono::Utc::now().to_rfc3339();
+        if crate::claude_login::record(&state.db.lock(), expires_at, &now).is_ok() {
+            let _ = app.emit(crate::claude_login::LOGIN_EVENT, serde_json::json!({ "expiresAt": expires_at }));
+        }
+    }
+    Ok(checks)
 }
 
 /// One-click: register the bundled `octopush-mcp` server with Claude Code at

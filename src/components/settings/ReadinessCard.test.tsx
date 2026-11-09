@@ -94,6 +94,17 @@ describe("ReadinessCard", () => {
     expect(screen.queryByText(/Couldn't run the checks/)).toBeNull();
   });
 
+  it("asks claude auth status only on Check again, never on the automatic pass", async () => {
+    readinessCheck.mockResolvedValue([row({ id: "auth", label: "Claude auth", value: "Subscription" })]);
+    render(<ReadinessCard />);
+    await screen.findByTestId("readiness-row-auth");
+    expect(readinessCheck).toHaveBeenLastCalledWith(false);
+
+    fireEvent.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() => expect(readinessCheck).toHaveBeenCalledTimes(2));
+    expect(readinessCheck).toHaveBeenLastCalledWith(true);
+  });
+
   it("says 'Not checked yet' and offers 'Run the check' before the first run", () => {
     const check = vi.fn().mockResolvedValue(undefined);
     useReadinessStore.setState({ check });

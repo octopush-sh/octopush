@@ -270,7 +270,12 @@ pub(crate) fn credential_expiry_from_result(v: &Value) -> Option<i64> {
     if !is_result_event(v) {
         return None;
     }
-    let raw = v.get("credential_expires_at")?;
+    expiry_secs(v.get("credential_expires_at")?)
+}
+
+/// A sign-in end as epoch seconds: RFC 3339 text, or epoch seconds or
+/// milliseconds. `None` for anything else (null, `0`, unreadable text).
+pub(crate) fn expiry_secs(raw: &Value) -> Option<i64> {
     match raw.as_str() {
         Some(s) => chrono::DateTime::parse_from_rfc3339(s.trim()).ok().map(|d| d.timestamp()),
         None => epoch_secs(Some(raw)).filter(|s| *s > 0),
