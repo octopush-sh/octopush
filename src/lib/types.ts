@@ -503,6 +503,28 @@ export interface SyncPrefs {
 
 export type SyncKind = "history" | "library";
 
+/** How the last push attempt for one sync kind ended. */
+export type SyncAttemptOutcome = "sent" | "failed";
+
+/** The last push attempt for one sync kind: time, outcome, count, HTTP status
+ *  — nothing else is kept (#518). */
+export interface SyncAttempt {
+  /** RFC3339 UTC. */
+  at: string;
+  outcome: SyncAttemptOutcome;
+  /** Runs (history) or library items in the attempt. */
+  count: number;
+  /** The non-2xx status of a failed request; absent for a network error. */
+  httpStatus?: number | null;
+}
+
+/** The last attempt per kind (`get_sync_status`); `null` = nothing recorded,
+ *  or that sync doesn't apply to the signed-in account. */
+export interface SyncStatus {
+  history: SyncAttempt | null;
+  library: SyncAttempt | null;
+}
+
 export interface AppSettings {
   providerKeys: Record<string, string>;
   providerBaseUrls: Record<string, string>;

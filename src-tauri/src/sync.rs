@@ -22,6 +22,10 @@
 //! sync never affects the run or the local library. Turning a toggle off stops
 //! future uploads; it does not delete what was already synced (there is no
 //! delete endpoint yet).
+//!
+//! The outcome of the last push per kind ([`SyncAttempt`]: time, outcome,
+//! count, HTTP status — nothing else) is kept in memory and in `settings.json`
+//! for the status line under each Sync toggle.
 
 use crate::db::Db;
 use crate::error::{AppError, AppResult};
@@ -105,6 +109,258 @@ impl PushOutcome {
 
 /// Cap a single push batch to the server's documented limit.
 pub(crate) const MAX_PUSH: usize = 500;
+
+// ─── Last sync attempt (Settings › Account › Sync status line, #518) ─────────
+
+/// How the last push attempt for one kind ended. Only a request that was
+/// actually made records: `Disabled`, `Empty` and `SignedOut` never do (a
+/// signed-out push only happens after the session was revoked and cleared, and
+/// the owner-bound status then reads as off anyway).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum AttemptOutcome {
+    Sent,
+    Failed,
+}
+
+/// The last push attempt for one sync kind. **Exactly these four fields** —
+/// never a payload, a run title or an error body (privacy: this lands in
+/// `settings.json`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncAttempt {
+    /// RFC3339 UTC, second precision.
+    pub at: String,
+    pub outcome: AttemptOutcome,
+    /// Runs (history) or library items in the attempt.
+    #[serde(default)]
+    pub count: u32,
+    /// The non-2xx status of a failed request; `None` for a network error and
+    /// for every non-failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+/// The last attempt per kind — the wire shape of `get_sync_status` and the
+/// `lastSyncAttempt` field of `settings.json`.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncStatus {
+    #[serde(default)]
+    pub history: Option<SyncAttempt>,
+    #[serde(default)]
+    pub library: Option<SyncAttempt>,
+}
+
+impl SyncStatus {
+    /// `settings.json`'s reader: any unreadable value falls back to the
+    /// default, and one bad kind drops only that kind.
+    pub fn deserialize_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d).unwrap_or(serde_json::Value::Null);
+        let entry = |key: &str| {
+            v.get(key)
+                .cloned()
+                .and_then(|e| serde_json::from_value::<Option<SyncAttempt>>(e).ok())
+                .flatten()
+        };
+        Ok(SyncStatus { history: entry("history"), library: entry("library") })
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.history.is_none() && self.library.is_none()
+    }
+    pub fn get(&self, kind: SyncKind) -> Option<&SyncAttempt> {
+        match kind {
+            SyncKind::History => self.history.as_ref(),
+            SyncKind::Library => self.library.as_ref(),
+        }
+    }
+    pub fn set(&mut self, kind: SyncKind, attempt: Option<SyncAttempt>) {
+        match kind {
+            SyncKind::History => self.history = attempt,
+            SyncKind::Library => self.library = attempt,
+        }
+    }
+}
+
+/// Would replacing `prev` with `next` change what the user can see (outcome,
+/// count, HTTP status, or the displayed minute)? A burst of identical pushes
+/// within the same minute then writes `settings.json` once, not every time.
+pub fn attempt_matters(prev: Option<&SyncAttempt>, next: &SyncAttempt) -> bool {
+    let minute = |s: &str| s.get(..16).unwrap_or(s).to_string();
+    match prev {
+        None => true,
+        Some(p) => {
+            p.outcome != next.outcome
+                || p.count != next.count
+                || p.http_status != next.http_status
+                || minute(&p.at) != minute(&next.at)
+        }
+    }
+}
+
+/// The in-memory record of the last attempt per kind, seeded from
+/// `settings.json` on first use so it survives a restart. Writes to disk happen
+/// off the push path ([`persist_status`]) and never fail a push.
+pub mod status {
+    use super::{SyncKind, SyncStatus};
+
+    #[cfg(not(test))]
+    static STORE: parking_lot::Mutex<Option<SyncStatus>> = parking_lot::const_mutex(None);
+
+    #[cfg(not(test))]
+    pub(crate) fn with<R>(f: impl FnOnce(&mut SyncStatus) -> R) -> R {
+        let mut guard = STORE.lock();
+        let store = guard.get_or_insert_with(|| {
+            crate::settings::load_settings().map(|s| s.last_sync_attempt).unwrap_or_default()
+        });
+        f(store)
+    }
+
+    // Tests: per-thread and never seeded from (or written to) the developer's
+    // real `~/.octopush/settings.json`.
+    #[cfg(test)]
+    thread_local! {
+        static STORE: std::cell::RefCell<SyncStatus> = std::cell::RefCell::new(SyncStatus::default());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with<R>(f: impl FnOnce(&mut SyncStatus) -> R) -> R {
+        STORE.with(|s| f(&mut s.borrow_mut()))
+    }
+
+    /// The last attempt per kind, as recorded.
+    pub fn snapshot() -> SyncStatus {
+        with(|s| s.clone())
+    }
+
+    /// Drop one kind's record from memory (the caller clears disk, under the
+    /// settings write lock).
+    pub(crate) fn forget(kind: SyncKind) {
+        with(|s| s.set(kind, None));
+    }
+}
+
+/// Record what a push did. `Disabled`, `Empty` and `SignedOut` record nothing,
+/// and neither does an attempt that finishes after the user turned the toggle
+/// off (checked here, and again under the settings write lock when persisting).
+pub(crate) fn record_push(kind: SyncKind, outcome: PushOutcome, count: usize, http_status: Option<u16>) {
+    let outcome = match outcome {
+        PushOutcome::Disabled | PushOutcome::Empty | PushOutcome::SignedOut => return,
+        PushOutcome::Sent => AttemptOutcome::Sent,
+        PushOutcome::Failed => AttemptOutcome::Failed,
+    };
+    if !crate::settings::sync_flag_on(kind) {
+        return;
+    }
+    let next = SyncAttempt {
+        at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        outcome,
+        count: u32::try_from(count).unwrap_or(u32::MAX),
+        http_status: if outcome == AttemptOutcome::Failed { http_status } else { None },
+    };
+    let changed = status::with(|s| {
+        let changed = attempt_matters(s.get(kind), &next);
+        s.set(kind, Some(next));
+        changed
+    });
+    if changed {
+        persist_status();
+    }
+}
+
+/// A run-detail push is the second half of one run's upload: its metadata went
+/// first (`push_runs`), so a *successful* detail push leaves an existing record
+/// alone — it never turns "3 runs" into "1 run", and never hides a metadata
+/// failure. A failed detail push records like any other, counting the one run
+/// whose detail didn't go.
+pub(crate) fn record_detail_push(outcome: PushOutcome, http_status: Option<u16>) {
+    if outcome == PushOutcome::Sent && status::with(|s| s.history.is_some()) {
+        return;
+    }
+    record_push(SyncKind::History, outcome, 1, http_status);
+}
+
+/// Fold the in-memory record into `settings` (called under the settings write
+/// lock). A kind whose flag is off on disk is forgotten in memory and kept off
+/// disk, so an attempt racing a toggle-off can never be re-added.
+pub(crate) fn merge_status_into(settings: &mut crate::settings::AppSettings) {
+    let prefs = settings.sync_prefs();
+    for (kind, on) in [(SyncKind::History, prefs.history_sync), (SyncKind::Library, prefs.library_sync)] {
+        if !on {
+            status::forget(kind);
+        }
+    }
+    settings.last_sync_attempt = status::snapshot();
+}
+
+/// The background persist's write itself (a read-modify-write that refuses to
+/// touch an unparseable `settings.json`).
+pub(crate) fn persist_status_now() -> AppResult<()> {
+    crate::settings::update_settings(merge_status_into)
+}
+
+/// Write the in-memory record to `settings.json` off the push path. The
+/// snapshot is taken under the settings write lock, so the last write always
+/// carries the newest record; a failure is logged and otherwise ignored.
+pub(crate) fn persist_status() {
+    if cfg!(test) {
+        return; // tests never touch the real settings file
+    }
+    let job = || {
+        if let Err(e) = persist_status_now() {
+            tracing::debug!("sync status: could not persist the last attempt: {e}");
+        }
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(job);
+        }
+        Err(_) => {
+            std::thread::spawn(job);
+        }
+    }
+}
+
+/// The sync API base URL (tests point it at a local server).
+fn api_base() -> String {
+    #[cfg(test)]
+    if let Some(base) = test_net::base() {
+        return base;
+    }
+    SYNC_API_BASE.to_string()
+}
+
+/// The session's access token (tests inject one, or none).
+async fn access_token() -> Option<String> {
+    #[cfg(test)]
+    if let Some(token) = test_net::token() {
+        return token;
+    }
+    crate::auth::current_access_token().await
+}
+
+/// Test-only, per-thread overrides of the sync API base URL and the access
+/// token, so push outcomes can be exercised against a local server without
+/// the keychain or the real service.
+#[cfg(test)]
+pub mod test_net {
+    use std::cell::RefCell;
+    thread_local! {
+        static BASE: RefCell<Option<String>> = const { RefCell::new(None) };
+        static TOKEN: RefCell<Option<Option<String>>> = const { RefCell::new(None) };
+    }
+    pub fn base() -> Option<String> {
+        BASE.with(|b| b.borrow().clone())
+    }
+    pub fn token() -> Option<Option<String>> {
+        TOKEN.with(|t| t.borrow().clone())
+    }
+    pub fn set(base: Option<String>, token: Option<Option<String>>) {
+        BASE.with(|b| *b.borrow_mut() = base);
+        TOKEN.with(|t| *t.borrow_mut() = token);
+    }
+}
 
 /// One synced run's metadata. This IS the wire + storage format — the server
 /// stores the JSON blob verbatim, keyed by `run_id`, and the desktop's History
@@ -336,25 +592,27 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
     if !opted_in(SyncKind::History) {
         return PushOutcome::Disabled;
     }
-    let Some(token) = crate::auth::current_access_token().await else {
+    let Some(token) = access_token().await else {
         return PushOutcome::SignedOut; // signed out → skip silently
     };
     let body = serde_json::json!({ "run_id": detail.run_id, "data": detail });
-    let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
-    match client.post(&url).bearer_auth(token).json(&body).send().await {
+    let url = format!("{}/api/sync-run-detail", api_base());
+    let (outcome, http_status) = match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed run detail");
-            PushOutcome::Sent
+            (PushOutcome::Sent, None)
         }
         Ok(resp) => {
             tracing::warn!("history sync detail push failed: HTTP {}", resp.status());
-            PushOutcome::Failed
+            (PushOutcome::Failed, Some(resp.status().as_u16()))
         }
         Err(e) => {
             tracing::warn!("history sync detail push error: {}", crate::tls::describe_request_error(&e));
-            PushOutcome::Failed
+            (PushOutcome::Failed, None)
         }
-    }
+    };
+    record_detail_push(outcome, http_status);
+    outcome
 }
 
 /// GET one run's detail. `Ok(None)` when the server has none (a run synced
@@ -443,27 +701,29 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
     if runs.is_empty() {
         return PushOutcome::Empty;
     }
-    let Some(token) = crate::auth::current_access_token().await else {
-        return PushOutcome::SignedOut; // signed out / no valid token → skip silently
-    };
     let batch: Vec<SyncRun> = runs.into_iter().take(MAX_PUSH).collect();
     let count = batch.len();
+    let Some(token) = access_token().await else {
+        return PushOutcome::SignedOut; // signed out / no valid token → skip silently
+    };
     let body = serde_json::json!({ "runs": batch });
-    let url = format!("{SYNC_API_BASE}/api/sync-runs");
-    match client.post(&url).bearer_auth(token).json(&body).send().await {
+    let url = format!("{}/api/sync-runs", api_base());
+    let (outcome, http_status) = match client.post(&url).bearer_auth(token).json(&body).send().await {
         Ok(resp) if resp.status().is_success() => {
             tracing::debug!("history sync: pushed {count} run(s)");
-            PushOutcome::Sent
+            (PushOutcome::Sent, None)
         }
         Ok(resp) => {
             tracing::warn!("history sync push failed: HTTP {}", resp.status());
-            PushOutcome::Failed
+            (PushOutcome::Failed, Some(resp.status().as_u16()))
         }
         Err(e) => {
             tracing::warn!("history sync push error: {}", crate::tls::describe_request_error(&e));
-            PushOutcome::Failed
+            (PushOutcome::Failed, None)
         }
-    }
+    };
+    record_push(SyncKind::History, outcome, count, http_status);
+    outcome
 }
 
 /// GET the signed-in user's full run history from the sync API. Parses leniently
@@ -589,11 +849,13 @@ pub async fn push_library_items(
     if items.is_empty() {
         return PushOutcome::Empty;
     }
-    let Some(token) = crate::auth::current_access_token().await else {
+    let count = items.len();
+    let Some(token) = access_token().await else {
         return PushOutcome::SignedOut; // signed out → skip silently
     };
-    let url = format!("{SYNC_API_BASE}/api/sync-library");
+    let url = format!("{}/api/sync-library", api_base());
     let mut outcome = PushOutcome::Sent;
+    let mut failed_status: Option<u16> = None;
     for chunk in items.chunks(LIBRARY_PUSH_CHUNK) {
         // Re-check between chunks: turning sync off mid-heal stops the rest.
         if !opted_in(SyncKind::Library) {
@@ -607,13 +869,16 @@ pub async fn push_library_items(
             Ok(resp) => {
                 tracing::warn!("library sync push failed: HTTP {}", resp.status());
                 outcome = PushOutcome::Failed;
+                failed_status = Some(resp.status().as_u16());
             }
             Err(e) => {
                 tracing::warn!("library sync push error: {}", crate::tls::describe_request_error(&e));
                 outcome = PushOutcome::Failed;
+                failed_status = None; // the latest failure was a network error
             }
         }
     }
+    record_push(SyncKind::Library, outcome, count, failed_status);
     outcome
 }
 

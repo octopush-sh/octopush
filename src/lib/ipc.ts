@@ -430,6 +430,7 @@ import type {
   AppSettings,
   SyncPrefs,
   SyncKind,
+  SyncStatus,
   Budget,
   BudgetPeriod,
   BudgetScope,
@@ -1368,6 +1369,9 @@ export const ipc = {
   // ─── Cross-machine run history (Pro-real Part B / B1) ──────────
   /** The user's cloud-sync opt-ins (both off by default). Local read. */
   getSyncPrefs: () => invoke<SyncPrefs>("get_sync_prefs"),
+  /** The last push attempt per sync kind, for the line under each toggle.
+   *  Local read. */
+  getSyncStatus: () => invoke<SyncStatus>("get_sync_status"),
   /** Turn one cloud sync on/off; returns the new pair. Turning on is Pro-gated
    *  (throws `UpgradeRequired` for Free). Off never deletes server data. */
   setSyncPref: (kind: SyncKind, enabled: boolean) =>

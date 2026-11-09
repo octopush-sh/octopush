@@ -9,6 +9,7 @@ import type { Entitlement } from "../../lib/ipc";
 
 const getSyncPrefs = vi.fn();
 const setSyncPref = vi.fn();
+const getSyncStatus = vi.fn();
 const PRO: Entitlement = {
   plan: "pro",
   features: ["history.sync", "library.sync"],
@@ -21,6 +22,7 @@ vi.mock("../../lib/ipc", () => ({
   ipc: {
     getSyncPrefs: (...a: unknown[]) => getSyncPrefs(...a),
     setSyncPref: (...a: unknown[]) => setSyncPref(...a),
+    getSyncStatus: (...a: unknown[]) => getSyncStatus(...a),
     authStatus: () => Promise.resolve({ signedIn: true, email: "a@b.c", name: "A" }),
     authRefresh: () => Promise.resolve({ signedIn: true, email: "a@b.c", name: "A" }),
     getEntitlement: () => Promise.resolve(entitlement),
@@ -49,10 +51,12 @@ beforeEach(() => {
     loaded: false,
     saving: null,
     error: null,
+    status: { history: null, library: null },
   });
   // A user who never chose: the backend answers off/off.
   getSyncPrefs.mockReset().mockResolvedValue({ historySync: false, librarySync: false });
   setSyncPref.mockReset();
+  getSyncStatus.mockReset().mockResolvedValue({ history: null, library: null });
 });
 
 describe("AccountPane — Sync (opt-in)", () => {
@@ -222,5 +226,78 @@ describe("AccountPane — Sync rows render at full ink for Pro", () => {
     await waitFor(() => expect(getSyncPrefs).toHaveBeenCalled());
     expect(screen.getByTestId("sync-history-toggle").closest("label")).toHaveClass("opacity-55");
     expect(screen.getByTestId("sync-library-toggle").closest("label")).toHaveClass("opacity-55");
+  });
+});
+
+describe("AccountPane — last sync attempt under each toggle (#518)", () => {
+  const today = () => {
+    const d = new Date();
+    d.setHours(14, 2, 0, 0);
+    return d.toISOString();
+  };
+
+  it("shows the last send under an enabled toggle, in muted mono", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: true, librarySync: true });
+    getSyncStatus.mockResolvedValue({
+      history: { at: today(), outcome: "sent", count: 3 },
+      library: { at: today(), outcome: "sent", count: 1 },
+    });
+    render(<AccountPane />);
+    const history = await screen.findByTestId("sync-history-status");
+    expect(history).toHaveTextContent("Last sent 14:02 · 3 runs");
+    expect(history).toHaveClass("font-mono", "text-octo-mute");
+    expect(history).toHaveAttribute("data-tour", "settings-account-sync-history-status");
+    expect(await screen.findByTestId("sync-library-status")).toHaveTextContent(
+      "Last sent 14:02 · 1 item",
+    );
+  });
+
+  it("a failed attempt reads amber, with or without an HTTP status", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: true, librarySync: true });
+    getSyncStatus.mockResolvedValue({
+      history: { at: today(), outcome: "failed", count: 3, httpStatus: 503 },
+      library: { at: today(), outcome: "failed", count: 2 },
+    });
+    render(<AccountPane />);
+    const history = await screen.findByTestId("sync-history-status");
+    expect(history).toHaveTextContent(
+      "Last attempt failed 14:02 · HTTP 503 · Octopush retries with the next run",
+    );
+    expect(history).toHaveClass("text-octo-warning");
+    const library = await screen.findByTestId("sync-library-status");
+    expect(library).toHaveTextContent(
+      "Last attempt failed 14:02 · Octopush retries with the next run",
+    );
+    expect(library).toHaveClass("text-octo-warning");
+  });
+
+  it("shows nothing under a toggle that is off, even with a record", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: false, librarySync: true });
+    getSyncStatus.mockResolvedValue({
+      history: { at: today(), outcome: "sent", count: 3 },
+      library: null,
+    });
+    render(<AccountPane />);
+    await waitFor(() => expect(getSyncStatus).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(screen.getByTestId("sync-library-toggle")).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(screen.queryByTestId("sync-history-status")).toBeNull();
+    // On, but nothing recorded yet: still nothing.
+    expect(screen.queryByTestId("sync-library-status")).toBeNull();
+  });
+
+  it("an unreadable status shows nothing", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: true, librarySync: false });
+    getSyncStatus.mockRejectedValue(new Error("boom"));
+    render(<AccountPane />);
+    await waitFor(() =>
+      expect(screen.getByTestId("sync-history-toggle")).toHaveAttribute("aria-checked", "true"),
+    );
+    expect(screen.queryByTestId("sync-history-status")).toBeNull();
   });
 });

@@ -14674,6 +14674,392 @@ mod sync_opt_in_tests {
     }
 }
 
+// ── Last sync attempt under each Sync toggle (#518) ───────────────────
+#[cfg(test)]
+mod sync_status_tests {
+    use crate::settings::{test_sync_override, AppSettings};
+    use crate::sync::{
+        attempt_matters, status, test_net, AttemptOutcome, PushOutcome, SyncAttempt, SyncKind,
+        SyncStatus,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+        status::forget(SyncKind::History);
+        status::forget(SyncKind::Library);
+    }
+
+    fn a_run(id: &str) -> crate::sync::SyncRun {
+        crate::sync::SyncRun {
+            run_id: id.into(),
+            machine_id: "m1".into(),
+            machine_name: None,
+            workspace_name: None,
+            task: "secret task title".into(),
+            status: "completed".into(),
+            cost_usd: 0.0,
+            input_tokens: 0,
+            output_tokens: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            finished_at: None,
+            stages: vec![],
+        }
+    }
+
+    /// A one-shot-per-connection HTTP server answering every request with
+    /// `code`. Returns its base URL.
+    async fn serve(code: u16) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    // Read the headers, then the declared body, before answering.
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let text = String::from_utf8_lossy(&buf).to_string();
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let len = text[..end]
+                                .lines()
+                                .find_map(|l| {
+                                    let l = l.to_ascii_lowercase();
+                                    l.strip_prefix("content-length:").map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                                })
+                                .unwrap_or(0);
+                            if buf.len() >= end + 4 + len {
+                                break;
+                            }
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A base URL nothing listens on — a network error, no HTTP status.
+    async fn dead_base() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    #[tokio::test]
+    async fn sent_runs_record_time_outcome_and_count() {
+        reset(true, false);
+        test_net::set(Some(serve(200).await), token());
+        let client = reqwest::Client::new();
+        let out = crate::sync::push_runs(&client, vec![a_run("a"), a_run("b"), a_run("c")]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let rec = status::snapshot().history.expect("recorded");
+        assert_eq!(rec.outcome, AttemptOutcome::Sent);
+        assert_eq!(rec.count, 3);
+        assert_eq!(rec.http_status, None);
+        assert!(chrono::DateTime::parse_from_rfc3339(&rec.at).is_ok(), "{}", rec.at);
+        assert!(status::snapshot().library.is_none(), "kinds are independent");
+    }
+
+    #[tokio::test]
+    async fn failed_push_records_the_http_status() {
+        reset(true, true);
+        test_net::set(Some(serve(503).await), token());
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::Failed);
+        let rec = status::snapshot().history.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 1, Some(503)));
+
+        let items = vec![
+            crate::sync::SyncLibraryItem::tombstone("pipeline", "p1"),
+            crate::sync::SyncLibraryItem::tombstone("role", "r1"),
+        ];
+        assert_eq!(crate::sync::push_library_items(&client, items).await, PushOutcome::Failed);
+        let rec = status::snapshot().library.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 2, Some(503)));
+    }
+
+    #[tokio::test]
+    async fn network_error_records_failed_without_a_status() {
+        reset(false, true);
+        test_net::set(Some(dead_base().await), token());
+        let client = reqwest::Client::new();
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::Failed);
+        let rec = status::snapshot().library.unwrap();
+        assert_eq!((rec.outcome, rec.http_status), (AttemptOutcome::Failed, None));
+    }
+
+    #[tokio::test]
+    async fn signed_out_push_records_nothing() {
+        reset(true, true);
+        test_net::set(Some(dead_base().await), Some(None));
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::SignedOut);
+        let detail = crate::sync::SyncRunDetail { run_id: "a".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::SignedOut);
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::SignedOut);
+        assert!(status::snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_recorded_when_disabled_or_empty() {
+        reset(false, false);
+        test_net::set(Some(serve(200).await), token());
+        let client = reqwest::Client::new();
+        assert_eq!(crate::sync::push_runs(&client, vec![a_run("a")]).await, PushOutcome::Disabled);
+        let detail = crate::sync::SyncRunDetail { run_id: "a".into(), stages: vec![] };
+        assert_eq!(crate::sync::push_run_detail(&client, detail).await, PushOutcome::Disabled);
+        let item = crate::sync::SyncLibraryItem::tombstone("pipeline", "p1");
+        assert_eq!(crate::sync::push_library_items(&client, vec![item]).await, PushOutcome::Disabled);
+        assert!(status::snapshot().is_empty());
+
+        test_sync_override::set(SyncKind::History, Some(true));
+        test_sync_override::set(SyncKind::Library, Some(true));
+        assert_eq!(crate::sync::push_runs(&client, vec![]).await, PushOutcome::Empty);
+        assert_eq!(crate::sync::push_library_items(&client, vec![]).await, PushOutcome::Empty);
+        assert!(status::snapshot().is_empty());
+    }
+
+    #[test]
+    fn record_push_maps_every_outcome() {
+        for (outcome, expected) in [
+            (PushOutcome::Disabled, None),
+            (PushOutcome::Empty, None),
+            (PushOutcome::Sent, Some(AttemptOutcome::Sent)),
+            (PushOutcome::Failed, Some(AttemptOutcome::Failed)),
+            (PushOutcome::SignedOut, None),
+        ] {
+            reset(true, true);
+            crate::sync::record_push(SyncKind::History, outcome, 4, Some(500));
+            let rec = status::snapshot().history;
+            assert_eq!(rec.as_ref().map(|r| r.outcome), expected, "{outcome:?}");
+            if let Some(r) = rec {
+                assert_eq!(r.count, 4);
+                // Only a failure carries an HTTP status.
+                assert_eq!(r.http_status, (outcome == PushOutcome::Failed).then_some(500));
+            }
+        }
+        // Toggle turned off while the push was in flight ⇒ nothing recorded.
+        reset(false, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 1, None);
+        assert!(status::snapshot().history.is_none());
+    }
+
+    #[test]
+    fn detail_push_keeps_the_batch_count_but_shows_its_own_failure() {
+        reset(true, false);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 500, None);
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().count, 500);
+        crate::sync::record_detail_push(PushOutcome::Failed, Some(413));
+        let rec = status::snapshot().history.unwrap();
+        assert_eq!((rec.outcome, rec.count, rec.http_status), (AttemptOutcome::Failed, 1, Some(413)));
+        // A later successful detail push doesn't hide that failure…
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().outcome, AttemptOutcome::Failed);
+        // …and with no record yet it counts its one run.
+        reset(true, false);
+        crate::sync::record_detail_push(PushOutcome::Sent, None);
+        assert_eq!(status::snapshot().history.unwrap().count, 1);
+    }
+
+    #[test]
+    fn only_visible_changes_need_a_disk_write() {
+        let a = SyncAttempt {
+            at: "2026-11-09T14:02:05Z".into(),
+            outcome: AttemptOutcome::Sent,
+            count: 3,
+            http_status: None,
+        };
+        assert!(attempt_matters(None, &a));
+        let same_minute = SyncAttempt { at: "2026-11-09T14:02:59Z".into(), ..a.clone() };
+        assert!(!attempt_matters(Some(&a), &same_minute));
+        let next_minute = SyncAttempt { at: "2026-11-09T14:03:00Z".into(), ..a.clone() };
+        assert!(attempt_matters(Some(&a), &next_minute));
+        assert!(attempt_matters(Some(&a), &SyncAttempt { count: 4, ..a.clone() }));
+        assert!(attempt_matters(
+            Some(&a),
+            &SyncAttempt { outcome: AttemptOutcome::Failed, http_status: Some(503), ..a.clone() }
+        ));
+    }
+
+    #[test]
+    fn settings_field_round_trips_with_only_the_four_fields() {
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(s.last_sync_attempt.is_empty());
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(!json.contains("lastSyncAttempt"), "absent when empty: {json}");
+
+        let mut s = AppSettings::default();
+        s.last_sync_attempt = SyncStatus {
+            history: Some(SyncAttempt {
+                at: "2026-11-09T14:02:00Z".into(),
+                outcome: AttemptOutcome::Failed,
+                count: 3,
+                http_status: Some(503),
+            }),
+            library: None,
+        };
+        let json = serde_json::to_value(&s).unwrap();
+        let rec = &json["lastSyncAttempt"]["history"];
+        let mut keys: Vec<_> = rec.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["at", "count", "httpStatus", "outcome"]);
+        assert_eq!(rec["outcome"], "failed");
+        let back: AppSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(back.last_sync_attempt, s.last_sync_attempt);
+    }
+
+    fn a_record() -> SyncAttempt {
+        SyncAttempt {
+            at: "2026-11-09T14:02:00Z".into(),
+            outcome: AttemptOutcome::Sent,
+            count: 1,
+            http_status: None,
+        }
+    }
+
+    /// Apply one toggle change the way `set_sync_opted_in` does.
+    fn toggle(s: &mut AppSettings, kind: SyncKind, on: bool, sub: &str) -> Vec<SyncKind> {
+        let before = s.sync_prefs();
+        let before_owner = s.sync_owner.clone();
+        s.set_sync_opted_in_by(kind, on, sub);
+        s.drop_stale_sync_attempts(before, before_owner.as_deref())
+    }
+
+    #[test]
+    fn a_record_never_outlives_its_toggle_or_its_account() {
+        let rec = a_record();
+        let mut s = AppSettings::default();
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        toggle(&mut s, SyncKind::Library, true, "user_1");
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
+        // Re-asserting an ON toggle keeps both records.
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        assert!(s.last_sync_attempt.history.is_some() && s.last_sync_attempt.library.is_some());
+
+        // Off drops that kind only.
+        toggle(&mut s, SyncKind::Library, false, "user_1");
+        assert!(s.last_sync_attempt.history.is_some());
+        assert!(s.last_sync_attempt.library.is_none());
+
+        // Off → on starts clean, even if a stale record slipped in meanwhile.
+        s.last_sync_attempt.library = Some(rec.clone());
+        toggle(&mut s, SyncKind::Library, true, "user_1");
+        assert!(s.last_sync_attempt.library.is_none());
+
+        // Another account turning a sync on never inherits the first one's record.
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
+        toggle(&mut s, SyncKind::History, true, "user_2");
+        assert!(s.last_sync_attempt.is_empty());
+    }
+
+    #[test]
+    fn persisting_never_re_adds_a_kind_turned_off_meanwhile() {
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+        crate::sync::record_push(SyncKind::Library, PushOutcome::Sent, 2, None);
+        // On disk, library was turned off after the push recorded.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::History, true, "user_1");
+        crate::sync::merge_status_into(&mut s);
+        assert_eq!(s.last_sync_attempt.history.as_ref().map(|r| r.count), Some(3));
+        assert!(s.last_sync_attempt.library.is_none(), "kept off disk");
+        assert!(status::snapshot().library.is_none(), "and forgotten in memory");
+    }
+
+    #[test]
+    fn an_unknown_outcome_drops_only_that_entry() {
+        let json = r#"{
+            "providerKeys": {"anthropic": "sk-ant-keep"},
+            "gitCredentials": {"github.com": {"username": "u", "token": "t"}},
+            "historySyncEnabled": true,
+            "lastSyncAttempt": {
+                "history": {"at": "2026-11-09T14:02:00Z", "outcome": "signedOut", "count": 3},
+                "library": {"at": "2026-11-09T14:02:00Z", "outcome": "sent", "count": 2}
+            }
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("the file still loads");
+        assert_eq!(s.provider_keys.get("anthropic").map(String::as_str), Some("sk-ant-keep"));
+        assert!(s.git_credentials.contains_key("github.com"));
+        assert!(s.history_sync_enabled);
+        assert!(s.last_sync_attempt.history.is_none(), "the unreadable entry is dropped");
+        assert_eq!(s.last_sync_attempt.library.as_ref().map(|r| r.count), Some(2));
+
+        // A wholly wrong shape falls back to no record, never a failed file.
+        let s: AppSettings =
+            serde_json::from_str(r#"{"providerKeys":{"a":"k"},"lastSyncAttempt":"garbage"}"#).unwrap();
+        assert!(s.last_sync_attempt.is_empty());
+        assert_eq!(s.provider_keys.get("a").map(String::as_str), Some("k"));
+    }
+
+    #[test]
+    fn an_unparseable_settings_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        crate::settings::test_settings_path::set(Some(path.clone()));
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+
+        for corrupt in ["{", r#"{"providerKeys":{"anthropic":"sk"},"historySyncEnabled":"yes"}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            // The app's read side keeps its old behaviour: defaults.
+            assert!(crate::settings::load_settings().unwrap().provider_keys.is_empty());
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(crate::settings::update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(crate::sync::persist_status_now().is_err(), "background persist");
+            assert!(crate::settings::clear_sync_opt_ins().is_err());
+            assert!(crate::settings::save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(crate::settings::set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+
+        // A missing file still starts from defaults, and a valid one is written.
+        std::fs::remove_file(&path).unwrap();
+        crate::sync::persist_status_now().unwrap();
+        let written: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Flags are off in a fresh file, so the record is kept off disk.
+        assert!(written.last_sync_attempt.is_empty());
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
+    fn sign_out_and_stale_saves_handle_the_record() {
+        let rec = a_record();
+        let mut s = AppSettings::default();
+        toggle(&mut s, SyncKind::History, true, "user_1");
+        s.last_sync_attempt = SyncStatus { history: Some(rec), library: None };
+
+        // A stale whole-file save from a settings pane carries the record over.
+        let mut incoming = AppSettings::default();
+        incoming.preserve_sync_fields_from(&s);
+        assert_eq!(incoming.last_sync_attempt, s.last_sync_attempt);
+
+        s.clear_sync_opt_ins();
+        assert!(s.last_sync_attempt.is_empty());
+    }
+}
+
 #[cfg(test)]
 mod updater_channel_tests {
     use crate::settings::AppSettings;

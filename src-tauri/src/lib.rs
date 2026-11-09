@@ -421,6 +421,7 @@ pub fn run() {
             commands::preview_routine_schedule,
             // Cross-machine run history (Pro-real Part B / B1)
             commands::get_sync_prefs,
+            commands::get_sync_status,
             commands::set_sync_pref,
             // Updater (channels + launch alert)
             commands::get_update_channel,

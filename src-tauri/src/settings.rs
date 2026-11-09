@@ -91,6 +91,20 @@ pub struct AppSettings {
     #[serde(default)]
     pub sync_owner: Option<String>,
 
+    /// The last push attempt per sync kind, for the status line under each
+    /// Sync toggle (#518): time, outcome, count and HTTP status — **nothing
+    /// else** (no payloads, run titles or error bodies). Owned by
+    /// `sync::record_push`; cleared when its toggle turns off and on sign-out.
+    /// Parsed leniently (per kind): an entry this build can't read — an
+    /// outcome from a newer or dev build — drops only that entry, never the
+    /// whole file.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::sync::SyncStatus::is_empty",
+        deserialize_with = "crate::sync::SyncStatus::deserialize_lenient"
+    )]
+    pub last_sync_attempt: crate::sync::SyncStatus,
+
     /// Update channel (Settings › About): `stable` (default) or `beta`.
     /// Owned by `set_update_channel` — whole-file saves carry it over.
     #[serde(default)]
@@ -109,19 +123,65 @@ pub struct AppSettings {
 }
 
 fn settings_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_settings_path::get() {
+        return p;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".octopush")
         .join("settings.json")
 }
 
+/// Read `settings.json` for the app. Missing ⇒ defaults; **unparseable ⇒
+/// defaults too** (the long-standing read-side behaviour, unchanged). Writers
+/// must not use this for a read-modify-write — see [`load_settings_for_write`].
 pub fn load_settings() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Err(LoadError::Unparseable) => Ok(AppSettings::default()),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Ok(s) => Ok(s),
+    }
+}
+
+enum LoadError {
+    Io(std::io::Error),
+    Unparseable,
+}
+
+/// Read for a read-modify-write: a missing file starts from defaults, but a
+/// file that exists and doesn't parse is an **error** — writing defaults back
+/// would wipe provider keys, git credentials and the Jira config. Logged
+/// without the file's contents.
+fn load_settings_for_write() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Ok(s) => Ok(s),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Err(LoadError::Unparseable) => {
+            tracing::warn!("settings.json exists but doesn't parse; refusing to overwrite it");
+            Err(crate::error::AppError::Other(
+                "settings.json couldn't be read, so it was left unchanged".into(),
+            ))
+        }
+    }
+}
+
+fn load_settings_strict() -> Result<AppSettings, LoadError> {
     let path = settings_path();
     if !path.exists() {
         return Ok(AppSettings::default());
     }
-    let content = std::fs::read_to_string(&path)?;
-    let mut settings: AppSettings = serde_json::from_str(&content).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).map_err(LoadError::Io)?;
+    let mut settings: AppSettings = serde_json::from_str(&content).map_err(|e| {
+        // Category and position only — never the contents (they hold keys).
+        tracing::warn!(
+            "settings.json parse failed ({:?} at line {}, column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        );
+        LoadError::Unparseable
+    })?;
 
     if let Some(k) = settings.legacy_anthropic_api_key.take() {
         if !k.is_empty() && !settings.provider_keys.contains_key("anthropic") {
@@ -137,7 +197,25 @@ pub fn load_settings() -> AppResult<AppSettings> {
     Ok(settings)
 }
 
-pub fn save_settings(settings: &AppSettings) -> AppResult<()> {
+/// Serializes every read-modify-write of `settings.json` made through
+/// [`update_settings`], so a background writer (the sync status, #518) can
+/// never resurrect a value another writer just changed — e.g. flip a sync
+/// opt-in back on.
+static SETTINGS_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// Read-modify-write `settings.json` under [`SETTINGS_WRITE_LOCK`]. A read
+/// failure aborts without writing.
+pub fn update_settings<R>(f: impl FnOnce(&mut AppSettings) -> R) -> AppResult<R> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
+    let out = f(&mut settings);
+    save_settings(&settings)?;
+    Ok(out)
+}
+
+/// Overwrite the whole file. Writers outside this module go through
+/// [`update_settings`] (read-modify-write under the write lock) instead.
+pub(crate) fn save_settings(settings: &AppSettings) -> AppResult<()> {
     let path = settings_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -208,11 +286,37 @@ impl AppSettings {
         }
     }
 
-    /// Forget every opt-in (sign-out).
+    /// Forget every opt-in (sign-out), and the last-attempt records with them.
     pub fn clear_sync_opt_ins(&mut self) {
         self.history_sync_enabled = false;
         self.library_sync_enabled = false;
         self.sync_owner = None;
+        self.last_sync_attempt = crate::sync::SyncStatus::default();
+    }
+
+    /// After a toggle change, drop the last-attempt record of every kind that
+    /// is now off, just went from off to on, or changed owner (`before` /
+    /// `before_owner` are the values prior to the change) — a record never
+    /// outlives its toggle or carries over to another account. Returns the
+    /// kinds dropped, so the caller can forget them in memory too.
+    pub fn drop_stale_sync_attempts(
+        &mut self,
+        before: SyncPrefs,
+        before_owner: Option<&str>,
+    ) -> Vec<crate::sync::SyncKind> {
+        let owner_changed = self.sync_owner.as_deref() != before_owner;
+        let mut dropped = Vec::new();
+        for (kind, was_on) in [
+            (crate::sync::SyncKind::History, before.history_sync),
+            (crate::sync::SyncKind::Library, before.library_sync),
+        ] {
+            let on = self.flag(kind);
+            if !on || !was_on || owner_changed {
+                self.last_sync_attempt.set(kind, None);
+                dropped.push(kind);
+            }
+        }
+        dropped
     }
 
     /// `set_sync_pref` is the ONLY writer of the opt-ins: a whole-file save
@@ -222,6 +326,7 @@ impl AppSettings {
         self.history_sync_enabled = on_disk.history_sync_enabled;
         self.library_sync_enabled = on_disk.library_sync_enabled;
         self.sync_owner = on_disk.sync_owner.clone();
+        self.last_sync_attempt = on_disk.last_sync_attempt.clone();
     }
 
     /// Same rule for the updater prefs: `set_update_channel` /
@@ -239,9 +344,7 @@ pub fn update_channel() -> crate::updater::UpdateChannel {
 
 /// Persist the update channel (read-modify-write).
 pub fn set_update_channel(channel: crate::updater::UpdateChannel) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.update_channel = channel;
-    save_settings(&settings)
+    update_settings(|s| s.update_channel = channel)
 }
 
 /// The version the user skipped, if any.
@@ -251,9 +354,7 @@ pub fn skipped_update_version() -> Option<String> {
 
 /// Persist (or clear, with `None`) the skipped version.
 pub fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.skipped_update_version = version.filter(|v| !v.trim().is_empty());
-    save_settings(&settings)
+    update_settings(|s| s.skipped_update_version = version.filter(|v| !v.trim().is_empty()))
 }
 
 /// Has the signed-in user opted in to this kind of cloud sync? Reads
@@ -274,6 +375,17 @@ pub fn sync_opted_in(kind: crate::sync::SyncKind) -> bool {
     settings.sync_opted_in_for(kind, sub.as_deref())
 }
 
+/// Is this kind's opt-in flag set at all (ignoring which account set it)? The
+/// sync status recorder's re-check: an attempt that finishes after the toggle
+/// went off records nothing. Any read failure answers **no**.
+pub fn sync_flag_on(kind: crate::sync::SyncKind) -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_sync_override::get(kind) {
+        return v;
+    }
+    load_settings().map(|s| s.flag(kind)).unwrap_or(false)
+}
+
 /// The opt-ins as they apply to whoever is signed in now.
 pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
     let settings = load_settings()?;
@@ -285,8 +397,12 @@ pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
 /// return the new effective pair. Enabling requires a signed-in user (the
 /// opt-in is bound to their Clerk id); disabling always succeeds.
 pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
-    let mut settings = load_settings()?;
+    // The keychain read stays outside the write lock.
     let sub = crate::auth::current_identity().map(|(sub, _)| sub);
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
+    let before = settings.sync_prefs();
+    let before_owner = settings.sync_owner.clone();
     match sub.as_deref() {
         Some(me) if !me.is_empty() => settings.set_sync_opted_in_by(kind, enabled, me),
         _ if enabled => {
@@ -294,14 +410,22 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
         }
         _ => settings.set_flag(kind, false),
     }
+    // A toggle that is off shows no status and keeps none; one just turned on
+    // (or now owned by another account) starts with none.
+    for stale in settings.drop_stale_sync_attempts(before, before_owner.as_deref()) {
+        crate::sync::status::forget(stale);
+    }
     save_settings(&settings)?;
     Ok(settings.sync_prefs_for(sub.as_deref()))
 }
 
-/// Sign-out: drop both opt-ins and their owner.
+/// Sign-out: drop both opt-ins, their owner and the last-attempt records.
 pub fn clear_sync_opt_ins() -> AppResult<()> {
-    let mut settings = load_settings()?;
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings_for_write()?;
     settings.clear_sync_opt_ins();
+    crate::sync::status::forget(crate::sync::SyncKind::History);
+    crate::sync::status::forget(crate::sync::SyncKind::Library);
     save_settings(&settings)
 }
 
@@ -310,10 +434,28 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 /// `set_update_channel` / `set_skipped_update_version`), which are carried
 /// over from disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
-    let on_disk = load_settings()?;
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let on_disk = load_settings_for_write()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
     save_settings(&incoming)
+}
+
+/// Test-only, per-thread override of where `settings.json` lives, so writer
+/// tests run against a temp file.
+#[cfg(test)]
+pub mod test_settings_path {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    thread_local! {
+        static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    pub fn get() -> Option<PathBuf> {
+        PATH.with(|p| p.borrow().clone())
+    }
+    pub fn set(p: Option<PathBuf>) {
+        PATH.with(|c| *c.borrow_mut() = p);
+    }
 }
 
 /// Test-only, per-thread override of [`sync_opted_in`] so gating tests never
@@ -374,25 +516,22 @@ pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConf
 
 /// Persist the issue tracker configuration.
 pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.issue_tracker = Some(config);
-    save_settings(&settings)
+    update_settings(|s| s.issue_tracker = Some(config))
 }
 
-/// Persist git credentials for a host.  NOTE: save_settings does a full-file
-/// overwrite (last-write-wins). Callers must read-modify-write to avoid
-/// clobbering fields they don't own. Not safe for concurrent writers, but the
-/// app is single-window so that's acceptable.
+/// Persist git credentials for a host. Goes through [`update_settings`], so it
+/// is a read-modify-write under the settings write lock and can't clobber a
+/// concurrent writer's fields.
 pub fn save_git_credentials(host: &str, username: &str, token: &str) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.git_credentials.insert(
-        host.to_string(),
-        GitCredentialEntry {
-            username: username.to_string(),
-            token: token.to_string(),
-        },
-    );
-    save_settings(&settings)
+    update_settings(|s| {
+        s.git_credentials.insert(
+            host.to_string(),
+            GitCredentialEntry {
+                username: username.to_string(),
+                token: token.to_string(),
+            },
+        );
+    })
 }
 
 #[cfg(test)]
