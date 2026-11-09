@@ -158,7 +158,7 @@ pub struct SyncStage {
 
 /// A friendly label for this machine ("MacBook Pro"), for "from …" attribution.
 pub fn machine_name_label() -> String {
-    sysinfo::System::host_name().unwrap_or_else(|| "Unknown machine".to_string())
+    sysinfo::System::host_name().unwrap_or_else(|_| "Unknown machine".to_string())
 }
 
 // ─── B2: the heavy per-run detail (journals · artifacts · diffs) ────────────

@@ -5964,7 +5964,10 @@ pub async fn get_perf_stats(perf: tauri::State<'_, crate::perf::PerfState>) -> R
     // Hold the System lock only across the refresh+sample, not the FFI loop below.
     let samples = {
         let mut sys = perf.0.lock();
-        crate::perf::sample_system(&mut sys)
+        let Some(sys) = sys.as_mut() else {
+            return Err("process sampling is unavailable on this system".into());
+        };
+        crate::perf::sample_system(sys)
     };
     let app_pid = std::process::id();
     let daemon_pid = crate::perf::daemon_pid();
