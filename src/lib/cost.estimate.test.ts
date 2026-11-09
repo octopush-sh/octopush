@@ -4,6 +4,7 @@ import {
   estimateRangeText,
   estimateSavingsText,
   formatEstimateUsd,
+  formatUsd,
 } from "./cost";
 import type { RunEstimate, StageEstimate } from "./ipc";
 
@@ -16,6 +17,14 @@ describe("pre-run estimate copy", () => {
     expect(formatEstimateUsd(0.004)).toBe("<$0.01");
     expect(formatEstimateUsd(0)).toBe("$0.00");
     expect(formatEstimateUsd(1.234)).toBe("$1.23");
+    expect(formatEstimateUsd(12843.27)).toBe("$12,843.27");
+  });
+
+  it("groups thousands in every currency figure", () => {
+    expect(formatUsd(0.41)).toBe("$0.41");
+    expect(formatUsd(0)).toBe("$0.00");
+    expect(formatUsd(85393.45)).toBe("$85,393.45");
+    expect(formatUsd(1234567.891)).toBe("$1,234,567.89");
   });
 
   it("shows the p25–p75 range, or one figure when the ends round alike", () => {

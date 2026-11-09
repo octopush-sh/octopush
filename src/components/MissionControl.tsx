@@ -22,6 +22,7 @@ import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
 import { lastActivity } from "../lib/liveLine";
 import { claudeWaitReason, claudeWaitingCopy, type ClaudeWaitReason } from "../lib/claudeWaiting";
 import { stageTitle } from "../lib/stageMeta";
+import { formatUsd } from "../lib/cost";
 import { OverlayRoom, RoomClose } from "./primitives/OverlayRoom";
 import { StageDots } from "./direct/StageDots";
 import { Reveal } from "./primitives/Reveal";
@@ -178,11 +179,11 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
               >
                 {baseline > 0 && (
                   <>
-                    <span className="octo-tabular text-octo-verdigris">saved ${saved.toFixed(2)}</span>
+                    <span className="octo-tabular text-octo-verdigris">saved {formatUsd(saved)}</span>
                     <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
                   </>
                 )}
-                <span className="octo-tabular text-octo-brass">spent ${spent.toFixed(2)}</span>
+                <span className="octo-tabular text-octo-brass">spent {formatUsd(spent)}</span>
               </span>
             )}
             <button
@@ -757,11 +758,11 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
       )}
       {/* Per-card spend is quiet; brass spend belongs to the header's fleet ledger. */}
       <span data-tour="mission-control-card-spent" className="octo-tabular text-octo-mute">
-        ${run.costUsd.toFixed(2)}
+        {formatUsd(run.costUsd)}
       </span>
       {run.baselineUsd > run.costUsd && band !== "settled" && (
         <span className="octo-tabular text-octo-verdigris">
-          saved ${(run.baselineUsd - run.costUsd).toFixed(2)}
+          saved {formatUsd(run.baselineUsd - run.costUsd)}
         </span>
       )}
       <span className="relative z-10 ml-auto flex items-center gap-1 opacity-0 transition-opacity duration-[180ms] group-hover:opacity-100 group-focus-within:opacity-100">
@@ -811,7 +812,7 @@ export function awayLine(settled: Run[], awayRunIds: string[]): { count: number;
   const priced = away.filter((r) => r.baselineUsd > 0);
   if (priced.length === 0) return { count: away.length, saved: "unpriced" };
   const saved = priced.reduce((sum, r) => sum + Math.max(0, r.baselineUsd - r.costUsd), 0);
-  return { count: away.length, saved: `saved $${saved.toFixed(2)}` };
+  return { count: away.length, saved: `saved ${formatUsd(saved)}` };
 }
 
 /** True while the run settled within the last few seconds — gates the one-shot

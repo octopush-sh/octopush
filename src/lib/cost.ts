@@ -111,10 +111,22 @@ export function budgetUnenforceableNote(unpricedStages: number): string {
   return `budget not enforceable: ${unpricedStages === 1 ? "1 stage" : `${unpricedStages} stages`} unpriced`;
 }
 
+const USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
+
+/** The one currency formatter: "$0.41", "$85,393.45" — grouped, two decimals. */
+export function formatUsd(n: number): string {
+  return USD.format(n);
+}
+
 /** "$0.40"; a positive amount under a cent reads "<$0.01", never "$0.00". */
 export function formatEstimateUsd(n: number): string {
   if (n > 0 && n < 0.005) return "<$0.01";
-  return `$${n.toFixed(2)}`;
+  return formatUsd(n);
 }
 
 /** True when the estimate has stages and none of them is priced. */

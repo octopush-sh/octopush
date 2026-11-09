@@ -22,6 +22,15 @@ describe("RunLedger", () => {
     expect(within(strip).getByText("$0.09").className).toContain("octo-tabular");
   });
 
+  it("groups thousands in large figures", () => {
+    const big = { ...baseRun, costUsd: 12843.27, baselineUsd: 98236.72, budgetUsd: 20000 } as Run;
+    render(<RunLedger run={big} stages={stages} />);
+    const strip = screen.getByRole("button", { name: /saved/i });
+    expect(within(strip).getByText("$85,393.45")).toBeInTheDocument();
+    expect(within(strip).getByText("$12,843.27")).toBeInTheDocument();
+    expect(within(strip).getByText(/budget \$20,000\.00/)).toBeInTheDocument();
+  });
+
   it("shows 'baseline unavailable' instead of hiding the slot", () => {
     render(<RunLedger run={{ ...baseRun, baselineUsd: 0 } as Run} stages={stages} />);
     expect(screen.getByText("baseline unavailable")).toBeInTheDocument();

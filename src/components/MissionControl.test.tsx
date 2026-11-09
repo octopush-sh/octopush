@@ -294,6 +294,11 @@ describe("MissionControl", () => {
     expect(awayLine([mkRun("x", "running"), mkRun("y", "completed")], ["x", "y"])?.count).toBe(1);
   });
 
+  it("awayLine groups thousands in a large saving", () => {
+    const big = mkRun("b", "completed", { costUsd: 0.41, baselineUsd: 12843.68 });
+    expect(awayLine([big], ["b"])?.saved).toBe("saved $12,843.27");
+  });
+
   it("reads 'unpriced' — never $0.00 — when no away run can be priced", () => {
     useRunsStore.setState({
       runsByWs: { "ws-u": [mkRun("u", "completed", { costUsd: 0, baselineUsd: 0 })] },
