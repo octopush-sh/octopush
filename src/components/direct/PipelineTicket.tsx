@@ -1,5 +1,9 @@
-import { Pencil } from "lucide-react";
+import { useState } from "react";
+import { Copy, Download, Pencil } from "lucide-react";
 import type { PipelineWithStages } from "../../lib/ipc";
+import { copyCrewJson, exportCrewFile } from "../../lib/crew";
+import { MENU_HEADER, MENU_ITEM } from "../../lib/menuStyles";
+import { MenuSurface } from "../MenuSurface";
 import { StageDots } from "./StageDots";
 
 interface Props {
@@ -18,11 +22,45 @@ interface Props {
  *  long name would otherwise run over the next ticket (#312). The focus ring
  *  is the button's own box-shadow, which the clip doesn't touch. */
 export function PipelineTicket({ pipeline, selected, onSelect, onEdit }: Props) {
-  const { name, isBuiltin } = pipeline.pipeline;
+  const { id, name, isBuiltin } = pipeline.pipeline;
   const stages = [...pipeline.stages].sort((a, b) => a.position - b.position);
+  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
 
   return (
-    <div className="group relative shrink-0">
+    <div
+      className="group relative shrink-0"
+      onContextMenu={(e) => {
+        e.preventDefault();
+        setMenu({ x: e.clientX, y: e.clientY });
+      }}
+    >
+      {menu && (
+        <MenuSurface x={menu.x} y={menu.y} ariaLabel={`${name} options`} onDismiss={() => setMenu(null)}>
+          <div className={MENU_HEADER}>{name}</div>
+          <button
+            type="button"
+            role="menuitem"
+            className={MENU_ITEM}
+            onClick={() => {
+              setMenu(null);
+              void exportCrewFile(id);
+            }}
+          >
+            <Download size={12} aria-hidden /> Export crew…
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            className={MENU_ITEM}
+            onClick={() => {
+              setMenu(null);
+              void copyCrewJson(id);
+            }}
+          >
+            <Copy size={12} aria-hidden /> Copy crew as JSON
+          </button>
+        </MenuSurface>
+      )}
       <button
         type="button"
         onClick={onSelect}

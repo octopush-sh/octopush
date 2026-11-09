@@ -11,6 +11,7 @@ pub mod claude_login;
 pub mod claude_plan;
 mod commands;
 pub mod context_guard;
+pub mod crew;
 // `db` and `error` are public so the `octopush-mcp` binary (a sibling bin in
 // this crate) can drive the data layer directly. The MCP server is a thin,
 // read-and-author surface over the same SQLite store the desktop app uses.
@@ -262,6 +263,12 @@ pub fn run() {
             commands::get_pipeline,
             commands::save_pipeline,
             commands::delete_pipeline,
+            commands::export_crew,
+            commands::save_crew_file,
+            commands::read_crew_file,
+            commands::preview_crew,
+            commands::import_crew,
+            commands::list_repo_crews,
             commands::create_run,
             commands::start_run,
             commands::get_run,

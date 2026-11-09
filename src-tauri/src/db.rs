@@ -6944,6 +6944,21 @@ fn draft_ancestors(stages: &[StageDraft], idx: usize) -> std::collections::HashS
 /// Roles are looked up from the DB; an unknown role key is rejected.
 impl Db {
 pub fn validate_pipeline_stages(&self, stages: &[StageDraft]) -> crate::error::AppResult<()> {
+    match self.pipeline_stage_issues(stages, &[])?.into_iter().next() {
+        Some((_, msg)) => Err(crate::error::AppError::Other(msg)),
+        None => Ok(()),
+    }
+}
+
+/// Every stage's first contract violation as (position, message), in stage
+/// order — the rules [`Db::validate_pipeline_stages`] enforces, so a crew
+/// import can show a per-stage error. `extra` roles count as existing (an
+/// import's custom roles, before they are saved).
+pub fn pipeline_stage_issues(
+    &self,
+    stages: &[StageDraft],
+    extra: &[crate::orchestrator::roles::RoleDef],
+) -> crate::error::AppResult<Vec<(usize, String)>> {
     use crate::error::AppError;
     if stages.is_empty() {
         return Err(AppError::Other("a pipeline needs at least one stage".into()));
@@ -6952,98 +6967,113 @@ pub fn validate_pipeline_stages(&self, stages: &[StageDraft]) -> crate::error::A
     // loop-target-is-ancestor rule only applies to authored graphs (a linear
     // draft has no parents, so "earlier position" is the right contract there).
     let authored = stages.iter().any(|s| !s.parents.is_empty());
-    for (i, s) in stages.iter().enumerate() {
-        if self.get_role(&s.role)?.is_none() {
-            return Err(AppError::Other(format!("unknown stage role '{}'", s.role)));
+    let mut issues = Vec::new();
+    for i in 0..stages.len() {
+        if let Some(msg) = self.stage_issue(stages, i, authored, extra)? {
+            issues.push((i, msg));
         }
-        if !matches!(s.substrate.as_str(), "api" | "cli") {
-            return Err(AppError::Other(format!("unknown substrate '{}'", s.substrate)));
-        }
-        if s.agent_model.trim().is_empty() {
-            return Err(AppError::Other(format!("stage {} has no model", i + 1)));
-        }
-        if !(1..=100).contains(&s.max_iterations) {
-            return Err(AppError::Other(format!(
-                "stage {} max turns must be between 1 and 100 (got {})",
-                i + 1,
-                s.max_iterations
-            )));
-        }
-        // Flow-edge parents: each must reference a strictly-earlier stage (the
-        // builder topo-sorts before saving, so a valid DAG always satisfies
-        // this) and must be distinct. This is what keeps the graph acyclic and
-        // makes the ancestry-aware dossier well-defined.
-        {
-            let mut seen = std::collections::HashSet::new();
-            for &p in &s.parents {
-                if p < 0 || p >= i as i64 {
-                    return Err(AppError::Other(format!(
-                        "stage {} has an upstream link to a non-earlier stage — the flow must be acyclic",
-                        i + 1
-                    )));
-                }
-                if !seen.insert(p) {
-                    return Err(AppError::Other(format!(
-                        "stage {} lists the same upstream stage twice",
-                        i + 1
-                    )));
-                }
-            }
-        }
-        // Tool allowlist, when set, must be a non-empty subset of the known
-        // workspace tools — an empty list would leave the agent unable to act.
-        if let Some(tools) = &s.tools {
-            if tools.is_empty() {
-                return Err(AppError::Other(format!(
-                    "stage {} has an empty tool list — give it at least one tool",
+    }
+    Ok(issues)
+}
+
+/// The first rule stage `i` breaks, or `None`.
+fn stage_issue(
+    &self,
+    stages: &[StageDraft],
+    i: usize,
+    authored: bool,
+    extra: &[crate::orchestrator::roles::RoleDef],
+) -> crate::error::AppResult<Option<String>> {
+    let s = &stages[i];
+    let role = match extra.iter().find(|r| r.key == s.role) {
+        Some(r) => Some(r.clone()),
+        None => self.get_role(&s.role)?,
+    };
+    let Some(role) = role else {
+        return Ok(Some(format!("unknown stage role '{}'", s.role)));
+    };
+    if !matches!(s.substrate.as_str(), "api" | "cli") {
+        return Ok(Some(format!("unknown substrate '{}'", s.substrate)));
+    }
+    if s.agent_model.trim().is_empty() {
+        return Ok(Some(format!("stage {} has no model", i + 1)));
+    }
+    if !(1..=100).contains(&s.max_iterations) {
+        return Ok(Some(format!(
+            "stage {} max turns must be between 1 and 100 (got {})",
+            i + 1,
+            s.max_iterations
+        )));
+    }
+    // Flow-edge parents: each must reference a strictly-earlier stage (the
+    // builder topo-sorts before saving, so a valid DAG always satisfies
+    // this) and must be distinct. This is what keeps the graph acyclic and
+    // makes the ancestry-aware dossier well-defined.
+    {
+        let mut seen = std::collections::HashSet::new();
+        for &p in &s.parents {
+            if p < 0 || p >= i as i64 {
+                return Ok(Some(format!(
+                    "stage {} has an upstream link to a non-earlier stage — the flow must be acyclic",
                     i + 1
                 )));
             }
-            for t in tools {
-                if !KNOWN_TOOLS.contains(&t.as_str()) {
-                    return Err(AppError::Other(format!("unknown tool '{t}'")));
-                }
-            }
-        }
-        if let Some(instr) = &s.instructions {
-            if instr.chars().count() > MAX_INSTRUCTIONS_CHARS {
-                return Err(AppError::Other(format!(
-                    "stage {} instructions are too long (max {MAX_INSTRUCTIONS_CHARS} characters)",
-                    i + 1
-                )));
-            }
-        }
-        match s.loop_target_position {
-            Some(target) => {
-                if !self.get_role(&s.role)?.map(|r| r.can_loop).unwrap_or(false) {
-                    return Err(AppError::Other(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
-                }
-                if target < 0 || target >= i as i64 {
-                    return Err(AppError::Other("loop target must be an earlier stage".into()));
-                }
-                // In an authored graph the loop must return to a stage on the
-                // review's own path; otherwise loop_back can't re-run it (the
-                // dossier and reset both follow ancestry, not raw position).
-                if authored && !draft_ancestors(stages, i).contains(&target) {
-                    return Err(AppError::Other(
-                        "loop target must be an earlier stage on the review's own path".into(),
-                    ));
-                }
-                if s.loop_max_iterations < 1 {
-                    return Err(AppError::Other("loop max iterations must be at least 1".into()));
-                }
-                if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
-                    return Err(AppError::Other("loop mode must be 'gated' or 'auto'".into()));
-                }
-            }
-            None => {
-                if s.loop_max_iterations != 0 || s.loop_mode.is_some() {
-                    return Err(AppError::Other("loop fields set without a loop target".into()));
-                }
+            if !seen.insert(p) {
+                return Ok(Some(format!("stage {} lists the same upstream stage twice", i + 1)));
             }
         }
     }
-    Ok(())
+    // Tool allowlist, when set, must be a non-empty subset of the known
+    // workspace tools — an empty list would leave the agent unable to act.
+    if let Some(tools) = &s.tools {
+        if tools.is_empty() {
+            return Ok(Some(format!(
+                "stage {} has an empty tool list — give it at least one tool",
+                i + 1
+            )));
+        }
+        for t in tools {
+            if !KNOWN_TOOLS.contains(&t.as_str()) {
+                return Ok(Some(format!("unknown tool '{t}'")));
+            }
+        }
+    }
+    if let Some(instr) = &s.instructions {
+        if instr.chars().count() > MAX_INSTRUCTIONS_CHARS {
+            return Ok(Some(format!(
+                "stage {} instructions are too long (max {MAX_INSTRUCTIONS_CHARS} characters)",
+                i + 1
+            )));
+        }
+    }
+    match s.loop_target_position {
+        Some(target) => {
+            if !role.can_loop {
+                return Ok(Some(format!("stage '{}' cannot carry a loop (not a review role)", s.role)));
+            }
+            if target < 0 || target >= i as i64 {
+                return Ok(Some("loop target must be an earlier stage".into()));
+            }
+            // In an authored graph the loop must return to a stage on the
+            // review's own path; otherwise loop_back can't re-run it (the
+            // dossier and reset both follow ancestry, not raw position).
+            if authored && !draft_ancestors(stages, i).contains(&target) {
+                return Ok(Some("loop target must be an earlier stage on the review's own path".into()));
+            }
+            if s.loop_max_iterations < 1 {
+                return Ok(Some("loop max iterations must be at least 1".into()));
+            }
+            if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
+                return Ok(Some("loop mode must be 'gated' or 'auto'".into()));
+            }
+        }
+        None => {
+            if s.loop_max_iterations != 0 || s.loop_mode.is_some() {
+                return Ok(Some("loop fields set without a loop target".into()));
+            }
+        }
+    }
+    Ok(None)
 }
 } // impl Db (validate_pipeline_stages)
 

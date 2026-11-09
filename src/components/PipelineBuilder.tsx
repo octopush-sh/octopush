@@ -16,7 +16,8 @@ import {
   type OnBeforeDelete,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Undo2, Redo2, Network, X } from "lucide-react";
+import { Undo2, Redo2, Network, X, Download, Copy } from "lucide-react";
+import { copyCrewJson, exportCrewFile, openDroppedCrew } from "../lib/crew";
 import type { PipelineWithStages, Role } from "../lib/ipc";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -239,6 +240,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
   const onDrop = useCallback(
     (e: React.DragEvent) => {
       e.preventDefault();
+      // A dropped crew file opens the import review (never edits this graph).
+      if (openDroppedCrew(e)) return;
       const role = e.dataTransfer.getData(ARCHETYPE_DND_MIME);
       if (!role) return;
       addNode(role, rf.screenToFlowPosition({ x: e.clientX, y: e.clientY }));
@@ -533,6 +536,30 @@ function BuilderInner({ pipeline, onClose }: Props) {
                   >
                     <Network size={13} strokeWidth={1.75} />
                   </button>
+                  {pipeline && (
+                    <>
+                      <span aria-hidden className="mx-0.5 h-4 w-px bg-octo-hairline" />
+                      <button
+                        type="button"
+                        data-tour="builder-export-crew"
+                        aria-label="Export crew…"
+                        title="Export crew… — save the saved pipeline and its custom roles as a .octocrew.json file"
+                        onClick={() => void exportCrewFile(pipeline.pipeline.id)}
+                        className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                      >
+                        <Download size={13} strokeWidth={1.75} />
+                      </button>
+                      <button
+                        type="button"
+                        aria-label="Copy crew as JSON"
+                        title="Copy crew as JSON — the saved pipeline and its custom roles"
+                        onClick={() => void copyCrewJson(pipeline.pipeline.id)}
+                        className="flex h-6 w-6 items-center justify-center rounded-sm text-octo-sage transition-colors duration-[150ms] hover:text-octo-brass"
+                      >
+                        <Copy size={13} strokeWidth={1.75} />
+                      </button>
+                    </>
+                  )}
                 </div>
               </Panel>
               <Panel position="bottom-center" className="!mb-4">

@@ -72,6 +72,10 @@ Current anchors:
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-stage-waiting` | Direct run track, only while a running stage has no activity yet: its card's live line "waiting for first tool call" | `RunFlow.tsx` |
+| `direct-launcher-import-crew` · `direct-launcher-repo-crews` | Direct launcher: the "import a crew" link beside the ensemble eyebrow · the "from this repo" group (only when the worktree has `.octopush/crews/*.octocrew.json`) | `PipelineSetup.tsx` |
+| `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |
+| `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
+| `palette-import-crew` | Command palette, Actions: "Import a crew…" | `CommandPalette.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
 | `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the focused session's rail cell · a rail cell flyout's "Open beside" / "Replace in the focused pane" (on hover, while Open beside can do something) | `run/SessionRail.tsx` |

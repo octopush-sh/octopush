@@ -184,6 +184,52 @@ export interface StageDraft {
   /** Free-form additions appended to the archetype's system prompt. */
   instructions: string | null;
 }
+/** One stage of a crew import's review sheet (mirrors Rust `crew::CrewStagePreview`). */
+export interface CrewStagePreview {
+  position: number;
+  label: string;
+  /** The role key it will use (after any rename). */
+  role: string;
+  agentModel: string;
+  escalateModel: string | null;
+  substrate: AgentSubstrate;
+  checkpoint: boolean;
+  /** False = the stage can change the worktree. */
+  readOnly: boolean;
+  /** The role may commit, push and run release commands. */
+  actionRole: boolean;
+  tools: string[];
+  instructions: string | null;
+  unpricedModel: boolean;
+  unpricedEscalate: boolean;
+  problem: string | null;
+}
+export interface CrewRolePreview {
+  key: string;
+  originalKey: string;
+  label: string;
+  promptBody: string;
+  /** new · renamed (its key was taken here) · existing (identical role reused) */
+  fate: "new" | "renamed" | "existing";
+}
+export interface CrewPreview {
+  name: string;
+  description: string;
+  stages: CrewStagePreview[];
+  roles: CrewRolePreview[];
+  /** Problems not tied to one stage. */
+  problems: string[];
+  ok: boolean;
+}
+/** A crew file committed in the repo (`.octopush/crews/*.octocrew.json`). */
+export interface RepoCrew {
+  file: string;
+  name: string;
+  description: string;
+  stageCount: number;
+  json: string;
+  problem: string | null;
+}
 export interface PipelineDraft {
   pipelineId: string | null; // null = create; a builtin id = fork; a custom id = update
   name: string;
@@ -1236,6 +1282,21 @@ export const ipc = {
 
   deletePipeline: (pipelineId: string) =>
     invoke<void>("delete_pipeline", { pipelineId }),
+
+  // ─── Portable crews (.octocrew.json) ──────────────────────────────
+  /** A saved pipeline (plus the custom roles it uses) as crew-file text. */
+  exportCrew: (pipelineId: string) => invoke<string>("export_crew", { pipelineId }),
+  /** Native save dialog, then the file. Resolves to the path, or null if cancelled. */
+  saveCrewFile: (pipelineId: string) => invoke<string | null>("save_crew_file", { pipelineId }),
+  readCrewFile: (path: string) => invoke<string>("read_crew_file", { path }),
+  /** What an import would save. Writes nothing. `modelSwaps`: [from, to] pairs. */
+  previewCrew: (text: string, modelSwaps?: [string, string][]) =>
+    invoke<CrewPreview>("preview_crew", { text, modelSwaps: modelSwaps ?? null }),
+  /** Save a reviewed crew as a new custom pipeline; never starts a run. Returns its id. */
+  importCrew: (text: string, modelSwaps?: [string, string][]) =>
+    invoke<string>("import_crew", { text, modelSwaps: modelSwaps ?? null }),
+  /** Crews committed under `<worktree>/.octopush/crews/`, re-read on every call. */
+  listRepoCrews: (workspacePath: string) => invoke<RepoCrew[]>("list_repo_crews", { workspacePath }),
 
   // ─── Routines (scheduled crews — Pro) ─────────────────────────────
   listRoutines: () => invoke<Routine[]>("list_routines"),

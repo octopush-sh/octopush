@@ -29,11 +29,12 @@ vi.mock("../hooks/useEntitlement", () => ({
 }));
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
+const repoCrewsMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
     ...actual,
-    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock },
+    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, listRepoCrews: repoCrewsMock },
   };
 });
 
@@ -63,6 +64,38 @@ beforeEach(() => {
   estimateMock.mockResolvedValue({ estimateUsd: 0.05, baselineUsd: 0.4 });
   useRunsStore.setState({ launcherPrefill: null });
   useMissionsStore.setState({ missionByWorkspaceId: {} });
+  repoCrewsMock.mockReset();
+  repoCrewsMock.mockResolvedValue([]);
+});
+
+describe("PipelineSetup crews from the repo", () => {
+  it("lists .octopush/crews files read-only and forks one through the review sheet", async () => {
+    const { useCrewImportStore } = await import("../stores/crewImportStore");
+    useCrewImportStore.getState().close();
+    repoCrewsMock.mockResolvedValue([
+      { file: "relay.octocrew.json", name: "Repo relay", description: "", stageCount: 3, json: "{\"octocrew\":1}", problem: null },
+      { file: "broken.octocrew.json", name: "broken", description: "", stageCount: 0, json: "{", problem: "This isn't JSON" },
+    ]);
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect(await screen.findByText("Repo relay")).toBeInTheDocument();
+    expect(repoCrewsMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(screen.getByText("from this repo")).toBeInTheDocument();
+    expect(screen.getByText("This isn't JSON")).toBeInTheDocument();
+    // Only the valid file can be forked, and forking only opens the review.
+    const forks = screen.getAllByRole("button", { name: "Fork into my library" });
+    expect(forks).toHaveLength(1);
+    fireEvent.click(forks[0]);
+    const s = useCrewImportStore.getState();
+    expect(s.open).toBe(true);
+    expect(s.text).toBe("{\"octocrew\":1}");
+    expect(s.origin).toBe(".octopush/crews/relay.octocrew.json");
+  });
+
+  it("hides the group when the repo has no crews", async () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await waitFor(() => expect(repoCrewsMock).toHaveBeenCalled());
+    expect(screen.queryByText("from this repo")).not.toBeInTheDocument();
+  });
 });
 
 describe("PipelineSetup begin gate", () => {

@@ -213,6 +213,42 @@ impl<'o> Drop for ActiveGuard<'o> {
     }
 }
 
+/// True when a stage CANNOT mutate the worktree — the bar for running it
+/// concurrently with a writer. API: the tool allowlist grants no
+/// write/edit/run. CLI: only a CODEX worktree review counts — codex's
+/// `--sandbox read-only` is kernel-enforced; a Claude CLI review keeps
+/// Bash (reviewers run builds/tests), and a Bash that can `git stash` or
+/// `npm install` into the shared checkout is a writer for scheduling
+/// purposes, whatever the edit-tool denial says. Writers — including any
+/// stage whose tools are unknown — serialize. Plain fields, so a crew import
+/// can show the same verdict before anything is saved.
+pub fn stage_read_only(
+    substrate: &str,
+    agent_model: &str,
+    tools: Option<&[String]>,
+    role: Option<&roles::RoleDef>,
+) -> bool {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    match AgentSubstrate::from_db(substrate) {
+        Some(AgentSubstrate::Api) => tools
+            .map(|t| {
+                !t.iter()
+                    .any(|x| matches!(x.as_str(), "write_file" | "edit_file" | "run_command"))
+            })
+            .unwrap_or(false),
+        Some(AgentSubstrate::Cli) => {
+            matches!(dialect_for_model(agent_model), CliDialect::Codex)
+                && role
+                    .map(|rd| {
+                        matches!(rd.artifact_kind, ArtifactKind::Review)
+                            && matches!(rd.environment, types::RoleEnvironment::Worktree)
+                    })
+                    .unwrap_or(false)
+        }
+        None => false,
+    }
+}
+
 /// Drives runs: one stage at a time, pausing at checkpoints.
 pub struct Orchestrator {
     db: Arc<Mutex<Db>>,
@@ -1781,44 +1817,14 @@ impl Orchestrator {
         }
     }
 
-    /// True when a stage CANNOT mutate the worktree — the bar for running it
-    /// concurrently with a writer. API: the tool allowlist grants no
-    /// write/edit/run. CLI: only a CODEX worktree review counts — codex's
-    /// `--sandbox read-only` is kernel-enforced; a Claude CLI review keeps
-    /// Bash (reviewers run builds/tests), and a Bash that can `git stash` or
-    /// `npm install` into the shared checkout is a writer for scheduling
-    /// purposes, whatever the edit-tool denial says. Writers — including any
-    /// stage whose tools are unknown — serialize.
+    /// [`stage_read_only`] for a run stage.
     fn stage_is_read_only(&self, s: &crate::db::RunStageRow) -> bool {
         use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
-        match AgentSubstrate::from_db(&s.substrate) {
-            Some(AgentSubstrate::Api) => s
-                .tools
-                .as_ref()
-                .map(|t| {
-                    !t.iter()
-                        .any(|x| matches!(x.as_str(), "write_file" | "edit_file" | "run_command"))
-                })
-                .unwrap_or(false),
-            Some(AgentSubstrate::Cli) => {
-                matches!(dialect_for_model(&s.agent_model), CliDialect::Codex)
-                    && self
-                        .db
-                        .lock()
-                        .get_role(&s.role)
-                        .ok()
-                        .flatten()
-                        .map(|rd| {
-                            matches!(rd.artifact_kind, ArtifactKind::Review)
-                                && matches!(
-                                    rd.environment,
-                                    crate::orchestrator::types::RoleEnvironment::Worktree
-                                )
-                        })
-                        .unwrap_or(false)
-            }
-            None => false,
-        }
+        // The role matters only for a Codex CLI stage; skip the lookup otherwise.
+        let needs_role = matches!(AgentSubstrate::from_db(&s.substrate), Some(AgentSubstrate::Cli))
+            && matches!(dialect_for_model(&s.agent_model), CliDialect::Codex);
+        let role = if needs_role { self.db.lock().get_role(&s.role).ok().flatten() } else { None };
+        stage_read_only(&s.substrate, &s.agent_model, s.tools.as_deref(), role.as_ref())
     }
 
     /// The freshly-persisted artifact text of `stage` (its review findings).
