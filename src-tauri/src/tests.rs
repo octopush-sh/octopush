@@ -14185,13 +14185,17 @@ mod pricing_table_tests {
         let providers = crate::provider_router::builtin_providers();
         let router = crate::provider_router::ProviderRouter::from_map(providers.clone());
         for name in ["anthropic", "openai"] {
+            let local = providers[name].local;
             for m in &providers[name].models {
                 let t = builtin_prices(&m.id).unwrap_or_else(|| panic!("{} missing from the table", m.id));
                 assert_eq!(t.input_per_m, m.input_cost_per_m, "{}", m.id);
                 assert_eq!(t.output_per_m, m.output_cost_per_m, "{}", m.id);
-                if m.cache_read_cost_per_m > 0.0 {
-                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{}", m.id);
-                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{}", m.id);
+                // Cache columns too: a $0 here would bill cached input at the
+                // wrong rate. Only explicitly free or local entries skip them.
+                let free = m.input_cost_per_m == 0.0 && m.output_cost_per_m == 0.0;
+                if !local && !free {
+                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{} cache read", m.id);
+                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{} cache write", m.id);
                 }
                 // 1-hour writes: 2× input, the same on the catalog-first path.
                 if m.id.starts_with("claude-") {
@@ -14240,6 +14244,58 @@ mod pricing_table_tests {
         assert_eq!((get("claude-opus-4-6").input_cost_per_m, get("claude-opus-4-6").output_cost_per_m), (5.0, 25.0));
         assert_eq!(get("claude-opus-4-6").cache_read_cost_per_m, 0.50);
         assert_eq!((get("claude-sonnet-5").input_cost_per_m, get("claude-sonnet-5").output_cost_per_m), (2.2, 11.0));
+    }
+
+    #[test]
+    fn stale_gpt_4o_cache_prices_on_disk_are_corrected_but_edits_kept() {
+        use crate::provider_router::{builtin_providers, migrate_stale_builtin_prices};
+        let defaults = builtin_providers();
+        let mut list: Vec<_> = vec![defaults["openai"].clone()];
+        for m in &mut list[0].models {
+            match m.id.as_str() {
+                // The old shipped default: cached input at $0 → corrected.
+                "gpt-4o" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (2.5, 10.0, 0.0, 0.0);
+                }
+                // A user edit → left alone.
+                "gpt-4o-mini" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (0.2, 0.6, 0.0, 0.0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 1);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().clone();
+        assert_eq!((get("gpt-4o").cache_read_cost_per_m, get("gpt-4o").cache_creation_cost_per_m), (1.25, 2.50));
+        assert_eq!((get("gpt-4o-mini").input_cost_per_m, get("gpt-4o-mini").cache_read_cost_per_m), (0.2, 0.0));
+        // The old mini default alone is corrected too.
+        let mut mini = vec![defaults["openai"].clone()];
+        for m in &mut mini[0].models {
+            if m.id == "gpt-4o-mini" {
+                (m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (0.0, 0.0);
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut mini, &defaults), 1);
+        let m = mini[0].models.iter().find(|m| m.id == "gpt-4o-mini").unwrap();
+        assert_eq!((m.cache_read_cost_per_m, m.cache_creation_cost_per_m), (0.075, 0.15));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn gpt_4o_cached_input_is_priced_at_its_cached_rate() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // 1,000 cached tokens (OpenAI's `prompt_tokens_details.cached_tokens`).
+        let gpt = prices_for("gpt-4o").expect("gpt-4o is priced");
+        assert!(near(gpt.cost(0, 0, 1_000, 0), 1_000.0 * 1.25 / 1e6), "{gpt:?}");
+        let mini = prices_for("gpt-4o-mini").expect("gpt-4o-mini is priced");
+        assert!(near(mini.cost(0, 0, 1_000, 0), 1_000.0 * 0.075 / 1e6), "{mini:?}");
+        // Catalog-first and the table agree.
+        assert_eq!(Some(gpt), builtin_prices("gpt-4o"));
+        assert_eq!(Some(mini), builtin_prices("gpt-4o-mini"));
     }
 }
 
