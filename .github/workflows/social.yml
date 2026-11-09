@@ -19,6 +19,9 @@ name: social
 on:
   schedule:
     - cron: "47 11 * * *"
+    # Backup: GitHub drops or delays busy-hour schedules. `check` skips a
+    # scheduled run when today's issue already exists, so this never files twice.
+    - cron: "23 16 * * *"
   workflow_dispatch:
     inputs:
       kind:
