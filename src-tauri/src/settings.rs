@@ -91,6 +91,13 @@ pub struct AppSettings {
     #[serde(default)]
     pub sync_owner: Option<String>,
 
+    /// The last push attempt per sync kind, for the status line under each
+    /// Sync toggle (#518): time, outcome, count and HTTP status — **nothing
+    /// else** (no payloads, run titles or error bodies). Owned by
+    /// `sync::record_push`; cleared when its toggle turns off and on sign-out.
+    #[serde(default, skip_serializing_if = "crate::sync::SyncStatus::is_empty")]
+    pub last_sync_attempt: crate::sync::SyncStatus,
+
     /// Update channel (Settings › About): `stable` (default) or `beta`.
     /// Owned by `set_update_channel` — whole-file saves carry it over.
     #[serde(default)]
@@ -135,6 +142,22 @@ pub fn load_settings() -> AppResult<AppSettings> {
     }
 
     Ok(settings)
+}
+
+/// Serializes every read-modify-write of `settings.json` made through
+/// [`update_settings`], so a background writer (the sync status, #518) can
+/// never resurrect a value another writer just changed — e.g. flip a sync
+/// opt-in back on.
+static SETTINGS_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
+
+/// Read-modify-write `settings.json` under [`SETTINGS_WRITE_LOCK`]. A read
+/// failure aborts without writing.
+pub fn update_settings<R>(f: impl FnOnce(&mut AppSettings) -> R) -> AppResult<R> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
+    let mut settings = load_settings()?;
+    let out = f(&mut settings);
+    save_settings(&settings)?;
+    Ok(out)
 }
 
 pub fn save_settings(settings: &AppSettings) -> AppResult<()> {
@@ -208,11 +231,27 @@ impl AppSettings {
         }
     }
 
-    /// Forget every opt-in (sign-out).
+    /// Forget every opt-in (sign-out), and the last-attempt records with them.
     pub fn clear_sync_opt_ins(&mut self) {
         self.history_sync_enabled = false;
         self.library_sync_enabled = false;
         self.sync_owner = None;
+        self.last_sync_attempt = crate::sync::SyncStatus::default();
+    }
+
+    /// Drop the last-attempt record of every kind whose flag is off. Returns
+    /// the kinds dropped, so the caller can forget them in memory too.
+    pub fn drop_sync_attempts_for_off_kinds(&mut self) -> Vec<crate::sync::SyncKind> {
+        let mut dropped = Vec::new();
+        for kind in [crate::sync::SyncKind::History, crate::sync::SyncKind::Library] {
+            if !self.flag(kind) {
+                if self.last_sync_attempt.get(kind).is_some() {
+                    self.last_sync_attempt.set(kind, None);
+                }
+                dropped.push(kind);
+            }
+        }
+        dropped
     }
 
     /// `set_sync_pref` is the ONLY writer of the opt-ins: a whole-file save
@@ -222,6 +261,7 @@ impl AppSettings {
         self.history_sync_enabled = on_disk.history_sync_enabled;
         self.library_sync_enabled = on_disk.library_sync_enabled;
         self.sync_owner = on_disk.sync_owner.clone();
+        self.last_sync_attempt = on_disk.last_sync_attempt.clone();
     }
 
     /// Same rule for the updater prefs: `set_update_channel` /
@@ -239,9 +279,7 @@ pub fn update_channel() -> crate::updater::UpdateChannel {
 
 /// Persist the update channel (read-modify-write).
 pub fn set_update_channel(channel: crate::updater::UpdateChannel) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.update_channel = channel;
-    save_settings(&settings)
+    update_settings(|s| s.update_channel = channel)
 }
 
 /// The version the user skipped, if any.
@@ -251,9 +289,7 @@ pub fn skipped_update_version() -> Option<String> {
 
 /// Persist (or clear, with `None`) the skipped version.
 pub fn set_skipped_update_version(version: Option<String>) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.skipped_update_version = version.filter(|v| !v.trim().is_empty());
-    save_settings(&settings)
+    update_settings(|s| s.skipped_update_version = version.filter(|v| !v.trim().is_empty()))
 }
 
 /// Has the signed-in user opted in to this kind of cloud sync? Reads
@@ -274,6 +310,17 @@ pub fn sync_opted_in(kind: crate::sync::SyncKind) -> bool {
     settings.sync_opted_in_for(kind, sub.as_deref())
 }
 
+/// Is this kind's opt-in flag set at all (ignoring which account set it)? The
+/// sync status recorder's re-check: an attempt that finishes after the toggle
+/// went off records nothing. Any read failure answers **no**.
+pub fn sync_flag_on(kind: crate::sync::SyncKind) -> bool {
+    #[cfg(test)]
+    if let Some(v) = test_sync_override::get(kind) {
+        return v;
+    }
+    load_settings().map(|s| s.flag(kind)).unwrap_or(false)
+}
+
 /// The opt-ins as they apply to whoever is signed in now.
 pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
     let settings = load_settings()?;
@@ -285,6 +332,7 @@ pub fn current_sync_prefs() -> AppResult<SyncPrefs> {
 /// return the new effective pair. Enabling requires a signed-in user (the
 /// opt-in is bound to their Clerk id); disabling always succeeds.
 pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResult<SyncPrefs> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
     let mut settings = load_settings()?;
     let sub = crate::auth::current_identity().map(|(sub, _)| sub);
     match sub.as_deref() {
@@ -294,14 +342,21 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
         }
         _ => settings.set_flag(kind, false),
     }
+    // A toggle that is off shows no status, and keeps none.
+    for off in settings.drop_sync_attempts_for_off_kinds() {
+        crate::sync::status::forget(off);
+    }
     save_settings(&settings)?;
     Ok(settings.sync_prefs_for(sub.as_deref()))
 }
 
-/// Sign-out: drop both opt-ins and their owner.
+/// Sign-out: drop both opt-ins, their owner and the last-attempt records.
 pub fn clear_sync_opt_ins() -> AppResult<()> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
     let mut settings = load_settings()?;
     settings.clear_sync_opt_ins();
+    crate::sync::status::forget(crate::sync::SyncKind::History);
+    crate::sync::status::forget(crate::sync::SyncKind::Library);
     save_settings(&settings)
 }
 
@@ -310,6 +365,7 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 /// `set_update_channel` / `set_skipped_update_version`), which are carried
 /// over from disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
+    let _guard = SETTINGS_WRITE_LOCK.lock();
     let on_disk = load_settings()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
@@ -374,9 +430,7 @@ pub fn get_issue_tracker_config() -> Option<crate::issue_tracker::jira::JiraConf
 
 /// Persist the issue tracker configuration.
 pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.issue_tracker = Some(config);
-    save_settings(&settings)
+    update_settings(|s| s.issue_tracker = Some(config))
 }
 
 /// Persist git credentials for a host.  NOTE: save_settings does a full-file
@@ -384,15 +438,15 @@ pub fn save_issue_tracker_config(config: crate::issue_tracker::jira::JiraConfig)
 /// clobbering fields they don't own. Not safe for concurrent writers, but the
 /// app is single-window so that's acceptable.
 pub fn save_git_credentials(host: &str, username: &str, token: &str) -> AppResult<()> {
-    let mut settings = load_settings()?;
-    settings.git_credentials.insert(
-        host.to_string(),
-        GitCredentialEntry {
-            username: username.to_string(),
-            token: token.to_string(),
-        },
-    );
-    save_settings(&settings)
+    update_settings(|s| {
+        s.git_credentials.insert(
+            host.to_string(),
+            GitCredentialEntry {
+                username: username.to_string(),
+                token: token.to_string(),
+            },
+        );
+    })
 }
 
 #[cfg(test)]

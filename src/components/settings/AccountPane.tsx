@@ -9,6 +9,9 @@ import { ipc } from "../../lib/ipc";
 import { awaitProAfterCheckout } from "../../lib/awaitPro";
 import { pushToast } from "../Toasts";
 import { useSyncPrefsStore } from "../../stores/syncPrefsStore";
+import { syncStatusLine } from "../../lib/syncStatusLine";
+import { tourId } from "../../lib/tour/ids";
+import type { SyncAttempt, SyncKind } from "../../lib/types";
 import { PaneHeader, SectionLabel, ToggleRow } from "./shared";
 
 /** Toggle + helper copy for the two cloud syncs. Exported so the website and
@@ -52,6 +55,37 @@ export function syncRowState({
   };
 }
 
+/** The last-attempt line under one enabled Sync toggle (muted mono; amber
+ *  when the last attempt failed or uploads are paused). Nothing when off. */
+export function SyncStatusNote({
+  kind,
+  enabled,
+  attempt,
+}: {
+  kind: SyncKind;
+  enabled: boolean;
+  attempt: SyncAttempt | null;
+}) {
+  const line = syncStatusLine(kind, enabled, attempt);
+  if (!line) return null;
+  return (
+    <p
+      key={line.text}
+      className={`octo-fade-in px-4 pt-1.5 font-mono text-[11px] leading-[1.5] ${
+        line.tone === "warning" ? "text-octo-warning" : "text-octo-mute"
+      }`}
+      data-testid={`sync-${kind}-status`}
+      data-tour={
+        kind === "history"
+          ? tourId("settings-account-sync-history-status")
+          : tourId("settings-account-sync-library-status")
+      }
+    >
+      {line.text}
+    </p>
+  );
+}
+
 export function AccountPane() {
   const { status, signingIn, error, signIn, cancelSignIn, signOut, refresh } = useAuth();
   const { plan, reload, hasFeature } = useEntitlement();
@@ -62,6 +96,8 @@ export function AccountPane() {
   const syncError = useSyncPrefsStore((s) => s.error);
   const loadSyncPrefs = useSyncPrefsStore((s) => s.load);
   const setSyncPref = useSyncPrefsStore((s) => s.setPref);
+  const syncStatus = useSyncPrefsStore((s) => s.status);
+  const loadSyncStatus = useSyncPrefsStore((s) => s.loadStatus);
   const historyRow = syncRowState({
     signedIn: status.signedIn,
     entitled: hasFeature("history.sync"),
@@ -78,6 +114,10 @@ export function AccountPane() {
   useEffect(() => {
     void loadSyncPrefs();
   }, [loadSyncPrefs, status.signedIn]);
+
+  useEffect(() => {
+    void loadSyncStatus();
+  }, [loadSyncStatus, status.signedIn, historySync, librarySync]);
 
   // On opening the pane while signed in, re-fetch identity (to pick up a plan
   // change after a just-completed checkout) and reload the entitlement.
@@ -209,26 +249,32 @@ export function AccountPane() {
 
         <div className="space-y-2" data-testid="sync-section">
           <SectionLabel>Sync</SectionLabel>
-          <ToggleRow
-            label={SYNC_COPY.historyLabel}
-            description={SYNC_COPY.historyDescription}
-            checked={historySync}
-            disabled={historyRow.disabled}
-            busy={historyRow.busy}
-            title={historyRow.title}
-            onChange={(v) => void setSyncPref("history", v)}
-            testId="sync-history-toggle"
-          />
-          <ToggleRow
-            label={SYNC_COPY.libraryLabel}
-            description={SYNC_COPY.libraryDescription}
-            checked={librarySync}
-            disabled={libraryRow.disabled}
-            busy={libraryRow.busy}
-            title={libraryRow.title}
-            onChange={(v) => void setSyncPref("library", v)}
-            testId="sync-library-toggle"
-          />
+          <div>
+            <ToggleRow
+              label={SYNC_COPY.historyLabel}
+              description={SYNC_COPY.historyDescription}
+              checked={historySync}
+              disabled={historyRow.disabled}
+              busy={historyRow.busy}
+              title={historyRow.title}
+              onChange={(v) => void setSyncPref("history", v)}
+              testId="sync-history-toggle"
+            />
+            <SyncStatusNote kind="history" enabled={historySync} attempt={syncStatus.history} />
+          </div>
+          <div>
+            <ToggleRow
+              label={SYNC_COPY.libraryLabel}
+              description={SYNC_COPY.libraryDescription}
+              checked={librarySync}
+              disabled={libraryRow.disabled}
+              busy={libraryRow.busy}
+              title={libraryRow.title}
+              onChange={(v) => void setSyncPref("library", v)}
+              testId="sync-library-toggle"
+            />
+            <SyncStatusNote kind="library" enabled={librarySync} attempt={syncStatus.library} />
+          </div>
           <p className="pt-1 text-[12px] leading-[1.55] text-octo-mute" data-testid="sync-note">
             {SYNC_COPY.note}
           </p>

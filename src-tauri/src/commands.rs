@@ -2118,6 +2118,22 @@ pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
     crate::settings::current_sync_prefs()
 }
 
+/// The last push attempt per sync kind (time, outcome, count, HTTP status) for
+/// the status line under each Settings › Account › Sync toggle. A kind whose
+/// opt-in doesn't apply to the signed-in user answers `None`. Local read only.
+#[tauri::command]
+pub async fn get_sync_status() -> AppResult<crate::sync::SyncStatus> {
+    let prefs = crate::settings::current_sync_prefs()?;
+    let mut status = crate::sync::status::snapshot();
+    if !prefs.history_sync {
+        status.history = None;
+    }
+    if !prefs.library_sync {
+        status.library = None;
+    }
+    Ok(status)
+}
+
 /// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
 /// the new pair. The opt-in is bound to the signed-in Clerk user. Turning ON
 /// requires the matching Pro feature (the UI disables
@@ -2371,7 +2387,12 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
 /// session in the OS keychain. Returns the resulting auth status.
 #[tauri::command]
 pub async fn auth_begin_sign_in() -> AppResult<crate::auth::AuthStatus> {
-    crate::auth::begin_sign_in().await
+    let status = crate::auth::begin_sign_in().await?;
+    // Signed back in: a "Paused: sign in again" sync status no longer applies.
+    if status.signed_in && crate::sync::status::forget_signed_out() {
+        crate::sync::persist_status();
+    }
+    Ok(status)
 }
 
 /// Clear the stored session (sign out locally). Also drops the local run-history
@@ -3883,9 +3904,7 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
     *state.router.lock() = updated_router;
 
     // Persist the refresh timestamp to settings.
-    let mut settings = crate::settings::load_settings().unwrap_or_default();
-    settings.last_pricing_refresh = Some(fetched_at.clone());
-    let _ = crate::settings::save_settings(&settings);
+    let _ = crate::settings::update_settings(|s| s.last_pricing_refresh = Some(fetched_at.clone()));
 
     // A model that had no price when its spend was recorded left $0 rows in
     // the ledger; now that it may have one, price them.
