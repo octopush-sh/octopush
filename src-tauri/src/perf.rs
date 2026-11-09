@@ -90,7 +90,11 @@ pub fn pick_disk_for_path(mounts: &[(PathBuf, u64, u64)], target: &Path) -> Disk
 /// Read the free/total bytes of the volume that `$HOME` lives on. Zeroes when
 /// sysinfo cannot list disks, the same as when no mount matches.
 pub fn home_disk() -> DiskInfo {
-    let mounts: Vec<(PathBuf, u64, u64)> = match sysinfo::Disks::new_with_refreshed_list() {
+    // Storage only: this runs on every perf poll, and `new_with_refreshed_list()`
+    // would also walk IOKit per volume for I/O counters we never read.
+    let mounts: Vec<(PathBuf, u64, u64)> = match sysinfo::Disks::new_with_refreshed_list_specifics(
+        sysinfo::DiskRefreshKind::nothing().with_storage(),
+    ) {
         Ok(disks) => disks
             .iter()
             .map(|d| (d.mount_point().to_path_buf(), d.total_space(), d.available_space()))
