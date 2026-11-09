@@ -4964,9 +4964,9 @@ pub async fn github_ship_readiness(path: String) -> AppResult<crate::github::Shi
     let github_remote = (|| -> Option<bool> {
         let repo = git2::Repository::discover(&path).ok()?;
         let names = repo.remotes().ok()?;
-        for name in names.iter().flatten() {
+        for name in names.iter().filter_map(|n| n.ok().flatten()) {
             if let Ok(remote) = repo.find_remote(name) {
-                if let Some(url) = remote.url() {
+                if let Ok(url) = remote.url() {
                     if let Some(parsed) = crate::git_url::parse_git_url(url) {
                         if is_github_host(&parsed.host) {
                             return Some(true);
@@ -5217,8 +5217,8 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
             }
         };
         let url = match remote.url() {
-            Some(u) => u.to_string(),
-            None => {
+            Ok(u) => u.to_string(),
+            Err(_) => {
                 tracing::info!("find_pr_for_branch: remote `origin` has no url");
                 return Ok(None);
             }
