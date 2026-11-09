@@ -153,6 +153,19 @@ pub struct SyncStatus {
 }
 
 impl SyncStatus {
+    /// `settings.json`'s reader: any unreadable value falls back to the
+    /// default, and one bad kind drops only that kind.
+    pub fn deserialize_lenient<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d).unwrap_or(serde_json::Value::Null);
+        let entry = |key: &str| {
+            v.get(key)
+                .cloned()
+                .and_then(|e| serde_json::from_value::<Option<SyncAttempt>>(e).ok())
+                .flatten()
+        };
+        Ok(SyncStatus { history: entry("history"), library: entry("library") })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.history.is_none() && self.library.is_none()
     }
@@ -281,6 +294,12 @@ pub(crate) fn merge_status_into(settings: &mut crate::settings::AppSettings) {
     settings.last_sync_attempt = status::snapshot();
 }
 
+/// The background persist's write itself (a read-modify-write that refuses to
+/// touch an unparseable `settings.json`).
+pub(crate) fn persist_status_now() -> AppResult<()> {
+    crate::settings::update_settings(merge_status_into)
+}
+
 /// Write the in-memory record to `settings.json` off the push path. The
 /// snapshot is taken under the settings write lock, so the last write always
 /// carries the newest record; a failure is logged and otherwise ignored.
@@ -289,7 +308,7 @@ pub(crate) fn persist_status() {
         return; // tests never touch the real settings file
     }
     let job = || {
-        if let Err(e) = crate::settings::update_settings(merge_status_into) {
+        if let Err(e) = persist_status_now() {
             tracing::debug!("sync status: could not persist the last attempt: {e}");
         }
     };

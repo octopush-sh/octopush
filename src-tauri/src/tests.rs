@@ -14988,6 +14988,62 @@ mod sync_status_tests {
     }
 
     #[test]
+    fn an_unknown_outcome_drops_only_that_entry() {
+        let json = r#"{
+            "providerKeys": {"anthropic": "sk-ant-keep"},
+            "gitCredentials": {"github.com": {"username": "u", "token": "t"}},
+            "historySyncEnabled": true,
+            "lastSyncAttempt": {
+                "history": {"at": "2026-11-09T14:02:00Z", "outcome": "signedOut", "count": 3},
+                "library": {"at": "2026-11-09T14:02:00Z", "outcome": "sent", "count": 2}
+            }
+        }"#;
+        let s: AppSettings = serde_json::from_str(json).expect("the file still loads");
+        assert_eq!(s.provider_keys.get("anthropic").map(String::as_str), Some("sk-ant-keep"));
+        assert!(s.git_credentials.contains_key("github.com"));
+        assert!(s.history_sync_enabled);
+        assert!(s.last_sync_attempt.history.is_none(), "the unreadable entry is dropped");
+        assert_eq!(s.last_sync_attempt.library.as_ref().map(|r| r.count), Some(2));
+
+        // A wholly wrong shape falls back to no record, never a failed file.
+        let s: AppSettings =
+            serde_json::from_str(r#"{"providerKeys":{"a":"k"},"lastSyncAttempt":"garbage"}"#).unwrap();
+        assert!(s.last_sync_attempt.is_empty());
+        assert_eq!(s.provider_keys.get("a").map(String::as_str), Some("k"));
+    }
+
+    #[test]
+    fn an_unparseable_settings_file_is_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        crate::settings::test_settings_path::set(Some(path.clone()));
+        reset(true, true);
+        crate::sync::record_push(SyncKind::History, PushOutcome::Sent, 3, None);
+
+        for corrupt in ["{", r#"{"providerKeys":{"anthropic":"sk"},"historySyncEnabled":"yes"}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            // The app's read side keeps its old behaviour: defaults.
+            assert!(crate::settings::load_settings().unwrap().provider_keys.is_empty());
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(crate::settings::update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(crate::sync::persist_status_now().is_err(), "background persist");
+            assert!(crate::settings::clear_sync_opt_ins().is_err());
+            assert!(crate::settings::save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(crate::settings::set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+
+        // A missing file still starts from defaults, and a valid one is written.
+        std::fs::remove_file(&path).unwrap();
+        crate::sync::persist_status_now().unwrap();
+        let written: AppSettings =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        // Flags are off in a fresh file, so the record is kept off disk.
+        assert!(written.last_sync_attempt.is_empty());
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
     fn sign_out_and_stale_saves_handle_the_record() {
         let rec = a_record();
         let mut s = AppSettings::default();

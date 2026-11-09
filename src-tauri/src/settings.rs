@@ -95,7 +95,14 @@ pub struct AppSettings {
     /// Sync toggle (#518): time, outcome, count and HTTP status — **nothing
     /// else** (no payloads, run titles or error bodies). Owned by
     /// `sync::record_push`; cleared when its toggle turns off and on sign-out.
-    #[serde(default, skip_serializing_if = "crate::sync::SyncStatus::is_empty")]
+    /// Parsed leniently (per kind): an entry this build can't read — an
+    /// outcome from a newer or dev build — drops only that entry, never the
+    /// whole file.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::sync::SyncStatus::is_empty",
+        deserialize_with = "crate::sync::SyncStatus::deserialize_lenient"
+    )]
     pub last_sync_attempt: crate::sync::SyncStatus,
 
     /// Update channel (Settings › About): `stable` (default) or `beta`.
@@ -116,19 +123,65 @@ pub struct AppSettings {
 }
 
 fn settings_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(p) = test_settings_path::get() {
+        return p;
+    }
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join(".octopush")
         .join("settings.json")
 }
 
+/// Read `settings.json` for the app. Missing ⇒ defaults; **unparseable ⇒
+/// defaults too** (the long-standing read-side behaviour, unchanged). Writers
+/// must not use this for a read-modify-write — see [`load_settings_for_write`].
 pub fn load_settings() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Err(LoadError::Unparseable) => Ok(AppSettings::default()),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Ok(s) => Ok(s),
+    }
+}
+
+enum LoadError {
+    Io(std::io::Error),
+    Unparseable,
+}
+
+/// Read for a read-modify-write: a missing file starts from defaults, but a
+/// file that exists and doesn't parse is an **error** — writing defaults back
+/// would wipe provider keys, git credentials and the Jira config. Logged
+/// without the file's contents.
+fn load_settings_for_write() -> AppResult<AppSettings> {
+    match load_settings_strict() {
+        Ok(s) => Ok(s),
+        Err(LoadError::Io(e)) => Err(e.into()),
+        Err(LoadError::Unparseable) => {
+            tracing::warn!("settings.json exists but doesn't parse; refusing to overwrite it");
+            Err(crate::error::AppError::Other(
+                "settings.json couldn't be read, so it was left unchanged".into(),
+            ))
+        }
+    }
+}
+
+fn load_settings_strict() -> Result<AppSettings, LoadError> {
     let path = settings_path();
     if !path.exists() {
         return Ok(AppSettings::default());
     }
-    let content = std::fs::read_to_string(&path)?;
-    let mut settings: AppSettings = serde_json::from_str(&content).unwrap_or_default();
+    let content = std::fs::read_to_string(&path).map_err(LoadError::Io)?;
+    let mut settings: AppSettings = serde_json::from_str(&content).map_err(|e| {
+        // Category and position only — never the contents (they hold keys).
+        tracing::warn!(
+            "settings.json parse failed ({:?} at line {}, column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        );
+        LoadError::Unparseable
+    })?;
 
     if let Some(k) = settings.legacy_anthropic_api_key.take() {
         if !k.is_empty() && !settings.provider_keys.contains_key("anthropic") {
@@ -154,7 +207,7 @@ static SETTINGS_WRITE_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(()
 /// failure aborts without writing.
 pub fn update_settings<R>(f: impl FnOnce(&mut AppSettings) -> R) -> AppResult<R> {
     let _guard = SETTINGS_WRITE_LOCK.lock();
-    let mut settings = load_settings()?;
+    let mut settings = load_settings_for_write()?;
     let out = f(&mut settings);
     save_settings(&settings)?;
     Ok(out)
@@ -347,7 +400,7 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
     // The keychain read stays outside the write lock.
     let sub = crate::auth::current_identity().map(|(sub, _)| sub);
     let _guard = SETTINGS_WRITE_LOCK.lock();
-    let mut settings = load_settings()?;
+    let mut settings = load_settings_for_write()?;
     let before = settings.sync_prefs();
     let before_owner = settings.sync_owner.clone();
     match sub.as_deref() {
@@ -369,7 +422,7 @@ pub fn set_sync_opted_in(kind: crate::sync::SyncKind, enabled: bool) -> AppResul
 /// Sign-out: drop both opt-ins, their owner and the last-attempt records.
 pub fn clear_sync_opt_ins() -> AppResult<()> {
     let _guard = SETTINGS_WRITE_LOCK.lock();
-    let mut settings = load_settings()?;
+    let mut settings = load_settings_for_write()?;
     settings.clear_sync_opt_ins();
     crate::sync::status::forget(crate::sync::SyncKind::History);
     crate::sync::status::forget(crate::sync::SyncKind::Library);
@@ -382,10 +435,27 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 /// over from disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
     let _guard = SETTINGS_WRITE_LOCK.lock();
-    let on_disk = load_settings()?;
+    let on_disk = load_settings_for_write()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
     save_settings(&incoming)
+}
+
+/// Test-only, per-thread override of where `settings.json` lives, so writer
+/// tests run against a temp file.
+#[cfg(test)]
+pub mod test_settings_path {
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+    thread_local! {
+        static PATH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+    pub fn get() -> Option<PathBuf> {
+        PATH.with(|p| p.borrow().clone())
+    }
+    pub fn set(p: Option<PathBuf>) {
+        PATH.with(|c| *c.borrow_mut() = p);
+    }
 }
 
 /// Test-only, per-thread override of [`sync_opted_in`] so gating tests never
