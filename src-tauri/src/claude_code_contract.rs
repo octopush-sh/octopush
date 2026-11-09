@@ -702,6 +702,20 @@ fn claude_stage_env_disables_fast_mode() {
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_FAST_MODE"));
 }
 
+#[test]
+fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
+    // 2.1.319 backgrounds MCP tasks right away; a stage settled on its
+    // `result` must not hand on work still running. `stage_env` takes no
+    // resume flag, so fresh and `--resume` spawns get the same pin.
+    let env = CliDialect::Claude.stage_env();
+    let pin = env
+        .iter()
+        .find(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND")
+        .map(|(_, v)| v.as_str());
+    assert_eq!(pin, Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND"));
+}
+
 // ─── `rate_limit_event` → Claude plan windows ────────────────────────────
 
 const SUBSCRIBER_REL: &str = "stream-json/subscriber-rate-limit.jsonl";

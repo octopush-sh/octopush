@@ -940,12 +940,20 @@ impl CliDialect {
     /// settle grace after its `result` ([`SETTLE_AFTER_RESULT_SECS`]), so the
     /// CLI's own clean exit (EOF) comes before the runner stops it. Fast mode
     /// is off for stages (`CLAUDE_CODE_DISABLE_FAST_MODE`): a stage runs at the
-    /// rate its model was routed for, not the doubled fast-mode rate.
+    /// rate its model was routed for, not the doubled fast-mode rate. MCP tasks
+    /// run inside their tool call (`CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND`):
+    /// since 2.1.319, "when an MCP server runs a tool call as a task, Claude
+    /// Code moves it to the background right away", and a stage settled on its
+    /// `result` could otherwise hand on work that is still running. The
+    /// changelog scopes that to the terminal, so this is a defensive pin; an
+    /// older CLI ignores the unknown variable. Set on fresh and `--resume` runs
+    /// alike; Run-mode terminals never get it — backgrounding is theirs to keep.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
                 ("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", BG_WAIT_CEILING_MS.to_string()),
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
+                ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
         }
