@@ -215,6 +215,25 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     expect(inputs[1].value).toBe("");
   });
 
+  it("middle-truncates long project names so sibling projects keep their distinct tails", async () => {
+    listRecentProjectsMock.mockResolvedValue([
+      { id: "p1", name: "octopush-enterprise-mobile", path: "/p1", jiraProjectKey: null },
+      { id: "p2", name: "octopush-enterprise-billing", path: "/p2", jiraProjectKey: null },
+    ]);
+
+    await renderIntegrationsPane();
+    await screen.findByText(/project links/i);
+
+    const mobile = screen.getByTitle("octopush-enterprise-mobile");
+    const billing = screen.getByTitle("octopush-enterprise-billing");
+    // The tail is pinned outside the ellipsizing head, so it can't be cut.
+    expect(mobile.querySelector(".octo-midtrunc-tail")?.textContent).toBe("prise-mobile");
+    expect(billing.querySelector(".octo-midtrunc-tail")?.textContent).toBe("rise-billing");
+    // The label is the elastic column (a definite width), not a fixed 160px one.
+    expect(mobile).toHaveClass("min-w-0", "flex-1");
+    expect(mobile.textContent).toBe("octopush-enterprise-mobile");
+  });
+
   it("saving a Project links row calls updateProjectJiraKey with the right args", async () => {
     listRecentProjectsMock.mockResolvedValue([
       { id: "p1", name: "Octopush", path: "/p1", jiraProjectKey: "CLPNSNS" },

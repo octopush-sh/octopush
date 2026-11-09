@@ -947,7 +947,7 @@ Four distinct integration surfaces: (1) Jira issue tracking, (2) Octopush as an 
 - **Backlog row context menu** — Right-click a Mine row → "Create workspace". _Support:_ `BacklogRowContextMenu.tsx` → `App.startCreateForTicket`.
 - **Inline ticket picker** — Scope toggle (PROJECT vs All), fuzzy search over cached tickets, exact-key fallback (verified via `getIssue`). _Support:_ `InlineTicketPicker.tsx`.
 - **Jira ticket picker modal / project-key modal** — Link/Change/Unlink a ticket; set/clear a project's Jira key. _Support:_ `JiraTicketPickerModal.tsx`, `JiraProjectKeyModal.tsx`.
-- **Settings → Issue tracking** — Master-detail: tracker list (Jira active; Linear & Azure DevOps "Soon"); Jira detail (Base URL / Email / API token + show-hide) + per-project Jira-key inputs, each with its own "Save the link". _Support:_ `settings/IssueTrackingSection.tsx`.
+- **Settings → Issue tracking** — Master-detail: tracker list (Jira active; Linear & Azure DevOps "Soon"); Jira detail (Base URL / Email / API token + show-hide) + per-project Jira-key inputs, each with its own "Save the link". Each project name fills the width the key input leaves and is middle-truncated (`<MidTruncate>`, full name in the `title`), so sibling projects like `octopush-enterprise-mobile` / `-billing` keep their distinct tails. _Support:_ `settings/IssueTrackingSection.tsx`.
 
 ### In-app MCP client (Octopush → other MCP servers)
 - **Config shape & sources** — Claude-Code-compatible `{ "mcpServers": { "<name>": { command, args, env } } }` from `~/.claude/mcp.json` (user) ∪ `<worktree>/.claude/mcp.json` (project overrides user). _Support:_ `mcp/mod.rs`.

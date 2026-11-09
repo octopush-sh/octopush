@@ -6,8 +6,10 @@
 import { useEffect, useRef, useState } from "react";
 import { Check } from "lucide-react";
 import { ipc } from "../../lib/ipc";
+import { tourId } from "../../lib/tour/ids";
 import type { ProjectInfo } from "../../lib/types";
 import { pushToast } from "../Toasts";
+import { MidTruncate } from "../primitives/MidTruncate";
 import { SectionLabel } from "./shared";
 
 // Sentinel shown in the API-token field when a saved token is loaded; if the
@@ -270,16 +272,28 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
           </div>
         ) : (
           <div className="space-y-2">
-            {projects.map((p) => (
+            {projects.map((p, i) => (
               <div key={p.id} className="flex items-center gap-3">
-                <div className="w-[160px] shrink-0 truncate text-[13px] text-octo-ivory" title={p.name}>{p.name}</div>
-                <input
-                  type="text"
-                  value={mapDrafts[p.id] ?? ""}
-                  onChange={(e) => setMapDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
-                  placeholder="Project key"
-                  className={`${inputClass} flex-1`}
-                />
+                {/* The name takes the width the key input leaves (a definite
+                    `flex-1 min-w-0` box) and is MIDDLE-truncated: sibling projects
+                    share their head (`octopush-enterprise-…`), so the tail is what
+                    tells the rows apart (design-system E1). */}
+                <div
+                  className="min-w-0 flex-1 text-[13px] text-octo-ivory"
+                  title={p.name}
+                  data-tour={i === 0 ? tourId("settings-integrations-project-link") : undefined}
+                >
+                  <MidTruncate text={p.name} />
+                </div>
+                <div className="w-[200px] min-w-[96px] shrink">
+                  <input
+                    type="text"
+                    value={mapDrafts[p.id] ?? ""}
+                    onChange={(e) => setMapDrafts((d) => ({ ...d, [p.id]: e.target.value }))}
+                    placeholder="Project key"
+                    className={inputClass}
+                  />
+                </div>
                 <button
                   type="button"
                   onClick={() => void saveMapping(p.id)}
