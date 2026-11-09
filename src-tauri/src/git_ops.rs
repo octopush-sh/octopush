@@ -160,7 +160,7 @@ pub fn open_repo(path: &Path) -> AppResult<Repository> {
 }
 
 pub fn current_branch(repo: &Repository) -> Option<String> {
-    repo.head().ok()?.shorthand().map(String::from)
+    repo.head().ok()?.shorthand().ok().map(String::from)
 }
 
 pub fn is_git_repo(path: &Path) -> bool {
@@ -171,7 +171,7 @@ pub fn is_git_repo(path: &Path) -> bool {
 pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
     let repo = open_repo(path)?;
     let result = match repo.head() {
-        Ok(head) => head.shorthand().map(String::from),
+        Ok(head) => head.shorthand().ok().map(String::from),
         Err(_) => None, // Empty repo — no HEAD
     };
     Ok(result)
@@ -184,7 +184,7 @@ pub fn default_branch(path: &Path) -> AppResult<Option<String>> {
 pub fn repo_default_branch(path: &Path) -> Option<String> {
     let repo = open_repo(path).ok()?;
     if let Ok(r) = repo.find_reference("refs/remotes/origin/HEAD") {
-        if let Some(name) = r.symbolic_target().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
+        if let Some(name) = r.symbolic_target().ok().flatten().and_then(|t| t.strip_prefix("refs/remotes/origin/")) {
             return Some(name.to_string());
         }
     }
@@ -369,7 +369,7 @@ pub fn status_files(path: &Path) -> AppResult<GitStatus> {
     let conflicted = changed_files.iter().filter(|f| f.conflicted).count();
     let has_upstream = repo
         .head().ok()
-        .and_then(|h| h.shorthand().map(|s| s.to_string()))
+        .and_then(|h| h.shorthand().ok().map(|s| s.to_string()))
         .and_then(|name| repo.find_branch(&name, git2::BranchType::Local).ok())
         .map(|b| b.upstream().is_ok())
         .unwrap_or(false);
@@ -427,7 +427,7 @@ pub fn is_dirty(path: &Path) -> AppResult<bool> {
 /// never been pushed) or the comparison cannot be computed.
 fn upstream_ahead_behind(repo: &Repository) -> Option<(usize, usize)> {
     let head = repo.head().ok()?;
-    let branch_name = head.shorthand()?;
+    let branch_name = head.shorthand().ok()?;
     let branch = repo
         .find_branch(branch_name, git2::BranchType::Local)
         .ok()?;
@@ -486,7 +486,7 @@ fn is_live_worktree_at(repo: &Repository, path: &Path) -> bool {
         return true; // the main worktree (never listed by worktrees())
     }
     let Ok(names) = repo.worktrees() else { return false };
-    names.iter().flatten().any(|name| {
+    names.iter().filter_map(|n| n.ok().flatten()).any(|name| {
         repo.find_worktree(name)
             .ok()
             .is_some_and(|wt| wt.validate().is_ok() && canonical(wt.path()) == target)
@@ -502,15 +502,15 @@ pub fn live_worktree_on_branch(repo: &Repository, branch: &str) -> Option<PathBu
     let on_branch = |dir: &Path| -> bool {
         let Ok(sub) = Repository::open(dir) else { return false };
         let Ok(head) = sub.head() else { return false };
-        head.is_branch() && head.shorthand() == Some(branch)
+        head.is_branch() && head.shorthand().ok() == Some(branch)
     };
     if let Some(wd) = repo.workdir() {
-        if repo.head().ok().is_some_and(|h| h.is_branch() && h.shorthand() == Some(branch)) {
+        if repo.head().ok().is_some_and(|h| h.is_branch() && h.shorthand().ok() == Some(branch)) {
             return Some(canonical(wd));
         }
     }
     let names = repo.worktrees().ok()?;
-    for name in names.iter().flatten() {
+    for name in names.iter().filter_map(|n| n.ok().flatten()) {
         if let Ok(wt) = repo.find_worktree(name) {
             if wt.validate().is_ok() && on_branch(wt.path()) {
                 return Some(canonical(wt.path()));
@@ -622,7 +622,7 @@ pub fn delete_worktree(repo_path: &Path, worktree_path: &Path) -> AppResult<()> 
     let repo = open_repo(repo_path)?;
     let target = canonical(worktree_path);
     let Ok(names) = repo.worktrees() else { return Ok(()) };
-    for name in names.iter().flatten() {
+    for name in names.iter().filter_map(|n| n.ok().flatten()) {
         if let Ok(wt) = repo.find_worktree(name) {
             if canonical(wt.path()) == target {
                 let mut opts = git2::WorktreePruneOptions::new();
@@ -766,7 +766,7 @@ pub struct PrTarget {
 pub fn pr_target(repo: &Repository, base: &str, head: &str) -> PrTarget {
     let remotes: Vec<String> = repo
         .remotes()
-        .map(|r| r.iter().flatten().map(String::from).collect())
+        .map(|r| r.iter().filter_map(|n| n.ok().flatten()).map(String::from).collect())
         .unwrap_or_default();
     let config = repo.config().ok();
     let get = |key: String| config.as_ref().and_then(|c| c.get_string(&key).ok());
@@ -802,7 +802,7 @@ pub fn pr_target(repo: &Repository, base: &str, head: &str) -> PrTarget {
 /// A remote's parsed URL (host, owner, repo), for `gh --repo` and `owner:branch`.
 pub fn remote_slug(repo: &Repository, remote: &str) -> Option<crate::git_url::ParsedGitUrl> {
     let r = repo.find_remote(remote).ok()?;
-    crate::git_url::parse_git_url(r.url()?)
+    crate::git_url::parse_git_url(r.url().ok()?)
 }
 
 /// What a pull request from HEAD onto `base` contains: the diff from their
@@ -842,7 +842,7 @@ pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<Stri
         .filter_map(|o| o.ok())
         .take(50)
         .filter_map(|oid| repo.find_commit(oid).ok())
-        .map(|c| c.summary().unwrap_or("").to_string())
+        .map(|c| c.summary().ok().flatten().unwrap_or("").to_string())
         .collect();
     Ok((text, subjects))
 }
@@ -901,7 +901,7 @@ fn commit_info(commit: &git2::Commit) -> CommitInfo {
     CommitInfo {
         sha_short: sha[..7].to_string(),
         sha,
-        summary: commit.summary().unwrap_or("").to_string(),
+        summary: commit.summary().ok().flatten().unwrap_or("").to_string(),
         author_name: commit.author().name().unwrap_or("").to_string(),
         timestamp_ms: commit.time().seconds() * 1000,
     }
@@ -982,13 +982,15 @@ pub fn blame_file(path: &Path, file: &str) -> AppResult<Vec<BlameLine>> {
             .or_insert_with(|| {
                 repo.find_commit(oid)
                     .ok()
-                    .and_then(|c| c.summary().map(String::from))
+                    .and_then(|c| c.summary().ok().flatten().map(String::from))
                     .unwrap_or_default()
             })
             .clone();
+        // git2 0.21 returns None when libgit2 has no signature for the hunk
+        // (it used to hand back a dangling pointer). Blank author, epoch time.
         let sig = hunk.final_signature();
-        let author_name = sig.name().unwrap_or("").to_string();
-        let timestamp_ms = sig.when().seconds() * 1000;
+        let author_name = sig.as_ref().and_then(|s| s.name().ok()).unwrap_or("").to_string();
+        let timestamp_ms = sig.as_ref().map_or(0, |s| s.when().seconds() * 1000);
         let sha = oid.to_string();
         let sha_short = sha[..7].to_string();
         let start = hunk.final_start_line();
@@ -1241,7 +1243,7 @@ pub fn list_tags(path: &Path) -> AppResult<Vec<String>> {
         .tag_names(None)
         .map_err(|e| AppError::Other(format!("list tags: {e}")))?
         .iter()
-        .filter_map(|t| t.map(String::from))
+        .filter_map(|t| t.ok().flatten().map(String::from))
         .collect())
 }
 
@@ -1965,7 +1967,7 @@ mod tests {
         assert!(!dir.path().join(".git/worktrees/feat/foo").exists());
         // And the worktree is really on the slashed branch.
         let sub = Repository::open(&wt).unwrap();
-        assert_eq!(sub.head().unwrap().shorthand(), Some("feat/foo"));
+        assert_eq!(sub.head().unwrap().shorthand().ok(), Some("feat/foo"));
     }
 
     #[test]
@@ -2046,7 +2048,7 @@ mod tests {
             .worktrees()
             .unwrap()
             .iter()
-            .flatten()
+            .filter_map(|n| n.ok().flatten())
             .map(String::from)
             .collect();
         assert_eq!(

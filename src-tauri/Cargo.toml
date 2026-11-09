@@ -54,7 +54,7 @@ chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "7"
 anyhow = "1"
-git2 = { version = "0.19", features = ["vendored-openssl", "vendored-libgit2"] }
+git2 = { version = "0.21", features = ["vendored-openssl", "vendored-libgit2"] }
 thiserror = "2"
 parking_lot = "0.12"
 bytes = "1"
