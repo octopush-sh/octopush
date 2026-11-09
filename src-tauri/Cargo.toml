@@ -110,7 +110,7 @@ security-framework = { version = "3", default-features = false }
 core-foundation = "0.10"
 
 [dev-dependencies]
-serial_test = "3"
+serial_test = "4"
 
 [features]
 # This feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
