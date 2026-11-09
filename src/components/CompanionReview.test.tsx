@@ -31,14 +31,6 @@ function gitStatus(over: Partial<GitStatus> = {}): GitStatus {
   } as GitStatus;
 }
 
-const DIFF = `diff --git a/src/a.ts b/src/a.ts
---- a/src/a.ts
-+++ b/src/a.ts
-@@ -1 +1,2 @@
- const x = 1;
-+const y = 2;
-`;
-
 beforeEach(() => {
   vi.clearAllMocks();
   listFileEdits.mockResolvedValue([]);
@@ -47,30 +39,45 @@ beforeEach(() => {
 });
 
 describe("CompanionReview", () => {
-  it("shows a readiness verdict and scope", async () => {
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} gitDiff={DIFF} />);
-    expect(screen.getByText(/1 change to review/i)).toBeInTheDocument();
-    expect(screen.getByText(/1 file/i)).toBeInTheDocument();
+  it("shows a readiness verdict that names files as its unit", () => {
+    const two = gitStatus({
+      changedFiles: [
+        { path: "src/a.ts", status: "modified", staged: false, unstaged: true, conflicted: false },
+        { path: "src/b.ts", status: "modified", staged: false, unstaged: true, conflicted: false },
+      ],
+    } as Partial<GitStatus>);
+    const { rerender } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={two} />);
+    expect(screen.getByText("2 files to review.")).toBeInTheDocument();
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    expect(screen.getByText("1 file to review.")).toBeInTheDocument();
+  });
+
+  it("leaves the file count and +/− stat to the mode band's tail", () => {
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    // Only the verdict mentions the file count; no separate "1 file" meta line.
+    expect(screen.getAllByText(/\b1 file\b/)).toHaveLength(1);
+    expect(screen.queryByText(/^\+\d+$/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^−\d+$/)).not.toBeInTheDocument();
   });
 
   it("shows — rather than 'Up to date' when ahead/behind is unknown", () => {
     const { rerender } = render(
-      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ aheadBehindKnown: false })} gitDiff={DIFF} />,
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ aheadBehindKnown: false })} />,
     );
     expect(screen.queryByText("Up to date with origin")).not.toBeInTheDocument();
     expect(screen.getByText("—")).toHaveAttribute("title", expect.stringContaining("Ahead/behind unknown"));
 
-    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} gitDiff={DIFF} />);
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
     expect(screen.getByText("Up to date with origin")).toBeInTheDocument();
     // Unpublished wins: there is nothing to compare with.
     rerender(
-      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false, aheadBehindKnown: false })} gitDiff={DIFF} />,
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false, aheadBehindKnown: false })} />,
     );
     expect(screen.getByText("Not published yet")).toBeInTheDocument();
   });
 
   it("flags conflicts in the verdict", () => {
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ conflicted: 2 })} gitDiff={DIFF} />);
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ conflicted: 2 })} />);
     expect(screen.getByText(/resolve 2 conflicts first/i)).toBeInTheDocument();
   });
 
@@ -82,7 +89,7 @@ describe("CompanionReview", () => {
       id: 7, workspaceId: "w1", role: "assistant", content: "Added const y for the demo.",
       model: "claude-sonnet-4-6", inputTokens: null, outputTokens: null, costUsd: null, createdAt: new Date().toISOString(),
     });
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} gitDiff={DIFF} />);
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
     await waitFor(() => expect(screen.getByText(/shaped by/i)).toBeInTheDocument());
     expect(screen.getByText(/1 agent turn/i)).toBeInTheDocument();
 
@@ -94,19 +101,20 @@ describe("CompanionReview", () => {
 
   it("notes hand-written changes when no agent edits are tracked", async () => {
     listFileEdits.mockResolvedValue([]);
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} gitDiff={DIFF} />);
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
     await waitFor(() => expect(screen.getByText(/likely hand-written/i)).toBeInTheDocument());
   });
 
   it("summarises branch publish state", async () => {
     getLastCommit.mockResolvedValue({ shortSha: "abc1234", subject: "do the thing", body: "" });
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ ahead: 2 })} gitDiff={DIFF} />);
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ ahead: 2 })} />);
     expect(screen.getByText(/2 ahead/i)).toBeInTheDocument();
+    await waitFor(() => expect(getLastCommit).toHaveBeenCalled());
     await waitFor(() => expect(screen.getByText(/do the thing/i)).toBeInTheDocument());
   });
 
   it("shows 'Not published yet' without an upstream", () => {
-    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false })} gitDiff={DIFF} />);
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false })} />);
     expect(screen.getByText(/not published yet/i)).toBeInTheDocument();
   });
 });
