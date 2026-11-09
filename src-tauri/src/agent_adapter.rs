@@ -488,7 +488,8 @@ pub fn probe_claude_login_expiry() -> Option<i64> {
 // ─── Claude Code hooks (Run-mode attention, #287) ─────────────────
 //
 // In a worktree Octopush created, `Notification` (`permission_prompt`,
-// `idle_prompt`) and `Stop` hooks go into `.claude/settings.local.json`,
+// `idle_prompt`, `elicitation_dialog`, `elicitation_url_dialog`) and `Stop`
+// hooks go into `.claude/settings.local.json`,
 // merged with whatever the user keeps there. Each runs `octopush-mcp hook`,
 // which reads the payload below from stdin. A `Notification` hook also passes
 // `--kind <signal>` for the matcher it is registered under, so the matcher
@@ -505,15 +506,21 @@ pub const HOOK_MARKER: &str = "--octopush-hook";
 /// Precedes the signal a `Notification` hook was registered for.
 pub const HOOK_KIND_FLAG: &str = "--kind";
 
-const NOTIFICATION_MATCHERS: [(&str, HookSignal); 2] =
-    [("permission_prompt", HookSignal::NeedsPermission), ("idle_prompt", HookSignal::NeedsInput)];
+/// An MCP server's elicitation (a form or a URL) waits on the human too (#594).
+const NOTIFICATION_MATCHERS: [(&str, HookSignal); 4] = [
+    ("permission_prompt", HookSignal::NeedsPermission),
+    ("idle_prompt", HookSignal::NeedsInput),
+    ("elicitation_dialog", HookSignal::NeedsInput),
+    ("elicitation_url_dialog", HookSignal::NeedsInput),
+];
 
 /// What a hook payload means for the attention beacon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookSignal {
     /// `Notification` / `permission_prompt` — waiting on permission.
     NeedsPermission,
-    /// `Notification` / `idle_prompt` — waiting on your input.
+    /// `Notification` / `idle_prompt`, `elicitation_dialog`,
+    /// `elicitation_url_dialog` — waiting on your input.
     NeedsInput,
     /// `Stop` — Claude finished its turn.
     Settled,
@@ -554,11 +561,10 @@ pub fn parse_hook_event(payload: &serde_json::Value, kind: Option<&str>) -> Opti
     let signal = match payload.get("hook_event_name")?.as_str()? {
         "Notification" => match kind.and_then(HookSignal::parse) {
             Some(s @ (HookSignal::NeedsPermission | HookSignal::NeedsInput)) => s,
-            _ => match payload.get("notification_type")?.as_str()? {
-                "permission_prompt" => HookSignal::NeedsPermission,
-                "idle_prompt" => HookSignal::NeedsInput,
-                _ => return None,
-            },
+            _ => {
+                let kind = payload.get("notification_type")?.as_str()?;
+                NOTIFICATION_MATCHERS.iter().find(|(m, _)| *m == kind)?.1
+            }
         },
         "Stop" => HookSignal::Settled,
         _ => return None,
@@ -842,13 +848,17 @@ mod tests {
     }
 
     #[test]
-    fn merge_into_an_empty_file_registers_three_async_hooks() {
+    fn merge_into_an_empty_file_registers_five_async_hooks() {
         let merged = merge_claude_hooks(serde_json::json!({}), Path::new(BIN)).unwrap();
         assert_eq!(our_commands(&merged), [
             ("Notification".to_string(), Some("permission_prompt".to_string())),
             ("Notification".to_string(), Some("idle_prompt".to_string())),
+            ("Notification".to_string(), Some("elicitation_dialog".to_string())),
+            ("Notification".to_string(), Some("elicitation_url_dialog".to_string())),
             ("Stop".to_string(), None),
         ]);
+        let notifications = merged["hooks"]["Notification"].as_array().unwrap();
+        assert!(notifications.iter().all(|g| g["hooks"][0]["async"] == true));
         let hook = &merged["hooks"]["Stop"][0]["hooks"][0];
         assert_eq!(hook["type"], "command");
         assert_eq!(hook["async"], true);
@@ -857,6 +867,56 @@ mod tests {
         let command = |i: usize| merged["hooks"]["Notification"][i]["hooks"][0]["command"].clone();
         assert_eq!(command(0), hook_command(Path::new(BIN), Some(HookSignal::NeedsPermission)));
         assert_eq!(command(1), hook_command(Path::new(BIN), Some(HookSignal::NeedsInput)));
+        assert_eq!(command(2), hook_command(Path::new(BIN), Some(HookSignal::NeedsInput)));
+        assert_eq!(command(3), hook_command(Path::new(BIN), Some(HookSignal::NeedsInput)));
+    }
+
+    #[test]
+    fn re_installing_upgrades_a_two_matcher_install_in_place() {
+        // What a worktree hooked before #594 holds, beside the user's own hook.
+        let ours = |kind: &str| {
+            serde_json::json!({ "type": "command", "async": true,
+                "command": format!("'{BIN}' hook --kind {kind} --octopush-hook") })
+        };
+        let user_hook = serde_json::json!({ "matcher": "idle_prompt", "hooks": [{ "type": "command", "command": "say idle" }] });
+        let old = serde_json::json!({
+            "permissions": { "allow": ["Bash(npm test)"] },
+            "hooks": {
+                "Notification": [
+                    user_hook.clone(),
+                    { "matcher": "permission_prompt", "hooks": [ours("permission")] },
+                    { "matcher": "idle_prompt", "hooks": [ours("input")] }
+                ],
+                "Stop": [{ "hooks": [{ "type": "command", "async": true, "command": format!("'{BIN}' hook --octopush-hook") }] }]
+            }
+        });
+        let wt = tempfile::tempdir().unwrap();
+        let file = wt.path().join(LOCAL_SETTINGS_FILE);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, old.to_string()).unwrap();
+        let read = || -> serde_json::Value { serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap() };
+
+        // The launch sweep re-runs this install for every worktree it keeps hooked.
+        assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
+        let upgraded = read();
+        let matchers: Vec<_> = our_commands(&upgraded).into_iter().map(|(_, m)| m).collect();
+        assert_eq!(matchers, [
+            Some("permission_prompt".to_string()),
+            Some("idle_prompt".to_string()),
+            Some("elicitation_dialog".to_string()),
+            Some("elicitation_url_dialog".to_string()),
+            None,
+        ]);
+        assert_eq!(upgraded["permissions"], old["permissions"]);
+        assert_eq!(upgraded["hooks"]["Notification"][0], user_hook, "the user's hook stays first");
+        // Another sweep changes nothing; removal gives the user's settings back.
+        assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
+        assert_eq!(read(), upgraded);
+        remove_claude_hooks(wt.path()).unwrap();
+        assert_eq!(read(), serde_json::json!({
+            "permissions": { "allow": ["Bash(npm test)"] },
+            "hooks": { "Notification": [user_hook] }
+        }));
     }
 
     #[test]
@@ -871,7 +931,7 @@ mod tests {
         let once = merge_claude_hooks(user.clone(), Path::new("/old/octopush-mcp")).unwrap();
         // Re-installing from a moved app replaces ours instead of adding more.
         let twice = merge_claude_hooks(once, Path::new(BIN)).unwrap();
-        assert_eq!(our_commands(&twice).len(), 3);
+        assert_eq!(our_commands(&twice).len(), 5);
         assert!(!twice.to_string().contains("/old/octopush-mcp"));
         assert_eq!(twice["permissions"], user["permissions"]);
         assert_eq!(twice["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
@@ -965,7 +1025,7 @@ mod tests {
         // No file: created, then removed with its `.claude/` directory.
         assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
         let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(our_commands(&written).len(), 3);
+        assert_eq!(our_commands(&written).len(), 5);
         remove_claude_hooks(wt.path()).unwrap();
         assert!(!file.exists() && !wt.path().join(".claude").exists());
 
@@ -990,6 +1050,16 @@ mod tests {
         let p = |v: serde_json::Value| parse_hook_event(&v, None).map(|e| e.signal);
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "permission_prompt" })), Some(HookSignal::NeedsPermission));
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "idle_prompt" })), Some(HookSignal::NeedsInput));
+        // An MCP server's question, as a form or as a URL, waits on your input.
+        assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "elicitation_dialog" })), Some(HookSignal::NeedsInput));
+        assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "elicitation_url_dialog" })), Some(HookSignal::NeedsInput));
+        let elicitation = serde_json::json!({ "hook_event_name": "Notification", "notification_type": "elicitation_dialog",
+            "message": "secret text", "session_id": "s1", "cwd": "/wt" });
+        assert_eq!(
+            parse_hook_event(&elicitation, None),
+            Some(HookEvent { signal: HookSignal::NeedsInput, session_id: Some("s1".into()), cwd: Some("/wt".into()) }),
+            "the message text is never kept"
+        );
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Stop" })), Some(HookSignal::Settled));
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification", "notification_type": "auth_success" })), None);
         assert_eq!(p(serde_json::json!({ "hook_event_name": "Notification" })), None);
