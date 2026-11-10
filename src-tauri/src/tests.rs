@@ -15774,6 +15774,40 @@ mod crew_tests {
     }
 
     #[test]
+    fn stored_loop_counts_above_the_cap_are_clamped_not_rejected() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("implement"), draft("code_review")];
+        stages[1].loop_target_position = Some(0);
+        stages[1].loop_mode = Some("auto".into());
+        stages[1].loop_max_iterations = 3;
+        let pid = db.save_pipeline(None, "Old Loop", "d", &stages).unwrap();
+        // A row saved before the cap existed.
+        db.conn_ref()
+            .execute("UPDATE pipeline_stages SET loop_max_iterations = 15 WHERE pipeline_id = ?1 AND position = 1", [&pid])
+            .unwrap();
+        assert_eq!(db.get_pipeline_stages(&pid).unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        let drafts = db.pipeline_stage_drafts(&pid).unwrap();
+        assert_eq!(drafts[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        // What the builder and sync read back re-saves cleanly.
+        db.save_pipeline(Some(pid.clone()), "Old Loop", "d", &drafts).unwrap();
+
+        // A pulled item from a Mac that still holds 15 applies, clamped.
+        let mut remote = stages.clone();
+        remote[1].loop_max_iterations = 15;
+        let sp = crate::sync::SyncPipeline {
+            id: "remote-old-loop".into(), name: "Remote".into(), description: String::new(),
+            updated_at: "2099-01-01T00:00:00Z".into(), stages: remote.clone(),
+        };
+        assert!(db.upsert_pipeline_from_sync(&sp).unwrap());
+        assert_eq!(db.get_pipeline_stages("remote-old-loop").unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+
+        // New input above the cap is still rejected.
+        assert!(db.validate_pipeline_stages(&remote).is_err());
+        assert!(db.save_pipeline(None, "New", "d", &remote).is_err());
+        assert!(!crew::preview(&db, &one_stage_file(remote, vec![]), &[]).unwrap().ok);
+    }
+
+    #[test]
     fn imported_token_estimates_are_reset_to_the_local_defaults() {
         let (db, _t) = test_db();
         let mut r = triage("Find the real defects.");
@@ -15792,7 +15826,19 @@ mod crew_tests {
         let hostile = [
             '\u{E0041}', '\u{E007F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200B}', '\u{200F}',
             '\u{2060}', '\u{2064}', '\u{FEFF}', '\u{0000}', '\u{001B}', '\u{000D}', '\u{007F}', '\u{0085}', '\u{009F}',
+            // Variation selectors (both blocks), other Cf, Zl/Zp and blank fillers.
+            '\u{FE00}', '\u{FE0F}', '\u{E0100}', '\u{E01EF}', '\u{061C}', '\u{206A}', '\u{206F}', '\u{FFF9}',
+            '\u{FFFB}', '\u{180E}', '\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}',
+            '\u{1D173}', '\u{1D17A}', '\u{2028}', '\u{2029}', '\u{0600}', '\u{13430}', '\u{E0001}',
         ];
+        for c in hostile {
+            assert!(crew::is_hidden_char(c), "U+{:04X} is hidden", c as u32);
+            assert!(!crew::escape_hidden(&c.to_string()).contains(c), "U+{:04X} is escaped", c as u32);
+        }
+        // Ordinary text stays visible: accents, CJK, Hangul, Arabic, a bare emoji.
+        for ok in "é ü 漢字 한국어 عربي 🐙 — “q”".chars() {
+            assert!(!crew::is_hidden_char(ok), "U+{:04X} is ordinary text", ok as u32);
+        }
         type Inject = fn(&mut crew::CrewFile, &str);
         let fields: Vec<(&str, Inject)> = vec![
             ("name", |f, x| f.pipeline.name = format!("Relay{x}")),

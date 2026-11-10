@@ -4091,7 +4091,7 @@ impl Db {
                 substrate: r.get(5)?,
                 checkpoint: r.get::<_, i64>(6)? != 0,
                 loop_target_position: r.get(7)?,
-                loop_max_iterations: r.get(8)?,
+                loop_max_iterations: clamp_loop_iterations(r.get(8)?),
                 loop_mode: r.get(9)?,
                 max_iterations: r.get(10)?,
                 pos_x: r.get(11)?,
@@ -4881,7 +4881,7 @@ impl Db {
                 substrate: r.get(2)?,
                 checkpoint: r.get::<_, i64>(3)? != 0,
                 loop_target_position: r.get(4)?,
-                loop_max_iterations: r.get(5)?,
+                loop_max_iterations: clamp_loop_iterations(r.get(5)?),
                 loop_mode: r.get(6)?,
                 max_iterations: r.get(7)?,
                 pos_x: r.get(8)?,
@@ -4934,7 +4934,18 @@ impl Db {
             Some((local, _)) if local.as_str() >= sp.updated_at.as_str() => return Ok(false),
             _ => {}
         }
-        self.validate_pipeline_stages(&sp.stages)?;
+        // A pipeline saved before the loop cap may arrive with a larger count:
+        // clamp it rather than skip the item forever.
+        let stages: Vec<StageDraft> = sp
+            .stages
+            .iter()
+            .cloned()
+            .map(|mut st| {
+                st.loop_max_iterations = clamp_loop_iterations(st.loop_max_iterations);
+                st
+            })
+            .collect();
+        self.validate_pipeline_stages(&stages)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO pipelines (id, name, description, is_builtin, created_at, updated_at)
@@ -4944,7 +4955,7 @@ impl Db {
             params![sp.id, sp.name, sp.description, sp.updated_at],
         )?;
         tx.execute("DELETE FROM pipeline_stages WHERE pipeline_id = ?1", params![sp.id])?;
-        for (i, st) in sp.stages.iter().enumerate() {
+        for (i, st) in stages.iter().enumerate() {
             let parents_json = serde_json::to_string(&st.parents).ok();
             let tools_json = st.tools.as_ref().and_then(|t| serde_json::to_string(t).ok());
             tx.execute(
@@ -6914,6 +6925,14 @@ const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 /// stepper uses the same bound (`MAX_LOOP_ITERATIONS` in
 /// `src/components/builder/graph.ts`); keep the two in sync.
 pub const MAX_LOOP_ITERATIONS: i64 = 9;
+
+/// A stored loop count brought under [`MAX_LOOP_ITERATIONS`]. Pipelines saved
+/// before the cap (or synced from such a Mac) may hold a larger count; they are
+/// clamped when read or synced so they keep loading, re-saving and syncing.
+/// New input (builder, MCP, crew import) is still rejected above the cap.
+pub fn clamp_loop_iterations(n: i64) -> i64 {
+    n.min(MAX_LOOP_ITERATIONS)
+}
 
 /// The workspace tools a stage's agent may be granted. Keep in sync with
 /// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.

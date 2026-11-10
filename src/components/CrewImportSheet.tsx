@@ -204,7 +204,7 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                   <p className="m-0 mb-3 font-mono text-[10px] leading-[1.5] text-octo-warning" data-testid="crew-cli-note">
                     CLI stages run the agent with your shell and git credentials.
                     {claudeCliStages > 0 &&
-                      " Claude Code stages also load this repo's .claude/settings.json hooks and .mcp.json servers."}
+                      " Claude Code stages may also load this repo's .claude/settings.json hooks and .mcp.json servers."}
                   </p>
                 )}
                 <ol className="m-0 flex list-none flex-col gap-3 p-0">

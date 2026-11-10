@@ -283,20 +283,56 @@ pub fn stage_message(position: usize, msg: &str) -> String {
 
 // ─── Untrusted text ──────────────────────────────────────────────────────
 
-/// A character that can hide or reorder what the review sheet shows: Unicode
-/// tag characters (U+E0000–E007F), bidi embeddings, overrides and isolates
-/// (U+202A–202E, U+2066–2069), zero-width characters and marks, word joiners
-/// and invisible operators (U+200B–200F, U+2060–2064), the BOM (U+FEFF), and
-/// every C0/C1 control (and DEL) except `\n` and `\t`.
+/// Every code point of General Category `Cf` (format), `Zl` and `Zp`, from
+/// Unicode 15.1.0 (generated with Python's `unicodedata.category`; regenerate
+/// when the table goes stale). Inclusive ranges, sorted.
+const CF_ZL_ZP: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),   // SOFT HYPHEN
+    (0x0600, 0x0605),   // ARABIC NUMBER SIGN .. ARABIC NUMBER MARK ABOVE
+    (0x061C, 0x061C),   // ARABIC LETTER MARK
+    (0x06DD, 0x06DD),   // ARABIC END OF AYAH
+    (0x070F, 0x070F),   // SYRIAC ABBREVIATION MARK
+    (0x0890, 0x0891),   // ARABIC POUND MARK ABOVE .. ARABIC PIASTRE MARK ABOVE
+    (0x08E2, 0x08E2),   // ARABIC DISPUTED END OF AYAH
+    (0x180E, 0x180E),   // MONGOLIAN VOWEL SEPARATOR
+    (0x200B, 0x200F),   // ZERO WIDTH SPACE .. RIGHT-TO-LEFT MARK
+    (0x2028, 0x202E),   // LINE SEPARATOR (Zl), PARAGRAPH SEPARATOR (Zp) .. RIGHT-TO-LEFT OVERRIDE
+    (0x2060, 0x2064),   // WORD JOINER .. INVISIBLE PLUS
+    (0x2066, 0x206F),   // LEFT-TO-RIGHT ISOLATE .. NOMINAL DIGIT SHAPES
+    (0xFEFF, 0xFEFF),   // ZERO WIDTH NO-BREAK SPACE (BOM)
+    (0xFFF9, 0xFFFB),   // INTERLINEAR ANNOTATION ANCHOR .. TERMINATOR
+    (0x110BD, 0x110BD), // KAITHI NUMBER SIGN
+    (0x110CD, 0x110CD), // KAITHI NUMBER SIGN ABOVE
+    (0x13430, 0x1343F), // EGYPTIAN HIEROGLYPH VERTICAL JOINER .. END WALLED ENCLOSURE
+    (0x1BCA0, 0x1BCA3), // SHORTHAND FORMAT LETTER OVERLAP .. UP STEP
+    (0x1D173, 0x1D17A), // MUSICAL SYMBOL BEGIN BEAM .. END PHRASE
+    (0xE0001, 0xE0001), // LANGUAGE TAG
+    (0xE0020, 0xE007F), // TAG SPACE .. CANCEL TAG
+];
+
+/// Invisible or blank-rendering code points outside `Cf`/`Zl`/`Zp`.
+const OTHER_INVISIBLE: &[(u32, u32)] = &[
+    (0x034F, 0x034F),   // COMBINING GRAPHEME JOINER
+    (0x115F, 0x1160),   // HANGUL CHOSEONG / JUNGSEONG FILLER
+    (0x180B, 0x180F),   // MONGOLIAN FREE VARIATION SELECTORS (and U+180E above)
+    (0x2065, 0x2065),   // unassigned hole in the invisible-operator block
+    (0x3164, 0x3164),   // HANGUL FILLER
+    (0xFE00, 0xFE0F),   // VARIATION SELECTOR-1 .. 16
+    (0xFFA0, 0xFFA0),   // HALFWIDTH HANGUL FILLER
+    (0xE0000, 0xE007F), // the whole tag block, unassigned code points included
+    (0xE0100, 0xE01EF), // VARIATION SELECTOR-17 .. 256
+];
+
+/// A character that can hide or reorder what the review sheet shows: every
+/// `Cf`, `Zl` and `Zp` code point ([`CF_ZL_ZP`]: bidi controls, zero-width
+/// characters, tags, the BOM, soft hyphen …), the invisible characters in
+/// [`OTHER_INVISIBLE`] (all variation selectors, which can smuggle arbitrary
+/// bytes, are rejected, even a lone U+FE0F after an emoji), and every C0/C1
+/// control (and DEL) except `\n` and `\t`.
 pub fn is_hidden_char(c: char) -> bool {
     let u = c as u32;
-    (0xE0000..=0xE007F).contains(&u)
-        || (0x202A..=0x202E).contains(&u)
-        || (0x2066..=0x2069).contains(&u)
-        || (0x200B..=0x200F).contains(&u)
-        || (0x2060..=0x2064).contains(&u)
-        || u == 0xFEFF
-        || (c.is_control() && c != '\n' && c != '\t')
+    let within = |t: &[(u32, u32)]| t.iter().any(|&(a, b)| (a..=b).contains(&u));
+    (c.is_control() && c != '\n' && c != '\t') || within(CF_ZL_ZP) || within(OTHER_INVISIBLE)
 }
 
 /// `s` with every hidden character escaped (`\u{202e}`), so it can be shown.
