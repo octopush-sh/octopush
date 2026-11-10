@@ -1504,17 +1504,30 @@ mod budgets_v2_tests {
         }
     }
 
-    /// Non-Anthropic models have zero cache pricing (no caching support).
+    /// Every builtin model's cache columns match `token_engine::builtin_prices`
+    /// (Anthropic, and OpenAI's cached input since #611). Providers without
+    /// prompt-cache pricing there (DeepSeek, Ollama) keep both at zero.
     #[test]
-    fn non_anthropic_models_have_zero_cache_pricing() {
+    fn builtin_cache_pricing_matches_builtin_prices() {
         let providers = builtin_providers();
         for (name, p) in &providers {
-            if name == "anthropic" { continue; }
+            let cached = matches!(name.as_str(), "anthropic" | "openai");
             for m in &p.models {
-                assert_eq!(
-                    m.cache_read_cost_per_m, 0.0,
-                    "provider {name} model {} should have cache_read_cost_per_m == 0",
-                    m.id
+                let cols = (m.cache_read_cost_per_m, m.cache_creation_cost_per_m);
+                if !cached {
+                    assert_eq!(cols, (0.0, 0.0), "provider {name} model {} should have no cache pricing", m.id);
+                    continue;
+                }
+                let want = crate::token_engine::builtin_prices(&m.id)
+                    .unwrap_or_else(|| panic!("provider {name} model {} has no builtin_prices entry", m.id));
+                // Some columns are written as `3.0 * 0.10`: equal to the cent, not bit for bit.
+                let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+                assert!(
+                    same(cols.0, want.cache_read_per_m) && same(cols.1, want.cache_creation_per_m),
+                    "provider {name} model {}: cache (read, creation) per M {cols:?} should match builtin_prices ({}, {})",
+                    m.id,
+                    want.cache_read_per_m,
+                    want.cache_creation_per_m
                 );
             }
         }

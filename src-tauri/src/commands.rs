@@ -3947,10 +3947,13 @@ pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> App
 
 /// One-time: re-price `'computed'` ledger rows and DIRECT run figures of
 /// models an earlier release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at
-/// $3/$15 — `provider_router::STALE_BUILTIN_PRICES`) at today's price.
+/// $3/$15, GPT-4o and GPT-4o mini with cached input at $0 —
+/// `provider_router::STALE_BUILTIN_PRICES`) at today's price.
 /// Ledger rows are recomputed from their tokens; run stages (no cache split
 /// persisted) are scaled by the uniform correction factor, which is only
-/// applied when today's price is a uniform rescale of the stale one.
+/// applied when today's price is a uniform rescale of the stale one (so the
+/// GPT-4o entries, whose input and output prices didn't change, correct
+/// ledger rows only).
 fn fix_stale_prices(
     db: &Arc<parking_lot::Mutex<crate::db::Db>>,
     price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
