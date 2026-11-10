@@ -507,6 +507,16 @@ mod effort {
     }
 
     #[test]
+    fn fable_5_2_and_mythos_5_2_take_the_effort_path_with_xhigh() {
+        for m in ["claude-fable-5-2", "claude-mythos-5-2"] {
+            let (thinking, oc) = plan(m);
+            assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }), "{m} = effort model");
+            assert!(oc.is_some(), "{m} must carry output_config");
+            assert_eq!(effective_effort_level(m, Effort::Xhigh), "xhigh", "{m}");
+        }
+    }
+
+    #[test]
     fn thinking_json_opus_uses_adaptive_and_effort() {
         let (thinking, output_config) = thinking_json("claude-opus-4-8", Some(Effort::High), 32768);
         assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }));

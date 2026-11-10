@@ -198,7 +198,10 @@ pub fn normalize_model_id(model: &str) -> String {
 pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
     // (input, cache write 5m, cache hit, output) — USD per million tokens.
     let (input, cache_write, cache_hit, output) = match normalize_model_id(model).as_str() {
-        // Claude Fable
+        // Claude Fable (and Mythos 5.2, limited availability: priced so its
+        // transcripts count, but not in the catalog). Pricing page, fetched
+        // 2026-11-09: Fable 5.2 and Mythos 5.2 both $8 / $10 / $0.20 / $40.
+        "claude-fable-5-2" | "claude-mythos-5-2" => (8.0, 10.0, 0.20, 40.0),
         "claude-fable-5-1" => (10.0, 12.50, 0.25, 50.0),
         "claude-fable-5" => (10.0, 12.50, 1.0, 50.0),
         // Claude Opus
