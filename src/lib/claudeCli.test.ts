@@ -28,9 +28,15 @@ describe("crewClaudeModels", () => {
       { position: 0, substrate: "cli", agentModel: "claude-sonnet-5-5", escalateModel: "claude-fable-5-2" },
       { position: 1, substrate: "cli", agentModel: "claude-haiku-5-5" },
       { position: 2, substrate: "api", agentModel: "claude-fable-5-1", escalateModel: "claude-fable-5-1" },
-      { position: 3, substrate: "cli", agentModel: "gpt-5-codex", escalateModel: "claude-fable-5-2" },
+      { position: 3, substrate: "cli", agentModel: "gpt-5-codex", escalateModel: "claude-opus-5-5" },
     ];
-    expect(crewClaudeModels(stages, { 1: "claude-fable-5-1" })).toEqual(["claude-sonnet-5-5", "claude-fable-5-2", "claude-fable-5-1"]);
+    // The Codex stage's Claude escalation runs on Claude Code, so it counts.
+    expect(crewClaudeModels(stages, { 1: "claude-fable-5-1" })).toEqual([
+      "claude-sonnet-5-5",
+      "claude-fable-5-2",
+      "claude-fable-5-1",
+      "claude-opus-5-5",
+    ]);
     expect(crewClaudeModels(stages.slice(2, 3), {})).toEqual([]);
   });
 });
