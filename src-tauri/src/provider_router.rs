@@ -328,12 +328,17 @@ impl ProviderRouter {
 
 /// The first builtin Anthropic model carrying `tag`. The builtin list leads
 /// with the current lineup, so this follows it when a new generation ships.
+/// With no model so tagged it falls back to the first builtin Anthropic model,
+/// never to a hardcoded id that can go stale.
 fn builtin_anthropic_model_tagged(tag: &str) -> String {
-    builtin_providers()
-        .get("anthropic")
-        .and_then(|p| p.models.iter().find(|m| m.tags.iter().any(|t| t == tag)))
+    let providers = builtin_providers();
+    let models = providers.get("anthropic").map(|p| p.models.as_slice()).unwrap_or_default();
+    models
+        .iter()
+        .find(|m| m.tags.iter().any(|t| t == tag))
+        .or_else(|| models.first())
         .map(|m| m.id.clone())
-        .unwrap_or_else(|| "claude-sonnet-5-5".into())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -832,30 +837,28 @@ mod tests {
     }
 
     #[test]
-    fn suggest_model_architecture() {
+    fn suggest_model_every_task_type() {
         let router = ProviderRouter {
             providers: builtin_providers(),
         };
-        let suggestion = router.suggest_model(&TaskType::Architecture);
-        assert_eq!(suggestion.model_id, "claude-opus-5-5");
+        for (task, expected) in [
+            (TaskType::Architecture, "claude-opus-5-5"),
+            (TaskType::Debugging, "claude-opus-5-5"),
+            (TaskType::CodeReview, "claude-sonnet-5-5"),
+            (TaskType::Refactoring, "claude-sonnet-5-5"),
+            (TaskType::General, "claude-sonnet-5-5"),
+            (TaskType::QuickFix, "claude-haiku-5-5"),
+            (TaskType::Documentation, "claude-haiku-5-5"),
+            (TaskType::Testing, "claude-haiku-5-5"),
+        ] {
+            assert_eq!(router.suggest_model(&task).model_id, expected, "{task:?}");
+        }
     }
 
     #[test]
-    fn suggest_model_code_review() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::CodeReview);
-        assert_eq!(suggestion.model_id, "claude-sonnet-5-5");
-    }
-
-    #[test]
-    fn suggest_model_quick_fix() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::QuickFix);
-        assert_eq!(suggestion.model_id, "claude-haiku-5-5");
+    fn untagged_suggestion_falls_back_to_first_anthropic_builtin() {
+        let first = builtin_providers()["anthropic"].models[0].id.clone();
+        assert_eq!(builtin_anthropic_model_tagged("no such tag"), first);
     }
 
     #[test]

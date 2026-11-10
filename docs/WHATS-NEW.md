@@ -71,6 +71,7 @@ Current anchors:
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
+| `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-waiting` | Direct run track, only while a running stage has no activity yet: its card's live line "waiting for first tool call" | `RunFlow.tsx` |
 | `direct-launcher-import-crew` · `direct-launcher-repo-crews` | Direct launcher: the "import a crew" link beside the ensemble eyebrow · the "from this repo" group (only when the worktree has `.octopush/crews/*.octocrew.json`) | `PipelineSetup.tsx` |
 | `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |

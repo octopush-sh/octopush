@@ -50,6 +50,22 @@ describe("isTransientHalt", () => {
     }
   });
 
+  it("never flags a hook-deferred tool halt, whatever its tool name or stderr tail says", () => {
+    const deferred = [
+      "A hook paused mcp__cloudflare-dns__create_record before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      "The resumed session was waiting to run echo (MCP server srv), which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)\n— stderr —\nrequest timed out; connection refused",
+    ];
+    for (const e of deferred) {
+      expect(isTransientHalt(e), e).toBe(false);
+    }
+  });
+
+  it("matches the network patterns on word boundaries only", () => {
+    for (const e of ["tool mcp__cloudflare-dns__create_record crashed", "wrote dnsmasq.conf", "subrequest failedover"]) {
+      expect(isTransientHalt(e), e).toBe(false);
+    }
+  });
+
   it("does not false-positive on unrelated numbers in prose", () => {
     // A bare line/column, byte, or token count must not read as an HTTP status —
     // the code is only transient inside our "… API error <code> …" framing.
