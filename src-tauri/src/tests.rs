@@ -1504,17 +1504,30 @@ mod budgets_v2_tests {
         }
     }
 
-    /// Non-Anthropic models have zero cache pricing (no caching support).
+    /// Every builtin model's cache columns match `token_engine::builtin_prices`
+    /// (Anthropic, and OpenAI's cached input since #611). Providers without
+    /// prompt-cache pricing there (DeepSeek, Ollama) keep both at zero.
     #[test]
-    fn non_anthropic_models_have_zero_cache_pricing() {
+    fn builtin_cache_pricing_matches_builtin_prices() {
         let providers = builtin_providers();
         for (name, p) in &providers {
-            if name == "anthropic" { continue; }
+            let cached = matches!(name.as_str(), "anthropic" | "openai");
             for m in &p.models {
-                assert_eq!(
-                    m.cache_read_cost_per_m, 0.0,
-                    "provider {name} model {} should have cache_read_cost_per_m == 0",
-                    m.id
+                let cols = (m.cache_read_cost_per_m, m.cache_creation_cost_per_m);
+                if !cached {
+                    assert_eq!(cols, (0.0, 0.0), "provider {name} model {} should have no cache pricing", m.id);
+                    continue;
+                }
+                let want = crate::token_engine::builtin_prices(&m.id)
+                    .unwrap_or_else(|| panic!("provider {name} model {} has no builtin_prices entry", m.id));
+                // Some columns are written as `3.0 * 0.10`: equal to the cent, not bit for bit.
+                let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+                assert!(
+                    same(cols.0, want.cache_read_per_m) && same(cols.1, want.cache_creation_per_m),
+                    "provider {name} model {}: cache (read, creation) per M {cols:?} should match builtin_prices ({}, {})",
+                    m.id,
+                    want.cache_read_per_m,
+                    want.cache_creation_per_m
                 );
             }
         }
@@ -14185,13 +14198,17 @@ mod pricing_table_tests {
         let providers = crate::provider_router::builtin_providers();
         let router = crate::provider_router::ProviderRouter::from_map(providers.clone());
         for name in ["anthropic", "openai"] {
+            let local = providers[name].local;
             for m in &providers[name].models {
                 let t = builtin_prices(&m.id).unwrap_or_else(|| panic!("{} missing from the table", m.id));
                 assert_eq!(t.input_per_m, m.input_cost_per_m, "{}", m.id);
                 assert_eq!(t.output_per_m, m.output_cost_per_m, "{}", m.id);
-                if m.cache_read_cost_per_m > 0.0 {
-                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{}", m.id);
-                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{}", m.id);
+                // Cache columns too: a $0 here would bill cached input at the
+                // wrong rate. Only explicitly free or local entries skip them.
+                let free = m.input_cost_per_m == 0.0 && m.output_cost_per_m == 0.0;
+                if !local && !free {
+                    assert!((t.cache_read_per_m - m.cache_read_cost_per_m).abs() < 1e-9, "{} cache read", m.id);
+                    assert!((t.cache_creation_per_m - m.cache_creation_cost_per_m).abs() < 1e-9, "{} cache write", m.id);
                 }
                 // 1-hour writes: 2× input, the same on the catalog-first path.
                 if m.id.starts_with("claude-") {
@@ -14240,6 +14257,58 @@ mod pricing_table_tests {
         assert_eq!((get("claude-opus-4-6").input_cost_per_m, get("claude-opus-4-6").output_cost_per_m), (5.0, 25.0));
         assert_eq!(get("claude-opus-4-6").cache_read_cost_per_m, 0.50);
         assert_eq!((get("claude-sonnet-5").input_cost_per_m, get("claude-sonnet-5").output_cost_per_m), (2.2, 11.0));
+    }
+
+    #[test]
+    fn stale_gpt_4o_cache_prices_on_disk_are_corrected_but_edits_kept() {
+        use crate::provider_router::{builtin_providers, migrate_stale_builtin_prices};
+        let defaults = builtin_providers();
+        let mut list: Vec<_> = vec![defaults["openai"].clone()];
+        for m in &mut list[0].models {
+            match m.id.as_str() {
+                // The old shipped default: cached input at $0 → corrected.
+                "gpt-4o" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (2.5, 10.0, 0.0, 0.0);
+                }
+                // A user edit → left alone.
+                "gpt-4o-mini" => {
+                    (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) =
+                        (0.2, 0.6, 0.0, 0.0);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut list, &defaults), 1);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().clone();
+        assert_eq!((get("gpt-4o").cache_read_cost_per_m, get("gpt-4o").cache_creation_cost_per_m), (1.25, 2.50));
+        assert_eq!((get("gpt-4o-mini").input_cost_per_m, get("gpt-4o-mini").cache_read_cost_per_m), (0.2, 0.0));
+        // The old mini default alone is corrected too.
+        let mut mini = vec![defaults["openai"].clone()];
+        for m in &mut mini[0].models {
+            if m.id == "gpt-4o-mini" {
+                (m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (0.0, 0.0);
+            }
+        }
+        assert_eq!(migrate_stale_builtin_prices(&mut mini, &defaults), 1);
+        let m = mini[0].models.iter().find(|m| m.id == "gpt-4o-mini").unwrap();
+        assert_eq!((m.cache_read_cost_per_m, m.cache_creation_cost_per_m), (0.075, 0.15));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn gpt_4o_cached_input_is_priced_at_its_cached_rate() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        // 1,000 cached tokens (OpenAI's `prompt_tokens_details.cached_tokens`).
+        let gpt = prices_for("gpt-4o").expect("gpt-4o is priced");
+        assert!(near(gpt.cost(0, 0, 1_000, 0), 1_000.0 * 1.25 / 1e6), "{gpt:?}");
+        let mini = prices_for("gpt-4o-mini").expect("gpt-4o-mini is priced");
+        assert!(near(mini.cost(0, 0, 1_000, 0), 1_000.0 * 0.075 / 1e6), "{mini:?}");
+        // Catalog-first and the table agree.
+        assert_eq!(Some(gpt), builtin_prices("gpt-4o"));
+        assert_eq!(Some(mini), builtin_prices("gpt-4o-mini"));
     }
 }
 
@@ -14365,6 +14434,7 @@ mod unpriced_ledger_tests {
         assert_eq!(cost_of(&d, "e"), (0.0, "computed".into()));
         assert!(d.meta_get("ledger_unpriced_classify_v1").unwrap().is_some());
         assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
         // Flags set: a later legacy $0 row is no longer scanned, and the stale
         // pass never re-runs.
         d.insert_spend_event(&spend("claude-mythos-2", "f", "run", None, 0.0, "computed", 1_000, 0)).unwrap();
@@ -14374,6 +14444,54 @@ mod unpriced_ledger_tests {
         let d = db.lock();
         assert_eq!(cost_of(&d, "f"), (0.0, "computed".into()));
         assert!((cost_of(&d, "g").0 - 0.0225).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn upgraded_ledger_gets_the_gpt4o_cached_input_fix_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        // Billed with cached input at the full input price: (i + cr) × in + out × out.
+        let old = |i: f64, cr: f64, inp: f64, out: f64| ((i + cr) * inp + 100.0 * out) / 1e6;
+        let gpt4o_old = old(1_000.0, 50_000.0, 2.5, 10.0);
+        let mini_old = old(1_000.0, 50_000.0, 0.15, 0.6);
+        let opus46_stale = (1_000.0 * 15.0 + 100.0 * 75.0) / 1e6;
+        {
+            let d = db.lock();
+            // An install upgraded from v0.4.89+: the October pass already ran.
+            d.meta_set("ledger_stale_price_fix_2026_10_v1", "done").unwrap();
+            d.meta_set("ledger_unpriced_classify_v1", "done").unwrap();
+            d.insert_spend_event(&spend("gpt-4o", "a", "talk", Some("director"), gpt4o_old, "computed", 1_000, 50_000)).unwrap();
+            d.insert_spend_event(&spend("openai/gpt-4o-mini", "b", "run", None, mini_old, "computed", 1_000, 50_000)).unwrap();
+            // Provider-reported cost: never recomputed.
+            let mut reported = spend("gpt-4o", "c", "talk", Some("director"), gpt4o_old, "provider", 1_000, 50_000);
+            reported.provider_cost_usd = Some(gpt4o_old);
+            d.insert_spend_event(&reported).unwrap();
+            // A subscription-billed row: not 'computed', left alone.
+            d.insert_spend_event(&spend("gpt-4o", "d", "talk", Some("director"), gpt4o_old, "subscription", 1_000, 50_000)).unwrap();
+            // The October pass is not re-run for other stale ids.
+            d.insert_spend_event(&spend("claude-opus-4-6", "e", "run", None, opus46_stale, "computed", 1_000, 0)).unwrap();
+        }
+        crate::commands::reprice_ledger(&db).unwrap();
+        let gpt4o_new = (1_000.0 * 2.5 + 50_000.0 * 1.25 + 100.0 * 10.0) / 1e6;
+        let mini_new = (1_000.0 * 0.15 + 50_000.0 * 0.075 + 100.0 * 0.6) / 1e6;
+        let check = |d: &Db| {
+            let (a, basis) = cost_of(d, "a");
+            assert!((a - gpt4o_new).abs() < 1e-12 && basis == "computed", "gpt-4o row: {a} vs {gpt4o_new}");
+            let (b, _) = cost_of(d, "b");
+            assert!((b - mini_new).abs() < 1e-12, "gpt-4o-mini row: {b} vs {mini_new}");
+            assert_eq!(cost_of(d, "c"), (gpt4o_old, "provider".into()));
+            assert_eq!(cost_of(d, "d"), (gpt4o_old, "subscription".into()));
+            assert!((cost_of(d, "e").0 - opus46_stale).abs() < 1e-12);
+        };
+        {
+            let d = db.lock();
+            check(&d);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
+        }
+        // A second run changes nothing.
+        crate::commands::reprice_ledger(&db).unwrap();
+        check(&db.lock());
     }
 
     #[test]

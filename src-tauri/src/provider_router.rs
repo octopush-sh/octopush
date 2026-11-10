@@ -470,6 +470,9 @@ pub(crate) const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
     // Sonnet 5 was priced like Sonnet 4.6 ($3/$15); it is $2/$10.
     ("claude-sonnet-5", [3.0, 15.0, 0.3, 3.75]),
     ("claude-sonnet-5", [3.0, 15.0, 0.2, 2.5]),
+    // GPT-4o and GPT-4o mini shipped with cached input at $0; it is billed.
+    ("gpt-4o", [2.5, 10.0, 0.0, 0.0]),
+    ("gpt-4o-mini", [0.15, 0.6, 0.0, 0.0]),
 ];
 
 /// Reset models whose on-disk price is a known-stale builtin default (see
@@ -668,8 +671,10 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     display_name: "GPT-4o".into(),
                     input_cost_per_m: 2.50,
                     output_cost_per_m: 10.0,
-                    cache_read_cost_per_m: 0.0,
-                    cache_creation_cost_per_m: 0.0,
+                    // OpenAI bills cached input at its own rate and has no
+                    // cache-write line: writes cost the input price.
+                    cache_read_cost_per_m: 1.25,
+                    cache_creation_cost_per_m: 2.50,
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -680,8 +685,8 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     display_name: "GPT-4o mini".into(),
                     input_cost_per_m: 0.15,
                     output_cost_per_m: 0.60,
-                    cache_read_cost_per_m: 0.0,
-                    cache_creation_cost_per_m: 0.0,
+                    cache_read_cost_per_m: 0.075,
+                    cache_creation_cost_per_m: 0.15,
                     max_context: 128_000,
                     supports_vision: true,
                     supports_tools: true,
