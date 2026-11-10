@@ -1521,6 +1521,11 @@ export const ipc = {
   /** Installed Claude Code CLI version vs the tested floor (cached per app session). */
   claudeCliVersion: () =>
     invoke<ClaudeCliVersion>("claude_cli_version"),
+  /** Direct launcher: the one model among `models` the installed Claude Code
+   *  is too old to launch (`agent_adapter::CLAUDE_MODEL_FLOORS`), read from the
+   *  cached version without probing; null when none or the version is unknown. */
+  claudeModelFloorNote: (models: string[]) =>
+    invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
   /** Settings › General readiness card: local checks, each bounded at 3 s, never cached.
    *  `askClaude` (an explicit Check again) also runs `claude auth status`. */
   readinessCheck: (askClaude = false) =>
@@ -1605,6 +1610,16 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+}
+
+/** A crew model the installed Claude Code is too old for (mirrors Rust
+ *  `agent_adapter::ClaudeModelFloorNote`). */
+export interface ClaudeModelFloorNote {
+  /** Display name, e.g. "Fable 5.2". */
+  label: string;
+  /** The oldest Claude Code that runs it. */
+  needs: string;
+  installed: string;
 }
 
 /** Result of a one-click "Connect to Claude Code". */

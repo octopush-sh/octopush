@@ -2,7 +2,7 @@
 // tested with (`agent_adapter::TESTED_CLAUDE_FLOOR`) and the security fixes it
 // may lack (`CLAUDE_SECURITY_FIXES`). An old CLI is a warning in Settings ›
 // Integrations and the Direct launcher — it never blocks a run.
-import { ipc, type ClaudeCliVersion } from "./ipc";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote } from "./ipc";
 
 /** Why an old CLI matters, in one line (shared by every surface that warns). */
 export const CLAUDE_UPDATE_REASON =
@@ -52,6 +52,25 @@ export function crewUsesClaudeCode(
   overrides: Record<number, string>,
 ): boolean {
   return stages.some((s) => s.substrate === "cli" && runsOnClaudeCode(overrides[s.position] || s.agentModel));
+}
+
+/** Every model a Claude Code CLI stage of the crew may launch — its model
+ *  (with the launcher's overrides) and its escalation model — deduplicated. */
+export function crewClaudeModels(
+  stages: { position: number; substrate: string; agentModel: string; escalateModel?: string | null }[],
+  overrides: Record<number, string>,
+): string[] {
+  const models = stages
+    .filter((s) => s.substrate === "cli")
+    .flatMap((s) => [overrides[s.position] || s.agentModel, s.escalateModel ?? ""])
+    .filter((m) => m && runsOnClaudeCode(m));
+  return [...new Set(models)];
+}
+
+/** "Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316." */
+export function modelFloorLabel(note: ClaudeModelFloorNote | null): string | null {
+  if (!note) return null;
+  return `${note.label} needs Claude Code ${note.needs} or newer — this Mac has ${note.installed}.`;
 }
 
 /** True when the installed Claude Code is known to be older than the tested

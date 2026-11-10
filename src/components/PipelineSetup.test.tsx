@@ -29,13 +29,17 @@ vi.mock("../hooks/useEntitlement", () => ({
 }));
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
+const floorNoteMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
 const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
     ...actual,
-    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock },
+    ipc: {
+      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock,
+      listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
+    },
   };
 });
 
@@ -67,6 +71,8 @@ beforeEach(() => {
   useMissionsStore.setState({ missionByWorkspaceId: {} });
   repoCrewsMock.mockReset();
   repoCrewsMock.mockResolvedValue([]);
+  floorNoteMock.mockReset();
+  floorNoteMock.mockResolvedValue(null);
 });
 
 describe("PipelineSetup crews from the repo", () => {
@@ -482,6 +488,57 @@ describe("PipelineSetup Claude Code version preflight", () => {
     } finally {
       usePerfStore.setState({ stats: null });
     }
+  });
+
+  it("names a model this CLI is too old to launch, for a CLI stage or its escalation, and still lets the run begin", async () => {
+    const pipe = cliPipe("claude-sonnet-5-5");
+    pipe.stages.push({ ...pipe.stages[0], id: "c1", position: 1, agentModel: "claude-haiku-5-5", escalateModel: "claude-fable-5-2" } as any);
+    pipe.stages.push({ ...pipe.stages[0], id: "c2", position: 2, agentModel: "claude-fable-5-2", substrate: "api" } as any);
+    storeState.pipelines = [pipe];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.316" });
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-model-floor");
+    expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316.");
+    expect(line).toHaveClass("text-octo-warning");
+    // Only the CLI stages' models (and the escalation) are checked; the API stage isn't.
+    expect(floorNoteMock).toHaveBeenCalledWith(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("shows no model line when no stage needs a newer CLI", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(floorNoteMock).toHaveBeenCalled());
+    expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
+  });
+
+  it("shows no model line when the CLI isn't found", async () => {
+    storeState.pipelines = [cliPipe("claude-fable-5-2")];
+    cliVersionMock.mockResolvedValue({ version: null, floor: "2.1.314", belowFloor: false });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.316" });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
+    await screen.findByTestId("estimate-range");
+    expect(floorNoteMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
+  });
+
+  it("reads the version for a Codex stage escalating to Claude, and names the model", async () => {
+    const pipe = cliPipe("gpt-5-codex");
+    (pipe.stages[0] as any).escalateModel = "claude-fable-5-2";
+    storeState.pipelines = [pipe];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.307" });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-model-floor");
+    expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.307.");
+    expect(floorNoteMock).toHaveBeenCalledWith(["claude-fable-5-2"]);
+    // The update/security notes stay with crews whose own stages run Claude Code.
+    expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
   });
 
   it("does not probe for crews without a Claude Code CLI stage", async () => {
