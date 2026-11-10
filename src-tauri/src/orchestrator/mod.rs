@@ -64,12 +64,21 @@ pub(crate) fn escalation_changes_tier_on(stage: &RunStageRow, claude_cli_below_f
         .as_deref()
         .is_some_and(|m| m != stage.agent_model);
     let target_model = stage.escalate_model.as_deref().unwrap_or(stage.agent_model.as_str());
-    // On the CLI, effort applies only to Claude Code — which drops it when old.
+    // An old Claude Code drops `--effort`; Codex has no version floor.
+    let below_floor = claude_cli_below_floor
+        && cli_runner::dialect_for_model(target_model) == cli_runner::CliDialect::Claude;
     let effort_reaches = cli_runner::effort_applies(&stage.substrate, target_model)
-        && !(stage.substrate == "cli" && claude_cli_below_floor);
-    let effort_changes = effort_reaches
-        && stage.escalate_effort.is_some()
-        && stage.escalate_effort != stage.effort;
+        && !(stage.substrate == "cli" && below_floor);
+    // On the CLI, compare the levels each CLI actually gets (Codex passes
+    // `max` as `xhigh` on most models, so xhigh → max there is no change).
+    let effort_differs = match stage.substrate.as_str() {
+        "cli" => {
+            let level = |m: &str, e| cli_runner::dialect_for_model(m).effort_level(m, e);
+            level(target_model, stage.escalate_effort) != level(&stage.agent_model, stage.effort)
+        }
+        _ => stage.escalate_effort != stage.effort,
+    };
+    let effort_changes = effort_reaches && stage.escalate_effort.is_some() && effort_differs;
     model_changes || effort_changes
 }
 
@@ -758,9 +767,9 @@ impl Orchestrator {
         // Escalate only if the tier would ACTUALLY change — otherwise the retry
         // re-runs identically and burns spend for nothing. `escalate_model`
         // must differ from the base; `escalate_effort` counts only where effort
-        // reaches the agent — the API, or a Claude Code CLI stage (`--effort`)
-        // judged on the model it escalates to. Codex ignores effort, so an
-        // effort-only policy there is inert. No real change ⇒ halt as before.
+        // reaches the agent — the API, or a CLI stage (Claude Code's `--effort`,
+        // Codex's `model_reasoning_effort`) judged on the model it escalates
+        // to. No real change ⇒ halt as before.
         if !escalation_changes_tier(&fresh) {
             return Ok(false);
         }

@@ -5755,8 +5755,9 @@ impl Db {
     /// Tokens of the `limit` most recent stages of `role` at `effort` in
     /// completed runs, each summed over every attempt the ledger recorded
     /// (loop-backs and re-runs included — that is what the stage cost).
-    /// Effort reaches the API and Claude Code (`--effort`) but not Codex, so a
-    /// Codex CLI stage counts as no effort — the model test mirrors
+    /// Codex CLI stages recorded before they took an effort ran at Codex's
+    /// default, and the ledger can't tell them from later ones, so every Codex
+    /// CLI stage still counts as no effort here — the model test mirrors
     /// `cli_runner::dialect_for_model`. Read-only; feeds the pre-run estimate.
     pub fn stage_token_samples(
         &self,

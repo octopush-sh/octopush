@@ -7,6 +7,7 @@ const {
   claudeSecurityLabel,
   claudeUpdateLabel,
   cliTooOldForEffort,
+  codexEffortLevel,
   crewUsesClaudeCode,
   effortApplies,
   loadClaudeCliVersion,
@@ -77,11 +78,19 @@ describe("crewUsesClaudeCode", () => {
 });
 
 describe("effortApplies", () => {
-  it("mirrors the backend: API, and Claude Code CLI stages, but not Codex", () => {
+  it("mirrors the backend: API, and CLI stages on Claude Code and Codex", () => {
     expect(effortApplies("api", "gpt-5")).toBe(true);
     expect(effortApplies("cli", "claude-opus-5-5")).toBe(true);
     expect(effortApplies("cli", "my-proxy-model")).toBe(true);
-    expect(effortApplies("cli", "gpt-5-codex")).toBe(false);
+    expect(effortApplies("cli", "gpt-5-codex")).toBe(true);
+    expect(effortApplies("bogus", "claude-opus-5-5")).toBe(false);
+  });
+
+  it("passes max to Codex only on gpt-6, xhigh elsewhere", () => {
+    expect(codexEffortLevel("gpt-5-codex", "max")).toBe("xhigh");
+    expect(codexEffortLevel("gpt-6.1-terra", "max")).toBe("max");
+    expect(codexEffortLevel("GPT-6", "max")).toBe("max");
+    expect(codexEffortLevel("gpt-5-codex", "high")).toBe("high");
   });
 
   it("hides CLI effort only for a known version below the floor", () => {

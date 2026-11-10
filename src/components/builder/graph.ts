@@ -122,13 +122,13 @@ export interface StageNodeData {
   customName: string | null;
   agentModel: string;
   /** Per-stage reasoning effort; null = off (no thinking) on the API, Claude
-   *  Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  Code's or Codex's own default on a CLI stage. */
   effort: Effort | null;
   /** Escalation policy — the stronger model to retry with on failure; null =
    *  no model swap. Either escalate field set = the stage escalates. */
   escalateModel: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). */
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). */
   escalateEffort: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;

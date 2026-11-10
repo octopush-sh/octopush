@@ -9,7 +9,7 @@ import { Reveal } from "../primitives/Reveal";
 import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
-import { cliTooOldForEffort, effortApplies, loadClaudeCliVersion } from "../../lib/claudeCli";
+import { cliTooOldForEffort, codexEffortLevel, effortApplies, loadClaudeCliVersion, runsOnClaudeCode } from "../../lib/claudeCli";
 import type { ClaudeCliVersion, Effort } from "../../lib/ipc";
 
 const SUBSTRATE_OPTIONS = [
@@ -36,10 +36,22 @@ const CLI_EFFORT_OPTIONS = [
   { value: "off" as const, label: "Auto", title: "Claude Code's own default effort for this model" },
   ...EFFORT_OPTIONS.slice(1),
 ];
+/** On a Codex stage no effort means Codex's own default (its config file's
+ *  `model_reasoning_effort`), and Max runs as the model's top level. */
+function codexEffortOptions(model: string) {
+  const maxTitle =
+    codexEffortLevel(model, "max") === "max" ? "Maximum reasoning depth" : "Runs as XHi, this model's top level in Codex";
+  return [
+    { value: "off" as const, label: "Auto", title: "Codex's own default effort for this model" },
+    ...EFFORT_OPTIONS.slice(1, -1),
+    { value: "max" as const, label: "Max", title: maxTitle },
+  ];
+}
 
 /** One effort segment (base or escalation). API: the full track. Claude Code
  *  CLI: the same levels, passed as `--effort`, hidden on a CLI older than the
- *  tested floor (it would not get the flag). Codex: disabled, it ignores effort. */
+ *  tested floor (it would not get the flag). Codex: the same levels, passed as
+ *  `-c model_reasoning_effort`. */
 function EffortControl({
   substrate,
   model,
@@ -57,17 +69,17 @@ function EffortControl({
 }) {
   const isCli = substrate === "cli";
   const applies = effortApplies(substrate, model);
-  // Auto only where Claude Code actually supplies its own default; Codex keeps
-  // the plain track (disabled).
-  const claudeCli = isCli && applies;
+  // Auto on the CLI, where the null state is the CLI's own default.
+  const claudeCli = isCli && runsOnClaudeCode(model);
   const tooOld = claudeCli && cliTooOldForEffort(cli);
+  const options = !isCli ? EFFORT_OPTIONS : claudeCli ? CLI_EFFORT_OPTIONS : codexEffortOptions(model);
   return (
     <>
       <Reveal open={!tooOld}>
         <SegmentedControl
           fill
           disabled={!applies}
-          options={claudeCli ? CLI_EFFORT_OPTIONS : EFFORT_OPTIONS}
+          options={options}
           value={value ?? "off"}
           onChange={(v) => onChange(v === "off" ? null : v)}
           ariaLabel={ariaLabel}
@@ -77,9 +89,6 @@ function EffortControl({
         <span className="font-mono text-[9px] text-octo-mute">
           Update Claude Code ({cli?.floor} or newer) to set reasoning on this stage.
         </span>
-      </Reveal>
-      <Reveal open={!applies}>
-        <span className="font-mono text-[9px] text-octo-mute">Codex manages its own reasoning.</span>
       </Reveal>
     </>
   );
@@ -223,14 +232,14 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           </div>
 
           {/* Reasoning effort — how hard the model thinks per turn. API: Off =
-              no thinking. Claude Code CLI: passed as `--effort`, Auto = the
-              CLI's default. Codex ignores it. */}
+              no thinking. CLI: passed as Claude Code's `--effort` or Codex's
+              `model_reasoning_effort`, Auto = the CLI's default. */}
           <div className="flex flex-col gap-1" data-tour="builder-stage-reasoning">
             <span
               className="font-mono text-[10px] uppercase tracking-[0.18em] text-octo-mute"
               title={
                 isCli
-                  ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort; Auto keeps the CLI's default for the model."
+                  ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort, Codex as model_reasoning_effort; Auto keeps the CLI's default for the model."
                   : "How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking."
               }
             >

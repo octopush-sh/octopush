@@ -3810,7 +3810,7 @@ mod run_crud_tests {
         mk("completed", None, "api", 2_000);
         mk("aborted", None, "api", 50_000); // not a completed run
         mk("completed", Some("high"), "api", 8_000); // another effort
-        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex ignores effort
+        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // older Codex rows ran at the default
         mk("completed", Some("high"), "cli", 4_000); // Claude Code takes --effort
 
         let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
@@ -4719,14 +4719,28 @@ mod orchestrator_tests {
     }
 
     #[test]
-    fn try_escalate_refuses_effort_only_policy_on_codex_cli() {
-        // Codex ignores effort — an effort-only policy there must NOT burn a
-        // pointless same-tier retry (the retry would run identically).
+    fn try_escalate_accepts_effort_only_policy_on_codex_cli() {
+        // Codex takes `-c model_reasoning_effort`, so low → high is a real tier change.
         let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         let orch = orch_for(&db);
-        assert!(!orch.try_escalate(&run, &stage).unwrap(), "Codex ignores effort — no tier change, no retry");
-        assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "a Codex CLI effort-only policy escalates");
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn codex_escalation_judges_the_level_codex_actually_gets() {
+        // Below gpt-6, Codex gets `max` as `xhigh`: xhigh → max runs identically.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("xhigh"), None, Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false));
+        let (db, run) = esc_run_on("cli", "gpt-6.1-terra", Some("xhigh"), None, Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false), "gpt-6 lists max");
+        // An old Claude Code CLI doesn't stop Codex's effort.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, true));
     }
 
     #[test]
@@ -9132,12 +9146,31 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn claude_stages_pass_their_effort_and_codex_stages_do_not() {
+    fn cli_stages_pass_their_effort_in_each_dialect() {
         use crate::providers::Effort;
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::High)), vec!["--effort", "high"]);
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
-        assert!(CliDialect::Claude.effort_args(None).is_empty(), "no effort ⇒ the CLI's own default");
-        assert!(CliDialect::Codex.effort_args(Some(Effort::High)).is_empty());
+        let m = "claude-opus-5-5";
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::High)), vec!["--effort", "high"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Max)), vec!["--effort", "max"]);
+        assert!(CliDialect::Claude.effort_args(m, None).is_empty(), "no effort ⇒ the CLI's own default");
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5-codex", Some(Effort::High)),
+            vec!["-c", "model_reasoning_effort=\"high\""]
+        );
+        assert!(CliDialect::Codex.effort_args("gpt-5-codex", None).is_empty(), "no effort ⇒ Codex's own default");
+    }
+
+    #[test]
+    fn codex_gets_max_only_on_gpt_6() {
+        use crate::providers::Effort;
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(Effort::Max)), Some("xhigh"));
+        assert_eq!(CliDialect::Codex.effort_level("o3", Some(Effort::Max)), Some("xhigh"));
+        assert_eq!(CliDialect::Codex.effort_level("gpt-6.1-terra", Some(Effort::Max)), Some("max"));
+        assert_eq!(CliDialect::Codex.effort_level("GPT-6", Some(Effort::Max)), Some("max"));
+        for e in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh] {
+            assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(e)), Some(e.as_str()));
+        }
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", None), None);
     }
 
     #[test]
@@ -9170,11 +9203,11 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn effort_applies_to_api_and_claude_cli_only() {
+    fn effort_applies_to_api_and_both_cli_dialects() {
         use crate::orchestrator::cli_runner::effort_applies;
         assert!(effort_applies("api", "gpt-5"));
         assert!(effort_applies("cli", "claude-opus-5-5"));
-        assert!(!effort_applies("cli", "gpt-5-codex"));
+        assert!(effort_applies("cli", "gpt-5-codex"));
         assert!(!effort_applies("bogus", "claude-opus-5-5"));
     }
 
