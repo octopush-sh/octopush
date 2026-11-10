@@ -14317,8 +14317,16 @@ mod pricing_table_tests {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
         let _cfg = crate::provider_router::TestConfigDir::new();
         // $1 input, $0.05 cached input (5%), $5 output; writes cost input.
-        assert_prices("gpt-6.1-terra", 1.0, 1.0, 0.05, 5.0);
-        assert_prices("openai/gpt-6.1-terra", 1.0, 1.0, 0.05, 5.0);
+        // Not `assert_prices`: its 1-hour check (2× input) is Claude-only.
+        let terra = ModelPrices {
+            input_per_m: 1.0,
+            output_per_m: 5.0,
+            cache_read_per_m: 0.05,
+            cache_creation_per_m: 1.0,
+            cache_creation_1h_per_m: 1.0,
+        };
+        assert_eq!(builtin_prices("gpt-6.1-terra"), Some(terra));
+        assert_eq!(builtin_prices("openai/gpt-6.1-terra"), Some(terra));
         let p = prices_for("gpt-6.1-terra").expect("gpt-6.1-terra is priced");
         assert_eq!(Some(p), builtin_prices("gpt-6.1-terra"));
         // Not a Claude model: no 1-hour write tier.
