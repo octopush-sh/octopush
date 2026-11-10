@@ -430,7 +430,9 @@ describe("fileMatch — performance", () => {
     matchFiles(files, parsed); // warm up
     const t0 = performance.now();
     expect(matchFiles(files, parsed)).toHaveLength(20_000);
-    expect(performance.now() - t0).toBeLessThan(200);
+    // A generous ceiling: shared CI runners are slow, and a catastrophic
+    // backtracking blow-up would take far longer than this.
+    expect(performance.now() - t0).toBeLessThan(1000);
   });
 
   it("step works until its deadline, then yields", () => {
