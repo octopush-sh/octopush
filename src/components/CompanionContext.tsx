@@ -5,7 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
-import { unpricedTitle } from "../lib/cost";
+import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 
 interface Props {
@@ -306,7 +306,7 @@ function SpendRow({ row, onClick }: { row: SpendRowData; onClick?: () => void })
       <div className="flex items-baseline justify-between">
         <span className="text-octo-sage">{row.label}</span>
         <span className="octo-tabular font-mono text-[10px] text-octo-ivory">
-          ${row.costUsd.toFixed(2)} / ${row.limitUsd.toFixed(2)}
+          {formatUsd(row.costUsd)} / {formatUsd(row.limitUsd)}
         </span>
       </div>
       <div

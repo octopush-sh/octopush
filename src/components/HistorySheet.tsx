@@ -4,6 +4,7 @@ import { useSyncPrefsStore } from "../stores/syncPrefsStore";
 import { runStatusMeta, stageStatusWord } from "../lib/runStatus";
 import { formatRelTime } from "../lib/relTime";
 import { labelForRole } from "../lib/stageMeta";
+import { formatUsd } from "../lib/cost";
 import { iconForRole, iconForTool } from "../lib/roleIcons";
 import { ModalShell } from "./ModalShell";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -161,7 +162,7 @@ function RunList({
                 <span className={`shrink-0 ${meta.className}`}>{meta.glyph}</span>
                 <span className="min-w-0 flex-1 truncate text-[13px] text-octo-ivory">{run.task}</span>
                 <span className="shrink-0 font-mono text-[12px] text-octo-brass octo-tabular">
-                  ${run.cost_usd.toFixed(2)}
+                  {formatUsd(run.cost_usd)}
                 </span>
               </div>
               <div className="mt-1 flex items-center gap-1.5 font-mono text-[10px] text-octo-mute">
@@ -221,7 +222,7 @@ function RunDetailView({ run }: { run: SyncedRun }) {
           </>
         )}
         <span aria-hidden>·</span>
-        <span className="octo-tabular shrink-0 text-octo-brass">${run.cost_usd.toFixed(2)}</span>
+        <span className="octo-tabular shrink-0 text-octo-brass">{formatUsd(run.cost_usd)}</span>
         {detail && detail.stages.length > 0 && (
           <StageDots
             className="ml-auto shrink-0"
@@ -286,7 +287,7 @@ function StageSection({ stage }: { stage: SyncedRunStageDetail }) {
           {stage.model ? ` · ${stage.model}` : ""} · {word}
         </span>
         <span className="octo-tabular shrink-0 font-mono text-[11px] text-octo-brass">
-          ${stage.cost_usd.toFixed(2)}
+          {formatUsd(stage.cost_usd)}
         </span>
       </div>
 

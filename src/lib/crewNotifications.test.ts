@@ -40,6 +40,11 @@ describe("decideCompletionNotification (finished)", () => {
     expect(n?.body).toContain("$0.42");
   });
 
+  it("groups thousands in the cost", () => {
+    const n = decideCompletionNotification("running", run("completed", { costUsd: 12843.27 }), "checkout-flow");
+    expect(n?.body).toContain("$12,843.27");
+  });
+
   it("aborted is the director's own hand — silence", () => {
     expect(decideCompletionNotification("running", run("aborted"), "ws")).toBeNull();
   });

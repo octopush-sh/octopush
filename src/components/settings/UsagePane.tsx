@@ -20,7 +20,7 @@ import { ModalShell } from "../ModalShell";
 import { Listbox } from "../controls/Listbox";
 import { IconButton } from "../controls/IconButton";
 import { pushToast } from "../Toasts";
-import { modelCostCell } from "../../lib/cost";
+import { formatUsd, modelCostCell } from "../../lib/cost";
 import {
   PaneHeader, SectionLabel, Segments, Stat, Row, formatTokens, formatRelative, usd, useChartColors,
   type ChartColors,
@@ -528,7 +528,7 @@ export function UsagePane() {
                       labelFormatter={(b) => bucketLabel(String(b), report.trendBucket)}
                       formatter={(v, _name, item) => {
                         const tokens = (item?.payload as { tokens?: number } | undefined)?.tokens ?? 0;
-                        return [`$${Number(v).toFixed(2)} · ${formatTokens(tokens)} tokens`, "Cost"];
+                        return [`${formatUsd(Number(v))} ·${formatTokens(tokens)} tokens`, "Cost"];
                       }}
                     />
                     <Area type="monotone" dataKey="costUsd" stroke={chart.accent} fill="url(#grad-cost-brass)" strokeWidth={2} />
@@ -1047,11 +1047,11 @@ function BudgetRow({
             onClick={() => { setDraft(budget.limitUsd.toFixed(2)); setEditing(true); }}
             className="octo-tabular w-20 rounded border border-octo-hairline px-2 py-0.5 text-left font-mono text-[11px] text-octo-ivory transition hover:border-octo-brass"
           >
-            ${budget.limitUsd.toFixed(2)}
+            {formatUsd(budget.limitUsd)}
           </button>
         )}
         <span className="flex-1 text-octo-mute">
-          Spent: <span className="octo-tabular text-octo-ivory">${spentUsd.toFixed(2)}</span>
+          Spent: <span className="octo-tabular text-octo-ivory">{formatUsd(spentUsd)}</span>
           <span className="octo-tabular ml-1 text-octo-mute">{pct.toFixed(0)}%</span>
         </span>
         <IconButton label="Remove budget" danger onClick={onClear}>

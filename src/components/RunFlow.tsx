@@ -10,6 +10,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
 import { tourId } from "../lib/tour/ids";
+import { formatUsd } from "../lib/cost";
 import { RunFlowNav } from "./RunFlowNav";
 
 interface Props {
@@ -271,7 +272,7 @@ function MetaTokens({ stage: s }: { stage: RunStage }) {
   const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
   return (
     <span className="flex items-center gap-2">
-      <span className="octo-tabular text-octo-brass">${s.costUsd.toFixed(2)}</span>
+      <span className="octo-tabular text-octo-brass">{formatUsd(s.costUsd)}</span>
       {hasTokens && (
         <span className="octo-tabular text-octo-mute" title="input / output tokens">
           ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}
