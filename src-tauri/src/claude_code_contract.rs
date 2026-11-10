@@ -18,7 +18,7 @@
 //! | `SKILL.md` / `.claude/agents/*.md` frontmatter (incl. `effort:`) | `skills`, `skills::agents` |
 //! | `claude mcp add octopush …` argv | `mcp_setup` |
 //! | `Notification` / `Stop` hook stdin payloads | `agent_adapter::parse_hook_event`, `claude_hooks::record_hook` |
-//! | `claude auth status` JSON (`loginExpiresAt`) | `agent_adapter::parse_login_expires_at` |
+//! | `claude auth status --json` (`loggedIn`, `loginExpiresAt`) | `agent_adapter::parse_claude_auth_status` |
 
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -883,7 +883,7 @@ const AUTH_STATUS_VERSION: &str = "2.1.319";
 
 #[test]
 fn auth_status_signed_in_reports_the_sign_in_end() {
-    use crate::agent_adapter::parse_login_expires_at;
+    use crate::agent_adapter::{parse_claude_auth_status as parse, ClaudeLoginProbe::SignedIn};
     // Synthetic fixture (see the 2.1.319 README).
     let rec = synthesized(AUTH_STATUS_VERSION);
     let rel = "auth-status/signed-in.json";
@@ -891,39 +891,42 @@ fn auth_status_signed_in_reports_the_sign_in_end() {
     let mut v = rec.json(rel);
     require_str(&fx, &v, "loginExpiresAt");
     let want = chrono::DateTime::parse_from_rfc3339("2026-12-12T09:00:00Z").unwrap().timestamp();
-    assert_eq!(parse_login_expires_at(&rec.text(rel)), Some(want), "[{fx}]");
+    assert_eq!(parse(&rec.text(rel)), SignedIn(want), "[{fx}]");
     // A warning on stderr (joined after stdout) doesn't hide it.
-    assert_eq!(parse_login_expires_at(&format!("{}\nwarning: something\n", rec.text(rel))), Some(want), "[{fx}]");
+    assert_eq!(parse(&format!("{}\nwarning: something\n", rec.text(rel))), SignedIn(want), "[{fx}]");
 
     // Epoch seconds or milliseconds read as the same moment.
     v["loginExpiresAt"] = Value::from(want);
-    assert_eq!(parse_login_expires_at(&v.to_string()), Some(want));
+    assert_eq!(parse(&v.to_string()), SignedIn(want));
     v["loginExpiresAt"] = Value::from(want * 1000);
-    assert_eq!(parse_login_expires_at(&v.to_string()), Some(want));
+    assert_eq!(parse(&v.to_string()), SignedIn(want));
 }
 
 #[test]
-fn auth_status_signed_out_or_without_the_field_reports_nothing() {
-    use crate::agent_adapter::parse_login_expires_at;
+fn auth_status_signed_out_is_told_apart_from_unknown() {
+    use crate::agent_adapter::{parse_claude_auth_status as parse, ClaudeLoginProbe::*};
     let rec = synthesized(AUTH_STATUS_VERSION);
     for rel in ["auth-status/signed-out.json", "auth-status/no-login-expires-at.json"] {
         let fx = rec.label(rel);
         assert!(rec.json(rel).get("loggedIn").is_some_and(Value::is_boolean), "[{fx}] loggedIn");
-        assert_eq!(parse_login_expires_at(&rec.text(rel)), None, "[{fx}]");
     }
+    assert_eq!(parse(&rec.text("auth-status/signed-out.json")), SignedOut);
+    // An older CLI (before 2.1.318) is signed in but never says until when.
+    assert_eq!(parse(&rec.text("auth-status/no-login-expires-at.json")), Unknown);
+
     // Signed out: a leftover date is never read as a sign-in.
     let mut out = rec.json("auth-status/signed-out.json");
     out["loginExpiresAt"] = Value::from(1_797_000_000_i64);
-    assert_eq!(parse_login_expires_at(&out.to_string()), None);
+    assert_eq!(parse(&out.to_string()), SignedOut);
 
-    // An unreadable value, or output that isn't the object, is no value, never a panic.
+    // An unreadable value, or output that isn't the object, is unknown, never a panic.
     let mut v = rec.json("auth-status/signed-in.json");
     for junk in [Value::Null, Value::from("next month"), Value::from(""), Value::from(true), serde_json::json!({}), Value::from(0)] {
         v["loginExpiresAt"] = junk.clone();
-        assert_eq!(parse_login_expires_at(&v.to_string()), None, "{junk}");
+        assert_eq!(parse(&v.to_string()), Unknown, "{junk}");
     }
-    for text in ["", "Logged in using claude.ai", "error: unknown command 'auth'", "} {", "{not json}"] {
-        assert_eq!(parse_login_expires_at(text), None, "{text:?}");
+    for text in ["", "Logged in using claude.ai", "Not logged in", "error: unknown command 'auth'", "} {", "{not json}"] {
+        assert_eq!(parse(text), Unknown, "{text:?}");
     }
 }
 

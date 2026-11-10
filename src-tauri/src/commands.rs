@@ -3771,7 +3771,8 @@ pub async fn get_claude_plan(state: State<'_, AppState>) -> AppResult<Vec<crate:
 
 /// When the claude.ai sign-in ends, as CLI stages last reported it
 /// (`claude_login`); `None` until a stage on Claude Code 2.1.318+ said, and
-/// again once a stage ran as an API-key session. An Anthropic key doesn't
+/// again once a stage ran as an API-key session or Readiness's Check again
+/// found Claude Code signed out. An Anthropic key doesn't
 /// hide it: the Settings key never signs Claude Code in.
 #[tauri::command]
 pub async fn get_claude_login(state: State<'_, AppState>) -> AppResult<Option<crate::claude_login::LoginExpiry>> {
@@ -6477,11 +6478,11 @@ pub async fn readiness_check(
     let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude))
         .await
         .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))?;
-    if let Some(expires_at) = probed {
-        let now = chrono::Utc::now().to_rfc3339();
-        if crate::claude_login::record(&state.db.lock(), expires_at, &now).is_ok() {
-            let _ = app.emit(crate::claude_login::LOGIN_EVENT, serde_json::json!({ "expiresAt": expires_at }));
-        }
+    // Signed in with a date: stored. Signed out: the stored end is cleared,
+    // so the notes hide too. Unknown: left as it was.
+    let now = chrono::Utc::now().to_rfc3339();
+    if let Ok(Some(expires_at)) = crate::claude_login::apply_probe(&state.db.lock(), probed, &now) {
+        let _ = app.emit(crate::claude_login::LOGIN_EVENT, serde_json::json!({ "expiresAt": expires_at }));
     }
     Ok(checks)
 }

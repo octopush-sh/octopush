@@ -1,9 +1,13 @@
 //! "Is this Mac ready for a crew?" — the Settings › General readiness card.
 //! Each check runs one local command (Ollama: a TCP connect to a loopback
 //! port; disk space: the footer's volume reading) within 3 s, in parallel,
-//! never cached and with no telemetry.
+//! never cached and with no telemetry. On an explicit Check again,
+//! `claude auth status` runs too, with up to 15 s (it may refresh the OAuth
+//! token, which must not be cut short).
 
-use crate::agent_adapter::{parse_claude_version, ClaudeCliVersion, TESTED_CLAUDE_FLOOR};
+use crate::agent_adapter::{
+    parse_claude_version, version_below, ClaudeCliVersion, ClaudeLoginProbe, CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
+};
 use serde::Serialize;
 use std::io::Read;
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -100,15 +104,23 @@ pub fn run_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
 
 /// [`run_probe`], with what quitting does to it while it runs.
 pub fn run_probe_on_quit(cmd: Option<Command>, timeout: Duration, on_quit: OnQuit) -> Probe {
-    probe_with(cmd, timeout, true, on_quit)
+    probe_with(cmd, timeout, true, on_quit, None)
+}
+
+/// [`run_probe_on_quit`], but at the timeout its group gets SIGTERM first
+/// and up to `term_grace` to exit before the SIGKILL: for a command that may
+/// be saving something it must not lose halfway (`claude auth status`
+/// refreshing the OAuth token). Still [`Probe::TimedOut`] either way.
+pub fn run_probe_terminating(cmd: Option<Command>, timeout: Duration, term_grace: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, true, on_quit, Some(term_grace))
 }
 
 /// Like [`run_probe`], but output goes to `/dev/null` and is never read.
 pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
-    probe_with(cmd, timeout, false, OnQuit::Kill)
+    probe_with(cmd, timeout, false, OnQuit::Kill, None)
 }
 
-fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit) -> Probe {
+fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit, term_grace: Option<Duration>) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
     let io = || if capture { Stdio::piped() } else { Stdio::null() };
     cmd.stdin(Stdio::null()).stdout(io()).stderr(io());
@@ -136,6 +148,14 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: O
             Exit::Reaped => break true,
         }
         if Instant::now() >= deadline {
+            // Still running, so not reaped: the pid and group id are its own.
+            if let Some(grace) = term_grace {
+                if terminate_within(&mut child, grace) == Exit::Reaped {
+                    // Reaped and untracked by the fallback: its pid may be
+                    // another process's already, so nothing signals it.
+                    return Probe::TimedOut;
+                }
+            }
             IN_FLIGHT.untrack(pid);
             kill_process_group(&mut child);
             return Probe::TimedOut;
@@ -158,6 +178,21 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: O
     collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
     let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
     Probe::Exited { success, output }
+}
+
+/// SIGTERM `child`'s group, then wait up to `grace` for it to exit. Only
+/// called while it is running (not reaped). Whatever it left in its group is
+/// SIGKILLed by the caller afterwards unless it was reaped meanwhile.
+fn terminate_within(child: &mut Child, grace: Duration) -> Exit {
+    signal_group(child.id(), TERM);
+    let until = Instant::now() + grace;
+    loop {
+        let st = exit_status(child);
+        if st != Exit::Running || Instant::now() >= until {
+            return st;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Where a probed command stands.
@@ -463,13 +498,27 @@ pub fn kill_in_flight() {
     IN_FLIGHT.kill_all(QUIT_GRACE, kill_group);
 }
 
+#[cfg(unix)]
+const TERM: i32 = libc::SIGTERM;
+#[cfg(not(unix))]
+const TERM: i32 = 15;
+
+/// Send `sig` to the process group `process_group(0)` gave the child `pid`.
+#[cfg(unix)]
+fn signal_group(pid: u32, sig: i32) {
+    // SAFETY: kill(-pid, sig) only sends a signal; it touches no memory.
+    unsafe {
+        libc::kill(-(pid as i32), sig);
+    }
+}
+
+#[cfg(not(unix))]
+fn signal_group(_pid: u32, _sig: i32) {}
+
 /// SIGKILL the process group `process_group(0)` gave the child `pid`.
 #[cfg(unix)]
 fn kill_group(pid: u32) {
-    // SAFETY: kill(-pid, SIGKILL) only sends a signal; it touches no memory.
-    unsafe {
-        libc::kill(-(pid as i32), libc::SIGKILL);
-    }
+    signal_group(pid, libc::SIGKILL);
 }
 
 #[cfg(not(unix))]
@@ -558,6 +607,14 @@ pub fn day_label(epoch_secs: i64) -> String {
 /// on the `claude` login and API stages can't run (older CLIs never report
 /// the end).
 pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64) -> ReadinessCheck {
+    auth_check_on(has_anthropic_key, login_expires_at, now, None)
+}
+
+/// [`auth_check`], knowing the installed CLI's version (`claude --version`;
+/// `None` when unknown). On a CLI older than [`CLAUDE_LOGIN_END_SINCE`]
+/// `claude auth status` can't report a new end, so an ended sign-in's fix
+/// says to update Claude Code too: Check again alone would keep the old date.
+pub fn auth_check_on(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i64, cli_version: Option<&str>) -> ReadinessCheck {
     use crate::claude_login::{state, LoginState};
     const ID: &str = "auth";
     const LABEL: &str = "Claude auth";
@@ -576,8 +633,13 @@ pub fn auth_check(has_anthropic_key: bool, login_expires_at: Option<i64>, now: i
             ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, &format!("Sign-in ends {day}"), fix, Some(CLAUDE_LOGIN))
         }
         LoginState::Ended => {
-            let fix = "CLI stages and Routines can't run on it. Sign in again, then Check again.";
-            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), fix, Some(CLAUDE_LOGIN))
+            let fix = match cli_version.filter(|v| version_below(v, CLAUDE_LOGIN_END_SINCE)) {
+                Some(_) => format!(
+                    "CLI stages and Routines can't run on it. Sign in again, and update Claude Code to {CLAUDE_LOGIN_END_SINCE} or newer so Check again can read the new date."
+                ),
+                None => "CLI stages and Routines can't run on it. Sign in again, then Check again.".into(),
+            };
+            ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Fail, &format!("Sign-in ended {day}"), &fix, Some(CLAUDE_LOGIN))
         }
     }
 }
@@ -661,8 +723,9 @@ pub fn connect_any(addrs: &[SocketAddr], timeout: Duration, mut connect: impl Fn
     })
 }
 
-/// `name` resolved on the login-shell PATH the CLI stages use.
-fn local_command(name: &str, args: &[&str]) -> Option<Command> {
+/// `name` resolved on the login-shell PATH the CLI stages use, with the
+/// login shell's environment.
+pub(crate) fn local_command(name: &str, args: &[&str]) -> Option<Command> {
     use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
     let path_env = resolved_cli_path();
     let bin = resolve_executable(name, &path_env)?;
@@ -683,24 +746,40 @@ fn enabled_ollama_addr() -> Option<String> {
 }
 
 /// The sign-in end the auth row shows: what `claude auth status` just
-/// reported, else the stored one (`claude_login`), else none.
-pub fn login_end(probed: Option<i64>, stored: Option<i64>) -> Option<i64> {
-    probed.or(stored)
+/// reported; none when it said signed out (the stored end no longer
+/// applies); else the stored one (`claude_login`), else none.
+pub fn login_end(probed: ClaudeLoginProbe, stored: Option<i64>) -> Option<i64> {
+    match probed {
+        ClaudeLoginProbe::SignedIn(e) => Some(e),
+        ClaudeLoginProbe::SignedOut => None,
+        ClaudeLoginProbe::Unknown => stored,
+    }
 }
 
-/// Every check, in card order, and the sign-in end `claude auth status`
-/// reported (`None` when not asked, or it gave none) for the caller to store.
-/// Blocking: call it off the async runtime. `stored_login` is the stored
-/// claude.ai sign-in end (`claude_login`). `ask_claude` runs
+/// The auth row for what `claude auth status` said (`probed`), the stored
+/// end and the installed CLI's version.
+pub fn auth_row(has_anthropic_key: bool, probed: ClaudeLoginProbe, stored: Option<i64>, now: i64, cli_version: Option<&str>) -> ReadinessCheck {
+    auth_check_on(has_anthropic_key, login_end(probed, stored), now, cli_version)
+}
+
+/// Every check, in card order, and what `claude auth status` said
+/// ([`ClaudeLoginProbe::Unknown`] when not asked) for the caller to store or
+/// clear. Blocking: call it off the async runtime. `stored_login` is the
+/// stored claude.ai sign-in end (`claude_login`). `ask_claude` runs
 /// `claude auth status` too: only on an explicit Check again, since whether
 /// it contacts the network isn't known.
-pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessCheck>, Option<i64>) {
-    let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login_expiry));
+pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessCheck>, ClaudeLoginProbe) {
+    let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login));
     let claude = std::thread::spawn(|| {
         // Its answer may be newer than the session's cached version (the
         // user just updated): the launcher and the next stage probe again.
         crate::agent_adapter::forget_claude_cli_version();
-        claude_check(run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT), TESTED_CLAUDE_FLOOR)
+        let probe = run_probe(local_command("claude", &["--version"]), CHECK_TIMEOUT);
+        let version = match &probe {
+            Probe::Exited { success: true, output } => parse_claude_version(output),
+            _ => None,
+        };
+        (claude_check(probe, TESTED_CLAUDE_FLOOR), version)
     });
     let git = std::thread::spawn(|| git_check(run_probe(local_command("git", &["--version"]), CHECK_TIMEOUT)));
     let gh = std::thread::spawn(|| {
@@ -713,14 +792,17 @@ pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessChe
     });
     let ollama = std::thread::spawn(|| enabled_ollama_addr().map(|a| ollama_check(&a, CHECK_TIMEOUT)));
 
-    let probed = login.and_then(|t| t.join().ok().flatten());
+    let probed = login.and_then(|t| t.join().ok()).unwrap_or(ClaudeLoginProbe::Unknown);
     let lost = ReadinessCheck::failed_to_run;
+    let (claude, cli_version) = claude.join().unwrap_or_else(|_| (lost("claude", "Claude Code"), None));
     let mut checks = vec![
-        claude.join().unwrap_or_else(|_| lost("claude", "Claude Code")),
-        auth_check(
+        claude,
+        auth_row(
             crate::claude_login::has_anthropic_key(),
-            login_end(probed, stored_login),
+            probed,
+            stored_login,
             chrono::Utc::now().timestamp(),
+            cli_version.as_deref(),
         ),
         git.join().unwrap_or_else(|_| lost("git", "git")),
         gh.join().unwrap_or_else(|_| lost("gh", "GitHub CLI")),
@@ -1176,15 +1258,113 @@ mod tests {
 
     #[test]
     fn the_probed_sign_in_end_wins_over_the_stored_one() {
+        use ClaudeLoginProbe::*;
         let now = 1_800_000_000;
         let (stored, probed) = (now - 86_400, now + 30 * 86_400);
-        assert_eq!(login_end(Some(probed), Some(stored)), Some(probed));
-        assert_eq!(login_end(None, Some(stored)), Some(stored), "a failed probe or no field: the stored end");
-        assert_eq!(login_end(Some(probed), None), Some(probed), "a fresh install, before any stage ran");
-        assert_eq!(login_end(None, None), None);
+        assert_eq!(login_end(SignedIn(probed), Some(stored)), Some(probed));
+        assert_eq!(login_end(Unknown, Some(stored)), Some(stored), "a failed probe or no field: the stored end");
+        assert_eq!(login_end(SignedIn(probed), None), Some(probed), "a fresh install, before any stage ran");
+        assert_eq!(login_end(Unknown, None), None);
+        // Signed out: the stored end no longer applies.
+        assert_eq!(login_end(SignedOut, Some(stored)), None);
+        assert_eq!(login_end(SignedOut, None), None);
         // Signed in again: the row turns from rouge to verdigris on Check again.
-        assert_eq!(auth_check(false, login_end(None, Some(stored)), now).status, CheckStatus::Fail);
-        assert_eq!(auth_check(false, login_end(Some(probed), Some(stored)), now).status, CheckStatus::Ok);
+        assert_eq!(auth_check(false, login_end(Unknown, Some(stored)), now).status, CheckStatus::Fail);
+        assert_eq!(auth_check(false, login_end(SignedIn(probed), Some(stored)), now).status, CheckStatus::Ok);
+    }
+
+    /// The whole Check again path for a stored end that has passed:
+    /// `claude auth status --json` output → row → what is stored.
+    #[test]
+    fn check_again_signed_out_clears_the_stored_end_and_its_row() {
+        use crate::agent_adapter::parse_claude_auth_status;
+        use crate::claude_login::{apply_probe, load, record};
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let now = 1_800_000_000;
+        let gone = now - 86_400;
+        record(&db, gone, "2026-11-01T00:00:00Z").unwrap();
+        let stored = load(&db).unwrap().map(|l| l.expires_at);
+
+        // Signed out: no "Sign-in ended" row from the stale date, the
+        // no-sign-in row instead (key or not), and the date is cleared with
+        // an event so the notes hide.
+        let out = parse_claude_auth_status(r#"{"loggedIn":false,"authMethod":"none","apiProvider":"firstParty"}"#);
+        assert_eq!(out, ClaudeLoginProbe::SignedOut);
+        let row = auth_row(false, out, stored, now, Some("2.1.319"));
+        assert_eq!((row.status, row.value.as_str()), (CheckStatus::Warn, "Subscription"));
+        assert_eq!(auth_row(true, out, stored, now, Some("2.1.319")).value, "API key");
+        assert_eq!(apply_probe(&db, out, "2026-11-09T00:00:00Z").unwrap(), Some(None));
+        assert_eq!(load(&db).unwrap(), None);
+        // Nothing stored: nothing to clear, no event.
+        assert_eq!(apply_probe(&db, out, "2026-11-09T00:00:00Z").unwrap(), None);
+
+        // Unknown (timed out, an older CLI): the stored end and its row stay.
+        record(&db, gone, "2026-11-01T00:00:00Z").unwrap();
+        let older = parse_claude_auth_status(r#"{"loggedIn":true,"authMethod":"claude.ai"}"#);
+        assert_eq!(older, ClaudeLoginProbe::Unknown);
+        assert_eq!(auth_row(false, older, Some(gone), now, Some("2.1.319")).status, CheckStatus::Fail);
+        assert_eq!(apply_probe(&db, older, "2026-11-09T00:00:00Z").unwrap(), None);
+        assert_eq!(load(&db).unwrap().map(|l| l.expires_at), Some(gone));
+
+        // Signed in again with a new date: stored, row verdigris.
+        let far = now + 30 * 86_400;
+        let back = ClaudeLoginProbe::SignedIn(far);
+        assert_eq!(auth_row(false, back, Some(gone), now, Some("2.1.319")).status, CheckStatus::Ok);
+        assert_eq!(apply_probe(&db, back, "2026-11-09T00:00:00Z").unwrap(), Some(Some(far)));
+        assert_eq!(load(&db).unwrap().map(|l| l.expires_at), Some(far));
+    }
+
+    #[test]
+    fn an_ended_sign_in_on_an_older_cli_says_to_update_claude_code() {
+        let now = 1_800_000_000;
+        let gone = Some(now - 86_400);
+        let old = auth_check_on(false, gone, now, Some("2.1.317"));
+        assert_eq!((old.status, old.command.as_deref()), (CheckStatus::Fail, Some(CLAUDE_LOGIN)));
+        assert_eq!(
+            old.fix.as_deref(),
+            Some("CLI stages and Routines can't run on it. Sign in again, and update Claude Code to 2.1.318 or newer so Check again can read the new date.")
+        );
+        let fresh = "CLI stages and Routines can't run on it. Sign in again, then Check again.";
+        for v in [Some("2.1.318"), Some("2.1.319"), None, Some("not a version")] {
+            assert_eq!(auth_check_on(false, gone, now, v).fix.as_deref(), Some(fresh), "{v:?}");
+        }
+    }
+
+    #[test]
+    fn claude_auth_status_asks_for_json_with_room_to_refresh() {
+        use crate::agent_adapter::{CLAUDE_AUTH_STATUS_ARGS, CLAUDE_AUTH_STATUS_TIMEOUT};
+        assert_eq!(CLAUDE_AUTH_STATUS_ARGS, ["auth", "status", "--json"]);
+        assert!(CLAUDE_AUTH_STATUS_TIMEOUT >= Duration::from_secs(15) && CLAUDE_AUTH_STATUS_TIMEOUT > CHECK_TIMEOUT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminating_probe_gets_sigterm_before_sigkill() {
+        let dir = tempfile::tempdir().unwrap();
+        // It saves what it was writing on SIGTERM.
+        let saved = dir.path().join("saved");
+        let script = format!("trap 'echo saved > \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", saved.display());
+        let r = run_probe_terminating(sh(&script), Duration::from_millis(300), Duration::from_secs(3), OnQuit::Finish);
+        assert_eq!(r, Probe::TimedOut);
+        assert_eq!(std::fs::read_to_string(&saved).unwrap_or_default().trim(), "saved", "SIGTERM came first");
+
+        // The plain probe is unchanged: straight to SIGKILL, no SIGTERM.
+        let plain = dir.path().join("plain");
+        let script = format!("trap 'echo saved > \"{}\"; exit 0' TERM; while :; do sleep 0.05; done", plain.display());
+        assert_eq!(run_probe(sh(&script), Duration::from_millis(300)), Probe::TimedOut);
+        assert!(!plain.exists(), "run_probe must not send SIGTERM");
+
+        // One that ignores SIGTERM is SIGKILLed once the grace has passed.
+        let pidfile = dir.path().join("stubborn.pid");
+        let script = format!("trap '' TERM; echo $$ > '{}'; while :; do sleep 0.05; done", pidfile.display());
+        let started = Instant::now();
+        let grace = Duration::from_millis(500);
+        let r = run_probe_terminating(sh(&script), Duration::from_millis(300), grace, OnQuit::Finish);
+        let took = started.elapsed();
+        assert_eq!(r, Probe::TimedOut);
+        assert!(took >= Duration::from_millis(800) && took < Duration::from_secs(3), "{took:?}");
+        assert_dies(read_pid(&pidfile), "SIGKILL after the grace");
     }
 
     #[test]
