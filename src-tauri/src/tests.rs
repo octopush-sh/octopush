@@ -16159,6 +16159,90 @@ mod crew_tests {
         assert!(crew::preview(&db, &f, &[]).unwrap().ok);
     }
 
+    /// Issue #661: a crew whose text holds an ordinary emoji (`⚠️`, a ZWJ
+    /// sequence, a keycap) exports and imports back unchanged.
+    #[test]
+    fn emoji_with_a_variation_selector_or_joiner_round_trip() {
+        const WARN: &str = "\u{26A0}\u{FE0F}"; // ⚠️
+        const CHECK: &str = "\u{2714}\u{FE0F}"; // ✔️
+        const HEART: &str = "\u{2764}\u{FE0F}"; // ❤️
+        const CODER: &str = "\u{1F469}\u{200D}\u{1F4BB}"; // 👩‍💻
+        const RAINBOW: &str = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"; // 🏳️‍🌈
+        const BACK_TEXT: &str = "\u{21A9}\u{FE0E}"; // ↩︎
+        const KEYCAP: &str = "1\u{FE0F}\u{20E3}"; // 1️⃣
+        let text = format!(
+            "{WARN} Never force-push. {CHECK} tests, {HEART} docs, {CODER} review, {RAINBOW} ok, {BACK_TEXT} back, {KEYCAP} first"
+        );
+        let name = format!("Relay {WARN}");
+        let description = format!("{HEART} {CODER}");
+        let prompt = format!("{WARN} Find the real defects.");
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage(&prompt)).unwrap();
+        let mut stages = rich_stages();
+        stages[0].instructions = Some(WARN.into());
+        stages[1].instructions = Some(text.clone());
+        stages[2].custom_name = Some(format!("{CHECK} Triage"));
+        let pid = a.save_pipeline(None, &name, &description, &stages).unwrap();
+
+        let json = crew::to_json(&crew::export(&a, &pid).unwrap()).unwrap();
+        let parsed = crew::parse(&json).unwrap();
+        let (b, _tb) = test_db();
+        let p = crew::preview(&b, &parsed, &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].instructions.as_deref(), Some(WARN), "shown as written, not escaped");
+        assert_eq!(p.stages[1].instructions.as_deref(), Some(text.as_str()));
+        assert_eq!(p.name, name);
+        let new_id = crew::import(&b, &parsed, &[]).unwrap();
+        assert_eq!(as_json(&b.pipeline_stage_drafts(&new_id).unwrap()), as_json(&stages));
+        let head = b.list_pipelines().unwrap().into_iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!((head.name.as_str(), head.description.as_str()), (name.as_str(), description.as_str()));
+        assert_eq!(b.get_role("triage").unwrap().unwrap().prompt_body, prompt);
+    }
+
+    /// Only one selector or joiner per visible emoji gets through: runs, other
+    /// selectors and joiners outside an emoji still block, and stay escaped.
+    #[test]
+    fn selectors_and_joiners_outside_an_emoji_still_block() {
+        let hostile = [
+            "\u{FE0F}",
+            "a\u{FE0F}",
+            "1\u{FE0F}",
+            "\u{26A0}\u{FE0F}\u{FE0F}",
+            "\u{26A0}\u{FE0E}\u{FE0F}",
+            "\u{26A0}\u{FE00}",
+            "\u{26A0}\u{E0100}",
+            "a\u{200D}b",
+            "\u{1F419}\u{200D}",
+            "\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{200D}\u{1F419}",
+            "a\u{FE0F}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}a",
+        ];
+        for s in hostile {
+            assert!(crew::first_hidden(s).is_some(), "{s:?} has a hidden character");
+            let (db, _t) = test_db();
+            let mut f = one_stage_file(vec![draft("plan")], vec![]);
+            f.pipeline.stages[0].instructions = Some(format!("ok {s}"));
+            let p = crew::preview(&db, &f, &[]).unwrap();
+            assert!(!p.ok, "{s:?} must block");
+            let shown = p.stages[0].instructions.clone().unwrap();
+            assert!(shown.contains("\\u{"), "{s:?} is escaped: {shown}");
+            assert!(crew::import(&db, &f, &[]).is_err(), "{s:?} must not import");
+        }
+        for ok in [
+            "\u{26A0}\u{FE0F}",                           // ⚠️
+            "\u{26A0}\u{FE0E}",                           // ⚠︎
+            "\u{1F469}\u{200D}\u{1F4BB}",                 // 👩‍💻
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",          // ❤️‍🔥
+            "\u{1F468}\u{1F3FD}\u{200D}\u{1F4BB}",        // 👨🏽‍💻
+            "#\u{FE0F}\u{20E3}",                          // #️⃣
+            "\u{1F419}",                                  // 🐙
+        ] {
+            assert_eq!(crew::first_hidden(ok), None, "{ok:?} is an ordinary emoji");
+            assert_eq!(crew::escape_hidden(ok), ok);
+        }
+    }
+
     #[test]
     fn role_keys_and_lengths_are_bounded() {
         let (db, _t) = test_db();
