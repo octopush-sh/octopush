@@ -285,6 +285,33 @@ fn openai_parse_response_splits_cached_input() {
 }
 
 #[test]
+fn openai_parse_response_splits_cache_writes() {
+    // GPT-5.6+ bills cache writes and reports them, inside `prompt_tokens`, as
+    // `prompt_tokens_details.cache_write_tokens` (Chat Completions reference).
+    let resp = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }],
+        "usage": {
+            "prompt_tokens": 15000,
+            "completion_tokens": 200,
+            "prompt_tokens_details": { "cached_tokens": 12000, "cache_write_tokens": 2500 }
+        }
+    }));
+    assert_eq!(resp.input_tokens, 500, "billable input = prompt - cached - written");
+    assert_eq!(resp.cache_read_tokens, 12000);
+    assert_eq!(resp.cache_creation_tokens, 2500);
+    // Never more writes than the uncached remainder.
+    let resp = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "hi" }, "finish_reason": "stop" }],
+        "usage": {
+            "prompt_tokens": 1000,
+            "completion_tokens": 0,
+            "prompt_tokens_details": { "cached_tokens": 800, "cache_write_tokens": 500 }
+        }
+    }));
+    assert_eq!((resp.input_tokens, resp.cache_read_tokens, resp.cache_creation_tokens), (0, 800, 200));
+}
+
+#[test]
 fn openai_parse_response_no_cache_field() {
     // Providers that omit the details block report 0 cached (no change).
     let resp = openai_compat::parse_response(json!({

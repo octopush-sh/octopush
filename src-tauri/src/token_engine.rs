@@ -225,13 +225,15 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
         "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
         "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
-        // OpenAI — no cache-write line: writes cost the input price.
+        // OpenAI
         //
-        // GPT-6.1 Terra: OpenAI's model page (fetched 2026-11-08) says "Cached
-        // input tokens are priced at 5% of the uncached input token rate";
-        // Vercel's AI Gateway (same day) gives "$1/1M input tokens, $5/1M
-        // output tokens."
-        "gpt-6.1-terra" => (1.0, 1.0, 0.05, 5.0),
+        // GPT-6.1 Terra: OpenAI's model page and API pricing page (fetched
+        // 2026-11-10): $1 input, $0.05 cached input, $5 output, and cache
+        // writes $1.25 for the default 30-minute retention ($2.50 for 12-hour,
+        // which Octopush never requests). Prompts over 272K input tokens cost
+        // 2x input/cache and 1.5x output; that tier is not modelled yet.
+        "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
+        // GPT-4o family: no cache-write charge, so writes cost the input price.
         "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
         "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
         // Anything else is unknown — unpriced, not free.

@@ -9,4 +9,4 @@ steps:
     caption: GPT-6.1 Terra is now in the OpenAI models you can pick.
     action: none
 ---
-GPT-6.1 Terra is priced and can be picked for Talk and Codex stages. Its spend ($1 input, $0.05 cached input and $5 output per million tokens) now counts toward run budgets, and earlier unpriced usage is priced on the next launch.
+GPT-6.1 Terra is priced and can be picked for Talk and Codex stages. Its spend ($1 input, $0.05 cached input, $1.25 cache writes and $5 output per million tokens) now counts toward run budgets, and earlier unpriced usage is priced on the next launch.

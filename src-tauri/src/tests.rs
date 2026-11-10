@@ -9380,8 +9380,29 @@ mod cli_dialect_tests {
         assert_eq!(u.input_tokens, 400, "billable fresh input excludes cached");
         assert_eq!(u.cache_read_input_tokens, 600);
         assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_creation_input_tokens, 0, "older CLIs omit cache writes");
         // Non-usage events report nothing.
         assert!(codex_usage_from_event(&json!({"type":"turn.started"})).is_none());
+    }
+
+    #[test]
+    fn codex_usage_splits_cache_writes_out_of_input() {
+        // GPT-5.6+ bills cache writes: Codex reports them inside input_tokens
+        // as `cache_write_input_tokens` (openai/codex exec_events.rs `Usage`).
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":300,"output_tokens":50}})).unwrap();
+        assert_eq!(u.input_tokens, 100, "fresh input excludes cached and written");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.cache_creation_input_tokens, 300);
+        // A write count larger than the uncached remainder is clamped.
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":900,"output_tokens":0}})).unwrap();
+        assert_eq!((u.input_tokens, u.cache_creation_input_tokens), (0, 400));
+        // Legacy cumulative token_count events carry the same field.
+        let (key, u) = codex_usage_from_event(&json!({"msg":{"type":"token_count","info":{"total_token_usage":
+            {"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":200,"output_tokens":5}}}})).unwrap();
+        assert_eq!(key.as_deref(), Some("token_count"));
+        assert_eq!((u.input_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens), (200, 100, 200));
     }
 
     #[test]
@@ -14445,14 +14466,15 @@ mod pricing_table_tests {
     fn gpt_6_1_terra_is_priced_and_in_the_openai_catalog() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
         let _cfg = crate::provider_router::TestConfigDir::new();
-        // $1 input, $0.05 cached input (5%), $5 output; writes cost input.
+        // OpenAI's model and pricing pages (2026-11-10): $1 input, $0.05
+        // cached input, $5 output, $1.25 for 30-minute cache writes.
         // Not `assert_prices`: its 1-hour check (2× input) is Claude-only.
         let terra = ModelPrices {
             input_per_m: 1.0,
             output_per_m: 5.0,
             cache_read_per_m: 0.05,
-            cache_creation_per_m: 1.0,
-            cache_creation_1h_per_m: 1.0,
+            cache_creation_per_m: 1.25,
+            cache_creation_1h_per_m: 1.25,
         };
         assert_eq!(builtin_prices("gpt-6.1-terra"), Some(terra));
         assert_eq!(builtin_prices("openai/gpt-6.1-terra"), Some(terra));
@@ -14465,8 +14487,19 @@ mod pricing_table_tests {
         let m = providers["openai"].models.iter().find(|m| m.id == "gpt-6.1-terra").expect("in the openai catalog");
         assert_eq!(m.display_name, "GPT-6.1 Terra");
         assert_eq!(m.max_context, 1_050_000);
+        assert!(m.supports_vision, "image input is supported");
         assert!(m.supports_tools);
         assert_eq!(m.tags, vec!["balanced".to_string()]);
+        // 1M fresh + 1M written + 1M cached + 1M output = 1 + 1.25 + 0.05 + 5.
+        let cost = crate::token_engine::request_cost_for("gpt-6.1-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 7.30).abs() < 1e-9, "terra request cost: {cost}");
+        // The beta's cache-write-at-input price migrates to $1.25.
+        let mut list = vec![crate::provider_router::ProviderConfig {
+            models: vec![crate::provider_router::ModelInfo { cache_creation_cost_per_m: 1.0, ..m.clone() }],
+            ..providers["openai"].clone()
+        }];
+        assert_eq!(crate::provider_router::migrate_stale_builtin_prices(&mut list, &providers), 1);
+        assert_eq!(list[0].models[0].cache_creation_cost_per_m, 1.25);
     }
 }
 

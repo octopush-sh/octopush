@@ -473,6 +473,9 @@ pub(crate) const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
     // GPT-4o and GPT-4o mini shipped with cached input at $0; it is billed.
     ("gpt-4o", [2.5, 10.0, 0.0, 0.0]),
     ("gpt-4o-mini", [0.15, 0.6, 0.0, 0.0]),
+    // GPT-6.1 Terra shipped (beta) with cache writes at the input price; they
+    // are $1.25 for the default 30-minute retention.
+    ("gpt-6.1-terra", [1.0, 5.0, 0.05, 1.0]),
 ];
 
 /// Reset models whose on-disk price is a known-stale builtin default (see
@@ -666,18 +669,18 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             models: vec![
-                // OpenAI model page (fetched 2026-11-08): 1,050,000-token
-                // context, cached input at 5% of input. Prices must match
-                // `token_engine::builtin_prices`.
+                // OpenAI model page (fetched 2026-11-10): 1,050,000-token
+                // context, image input, cached input $0.05, 30-minute cache
+                // writes $1.25. Prices must match `token_engine::builtin_prices`.
                 ModelInfo {
                     id: "gpt-6.1-terra".into(),
                     display_name: "GPT-6.1 Terra".into(),
                     input_cost_per_m: 1.0,
                     output_cost_per_m: 5.0,
                     cache_read_cost_per_m: 0.05,
-                    cache_creation_cost_per_m: 1.0,
+                    cache_creation_cost_per_m: 1.25,
                     max_context: 1_050_000,
-                    supports_vision: false,
+                    supports_vision: true,
                     supports_tools: true,
                     tags: vec!["balanced".into()],
                 },

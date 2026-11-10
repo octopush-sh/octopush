@@ -1222,7 +1222,10 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
 /// usage (each event is a distinct key — `None` id ⇒ caller keys it uniquely).
 /// Legacy: `token_count` events are cumulative, so they share the fixed key
 /// `"token_count"` and latest-wins. Codex reports the FULL input including
-/// cached tokens (OpenAI-style), so the cached slice is split out for pricing.
+/// cached and cache-written tokens (OpenAI-style), so both slices are split
+/// out for pricing: `cached_input_tokens` at the cache-read rate and
+/// `cache_write_input_tokens` (openai/codex `exec_events.rs` `Usage`,
+/// `#[serde(default)]`, so older CLIs omit it) at the cache-write rate.
 pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
     let (usage, key) = if v.get("type").and_then(Value::as_str) == Some("turn.completed") {
         (v.get("usage")?, None)
@@ -1238,13 +1241,14 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
     let g = |k: &str| usage.get(k).and_then(Value::as_u64).unwrap_or(0);
     let input = g("input_tokens");
     let cached = g("cached_input_tokens").min(input);
+    let written = g("cache_write_input_tokens").min(input - cached);
     Some((
         key,
         CliUsage {
-            input_tokens: input - cached,
+            input_tokens: input - cached - written,
             output_tokens: g("output_tokens"),
             cache_read_input_tokens: cached,
-            cache_creation_input_tokens: 0,
+            cache_creation_input_tokens: written,
             cache_creation_1h_input_tokens: 0,
             fast: false,
         },
