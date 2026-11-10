@@ -108,6 +108,22 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(again.container.querySelector(pill)?.textContent).toBe("high");
   });
 
+  it("shows no effort pill on a Codex stage that ran without one", () => {
+    // Codex stages that ran before they took an effort had it cleared by the
+    // backend migration (#613), so they read as Codex's default — no pill.
+    const pill = '[title="Reasoning effort for this stage"]';
+    const base = { id: "c", position: 0, status: "done", startedAt: 1, substrate: "cli", agentModel: "gpt-5-codex" };
+    const before = render(
+      <RunFlow stages={[mk({ ...base, effort: null })]} selectedStageId="c" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(before.container.querySelector(pill)).toBeNull();
+    before.unmount();
+    const after = render(
+      <RunFlow stages={[mk({ ...base, effort: "xhigh" })]} selectedStageId="c" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(after.container.querySelector(pill)?.textContent).toBe("xhigh");
+  });
+
   it("says a running stage waits for its first tool call in the card's live line", () => {
     const { container, unmount } = render(
       <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
