@@ -3828,26 +3828,42 @@ mod run_crud_tests {
     #[test]
     fn migrate_clears_the_effort_codex_stages_never_got_once() {
         // #613: Codex CLI stages took no effort before, so a stored effort on
-        // one that already ran is false history. The upgrade clears it ONCE —
-        // pending stages keep theirs (they will run with it), Claude Code and
-        // API stages are untouched, and Codex stages run after the upgrade
-        // keep their (now real) effort. Drives the real migration by
-        // re-opening the same database file (app update).
-        fn mk(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, done: bool, tokens: i64) -> String {
+        // one that already ran is false history. The upgrade clears it ONCE,
+        // only in terminal runs and judged on the model the stage last ran on —
+        // stages of a draft or paused run keep theirs (they will run with it),
+        // Claude Code and API stages are untouched, and Codex stages run after
+        // the upgrade keep their (now real) effort. Drives the real migration
+        // by re-opening the same database file (app update).
+        #[allow(clippy::too_many_arguments)]
+        fn mk_as(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, escalated_to: Option<&str>, run_status: &str, stage_status: &str, tokens: i64) -> String {
             let run = db.create_run(ws, pid, "t", None, None, &[]).unwrap();
             let st = db.list_run_stages(&run).unwrap();
             db.conn_ref()
                 .execute(
-                    "UPDATE run_stages SET effort = 'high', escalate_effort = 'max', substrate = ?2, agent_model = ?3
+                    "UPDATE run_stages SET effort = 'high', escalate_effort = 'max', substrate = ?2, agent_model = ?3,
+                         escalate_model = ?4, escalated = ?5
                      WHERE id = ?1",
-                    rusqlite::params![st[0].id, substrate, model],
+                    rusqlite::params![st[0].id, substrate, model, escalated_to, escalated_to.is_some()],
                 )
                 .unwrap();
-            if done {
+            if stage_status == "done" {
                 db.complete_run_stage(&st[0].id, "done", tokens, tokens / 10, 0, 0, 0.1, None).unwrap();
-                db.set_run_status(&run, "completed", true).unwrap();
+            } else {
+                db.conn_ref()
+                    .execute("UPDATE run_stages SET status = ?2 WHERE id = ?1", rusqlite::params![st[0].id, stage_status])
+                    .unwrap();
+            }
+            if run_status != "draft" {
+                db.set_run_status(&run, run_status, matches!(run_status, "completed" | "aborted")).unwrap();
             }
             st[0].id.clone()
+        }
+        fn mk(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, done: bool, tokens: i64) -> String {
+            if done {
+                mk_as(db, ws, pid, model, substrate, None, "completed", "done", tokens)
+            } else {
+                mk_as(db, ws, pid, model, substrate, None, "draft", "pending", tokens)
+            }
         }
         let effort_of = |db: &Db, id: &str| -> (Option<String>, Option<String>) {
             db.conn_ref()
@@ -3873,6 +3889,11 @@ mod run_crud_tests {
         let claude_cli = mk(&db, &ws, &pid, "claude-sonnet-5-5", "cli", true, 4_000);
         let codex_api = mk(&db, &ws, &pid, "gpt-5", "api", true, 8_000);
         let pending_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", false, 0);
+        let parked_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "awaiting_checkpoint", 0);
+        let failed_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "failed", 0);
+        let claude_to_codex = mk_as(&db, &ws, &pid, "claude-sonnet-5-5", "cli", Some("gpt-5-codex"), "completed", "done", 16_000);
+        let codex_to_claude = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", Some("claude-opus-5-5"), "completed", "done", 32_000);
+        let aborted_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "aborted", "failed", 0);
         // A pre-upgrade install: no marker yet.
         db.conn_ref().execute("DELETE FROM app_meta WHERE key = 'codex_stage_effort_cleared_v1'", []).unwrap();
         drop(db);
@@ -3883,16 +3904,21 @@ mod run_crud_tests {
         assert_eq!(effort_of(&db, &claude_cli), high(), "Claude Code took --effort");
         assert_eq!(effort_of(&db, &codex_api), high(), "the API took the effort");
         assert_eq!(effort_of(&db, &pending_codex), high(), "a pending stage runs with it");
-        assert_eq!(inputs(&db, None), vec![1_000, 2_000], "old Codex rows count as no effort");
-        assert_eq!(inputs(&db, Some("high")), vec![4_000, 8_000]);
+        assert_eq!(effort_of(&db, &parked_codex), high(), "a budget-parked stage of a paused run runs with it");
+        assert_eq!(effort_of(&db, &failed_codex), high(), "a failed stage of a paused run can be retried with it");
+        assert_eq!(effort_of(&db, &claude_to_codex), (None, None), "it last ran on Codex");
+        assert_eq!(effort_of(&db, &codex_to_claude), high(), "it last ran on Claude Code, which took --effort");
+        assert_eq!(effort_of(&db, &aborted_codex), (None, None), "an aborted run is never resumed");
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000], "old Codex rows count as no effort");
+        assert_eq!(inputs(&db, Some("high")), vec![4_000, 8_000, 32_000]);
 
         // A Codex stage run after the upgrade keeps its effort across launches.
         let new_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", true, 3_000);
         drop(db);
         let db = Db::open(tmp.path()).unwrap();
         assert_eq!(effort_of(&db, &new_codex), high(), "one-shot: never re-cleared");
-        assert_eq!(inputs(&db, Some("high")), vec![3_000, 4_000, 8_000]);
-        assert_eq!(inputs(&db, None), vec![1_000, 2_000]);
+        assert_eq!(inputs(&db, Some("high")), vec![3_000, 4_000, 8_000, 32_000]);
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000]);
     }
 
     #[test]
