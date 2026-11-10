@@ -4008,16 +4008,25 @@ const LEDGER_STALE_PRICES_FIXED: &str = "ledger_stale_price_fix_2026_10_v1";
 const LEDGER_STALE_PRICES_FIXED_GPT4O: &str = "ledger_stale_price_fix_2026_11_gpt4o_v1";
 /// The models the GPT-4o cached-input correction covers.
 const GPT4O_STALE_IDS: &[&str] = &["gpt-4o", "gpt-4o-mini"];
+/// Held for a whole [`reprice_ledger`] call. Startup, Refresh pricing and
+/// Price them now can overlap; without it two calls could both see a
+/// one-time flag unset and run its pass twice (the October pass would then
+/// scale DIRECT stages twice). A dedicated lock rather than claiming the
+/// flag first, so a pass that fails is retried on the next call.
+static REPRICE_LEDGER_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 
 /// Price every unpriced ledger row with the catalog as it stands now (rows
 /// whose model is still unpriced stay at $0, marked `'unpriced'`; an
 /// explicit $0 marks them `'computed'`). Runs once at startup, after a
-/// pricing refresh, and on demand. Prices are resolved WITHOUT the DB lock
+/// pricing refresh, and on demand — one call at a time
+/// ([`REPRICE_LEDGER_LOCK`]). Prices are resolved WITHOUT the DB lock
 /// (one cached catalog load), each write batch is one transaction, and the
 /// two one-time passes — classifying legacy $0 rows and correcting spend
 /// billed at a known-wrong builtin price — are gated by `app_meta` flags so
 /// a launch does not rescan the whole ledger. Returns rows that got a price.
 pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> AppResult<usize> {
+    // Taken before any DB lock, never while holding one.
+    let _pass = REPRICE_LEDGER_LOCK.lock();
     let router = crate::token_engine::catalog();
     let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
 
