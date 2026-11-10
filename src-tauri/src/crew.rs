@@ -323,26 +323,100 @@ const OTHER_INVISIBLE: &[(u32, u32)] = &[
     (0xE0100, 0xE01EF), // VARIATION SELECTOR-17 .. 256
 ];
 
+/// Visible characters that can start an emoji: the symbols with an emoji
+/// presentation below U+3300 and the whole U+1F000–1FAFF emoji area. A
+/// superset of Unicode's `Emoji` property on purpose: each is a visible
+/// character, which is all [`hidden_mask`] needs.
+const EMOJI_BASE: &[(u32, u32)] = &[
+    (0x00A9, 0x00A9),   // ©
+    (0x00AE, 0x00AE),   // ®
+    (0x203C, 0x203C),   // ‼
+    (0x2049, 0x2049),   // ⁉
+    (0x2122, 0x2122),   // ™
+    (0x2139, 0x2139),   // ℹ
+    (0x2194, 0x2199),   // ↔ .. ↙
+    (0x21A9, 0x21AA),   // ↩ ↪
+    (0x231A, 0x231B),   // ⌚ ⌛
+    (0x2328, 0x2328),   // ⌨
+    (0x23CF, 0x23CF),   // ⏏
+    (0x23E9, 0x23F3),   // ⏩ .. ⏳
+    (0x23F8, 0x23FA),   // ⏸ .. ⏺
+    (0x24C2, 0x24C2),   // Ⓜ
+    (0x25AA, 0x25AB),   // ▪ ▫
+    (0x25B6, 0x25B6),   // ▶
+    (0x25C0, 0x25C0),   // ◀
+    (0x25FB, 0x25FE),   // ◻ .. ◾
+    (0x2600, 0x27BF),   // Miscellaneous Symbols, Dingbats (⚠ ✔ ❤ …)
+    (0x2934, 0x2935),   // ⤴ ⤵
+    (0x2B05, 0x2B07),   // ⬅ ⬆ ⬇
+    (0x2B1B, 0x2B1C),   // ⬛ ⬜
+    (0x2B50, 0x2B50),   // ⭐
+    (0x2B55, 0x2B55),   // ⭕
+    (0x3030, 0x3030),   // 〰
+    (0x303D, 0x303D),   // 〽
+    (0x3297, 0x3297),   // ㊗
+    (0x3299, 0x3299),   // ㊙
+    (0x1F000, 0x1FAFF), // pictographs, flags, skin tones, …
+];
+
+fn is_emoji_base(c: char) -> bool {
+    let u = c as u32;
+    EMOJI_BASE.iter().any(|&(a, b)| (a..=b).contains(&u))
+}
+
 /// A character that can hide or reorder what the review sheet shows: every
 /// `Cf`, `Zl` and `Zp` code point ([`CF_ZL_ZP`]: bidi controls, zero-width
 /// characters, tags, the BOM, soft hyphen …), the invisible characters in
-/// [`OTHER_INVISIBLE`] (all variation selectors, which can smuggle arbitrary
-/// bytes, are rejected, even a lone U+FE0F after an emoji), and every C0/C1
-/// control (and DEL) except `\n` and `\t`.
+/// [`OTHER_INVISIBLE`] (variation selectors, which can smuggle arbitrary
+/// bytes), and every C0/C1 control (and DEL) except `\n` and `\t`. In text,
+/// [`hidden_mask`] lets the joiners of an ordinary emoji through.
 pub fn is_hidden_char(c: char) -> bool {
     let u = c as u32;
     let within = |t: &[(u32, u32)]| t.iter().any(|&(a, b)| (a..=b).contains(&u));
     (c.is_control() && c != '\n' && c != '\t') || within(CF_ZL_ZP) || within(OTHER_INVISIBLE)
 }
 
+/// Which of `chars` are hidden: [`is_hidden_char`], except the parts of an
+/// ordinary emoji — one U+FE0E/FE0F right after an emoji base (`⚠️`) or after
+/// a keycap digit, `#` or `*` that U+20E3 follows (`1️⃣`), and one U+200D
+/// between an emoji (or its U+FE0F) and the next emoji base (`👩‍💻`). That is
+/// at most a selector and a joiner per visible emoji, too little to smuggle
+/// anything; runs, every other selector and a joiner anywhere else stay
+/// hidden.
+fn hidden_mask(chars: &[char]) -> Vec<bool> {
+    let mut hidden: Vec<bool> = Vec::with_capacity(chars.len());
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|j| (chars[j], hidden[j]));
+        let next = chars.get(i + 1).copied();
+        let emoji_part = match (c, prev) {
+            ('\u{FE0E}' | '\u{FE0F}', Some((p, _))) => {
+                is_emoji_base(p) || (matches!(p, '0'..='9' | '#' | '*') && next == Some('\u{20E3}'))
+            }
+            ('\u{200D}', Some((p, p_hidden))) => {
+                !p_hidden && (is_emoji_base(p) || p == '\u{FE0F}') && next.is_some_and(is_emoji_base)
+            }
+            _ => false,
+        };
+        hidden.push(is_hidden_char(c) && !emoji_part);
+    }
+    hidden
+}
+
+/// The first hidden character of `s`, by [`hidden_mask`].
+pub fn first_hidden(s: &str) -> Option<char> {
+    let chars: Vec<char> = s.chars().collect();
+    chars.iter().zip(hidden_mask(&chars)).find(|&(_, h)| h).map(|(&c, _)| c)
+}
+
 /// `s` with every hidden character escaped (`\u{202e}`), so it can be shown.
 pub fn escape_hidden(s: &str) -> String {
-    if !s.chars().any(is_hidden_char) {
+    if first_hidden(s).is_none() {
         return s.to_string();
     }
+    let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if is_hidden_char(c) {
+    for (c, hidden) in chars.iter().copied().zip(hidden_mask(&chars)) {
+        if hidden {
             out.push_str(&format!("\\u{{{:x}}}", c as u32));
         } else {
             out.push(c);
@@ -364,7 +438,7 @@ fn visible(s: &str, max: usize) -> String {
 
 /// `what` holds a hidden character, or is longer than `max` characters.
 fn text_problem(what: &str, s: &str, max: usize) -> Option<String> {
-    if let Some(c) = s.chars().find(|&c| is_hidden_char(c)) {
+    if let Some(c) = first_hidden(s) {
         return Some(format!("{what} contains a hidden or control character (U+{:04X})", c as u32));
     }
     let n = s.chars().count();
