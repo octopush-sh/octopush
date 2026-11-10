@@ -6,7 +6,7 @@ import { SegmentedControl } from "../controls/SegmentedControl";
 import { TogglePill } from "../controls/TogglePill";
 import { Stepper } from "../controls/Stepper";
 import { Reveal } from "../primitives/Reveal";
-import { archetypes, archetypeFor, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
+import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
 import { cliTooOldForEffort, effortApplies, loadClaudeCliVersion } from "../../lib/claudeCli";
@@ -394,7 +394,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
               <div className="flex items-center justify-between gap-2 pt-1">
                 <label className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.14em] text-octo-mute">
                   max ×
-                  <Stepper value={loop.max} min={1} max={9} onChange={(v) => applyLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
+                  <Stepper value={loop.max} min={1} max={MAX_LOOP_ITERATIONS} onChange={(v) => applyLoop({ ...loop, max: v })} ariaLabel="Max loop-backs" />
                 </label>
                 <SegmentedControl options={MODE_OPTIONS} value={loop.mode} onChange={(v) => applyLoop({ ...loop, mode: v })} ariaLabel="Loop mode" />
               </div>

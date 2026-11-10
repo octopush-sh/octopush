@@ -14,5 +14,5 @@ steps:
     action: none
 ---
 Export a pipeline and its custom roles as a `.octocrew.json` file from the builder, or right-click
-its ticket. Importing one shows each stage's tools, instructions and models first and never starts
-a run. Crews committed under `.octopush/crews/` appear in the launcher, ready to fork.
+its ticket. Importing one shows each stage's tools (or the full shell a CLI stage gets), loops,
+escalation, instructions and models first, and never starts a run. Crews committed under `.octopush/crews/` appear in the launcher, ready to fork.

@@ -36,8 +36,9 @@ const { useCrewImportStore } = await import("../stores/crewImportStore");
 function stage(over: Partial<CrewPreview["stages"][number]>): CrewPreview["stages"][number] {
   return {
     position: 0, label: "Plan", role: "plan", agentModel: "claude-haiku-4-5", escalateModel: null,
-    substrate: "api", checkpoint: false, readOnly: true, actionRole: false, tools: ["read_file"],
-    instructions: null, unpricedModel: false, unpricedEscalate: false, problem: null, ...over,
+    substrate: "api", cliDialect: null, checkpoint: false, readOnly: true, actionRole: false, tools: ["read_file"],
+    instructions: null, effort: null, escalateEffort: null, loopTargetPosition: null, loopMode: null,
+    loopMaxIterations: 0, unpricedModel: false, unpricedEscalate: false, warnings: [], problem: null, ...over,
   };
 }
 
@@ -83,6 +84,62 @@ describe("CrewImportSheet", () => {
     // The unknown model is flagged, never priced as free.
     await waitFor(() => expect(screen.getByText("not in your catalog · unpriced")).toBeInTheDocument());
     expect(importMock).not.toHaveBeenCalled();
+  });
+
+  it("a CLI stage shows its full shell and dialect instead of a tool list, and the header counts it", async () => {
+    previewMock.mockResolvedValue({
+      ...GOOD,
+      stages: [
+        stage({
+          label: "Builder", substrate: "cli", cliDialect: "claude", readOnly: false, tools: [],
+          warnings: ["Its tool list only limits API stages. As a CLI stage it gets a full shell instead."],
+        }),
+        stage({ position: 1, label: "Codex", substrate: "cli", cliDialect: "codex", agentModel: "gpt-5-codex", readOnly: false, tools: [] }),
+        stage({ position: 2, label: "Codex review", substrate: "cli", cliDialect: "codex", agentModel: "gpt-5-codex", readOnly: true, tools: [] }),
+        stage({ position: 3, label: "Plan" }),
+      ],
+    });
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    expect(await screen.findByText("Full shell · Claude Code (all permissions)")).toBeInTheDocument();
+    expect(screen.getByText("Full shell · Codex (no sandbox)")).toBeInTheDocument();
+    expect(screen.getByText("Shell · Codex (read-only sandbox)")).toBeInTheDocument();
+    expect(screen.getByText(/3 with a full shell \(CLI\)/)).toBeInTheDocument();
+    expect(screen.getByTestId("crew-cli-note").textContent).toMatch(/\.claude\/settings\.json hooks and \.mcp\.json/);
+    expect(screen.getByText(/tool list only limits API stages/)).toBeInTheDocument();
+    // Only the API stage lists tools.
+    expect(screen.getAllByTestId("crew-stage-tools")).toHaveLength(1);
+    expect(screen.getAllByTestId("crew-stage-shell")).toHaveLength(3);
+  });
+
+  it("an API-only crew shows no CLI note", async () => {
+    previewMock.mockResolvedValue(GOOD);
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    expect(await screen.findByText("Bugfix relay")).toBeInTheDocument();
+    expect(screen.queryByTestId("crew-cli-note")).not.toBeInTheDocument();
+    expect(screen.queryByText(/with a full shell/)).not.toBeInTheDocument();
+    expect(screen.queryByTestId("crew-stage-shell")).not.toBeInTheDocument();
+  });
+
+  it("substrate, escalation and loops get their own rows, never one truncated line", async () => {
+    const long = "claude-opus-4-6-with-a-very-long-identifier-that-would-be-cut-off";
+    previewMock.mockResolvedValue({
+      ...GOOD,
+      stages: [
+        stage({ effort: "high", escalateModel: long, escalateEffort: "max" }),
+        stage({ position: 1, label: "Review", loopTargetPosition: 0, loopMode: "auto", loopMaxIterations: 3 }),
+      ],
+    });
+    useCrewImportStore.getState().show("{crew}", null);
+    render(<CrewImportHost />);
+    expect(await screen.findByText(`escalates to ${long} · effort max`)).toBeInTheDocument();
+    expect(screen.getByText("Loops back to stage 1 · auto · up to ×3")).toBeInTheDocument();
+    expect(screen.getByText(/claude-haiku-4-5 · effort high/)).toBeInTheDocument();
+    expect(screen.getAllByTestId("crew-stage-substrate")[0].textContent).toBe("API");
+    for (const id of ["crew-stage-escalation", "crew-stage-loop", "crew-stage-substrate"]) {
+      for (const el of screen.getAllByTestId(id)) expect(el.className).not.toMatch(/truncate/);
+    }
   });
 
   it("re-previews with a replacement model and imports with it, never starting a run", async () => {

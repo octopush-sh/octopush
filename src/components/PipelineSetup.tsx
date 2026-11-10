@@ -168,6 +168,21 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     return () => { alive = false; };
   }, [workspacePath]);
 
+  // Fork reads the file's text only now, through the backend's safe reader.
+  const forkRepoCrew = async (file: string) => {
+    if (!workspacePath) return;
+    try {
+      const text = await ipc.readRepoCrew(workspacePath, file);
+      useCrewImportStore.getState().show(text, `.octopush/crews/${file}`);
+    } catch (e) {
+      pushToast({
+        level: "error",
+        title: "Couldn't read that crew",
+        body: (e instanceof Error ? e.message : String(e)).replace(/^other: /, ""),
+      });
+    }
+  };
+
   // Model overrides are keyed by stage POSITION. If the selected pipeline is
   // restructured under us — e.g. octopush-mcp's `update_pipeline` while the
   // window was unfocused, surfaced by the focus refresh — a kept override
@@ -409,7 +424,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                   ) : (
                     <button
                       type="button"
-                      onClick={() => useCrewImportStore.getState().show(c.json, `.octopush/crews/${c.file}`)}
+                      onClick={() => void forkRepoCrew(c.file)}
                       className="ml-auto shrink-0 font-serif text-[12px] text-octo-brass transition-opacity duration-[180ms] hover:opacity-80"
                     >
                       Fork into my library

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import type { CrewPreview } from "./ipc";
 import type { ProviderConfig } from "./types";
-import { catalogModelIds, flaggedModels, modelFlagText, openDroppedCrew } from "./crew";
+import { catalogModelIds, cliShellLine, escalationLine, flaggedModels, loopLine, modelFlagText, openDroppedCrew } from "./crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 
 const preview = (stages: Partial<CrewPreview["stages"][number]>[]): CrewPreview => ({
@@ -12,9 +12,37 @@ const preview = (stages: Partial<CrewPreview["stages"][number]>[]): CrewPreview 
   ok: true,
   stages: stages.map((s, i) => ({
     position: i, label: "s", role: "plan", agentModel: "a", escalateModel: null, substrate: "api",
-    checkpoint: false, readOnly: true, actionRole: false, tools: [], instructions: null,
-    unpricedModel: false, unpricedEscalate: false, problem: null, ...s,
+    cliDialect: null, checkpoint: false, readOnly: true, actionRole: false, tools: [], instructions: null,
+    effort: null, escalateEffort: null, loopTargetPosition: null, loopMode: null, loopMaxIterations: 0,
+    unpricedModel: false, unpricedEscalate: false, warnings: [], problem: null, ...s,
   })),
+});
+
+describe("crew stage lines", () => {
+  it("names a CLI stage's real power by dialect, and nothing on API", () => {
+    const [claude, codex, codexRo, api] = preview([
+      { substrate: "cli", cliDialect: "claude", readOnly: false },
+      { substrate: "cli", cliDialect: "codex", readOnly: false },
+      { substrate: "cli", cliDialect: "codex", readOnly: true },
+      {},
+    ]).stages;
+    expect(cliShellLine(claude)).toBe("Full shell · Claude Code (all permissions)");
+    expect(cliShellLine(codex)).toBe("Full shell · Codex (no sandbox)");
+    expect(cliShellLine(codexRo)).toBe("Shell · Codex (read-only sandbox)");
+    expect(cliShellLine(api)).toBeNull();
+  });
+
+  it("spells out loops and escalation", () => {
+    const [looping, plain, esc] = preview([
+      { loopTargetPosition: 1, loopMode: "gated", loopMaxIterations: 9 },
+      {},
+      { escalateEffort: "max" },
+    ]).stages;
+    expect(loopLine(looping)).toBe("Loops back to stage 2 · gated · up to ×9");
+    expect(loopLine(plain)).toBeNull();
+    expect(escalationLine(plain)).toBeNull();
+    expect(escalationLine(esc)).toBe("escalates · effort max");
+  });
 });
 
 describe("crew model flags", () => {

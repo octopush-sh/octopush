@@ -1869,10 +1869,18 @@ pub async fn save_crew_file(
     Ok(Some(path.to_string_lossy().into_owned()))
 }
 
-/// The text of a crew file the user picked to import (size-bounded).
+/// The text of a crew file the user picked to import (size-bounded, never
+/// blocking; the user's own pick may be a symlink).
 #[tauri::command]
 pub async fn read_crew_file(path: String) -> AppResult<String> {
-    crate::crew::read_file(std::path::Path::new(&path))
+    crate::crew::read_file(std::path::Path::new(&path), true)
+}
+
+/// The text of one repo crew (`.octopush/crews/<file>`), read on Fork without
+/// following symlinks.
+#[tauri::command]
+pub async fn read_repo_crew(workspace_path: String, file: String) -> AppResult<String> {
+    crate::crew::read_repo_crew(std::path::Path::new(&workspace_path), &file)
 }
 
 /// The import review sheet's content. Writes nothing.
@@ -1897,7 +1905,8 @@ pub async fn import_crew(
     crate::crew::import(&state.db.lock(), &crew, &model_swaps.unwrap_or_default())
 }
 
-/// Crews committed in the workspace under `.octopush/crews/`.
+/// Crews committed in the workspace under `.octopush/crews/`: names and
+/// counts only (the text is read on Fork by `read_repo_crew`).
 #[tauri::command]
 pub async fn list_repo_crews(workspace_path: String) -> AppResult<Vec<crate::crew::RepoCrew>> {
     Ok(crate::crew::scan_repo(std::path::Path::new(&workspace_path)))
@@ -2787,7 +2796,10 @@ pub async fn estimate_run_cost(
             let (tok_in, tok_out) = db
                 .get_role(&s.role)?
                 .map(|r| (r.token_est_in.max(0) as u64, r.token_est_out.max(0) as u64))
-                .unwrap_or((4_000, 1_000));
+                .unwrap_or((
+                    crate::crew::DEFAULT_TOKEN_EST_IN as u64,
+                    crate::crew::DEFAULT_TOKEN_EST_OUT as u64,
+                ));
             let model = overrides
                 .iter()
                 .find(|(pos, _)| *pos == s.position)

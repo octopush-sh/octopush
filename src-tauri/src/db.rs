@@ -6910,6 +6910,11 @@ fn default_max_iterations() -> i64 {
 /// from blowing up every prompt this stage runs).
 const MAX_INSTRUCTIONS_CHARS: usize = 8_000;
 
+/// The most loop-backs a review stage may take. The builder's "Max loop-backs"
+/// stepper uses the same bound (`MAX_LOOP_ITERATIONS` in
+/// `src/components/builder/graph.ts`); keep the two in sync.
+pub const MAX_LOOP_ITERATIONS: i64 = 9;
+
 /// The workspace tools a stage's agent may be granted. Keep in sync with
 /// `tool_definitions()` in chat_engine.rs and the role default_tools seeded in orchestrator/roles.rs.
 /// `grep`/`glob` are implied by read access and `edit_file` by `write_file`
@@ -7060,8 +7065,11 @@ fn stage_issue(
             if authored && !draft_ancestors(stages, i).contains(&target) {
                 return Ok(Some("loop target must be an earlier stage on the review's own path".into()));
             }
-            if s.loop_max_iterations < 1 {
-                return Ok(Some("loop max iterations must be at least 1".into()));
+            if !(1..=MAX_LOOP_ITERATIONS).contains(&s.loop_max_iterations) {
+                return Ok(Some(format!(
+                    "loop max iterations must be between 1 and {MAX_LOOP_ITERATIONS} (got {})",
+                    s.loop_max_iterations
+                )));
             }
             if !matches!(s.loop_mode.as_deref(), Some("gated") | Some("auto")) {
                 return Ok(Some("loop mode must be 'gated' or 'auto'".into()));

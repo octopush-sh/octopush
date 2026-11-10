@@ -8,7 +8,16 @@ import { useCrewImportStore } from "../stores/crewImportStore";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
 import { useProvidersStore } from "../stores/providersStore";
-import { catalogModelIds, flaggedModels, modelFlagText, pickCrewFile, POWER_TOOLS } from "../lib/crew";
+import {
+  catalogModelIds,
+  cliShellLine,
+  escalationLine,
+  flaggedModels,
+  loopLine,
+  modelFlagText,
+  pickCrewFile,
+  POWER_TOOLS,
+} from "../lib/crew";
 
 /** Mounts the sheet while the import store says so. */
 export function CrewImportHost() {
@@ -26,7 +35,8 @@ const errorText = (e: unknown) => (e instanceof Error ? e.message : String(e)).r
 /**
  * The crew import review. A crew is prompt text plus tool permissions that
  * will run in a worktree, so nothing is saved until the user has seen every
- * stage — writer or read-only, its tools, its full instructions, the custom
+ * stage — writer or read-only, its tools (or, for a CLI stage, the full shell
+ * it really gets), its loop and escalation, its full instructions, the custom
  * roles' prompts and any model the app can't price — and confirms. Import
  * never starts a run; the result is a normal, editable custom pipeline.
  */
@@ -91,6 +101,8 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
   };
 
   const writers = preview?.stages.filter((s) => !s.readOnly).length ?? 0;
+  const cliStages = preview?.stages.filter((s) => s.cliDialect !== null).length ?? 0;
+  const claudeCliStages = preview?.stages.filter((s) => s.cliDialect === "claude").length ?? 0;
 
   return (
     <ModalShell onClose={close} closeOnBackdrop={false} ariaLabel="Import a crew" panelClassName="w-full max-w-[720px]">
@@ -168,7 +180,7 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                   <p className="mb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">models to check</p>
                   {flags.map((f) => (
                     <div key={f.model} className="flex items-center gap-3 py-1" data-testid="crew-model-flag">
-                      <span className="min-w-0 truncate font-mono text-[11px] text-octo-ivory">{f.model}</span>
+                      <span className="min-w-0 break-all font-mono text-[11px] text-octo-ivory">{f.model}</span>
                       <span className="shrink-0 font-mono text-[10px] text-octo-warning">{modelFlagText(f)}</span>
                       <div className="ml-auto w-[220px] shrink-0">
                         <ModelPicker
@@ -184,7 +196,17 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
               <section>
                 <p className="mb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
                   {preview.stages.length} {preview.stages.length === 1 ? "stage" : "stages"} · {writers} can change files
+                  {cliStages > 0 && (
+                    <span className="text-octo-warning"> · {cliStages} with a full shell (CLI)</span>
+                  )}
                 </p>
+                {cliStages > 0 && (
+                  <p className="m-0 mb-3 font-mono text-[10px] leading-[1.5] text-octo-warning" data-testid="crew-cli-note">
+                    CLI stages run the agent with your shell and git credentials.
+                    {claudeCliStages > 0 &&
+                      " Claude Code stages also load this repo's .claude/settings.json hooks and .mcp.json servers."}
+                  </p>
+                )}
                 <ol className="m-0 flex list-none flex-col gap-3 p-0">
                   {preview.stages.map((s) => (
                     <li
@@ -194,7 +216,7 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                     >
                       <div className="flex items-baseline gap-2">
                         <span className="font-mono text-[10px] text-octo-mute">{s.position + 1}</span>
-                        <span className="min-w-0 truncate font-serif text-[14px] text-octo-ivory">{s.label}</span>
+                        <span className="min-w-0 break-words font-serif text-[14px] text-octo-ivory">{s.label}</span>
                         <span
                           className={`ml-auto shrink-0 font-mono text-[10px] ${s.readOnly ? "text-octo-sage" : "text-octo-warning"}`}
                           title={s.readOnly ? "Can't change the worktree" : "Can change files in the worktree"}
@@ -202,22 +224,64 @@ export function CrewImportSheet({ text, origin }: { text: string; origin: string
                           {s.readOnly ? "read-only" : "writer"}
                         </span>
                       </div>
-                      <p className="m-0 mt-1 truncate font-mono text-[10px] text-octo-mute">
-                        {s.role} · {s.agentModel} · {s.substrate}
-                        {s.escalateModel ? ` · escalates to ${s.escalateModel}` : ""}
-                        {s.checkpoint ? " · waits for you" : ""}
-                      </p>
+                      {/* One fact per row, each wrapping: nothing that grants power can be cut off. */}
+                      <dl className="m-0 mt-1 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 font-mono text-[10px]">
+                        <dt className="text-octo-mute">role</dt>
+                        <dd className="m-0 min-w-0 break-all text-octo-sage">{s.role}</dd>
+                        <dt className="text-octo-mute">runs on</dt>
+                        <dd className="m-0 min-w-0 break-all text-octo-sage" data-testid="crew-stage-substrate">
+                          {s.substrate === "cli" ? "CLI" : s.substrate === "api" ? "API" : s.substrate}
+                        </dd>
+                        <dt className="text-octo-mute">model</dt>
+                        <dd className="m-0 min-w-0 break-all text-octo-sage">
+                          {s.agentModel}
+                          {s.effort ? ` · effort ${s.effort}` : ""}
+                        </dd>
+                        {escalationLine(s) && (
+                          <>
+                            <dt className="text-octo-mute">escalation</dt>
+                            <dd className="m-0 min-w-0 break-all text-octo-sage" data-testid="crew-stage-escalation">
+                              {escalationLine(s)}
+                            </dd>
+                          </>
+                        )}
+                        {loopLine(s) && (
+                          <>
+                            <dt className="text-octo-mute">loop</dt>
+                            <dd className="m-0 min-w-0 break-words text-octo-sage" data-testid="crew-stage-loop">
+                              {loopLine(s)}
+                            </dd>
+                          </>
+                        )}
+                        {s.checkpoint && (
+                          <>
+                            <dt className="text-octo-mute">gate</dt>
+                            <dd className="m-0 text-octo-sage">waits for you</dd>
+                          </>
+                        )}
+                      </dl>
                       {s.actionRole && (
                         <p className="m-0 mt-1 font-mono text-[10px] text-octo-warning">may commit, push and run release commands</p>
                       )}
-                      <p className="m-0 mt-1 font-mono text-[10px]">
-                        {s.tools.map((t, i) => (
-                          <span key={t} className={POWER_TOOLS.has(t) ? "text-octo-warning" : "text-octo-sage"}>
-                            {i > 0 ? " · " : ""}
-                            {t}
-                          </span>
-                        ))}
-                      </p>
+                      {cliShellLine(s) ? (
+                        <p className="m-0 mt-1 font-mono text-[10px] text-octo-warning" data-testid="crew-stage-shell">
+                          {cliShellLine(s)}
+                        </p>
+                      ) : (
+                        <p className="m-0 mt-1 break-words font-mono text-[10px]" data-testid="crew-stage-tools">
+                          {s.tools.map((t, i) => (
+                            <span key={t} className={POWER_TOOLS.has(t) ? "text-octo-warning" : "text-octo-sage"}>
+                              {i > 0 ? " · " : ""}
+                              {t}
+                            </span>
+                          ))}
+                        </p>
+                      )}
+                      {s.warnings.map((w) => (
+                        <p key={w} className="m-0 mt-1 font-mono text-[10px] text-octo-warning" data-testid="crew-stage-warning">
+                          {w}
+                        </p>
+                      ))}
                       {s.instructions && (
                         <pre className="m-0 mt-2 max-h-48 overflow-auto whitespace-pre-wrap rounded bg-octo-onyx p-2 font-mono text-[10px] leading-[1.5] text-octo-ivory">
                           {s.instructions}

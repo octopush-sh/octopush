@@ -193,15 +193,27 @@ export interface CrewStagePreview {
   agentModel: string;
   escalateModel: string | null;
   substrate: AgentSubstrate;
+  /** The CLI a `cli` stage runs (by the model id); null on API. A CLI stage
+   *  gets a full shell: its tool list does not apply. */
+  cliDialect: "claude" | "codex" | null;
   checkpoint: boolean;
   /** False = the stage can change the worktree. */
   readOnly: boolean;
   /** The role may commit, push and run release commands. */
   actionRole: boolean;
+  /** The tools an API stage gets; empty for a CLI stage. */
   tools: string[];
   instructions: string | null;
+  effort: Effort | null;
+  escalateEffort: Effort | null;
+  /** The earlier stage (0-based position) a review loops back to. */
+  loopTargetPosition: number | null;
+  loopMode: string | null;
+  loopMaxIterations: number;
   unpricedModel: boolean;
   unpricedEscalate: boolean;
+  /** Worth reading, not blocking (a tool list on a CLI stage). */
+  warnings: string[];
   problem: string | null;
 }
 export interface CrewRolePreview {
@@ -221,13 +233,13 @@ export interface CrewPreview {
   problems: string[];
   ok: boolean;
 }
-/** A crew file committed in the repo (`.octopush/crews/*.octocrew.json`). */
+/** A crew file committed in the repo (`.octopush/crews/*.octocrew.json`):
+ *  names and counts only; `readRepoCrew` reads its text on Fork. */
 export interface RepoCrew {
   file: string;
   name: string;
   description: string;
   stageCount: number;
-  json: string;
   problem: string | null;
 }
 export interface PipelineDraft {
@@ -1297,6 +1309,8 @@ export const ipc = {
     invoke<string>("import_crew", { text, modelSwaps: modelSwaps ?? null }),
   /** Crews committed under `<worktree>/.octopush/crews/`, re-read on every call. */
   listRepoCrews: (workspacePath: string) => invoke<RepoCrew[]>("list_repo_crews", { workspacePath }),
+  /** One repo crew's text (never through a symlink), for Fork. */
+  readRepoCrew: (workspacePath: string, file: string) => invoke<string>("read_repo_crew", { workspacePath, file }),
 
   // ─── Routines (scheduled crews — Pro) ─────────────────────────────
   listRoutines: () => invoke<Routine[]>("list_routines"),

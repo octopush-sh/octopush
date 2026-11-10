@@ -30,11 +30,12 @@ vi.mock("../hooks/useEntitlement", () => ({
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
+const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<any>();
   return {
     ...actual,
-    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, listRepoCrews: repoCrewsMock },
+    ipc: { ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock },
   };
 });
 
@@ -73,8 +74,8 @@ describe("PipelineSetup crews from the repo", () => {
     const { useCrewImportStore } = await import("../stores/crewImportStore");
     useCrewImportStore.getState().close();
     repoCrewsMock.mockResolvedValue([
-      { file: "relay.octocrew.json", name: "Repo relay", description: "", stageCount: 3, json: "{\"octocrew\":1}", problem: null },
-      { file: "broken.octocrew.json", name: "broken", description: "", stageCount: 0, json: "{", problem: "This isn't JSON" },
+      { file: "relay.octocrew.json", name: "Repo relay", description: "", stageCount: 3, problem: null },
+      { file: "broken.octocrew.json", name: "broken", description: "", stageCount: 0, problem: "This isn't JSON" },
     ]);
     render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
     expect(await screen.findByText("Repo relay")).toBeInTheDocument();
@@ -84,9 +85,12 @@ describe("PipelineSetup crews from the repo", () => {
     // Only the valid file can be forked, and forking only opens the review.
     const forks = screen.getAllByRole("button", { name: "Fork into my library" });
     expect(forks).toHaveLength(1);
+    readRepoCrewMock.mockResolvedValue("{\"octocrew\":1}");
     fireEvent.click(forks[0]);
+    // The text is read only on Fork, through the backend's safe reader.
+    await waitFor(() => expect(useCrewImportStore.getState().open).toBe(true));
+    expect(readRepoCrewMock).toHaveBeenCalledWith("/tmp/w1", "relay.octocrew.json");
     const s = useCrewImportStore.getState();
-    expect(s.open).toBe(true);
     expect(s.text).toBe("{\"octocrew\":1}");
     expect(s.origin).toBe(".octopush/crews/relay.octocrew.json");
   });

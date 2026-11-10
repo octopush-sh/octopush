@@ -269,6 +269,7 @@ pub fn run() {
             commands::preview_crew,
             commands::import_crew,
             commands::list_repo_crews,
+            commands::read_repo_crew,
             commands::create_run,
             commands::start_run,
             commands::get_run,

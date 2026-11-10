@@ -118,3 +118,30 @@ export function modelFlagText(f: ModelFlag): string {
 
 /** Tools that change things, called out on the sheet. */
 export const POWER_TOOLS = new Set(["run_command", "write_file", "edit_file"]);
+
+type StagePreview = CrewPreview["stages"][number];
+
+/** A CLI stage's real power, in place of a tool list the CLI never applies:
+ *  Claude Code runs with every permission granted, Codex without its sandbox
+ *  (or in its read-only sandbox for a read-only review). Null on API. */
+export function cliShellLine(s: StagePreview): string | null {
+  if (s.cliDialect === "claude") return "Full shell · Claude Code (all permissions)";
+  if (s.cliDialect === "codex") return s.readOnly ? "Shell · Codex (read-only sandbox)" : "Full shell · Codex (no sandbox)";
+  return null;
+}
+
+/** `Loops back to stage 2 · auto · up to ×3`, or null without a loop. */
+export function loopLine(s: StagePreview): string | null {
+  if (s.loopTargetPosition === null) return null;
+  return [`Loops back to stage ${s.loopTargetPosition + 1}`, s.loopMode, `up to ×${s.loopMaxIterations}`]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+/** `escalates to claude-opus-4-6 · effort max`, or null without a policy. */
+export function escalationLine(s: StagePreview): string | null {
+  if (!s.escalateModel && !s.escalateEffort) return null;
+  return [s.escalateModel ? `escalates to ${s.escalateModel}` : "escalates", s.escalateEffort && `effort ${s.escalateEffort}`]
+    .filter(Boolean)
+    .join(" · ");
+}
