@@ -89,6 +89,10 @@ pub enum OnQuit {
     /// Given up to [`QUIT_GRACE`] to finish, then killed: a `claude mcp add`
     /// killed after its `remove` succeeded leaves Connect unregistered.
     Finish,
+    /// Neither killed nor waited for: it outlives the app in its own group
+    /// and finishes on its own. For `claude auth status`, which may be
+    /// refreshing the OAuth token: a kill then can sign the user out.
+    Leave,
 }
 
 /// How long quitting waits for an [`OnQuit::Finish`] probe.
@@ -465,9 +469,10 @@ impl InFlight {
 
     /// `kill` every tracked probe under the lock: an [`OnQuit::Kill`] one at
     /// once, an [`OnQuit::Finish`] one once `grace` has passed without it
-    /// untracking itself. A live [`Finishing`] mark is waited for within the
-    /// same `grace`, killing each probe started meanwhile by the same rule.
-    /// Waiting lets go of the lock, so a probe that finishes can untrack.
+    /// untracking itself; an [`OnQuit::Leave`] one is untracked unsignalled.
+    /// A live [`Finishing`] mark is waited for within the same `grace`,
+    /// handling each probe started meanwhile by the same rule. Waiting lets
+    /// go of the lock, so a probe that finishes can untrack.
     fn kill_all(&self, grace: Duration, mut kill: impl FnMut(u32)) {
         let deadline = Instant::now() + grace;
         let mut tracked = self.lock();
@@ -477,7 +482,7 @@ impl InFlight {
                 if on_quit == OnQuit::Kill {
                     kill(pid);
                 }
-                on_quit != OnQuit::Kill
+                on_quit == OnQuit::Finish
             });
             let left = deadline.saturating_duration_since(Instant::now());
             if (tracked.probes.is_empty() && tracked.finishing == 0) || left.is_zero() {
@@ -493,7 +498,7 @@ impl InFlight {
 
 /// SIGKILL every probe still running, with what it spawned (the app is
 /// quitting); one that should finish first, and a [`Finishing`] mark, get
-/// [`QUIT_GRACE`].
+/// [`QUIT_GRACE`]; an [`OnQuit::Leave`] one is left running.
 pub fn kill_in_flight() {
     IN_FLIGHT.kill_all(QUIT_GRACE, kill_group);
 }
@@ -1080,6 +1085,19 @@ mod tests {
     }
 
     #[test]
+    fn quitting_leaves_a_left_probe_running_without_waiting_for_it() {
+        let in_flight = InFlight::new();
+        in_flight.track(401, OnQuit::Leave);
+        in_flight.track(402, OnQuit::Kill);
+        let mut killed = Vec::new();
+        let started = Instant::now();
+        in_flight.kill_all(Duration::from_secs(2), |pid| killed.push(pid));
+        assert_eq!(killed, [402], "a left probe is never signalled");
+        assert!(started.elapsed() < Duration::from_millis(100), "nor waited for: {:?}", started.elapsed());
+        assert_eq!(in_flight.tracked(401), None);
+    }
+
+    #[test]
     fn quitting_kills_a_finishing_probe_once_the_grace_runs_out() {
         let in_flight = InFlight::new();
         in_flight.track(201, OnQuit::Finish);
@@ -1333,8 +1351,9 @@ mod tests {
 
     #[test]
     fn claude_auth_status_asks_for_json_with_room_to_refresh() {
-        use crate::agent_adapter::{CLAUDE_AUTH_STATUS_ARGS, CLAUDE_AUTH_STATUS_TIMEOUT};
+        use crate::agent_adapter::{CLAUDE_AUTH_STATUS_ARGS, CLAUDE_AUTH_STATUS_ON_QUIT, CLAUDE_AUTH_STATUS_TIMEOUT};
         assert_eq!(CLAUDE_AUTH_STATUS_ARGS, ["auth", "status", "--json"]);
+        assert_eq!(CLAUDE_AUTH_STATUS_ON_QUIT, OnQuit::Leave, "quitting must not cut a token refresh short");
         assert!(CLAUDE_AUTH_STATUS_TIMEOUT >= Duration::from_secs(15) && CLAUDE_AUTH_STATUS_TIMEOUT > CHECK_TIMEOUT);
     }
 

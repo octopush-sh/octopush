@@ -501,8 +501,12 @@ pub const CLAUDE_LOGIN_END_SINCE: &str = "2.1.318";
 /// How long `claude auth status` may run. It may refresh the OAuth token,
 /// and interrupting that can sign the user out (Claude Code changelog
 /// 2.1.301 and 2.1.317), so it gets far longer than a Readiness check, a
-/// SIGTERM before the SIGKILL, and is let finish at quit.
+/// SIGTERM before the SIGKILL, and is left running at quit.
 pub const CLAUDE_AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What quitting does to a running `claude auth status`: nothing. It runs in
+/// its own group, so it finishes the refresh on its own after the app exits.
+pub const CLAUDE_AUTH_STATUS_ON_QUIT: crate::readiness::OnQuit = crate::readiness::OnQuit::Leave;
 
 /// How long a timed-out `claude auth status` has after SIGTERM to save what
 /// it was writing before its group is SIGKILLed.
@@ -557,13 +561,13 @@ pub fn parse_claude_auth_status(output: &str) -> ClaudeLoginProbe {
 /// `claude auth status --json` with the login-shell PATH and environment the
 /// CLI stages use, through the Readiness probe runner (output capped, its
 /// process group SIGTERMed then SIGKILLed after
-/// [`CLAUDE_AUTH_STATUS_TIMEOUT`], let finish at quit). What it prints (the
+/// [`CLAUDE_AUTH_STATUS_TIMEOUT`], left running at quit). What it prints (the
 /// account too) stays in memory: only the date and whether it is signed in
 /// are kept.
 pub fn probe_claude_login() -> ClaudeLoginProbe {
-    use crate::readiness::{local_command, run_probe_terminating, OnQuit, Probe};
+    use crate::readiness::{local_command, run_probe_terminating, Probe};
     let cmd = local_command("claude", &CLAUDE_AUTH_STATUS_ARGS);
-    match run_probe_terminating(cmd, CLAUDE_AUTH_STATUS_TIMEOUT, CLAUDE_AUTH_STATUS_TERM_GRACE, OnQuit::Finish) {
+    match run_probe_terminating(cmd, CLAUDE_AUTH_STATUS_TIMEOUT, CLAUDE_AUTH_STATUS_TERM_GRACE, CLAUDE_AUTH_STATUS_ON_QUIT) {
         Probe::Exited { output, .. } => parse_claude_auth_status(&output),
         Probe::Missing | Probe::TimedOut => ClaudeLoginProbe::Unknown,
     }
