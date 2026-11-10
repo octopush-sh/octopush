@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RunEstimate } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
+import { dragHasFiles, openDroppedCrew } from "../lib/crew";
+import { useCrewImportStore } from "../stores/crewImportStore";
 import { CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
@@ -12,7 +14,7 @@ import { StageFlow } from "./direct/StageFlow";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
-import { CircleDot } from "lucide-react";
+import { CircleDot, FileUp } from "lucide-react";
 import { UnattendedReadiness } from "./UnattendedReadiness";
 import { RichPromptTextarea } from "./direct/RichPromptTextarea";
 import { useMissionsStore } from "../stores/missionsStore";
@@ -154,6 +156,33 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
 
   const selected: PipelineWithStages | undefined = pipelines.find((p) => p.pipeline.id === selectedId);
 
+  // Crews committed under .octopush/crews/, re-read each time the launcher opens.
+  const [repoCrews, setRepoCrews] = useState<RepoCrew[]>([]);
+  useEffect(() => {
+    if (!workspacePath) return;
+    let alive = true;
+    Promise.resolve()
+      .then(() => ipc.listRepoCrews(workspacePath))
+      .then((c) => { if (alive) setRepoCrews(c ?? []); })
+      .catch(() => { if (alive) setRepoCrews([]); });
+    return () => { alive = false; };
+  }, [workspacePath]);
+
+  // Fork reads the file's text only now, through the backend's safe reader.
+  const forkRepoCrew = async (file: string) => {
+    if (!workspacePath) return;
+    try {
+      const text = await ipc.readRepoCrew(workspacePath, file);
+      useCrewImportStore.getState().show(text, `.octopush/crews/${file}`);
+    } catch (e) {
+      pushToast({
+        level: "error",
+        title: "Couldn't read that crew",
+        body: (e instanceof Error ? e.message : String(e)).replace(/^other: /, ""),
+      });
+    }
+  };
+
   // Model overrides are keyed by stage POSITION. If the selected pipeline is
   // restructured under us — e.g. octopush-mcp's `update_pipeline` while the
   // window was unfocused, surfaced by the focus refresh — a kept override
@@ -209,7 +238,11 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   };
 
   return (
-    <div className="min-h-0 flex-1 overflow-auto px-8 py-7 octo-fade-in">
+    <div
+      className="min-h-0 flex-1 overflow-auto px-8 py-7 octo-fade-in"
+      onDragOver={(e) => { if (dragHasFiles(e)) e.preventDefault(); }}
+      onDrop={(e) => { openDroppedCrew(e); }}
+    >
       <div className="mx-auto max-w-[940px]">
         {/* Ceremony — serif title + one sans line. No eyebrow, no rule. */}
         <h1 className="m-0 font-serif text-[22px] tracking-[-0.005em] text-octo-ivory">Direct the work</h1>
@@ -291,7 +324,19 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
         )}
 
         {/* The ensemble. */}
-        <p className="mb-3 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>
+        <div className="mb-3 flex items-center">
+          <p className="m-0 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">ensemble</p>
+          <button
+            type="button"
+            data-tour="direct-launcher-import-crew"
+            onClick={() => useCrewImportStore.getState().show()}
+            title="Import a crew — a .octocrew.json file or pasted JSON. You review it before anything is saved; you can also drop a file here."
+            className="ml-auto flex items-center gap-1 rounded p-1 font-mono text-[9px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          >
+            <FileUp size={11} aria-hidden />
+            import a crew
+          </button>
+        </div>
         {!loaded ? (
           <div className="mb-10 flex gap-2">
             {[0, 1, 2].map((i) => (
@@ -360,6 +405,34 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 />
               </div>
             )}
+          </div>
+        )}
+
+        {/* Crews committed in the repo: read-only until forked. */}
+        {repoCrews.length > 0 && (
+          <div className="octo-fade-in mb-6" data-tour="direct-launcher-repo-crews">
+            <p className="mb-2 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">from this repo</p>
+            <ul className="m-0 flex list-none flex-col gap-1.5 p-0">
+              {repoCrews.map((c) => (
+                <li key={c.file} data-testid="repo-crew" className="flex min-w-0 items-baseline gap-2">
+                  <span className="min-w-0 truncate font-serif text-[13px] text-octo-ivory">{c.name}</span>
+                  <span className="shrink-0 font-mono text-[10px] text-octo-mute" title={`.octopush/crews/${c.file}`}>
+                    {c.problem ? c.file : `${c.stageCount} ${c.stageCount === 1 ? "stage" : "stages"}`}
+                  </span>
+                  {c.problem ? (
+                    <span className="min-w-0 truncate font-mono text-[10px] text-octo-rouge" title={c.problem}>{c.problem}</span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => void forkRepoCrew(c.file)}
+                      className="ml-auto shrink-0 font-serif text-[12px] text-octo-brass transition-opacity duration-[180ms] hover:opacity-80"
+                    >
+                      Fork into my library
+                    </button>
+                  )}
+                </li>
+              ))}
+            </ul>
           </div>
         )}
 

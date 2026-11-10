@@ -1831,6 +1831,87 @@ pub async fn delete_pipeline(
     Ok(())
 }
 
+// ─── Portable crews (`crew.rs`) ───────────────────────────────────
+
+/// A saved pipeline as `.octocrew.json` text (Copy crew as JSON).
+#[tauri::command]
+pub async fn export_crew(state: State<'_, AppState>, pipeline_id: String) -> AppResult<String> {
+    let crew = crate::crew::export(&state.db.lock(), &pipeline_id)?;
+    crate::crew::to_json(&crew)
+}
+
+/// Export crew…: a native save dialog, then the file. `None` when cancelled.
+/// The dialog opens from Rust, so the webview needs no file-write permission.
+#[tauri::command]
+pub async fn save_crew_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    pipeline_id: String,
+) -> AppResult<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let crew = crate::crew::export(&state.db.lock(), &pipeline_id)?;
+    let text = crate::crew::to_json(&crew)?;
+    let file_name = crate::crew::file_name(&crew.pipeline.name);
+    let picked = tokio::task::spawn_blocking(move || {
+        app.dialog()
+            .file()
+            .set_file_name(file_name)
+            .add_filter("Octopush crew", &["json"])
+            .blocking_save_file()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("save dialog failed: {e}")))?;
+    let Some(picked) = picked else { return Ok(None) };
+    let path = picked
+        .into_path()
+        .map_err(|e| AppError::Other(format!("can't save there: {e}")))?;
+    std::fs::write(&path, text)?;
+    Ok(Some(path.to_string_lossy().into_owned()))
+}
+
+/// The text of a crew file the user picked to import (size-bounded, never
+/// blocking; the user's own pick may be a symlink).
+#[tauri::command]
+pub async fn read_crew_file(path: String) -> AppResult<String> {
+    crate::crew::read_file(std::path::Path::new(&path), true)
+}
+
+/// The text of one repo crew (`.octopush/crews/<file>`), read on Fork without
+/// following symlinks.
+#[tauri::command]
+pub async fn read_repo_crew(workspace_path: String, file: String) -> AppResult<String> {
+    crate::crew::read_repo_crew(std::path::Path::new(&workspace_path), &file)
+}
+
+/// The import review sheet's content. Writes nothing.
+#[tauri::command]
+pub async fn preview_crew(
+    state: State<'_, AppState>,
+    text: String,
+    model_swaps: Option<Vec<(String, String)>>,
+) -> AppResult<crate::crew::CrewPreview> {
+    let crew = crate::crew::parse(&text)?;
+    crate::crew::preview(&state.db.lock(), &crew, &model_swaps.unwrap_or_default())
+}
+
+/// Save a reviewed crew as a new custom pipeline. Never starts a run.
+#[tauri::command]
+pub async fn import_crew(
+    state: State<'_, AppState>,
+    text: String,
+    model_swaps: Option<Vec<(String, String)>>,
+) -> AppResult<String> {
+    let crew = crate::crew::parse(&text)?;
+    crate::crew::import(&state.db.lock(), &crew, &model_swaps.unwrap_or_default())
+}
+
+/// Crews committed in the workspace under `.octopush/crews/`: names and
+/// counts only (the text is read on Fork by `read_repo_crew`).
+#[tauri::command]
+pub async fn list_repo_crews(workspace_path: String) -> AppResult<Vec<crate::crew::RepoCrew>> {
+    Ok(crate::crew::scan_repo(std::path::Path::new(&workspace_path)))
+}
+
 #[tauri::command]
 pub async fn create_run(
     state: State<'_, AppState>,
@@ -2715,7 +2796,10 @@ pub async fn estimate_run_cost(
             let (tok_in, tok_out) = db
                 .get_role(&s.role)?
                 .map(|r| (r.token_est_in.max(0) as u64, r.token_est_out.max(0) as u64))
-                .unwrap_or((4_000, 1_000));
+                .unwrap_or((
+                    crate::crew::DEFAULT_TOKEN_EST_IN as u64,
+                    crate::crew::DEFAULT_TOKEN_EST_OUT as u64,
+                ));
             let model = overrides
                 .iter()
                 .find(|(pos, _)| *pos == s.position)

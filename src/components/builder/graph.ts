@@ -17,6 +17,10 @@
 import type { Node, Edge } from "@xyflow/react";
 import type { AgentSubstrate, Effort, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
 
+/** The most loop-backs a review stage may take. Matches Rust
+ *  `db::MAX_LOOP_ITERATIONS`, which the stage validator enforces. */
+export const MAX_LOOP_ITERATIONS = 9;
+
 // ─── Tools ────────────────────────────────────────────────────────────────
 // Keep in sync with KNOWN_TOOLS in src-tauri/src/db.rs and tool_definitions().
 

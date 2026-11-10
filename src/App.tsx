@@ -70,6 +70,8 @@ import { runSyncBackfill } from "./lib/syncBackfill";
 import { useEntitlementStore } from "./stores/entitlementStore";
 import { UpdateNotifier } from "./components/UpdateNotifier";
 import { WhatsNewHost } from "./components/WhatsNewHost";
+import { CrewImportHost } from "./components/CrewImportSheet";
+import { useCrewImportStore } from "./stores/crewImportStore";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
@@ -3046,6 +3048,9 @@ function App() {
       </ErrorBoundary>
       <ErrorBoundary surface="Upgrade" variant="overlay" onDismiss={() => useUpgradeStore.getState().hide()}>
         <UpgradeSheet />
+      </ErrorBoundary>
+      <ErrorBoundary surface="Crew import" variant="overlay" onDismiss={() => useCrewImportStore.getState().close()}>
+        <CrewImportHost />
       </ErrorBoundary>
       <ErrorBoundary surface="Run history" variant="overlay" onDismiss={() => useHistoryStore.getState().close()}>
         <HistorySheet />

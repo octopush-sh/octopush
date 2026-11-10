@@ -11,6 +11,7 @@ import { useBlameStore } from "../stores/blameStore";
 import { ModalShell } from "./ModalShell";
 import { openWhatsNewForCurrentVersion, previewUnreleasedTips } from "../lib/whatsNewLaunch";
 import { tourId } from "../lib/tour/ids";
+import { useCrewImportStore } from "../stores/crewImportStore";
 
 interface Props {
   open: boolean;
@@ -168,6 +169,13 @@ export function CommandPalette({
                   onSelect={() => run(onOpenPullRequest)}
                 />
               )}
+              <Item
+                glyph="↓"
+                label="Import a crew…"
+                detail=".octocrew.json"
+                tour={tourId("palette-import-crew")}
+                onSelect={() => run(() => useCrewImportStore.getState().show())}
+              />
               <Item
                 glyph="↺"
                 label="Check for updates"
@@ -346,17 +354,20 @@ function Item({
   label,
   detail,
   shortcut,
+  tour,
   onSelect,
 }: {
   glyph: string;
   label: string;
   detail?: string;
   shortcut?: string;
+  tour?: string;
   onSelect: () => void;
 }) {
   return (
     <Command.Item
       onSelect={onSelect}
+      data-tour={tour}
       className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
       style={
         {

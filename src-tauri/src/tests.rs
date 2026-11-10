@@ -15374,3 +15374,620 @@ mod open_pull_request_tests {
         assert!(crate::git_ops::branch_pr_context(d, "nope").is_err());
     }
 }
+
+#[cfg(test)]
+mod crew_tests {
+    use crate::crew;
+    use crate::db::{Db, StageDraft};
+    use crate::orchestrator::roles::RoleDef;
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> (Db, NamedTempFile) {
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        (db, tmp)
+    }
+
+    fn draft(role: &str) -> StageDraft {
+        StageDraft {
+            role: role.into(), agent_model: "claude-haiku-4-5".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents: Vec::new(), tools: None,
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+
+    /// A custom review role (it can carry a loop).
+    fn triage(prompt: &str) -> RoleDef {
+        let (db, _tmp) = test_db();
+        let mut r = db.get_role("code_review").unwrap().unwrap();
+        r.key = "triage".into();
+        r.label = "Triage".into();
+        r.prompt_body = prompt.into();
+        r.is_builtin = false;
+        r
+    }
+
+    /// plan → implement → triage (custom, loops back to implement), with
+    /// effort, escalation, tools, instructions, names and canvas positions.
+    fn rich_stages() -> Vec<StageDraft> {
+        let mut plan = draft("plan");
+        plan.effort = Some(crate::providers::Effort::High);
+        plan.tools = Some(vec!["read_file".into(), "list_files".into()]);
+        plan.instructions = Some("Keep the plan to five steps.".into());
+        plan.custom_name = Some("Cheap planner".into());
+        plan.pos_x = Some(10.0);
+        plan.pos_y = Some(20.0);
+        let mut implement = draft("implement");
+        implement.agent_model = "claude-sonnet-4-6".into();
+        implement.parents = vec![0];
+        implement.checkpoint = true;
+        implement.max_iterations = 40;
+        implement.escalate_model = Some("claude-opus-4-6".into());
+        implement.escalate_effort = Some(crate::providers::Effort::Max);
+        let mut review = draft("triage");
+        review.parents = vec![1];
+        review.loop_target_position = Some(1);
+        review.loop_max_iterations = 3;
+        review.loop_mode = Some("auto".into());
+        review.tools = Some(vec!["read_file".into(), "grep".into(), "run_command".into()]);
+        vec![plan, implement, review]
+    }
+
+    fn as_json(stages: &[StageDraft]) -> serde_json::Value {
+        serde_json::to_value(stages).unwrap()
+    }
+
+    #[test]
+    fn export_then_import_produces_an_identical_pipeline() {
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage("Find the real defects.")).unwrap();
+        let stages = rich_stages();
+        let pid = a.save_pipeline(None, "Bugfix relay (cheap plan)", "Haiku plans, Sonnet builds", &stages).unwrap();
+
+        let text = crew::to_json(&crew::export(&a, &pid).unwrap()).unwrap();
+        let parsed = crew::parse(&text).unwrap();
+        assert_eq!(parsed.octocrew, crew::CREW_FORMAT);
+
+        let (b, _tb) = test_db();
+        let new_id = crew::import(&b, &parsed, &[]).unwrap();
+        assert_eq!(as_json(&b.pipeline_stage_drafts(&new_id).unwrap()), as_json(&stages));
+        let head = b.list_pipelines().unwrap().into_iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!(head.name, "Bugfix relay (cheap plan)");
+        assert_eq!(head.description, "Haiku plans, Sonnet builds");
+        assert!(!head.is_builtin);
+        let role = b.get_role("triage").unwrap().unwrap();
+        assert_eq!(role.prompt_body, "Find the real defects.");
+        assert!(!role.is_builtin);
+        assert_eq!(crew::file_name(&head.name), "bugfix-relay-cheap-plan.octocrew.json");
+    }
+
+    #[test]
+    fn the_file_holds_only_the_referenced_custom_roles_and_no_private_data() {
+        let (db, tmp) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let mut unused = triage("Never referenced.");
+        unused.key = "unused_role".into();
+        db.upsert_role(&unused).unwrap();
+        let pid = db.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+
+        let text = crew::to_json(&crew::export(&db, &pid).unwrap()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        top.sort();
+        assert_eq!(top, vec!["minApp", "octocrew", "pipeline", "roles"]);
+        let mut pipe: Vec<&str> = v["pipeline"].as_object().unwrap().keys().map(String::as_str).collect();
+        pipe.sort();
+        assert_eq!(pipe, vec!["description", "name", "stages"]);
+        let keys: Vec<&str> = v["roles"].as_array().unwrap().iter().map(|r| r["key"].as_str().unwrap()).collect();
+        assert_eq!(keys, vec!["triage"], "built-ins (plan, implement) and unused roles never travel");
+        for secret in ["apiKey", "api_key", "baseUrl", "base_url", "worktreePath", "workspaceId", "runId", "costUsd", "\"id\""] {
+            assert!(!text.contains(secret), "crew file must not carry {secret}");
+        }
+        assert!(!text.contains(&*tmp.path().to_string_lossy()), "no local paths");
+    }
+
+    #[test]
+    fn a_taken_role_key_is_suffixed_never_overwritten_and_an_identical_one_is_reused() {
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage("Find the real defects.")).unwrap();
+        let pid = a.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+        let file = crew::export(&a, &pid).unwrap();
+
+        // Same machine: the identical role is reused, not duplicated.
+        let again = crew::preview(&a, &file, &[]).unwrap();
+        assert_eq!(again.roles[0].fate, "existing");
+        assert_eq!(again.roles[0].key, "triage");
+        crew::import(&a, &file, &[]).unwrap();
+        assert!(a.get_role("triage-2").unwrap().is_none());
+
+        // Another machine has its own `triage`: the import becomes `triage-2`.
+        let (b, _tb) = test_db();
+        b.upsert_role(&triage("Local prompt.")).unwrap();
+        let preview = crew::preview(&b, &file, &[]).unwrap();
+        assert_eq!(preview.roles[0].fate, "renamed");
+        assert_eq!(preview.roles[0].key, "triage-2");
+        assert_eq!(preview.stages[2].role, "triage-2");
+        let new_id = crew::import(&b, &file, &[]).unwrap();
+        assert_eq!(b.get_role("triage").unwrap().unwrap().prompt_body, "Local prompt.");
+        assert_eq!(b.get_role("triage-2").unwrap().unwrap().prompt_body, "Find the real defects.");
+        assert_eq!(b.pipeline_stage_drafts(&new_id).unwrap()[2].role, "triage-2");
+
+        // A file role named like a built-in never touches the built-in.
+        let mut hostile = file.clone();
+        hostile.roles[0].key = "code_review".into();
+        hostile.pipeline.stages[2].role = "code_review".into();
+        let p = crew::preview(&b, &hostile, &[]).unwrap();
+        assert_eq!(p.roles[0].key, "code_review-2");
+        assert!(b.get_role("code_review").unwrap().unwrap().is_builtin);
+    }
+
+    #[test]
+    fn the_preview_shows_writers_tools_instructions_and_model_swaps() {
+        let (db, _t) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let pid = db.save_pipeline(None, "Relay", "", &rich_stages()).unwrap();
+        let file = crew::export(&db, &pid).unwrap();
+
+        let p = crew::preview(&db, &file, &[]).unwrap();
+        assert!(p.ok, "{:?}", p);
+        assert!(p.stages[0].read_only, "read_file + list_files only");
+        assert!(!p.stages[1].read_only, "no allowlist = writer");
+        assert!(!p.stages[2].read_only, "run_command = writer");
+        assert_eq!(p.stages[0].label, "Cheap planner");
+        assert_eq!(p.stages[0].instructions.as_deref(), Some("Keep the plan to five steps."));
+        assert!(p.stages[1].tools.contains(&"write_file".to_string()), "role defaults shown when no allowlist");
+        assert_eq!(p.roles[0].prompt_body, "Find the real defects.");
+
+        let swaps = vec![("claude-opus-4-6".to_string(), "claude-sonnet-4-6".to_string())];
+        let swapped = crew::preview(&db, &file, &swaps).unwrap();
+        assert_eq!(swapped.stages[1].escalate_model.as_deref(), Some("claude-sonnet-4-6"));
+        let id = crew::import(&db, &file, &swaps).unwrap();
+        assert_eq!(db.pipeline_stage_drafts(&id).unwrap()[1].escalate_model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn an_invalid_crew_reports_each_stage_and_saves_nothing() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("plan"), draft("implement"), draft("code_review"), draft("test")];
+        stages[1].tools = Some(vec!["format_disk".into()]);
+        stages[2].loop_target_position = Some(3);
+        stages[2].loop_max_iterations = 2;
+        stages[2].loop_mode = Some("gated".into());
+        stages[3].parents = vec![3];
+        stages[0].instructions = Some("x".repeat(8_001));
+        let mut bad_role = triage("p");
+        bad_role.key = "odd".into();
+        bad_role.default_tools = vec!["teleport".into()];
+        let file = crew::CrewFile {
+            octocrew: 1,
+            min_app: String::new(),
+            pipeline: crew::CrewPipeline { name: "Broken".into(), description: String::new(), stages },
+            roles: vec![bad_role],
+        };
+        let pipelines_before = db.list_pipelines().unwrap().len();
+        let roles_before = db.list_roles().unwrap().len();
+
+        let p = crew::preview(&db, &file, &[]).unwrap();
+        assert!(!p.ok);
+        // Each message names its stage exactly once.
+        assert_eq!(p.stages[0].problem.as_deref(), Some("Stage 1 instructions are too long (max 8000 characters)"));
+        assert_eq!(p.stages[1].problem.as_deref(), Some("Stage 2: unknown tool 'format_disk'"));
+        assert!(p.stages[0].problem.as_deref().unwrap().contains("too long"));
+        assert!(p.stages[1].problem.as_deref().unwrap().contains("unknown tool 'format_disk'"));
+        assert!(p.stages[2].problem.as_deref().unwrap().contains("loop target"));
+        assert!(p.stages[3].problem.as_deref().unwrap().contains("acyclic"));
+        assert!(p.problems.iter().any(|m| m.contains("teleport")));
+
+        assert!(crew::import(&db, &file, &[]).is_err());
+        let mut no_role_problem = file.clone();
+        no_role_problem.roles.clear();
+        let err = crew::import(&db, &no_role_problem, &[]).unwrap_err().to_string();
+        assert!(err.contains("Stage 1 instructions are too long"), "{err}");
+        assert!(!err.to_lowercase().contains("stage 1: stage 1"), "{err}");
+        // save_pipeline's own messages are unchanged.
+        let save_err = db.save_pipeline(None, "Broken", "", &no_role_problem.pipeline.stages).unwrap_err().to_string();
+        assert!(save_err.contains("stage 1 instructions are too long"), "{save_err}");
+        assert_eq!(db.list_pipelines().unwrap().len(), pipelines_before);
+        assert_eq!(db.list_roles().unwrap().len(), roles_before);
+        assert!(db.get_role("odd").unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_refuses_non_crews_and_newer_formats() {
+        assert!(crew::parse("not json").unwrap_err().to_string().contains("isn't JSON"));
+        assert!(crew::parse("{\"name\":\"x\"}").unwrap_err().to_string().contains("isn't an Octopush crew"));
+        let newer = r#"{"octocrew":2,"pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(newer).unwrap_err().to_string().contains("newer Octopush"));
+        let later = r#"{"octocrew":1,"minApp":"99.0.0","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(later).unwrap_err().to_string().contains("99.0.0"));
+        let ok = r#"{"octocrew":1,"minApp":"0.1.0","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(ok).is_ok());
+    }
+
+    #[test]
+    fn a_format_1_file_carries_the_fixed_floor_and_imports() {
+        let (a, _ta) = test_db();
+        let pid = a.save_pipeline(None, "Relay", "", &[draft("plan")]).unwrap();
+        let exported = crew::export(&a, &pid).unwrap();
+        // The floor for format 1, never the exporting app's version.
+        assert_eq!(exported.min_app, crew::CREW_MIN_APP);
+        let text = format!(
+            r#"{{"octocrew":1,"minApp":"{}","pipeline":{{"name":"Floor","stages":[{}]}}}}"#,
+            crew::CREW_MIN_APP,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        let (b, _tb) = test_db();
+        let id = crew::import(&b, &crew::parse(&text).unwrap(), &[]).unwrap();
+        assert_eq!(b.pipeline_stage_drafts(&id).unwrap().len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repo_scan_skips_a_symlinked_crews_folder() {
+        let outside = tempfile::tempdir().unwrap();
+        let elsewhere = outside.path().join("crews");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let body = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"Outside","stages":[{}]}}}}"#,
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        std::fs::write(elsewhere.join("a.octocrew.json"), body).unwrap();
+
+        // `.octopush/crews` itself is a link out of the worktree.
+        let wt = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(wt.path().join(".octopush")).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wt.path().join(crew::REPO_CREWS_DIR)).unwrap();
+        assert!(crew::scan_repo(wt.path()).is_empty());
+
+        // `.octopush` is a link out of the worktree.
+        let wt2 = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), wt2.path().join(".octopush")).unwrap();
+        assert!(crew::scan_repo(wt2.path()).is_empty());
+    }
+
+    #[test]
+    fn repo_crews_are_listed_from_the_worktree_and_re_read_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(crew::scan_repo(dir.path()).is_empty(), "no folder = no crews");
+        let crews = dir.path().join(crew::REPO_CREWS_DIR);
+        std::fs::create_dir_all(&crews).unwrap();
+        let body = |name: &str| {
+            format!(
+                r#"{{"octocrew":1,"pipeline":{{"name":"{name}","stages":[{}]}}}}"#,
+                serde_json::to_string(&draft("plan")).unwrap()
+            )
+        };
+        std::fs::write(crews.join("a.octocrew.json"), body("Repo relay")).unwrap();
+        std::fs::write(crews.join("b.octocrew.json"), "{ broken").unwrap();
+        std::fs::write(crews.join("notes.json"), body("Ignored")).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(crews.join("a.octocrew.json"), crews.join("c.octocrew.json")).unwrap();
+
+        let found = crew::scan_repo(dir.path());
+        let files: Vec<&str> = found.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(files, vec!["a.octocrew.json", "b.octocrew.json"], "symlinks and other files skipped");
+        assert_eq!(found[0].name, "Repo relay");
+        assert_eq!(found[0].stage_count, 1);
+        assert!(found[0].problem.is_none());
+        assert!(found[1].problem.is_some());
+
+        std::fs::write(crews.join("a.octocrew.json"), body("Renamed relay")).unwrap();
+        assert_eq!(crew::scan_repo(dir.path())[0].name, "Renamed relay");
+
+        // Fork: the text is read through the safe reader, then the normal import.
+        let (db, _t) = test_db();
+        let text = crew::read_repo_crew(dir.path(), &found[0].file).unwrap();
+        let id = crew::import(&db, &crew::parse(&text).unwrap(), &[]).unwrap();
+        assert_eq!(db.pipeline_stage_drafts(&id).unwrap().len(), 1);
+        // Only names inside the folder, and never a symlink.
+        assert!(crew::read_repo_crew(dir.path(), "../a.octocrew.json").is_err());
+        assert!(crew::read_repo_crew(dir.path(), "notes.json").is_err());
+        #[cfg(unix)]
+        assert!(crew::read_repo_crew(dir.path(), "c.octocrew.json").unwrap_err().to_string().contains("link"));
+    }
+
+    /// The listing carries names and counts only, each bounded, never the text.
+    #[test]
+    fn the_repo_listing_is_metadata_only_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let crews = dir.path().join(crew::REPO_CREWS_DIR);
+        std::fs::create_dir_all(&crews).unwrap();
+        let body = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"Relay","description":"{}","stages":[{}]}}}}"#,
+            "d".repeat(1_500),
+            serde_json::to_string(&draft("plan")).unwrap()
+        );
+        std::fs::write(crews.join("a.octocrew.json"), &body).unwrap();
+        let hidden = body.replace("\"Relay\"", "\"Re\\u202elay\"");
+        std::fs::write(crews.join("b.octocrew.json"), hidden).unwrap();
+        let found = crew::scan_repo(dir.path());
+        let v = serde_json::to_value(&found).unwrap();
+        assert!(v[0].get("json").is_none(), "no file text in the listing");
+        assert!(found[0].description.chars().count() <= 281);
+        assert!(found[0].problem.is_none());
+        assert_eq!(found[1].name, "b", "a hidden character in the name lists the file name instead");
+        assert!(found[1].problem.as_deref().unwrap().contains("U+202E"));
+        assert!(serde_json::to_string(&found).unwrap().len() < 2_000);
+    }
+
+    fn one_stage_file(stages: Vec<StageDraft>, roles: Vec<RoleDef>) -> crew::CrewFile {
+        crew::CrewFile {
+            octocrew: 1,
+            min_app: String::new(),
+            pipeline: crew::CrewPipeline { name: "Relay".into(), description: String::new(), stages },
+            roles,
+        }
+    }
+
+    #[test]
+    fn cli_stages_show_their_shell_dialect_not_a_tool_list() {
+        let (db, _t) = test_db();
+        let mut claude = draft("implement");
+        claude.substrate = "cli".into();
+        claude.agent_model = "claude-sonnet-4-6".into();
+        claude.tools = Some(vec!["read_file".into()]);
+        let mut codex = draft("implement");
+        codex.substrate = "cli".into();
+        codex.agent_model = "gpt-5-codex".into();
+        let api = draft("plan");
+        let p = crew::preview(&db, &one_stage_file(vec![claude, codex, api], vec![]), &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].cli_dialect.as_deref(), Some("claude"));
+        assert_eq!(p.stages[1].cli_dialect.as_deref(), Some("codex"));
+        assert_eq!(p.stages[2].cli_dialect, None);
+        assert!(p.stages[0].tools.is_empty(), "the allowlist does not apply on the CLI");
+        assert!(!p.stages[0].read_only, "a read_file-only allowlist does not make a CLI stage read-only");
+        assert!(p.stages[0].warnings.iter().any(|w| w.contains("full shell")));
+        assert!(p.stages[1].warnings.is_empty());
+        assert!(!p.stages[2].tools.is_empty());
+    }
+
+    #[test]
+    fn the_preview_shows_loops_effort_and_escalation_effort() {
+        let (db, _t) = test_db();
+        db.upsert_role(&triage("Find the real defects.")).unwrap();
+        let p = crew::preview(&db, &one_stage_file(rich_stages(), vec![triage("Find the real defects.")]), &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].effort, Some(crate::providers::Effort::High));
+        assert_eq!(p.stages[1].escalate_effort, Some(crate::providers::Effort::Max));
+        assert_eq!(p.stages[2].loop_target_position, Some(1));
+        assert_eq!(p.stages[2].loop_mode.as_deref(), Some("auto"));
+        assert_eq!(p.stages[2].loop_max_iterations, 3);
+    }
+
+    #[test]
+    fn loop_max_iterations_is_capped_like_the_builder() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("implement"), draft("code_review")];
+        stages[1].loop_target_position = Some(0);
+        stages[1].loop_mode = Some("auto".into());
+        stages[1].loop_max_iterations = crate::db::MAX_LOOP_ITERATIONS;
+        assert!(db.validate_pipeline_stages(&stages).is_ok());
+        stages[1].loop_max_iterations = 1_000_000;
+        let err = db.validate_pipeline_stages(&stages).unwrap_err().to_string();
+        assert!(err.contains("between 1 and 9"), "{err}");
+        let p = crew::preview(&db, &one_stage_file(stages, vec![]), &[]).unwrap();
+        assert!(!p.ok);
+        assert!(p.stages[1].problem.as_deref().unwrap().contains("between 1 and 9"));
+    }
+
+    #[test]
+    fn stored_loop_counts_above_the_cap_are_clamped_not_rejected() {
+        let (db, _t) = test_db();
+        let mut stages = vec![draft("implement"), draft("code_review")];
+        stages[1].loop_target_position = Some(0);
+        stages[1].loop_mode = Some("auto".into());
+        stages[1].loop_max_iterations = 3;
+        let pid = db.save_pipeline(None, "Old Loop", "d", &stages).unwrap();
+        // A row saved before the cap existed.
+        db.conn_ref()
+            .execute("UPDATE pipeline_stages SET loop_max_iterations = 15 WHERE pipeline_id = ?1 AND position = 1", [&pid])
+            .unwrap();
+        assert_eq!(db.get_pipeline_stages(&pid).unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        let drafts = db.pipeline_stage_drafts(&pid).unwrap();
+        assert_eq!(drafts[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+        // What the builder and sync read back re-saves cleanly.
+        db.save_pipeline(Some(pid.clone()), "Old Loop", "d", &drafts).unwrap();
+
+        // A pulled item from a Mac that still holds 15 applies, clamped.
+        let mut remote = stages.clone();
+        remote[1].loop_max_iterations = 15;
+        let sp = crate::sync::SyncPipeline {
+            id: "remote-old-loop".into(), name: "Remote".into(), description: String::new(),
+            updated_at: "2099-01-01T00:00:00Z".into(), stages: remote.clone(),
+        };
+        assert!(db.upsert_pipeline_from_sync(&sp).unwrap());
+        assert_eq!(db.get_pipeline_stages("remote-old-loop").unwrap()[1].loop_max_iterations, crate::db::MAX_LOOP_ITERATIONS);
+
+        // New input above the cap is still rejected.
+        assert!(db.validate_pipeline_stages(&remote).is_err());
+        assert!(db.save_pipeline(None, "New", "d", &remote).is_err());
+        assert!(!crew::preview(&db, &one_stage_file(remote, vec![]), &[]).unwrap().ok);
+    }
+
+    #[test]
+    fn imported_token_estimates_are_reset_to_the_local_defaults() {
+        let (db, _t) = test_db();
+        let mut r = triage("Find the real defects.");
+        r.token_est_in = 1;
+        r.token_est_out = 99_999_999;
+        let mut st = draft("triage");
+        st.agent_model = "claude-haiku-4-5".into();
+        crew::import(&db, &one_stage_file(vec![st], vec![r]), &[]).unwrap();
+        let saved = db.get_role("triage").unwrap().unwrap();
+        assert_eq!((saved.token_est_in, saved.token_est_out), (crew::DEFAULT_TOKEN_EST_IN, crew::DEFAULT_TOKEN_EST_OUT));
+    }
+
+    /// Every invisible or reordering character, in every string field, blocks.
+    #[test]
+    fn hidden_and_bidi_characters_block_the_import_in_every_field() {
+        let hostile = [
+            '\u{E0041}', '\u{E007F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}', '\u{200B}', '\u{200F}',
+            '\u{2060}', '\u{2064}', '\u{FEFF}', '\u{0000}', '\u{001B}', '\u{000D}', '\u{007F}', '\u{0085}', '\u{009F}',
+            // Variation selectors (both blocks), other Cf, Zl/Zp and blank fillers.
+            '\u{FE00}', '\u{FE0F}', '\u{E0100}', '\u{E01EF}', '\u{061C}', '\u{206A}', '\u{206F}', '\u{FFF9}',
+            '\u{FFFB}', '\u{180E}', '\u{00AD}', '\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}',
+            '\u{1D173}', '\u{1D17A}', '\u{2028}', '\u{2029}', '\u{0600}', '\u{13430}', '\u{E0001}',
+        ];
+        for c in hostile {
+            assert!(crew::is_hidden_char(c), "U+{:04X} is hidden", c as u32);
+            assert!(!crew::escape_hidden(&c.to_string()).contains(c), "U+{:04X} is escaped", c as u32);
+        }
+        // Ordinary text stays visible: accents, CJK, Hangul, Arabic, a bare emoji.
+        for ok in "é ü 漢字 한국어 عربي 🐙 — “q”".chars() {
+            assert!(!crew::is_hidden_char(ok), "U+{:04X} is ordinary text", ok as u32);
+        }
+        type Inject = fn(&mut crew::CrewFile, &str);
+        let fields: Vec<(&str, Inject)> = vec![
+            ("name", |f, x| f.pipeline.name = format!("Relay{x}")),
+            ("description", |f, x| f.pipeline.description = format!("d{x}")),
+            ("role key", |f, x| {
+                f.roles[0].key = format!("triage{x}");
+                f.pipeline.stages[0].role = f.roles[0].key.clone();
+            }),
+            ("role label", |f, x| f.roles[0].label = format!("Triage{x}")),
+            ("role description", |f, x| f.roles[0].description = format!("d{x}")),
+            ("prompt body", |f, x| f.roles[0].prompt_body = format!("Find{x} defects")),
+            ("stage role", |f, x| f.pipeline.stages[1].role = format!("plan{x}")),
+            ("custom name", |f, x| f.pipeline.stages[0].custom_name = Some(format!("n{x}"))),
+            ("instructions", |f, x| f.pipeline.stages[0].instructions = Some(format!("ok\n\tthen{x}"))),
+            ("model", |f, x| f.pipeline.stages[0].agent_model = format!("claude-haiku-4-5{x}")),
+            ("escalate model", |f, x| f.pipeline.stages[0].escalate_model = Some(format!("claude-opus-4-6{x}"))),
+            ("tool", |f, x| f.pipeline.stages[0].tools = Some(vec![format!("read_file{x}")])),
+        ];
+        let base = one_stage_file(vec![draft("triage"), draft("plan")], vec![triage("Find the real defects.")]);
+        {
+            let (db, _t) = test_db();
+            let p = crew::preview(&db, &base, &[]).unwrap();
+            assert!(p.ok, "the clean file imports: {p:?}");
+        }
+        for (what, inject) in &fields {
+            for c in hostile {
+                let (db, _t) = test_db();
+                let mut f = base.clone();
+                inject(&mut f, &c.to_string());
+                let p = crew::preview(&db, &f, &[]).unwrap();
+                assert!(!p.ok, "{what} with U+{:04X} must block", c as u32);
+                let shown = serde_json::to_string(&p).unwrap();
+                assert!(!shown.contains(c), "{what}: U+{:04X} reaches the sheet unescaped", c as u32);
+                assert!(crew::import(&db, &f, &[]).is_err(), "{what} with U+{:04X} must not import", c as u32);
+                assert!(db.get_role("triage").unwrap().is_none());
+            }
+        }
+        // Newlines and tabs in prompts and instructions are fine.
+        let (db, _t) = test_db();
+        let mut f = base.clone();
+        f.pipeline.stages[0].instructions = Some("one\n\ttwo".into());
+        assert!(crew::preview(&db, &f, &[]).unwrap().ok);
+    }
+
+    #[test]
+    fn role_keys_and_lengths_are_bounded() {
+        let (db, _t) = test_db();
+        let base = one_stage_file(vec![draft("triage")], vec![triage("p")]);
+        let blocked = |f: &crew::CrewFile| !crew::preview(&db, f, &[]).unwrap().ok;
+        for key in ["Triage", "-triage", "tri age", "tri.age", "", &"a".repeat(49)] {
+            let mut f = base.clone();
+            f.roles[0].key = key.to_string();
+            f.pipeline.stages[0].role = key.to_string();
+            assert!(blocked(&f), "key {key:?}");
+        }
+        let mut ok = base.clone();
+        ok.roles[0].key = format!("a{}", "-".repeat(47));
+        ok.pipeline.stages[0].role = ok.roles[0].key.clone();
+        assert!(!blocked(&ok), "48 characters is allowed");
+        let long = "x".repeat(129);
+        let cases: Vec<fn(&mut crew::CrewFile, &str)> = vec![
+            |f, l| f.roles[0].label = l.into(),
+            |f, l| f.pipeline.stages[0].custom_name = Some(l.into()),
+            |f, l| f.pipeline.stages[0].agent_model = l.into(),
+            |f, l| f.pipeline.stages[0].escalate_model = Some(l.into()),
+            |f, l| f.pipeline.name = l.into(),
+        ];
+        for (i, set) in cases.iter().enumerate() {
+            let mut f = base.clone();
+            set(&mut f, &long);
+            assert!(blocked(&f), "case {i}");
+        }
+        let mut f = base.clone();
+        f.pipeline.description = "d".repeat(2_001);
+        assert!(blocked(&f));
+    }
+
+    #[test]
+    fn a_stage_naming_a_rejected_file_role_never_falls_back_to_a_local_one() {
+        let (db, _t) = test_db();
+        // The local `triage` is a harmless review role.
+        db.upsert_role(&triage("Local, harmless.")).unwrap();
+        // The file's `triage` is malformed, so it is rejected…
+        let mut bad = triage("");
+        bad.prompt_body = String::new();
+        let f = one_stage_file(vec![draft("triage")], vec![bad]);
+        let p = crew::preview(&db, &f, &[]).unwrap();
+        assert!(!p.ok);
+        // …and the stage says so instead of quietly using the local role.
+        assert!(p.stages[0].problem.as_deref().unwrap().contains("defines but can't import"), "{p:?}");
+        assert!(crew::import(&db, &f, &[]).is_err());
+    }
+
+    #[test]
+    fn parse_bounds_text_stages_and_roles_and_handles_pre_releases() {
+        let big = format!(r#"{{"octocrew":1,"pipeline":{{"name":"{}","stages":[]}}}}"#, "x".repeat(crew::MAX_CREW_BYTES as usize));
+        assert!(crew::parse(&big).unwrap_err().to_string().contains("too large"));
+        let stage = serde_json::to_string(&draft("plan")).unwrap();
+        let many = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"x","stages":[{}]}}}}"#,
+            vec![stage.as_str(); crew::MAX_CREW_STAGES + 1].join(",")
+        );
+        assert!(crew::parse(&many).unwrap_err().to_string().contains("at most 64"));
+        let role = serde_json::to_string(&triage("p")).unwrap();
+        let roles = format!(
+            r#"{{"octocrew":1,"pipeline":{{"name":"x","stages":[]}},"roles":[{}]}}"#,
+            vec![role.as_str(); crew::MAX_CREW_ROLES + 1].join(",")
+        );
+        assert!(crew::parse(&roles).unwrap_err().to_string().contains("at most 32"));
+
+        assert_eq!(crew::version_parts("0.4.117-beta.2"), [0, 4, 117]);
+        assert_eq!(crew::version_parts("v0.4.117+build.5"), [0, 4, 117]);
+        assert_eq!(crew::version_parts("1.2"), [1, 2, 0]);
+        assert!(crew::version_parts("0.4.117-beta.1") > crew::version_parts("0.4.116"));
+        assert!(crew::version_parts("0.4.117-beta.1") == crew::version_parts(crew::CREW_MIN_APP));
+        assert_eq!(crew::CREW_MIN_APP, "0.4.117", "v0.4.116 shipped without crews");
+        let beta_floor = r#"{"octocrew":1,"minApp":"0.4.117-beta.3","pipeline":{"name":"x","stages":[]}}"#;
+        assert!(crew::parse(beta_floor).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reading_a_fifo_never_blocks_and_an_oversized_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("x.octocrew.json");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = fifo.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send((crew::read_file(&path, true).is_err(), crew::read_file(&path, false).is_err()));
+        });
+        let (followed, nofollow) = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("reading a FIFO blocked");
+        assert!(followed && nofollow, "a FIFO is not a crew file");
+
+        let big = dir.path().join("big.octocrew.json");
+        std::fs::write(&big, vec![b' '; crew::MAX_CREW_BYTES as usize + 1]).unwrap();
+        assert!(crew::read_file(&big, true).unwrap_err().to_string().contains("too large"));
+        let exact = dir.path().join("ok.octocrew.json");
+        std::fs::write(&exact, vec![b' '; crew::MAX_CREW_BYTES as usize]).unwrap();
+        assert!(crew::read_file(&exact, true).is_ok());
+        std::fs::write(&exact, [0xff, 0xfe]).unwrap();
+        assert!(crew::read_file(&exact, true).unwrap_err().to_string().contains("UTF-8"));
+
+        // The dialog's pick may be a link; a repo's crew may not.
+        let link = dir.path().join("link.octocrew.json");
+        std::os::unix::fs::symlink(&exact, &link).unwrap();
+        std::fs::write(&exact, "{}").unwrap();
+        assert_eq!(crew::read_file(&link, true).unwrap(), "{}");
+        assert!(crew::read_file(&link, false).unwrap_err().to_string().contains("link"));
+    }
+}
