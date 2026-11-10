@@ -666,6 +666,21 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             models: vec![
+                // OpenAI model page (fetched 2026-11-08): 1,050,000-token
+                // context, cached input at 5% of input. Prices must match
+                // `token_engine::builtin_prices`.
+                ModelInfo {
+                    id: "gpt-6.1-terra".into(),
+                    display_name: "GPT-6.1 Terra".into(),
+                    input_cost_per_m: 1.0,
+                    output_cost_per_m: 5.0,
+                    cache_read_cost_per_m: 0.05,
+                    cache_creation_cost_per_m: 1.0,
+                    max_context: 1_050_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                    tags: vec!["balanced".into()],
+                },
                 ModelInfo {
                     id: "gpt-4o".into(),
                     display_name: "GPT-4o".into(),

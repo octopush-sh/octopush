@@ -14310,6 +14310,35 @@ mod pricing_table_tests {
         assert_eq!(Some(gpt), builtin_prices("gpt-4o"));
         assert_eq!(Some(mini), builtin_prices("gpt-4o-mini"));
     }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn gpt_6_1_terra_is_priced_and_in_the_openai_catalog() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // $1 input, $0.05 cached input (5%), $5 output; writes cost input.
+        // Not `assert_prices`: its 1-hour check (2× input) is Claude-only.
+        let terra = ModelPrices {
+            input_per_m: 1.0,
+            output_per_m: 5.0,
+            cache_read_per_m: 0.05,
+            cache_creation_per_m: 1.0,
+            cache_creation_1h_per_m: 1.0,
+        };
+        assert_eq!(builtin_prices("gpt-6.1-terra"), Some(terra));
+        assert_eq!(builtin_prices("openai/gpt-6.1-terra"), Some(terra));
+        let p = prices_for("gpt-6.1-terra").expect("gpt-6.1-terra is priced");
+        assert_eq!(Some(p), builtin_prices("gpt-6.1-terra"));
+        // Not a Claude model: no 1-hour write tier.
+        assert_eq!(p.cache_creation_1h_per_m, p.cache_creation_per_m);
+        assert_eq!(ledger_cost_basis("gpt-6.1-terra", 0.0, 1_000), "computed");
+        let providers = crate::provider_router::builtin_providers();
+        let m = providers["openai"].models.iter().find(|m| m.id == "gpt-6.1-terra").expect("in the openai catalog");
+        assert_eq!(m.display_name, "GPT-6.1 Terra");
+        assert_eq!(m.max_context, 1_050_000);
+        assert!(m.supports_tools);
+        assert_eq!(m.tags, vec!["balanced".to_string()]);
+    }
 }
 
 #[cfg(test)]
