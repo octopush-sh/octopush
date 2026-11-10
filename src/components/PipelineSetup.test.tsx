@@ -527,6 +527,20 @@ describe("PipelineSetup Claude Code version preflight", () => {
     expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
   });
 
+  it("reads the version for a Codex stage escalating to Claude, and names the model", async () => {
+    const pipe = cliPipe("gpt-5-codex");
+    (pipe.stages[0] as any).escalateModel = "claude-fable-5-2";
+    storeState.pipelines = [pipe];
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    floorNoteMock.mockResolvedValue({ label: "Fable 5.2", needs: "2.1.321", installed: "2.1.307" });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-model-floor");
+    expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.307.");
+    expect(floorNoteMock).toHaveBeenCalledWith(["claude-fable-5-2"]);
+    // The update/security notes stay with crews whose own stages run Claude Code.
+    expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
+  });
+
   it("does not probe for crews without a Claude Code CLI stage", async () => {
     storeState.pipelines = [cliPipe("gpt-5-codex")];
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });

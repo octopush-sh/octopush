@@ -205,21 +205,24 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   // Preflight: a crew with a Claude Code CLI stage on an old CLI gets an
   // amber note under the foot. Informational only — it never gates Begin.
   const usesClaudeCode = !!selected && crewUsesClaudeCode(selected.stages, overrides);
+  // Every model that will run on Claude Code, escalations included — a Codex
+  // stage escalating to a Claude model still needs the version read below.
+  const claudeModels = selected ? crewClaudeModels(selected.stages, overrides) : [];
+  const claudeModelsKey = claudeModels.join("\n");
+  const needsCliVersion = usesClaudeCode || claudeModels.length > 0;
   const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
   useEffect(() => {
-    if (!usesClaudeCode) return;
+    if (!needsCliVersion) return;
     let alive = true;
     void loadClaudeCliVersion().then((v) => { if (alive) setCli(v); });
     return () => { alive = false; };
-  }, [usesClaudeCode]);
+  }, [needsCliVersion]);
   const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
   const cliSecurity = usesClaudeCode ? claudeSecurityLabel(cli) : null;
   const cliNote = cliUpdate ?? cliSecurity;
   // A CLI stage (or its escalation) on a model this CLI is too old to launch
   // — e.g. Fable 5.2 before 2.1.321. Once the version is known, the backend
   // checks against its cached copy; an unknown version never warns.
-  const claudeModels = selected ? crewClaudeModels(selected.stages, overrides) : [];
-  const claudeModelsKey = claudeModels.join("\n");
   const [floorNote, setFloorNote] = useState<ClaudeModelFloorNote | null>(null);
   useEffect(() => {
     setFloorNote(null);
