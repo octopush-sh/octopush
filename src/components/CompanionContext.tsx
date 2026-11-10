@@ -5,7 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
-import { unpricedTitle } from "../lib/cost";
+import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 
 interface Props {
@@ -27,9 +27,10 @@ interface Props {
   onOpenLogbook?: () => void;
 }
 
-/** `$4.20` — three decimals under a cent so a cheap turn never reads as free. */
+/** `$4.20`, `$12,843.27` — three decimals under a cent so a cheap turn never
+ *  reads as free. */
 export function usd(n: number): string {
-  return `$${n > 0 && n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`;
+  return n > 0 && n < 0.01 ? `$${n.toFixed(3)}` : formatUsd(n);
 }
 
 /** The cost lines of a conversation from its ledger figures. Pure so the
@@ -306,7 +307,7 @@ function SpendRow({ row, onClick }: { row: SpendRowData; onClick?: () => void })
       <div className="flex items-baseline justify-between">
         <span className="text-octo-sage">{row.label}</span>
         <span className="octo-tabular font-mono text-[10px] text-octo-ivory">
-          ${row.costUsd.toFixed(2)} / ${row.limitUsd.toFixed(2)}
+          {formatUsd(row.costUsd)} / {formatUsd(row.limitUsd)}
         </span>
       </div>
       <div

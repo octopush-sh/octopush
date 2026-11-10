@@ -84,6 +84,11 @@ describe("costLines", () => {
     expect(usd(0.5)).toBe("$0.50");
     expect(usd(0)).toBe("$0.00");
   });
+
+  it("groups thousands from a cent up, like the ledger", () => {
+    expect(usd(12843.27)).toBe("$12,843.27");
+    expect(usd(0.01)).toBe("$0.01");
+  });
 });
 
 describe("CompanionContext", () => {

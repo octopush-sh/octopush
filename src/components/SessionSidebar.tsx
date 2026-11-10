@@ -6,6 +6,7 @@ import { useTokenStore } from "../stores/tokenStore";
 import { useEffect } from "react";
 import { OctoMark } from "./icons/OctoMark";
 import { shortModel } from "../lib/modelLabel";
+import { formatUsd } from "../lib/cost";
 
 interface Props {
   onNewSession: () => void;
@@ -80,7 +81,7 @@ export function SessionSidebar({ onNewSession }: Props) {
         {sessions.length} session{sessions.length === 1 ? "" : "s"}
         {report && report.totalCostUsd > 0 && (
           <span className="float-right">
-            ${report.totalCostUsd.toFixed(2)} total
+            {formatUsd(report.totalCostUsd)} total
           </span>
         )}
       </footer>
@@ -156,7 +157,7 @@ function SessionRow({
       {/* Row 3: cost • tokens */}
       <div className="mt-0.5 flex items-center gap-1.5 pl-4 text-[11px] text-zinc-500">
         <Coins size={10} className="shrink-0 text-zinc-600" />
-        <span>${cost.toFixed(2)}</span>
+        <span>{formatUsd(cost)}</span>
         <span className="text-zinc-700">•</span>
         <span>{formatTokens(session.tokensUsed)} tok</span>
       </div>

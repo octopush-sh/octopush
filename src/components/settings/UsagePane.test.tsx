@@ -435,7 +435,7 @@ describe("UsagePane — gateway reconciliation", () => {
     expect(within(screen.getByTestId("usage-gateway-ledger")).getByText("$7.28")).toBeInTheDocument();
     expect(within(screen.getByTestId("usage-gateway-unaccounted")).getByText("$2.57")).toBeInTheDocument();
     expect(screen.getByTestId("usage-gateway-gap").textContent).toContain("26% not in the ledger");
-    expect(screen.getByTestId("usage-gateway-budget").textContent).toContain("Key budget exhausted · $7061 of $5400");
+    expect(screen.getByTestId("usage-gateway-budget").textContent).toContain("Key budget exhausted · $7,061 of $5,400");
     const models = within(screen.getByTestId("usage-gateway-models")).getAllByRole("listitem");
     expect(models[0].textContent).toContain("claude-sonnet-5");
     expect(models[0].textContent).toContain("gateway 100 · ledger 75");

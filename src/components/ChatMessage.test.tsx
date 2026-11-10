@@ -107,6 +107,10 @@ describe("usageFooter — the honest turn figure", () => {
     expect(usageFooter({ role: "assistant", content: "x", inputTokens: 10, outputTokens: 5, costUsd: 0.004 })).toBe("10 in · 5 out · $0.004");
     expect(usageFooter({ role: "assistant", content: "x", inputTokens: 10, outputTokens: 5, costUsd: 0 })).toBe("10 in · 5 out");
   });
+
+  it("groups thousands in a large turn cost", () => {
+    expect(usageFooter({ role: "assistant", content: "x", outputTokens: 5, costUsd: 1500 })).toBe("5 out · $1,500.00");
+  });
 });
 
 describe("user message — skills invoked with it", () => {

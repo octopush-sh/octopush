@@ -4,6 +4,7 @@ import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
 import type { ModelInfo } from "../lib/types";
 import { AUTO_MODEL } from "../lib/policy";
+import { formatUsd } from "../lib/cost";
 import { useProvidersStore } from "../stores/providersStore";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
@@ -48,7 +49,7 @@ function providerColor(name: string): string {
 // Format cost as "$X.XX" trimming trailing zeros.
 function formatCost(perM: number): string {
   if (perM === 0) return "free";
-  if (perM < 1) return `$${perM.toFixed(2)}`;
+  if (perM < 1) return formatUsd(perM);
   return `$${perM % 1 === 0 ? perM.toFixed(0) : perM.toFixed(1)}`;
 }
 
