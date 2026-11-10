@@ -528,7 +528,7 @@ export function UsagePane() {
                       labelFormatter={(b) => bucketLabel(String(b), report.trendBucket)}
                       formatter={(v, _name, item) => {
                         const tokens = (item?.payload as { tokens?: number } | undefined)?.tokens ?? 0;
-                        return [`${formatUsd(Number(v))} ·${formatTokens(tokens)} tokens`, "Cost"];
+                        return [`${formatUsd(Number(v))} · ${formatTokens(tokens)} tokens`, "Cost"];
                       }}
                     />
                     <Area type="monotone" dataKey="costUsd" stroke={chart.accent} fill="url(#grad-cost-brass)" strokeWidth={2} />

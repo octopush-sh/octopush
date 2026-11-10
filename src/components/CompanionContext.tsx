@@ -27,9 +27,10 @@ interface Props {
   onOpenLogbook?: () => void;
 }
 
-/** `$4.20` — three decimals under a cent so a cheap turn never reads as free. */
+/** `$4.20`, `$12,843.27` — three decimals under a cent so a cheap turn never
+ *  reads as free. */
 export function usd(n: number): string {
-  return `$${n > 0 && n < 0.01 ? n.toFixed(3) : n.toFixed(2)}`;
+  return n > 0 && n < 0.01 ? `$${n.toFixed(3)}` : formatUsd(n);
 }
 
 /** The cost lines of a conversation from its ledger figures. Pure so the
