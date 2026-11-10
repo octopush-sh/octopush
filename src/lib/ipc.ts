@@ -39,14 +39,14 @@ export interface PipelineStage {
   role: string;
   agentModel: string;
   /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
-   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  the CLI's own default (Claude Code or Codex) on a CLI stage. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. Either escalate field set = the
    *  stage has an escalation policy. */
   escalateModel?: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). null/absent =
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). null/absent =
    *  keep the base effort on the retry. */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
@@ -157,13 +157,13 @@ export interface StageDraft {
   role: string;
   agentModel: string;
   /** Per-stage reasoning effort; null/absent = off (no thinking) on the API,
-   *  Claude Code's own default on a Claude Code CLI stage; Codex ignores it. */
+   *  the CLI's own default (Claude Code or Codex) on a CLI stage. */
   effort?: Effort | null;
   /** Escalation policy — the stronger model to retry with if this stage fails.
    *  null/absent = no model swap on the retry. */
   escalateModel?: string | null;
   /** Escalation policy — the effort to bump to on the failed-retry (API, or a
-   *  Claude Code CLI stage as `--effort`; Codex ignores it). */
+   *  CLI stage as Claude Code's `--effort` or Codex's `model_reasoning_effort`). */
   escalateEffort?: Effort | null;
   substrate: AgentSubstrate;
   checkpoint: boolean;

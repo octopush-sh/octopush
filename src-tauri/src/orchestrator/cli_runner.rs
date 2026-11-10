@@ -857,9 +857,9 @@ pub fn dialect_for_model(model: &str) -> CliDialect {
 }
 
 /// True when a stage's reasoning effort actually reaches the agent: always on
-/// the API substrate; on the CLI only for a dialect that takes `--effort`
-/// (Claude Code, selected by `model`). Escalation and the pre-run estimate key
-/// on this, so an effort Codex would ignore never counts as a tier change.
+/// the API substrate; on the CLI for a dialect that takes an effort (Claude
+/// Code's `--effort`, Codex's `-c model_reasoning_effort`, selected by
+/// `model`). Escalation and the pre-run estimate key on this.
 pub fn effort_applies(substrate: &str, model: &str) -> bool {
     match substrate {
         "api" => true,
@@ -961,27 +961,58 @@ impl CliDialect {
 
     /// True when the stage's reasoning effort reaches this CLI. Claude Code
     /// takes `--effort <level>` (low/medium/high/xhigh/max, the same tokens as
-    /// [`crate::providers::Effort`]); Codex has no wired equivalent.
+    /// [`crate::providers::Effort`]); Codex takes the one-off config override
+    /// `-c model_reasoning_effort="<level>"`, which beats its config file.
     pub fn takes_effort(&self) -> bool {
-        matches!(self, CliDialect::Claude)
+        matches!(self, CliDialect::Claude | CliDialect::Codex)
     }
 
-    /// `--effort <level>` for a stage with an effort on a dialect that takes
-    /// it; empty otherwise (the CLI keeps its per-model default). Appended to
-    /// fresh and resumed runs alike.
-    pub fn effort_args(&self, effort: Option<crate::providers::Effort>) -> Vec<String> {
-        match effort {
-            Some(e) if self.takes_effort() => vec!["--effort".to_string(), e.as_str().to_string()],
-            _ => Vec::new(),
+    /// The level token this CLI gets for `effort` on `model`; `None` without
+    /// an effort. Codex's levels vary by model: only `gpt-6*` lists `max`, so
+    /// every other model gets its top level, `xhigh`, instead. Claude Code
+    /// clamps per model itself and gets the token unchanged.
+    pub fn effort_level(&self, model: &str, effort: Option<crate::providers::Effort>) -> Option<&'static str> {
+        use crate::providers::Effort;
+        let e = effort.filter(|_| self.takes_effort())?;
+        Some(match (self, e) {
+            (CliDialect::Codex, Effort::Max) if !model.to_ascii_lowercase().starts_with("gpt-6") => "xhigh",
+            _ => e.as_str(),
+        })
+    }
+
+    /// The effort flags for a stage with an effort — Claude Code's
+    /// `--effort <level>`, Codex's `-c model_reasoning_effort="<level>"` —
+    /// empty otherwise (the CLI keeps its per-model default). See
+    /// [`CliDialect::push_effort_args`] for where they go.
+    pub fn effort_args(&self, model: &str, effort: Option<crate::providers::Effort>) -> Vec<String> {
+        match (self, self.effort_level(model, effort)) {
+            (CliDialect::Claude, Some(l)) => vec!["--effort".to_string(), l.to_string()],
+            (CliDialect::Codex, Some(l)) => vec!["-c".to_string(), format!("model_reasoning_effort=\"{l}\"")],
+            (_, None) => Vec::new(),
         }
+    }
+
+    /// Adds [`CliDialect::effort_args`] to a built argv: appended on Claude
+    /// Code (fresh and resumed runs alike), and on Codex placed before the
+    /// trailing `-` so the stdin-prompt marker stays the last argument.
+    pub fn push_effort_args(&self, args: &mut Vec<String>, model: &str, effort: Option<crate::providers::Effort>) {
+        let flags = self.effort_args(model, effort);
+        let at = match self {
+            CliDialect::Codex if args.last().is_some_and(|a| a == "-") => args.len() - 1,
+            _ => args.len(),
+        };
+        let tail = args.split_off(at);
+        args.extend(flags);
+        args.extend(tail);
     }
 
     /// Inherited variables removed from the stage's CLI process. Claude Code
     /// lets `CLAUDE_CODE_EFFORT_LEVEL` beat `--effort`, so a value exported in
     /// the user's shell would silently override the stage's own setting — it
     /// is dropped when the stage passes an effort, and left alone otherwise.
+    /// Codex has no such variable (its `-c` override already wins).
     pub fn stage_env_remove(&self, effort: Option<crate::providers::Effort>) -> Vec<&'static str> {
-        if effort.is_some() && self.takes_effort() {
+        if effort.is_some() && *self == CliDialect::Claude {
             vec!["CLAUDE_CODE_EFFORT_LEVEL"]
         } else {
             Vec::new()
@@ -994,9 +1025,10 @@ impl CliDialect {
     /// older CLI ignores the unknown variable). A subagent's own `effort`
     /// frontmatter still wins. Set over any inherited export, and only when
     /// the stage passes an effort — otherwise the CLI keeps its defaults.
+    /// Codex has no environment equivalent.
     pub fn stage_effort_env(&self, effort: Option<crate::providers::Effort>) -> Vec<(&'static str, String)> {
         match effort {
-            Some(e) if self.takes_effort() => vec![("CLAUDE_CODE_SUBAGENT_EFFORT", e.as_str().to_string())],
+            Some(e) if *self == CliDialect::Claude => vec![("CLAUDE_CODE_SUBAGENT_EFFORT", e.as_str().to_string())],
             _ => Vec::new(),
         }
     }
@@ -1534,7 +1566,7 @@ impl AgentRunner for CliRunner {
             CliDialect::Codex => None,
         };
         args.extend(max_budget_args(budget_cap));
-        args.extend(dialect.effort_args(effort));
+        dialect.push_effort_args(&mut args, &stage.agent_model, effort);
 
         let path_env = resolved_cli_path();
         let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
@@ -1644,7 +1676,7 @@ impl AgentRunner for CliRunner {
             "launching {} · {}{}{}",
             dialect.binary(),
             stage.agent_model,
-            dialect.effort_args(effort).get(1).map(|e| format!(" · {e} effort")).unwrap_or_default(),
+            dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {

@@ -3810,19 +3810,115 @@ mod run_crud_tests {
         mk("completed", None, "api", 2_000);
         mk("aborted", None, "api", 50_000); // not a completed run
         mk("completed", Some("high"), "api", 8_000); // another effort
-        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex ignores effort
+        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex takes -c model_reasoning_effort
         mk("completed", Some("high"), "cli", 4_000); // Claude Code takes --effort
 
         let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
         none.sort();
-        assert_eq!(none, vec![1_000, 2_000, 3_000]);
+        assert_eq!(none, vec![1_000, 2_000]);
         let mut high = db.stage_token_samples("implement", Some("high"), 20).unwrap();
         high.sort_by_key(|s| s.input);
-        assert_eq!(high.iter().map(|s| s.input).collect::<Vec<_>>(), vec![4_000, 8_000]);
-        assert_eq!((high[1].input, high[1].output, high[1].cache_read, high[1].cache_creation), (8_000, 800, 7, 3));
+        assert_eq!(high.iter().map(|s| s.input).collect::<Vec<_>>(), vec![3_000, 4_000, 8_000]);
+        assert_eq!((high[2].input, high[2].output, high[2].cache_read, high[2].cache_creation), (8_000, 800, 7, 3));
         assert_eq!(db.stage_token_samples("plan", None, 20).unwrap().len(), 5);
         assert_eq!(db.stage_token_samples("implement", None, 2).unwrap().len(), 2, "limit caps the samples");
         assert!(db.stage_token_samples("test", None, 20).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_clears_the_effort_codex_stages_never_got_once() {
+        // #613: Codex CLI stages took no effort before, so a stored effort on
+        // one that already ran is false history. The upgrade clears it ONCE,
+        // only in terminal runs and judged on the model the stage last ran on —
+        // stages of a draft or paused run keep theirs (they will run with it),
+        // Claude Code and API stages are untouched, and Codex stages run after
+        // the upgrade keep their (now real) effort. Drives the real migration
+        // by re-opening the same database file (app update).
+        #[allow(clippy::too_many_arguments)]
+        fn mk_as(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, escalated_to: Option<&str>, run_status: &str, stage_status: &str, tokens: i64) -> String {
+            let run = db.create_run(ws, pid, "t", None, None, &[]).unwrap();
+            let st = db.list_run_stages(&run).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE run_stages SET effort = 'high', escalate_effort = 'max', substrate = ?2, agent_model = ?3,
+                         escalate_model = ?4, escalated = ?5
+                     WHERE id = ?1",
+                    rusqlite::params![st[0].id, substrate, model, escalated_to, escalated_to.is_some()],
+                )
+                .unwrap();
+            if stage_status == "done" {
+                db.complete_run_stage(&st[0].id, "done", tokens, tokens / 10, 0, 0, 0.1, None).unwrap();
+            } else {
+                db.conn_ref()
+                    .execute("UPDATE run_stages SET status = ?2 WHERE id = ?1", rusqlite::params![st[0].id, stage_status])
+                    .unwrap();
+            }
+            if run_status != "draft" {
+                db.set_run_status(&run, run_status, matches!(run_status, "completed" | "aborted")).unwrap();
+            }
+            st[0].id.clone()
+        }
+        fn mk(db: &Db, ws: &str, pid: &str, model: &str, substrate: &str, done: bool, tokens: i64) -> String {
+            if done {
+                mk_as(db, ws, pid, model, substrate, None, "completed", "done", tokens)
+            } else {
+                mk_as(db, ws, pid, model, substrate, None, "draft", "pending", tokens)
+            }
+        }
+        let effort_of = |db: &Db, id: &str| -> (Option<String>, Option<String>) {
+            db.conn_ref()
+                .query_row("SELECT effort, escalate_effort FROM run_stages WHERE id = ?1", [id], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap()
+        };
+        let high = || (Some("high".to_string()), Some("max".to_string()));
+        let inputs = |db: &Db, effort: Option<&str>| -> Vec<u64> {
+            let mut v: Vec<u64> = db.stage_token_samples("implement", effort, 20).unwrap().iter().map(|s| s.input).collect();
+            v.sort();
+            v
+        };
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let old_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", true, 1_000);
+        let old_o3 = mk(&db, &ws, &pid, "O3-mini", "cli", true, 2_000);
+        let claude_cli = mk(&db, &ws, &pid, "claude-sonnet-5-5", "cli", true, 4_000);
+        let codex_api = mk(&db, &ws, &pid, "gpt-5", "api", true, 8_000);
+        let pending_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", false, 0);
+        let parked_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "awaiting_checkpoint", 0);
+        let failed_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "paused", "failed", 0);
+        let claude_to_codex = mk_as(&db, &ws, &pid, "claude-sonnet-5-5", "cli", Some("gpt-5-codex"), "completed", "done", 16_000);
+        let codex_to_claude = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", Some("claude-opus-5-5"), "completed", "done", 32_000);
+        let aborted_codex = mk_as(&db, &ws, &pid, "gpt-5-codex", "cli", None, "aborted", "failed", 0);
+        // A pre-upgrade install: no marker yet.
+        db.conn_ref().execute("DELETE FROM app_meta WHERE key = 'codex_stage_effort_cleared_v1'", []).unwrap();
+        drop(db);
+
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(effort_of(&db, &old_codex), (None, None));
+        assert_eq!(effort_of(&db, &old_o3), (None, None));
+        assert_eq!(effort_of(&db, &claude_cli), high(), "Claude Code took --effort");
+        assert_eq!(effort_of(&db, &codex_api), high(), "the API took the effort");
+        assert_eq!(effort_of(&db, &pending_codex), high(), "a pending stage runs with it");
+        assert_eq!(effort_of(&db, &parked_codex), high(), "a budget-parked stage of a paused run runs with it");
+        assert_eq!(effort_of(&db, &failed_codex), high(), "a failed stage of a paused run can be retried with it");
+        assert_eq!(effort_of(&db, &claude_to_codex), (None, None), "it last ran on Codex");
+        assert_eq!(effort_of(&db, &codex_to_claude), high(), "it last ran on Claude Code, which took --effort");
+        assert_eq!(effort_of(&db, &aborted_codex), (None, None), "an aborted run is never resumed");
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000], "old Codex rows count as no effort");
+        assert_eq!(inputs(&db, Some("high")), vec![4_000, 8_000, 32_000]);
+
+        // A Codex stage run after the upgrade keeps its effort across launches.
+        let new_codex = mk(&db, &ws, &pid, "gpt-5-codex", "cli", true, 3_000);
+        drop(db);
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(effort_of(&db, &new_codex), high(), "one-shot: never re-cleared");
+        assert_eq!(inputs(&db, Some("high")), vec![3_000, 4_000, 8_000, 32_000]);
+        assert_eq!(inputs(&db, None), vec![1_000, 2_000, 16_000]);
     }
 
     #[test]
@@ -4719,14 +4815,28 @@ mod orchestrator_tests {
     }
 
     #[test]
-    fn try_escalate_refuses_effort_only_policy_on_codex_cli() {
-        // Codex ignores effort — an effort-only policy there must NOT burn a
-        // pointless same-tier retry (the retry would run identically).
+    fn try_escalate_accepts_effort_only_policy_on_codex_cli() {
+        // Codex takes `-c model_reasoning_effort`, so low → high is a real tier change.
         let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         let orch = orch_for(&db);
-        assert!(!orch.try_escalate(&run, &stage).unwrap(), "Codex ignores effort — no tier change, no retry");
-        assert!(!db.lock().list_run_stages(&run).unwrap()[0].escalated);
+        assert!(orch.try_escalate(&run, &stage).unwrap(), "a Codex CLI effort-only policy escalates");
+        assert!(db.lock().list_run_stages(&run).unwrap()[0].escalated);
+    }
+
+    #[test]
+    fn codex_escalation_judges_the_level_codex_actually_gets() {
+        // Below gpt-6, Codex gets `max` as `xhigh`: xhigh → max runs identically.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("xhigh"), None, Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false));
+        let (db, run) = esc_run_on("cli", "gpt-6.1-terra", Some("xhigh"), None, Some("max"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false), "gpt-6 lists max");
+        // An old Claude Code CLI doesn't stop Codex's effort.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, true));
     }
 
     #[test]
@@ -9132,12 +9242,31 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn claude_stages_pass_their_effort_and_codex_stages_do_not() {
+    fn cli_stages_pass_their_effort_in_each_dialect() {
         use crate::providers::Effort;
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::High)), vec!["--effort", "high"]);
-        assert_eq!(CliDialect::Claude.effort_args(Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
-        assert!(CliDialect::Claude.effort_args(None).is_empty(), "no effort ⇒ the CLI's own default");
-        assert!(CliDialect::Codex.effort_args(Some(Effort::High)).is_empty());
+        let m = "claude-opus-5-5";
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::High)), vec!["--effort", "high"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Xhigh)), vec!["--effort", "xhigh"]);
+        assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Max)), vec!["--effort", "max"]);
+        assert!(CliDialect::Claude.effort_args(m, None).is_empty(), "no effort ⇒ the CLI's own default");
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5-codex", Some(Effort::High)),
+            vec!["-c", "model_reasoning_effort=\"high\""]
+        );
+        assert!(CliDialect::Codex.effort_args("gpt-5-codex", None).is_empty(), "no effort ⇒ Codex's own default");
+    }
+
+    #[test]
+    fn codex_gets_max_only_on_gpt_6() {
+        use crate::providers::Effort;
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(Effort::Max)), Some("xhigh"));
+        assert_eq!(CliDialect::Codex.effort_level("o3", Some(Effort::Max)), Some("xhigh"));
+        assert_eq!(CliDialect::Codex.effort_level("gpt-6.1-terra", Some(Effort::Max)), Some("max"));
+        assert_eq!(CliDialect::Codex.effort_level("GPT-6", Some(Effort::Max)), Some("max"));
+        for e in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh] {
+            assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(e)), Some(e.as_str()));
+        }
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", None), None);
     }
 
     #[test]
@@ -9170,11 +9299,11 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn effort_applies_to_api_and_claude_cli_only() {
+    fn effort_applies_to_api_and_both_cli_dialects() {
         use crate::orchestrator::cli_runner::effort_applies;
         assert!(effort_applies("api", "gpt-5"));
         assert!(effort_applies("cli", "claude-opus-5-5"));
-        assert!(!effort_applies("cli", "gpt-5-codex"));
+        assert!(effort_applies("cli", "gpt-5-codex"));
         assert!(!effort_applies("bogus", "claude-opus-5-5"));
     }
 

@@ -32,10 +32,17 @@ export function runsOnClaudeCode(model: string): boolean {
 }
 
 /** Mirrors `cli_runner::effort_applies`: a stage's reasoning effort reaches
- *  the agent on the API, and on a CLI stage only through Claude Code
- *  (`claude -p --effort <level>`) — Codex ignores it. */
-export function effortApplies(substrate: string, model: string): boolean {
-  return substrate === "api" || (substrate === "cli" && runsOnClaudeCode(model));
+ *  the agent on the API, and on a CLI stage in either dialect — Claude Code
+ *  as `--effort <level>`, Codex as `-c model_reasoning_effort="<level>"`.
+ *  The model picks the dialect, and both take an effort today. */
+export function effortApplies(substrate: string, _model: string): boolean {
+  return substrate === "api" || substrate === "cli";
+}
+
+/** The level a Codex CLI stage actually gets: Codex lists `max` only on
+ *  `gpt-6*`, so other models get `xhigh` (mirrors `CliDialect::effort_level`). */
+export function codexEffortLevel(model: string, effort: string): string {
+  return effort === "max" && !model.toLowerCase().startsWith("gpt-6") ? "xhigh" : effort;
 }
 
 /** True when any CLI stage of the crew (with the launcher's per-position

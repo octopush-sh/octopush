@@ -2806,7 +2806,7 @@ pub async fn estimate_run_cost(
                 .map(|(_, m)| m.clone())
                 .unwrap_or_else(|| s.agent_model.clone());
             // Effort keys the history only where it reaches the agent (API, or
-            // Claude Code's `--effort`); a Codex stage keys as none.
+            // a CLI stage: Claude Code's `--effort`, Codex's `-c` override).
             let effort = s
                 .effort
                 .filter(|_| crate::orchestrator::cli_runner::effort_applies(&s.substrate, &model))

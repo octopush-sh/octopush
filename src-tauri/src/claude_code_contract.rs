@@ -509,7 +509,7 @@ fn stream_json_argv_flags_are_all_known_to_the_cli() {
     for rec in recordings() {
         let fx = rec.label("cli-help.txt");
         let help = rec.text("cli-help.txt");
-        let effort = || CliDialect::Claude.effort_args(Some(crate::providers::Effort::High));
+        let effort = || CliDialect::Claude.effort_args("claude-haiku-4-5", Some(crate::providers::Effort::High));
         for argv in [
             [build_cli_args("claude-haiku-4-5", "system", 3, true), effort()].concat(),
             [build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, true), effort()].concat(),
@@ -714,6 +714,52 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
         .map(|(_, v)| v.as_str());
     assert_eq!(pin, Some("1"), "{env:?}");
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND"));
+}
+
+// ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
+
+#[test]
+fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
+    use crate::providers::Effort;
+    for read_only in [false, true] {
+        let mut argv = CliDialect::Codex.argv("gpt-5-codex", "system", 25, read_only);
+        CliDialect::Codex.push_effort_args(&mut argv, "gpt-5-codex", Some(Effort::High));
+        let n = argv.len();
+        assert_eq!(argv[n - 1], "-", "the prompt still comes from stdin: {argv:?}");
+        assert_eq!(argv[n - 3..n - 1], ["-c", "model_reasoning_effort=\"high\""], "{argv:?}");
+        assert_eq!(argv[..2], ["exec", "--json"], "{argv:?}");
+        // A one-off override, nothing in the environment.
+        assert!(CliDialect::Codex.stage_effort_env(Some(Effort::High)).is_empty());
+        assert!(CliDialect::Codex.stage_env_remove(Some(Effort::High)).is_empty());
+    }
+}
+
+#[test]
+fn codex_argv_without_an_effort_keeps_codexs_own_default() {
+    let plain = CliDialect::Codex.argv("gpt-5-codex", "system", 25, false);
+    let mut argv = plain.clone();
+    CliDialect::Codex.push_effort_args(&mut argv, "gpt-5-codex", None);
+    assert_eq!(argv, plain);
+    assert!(!argv.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")), "{argv:?}");
+}
+
+#[test]
+fn codex_argv_maps_max_to_the_models_top_level() {
+    use crate::providers::Effort;
+    for (model, level) in [("gpt-5-codex", "xhigh"), ("gpt-6.1-terra", "max")] {
+        let mut argv = CliDialect::Codex.argv(model, "system", 25, false);
+        CliDialect::Codex.push_effort_args(&mut argv, model, Some(Effort::Max));
+        let want = format!("model_reasoning_effort=\"{level}\"");
+        assert!(argv.contains(&want), "[{model}] {argv:?}");
+    }
+}
+
+#[test]
+fn claude_argv_appends_the_effort_flag_at_the_end() {
+    use crate::providers::Effort;
+    let mut argv = build_cli_args_resume("claude-haiku-4-5", "aaaaaaaa-0000-4000-8000-000000000001", 3, false);
+    CliDialect::Claude.push_effort_args(&mut argv, "claude-haiku-4-5", Some(Effort::Low));
+    assert_eq!(argv[argv.len() - 2..], ["--effort", "low"], "{argv:?}");
 }
 
 // ─── `rate_limit_event` → Claude plan windows ────────────────────────────

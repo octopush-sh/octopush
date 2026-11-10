@@ -78,17 +78,20 @@ describe("StageInspector — escalate on failure", () => {
     expect(onPatch).toHaveBeenCalledWith({ escalateEffort: "max" });
   });
 
-  it("disables the escalate effort on a Codex CLI stage", () => {
-    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
+  it("enables the escalate effort on a Codex CLI stage", () => {
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
     fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
-    expect(group.getAttribute("aria-disabled")).toBe("true");
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    fireEvent.click(within(group).getByText("High"));
+    expect(onPatch).toHaveBeenCalledWith({ escalateEffort: "high" });
   });
 
   it("judges the escalate effort on the escalation model", () => {
     renderInspector({ substrate: "cli", agentModel: "claude-sonnet-5-5", escalateModel: "gpt-5" });
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
-    expect(group.getAttribute("aria-disabled")).toBe("true");
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    expect(group.querySelector("[title=\"Codex's own default effort for this model\"]")).not.toBeNull();
   });
 });
 
@@ -109,15 +112,33 @@ describe("StageInspector — reasoning on CLI stages", () => {
     expect(within(group).getByText("Off").getAttribute("aria-checked")).toBe("true");
   });
 
-  it("disables reasoning on a Codex stage and says why", () => {
-    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
+  it("passes a Codex stage's effort, with Auto for Codex's default", () => {
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5-codex", effort: null });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
-    expect(group.getAttribute("aria-disabled")).toBe("true");
-    expect(screen.getAllByText("Codex manages its own reasoning.")[0].closest("[aria-hidden='true']")).toBeNull();
-    // No Claude Code default applies on Codex, so no Auto segment or its tooltip.
-    expect(within(group).queryByText("Auto")).toBeNull();
-    expect(within(group).getByText("Off")).toBeTruthy();
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    expect(within(group).getByText("Auto").getAttribute("aria-checked")).toBe("true");
+    expect(within(group).queryByText("Off")).toBeNull();
+    expect(group.querySelector("[title=\"Codex's own default effort for this model\"]")).not.toBeNull();
     expect(group.querySelector("[title=\"Claude Code's own default effort for this model\"]")).toBeNull();
+    // Below gpt-6, Codex has no max: the segment says what it runs as.
+    expect(group.querySelector("[title=\"Runs as XHi, this model's top level in Codex\"]")).not.toBeNull();
+    fireEvent.click(within(group).getByText("High"));
+    expect(onPatch).toHaveBeenCalledWith({ effort: "high" });
+  });
+
+  it("keeps Max as max on a gpt-6 Codex stage", () => {
+    renderInspector({ substrate: "cli", agentModel: "gpt-6.1-terra" });
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.querySelector("[title=\"Runs as XHi, this model's top level in Codex\"]")).toBeNull();
+    expect(group.querySelector("[title=\"Maximum reasoning depth\"]")).not.toBeNull();
+  });
+
+  it("never shows the Claude Code update hint on a Codex stage", async () => {
+    cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });
+    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
+    await waitFor(() => expect(cliVersionMock).toHaveBeenCalled());
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.closest("[aria-hidden='true']")).toBeNull();
   });
 
   it("hides reasoning on a Claude Code older than the floor, folding the hint in", async () => {

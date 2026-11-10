@@ -91,14 +91,14 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(titles).toHaveLength(1);
   });
 
-  it("judges the effort pill on the model the stage actually ran on", () => {
+  it("shows the effort pill whichever CLI the stage ran on", () => {
     const pill = '[title="Reasoning effort for this stage"]';
     const base = { id: "e", position: 0, status: "running", startedAt: 1, substrate: "cli", effort: "high" };
     const onCodex = mk({ ...base, agentModel: "claude-sonnet-5-5", escalated: true, escalateModel: "gpt-5-codex" });
     const { container, unmount } = render(
       <RunFlow stages={[onCodex]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
     );
-    expect(container.querySelector(pill)).toBeNull();
+    expect(container.querySelector(pill)?.textContent).toBe("high");
     unmount();
     // Not escalated: the base model (Claude Code) decides, whatever the policy says.
     const notYet = mk({ ...base, agentModel: "claude-sonnet-5-5", escalated: false, escalateModel: "gpt-5-codex" });
@@ -106,6 +106,22 @@ describe("RunFlow — depth of field & the single beacon", () => {
       <RunFlow stages={[notYet]} selectedStageId="e" beaconStageId={null} onSelectStage={() => {}} />,
     );
     expect(again.container.querySelector(pill)?.textContent).toBe("high");
+  });
+
+  it("shows no effort pill on a Codex stage that ran without one", () => {
+    // Codex stages that ran before they took an effort had it cleared by the
+    // backend migration (#613), so they read as Codex's default — no pill.
+    const pill = '[title="Reasoning effort for this stage"]';
+    const base = { id: "c", position: 0, status: "done", startedAt: 1, substrate: "cli", agentModel: "gpt-5-codex" };
+    const before = render(
+      <RunFlow stages={[mk({ ...base, effort: null })]} selectedStageId="c" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(before.container.querySelector(pill)).toBeNull();
+    before.unmount();
+    const after = render(
+      <RunFlow stages={[mk({ ...base, effort: "xhigh" })]} selectedStageId="c" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(after.container.querySelector(pill)?.textContent).toBe("xhigh");
   });
 
   it("says a running stage waits for its first tool call in the card's live line", () => {

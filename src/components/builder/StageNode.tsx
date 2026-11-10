@@ -25,7 +25,7 @@ function StageNodeImpl({ id, data, selected }: NodeProps<StageNodeT>) {
   // The CLI agent manages its own tools, so the allowlist doesn't apply there —
   // show it as "managed" rather than implying a restriction we don't enforce.
   const cliManaged = data.substrate === "cli";
-  // Effort reaches the API and Claude Code (`--effort`), not Codex.
+  // Effort reaches the API and both CLIs (Claude Code `--effort`, Codex `-c`).
   const showEffort = effortApplies(data.substrate, data.agentModel);
   // Escalation policy hint: the model swap applies to both substrates; the
   // effort-only bump follows the same rule as the base effort pill.

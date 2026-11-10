@@ -788,6 +788,35 @@ impl Db {
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
         )?;
+        // #613 (ONE-SHOT, gated via app_meta): Codex CLI stages took no effort
+        // before #613, so a stored effort on one that already ran is one it never
+        // got. Clear it, so history (RunFlow's pill, the pre-run estimate's
+        // samples) is true to what ran; from here on a Codex stage's effort is
+        // real. Only stages of a terminal run (completed/aborted — what `drive`
+        // never resumes) are cleared: every stage of a draft, running or paused
+        // run (a budget-parked `awaiting_checkpoint` stage, a retryable failed
+        // one) will still run with its effort. A stage is judged on the model it
+        // last ran on (`escalate_model` once escalated, as RunFlow and
+        // `run_stage_once` do); the model test mirrors
+        // `cli_runner::dialect_for_model`. `pipeline_stages` is left alone: those
+        // efforts apply from now on.
+        if self.meta_get("codex_stage_effort_cleared_v1")?.is_none() {
+            self.conn.execute(
+                "UPDATE run_stages SET effort = NULL, escalate_effort = NULL
+                 WHERE id IN (
+                     SELECT id FROM (
+                         SELECT s.id, lower(CASE WHEN s.escalated AND s.escalate_model IS NOT NULL
+                                                 THEN s.escalate_model ELSE s.agent_model END) AS m
+                         FROM run_stages s JOIN runs r ON r.id = s.run_id
+                         WHERE s.substrate = 'cli' AND r.status IN ('completed', 'aborted')
+                     )
+                     WHERE m LIKE 'gpt-%' OR m LIKE 'o1%' OR m LIKE 'o3%' OR m LIKE 'o4%'
+                        OR m LIKE '%codex%'
+                 )",
+                [],
+            )?;
+            self.meta_set("codex_stage_effort_cleared_v1", "done")?;
+        }
 
         // ── Routine pre-fire condition (Routines, `fire_condition` gate) ────
         // An optional shell command evaluated before each fire (exit 0 ⇒ fire,
@@ -5755,9 +5784,9 @@ impl Db {
     /// Tokens of the `limit` most recent stages of `role` at `effort` in
     /// completed runs, each summed over every attempt the ledger recorded
     /// (loop-backs and re-runs included — that is what the stage cost).
-    /// Effort reaches the API and Claude Code (`--effort`) but not Codex, so a
-    /// Codex CLI stage counts as no effort — the model test mirrors
-    /// `cli_runner::dialect_for_model`. Read-only; feeds the pre-run estimate.
+    /// Every stage keys by its stored effort: Codex CLI stages that ran before
+    /// they took one had it cleared by a one-time migration (#613), so they
+    /// count as no effort, as they ran. Read-only; feeds the pre-run estimate.
     pub fn stage_token_samples(
         &self,
         role: &str,
@@ -5771,11 +5800,7 @@ impl Db {
              JOIN run_stages s ON s.id = se.source_id
              JOIN runs r ON r.id = s.run_id
              WHERE se.surface = 'direct' AND r.status = 'completed' AND s.role = ?1
-               AND (CASE WHEN s.substrate = 'cli' AND (
-                        lower(s.agent_model) LIKE 'gpt-%' OR lower(s.agent_model) LIKE 'o1%'
-                        OR lower(s.agent_model) LIKE 'o3%' OR lower(s.agent_model) LIKE 'o4%'
-                        OR lower(s.agent_model) LIKE '%codex%'
-                    ) THEN NULL ELSE s.effort END) IS ?2
+               AND s.effort IS ?2
              GROUP BY s.id
              HAVING SUM(se.input_tokens + se.output_tokens + se.cache_read_tokens + se.cache_creation_tokens) > 0
              ORDER BY MAX(se.ts_utc) DESC
