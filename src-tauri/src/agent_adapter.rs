@@ -443,45 +443,84 @@ fn probe_claude_version() -> Option<String> {
 
 // ─── `claude auth status` → claude.ai sign-in end (2.1.318+) ──────
 
-pub const CLAUDE_AUTH_STATUS_ARGS: [&str; 2] = ["auth", "status"];
+/// `--json` is asked for explicitly (it is the default today, see
+/// `claude auth status --help`), so a future default change can't turn the
+/// answer into text.
+pub const CLAUDE_AUTH_STATUS_ARGS: [&str; 3] = ["auth", "status", "--json"];
 
-/// When the stored claude.ai sign-in ends, epoch seconds, from
-/// `claude auth status`'s JSON (`loginExpiresAt`, Claude Code 2.1.318+).
-/// `None` when signed out (`loggedIn: false`), for an older CLI without the
-/// field, and for output that isn't the JSON object. The format isn't
-/// documented, so RFC 3339 text and epoch seconds or milliseconds are all
-/// accepted. Text around the object (a stderr warning) is skipped.
-pub fn parse_login_expires_at(output: &str) -> Option<i64> {
-    let start = output.find('{')?;
-    let end = output.rfind('}')?;
-    let v: serde_json::Value = serde_json::from_str(output.get(start..=end)?).ok()?;
-    if v.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(false) {
-        return None;
-    }
-    crate::orchestrator::cli_runner::expiry_secs(v.get("loginExpiresAt")?)
+/// The Claude Code release whose `claude auth status` reports
+/// `loginExpiresAt` (changelog 2.1.318). Older CLIs never say when the
+/// sign-in ends, so Check again can't read a new date from them.
+pub const CLAUDE_LOGIN_END_SINCE: &str = "2.1.318";
+
+/// How long `claude auth status` may run. It may refresh the OAuth token,
+/// and interrupting that can sign the user out (Claude Code changelog
+/// 2.1.301 and 2.1.317), so it gets far longer than a Readiness check, a
+/// SIGTERM before the SIGKILL, and is let finish at quit.
+pub const CLAUDE_AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long a timed-out `claude auth status` has after SIGTERM to save what
+/// it was writing before its group is SIGKILLed.
+pub const CLAUDE_AUTH_STATUS_TERM_GRACE: Duration = Duration::from_secs(2);
+
+/// What `claude auth status` said about the claude.ai sign-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaudeLoginProbe {
+    /// Signed in; the stored sign-in ends at this epoch second
+    /// (`loginExpiresAt`, Claude Code 2.1.318+).
+    SignedIn(i64),
+    /// `loggedIn: false`: there is no sign-in, so no stored end applies.
+    SignedOut,
+    /// Not asked, missing, timed out, an older CLI without the field, or
+    /// output that isn't the JSON object: nothing is known.
+    Unknown,
 }
 
-/// `claude auth status` with the login-shell PATH and environment the CLI
-/// stages use, through the Readiness probe runner (3 s, output capped, its
-/// process group killed). `None` when it is missing, hangs, or reports no
-/// sign-in end. What it prints (the account too) stays in memory: only the
-/// date is kept.
-pub fn probe_claude_login_expiry() -> Option<i64> {
-    use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
-    use crate::readiness::{run_probe, Probe, CHECK_TIMEOUT};
-    let path_env = resolved_cli_path();
-    let cmd = resolve_executable("claude", &path_env).map(|bin| {
-        let mut cmd = Command::new(bin);
-        cmd.args(CLAUDE_AUTH_STATUS_ARGS);
-        for (k, v) in login_shell_env() {
-            cmd.env(k, v);
+impl ClaudeLoginProbe {
+    /// The sign-in end, when signed in with one.
+    pub fn expires_at(self) -> Option<i64> {
+        match self {
+            ClaudeLoginProbe::SignedIn(e) => Some(e),
+            _ => None,
         }
-        cmd.env("PATH", &path_env);
-        cmd
-    });
-    match run_probe(cmd, CHECK_TIMEOUT) {
-        Probe::Exited { output, .. } => parse_login_expires_at(&output),
-        Probe::Missing | Probe::TimedOut => None,
+    }
+}
+
+/// Read `claude auth status --json`. `loggedIn: false` is
+/// [`ClaudeLoginProbe::SignedOut`] whatever else it prints;
+/// `loginExpiresAt` (Claude Code 2.1.318+) gives
+/// [`ClaudeLoginProbe::SignedIn`]; anything else is
+/// [`ClaudeLoginProbe::Unknown`]. The date format isn't documented, so
+/// RFC 3339 text and epoch seconds or milliseconds are all accepted. Text
+/// around the object (a stderr warning) is skipped.
+pub fn parse_claude_auth_status(output: &str) -> ClaudeLoginProbe {
+    let object = || -> Option<serde_json::Value> {
+        let start = output.find('{')?;
+        let end = output.rfind('}')?;
+        serde_json::from_str(output.get(start..=end)?).ok()
+    };
+    let Some(v) = object() else { return ClaudeLoginProbe::Unknown };
+    if v.get("loggedIn").and_then(serde_json::Value::as_bool) == Some(false) {
+        return ClaudeLoginProbe::SignedOut;
+    }
+    match v.get("loginExpiresAt").and_then(crate::orchestrator::cli_runner::expiry_secs) {
+        Some(e) => ClaudeLoginProbe::SignedIn(e),
+        None => ClaudeLoginProbe::Unknown,
+    }
+}
+
+/// `claude auth status --json` with the login-shell PATH and environment the
+/// CLI stages use, through the Readiness probe runner (output capped, its
+/// process group SIGTERMed then SIGKILLed after
+/// [`CLAUDE_AUTH_STATUS_TIMEOUT`], let finish at quit). What it prints (the
+/// account too) stays in memory: only the date and whether it is signed in
+/// are kept.
+pub fn probe_claude_login() -> ClaudeLoginProbe {
+    use crate::readiness::{local_command, run_probe_terminating, OnQuit, Probe};
+    let cmd = local_command("claude", &CLAUDE_AUTH_STATUS_ARGS);
+    match run_probe_terminating(cmd, CLAUDE_AUTH_STATUS_TIMEOUT, CLAUDE_AUTH_STATUS_TERM_GRACE, OnQuit::Finish) {
+        Probe::Exited { output, .. } => parse_claude_auth_status(&output),
+        Probe::Missing | Probe::TimedOut => ClaudeLoginProbe::Unknown,
     }
 }
 

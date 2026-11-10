@@ -6,6 +6,7 @@
 //! already streams to the stage. Older CLIs never send it, so nothing is
 //! stored and every reader keeps its old behaviour.
 
+use crate::agent_adapter::ClaudeLoginProbe;
 use crate::db::Db;
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
@@ -56,9 +57,29 @@ pub fn record(db: &Db, expires_at: i64, seen_at: &str) -> AppResult<()> {
 }
 
 /// Forget the stored end: a Claude Code stage ran as an API-key session, so
-/// stages no longer use the sign-in and none will report a new date.
+/// stages no longer use the sign-in and none will report a new date, or
+/// `claude auth status` said signed out ([`apply_probe`]).
 pub fn clear(db: &Db) -> AppResult<()> {
     db.meta_delete(KEY)
+}
+
+/// What a Readiness `claude auth status` answer does to the stored end:
+/// signed in with a date records it; signed out clears it (no sign-in, so the
+/// old date no longer applies); unknown leaves it. Returns the `expiresAt`
+/// for a [`LOGIN_EVENT`] when something changed (`None` inside: cleared), so
+/// the launcher and the sign-in notes agree with the row.
+pub fn apply_probe(db: &Db, probe: ClaudeLoginProbe, seen_at: &str) -> AppResult<Option<Option<i64>>> {
+    match probe {
+        ClaudeLoginProbe::SignedIn(expires_at) => {
+            record(db, expires_at, seen_at)?;
+            Ok(Some(Some(expires_at)))
+        }
+        ClaudeLoginProbe::SignedOut if load(db)?.is_some() => {
+            clear(db)?;
+            Ok(Some(None))
+        }
+        ClaudeLoginProbe::SignedOut | ClaudeLoginProbe::Unknown => Ok(None),
+    }
 }
 
 /// The stored end; `None` until a stage reported one (or if unreadable).
