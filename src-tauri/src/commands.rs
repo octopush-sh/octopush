@@ -3917,6 +3917,12 @@ pub async fn refresh_pricing(state: State<'_, AppState>) -> AppResult<RefreshPri
 const LEDGER_UNPRICED_CLASSIFIED: &str = "ledger_unpriced_classify_v1";
 /// `app_meta` flag: rows billed at a known-wrong builtin price were fixed.
 const LEDGER_STALE_PRICES_FIXED: &str = "ledger_stale_price_fix_2026_10_v1";
+/// `app_meta` flag: rows billed with GPT-4o / GPT-4o mini cached input at the
+/// full input price were fixed. Separate from [`LEDGER_STALE_PRICES_FIXED`]
+/// because installs upgraded from v0.4.89+ already carry that flag.
+const LEDGER_STALE_PRICES_FIXED_GPT4O: &str = "ledger_stale_price_fix_2026_11_gpt4o_v1";
+/// The models the GPT-4o cached-input correction covers.
+const GPT4O_STALE_IDS: &[&str] = &["gpt-4o", "gpt-4o-mini"];
 
 /// Price every unpriced ledger row with the catalog as it stands now (rows
 /// whose model is still unpriced stay at $0, marked `'unpriced'`; an
@@ -3931,7 +3937,18 @@ pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> App
     let price = |m: &str| crate::token_engine::prices_in(router.as_deref(), m);
 
     if db.lock().meta_get(LEDGER_STALE_PRICES_FIXED)?.is_none() {
-        fix_stale_prices(db, &price)?;
+        // Fresh pass over every stale id: covers the GPT-4o fix too.
+        let mut ids: Vec<&str> = crate::provider_router::STALE_BUILTIN_PRICES.iter().map(|(id, _)| *id).collect();
+        ids.dedup();
+        fix_stale_prices(db, &price, &ids, true)?;
+        let d = db.lock();
+        d.meta_set(LEDGER_STALE_PRICES_FIXED, "done")?;
+        d.meta_set(LEDGER_STALE_PRICES_FIXED_GPT4O, "done")?;
+    } else if db.lock().meta_get(LEDGER_STALE_PRICES_FIXED_GPT4O)?.is_none() {
+        // Upgraded past the October pass: correct the GPT-4o rows only. Its
+        // change is not a uniform rescale, so DIRECT stages are never scaled.
+        fix_stale_prices(db, &price, GPT4O_STALE_IDS, false)?;
+        db.lock().meta_set(LEDGER_STALE_PRICES_FIXED_GPT4O, "done")?;
     }
 
     let classify_legacy = db.lock().meta_get(LEDGER_UNPRICED_CLASSIFIED)?.is_none();
@@ -3945,23 +3962,26 @@ pub(crate) fn reprice_ledger(db: &Arc<parking_lot::Mutex<crate::db::Db>>) -> App
     Ok(n)
 }
 
-/// One-time: re-price `'computed'` ledger rows and DIRECT run figures of
-/// models an earlier release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at
-/// $3/$15, GPT-4o and GPT-4o mini with cached input at $0 —
-/// `provider_router::STALE_BUILTIN_PRICES`) at today's price.
-/// Ledger rows are recomputed from their tokens; run stages (no cache split
-/// persisted) are scaled by the uniform correction factor, which is only
-/// applied when today's price is a uniform rescale of the stale one (so the
-/// GPT-4o entries, whose input and output prices didn't change, correct
-/// ledger rows only).
+/// One-time: re-price `'computed'` ledger rows of `ids` — models an earlier
+/// release priced wrong (Opus 4.6 at $15/$75, Sonnet 5 at $3/$15, GPT-4o and
+/// GPT-4o mini with cached input at $0 — `provider_router::STALE_BUILTIN_PRICES`)
+/// — at today's price, and with `scale_direct` their DIRECT run figures too.
+/// Ledger rows are recomputed from their tokens (idempotent: a re-run lands
+/// on the same cost); run stages (no cache split persisted) are scaled by the
+/// uniform correction factor, which is only applied when today's price is a
+/// uniform rescale of the stale one (so the GPT-4o entries, whose input and
+/// output prices didn't change, correct ledger rows only). The caller gates
+/// each pass with its `app_meta` flag: `ledger_stale_price_fix_2026_10_v1`
+/// runs every id; installs that already had it get a GPT-4o-only pass under
+/// `ledger_stale_price_fix_2026_11_gpt4o_v1`, with no stage scaling.
 fn fix_stale_prices(
     db: &Arc<parking_lot::Mutex<crate::db::Db>>,
     price: &dyn Fn(&str) -> Option<crate::token_engine::ModelPrices>,
+    ids: &[&str],
+    scale_direct: bool,
 ) -> AppResult<()> {
-    let mut ids: Vec<&str> = crate::provider_router::STALE_BUILTIN_PRICES.iter().map(|(id, _)| *id).collect();
-    ids.dedup();
     let mut ratios: Vec<(String, f64)> = Vec::new();
-    for id in &ids {
+    for id in ids.iter().filter(|_| scale_direct) {
         // The first listed tuple is the full stale default.
         let Some((_, stale)) = crate::provider_router::STALE_BUILTIN_PRICES.iter().find(|(i, _)| i == id) else { continue };
         let Some(now) = price(id) else { continue };
@@ -3983,7 +4003,6 @@ fn fix_stale_prices(
     let d = db.lock();
     let repriced = d.apply_reprice(&plan)?;
     let stages = d.fix_stale_direct_prices(&ratios)?;
-    d.meta_set(LEDGER_STALE_PRICES_FIXED, "done")?;
     if repriced + stages > 0 {
         tracing::info!(rows = repriced, stages, "corrected spend billed at a stale builtin price");
     }

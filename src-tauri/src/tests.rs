@@ -14434,6 +14434,7 @@ mod unpriced_ledger_tests {
         assert_eq!(cost_of(&d, "e"), (0.0, "computed".into()));
         assert!(d.meta_get("ledger_unpriced_classify_v1").unwrap().is_some());
         assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
         // Flags set: a later legacy $0 row is no longer scanned, and the stale
         // pass never re-runs.
         d.insert_spend_event(&spend("claude-mythos-2", "f", "run", None, 0.0, "computed", 1_000, 0)).unwrap();
@@ -14443,6 +14444,54 @@ mod unpriced_ledger_tests {
         let d = db.lock();
         assert_eq!(cost_of(&d, "f"), (0.0, "computed".into()));
         assert!((cost_of(&d, "g").0 - 0.0225).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn upgraded_ledger_gets_the_gpt4o_cached_input_fix_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        // Billed with cached input at the full input price: (i + cr) × in + out × out.
+        let old = |i: f64, cr: f64, inp: f64, out: f64| ((i + cr) * inp + 100.0 * out) / 1e6;
+        let gpt4o_old = old(1_000.0, 50_000.0, 2.5, 10.0);
+        let mini_old = old(1_000.0, 50_000.0, 0.15, 0.6);
+        let opus46_stale = (1_000.0 * 15.0 + 100.0 * 75.0) / 1e6;
+        {
+            let d = db.lock();
+            // An install upgraded from v0.4.89+: the October pass already ran.
+            d.meta_set("ledger_stale_price_fix_2026_10_v1", "done").unwrap();
+            d.meta_set("ledger_unpriced_classify_v1", "done").unwrap();
+            d.insert_spend_event(&spend("gpt-4o", "a", "talk", Some("director"), gpt4o_old, "computed", 1_000, 50_000)).unwrap();
+            d.insert_spend_event(&spend("openai/gpt-4o-mini", "b", "run", None, mini_old, "computed", 1_000, 50_000)).unwrap();
+            // Provider-reported cost: never recomputed.
+            let mut reported = spend("gpt-4o", "c", "talk", Some("director"), gpt4o_old, "provider", 1_000, 50_000);
+            reported.provider_cost_usd = Some(gpt4o_old);
+            d.insert_spend_event(&reported).unwrap();
+            // A subscription-billed row: not 'computed', left alone.
+            d.insert_spend_event(&spend("gpt-4o", "d", "talk", Some("director"), gpt4o_old, "subscription", 1_000, 50_000)).unwrap();
+            // The October pass is not re-run for other stale ids.
+            d.insert_spend_event(&spend("claude-opus-4-6", "e", "run", None, opus46_stale, "computed", 1_000, 0)).unwrap();
+        }
+        crate::commands::reprice_ledger(&db).unwrap();
+        let gpt4o_new = (1_000.0 * 2.5 + 50_000.0 * 1.25 + 100.0 * 10.0) / 1e6;
+        let mini_new = (1_000.0 * 0.15 + 50_000.0 * 0.075 + 100.0 * 0.6) / 1e6;
+        let check = |d: &Db| {
+            let (a, basis) = cost_of(d, "a");
+            assert!((a - gpt4o_new).abs() < 1e-12 && basis == "computed", "gpt-4o row: {a} vs {gpt4o_new}");
+            let (b, _) = cost_of(d, "b");
+            assert!((b - mini_new).abs() < 1e-12, "gpt-4o-mini row: {b} vs {mini_new}");
+            assert_eq!(cost_of(d, "c"), (gpt4o_old, "provider".into()));
+            assert_eq!(cost_of(d, "d"), (gpt4o_old, "subscription".into()));
+            assert!((cost_of(d, "e").0 - opus46_stale).abs() < 1e-12);
+        };
+        {
+            let d = db.lock();
+            check(&d);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_11_gpt4o_v1").unwrap().is_some());
+        }
+        // A second run changes nothing.
+        crate::commands::reprice_ledger(&db).unwrap();
+        check(&db.lock());
     }
 
     #[test]
