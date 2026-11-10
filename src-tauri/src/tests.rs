@@ -13471,6 +13471,34 @@ mod transcript_tests {
 
     #[test]
     #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fable_5_2_transcripts_instead_of_leaving_them_unpriced() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/fable-5-2";
+        session_on(&db.lock(), "sess-f52", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Fable 5.2: $8 in, $40 out, $0.20 hits, $10 5-minute writes.
+        std::fs::write(
+            pdir.join("cc-sess.jsonl"),
+            format!(
+                "{}\n",
+                line("assistant", "req_f52", "claude-fable-5-2", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "2026-11-09T10:00:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 0);
+        let expected = 8.0 + 0.20 + 10.0 + 40.0;
+        assert!((rep.totals.cost_usd - expected).abs() < 1e-6, "{} vs {expected}", rep.totals.cost_usd);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn ingest_prices_fast_mode_turns_at_the_fast_rate_and_stores_their_speed() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
         let _cfg = crate::provider_router::TestConfigDir::new();
@@ -14257,6 +14285,28 @@ mod pricing_table_tests {
         assert_prices("claude-haiku-5-5", 0.10, 0.125, 0.01, 0.50);
         assert_prices("claude-fable-5", 10.0, 12.50, 1.0, 50.0);
         assert_prices("claude-opus-5", 5.0, 6.25, 0.50, 25.0);
+    }
+
+    #[test]
+    fn fable_5_2_and_mythos_5_2_are_priced_in_every_spelling() {
+        // Pricing page: $8 in / $10 5m write / $16 1h write / $0.20 hit / $40 out.
+        for m in [
+            "claude-fable-5-2",
+            "claude-fable-5.2[1m]",
+            "eu.anthropic.claude-fable-5-2-v1",
+            "claude-mythos-5-2",
+            "claude-mythos-5.2[1m]",
+            "us.anthropic.claude-mythos-5-2-v1:0",
+        ] {
+            assert_prices(m, 8.0, 10.0, 0.20, 40.0);
+            let p = builtin_prices(m).unwrap();
+            assert!((p.cache_creation_1h_per_m - 16.0).abs() < 1e-9, "{m}");
+        }
+        assert_eq!(crate::token_engine::normalize_model_id("eu.anthropic.claude-fable-5-2-v1"), "claude-fable-5-2");
+        // Mythos 5.2 is priced, not offered: it stays out of the catalog.
+        let catalog = crate::provider_router::builtin_providers();
+        assert!(catalog["anthropic"].models.iter().any(|m| m.id == "claude-fable-5-2"));
+        assert!(!catalog.values().flat_map(|p| &p.models).any(|m| m.id.contains("mythos")));
     }
 
     #[test]
