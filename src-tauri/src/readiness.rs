@@ -1160,14 +1160,14 @@ mod tests {
 
     #[test]
     fn claude_found_missing_old_timeout_and_broken() {
-        let ok = claude_check(probe("echo '2.1.319 (Claude Code)'"), "2.1.314");
-        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.319", None));
+        let ok = claude_check(probe("echo '2.1.321 (Claude Code)'"), "2.1.314");
+        assert_eq!((ok.status, ok.value.as_str(), ok.fix.as_deref()), (CheckStatus::Ok, "2.1.321", None));
         // At the floor but without a security fix: amber, never blocked.
-        let unsafe_cli = claude_check(probe("echo '2.1.316 (Claude Code)'"), "2.1.314");
-        assert_eq!((unsafe_cli.status, unsafe_cli.value.as_str()), (CheckStatus::Warn, "2.1.316"));
+        let unsafe_cli = claude_check(probe("echo '2.1.319 (Claude Code)'"), "2.1.314");
+        assert_eq!((unsafe_cli.status, unsafe_cli.value.as_str()), (CheckStatus::Warn, "2.1.319"));
         assert_eq!(
             unsafe_cli.fix.as_deref(),
-            Some("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree.")
+            Some("Update Claude Code: 2.1.321 fixes a read-only Bash command running outside the sandbox without a prompt.")
         );
         assert_eq!(unsafe_cli.command.as_deref(), Some(UPDATE_CLAUDE));
         let missing = claude_check(Probe::Missing, "2.1.314");
@@ -1175,8 +1175,8 @@ mod tests {
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
         assert_eq!((old.status, old.value.as_str()), (CheckStatus::Warn, "2.1.307 · tested with 2.1.314"));
         assert_eq!(old.command.as_deref(), Some(UPDATE_CLAUDE));
-        // 2.1.314 itself lacks the 2.1.319 fix: recommend the fix.
-        assert_eq!(old.fix.as_deref(), Some("Update to 2.1.319 or newer; older releases can record wrong token usage."));
+        // 2.1.314 itself lacks the 2.1.321 fix: recommend the fix.
+        assert_eq!(old.fix.as_deref(), Some("Update to 2.1.321 or newer; older releases can record wrong token usage."));
         let hung = claude_check(run_probe(sh("sleep 5"), Duration::from_millis(100)), "2.1.314");
         assert_eq!((hung.status, hung.timed_out), (CheckStatus::Warn, true));
         let broken = claude_check(probe("echo 2.1.316; exit 1"), "2.1.314");

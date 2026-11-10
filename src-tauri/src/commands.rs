@@ -6568,6 +6568,16 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
         .map_err(|e| AppError::Other(format!("version task failed: {e}")))
 }
 
+/// Direct launcher: the one crew model (Claude Code CLI stages and their
+/// escalation models) the installed CLI is too old to launch. Reads the cached
+/// version without waiting or probing, like stage escalation; `None` when
+/// none needs a newer CLI or the version is unknown.
+#[tauri::command]
+pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached()
+        .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
 /// Settings › General readiness card: local checks (claude, auth mode, git,
 /// gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
 /// (an explicit Check again) also runs `claude auth status`; the sign-in end
