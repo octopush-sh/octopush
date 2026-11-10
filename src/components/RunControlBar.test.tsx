@@ -146,6 +146,33 @@ describe("RunControlBar", () => {
     expect(h.onReject).toHaveBeenCalledWith("", 50);
   });
 
+  it("hook-deferred tool: a transient-looking tool name or stderr tail keeps the halt layout", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused mcp__cloudflare-dns__create_record before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)\n— stderr —\nrequest timed out",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.queryByText(/awaiting retry/i)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Re-run · 50 turns$/i })).toBeInTheDocument();
+  });
+
+  it("halt banner with Re-run primary: Re-run with feedback opens the editor and passes turns", async () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused Edit before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: /^Re-run with feedback$/i }));
+    expect(h.onReject).not.toHaveBeenCalled();
+    fireEvent.change(await screen.findByRole("textbox"), { target: { value: "skip the hook" } });
+    fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
+    expect(h.onReject).toHaveBeenCalledWith("skip the hook", 50);
+  });
+
   it("transient halt: offers Resume in amber, not accept/re-run", () => {
     const h = handlers();
     render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "rate limit exceeded" })}

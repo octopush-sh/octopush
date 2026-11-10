@@ -1,4 +1,5 @@
 import type { Run, RunStageStatus, RunStatus } from "./ipc";
+import { isDeferredToolHalt } from "./stageHalt";
 
 export interface StatusMeta {
   label: string;
@@ -70,6 +71,9 @@ export function needsYou(run: Pick<Run, "status">): boolean {
  *  the right affordance rather than Re-run-from-scratch or accept-partial-work. */
 export function isTransientHalt(error: string | null): boolean {
   if (!error) return false;
+  // A hook-deferred tool halt is never transient, whatever its tool name or
+  // stderr tail says ("cloudflare-dns", "timed out"): re-run is the way on.
+  if (isDeferredToolHalt(error)) return false;
   const e = error.toLowerCase();
   return (
     // Startup recovery stamps "interrupted — Octopush closed while…" on stages
@@ -82,9 +86,9 @@ export function isTransientHalt(error: string | null): boolean {
     // FATAL error as transient — hiding "Accept & continue" behind "Resume".
     /api error (429|529|50[0-4])\b/.test(e) ||
     // Connection-level failures (reqwest "request failed", timeouts, DNS).
-    /request failed/.test(e) ||
+    /\brequest failed\b/.test(e) ||
     /\btimed?\s?out\b|\btimeout\b/.test(e) ||
-    /connection (reset|closed|refused)|dns/.test(e)
+    /\bconnection (reset|closed|refused)\b|\bdns\b/.test(e)
   );
 }
 

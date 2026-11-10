@@ -256,10 +256,11 @@ function DecisionBar({
   const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
-  const transient = failed && isTransientHalt(blockedStage.error);
+  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
+  // A cause that prefers a re-run (a deferred tool) is never a transient wait.
+  const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
   const canResume = blockedStage.substrate === "cli" && !!blockedStage.sessionId;
   const canDiscard = !!blockedStage.baselineCommit;
-  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
   // Resume is the primary action when it can continue the session, unless the
   // cause says a fresh attempt is the likelier way forward (a deferred tool).
   const resumeFirst = canResume && !cause.preferRerun;
@@ -323,6 +324,12 @@ function DecisionBar({
                   <button type="button" onClick={() => setMode("reject")}
                     className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                     Re-run
+                  </button>
+                )}
+                {!resumeFirst && (
+                  <button type="button" onClick={() => setMode("reject")} data-tour="direct-halt-rerun-feedback"
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Re-run with feedback
                   </button>
                 )}
                 {canResume && !resumeFirst && (
