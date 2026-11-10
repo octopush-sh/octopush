@@ -713,7 +713,7 @@ mod effort {
     #[test]
     fn openai_reasoning_effort_only_on_reasoning_models() {
         // Reasoning models get reasoning_effort…
-        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini"] {
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "gpt-6.1-terra"] {
             let mut req = sample_request();
             req.model = m.into();
             req.effort = Some(Effort::High);
@@ -743,7 +743,7 @@ mod effort {
     fn openai_reasoning_models_use_max_completion_tokens() {
         // Reasoning models reject `max_tokens` (400) — they want
         // `max_completion_tokens`, also unclamped.
-        for m in ["o1", "o3-mini", "o4-mini", "gpt-5"] {
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-6.1-terra"] {
             let mut req = sample_request();
             req.model = m.into();
             req.max_tokens = 48000;
