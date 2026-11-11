@@ -16525,6 +16525,12 @@ mod crew_tests {
             "\u{1F419}\u{200D}\u{200D}\u{1F419}",
             "a\u{FE0F}\u{200D}\u{1F419}",
             "\u{1F419}\u{200D}a",
+            // Issue #690: a joiner needs an Extended_Pictographic on each side.
+            "\u{1F1FA}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{1F1FA}",
+            "\u{1F3FD}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{1F3FD}",
+            "\u{1F1FA}\u{1F3FD}\u{200D}\u{1F419}",
         ];
         for s in hostile {
             assert!(crew::first_hidden(s).is_some(), "{s:?} has a hidden character");
@@ -16543,6 +16549,14 @@ mod crew_tests {
             "\u{1F469}\u{200D}\u{1F4BB}",                 // 👩‍💻
             "\u{2764}\u{FE0F}\u{200D}\u{1F525}",          // ❤️‍🔥
             "\u{1F468}\u{1F3FD}\u{200D}\u{1F4BB}",        // 👨🏽‍💻
+            "\u{1F3F3}\u{FE0F}\u{200D}\u{26A7}\u{FE0F}",  // 🏳️‍⚧️
+            "\u{1F3F4}\u{200D}\u{2620}\u{FE0F}",          // 🏴‍☠️
+            "\u{1F441}\u{FE0F}\u{200D}\u{1F5E8}\u{FE0F}", // 👁️‍🗨️
+            "\u{1F43B}\u{200D}\u{2744}\u{FE0F}",          // 🐻‍❄️
+            "\u{1F408}\u{200D}\u{2B1B}",                  // 🐈‍⬛
+            "\u{1F642}\u{200D}\u{2194}\u{FE0F}",          // 🙂‍↔️
+            "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}", // 👩‍👩‍👧‍👦
+            "\u{1F9D1}\u{1F3FB}\u{200D}\u{1F91D}\u{200D}\u{1F9D1}\u{1F3FC}", // 🧑🏻‍🤝‍🧑🏼
             "#\u{FE0F}\u{20E3}",                          // #️⃣
             "\u{1F419}",                                  // 🐙
         ] {

@@ -364,6 +364,113 @@ fn is_emoji_base(c: char) -> bool {
     EMOJI_BASE.iter().any(|&(a, b)| (a..=b).contains(&u))
 }
 
+/// Unicode's `Extended_Pictographic` property (emoji-data.txt), the only
+/// characters a U+200D may join: every pictograph of an emoji ZWJ sequence
+/// has it, the skin tones, regional indicators and text symbols beside them
+/// in [`EMOJI_BASE`] don't.
+const EXTENDED_PICTOGRAPHIC: &[(u32, u32)] = &[
+    (0x00A9, 0x00A9),
+    (0x00AE, 0x00AE),
+    (0x203C, 0x203C),
+    (0x2049, 0x2049),
+    (0x2122, 0x2122),
+    (0x2139, 0x2139),
+    (0x2194, 0x2199),
+    (0x21A9, 0x21AA),
+    (0x231A, 0x231B),
+    (0x2328, 0x2328),
+    (0x2388, 0x2388),
+    (0x23CF, 0x23CF),
+    (0x23E9, 0x23F3),
+    (0x23F8, 0x23FA),
+    (0x24C2, 0x24C2),
+    (0x25AA, 0x25AB),
+    (0x25B6, 0x25B6),
+    (0x25C0, 0x25C0),
+    (0x25FB, 0x25FE),
+    (0x2600, 0x2605),
+    (0x2607, 0x2612),
+    (0x2614, 0x2685),
+    (0x2690, 0x2705),
+    (0x2708, 0x2712),
+    (0x2714, 0x2714),
+    (0x2716, 0x2716),
+    (0x271D, 0x271D),
+    (0x2721, 0x2721),
+    (0x2728, 0x2728),
+    (0x2733, 0x2734),
+    (0x2744, 0x2744),
+    (0x2747, 0x2747),
+    (0x274C, 0x274C),
+    (0x274E, 0x274E),
+    (0x2753, 0x2755),
+    (0x2757, 0x2757),
+    (0x2763, 0x2767),
+    (0x2795, 0x2797),
+    (0x27A1, 0x27A1),
+    (0x27B0, 0x27B0),
+    (0x27BF, 0x27BF),
+    (0x2934, 0x2935),
+    (0x2B05, 0x2B07),
+    (0x2B1B, 0x2B1C),
+    (0x2B50, 0x2B50),
+    (0x2B55, 0x2B55),
+    (0x3030, 0x3030),
+    (0x303D, 0x303D),
+    (0x3297, 0x3297),
+    (0x3299, 0x3299),
+    (0x1F000, 0x1F0FF),
+    (0x1F10D, 0x1F10F),
+    (0x1F12F, 0x1F12F),
+    (0x1F16C, 0x1F171),
+    (0x1F17E, 0x1F17F),
+    (0x1F18E, 0x1F18E),
+    (0x1F191, 0x1F19A),
+    (0x1F1AD, 0x1F1E5),
+    (0x1F201, 0x1F20F),
+    (0x1F21A, 0x1F21A),
+    (0x1F22F, 0x1F22F),
+    (0x1F232, 0x1F23A),
+    (0x1F23C, 0x1F23F),
+    (0x1F249, 0x1F3FA),
+    (0x1F400, 0x1F53D),
+    (0x1F546, 0x1F64F),
+    (0x1F680, 0x1F6FF),
+    (0x1F774, 0x1F77F),
+    (0x1F7D5, 0x1F7FF),
+    (0x1F80C, 0x1F80F),
+    (0x1F848, 0x1F84F),
+    (0x1F85A, 0x1F85F),
+    (0x1F888, 0x1F88F),
+    (0x1F8AE, 0x1F8FF),
+    (0x1F90C, 0x1F93A),
+    (0x1F93C, 0x1F945),
+    (0x1F947, 0x1FAFF),
+    (0x1FC00, 0x1FFFD),
+];
+
+fn is_pictographic(c: char) -> bool {
+    let u = c as u32;
+    EXTENDED_PICTOGRAPHIC.iter().any(|&(a, b)| (a..=b).contains(&u))
+}
+
+/// A skin tone (`Emoji_Modifier`), which may sit between a pictograph and
+/// its joiner (`👨🏽‍💻`).
+fn is_skin_tone(c: char) -> bool {
+    ('\u{1F3FB}'..='\u{1F3FF}').contains(&c)
+}
+
+/// Whether the U+200D at `i` follows a pictograph: right after it, after its
+/// shown U+FE0F (`🏳️‍🌈`) or after its skin tone (`👨🏽‍💻`).
+fn joins_a_pictograph(chars: &[char], hidden: &[bool], i: usize) -> bool {
+    let Some(mut j) = i.checked_sub(1) else { return false };
+    if (chars[j] == '\u{FE0F}' && !hidden[j]) || is_skin_tone(chars[j]) {
+        let Some(k) = j.checked_sub(1) else { return false };
+        j = k;
+    }
+    !hidden[j] && is_pictographic(chars[j])
+}
+
 /// A character that can hide or reorder what the review sheet shows: every
 /// `Cf`, `Zl` and `Zp` code point ([`CF_ZL_ZP`]: bidi controls, zero-width
 /// characters, tags, the BOM, soft hyphen …), the invisible characters in
@@ -379,7 +486,8 @@ pub fn is_hidden_char(c: char) -> bool {
 /// Which of `chars` are hidden: [`is_hidden_char`], except the parts of an
 /// ordinary emoji — one U+FE0E/FE0F right after an emoji base (`⚠️`) or after
 /// a keycap digit, `#` or `*` that U+20E3 follows (`1️⃣`), and one U+200D
-/// between an emoji (or its U+FE0F) and the next emoji base (`👩‍💻`). That is
+/// between two [`EXTENDED_PICTOGRAPHIC`] characters, the first maybe followed
+/// by its U+FE0F or skin tone (`👩‍💻`, `🏳️‍🌈`, `👨🏽‍💻`). That is
 /// at most a selector and a joiner per visible emoji, too little to smuggle
 /// anything; runs, every other selector and a joiner anywhere else stay
 /// hidden.
@@ -392,9 +500,7 @@ fn hidden_mask(chars: &[char]) -> Vec<bool> {
             ('\u{FE0E}' | '\u{FE0F}', Some((p, _))) => {
                 is_emoji_base(p) || (matches!(p, '0'..='9' | '#' | '*') && next == Some('\u{20E3}'))
             }
-            ('\u{200D}', Some((p, p_hidden))) => {
-                !p_hidden && (is_emoji_base(p) || p == '\u{FE0F}') && next.is_some_and(is_emoji_base)
-            }
+            ('\u{200D}', Some(_)) => joins_a_pictograph(chars, &hidden, i) && next.is_some_and(is_pictographic),
             _ => false,
         };
         hidden.push(is_hidden_char(c) && !emoji_part);

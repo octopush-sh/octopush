@@ -683,9 +683,9 @@ pub fn parse_cli_result(
         let error = match (bad_subtype, parsed.result.is_empty()) {
             (Some(BUDGET_STOP_SUBTYPE), _) => format!(
                 "budget reached mid-stage — Claude Code stopped at the run's remaining budget \
-                 ({BUDGET_STOP_SUBTYPE}, ${:.2} reported) — resume to continue within what is left of the budget, \
+                 ({BUDGET_STOP_SUBTYPE}, {} reported) — resume to continue within what is left of the budget, \
                  accept the partial work, or re-run",
-                parsed.total_cost_usd
+                crate::token_engine::format_usd(parsed.total_cost_usd)
             ),
             (Some(st), true) => format!(
                 "claude stopped early ({st}) — review the work journal, then resume or re-run"

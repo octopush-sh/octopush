@@ -961,7 +961,8 @@ pub async fn run_agentic_loop(
             let spent = spent + out.peer_cost_usd;
             if spent >= limit {
                 emitter.notice(&format!(
-                    "run budget reached mid-stage (${spent:.2} spent by this stage) — closing with what it has"
+                    "run budget reached mid-stage ({} spent by this stage) — closing with what it has",
+                    crate::token_engine::format_usd(spent)
                 ));
                 let voided: Vec<LlmToolResult> = resp
                     .tool_uses
