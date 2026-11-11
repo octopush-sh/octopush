@@ -1,5 +1,5 @@
 ---
-title: GPT-6 through a gateway works again
+title: GPT-6 through a gateway uses Chat Completions
 kind: fix
 area: app
 ---
