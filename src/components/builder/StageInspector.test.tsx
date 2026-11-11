@@ -1,5 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent, within, waitFor } from "@testing-library/react";
+import { cleanup, render, screen, fireEvent, within, waitFor } from "@testing-library/react";
 
 // ModelPicker (rendered by the escalate-model control) fetches providers on
 // mount — stub it so these tests don't reach real Tauri IPC.
@@ -79,7 +79,7 @@ describe("StageInspector — escalate on failure", () => {
   });
 
   it("enables the escalate effort on a Codex CLI stage", () => {
-    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5-codex" });
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5.5" });
     fireEvent.click(screen.getByRole("button", { name: /escalate on failure/i }));
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     expect(group.getAttribute("aria-disabled")).not.toBe("true");
@@ -88,7 +88,7 @@ describe("StageInspector — escalate on failure", () => {
   });
 
   it("judges the escalate effort on the escalation model", () => {
-    renderInspector({ substrate: "cli", agentModel: "claude-sonnet-5-5", escalateModel: "gpt-5" });
+    renderInspector({ substrate: "cli", agentModel: "claude-sonnet-5-5", escalateModel: "gpt-5.5" });
     const group = screen.getByRole("radiogroup", { name: "Escalation effort" });
     expect(group.getAttribute("aria-disabled")).not.toBe("true");
     expect(group.querySelector("[title=\"Codex's own default effort for this model\"]")).not.toBeNull();
@@ -113,24 +113,36 @@ describe("StageInspector — reasoning on CLI stages", () => {
   });
 
   it("passes a Codex stage's effort, with Auto for Codex's default", () => {
-    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5-codex", effort: null });
+    const onPatch = renderInspector({ substrate: "cli", agentModel: "gpt-5.5", effort: null });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
     expect(group.getAttribute("aria-disabled")).not.toBe("true");
     expect(within(group).getByText("Auto").getAttribute("aria-checked")).toBe("true");
     expect(within(group).queryByText("Off")).toBeNull();
     expect(group.querySelector("[title=\"Codex's own default effort for this model\"]")).not.toBeNull();
     expect(group.querySelector("[title=\"Claude Code's own default effort for this model\"]")).toBeNull();
-    // Below gpt-6, Codex has no max: the segment says what it runs as.
-    expect(group.querySelector("[title=\"Runs as XHi, this model's top level in Codex\"]")).not.toBeNull();
+    // gpt-5.5 lists no max in Codex's catalog: the segment says what it runs as.
+    expect(group.querySelector("[title=\"Runs as XHi, the highest level this model lists in Codex\"]")).not.toBeNull();
     fireEvent.click(within(group).getByText("High"));
     expect(onPatch).toHaveBeenCalledWith({ effort: "high" });
   });
 
-  it("keeps Max as max on a gpt-6 Codex stage", () => {
-    renderInspector({ substrate: "cli", agentModel: "gpt-6.1-terra" });
+  it("keeps Max as max on a Codex model that lists it", () => {
+    for (const model of ["gpt-6.1-terra", "gpt-5.6-sol"]) {
+      renderInspector({ substrate: "cli", agentModel: model });
+      const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+      expect(group.querySelector("[title*=\"Runs as\"]")).toBeNull();
+      expect(group.querySelector("[title=\"Maximum reasoning depth\"]")).not.toBeNull();
+      cleanup();
+    }
+  });
+
+  it("disables reasoning on a Codex model its catalog doesn't list", () => {
+    renderInspector({ substrate: "cli", agentModel: "gpt-5-codex", effort: null });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
-    expect(group.querySelector("[title=\"Runs as XHi, this model's top level in Codex\"]")).toBeNull();
-    expect(group.querySelector("[title=\"Maximum reasoning depth\"]")).not.toBeNull();
+    expect(group.getAttribute("aria-disabled")).toBe("true");
+    expect(
+      group.querySelector("[title=\"Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default\"]"),
+    ).not.toBeNull();
   });
 
   it("never shows the Claude Code update hint on a Codex stage", async () => {

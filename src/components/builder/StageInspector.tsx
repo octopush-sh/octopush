@@ -37,14 +37,26 @@ const CLI_EFFORT_OPTIONS = [
   ...EFFORT_OPTIONS.slice(1),
 ];
 /** On a Codex stage no effort means Codex's own default (its config file's
- *  `model_reasoning_effort`), and Max runs as the model's top level. */
+ *  `model_reasoning_effort`), and a level the model doesn't list in Codex's
+ *  catalog runs as the highest one it does. A model the catalog doesn't know
+ *  gets no effort at all (the control is disabled), so Auto says why. */
+const CODEX_LEVEL_LABELS: Record<string, string> = { low: "Low", medium: "Med", high: "High", xhigh: "XHi", max: "Max" };
 function codexEffortOptions(model: string) {
-  const maxTitle =
-    codexEffortLevel(model, "max") === "max" ? "Maximum reasoning depth" : "Runs as XHi, this model's top level in Codex";
+  const known = codexEffortLevel(model, "low") !== null;
   return [
-    { value: "off" as const, label: "Auto", title: "Codex's own default effort for this model" },
-    ...EFFORT_OPTIONS.slice(1, -1),
-    { value: "max" as const, label: "Max", title: maxTitle },
+    {
+      value: "off" as const,
+      label: "Auto",
+      title: known
+        ? "Codex's own default effort for this model"
+        : "Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default",
+    },
+    ...EFFORT_OPTIONS.slice(1).map((o) => {
+      const runs = codexEffortLevel(model, o.value);
+      return runs && runs !== o.value
+        ? { ...o, title: `Runs as ${CODEX_LEVEL_LABELS[runs] ?? runs}, the highest level this model lists in Codex` }
+        : o;
+    }),
   ];
 }
 

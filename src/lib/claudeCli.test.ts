@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import codexCatalog from "./codexEffortLevels.json";
 
 const cliVersionMock = vi.hoisted(() => vi.fn());
 vi.mock("./ipc", () => ({ ipc: { claudeCliVersion: cliVersionMock } }));
@@ -8,6 +9,7 @@ const {
   claudeUpdateLabel,
   cliTooOldForEffort,
   codexEffortLevel,
+  codexEffortLevels,
   crewClaudeModels,
   crewUsesClaudeCode,
   effortApplies,
@@ -108,19 +110,44 @@ describe("crewUsesClaudeCode", () => {
 });
 
 describe("effortApplies", () => {
-  it("mirrors the backend: API, and CLI stages on Claude Code and Codex", () => {
+  it("mirrors the backend: API, Claude Code, and Codex on a model its catalog knows", () => {
     expect(effortApplies("api", "gpt-5")).toBe(true);
     expect(effortApplies("cli", "claude-opus-5-5")).toBe(true);
     expect(effortApplies("cli", "my-proxy-model")).toBe(true);
-    expect(effortApplies("cli", "gpt-5-codex")).toBe(true);
+    expect(effortApplies("cli", "gpt-5.5")).toBe(true);
+    expect(effortApplies("cli", "gpt-5.6-sol")).toBe(true);
+    expect(effortApplies("cli", "gpt-5-codex")).toBe(false);
+    expect(effortApplies("cli", "o3")).toBe(false);
+    expect(effortApplies("api", "gpt-5-codex")).toBe(true);
     expect(effortApplies("bogus", "claude-opus-5-5")).toBe(false);
   });
 
-  it("passes max to Codex only on gpt-6, xhigh elsewhere", () => {
-    expect(codexEffortLevel("gpt-5-codex", "max")).toBe("xhigh");
-    expect(codexEffortLevel("gpt-6.1-terra", "max")).toBe("max");
-    expect(codexEffortLevel("GPT-6", "max")).toBe("max");
-    expect(codexEffortLevel("gpt-5-codex", "high")).toBe("high");
+  it("follows Codex's catalog for every model it lists", () => {
+    const levels = ["low", "medium", "high", "xhigh", "max"];
+    for (const [slug, listed] of Object.entries(codexCatalog.models)) {
+      for (const e of levels) {
+        const want = listed.includes(e) ? e : "xhigh"; // only max is ever missing today
+        expect(codexEffortLevel(slug, e), `${slug} ${e}`).toBe(want);
+      }
+    }
+    // gpt-5.6-* and codex-auto-review list max too, not only gpt-6*.
+    for (const m of ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "codex-auto-review", "gpt-6.1-terra"]) {
+      expect(codexEffortLevel(m, "max")).toBe("max");
+    }
+    expect(codexEffortLevel("gpt-5.5", "max")).toBe("xhigh");
+    expect(codexEffortLevel("GPT-5.5", "high")).toBe("high");
+  });
+
+  it("passes nothing to Codex on a model its catalog doesn't know", () => {
+    for (const m of ["gpt-5-codex", "o3", "o4-mini", "gpt-5", "gpt-4o", "GPT-6"]) {
+      expect(codexEffortLevels(m)).toBeUndefined();
+      for (const e of ["low", "medium", "high", "xhigh", "max"]) expect(codexEffortLevel(m, e)).toBeNull();
+    }
+  });
+
+  it("reads the table the Rust side reads (one shared file)", () => {
+    expect(codexCatalog.source).toContain("models.json");
+    expect(Object.keys(codexCatalog.models).length).toBeGreaterThanOrEqual(12);
   });
 
   it("hides CLI effort only for a known version below the floor", () => {

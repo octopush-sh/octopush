@@ -1,0 +1,17 @@
+{
+  "source": "openai/codex codex-rs/models-manager/models.json @ a7a9d82f15f15e8a89399abb15f4766430b9d5c7 (supported_reasoning_levels per slug)",
+  "models": {
+    "gpt-6-astra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6.1-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6.1-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-6-luna": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-5.6-sol": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-terra": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.6-luna": ["low", "medium", "high", "xhigh", "max"],
+    "gpt-daybreak-blue-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-daybreak-red-latest": ["low", "medium", "high", "xhigh", "max", "ultra"],
+    "gpt-5.5": ["low", "medium", "high", "xhigh"],
+    "codex-auto-review": ["low", "medium", "high", "xhigh", "max"]
+  }
+}

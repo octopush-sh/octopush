@@ -722,8 +722,8 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
 fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
     use crate::providers::Effort;
     for read_only in [false, true] {
-        let mut argv = CliDialect::Codex.argv("gpt-5-codex", "system", 25, read_only);
-        CliDialect::Codex.push_effort_args(&mut argv, "gpt-5-codex", Some(Effort::High));
+        let mut argv = CliDialect::Codex.argv("gpt-5.5", "system", 25, read_only);
+        CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", Some(Effort::High));
         let n = argv.len();
         assert_eq!(argv[n - 1], "-", "the prompt still comes from stdin: {argv:?}");
         assert_eq!(argv[n - 3..n - 1], ["-c", "model_reasoning_effort=\"high\""], "{argv:?}");
@@ -736,17 +736,36 @@ fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
 
 #[test]
 fn codex_argv_without_an_effort_keeps_codexs_own_default() {
-    let plain = CliDialect::Codex.argv("gpt-5-codex", "system", 25, false);
+    let plain = CliDialect::Codex.argv("gpt-5.5", "system", 25, false);
     let mut argv = plain.clone();
-    CliDialect::Codex.push_effort_args(&mut argv, "gpt-5-codex", None);
+    CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", None);
     assert_eq!(argv, plain);
     assert!(!argv.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")), "{argv:?}");
 }
 
 #[test]
+fn codex_argv_on_a_model_outside_the_catalog_carries_no_override() {
+    // Codex sends the level to the API unchanged, so on a model whose levels
+    // its catalog doesn't list (gpt-5-codex, o3, a non-reasoning model) the
+    // stage keeps Codex's default rather than risk a rejected level.
+    use crate::providers::Effort;
+    for model in ["gpt-5-codex", "o3", "o4-mini", "gpt-4o"] {
+        for effort in [Effort::Low, Effort::High, Effort::Xhigh, Effort::Max] {
+            let plain = CliDialect::Codex.argv(model, "system", 25, false);
+            let mut argv = plain.clone();
+            CliDialect::Codex.push_effort_args(&mut argv, model, Some(effort));
+            assert_eq!(argv, plain, "[{model} {effort:?}]");
+            assert!(!argv.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")), "{argv:?}");
+        }
+    }
+}
+
+#[test]
 fn codex_argv_maps_max_to_the_models_top_level() {
     use crate::providers::Effort;
-    for (model, level) in [("gpt-5-codex", "xhigh"), ("gpt-6.1-terra", "max")] {
+    // Levels per Codex's catalog (models.json @ a7a9d82): gpt-5.5 tops out at
+    // xhigh; gpt-5.6-sol, gpt-6.1-terra and codex-auto-review list max.
+    for (model, level) in [("gpt-5.5", "xhigh"), ("gpt-6.1-terra", "max"), ("gpt-5.6-sol", "max"), ("codex-auto-review", "max")] {
         let mut argv = CliDialect::Codex.argv(model, "system", 25, false);
         CliDialect::Codex.push_effort_args(&mut argv, model, Some(Effort::Max));
         let want = format!("model_reasoning_effort=\"{level}\"");

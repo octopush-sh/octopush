@@ -863,9 +863,65 @@ pub fn dialect_for_model(model: &str) -> CliDialect {
 pub fn effort_applies(substrate: &str, model: &str) -> bool {
     match substrate {
         "api" => true,
-        "cli" => dialect_for_model(model).takes_effort(),
+        "cli" => match dialect_for_model(model) {
+            // Codex gets an effort only on a model whose levels we know.
+            CliDialect::Codex => codex_effort_levels(model).is_some_and(|l| !l.is_empty()),
+            d => d.takes_effort(),
+        },
         _ => false,
     }
+}
+
+/// The reasoning levels Codex advertises per model, from its bundled catalog
+/// (`supported_reasoning_levels` in openai/codex
+/// `codex-rs/models-manager/models.json`; the commit is in the file's
+/// `source`). One table for both sides: `src/lib/codexEffortLevels.json`,
+/// which `lib/claudeCli.ts` imports too. Codex sends the effort to the API
+/// unchanged (`codex-rs/core/src/client.rs` `build_reasoning`), so a level the
+/// model doesn't list can fail the stage.
+const CODEX_EFFORT_LEVELS_JSON: &str = include_str!("../../../src/lib/codexEffortLevels.json");
+
+fn codex_effort_table() -> &'static std::collections::HashMap<String, Vec<String>> {
+    static TABLE: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        #[derive(serde::Deserialize)]
+        struct Catalog {
+            models: std::collections::HashMap<String, Vec<String>>,
+        }
+        // Pinned by `codex_effort_table_parses_and_lists_only_codex_tokens`.
+        serde_json::from_str::<Catalog>(CODEX_EFFORT_LEVELS_JSON)
+            .map(|c| c.models)
+            .unwrap_or_default()
+    })
+}
+
+/// The levels Codex lists for `model` (case-insensitive slug match), or `None`
+/// for a model missing from its catalog. An empty list = a non-reasoning model.
+pub fn codex_effort_levels(model: &str) -> Option<&'static [String]> {
+    codex_effort_table().get(&model.trim().to_ascii_lowercase()).map(Vec::as_slice)
+}
+
+/// The level Codex gets for `effort` on `model`: the effort itself when the
+/// model lists it, else the highest listed level below it (the lowest listed
+/// one if none is below). `None` — pass no override, Codex keeps its default —
+/// for an unknown or non-reasoning model.
+pub fn codex_effort_level(model: &str, effort: crate::providers::Effort) -> Option<&'static str> {
+    clamp_to_listed_levels(codex_effort_levels(model)?, effort)
+}
+
+/// [`codex_effort_level`]'s clamp on an explicit level list: `None` when the
+/// list holds none of Octopush's levels (a non-reasoning model).
+pub fn clamp_to_listed_levels(listed: &[String], effort: crate::providers::Effort) -> Option<&'static str> {
+    use crate::providers::Effort;
+    const ORDER: [Effort; 5] = [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max];
+    let supported: Vec<Effort> = ORDER.into_iter().filter(|e| listed.iter().any(|l| l == e.as_str())).collect();
+    let rank = |e: Effort| ORDER.iter().position(|o| *o == e).unwrap_or(0);
+    supported
+        .iter()
+        .rev()
+        .find(|e| rank(**e) <= rank(effort))
+        .or_else(|| supported.first())
+        .map(|e| e.as_str())
 }
 
 impl CliDialect {
@@ -968,15 +1024,28 @@ impl CliDialect {
     }
 
     /// The level token this CLI gets for `effort` on `model`; `None` without
-    /// an effort. Codex's levels vary by model: only `gpt-6*` lists `max`, so
-    /// every other model gets its top level, `xhigh`, instead. Claude Code
-    /// clamps per model itself and gets the token unchanged.
+    /// an effort. Codex's levels vary by model, so it gets the level clamped
+    /// to what the model lists in Codex's catalog ([`codex_effort_level`]),
+    /// and nothing on a model missing from it or without reasoning. Claude
+    /// Code clamps per model itself and gets the token unchanged.
     pub fn effort_level(&self, model: &str, effort: Option<crate::providers::Effort>) -> Option<&'static str> {
-        use crate::providers::Effort;
         let e = effort.filter(|_| self.takes_effort())?;
-        Some(match (self, e) {
-            (CliDialect::Codex, Effort::Max) if !model.to_ascii_lowercase().starts_with("gpt-6") => "xhigh",
-            _ => e.as_str(),
+        match self {
+            CliDialect::Codex => codex_effort_level(model, e),
+            CliDialect::Claude => Some(e.as_str()),
+        }
+    }
+
+    /// The journal line for a Codex stage whose effort is not passed because
+    /// Codex's catalog doesn't list the model's levels (or lists none);
+    /// `None` when the effort reaches the CLI, or there is none.
+    pub fn unpassed_effort_notice(&self, model: &str, effort: Option<crate::providers::Effort>) -> Option<String> {
+        let e = effort?;
+        (*self == CliDialect::Codex && self.effort_level(model, Some(e)).is_none()).then(|| {
+            format!(
+                "This stage's {} effort is not passed to Codex: its model catalog lists no reasoning levels for {model}, so it runs at Codex's default effort.",
+                e.as_str()
+            )
         })
     }
 
@@ -1664,6 +1733,9 @@ impl AgentRunner for CliRunner {
                 "This stage's {} effort is not passed to the older Claude Code; it runs at the CLI's default effort.",
                 e.as_str()
             ));
+        }
+        if let Some(note) = dialect.unpassed_effort_notice(&stage.agent_model, effort) {
+            emitter.notice(&note);
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
