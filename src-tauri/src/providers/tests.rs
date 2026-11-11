@@ -838,11 +838,32 @@ mod effort {
 
 #[test]
 fn openai_gpt6_models_use_the_responses_api() {
+    let openai = "https://api.openai.com/v1";
     for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol", "GPT-6-Sol"] {
-        assert!(openai_compat::uses_responses_api(m), "{m} needs the Responses API for tools");
+        assert!(openai_compat::uses_responses_api(m, openai), "{m} needs the Responses API for tools");
     }
     for m in ["gpt-4o", "gpt-5", "o3-mini", "deepseek-chat", "llama3.1"] {
-        assert!(!openai_compat::uses_responses_api(m), "{m} stays on Chat Completions");
+        assert!(!openai_compat::uses_responses_api(m, openai), "{m} stays on Chat Completions");
+    }
+}
+
+#[test]
+fn openai_gpt6_routes_to_responses_only_on_api_openai_com() {
+    assert!(openai_compat::uses_responses_api("gpt-6.1-terra", "https://api.openai.com/v1"));
+    // Host compared case-insensitively; a pasted full endpoint still counts.
+    assert!(openai_compat::uses_responses_api("gpt-6-sol", "https://API.OpenAI.com/v1/"));
+    assert!(openai_compat::uses_responses_api("gpt-6-sol", "https://api.openai.com/v1/chat/completions"));
+    // Gateways and overrides keep Chat Completions: they may not speak Responses.
+    for base in [
+        "http://localhost:4000/v1",
+        "https://openrouter.ai/api/v1",
+        "https://my-litellm.example.com/v1",
+        "https://api.openai.com.evil.example/v1",
+        "https://proxy.example/api.openai.com/v1",
+        "api.openai.com/v1",
+        "",
+    ] {
+        assert!(!openai_compat::uses_responses_api("gpt-6-sol", base), "{base} stays on Chat Completions");
     }
 }
 
@@ -876,6 +897,7 @@ fn openai_responses_request_shape() {
     assert_eq!(tool["name"], "read_file");
     assert_eq!(tool["description"], "Read a file.");
     assert!(tool["parameters"].is_object());
+    assert_eq!(tool["strict"], false, "omitted strict would attempt strict mode");
     assert!(tool.get("function").is_none());
     assert!(body.get("tool_choice").is_none());
     req.tool_choice = Some("emit_result".into());
@@ -982,6 +1004,27 @@ fn openai_parse_responses_stop_reasons() {
         "output": []
     }));
     assert_eq!(filtered.stop_reason, LlmStopReason::Other("content_filter".into()));
+}
+
+#[test]
+fn openai_parse_responses_refusal_is_visible() {
+    let resp = openai_compat::parse_responses_response(json!({
+        "status": "completed",
+        "output": [{ "type": "message", "role": "assistant", "content": [
+            { "type": "refusal", "refusal": "I can't help with that." }
+        ]}]
+    }));
+    assert_eq!(resp.text, "I can't help with that.");
+    assert_eq!(resp.stop_reason, LlmStopReason::Other("refusal".into()), "never an empty EndTurn");
+    let mixed = openai_compat::parse_responses_response(json!({
+        "status": "completed",
+        "output": [{ "type": "message", "content": [
+            { "type": "output_text", "text": "Partly." },
+            { "type": "refusal", "refusal": "Not the rest." }
+        ]}]
+    }));
+    assert_eq!(mixed.text, "Partly.\n\nNot the rest.");
+    assert_eq!(mixed.stop_reason, LlmStopReason::Other("refusal".into()));
 }
 
 #[test]
