@@ -9466,8 +9466,29 @@ mod cli_dialect_tests {
         assert_eq!(u.input_tokens, 400, "billable fresh input excludes cached");
         assert_eq!(u.cache_read_input_tokens, 600);
         assert_eq!(u.output_tokens, 50);
+        assert_eq!(u.cache_creation_input_tokens, 0, "older CLIs omit cache writes");
         // Non-usage events report nothing.
         assert!(codex_usage_from_event(&json!({"type":"turn.started"})).is_none());
+    }
+
+    #[test]
+    fn codex_usage_splits_cache_writes_out_of_input() {
+        // GPT-5.6+ bills cache writes: Codex reports them inside input_tokens
+        // as `cache_write_input_tokens` (openai/codex exec_events.rs `Usage`).
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":300,"output_tokens":50}})).unwrap();
+        assert_eq!(u.input_tokens, 100, "fresh input excludes cached and written");
+        assert_eq!(u.cache_read_input_tokens, 600);
+        assert_eq!(u.cache_creation_input_tokens, 300);
+        // A write count larger than the uncached remainder is clamped.
+        let (_, u) = codex_usage_from_event(&json!({"type":"turn.completed",
+            "usage":{"input_tokens":1000,"cached_input_tokens":600,"cache_write_input_tokens":900,"output_tokens":0}})).unwrap();
+        assert_eq!((u.input_tokens, u.cache_creation_input_tokens), (0, 400));
+        // Legacy cumulative token_count events carry the same field.
+        let (key, u) = codex_usage_from_event(&json!({"msg":{"type":"token_count","info":{"total_token_usage":
+            {"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":200,"output_tokens":5}}}})).unwrap();
+        assert_eq!(key.as_deref(), Some("token_count"));
+        assert_eq!((u.input_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens), (200, 100, 200));
     }
 
     #[test]
@@ -14581,14 +14602,15 @@ mod pricing_table_tests {
     fn gpt_6_1_terra_is_priced_and_in_the_openai_catalog() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
         let _cfg = crate::provider_router::TestConfigDir::new();
-        // $1 input, $0.05 cached input (5%), $5 output; writes cost input.
+        // OpenAI's model and pricing pages (2026-11-10): $1 input, $0.05
+        // cached input, $5 output, $1.25 for 30-minute cache writes.
         // Not `assert_prices`: its 1-hour check (2× input) is Claude-only.
         let terra = ModelPrices {
             input_per_m: 1.0,
             output_per_m: 5.0,
             cache_read_per_m: 0.05,
-            cache_creation_per_m: 1.0,
-            cache_creation_1h_per_m: 1.0,
+            cache_creation_per_m: 1.25,
+            cache_creation_1h_per_m: 1.25,
         };
         assert_eq!(builtin_prices("gpt-6.1-terra"), Some(terra));
         assert_eq!(builtin_prices("openai/gpt-6.1-terra"), Some(terra));
@@ -14601,8 +14623,106 @@ mod pricing_table_tests {
         let m = providers["openai"].models.iter().find(|m| m.id == "gpt-6.1-terra").expect("in the openai catalog");
         assert_eq!(m.display_name, "GPT-6.1 Terra");
         assert_eq!(m.max_context, 1_050_000);
+        assert!(m.supports_vision, "image input is supported");
         assert!(m.supports_tools);
         assert_eq!(m.tags, vec!["balanced".to_string()]);
+        // 1M fresh + 1M written + 1M cached + 1M output = 1 + 1.25 + 0.05 + 5.
+        let cost = crate::token_engine::request_cost_for("gpt-6.1-terra", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 7.30).abs() < 1e-9, "terra request cost: {cost}");
+        // The beta's cache-write-at-input price migrates to $1.25.
+        let mut list = vec![crate::provider_router::ProviderConfig {
+            models: vec![crate::provider_router::ModelInfo { cache_creation_cost_per_m: 1.0, ..m.clone() }],
+            ..providers["openai"].clone()
+        }];
+        assert_eq!(crate::provider_router::migrate_stale_builtin_prices(&mut list, &providers), 1);
+        assert_eq!(list[0].models[0].cache_creation_cost_per_m, 1.25);
+    }
+
+    #[test]
+    fn cache_write_unset_on_a_custom_model_bills_at_the_input_price() {
+        use crate::provider_router::{builtin_providers, ProviderRouter};
+        use crate::token_engine::prices_in;
+        let mut map = builtin_providers();
+        // A user-added model through a LiteLLM gateway: the Models dialog
+        // saves cacheCreationCostPerM (and cacheReadCostPerM) as 0.
+        let mut gw = map["openai"].clone();
+        gw.name = "litellm".into();
+        gw.models.truncate(1);
+        let m = &mut gw.models[0];
+        m.id = "house-gpt".into();
+        (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (2.0, 8.0, 0.0, 0.0);
+        map.insert("litellm".into(), gw);
+        // A deliberately free custom model stays free.
+        let mut free = map["openai"].clone();
+        free.name = "zero-co".into();
+        free.models.truncate(1);
+        let f = &mut free.models[0];
+        f.id = "house-free".into();
+        (f.input_cost_per_m, f.output_cost_per_m, f.cache_read_cost_per_m, f.cache_creation_cost_per_m) = (0.0, 0.0, 0.0, 0.0);
+        map.insert("zero-co".into(), free);
+        let router = ProviderRouter::from_map(map);
+
+        let p = prices_in(Some(&router), "house-gpt").expect("custom model is priced");
+        assert_eq!(p.cache_creation_per_m, 2.0, "unset write price falls back to input");
+        assert_eq!(p.cache_creation_1h_per_m, 2.0);
+        // 1M cache-write tokens bill like 1M input tokens, never $0.
+        let writes = p.cost(0, 0, 0, 1_000_000);
+        assert!((writes - 2.0).abs() < 1e-9, "cache writes: {writes}");
+        assert!((crate::token_engine::request_cost("house-gpt", p, 0, 0, 0, 1_000_000) - 2.0).abs() < 1e-9);
+        assert_eq!(prices_in(Some(&router), "house-free"), Some(ModelPrices::FREE));
+
+        // A builtin with an explicit write price keeps it: Terra at $1.25,
+        // and every paid builtin has a non-zero write price.
+        let t = prices_in(Some(&router), "gpt-6.1-terra").expect("terra is priced");
+        assert_eq!(t.cache_creation_per_m, 1.25);
+        assert!((t.cost(0, 0, 0, 1_000_000) - 1.25).abs() < 1e-9);
+        for (name, prov) in builtin_providers() {
+            if prov.local || name == "deepseek" {
+                continue;
+            }
+            for m in &prov.models {
+                assert!(m.cache_creation_cost_per_m > 0.0, "{} has no write price", m.id);
+                let c = prices_in(Some(&router), &m.id).unwrap();
+                assert_eq!(c.cache_creation_per_m, m.cache_creation_cost_per_m, "{}", m.id);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn saved_terra_entry_gets_vision_backfilled_and_keeps_user_edits() {
+        use crate::provider_router::{backfill_builtin_vision, builtin_providers, write_providers, ProviderRouter};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let defaults = builtin_providers();
+        let mut openai = defaults["openai"].clone();
+        for m in &mut openai.models {
+            if m.id == "gpt-6.1-terra" {
+                // As #664 saved it, plus a user edit to other fields.
+                m.supports_vision = false;
+                m.display_name = "Terra (team)".into();
+                m.tags = vec!["house".into()];
+                m.input_cost_per_m = 1.1;
+            }
+        }
+        // A custom provider reusing the id is not a builtin entry.
+        let mut other = openai.clone();
+        other.name = "litellm".into();
+        other.models.retain(|m| m.id == "gpt-6.1-terra");
+        let mut list = vec![openai, other];
+        assert_eq!(backfill_builtin_vision(&mut list.clone()), 1);
+
+        write_providers(&list).unwrap();
+        let router = ProviderRouter::load().unwrap();
+        let by_name = |n: &str| router.list_providers().into_iter().find(|p| p.name == n).cloned().unwrap();
+        let terra = by_name("openai").models.into_iter().find(|m| m.id == "gpt-6.1-terra").unwrap();
+        assert!(terra.supports_vision, "vision backfilled");
+        assert_eq!(terra.display_name, "Terra (team)");
+        assert_eq!(terra.tags, vec!["house".to_string()]);
+        assert_eq!(terra.input_cost_per_m, 1.1);
+        assert!(!by_name("litellm").models[0].supports_vision, "custom provider untouched");
+        // Idempotent.
+        list = router.list_providers().into_iter().cloned().collect();
+        assert_eq!(backfill_builtin_vision(&mut list), 0);
     }
 }
 

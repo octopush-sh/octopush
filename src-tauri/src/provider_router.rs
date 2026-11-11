@@ -188,6 +188,10 @@ impl ProviderRouter {
             // (left untouched when the user has edited them).
             migrate_stale_builtin_prices(&mut list, &defaults);
 
+            // Migration: builtins that shipped text-only and turned out to
+            // take image input (GPT-6.1 Terra, #664).
+            backfill_builtin_vision(&mut list);
+
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
             // provider is absent, so a pre-existing "anthropic" block would
@@ -478,6 +482,9 @@ pub(crate) const STALE_BUILTIN_PRICES: &[(&str, [f64; 4])] = &[
     // GPT-4o and GPT-4o mini shipped with cached input at $0; it is billed.
     ("gpt-4o", [2.5, 10.0, 0.0, 0.0]),
     ("gpt-4o-mini", [0.15, 0.6, 0.0, 0.0]),
+    // GPT-6.1 Terra shipped (beta) with cache writes at the input price; they
+    // are $1.25 for the default 30-minute retention.
+    ("gpt-6.1-terra", [1.0, 5.0, 0.05, 1.0]),
 ];
 
 /// Reset models whose on-disk price is a known-stale builtin default (see
@@ -509,6 +516,28 @@ pub(crate) fn migrate_stale_builtin_prices(
                 m.output_cost_per_m = d.output_cost_per_m;
                 m.cache_read_cost_per_m = d.cache_read_cost_per_m;
                 m.cache_creation_cost_per_m = d.cache_creation_cost_per_m;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Builtin models an earlier release saved with `supports_vision: false`
+/// that do take image input, as `(provider, model id)`. GPT-6.1 Terra shipped
+/// text-only in #664; OpenAI's model page lists image input.
+pub(crate) const VISION_BACKFILL: &[(&str, &str)] = &[("openai", "gpt-6.1-terra")];
+
+/// Turn `supports_vision` on for a saved [`VISION_BACKFILL`] entry. Only
+/// that flag changes, so prices, tags, context and display name the user
+/// edited stay as saved; the Models dialog has no vision toggle, so this
+/// never overrides a user choice. Returns how many models changed.
+pub(crate) fn backfill_builtin_vision(list: &mut [ProviderConfig]) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        for m in &mut p.models {
+            if !m.supports_vision && VISION_BACKFILL.iter().any(|(prov, id)| *prov == p.name && *id == m.id) {
+                m.supports_vision = true;
                 n += 1;
             }
         }
@@ -685,18 +714,18 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             models: vec![
-                // OpenAI model page (fetched 2026-11-08): 1,050,000-token
-                // context, cached input at 5% of input. Prices must match
-                // `token_engine::builtin_prices`.
+                // OpenAI model page (fetched 2026-11-10): 1,050,000-token
+                // context, image input, cached input $0.05, 30-minute cache
+                // writes $1.25. Prices must match `token_engine::builtin_prices`.
                 ModelInfo {
                     id: "gpt-6.1-terra".into(),
                     display_name: "GPT-6.1 Terra".into(),
                     input_cost_per_m: 1.0,
                     output_cost_per_m: 5.0,
                     cache_read_cost_per_m: 0.05,
-                    cache_creation_cost_per_m: 1.0,
+                    cache_creation_cost_per_m: 1.25,
                     max_context: 1_050_000,
-                    supports_vision: false,
+                    supports_vision: true,
                     supports_tools: true,
                     tags: vec!["balanced".into()],
                 },

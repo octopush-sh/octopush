@@ -263,18 +263,21 @@ pub fn parse_response(response: Value) -> LlmResponse {
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
     // OpenAI-compatible providers report cached prompt tokens under
-    // `usage.prompt_tokens_details.cached_tokens` (DeepSeek uses the same key).
-    // Crucially, `prompt_tokens` is the FULL prompt count and already INCLUDES
-    // the cached ones, so we subtract to get the billable (fresh) input and
-    // surface the cached slice separately — otherwise cached input is priced at
-    // the full input rate. Providers that omit the field report 0 (no change).
-    let cache_read_tokens = response.get("usage")
-        .and_then(|u| u.get("prompt_tokens_details"))
-        .and_then(|d| d.get("cached_tokens"))
-        .and_then(|v| v.as_u64())
-        .unwrap_or(0)
-        .min(prompt_tokens);
-    let input_tokens = prompt_tokens - cache_read_tokens;
+    // `usage.prompt_tokens_details.cached_tokens` (DeepSeek uses the same key)
+    // and, on GPT-5.6 and later, tokens written to the prompt cache under
+    // `usage.prompt_tokens_details.cache_write_tokens` (Chat Completions API
+    // reference, checked 2026-11-10). Crucially, `prompt_tokens` is the FULL
+    // prompt count and already INCLUDES both slices ("input tokens use the
+    // uncached-input, cached-input, or cache-write rate", prompt-caching
+    // guide), so we subtract them to get the billable (fresh) input and
+    // surface each slice separately — otherwise cached input is priced at the
+    // full input rate and cache writes (1.25x input on GPT-5.6+) are
+    // under-counted. Providers that omit a field report 0 (no change).
+    let details = response.get("usage").and_then(|u| u.get("prompt_tokens_details"));
+    let detail = |k: &str| details.and_then(|d| d.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_read_tokens = detail("cached_tokens").min(prompt_tokens);
+    let cache_creation_tokens = detail("cache_write_tokens").min(prompt_tokens - cache_read_tokens);
+    let input_tokens = prompt_tokens - cache_read_tokens - cache_creation_tokens;
 
     LlmResponse {
         text,
@@ -283,8 +286,9 @@ pub fn parse_response(response: Value) -> LlmResponse {
         input_tokens,
         output_tokens,
         cache_read_tokens,
-        // OpenAI-style caching has no separate cache-write line — only reads.
-        cache_creation_tokens: 0,
+        // Our requests set no `prompt_cache_options.ttl`, so every write is
+        // at the default 30-minute retention: the catalog's write price.
+        cache_creation_tokens,
         // Header-based rate-limit hints are Anthropic-specific; none here.
         rate_limit: None,
         // OpenAI-compat returns no verbatim content-block array to replay.

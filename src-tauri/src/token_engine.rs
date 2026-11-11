@@ -228,13 +228,15 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         "claude-haiku-5-5" => (0.10, 0.125, 0.01, 0.50),
         "claude-haiku-4-5" => (1.0, 1.25, 0.10, 5.0),
         "claude-3-5-haiku" => (0.80, 1.0, 0.08, 4.0),
-        // OpenAI — no cache-write line: writes cost the input price.
+        // OpenAI
         //
-        // GPT-6.1 Terra: OpenAI's model page (fetched 2026-11-08) says "Cached
-        // input tokens are priced at 5% of the uncached input token rate";
-        // Vercel's AI Gateway (same day) gives "$1/1M input tokens, $5/1M
-        // output tokens."
-        "gpt-6.1-terra" => (1.0, 1.0, 0.05, 5.0),
+        // GPT-6.1 Terra: OpenAI's model page and API pricing page (fetched
+        // 2026-11-10): $1 input, $0.05 cached input, $5 output, and cache
+        // writes $1.25 for the default 30-minute retention ($2.50 for 12-hour,
+        // which Octopush never requests). Prompts over 272K input tokens cost
+        // 2x input/cache and 1.5x output; that tier is not modelled yet.
+        "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
+        // GPT-4o family: no cache-write charge, so writes cost the input price.
         "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
         "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
         // Anything else is unknown — unpriced, not free.
@@ -428,15 +430,24 @@ pub fn catalog() -> Option<Arc<crate::provider_router::ProviderRouter>> {
 /// the user deliberately priced at zero). A `provider/model` id whose prefix
 /// names a **local** catalog provider is free even when the model itself is
 /// not listed. Then the builtin table; `None` means genuinely unknown.
+///
+/// A catalog entry with a `$0` cache-write price but a non-zero input price
+/// (a user-added model: Settings → Models saves `cacheCreationCostPerM: 0`)
+/// prices its cache writes at the input rate, the way OpenAI-compatible
+/// usage was billed before cache writes were split out of the prompt total.
+/// A `$0` write column there means "not set", not "free"; an explicitly free
+/// model has a `$0` input price too and stays free. Every builtin catalog
+/// entry carries an explicit write price, so builtins are unaffected.
 pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model: &str) -> Option<ModelPrices> {
     if let Some(router) = router {
         if let Some((_, mi)) = router.find_model(model) {
+            let write_per_m = effective_write_per_m(mi.input_cost_per_m, mi.cache_creation_cost_per_m);
             return Some(ModelPrices {
                 input_per_m: mi.input_cost_per_m,
                 output_per_m: mi.output_cost_per_m,
                 cache_read_per_m: mi.cache_read_cost_per_m,
-                cache_creation_per_m: mi.cache_creation_cost_per_m,
-                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, mi.cache_creation_cost_per_m),
+                cache_creation_per_m: write_per_m,
+                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, write_per_m),
             });
         }
         if router.provider_for_prefix(model).is_some_and(|p| p.local) {
@@ -444,6 +455,16 @@ pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model:
         }
     }
     builtin_prices(model)
+}
+
+/// A catalog cache-write price, with an unset (`$0`) column on a paid model
+/// falling back to the input price (see [`prices_in`]).
+pub fn effective_write_per_m(input_per_m: f64, cache_creation_per_m: f64) -> f64 {
+    if cache_creation_per_m == 0.0 && input_per_m > 0.0 {
+        input_per_m
+    } else {
+        cache_creation_per_m
+    }
 }
 
 /// Resolve a model's prices, catalog-first (see [`prices_in`]). `None` means
