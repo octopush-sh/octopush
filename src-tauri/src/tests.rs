@@ -14656,6 +14656,58 @@ mod unpriced_ledger_tests {
 
     #[test]
     #[serial_test::serial(pricing_catalog)]
+    fn concurrent_reprices_run_the_october_pass_once() {
+        // Several rounds: two passes started together overlap almost always
+        // without the reprice lock.
+        for round in 0..8 {
+            let db = Arc::new(Mutex::new(test_db()));
+            let run = {
+                let d = db.lock();
+                let now = chrono::Utc::now().to_rfc3339();
+                d.conn_ref()
+                    .execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now])
+                    .unwrap();
+                d.conn_ref()
+                    .execute(
+                        "INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)",
+                        [&now],
+                    )
+                    .unwrap();
+                let pid = d.insert_pipeline("P", "d", false).unwrap();
+                d.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+                // A pre-v0.4.89 DIRECT stage billed at the stale $15/$75.
+                let run = d.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+                let stages = d.list_run_stages(&run).unwrap();
+                d.complete_run_stage(&stages[0].id, "done", 10_000, 2_000, 0, 0, 0.30, None).unwrap();
+                d.set_run_cost(&run, 0.30, 0.60).unwrap();
+                run
+            };
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let passes: Vec<_> = (0..2)
+                .map(|_| {
+                    let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        // The test config dir is per thread.
+                        let _cfg = crate::provider_router::TestConfigDir::new();
+                        barrier.wait();
+                        crate::commands::reprice_ledger(&db).unwrap();
+                    })
+                })
+                .collect();
+            for p in passes {
+                p.join().unwrap();
+            }
+            let d = db.lock();
+            let stage = d.list_run_stages(&run).unwrap()[0].cost_usd;
+            assert!((stage - 0.10).abs() < 1e-9, "round {round}: stage scaled once to $0.10, got {stage}");
+            let r = d.get_run(&run).unwrap().unwrap();
+            assert!((r.cost_usd - 0.10).abs() < 1e-9, "round {round}: run cost {}", r.cost_usd);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn upgraded_ledger_gets_the_gpt4o_cached_input_fix_once() {
         let _cfg = crate::provider_router::TestConfigDir::new();
         let db = Arc::new(Mutex::new(test_db()));
