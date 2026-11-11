@@ -3,6 +3,7 @@
 // may lack (`CLAUDE_SECURITY_FIXES`). An old CLI is a warning in Settings ›
 // Integrations and the Direct launcher — it never blocks a run.
 import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote } from "./ipc";
+import codexCatalog from "./codexEffortLevels.json";
 
 /** Why an old CLI matters, in one line (shared by every surface that warns). */
 export const CLAUDE_UPDATE_REASON =
@@ -33,16 +34,39 @@ export function runsOnClaudeCode(model: string): boolean {
 
 /** Mirrors `cli_runner::effort_applies`: a stage's reasoning effort reaches
  *  the agent on the API, and on a CLI stage in either dialect — Claude Code
- *  as `--effort <level>`, Codex as `-c model_reasoning_effort="<level>"`.
- *  The model picks the dialect, and both take an effort today. */
-export function effortApplies(substrate: string, _model: string): boolean {
-  return substrate === "api" || substrate === "cli";
+ *  as `--effort <level>`, Codex as `-c model_reasoning_effort="<level>"` but
+ *  only on a model whose levels Codex's catalog lists (see
+ *  `codexEffortLevel`). The model picks the dialect. */
+export function effortApplies(substrate: string, model: string): boolean {
+  if (substrate === "api") return true;
+  if (substrate !== "cli") return false;
+  return runsOnClaudeCode(model) || (codexEffortLevels(model)?.length ?? 0) > 0;
 }
 
-/** The level a Codex CLI stage actually gets: Codex lists `max` only on
- *  `gpt-6*`, so other models get `xhigh` (mirrors `CliDialect::effort_level`). */
-export function codexEffortLevel(model: string, effort: string): string {
-  return effort === "max" && !model.toLowerCase().startsWith("gpt-6") ? "xhigh" : effort;
+const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
+
+/** The levels Codex lists for `model` in its bundled catalog
+ *  (`codexEffortLevels.json`, shared with `cli_runner::codex_effort_levels`,
+ *  which cites the openai/codex `models.json` commit), or undefined for a
+ *  model the catalog doesn't know. Empty = a non-reasoning model. */
+export function codexEffortLevels(model: string): readonly string[] | undefined {
+  const table = codexCatalog.models as Record<string, readonly string[]>;
+  const key = model.trim().toLowerCase();
+  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+/** The level a Codex CLI stage actually gets (mirrors
+ *  `cli_runner::codex_effort_level`): the effort when the model lists it,
+ *  else the highest listed level below it (the lowest listed if none is
+ *  below); null — no override, Codex's own default — for a model the catalog
+ *  doesn't know or one without reasoning. */
+export function codexEffortLevel(model: string, effort: string): string | null {
+  const listed = codexEffortLevels(model);
+  if (!listed) return null;
+  const supported = EFFORT_ORDER.filter((e) => listed.includes(e));
+  const rank = EFFORT_ORDER.indexOf(effort as (typeof EFFORT_ORDER)[number]);
+  const below = supported.filter((e) => EFFORT_ORDER.indexOf(e) <= rank);
+  return below[below.length - 1] ?? supported[0] ?? null;
 }
 
 /** True when any CLI stage of the crew (with the launcher's per-position

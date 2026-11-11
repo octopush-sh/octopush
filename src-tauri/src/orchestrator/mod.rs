@@ -69,8 +69,8 @@ pub(crate) fn escalation_changes_tier_on(stage: &RunStageRow, claude_cli_below_f
         && cli_runner::dialect_for_model(target_model) == cli_runner::CliDialect::Claude;
     let effort_reaches = cli_runner::effort_applies(&stage.substrate, target_model)
         && !(stage.substrate == "cli" && below_floor);
-    // On the CLI, compare the levels each CLI actually gets (Codex passes
-    // `max` as `xhigh` on most models, so xhigh → max there is no change).
+    // On the CLI, compare the levels each CLI actually gets (Codex clamps to
+    // the model's listed levels, so xhigh → max on gpt-5.5 is no change).
     let effort_differs = match stage.substrate.as_str() {
         "cli" => {
             let level = |m: &str, e| cli_runner::dialect_for_model(m).effort_level(m, e);

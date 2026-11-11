@@ -58,13 +58,17 @@ describe("StageFlow — quiet crew line", () => {
     const { unmount } = render(<StageFlow stages={cli("claude-sonnet-5-5")} overrides={{}} onOverride={vi.fn()} />);
     expect(screen.getByText("· xhigh")).toBeInTheDocument();
     unmount();
-    render(<StageFlow stages={cli("gpt-5-codex")} overrides={{}} onOverride={vi.fn()} />);
+    const codex = render(<StageFlow stages={cli("gpt-5.5")} overrides={{}} onOverride={vi.fn()} />);
     expect(screen.getByText("· xhigh")).toBeInTheDocument();
+    codex.unmount();
+    // Codex gets no effort on a model its catalog doesn't list, so no pill.
+    render(<StageFlow stages={cli("gpt-5-codex")} overrides={{}} onOverride={vi.fn()} />);
+    expect(screen.queryByText("· xhigh")).toBeNull();
   });
 
   it("keeps a CLI stage's effort when the run overrides it onto Codex", () => {
     const cli = [{ ...stages[1], agentModel: "claude-sonnet-5-5", effort: "low", loopTargetPosition: null }];
-    render(<StageFlow stages={cli} overrides={{ 1: "gpt-5" }} onOverride={vi.fn()} />);
+    render(<StageFlow stages={cli} overrides={{ 1: "gpt-5.5" }} onOverride={vi.fn()} />);
     expect(screen.getByText("· low")).toBeInTheDocument();
   });
 });

@@ -3810,7 +3810,7 @@ mod run_crud_tests {
         mk("completed", None, "api", 2_000);
         mk("aborted", None, "api", 50_000); // not a completed run
         mk("completed", Some("high"), "api", 8_000); // another effort
-        mk_on("completed", Some("high"), "cli", "gpt-5-codex", 3_000); // Codex takes -c model_reasoning_effort
+        mk_on("completed", Some("high"), "cli", "gpt-5.5", 3_000); // Codex takes -c model_reasoning_effort
         mk("completed", Some("high"), "cli", 4_000); // Claude Code takes --effort
 
         let mut none: Vec<u64> = db.stage_token_samples("implement", None, 20).unwrap().iter().map(|s| s.input).collect();
@@ -4817,7 +4817,7 @@ mod orchestrator_tests {
     #[test]
     fn try_escalate_accepts_effort_only_policy_on_codex_cli() {
         // Codex takes `-c model_reasoning_effort`, so low → high is a real tier change.
-        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         let orch = orch_for(&db);
         assert!(orch.try_escalate(&run, &stage).unwrap(), "a Codex CLI effort-only policy escalates");
@@ -4826,15 +4826,30 @@ mod orchestrator_tests {
 
     #[test]
     fn codex_escalation_judges_the_level_codex_actually_gets() {
-        // Below gpt-6, Codex gets `max` as `xhigh`: xhigh → max runs identically.
-        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("xhigh"), None, Some("max"));
+        // gpt-5.5 lists no `max`, so Codex gets it clamped to `xhigh`:
+        // xhigh → max runs identically.
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("xhigh"), None, Some("max"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false));
-        let (db, run) = esc_run_on("cli", "gpt-6.1-terra", Some("xhigh"), None, Some("max"));
-        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
-        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false), "gpt-6 lists max");
-        // An old Claude Code CLI doesn't stop Codex's effort.
+        // gpt-5.6-sol lists `max` (it is not just gpt-6*).
+        for model in ["gpt-6.1-terra", "gpt-5.6-sol"] {
+            let (db, run) = esc_run_on("cli", model, Some("xhigh"), None, Some("max"));
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false), "{model} lists max");
+        }
+        // A model missing from Codex's catalog gets no override at any level,
+        // so an effort-only escalation would re-run identically.
         let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), None, Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(!crate::orchestrator::escalation_changes_tier_on(&stage, false), "unknown model: no effort passes");
+        let orch = orch_for(&db);
+        assert!(!orch.try_escalate(&run, &stage).unwrap(), "no identical retry");
+        // Escalating onto a model whose levels are known does pass the effort.
+        let (db, run) = esc_run_on("cli", "gpt-5-codex", Some("low"), Some("gpt-5.5"), Some("high"));
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert!(crate::orchestrator::escalation_changes_tier_on(&stage, false));
+        // An old Claude Code CLI doesn't stop Codex's effort.
+        let (db, run) = esc_run_on("cli", "gpt-5.5", Some("low"), None, Some("high"));
         let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
         assert!(crate::orchestrator::escalation_changes_tier_on(&stage, true));
     }
@@ -9250,23 +9265,89 @@ mod cli_dialect_tests {
         assert_eq!(CliDialect::Claude.effort_args(m, Some(Effort::Max)), vec!["--effort", "max"]);
         assert!(CliDialect::Claude.effort_args(m, None).is_empty(), "no effort ⇒ the CLI's own default");
         assert_eq!(
-            CliDialect::Codex.effort_args("gpt-5-codex", Some(Effort::High)),
+            CliDialect::Codex.effort_args("gpt-5.5", Some(Effort::High)),
             vec!["-c", "model_reasoning_effort=\"high\""]
         );
-        assert!(CliDialect::Codex.effort_args("gpt-5-codex", None).is_empty(), "no effort ⇒ Codex's own default");
+        assert!(CliDialect::Codex.effort_args("gpt-5.5", None).is_empty(), "no effort ⇒ Codex's own default");
+        // A model missing from Codex's catalog keeps Codex's default.
+        assert!(CliDialect::Codex.effort_args("gpt-5-codex", Some(Effort::High)).is_empty());
     }
 
     #[test]
-    fn codex_gets_max_only_on_gpt_6() {
-        use crate::providers::Effort;
-        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(Effort::Max)), Some("xhigh"));
-        assert_eq!(CliDialect::Codex.effort_level("o3", Some(Effort::Max)), Some("xhigh"));
-        assert_eq!(CliDialect::Codex.effort_level("gpt-6.1-terra", Some(Effort::Max)), Some("max"));
-        assert_eq!(CliDialect::Codex.effort_level("GPT-6", Some(Effort::Max)), Some("max"));
-        for e in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh] {
-            assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", Some(e)), Some(e.as_str()));
+    fn codex_effort_table_parses_and_lists_only_codex_tokens() {
+        use crate::orchestrator::cli_runner::codex_effort_levels;
+        // The shared table must parse, or every Codex model reads as unknown.
+        let raw: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/codexEffortLevels.json")).expect("valid JSON");
+        let models = raw["models"].as_object().expect("models map");
+        assert!(models.len() >= 12, "{models:?}");
+        assert!(raw["source"].as_str().is_some_and(|s| s.contains("models.json")));
+        let known = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+        for (slug, levels) in models {
+            assert_eq!(slug, &slug.to_ascii_lowercase(), "slugs are matched lowercased");
+            let levels: Vec<String> = serde_json::from_value(levels.clone()).unwrap();
+            assert!(levels.iter().all(|l| known.contains(&l.as_str())), "{slug}: {levels:?}");
+            assert_eq!(codex_effort_levels(slug).map(<[String]>::to_vec), Some(levels), "{slug}");
         }
-        assert_eq!(CliDialect::Codex.effort_level("gpt-5-codex", None), None);
+        assert_eq!(codex_effort_levels("GPT-5.5 ").map(<[String]>::len), Some(4), "case/space-insensitive");
+        assert_eq!(codex_effort_levels("gpt-5-codex"), None);
+    }
+
+    #[test]
+    fn codex_effort_follows_the_catalog_for_every_model() {
+        use crate::providers::Effort::*;
+        let all = [Low, Medium, High, Xhigh, Max];
+        // Catalog @ a7a9d82: everything lists low..xhigh; max on these.
+        let with_max = [
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-sol", "gpt-6-luna",
+            "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+            "gpt-daybreak-blue-latest", "gpt-daybreak-red-latest", "codex-auto-review",
+        ];
+        for m in with_max {
+            assert_eq!(dialect_for_model(m), CliDialect::Codex, "{m}");
+            for e in all {
+                assert_eq!(CliDialect::Codex.effort_level(m, Some(e)), Some(e.as_str()), "{m} {e:?}");
+            }
+        }
+        // gpt-5.5 tops out at xhigh: max clamps down, the rest pass.
+        for e in [Low, Medium, High, Xhigh] {
+            assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", Some(e)), Some(e.as_str()));
+        }
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", Some(Max)), Some("xhigh"));
+        // Unknown to the catalog (older or non-reasoning models, typos): nothing.
+        for m in ["gpt-5-codex", "o3", "o4-mini", "gpt-5", "gpt-4o", "GPT-6"] {
+            for e in all {
+                assert_eq!(CliDialect::Codex.effort_level(m, Some(e)), None, "{m} {e:?}");
+                assert!(CliDialect::Codex.effort_args(m, Some(e)).is_empty(), "{m} {e:?}");
+            }
+            assert!(CliDialect::Codex.unpassed_effort_notice(m, Some(High)).is_some_and(|n| n.contains(m)));
+        }
+        assert_eq!(CliDialect::Codex.unpassed_effort_notice("gpt-5.5", Some(Max)), None);
+        assert_eq!(CliDialect::Codex.unpassed_effort_notice("gpt-5-codex", None), None);
+        assert_eq!(CliDialect::Claude.unpassed_effort_notice("claude-opus-5-5", Some(High)), None);
+        assert_eq!(CliDialect::Codex.effort_level("gpt-5.5", None), None);
+    }
+
+    #[test]
+    fn codex_clamps_to_the_highest_listed_level_below() {
+        use crate::orchestrator::cli_runner::codex_effort_level;
+        use crate::providers::Effort::*;
+        // Exercised on the real table; the clamp itself is generic.
+        assert_eq!(codex_effort_level("gpt-5.5", Max), Some("xhigh"));
+        assert_eq!(codex_effort_level("gpt-6-luna", Max), Some("max"));
+        assert_eq!(codex_effort_level("gpt-6-luna", Low), Some("low"));
+        use crate::orchestrator::cli_runner::clamp_to_listed_levels;
+        let l = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // A non-reasoning model (no levels) gets nothing at any effort.
+        for e in [Low, Medium, High, Xhigh, Max] {
+            assert_eq!(clamp_to_listed_levels(&l(&[]), e), None, "{e:?}");
+            assert_eq!(clamp_to_listed_levels(&l(&["none", "minimal"]), e), None, "{e:?}");
+        }
+        // Down to the highest listed level below; up to the lowest when none is below.
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "medium", "high"]), Max), Some("high"));
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "medium", "high"]), Xhigh), Some("high"));
+        assert_eq!(clamp_to_listed_levels(&l(&["medium", "high"]), Low), Some("medium"));
+        assert_eq!(clamp_to_listed_levels(&l(&["low", "high"]), Medium), Some("low"));
     }
 
     #[test]
@@ -9303,7 +9384,12 @@ mod cli_dialect_tests {
         use crate::orchestrator::cli_runner::effort_applies;
         assert!(effort_applies("api", "gpt-5"));
         assert!(effort_applies("cli", "claude-opus-5-5"));
-        assert!(effort_applies("cli", "gpt-5-codex"));
+        assert!(effort_applies("cli", "gpt-5.5"));
+        assert!(effort_applies("cli", "gpt-5.6-sol"));
+        // A Codex model missing from Codex's catalog gets no effort.
+        assert!(!effort_applies("cli", "gpt-5-codex"));
+        assert!(!effort_applies("cli", "o3"));
+        assert!(effort_applies("api", "gpt-5-codex"));
         assert!(!effort_applies("bogus", "claude-opus-5-5"));
     }
 
