@@ -840,8 +840,8 @@ fn start_setup_terminal(
         .ok_or_else(|| crate::error::AppError::Other("the workspace has no worktree".into()))?;
     let runner = setup::ensure_runner(&setup::runner_dir())?;
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
-    // The script, plus Conductor's variables for scripts imported from a
-    // `.conductor/settings.toml` (the runner skips any the user exports).
+    // The script, plus Conductor's variables for every setup script, so scripts
+    // written for Conductor work unchanged (the runner skips any the user exports).
     let env = setup::runner_env(script, project_root, &cwd, &ws.name);
     if let Err(e) = spawn_terminal_session(
         app.clone(),
