@@ -9913,6 +9913,67 @@ mod live_tests {
         assert_eq!(tool["hint"], "a.rs");
     }
 
+    /// Scripted turns, recording each request as the Responses body it becomes.
+    struct ResponsesRecorder { turns: Mutex<VecDeque<LlmResponse>>, bodies: Mutex<Vec<Value>> }
+    #[async_trait::async_trait]
+    impl LlmProvider for ResponsesRecorder {
+        async fn complete(&self, _b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
+            -> crate::error::AppResult<LlmResponse> {
+            self.bodies.lock().push(crate::providers::openai_compat::build_responses_request(r));
+            Ok(self.turns.lock().pop_front().expect("ResponsesRecorder ran out of turns"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_loop_replays_gpt6_reasoning_but_not_a_truncated_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let gpt_turn = |rs: &str, call: &str| crate::providers::openai_compat::parse_responses_response(json!({
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": rs, "summary": [], "encrypted_content": format!("enc-{rs}") },
+                { "type": "function_call", "id": format!("fc-{call}"), "call_id": call, "name": "read_file",
+                  "arguments": "{\"path\":\"a.rs\"}", "status": "completed" }
+            ]
+        }), "gpt-6-sol");
+        let mut cut = gpt_turn("rs_2", "call_2");
+        cut.stop_reason = LlmStopReason::MaxTokens;
+        let provider = ResponsesRecorder {
+            turns: Mutex::new(VecDeque::from(vec![
+                gpt_turn("rs_1", "call_1"),
+                cut,
+                resp("done", vec![], LlmStopReason::EndTurn),
+            ])),
+            bodies: Mutex::new(vec![]),
+        };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "https://api.openai.com/v1", None, &client, "gpt-6-sol",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false, None, &[], None,
+                                   None,).await.unwrap();
+        assert_eq!(out.text, "done");
+
+        let bodies = provider.bodies.lock();
+        assert_eq!(bodies.len(), 3);
+        // Turn 2: the reasoning item, then its call with its fc id, then the output.
+        let input = bodies[1]["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], "reasoning");
+        assert_eq!(input[1]["encrypted_content"], "enc-rs_1");
+        assert_eq!(input[2]["type"], "function_call");
+        assert_eq!(input[2]["id"], "fc-call_1");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_1");
+        // Turn 3: the truncated turn's reasoning is dropped and its call rebuilt.
+        let input = bodies[2]["input"].as_array().unwrap();
+        let text = serde_json::to_string(input).unwrap();
+        assert!(text.contains("enc-rs_1"), "the completed turn still replays");
+        assert!(!text.contains("enc-rs_2") && !text.contains("fc-call_2"), "{text}");
+        let call_2 = input.iter().find(|i| i["type"] == "function_call" && i["call_id"] == "call_2").unwrap();
+        assert!(call_2.get("id").is_none());
+    }
+
     #[tokio::test]
     async fn agentic_loop_exhaustion_forces_a_toolless_close() {
         let dir = tempfile::tempdir().unwrap();

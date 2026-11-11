@@ -110,6 +110,18 @@ describe("StageInspector — reasoning on CLI stages", () => {
     renderInspector({ substrate: "api", effort: null });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
     expect(within(group).getByText("Off").getAttribute("aria-checked")).toBe("true");
+    expect(group.querySelector("[title=\"No extra thinking (fastest, cheapest)\"]")).not.toBeNull();
+  });
+
+  it("says what Off does on each GPT-6 model", () => {
+    renderInspector({ substrate: "api", agentModel: "gpt-6-astra", effort: null });
+    let group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.querySelector("[title=\"OpenAI has no off level for this model, so it reasons at its default: medium\"]")).not.toBeNull();
+    expect(screen.getByText("Reasoning").getAttribute("title")).toMatch(/Off: OpenAI has no off level/);
+    cleanup();
+    renderInspector({ substrate: "api", agentModel: "gpt-6-sol", effort: null });
+    group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.querySelector("[title^=\"No reasoning (effort none on OpenAI\"]")).not.toBeNull();
   });
 
   it("passes a Codex stage's effort, with Auto for Codex's default", () => {
