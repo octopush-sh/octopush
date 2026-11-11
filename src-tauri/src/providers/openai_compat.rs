@@ -4,10 +4,13 @@
 //! any self-hosted server that speaks the OpenAI Chat Completions protocol
 //! (vllm, llama.cpp server, LMStudio, LocalAI, etc.).
 //!
-//! GPT-6 models go to the Responses API instead (`/responses`): on Chat
-//! Completions they take no tools at all (GPT-6 Astra, GPT-6.1 Sol/Terra) or
-//! only with `reasoning_effort: "none"` (GPT-6 Sol/Luna), and every API stage
-//! sends tools. See `uses_responses_api`.
+//! GPT-6 models on OpenAI itself (`api.openai.com`) go to the Responses API
+//! instead (`/responses`): on Chat Completions they take no tools at all
+//! (GPT-6 Astra, GPT-6.1 Sol/Terra) or only with `reasoning_effort: "none"`
+//! (GPT-6 Sol/Luna), and every API stage sends tools. A GPT-6 id behind any
+//! other base URL (LiteLLM, OpenRouter, a custom gateway) stays on Chat
+//! Completions, since such a gateway may not speak Responses. See
+//! `uses_responses_api`.
 
 use super::{
     Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
@@ -28,7 +31,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         req: &LlmRequest,
         client: &reqwest::Client,
     ) -> AppResult<LlmResponse> {
-        let responses = uses_responses_api(&req.model);
+        let responses = uses_responses_api(&req.model, api_base);
         let (body, url) = if responses {
             (build_responses_request(req), responses_url(api_base))
         } else {
@@ -97,13 +100,29 @@ fn is_gpt6(model_id: &str) -> bool {
     model_id.to_ascii_lowercase().contains("gpt-6")
 }
 
-/// Whether this model is sent to the Responses API rather than Chat
+/// Whether this request is sent to the Responses API rather than Chat
 /// Completions. Per OpenAI's model pages and reasoning guide, GPT-6.1 Terra
 /// "requires the Responses API" for tool calling, GPT-6 Astra and GPT-6.1 Sol
 /// get no function calling on Chat Completions, and GPT-6 Sol/Luna only with
 /// `reasoning_effort: "none"`, which would throw the stage's effort away.
-pub fn uses_responses_api(model_id: &str) -> bool {
-    is_gpt6(model_id)
+///
+/// Only when the base URL is OpenAI's own API host, though: a GPT-6 id behind
+/// LiteLLM, OpenRouter, a custom OpenAI-compatible provider or a base-URL
+/// override goes to whatever that gateway speaks, and many speak Chat
+/// Completions only, where `/responses` would fail every request. Those keep
+/// the pre-Responses behaviour (Chat Completions).
+pub fn uses_responses_api(model_id: &str, api_base: &str) -> bool {
+    is_gpt6(model_id) && is_openai_api_host(api_base)
+}
+
+/// Whether a configured base URL points at `api.openai.com` (host compared
+/// case-insensitively; scheme, port and path don't matter). An unparseable
+/// base is not OpenAI.
+fn is_openai_api_host(api_base: &str) -> bool {
+    reqwest::Url::parse(api_base.trim())
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.eq_ignore_ascii_case("api.openai.com")))
+        .unwrap_or(false)
 }
 
 /// The OpenAI effort level for a reasoning model. GPT-6 takes all five levels
@@ -185,7 +204,7 @@ pub fn build_request(req: &LlmRequest) -> Value {
     body
 }
 
-/// Build a Responses API body (GPT-6, see `uses_responses_api`). Stateless:
+/// Build a Responses API body (GPT-6 on OpenAI, see `uses_responses_api`). Stateless:
 /// `store: false` keeps OpenAI from retaining the conversation (Chat
 /// Completions doesn't store by default either), so every turn re-sends the
 /// whole history as input items, and tool calls are replayed by `call_id`.
@@ -195,11 +214,16 @@ pub fn build_responses_request(req: &LlmRequest) -> Value {
         input.extend(message_to_responses(m));
     }
 
+    // `strict: false` explicitly: an omitted `strict` makes Responses try to
+    // normalize the schema into strict mode, while Chat Completions (and every
+    // other provider here) is non-strict by default (function-calling guide,
+    // "Strict mode"). Our tool schemas aren't written for strict mode.
     let tools: Vec<Value> = req.tools.iter().map(|t| json!({
         "type": "function",
         "name": t.name,
         "description": t.description,
         "parameters": t.input_schema,
+        "strict": false,
     })).collect();
 
     let mut body = json!({
@@ -271,10 +295,13 @@ fn message_to_responses(msg: &LlmMessage) -> Vec<Value> {
 
 /// Parse a Responses API body: `output_text` parts of `message` items are the
 /// text, `function_call` items the tool uses (keyed by `call_id`, which the
-/// next turn's `function_call_output` answers). Reasoning items are dropped.
+/// next turn's `function_call_output` answers). A `refusal` part's
+/// explanation becomes visible text and the turn stops as
+/// `Other("refusal")`, never an empty EndTurn. Reasoning items are dropped.
 pub fn parse_responses_response(response: Value) -> LlmResponse {
     let mut text = String::new();
     let mut tool_uses: Vec<LlmToolUse> = Vec::new();
+    let mut refused = false;
 
     let items = response.get("output").and_then(|o| o.as_array());
     for item in items.into_iter().flatten() {
@@ -282,10 +309,22 @@ pub fn parse_responses_response(response: Value) -> LlmResponse {
             Some("message") => {
                 let parts = item.get("content").and_then(|c| c.as_array());
                 for part in parts.into_iter().flatten() {
-                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            text.push_str(t);
+                    match part.get("type").and_then(|t| t.as_str()) {
+                        Some("output_text") => {
+                            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                text.push_str(t);
+                            }
                         }
+                        // `{ "type": "refusal", "refusal": "<explanation>" }`
+                        Some("refusal") => {
+                            refused = true;
+                            let why = part.get("refusal").and_then(|r| r.as_str()).unwrap_or("");
+                            if !text.is_empty() && !why.is_empty() {
+                                text.push_str("\n\n");
+                            }
+                            text.push_str(why);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -316,6 +355,7 @@ pub fn parse_responses_response(response: Value) -> LlmResponse {
         },
         Some(s) if s != "completed" => LlmStopReason::Other(s.to_string()),
         _ if !tool_uses.is_empty() => LlmStopReason::ToolUse,
+        _ if refused => LlmStopReason::Other("refusal".to_string()),
         _ => LlmStopReason::EndTurn,
     };
 
