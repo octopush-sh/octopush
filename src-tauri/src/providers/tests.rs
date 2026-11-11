@@ -791,6 +791,39 @@ mod effort {
     }
 
     #[test]
+    fn openai_effort_passes_xhigh_and_max_through_on_gpt6_only() {
+        // Every GPT-6 model page accepts xhigh and max (#689).
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol"] {
+            for e in [Effort::Xhigh, Effort::Max] {
+                assert_eq!(openai_compat::reasoning_effort_level(m, e), e.as_str(), "{m}");
+            }
+        }
+        // The older reasoning models stop at high.
+        for m in ["o3-mini", "gpt-5"] {
+            assert_eq!(openai_compat::reasoning_effort_level(m, Effort::Xhigh), "high", "{m}");
+            assert_eq!(openai_compat::reasoning_effort_level(m, Effort::Max), "high", "{m}");
+            assert_eq!(openai_compat::reasoning_effort_level(m, Effort::Low), "low", "{m}");
+        }
+        let mut req = sample_request();
+        req.model = "gpt-5".into();
+        req.effort = Some(Effort::Max);
+        assert_eq!(openai_compat::build_request(&req)["reasoning_effort"], "high");
+    }
+
+    #[test]
+    fn openai_responses_request_carries_effort_unfolded() {
+        let mut req = sample_request();
+        req.model = "gpt-6.1-terra".into();
+        req.effort = Some(Effort::Max);
+        let body = openai_compat::build_responses_request(&req);
+        assert_eq!(body["reasoning"], json!({ "effort": "max" }));
+        assert!(body.get("reasoning_effort").is_none(), "Chat Completions key must not leak");
+        // No effort → no reasoning block (the API's own default).
+        req.effort = None;
+        assert!(openai_compat::build_responses_request(&req).get("reasoning").is_none());
+    }
+
+    #[test]
     fn max_tokens_for_floors_by_effort() {
         assert_eq!(max_tokens_for(None), 32768);
         assert_eq!(max_tokens_for(Some(Effort::Low)), 32768);
@@ -799,6 +832,173 @@ mod effort {
         assert_eq!(max_tokens_for(Some(Effort::Xhigh)), 64000);
         assert_eq!(max_tokens_for(Some(Effort::Max)), 64000);
     }
+}
+
+// ─── OpenAI Responses API (GPT-6 tool calls, #689) ───────────────────────────
+
+#[test]
+fn openai_gpt6_models_use_the_responses_api() {
+    for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol", "GPT-6-Sol"] {
+        assert!(openai_compat::uses_responses_api(m), "{m} needs the Responses API for tools");
+    }
+    for m in ["gpt-4o", "gpt-5", "o3-mini", "deepseek-chat", "llama3.1"] {
+        assert!(!openai_compat::uses_responses_api(m), "{m} stays on Chat Completions");
+    }
+}
+
+#[test]
+fn openai_responses_url_from_any_pasted_base() {
+    for base in [
+        "https://api.openai.com/v1",
+        "https://api.openai.com/v1/",
+        "https://api.openai.com/v1/chat/completions",
+        "https://api.openai.com/v1/responses",
+    ] {
+        assert_eq!(openai_compat::responses_url(base), "https://api.openai.com/v1/responses", "{base}");
+    }
+}
+
+#[test]
+fn openai_responses_request_shape() {
+    let mut req = sample_request();
+    req.model = "gpt-6-sol".into();
+    req.max_tokens = 48000;
+    let body = openai_compat::build_responses_request(&req);
+    assert_eq!(body["model"], "gpt-6-sol");
+    assert_eq!(body["instructions"], "You are helpful.");
+    assert_eq!(body["input"][0], json!({ "role": "user", "content": "Hi there." }));
+    assert_eq!(body["max_output_tokens"], 48000);
+    assert_eq!(body["store"], false, "nothing is kept server-side");
+    assert!(body.get("messages").is_none() && body.get("max_completion_tokens").is_none());
+    // Responses tools are flat: no `function` wrapper.
+    let tool = &body["tools"][0];
+    assert_eq!(tool["type"], "function");
+    assert_eq!(tool["name"], "read_file");
+    assert_eq!(tool["description"], "Read a file.");
+    assert!(tool["parameters"].is_object());
+    assert!(tool.get("function").is_none());
+    assert!(body.get("tool_choice").is_none());
+    req.tool_choice = Some("emit_result".into());
+    let body = openai_compat::build_responses_request(&req);
+    assert_eq!(body["tool_choice"], json!({ "type": "function", "name": "emit_result" }));
+}
+
+#[test]
+fn openai_responses_replays_tool_turns_by_call_id() {
+    let mut req = sample_request();
+    req.model = "gpt-6.1-terra".into();
+    req.messages.push(LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw: vec![],
+            text: "let me read it".into(),
+            tool_uses: vec![
+                LlmToolUse { id: "call_1".into(), name: "read_file".into(), input: json!({ "path": "x" }) },
+                LlmToolUse { id: "call_2".into(), name: "read_file".into(), input: json!({ "path": "y" }) },
+            ],
+        },
+    });
+    req.messages.push(LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::ToolResults(vec![
+            LlmToolResult { tool_use_id: "call_1".into(), content: "ok".into(), is_error: false },
+            LlmToolResult { tool_use_id: "call_2".into(), content: "ok2".into(), is_error: false },
+        ]),
+    });
+    let body = openai_compat::build_responses_request(&req);
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 6, "user, assistant text, 2 calls, 2 outputs");
+    assert_eq!(input[1], json!({ "role": "assistant", "content": "let me read it" }));
+    assert_eq!(input[2]["type"], "function_call");
+    assert_eq!(input[2]["call_id"], "call_1");
+    assert_eq!(input[2]["name"], "read_file");
+    assert!(input[2].get("id").is_none(), "an fc_ id would demand its reasoning item");
+    let args: serde_json::Value = serde_json::from_str(input[3]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(args, json!({ "path": "y" }));
+    assert_eq!(input[4], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
+    assert_eq!(input[5]["call_id"], "call_2");
+}
+
+#[test]
+fn openai_responses_multimodal_uses_input_parts() {
+    let mut req = sample_request();
+    req.model = "gpt-6.1-terra".into();
+    req.messages = vec![LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::Multimodal(vec![
+            LlmBlock::Text("hi".into()),
+            LlmBlock::Image { media_type: "image/png".into(), data: "ZZ".into() },
+        ]),
+    }];
+    let body = openai_compat::build_responses_request(&req);
+    let content = &body["input"][0]["content"];
+    assert_eq!(content[0], json!({ "type": "input_text", "text": "hi" }));
+    assert_eq!(content[1], json!({ "type": "input_image", "image_url": "data:image/png;base64,ZZ" }));
+}
+
+#[test]
+fn openai_parse_responses_tool_calls() {
+    let resp = openai_compat::parse_responses_response(json!({
+        "status": "completed",
+        "output": [
+            { "type": "reasoning", "id": "rs_1", "summary": [] },
+            { "type": "message", "role": "assistant", "content": [
+                { "type": "output_text", "text": "Reading." }
+            ]},
+            { "type": "function_call", "id": "fc_1", "call_id": "call_9", "name": "write_file",
+              "arguments": "{\"path\":\"a.ts\",\"content\":\"hello\"}" }
+        ],
+        "usage": { "input_tokens": 30, "output_tokens": 5 }
+    }));
+    assert_eq!(resp.text, "Reading.");
+    assert_eq!(resp.tool_uses.len(), 1);
+    assert_eq!(resp.tool_uses[0].id, "call_9", "keyed by call_id, not the item id");
+    assert_eq!(resp.tool_uses[0].name, "write_file");
+    assert_eq!(resp.tool_uses[0].input, json!({ "path": "a.ts", "content": "hello" }));
+    assert_eq!(resp.stop_reason, LlmStopReason::ToolUse);
+    assert_eq!((resp.input_tokens, resp.output_tokens), (30, 5));
+    assert!(resp.raw_content.is_empty());
+}
+
+#[test]
+fn openai_parse_responses_stop_reasons() {
+    let text_only = openai_compat::parse_responses_response(json!({
+        "status": "completed",
+        "output": [{ "type": "message", "content": [{ "type": "output_text", "text": "Done." }] }]
+    }));
+    assert_eq!(text_only.text, "Done.");
+    assert_eq!(text_only.stop_reason, LlmStopReason::EndTurn);
+    // Cut at the token cap, even mid tool call.
+    let cut = openai_compat::parse_responses_response(json!({
+        "status": "incomplete",
+        "incomplete_details": { "reason": "max_output_tokens" },
+        "output": [{ "type": "function_call", "call_id": "c", "name": "n", "arguments": "{" }]
+    }));
+    assert_eq!(cut.stop_reason, LlmStopReason::MaxTokens);
+    assert_eq!(cut.tool_uses[0].input, json!({}), "truncated arguments parse to {{}}");
+    let filtered = openai_compat::parse_responses_response(json!({
+        "status": "incomplete",
+        "incomplete_details": { "reason": "content_filter" },
+        "output": []
+    }));
+    assert_eq!(filtered.stop_reason, LlmStopReason::Other("content_filter".into()));
+}
+
+#[test]
+fn openai_parse_responses_splits_cached_input() {
+    let resp = openai_compat::parse_responses_response(json!({
+        "status": "completed",
+        "output": [],
+        "usage": {
+            "input_tokens": 15000,
+            "output_tokens": 200,
+            "input_tokens_details": { "cached_tokens": 12000, "cache_write_tokens": 2500 }
+        }
+    }));
+    assert_eq!(resp.input_tokens, 500, "billable input = input - cached - written");
+    assert_eq!(resp.cache_read_tokens, 12000);
+    assert_eq!(resp.cache_creation_tokens, 2500);
+    assert_eq!(resp.output_tokens, 200);
 }
 
 // ─── complete_with_retry: transient-failure resilience ──────────────────────────

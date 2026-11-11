@@ -3,6 +3,11 @@
 //! Used by OpenAI proper, DeepSeek, Ollama (via /v1/chat/completions), and
 //! any self-hosted server that speaks the OpenAI Chat Completions protocol
 //! (vllm, llama.cpp server, LMStudio, LocalAI, etc.).
+//!
+//! GPT-6 models go to the Responses API instead (`/responses`): on Chat
+//! Completions they take no tools at all (GPT-6 Astra, GPT-6.1 Sol/Terra) or
+//! only with `reasoning_effort: "none"` (GPT-6 Sol/Luna), and every API stage
+//! sends tools. See `uses_responses_api`.
 
 use super::{
     Effort, LlmContent, LlmMessage, LlmProvider, LlmRequest, LlmResponse, LlmRole,
@@ -23,8 +28,12 @@ impl LlmProvider for OpenAICompatibleProvider {
         req: &LlmRequest,
         client: &reqwest::Client,
     ) -> AppResult<LlmResponse> {
-        let body = build_request(req);
-        let url = chat_completions_url(api_base);
+        let responses = uses_responses_api(&req.model);
+        let (body, url) = if responses {
+            (build_responses_request(req), responses_url(api_base))
+        } else {
+            (build_request(req), chat_completions_url(api_base))
+        };
 
         let mut request = client.post(&url)
             .header("content-type", "application/json")
@@ -59,7 +68,7 @@ impl LlmProvider for OpenAICompatibleProvider {
         let response: Value = resp.json().await
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
-        Ok(parse_response(response))
+        Ok(if responses { parse_responses_response(response) } else { parse_response(response) })
     }
 }
 
@@ -70,6 +79,41 @@ pub fn chat_completions_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     let base = base.strip_suffix("/chat/completions").unwrap_or(base);
     format!("{base}/chat/completions")
+}
+
+/// Resolve the Responses endpoint from a configured base URL, stripping a
+/// pasted full endpoint (either API's) so we never double the path.
+pub fn responses_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    let base = base.strip_suffix("/chat/completions").unwrap_or(base);
+    let base = base.strip_suffix("/responses").unwrap_or(base);
+    format!("{base}/responses")
+}
+
+/// GPT-6 models (Sol, Luna, Astra, 6.1 Terra, 6.1 Sol). Their model pages
+/// accept every effort level up to `max`, and their tool calls need the
+/// Responses API.
+fn is_gpt6(model_id: &str) -> bool {
+    model_id.to_ascii_lowercase().contains("gpt-6")
+}
+
+/// Whether this model is sent to the Responses API rather than Chat
+/// Completions. Per OpenAI's model pages and reasoning guide, GPT-6.1 Terra
+/// "requires the Responses API" for tool calling, GPT-6 Astra and GPT-6.1 Sol
+/// get no function calling on Chat Completions, and GPT-6 Sol/Luna only with
+/// `reasoning_effort: "none"`, which would throw the stage's effort away.
+pub fn uses_responses_api(model_id: &str) -> bool {
+    is_gpt6(model_id)
+}
+
+/// The OpenAI effort level for a reasoning model. GPT-6 takes all five levels
+/// as-is; the older reasoning models (o-series, GPT-5) stop at `high`, so
+/// `xhigh` and `max` fold to it there.
+pub fn reasoning_effort_level(model_id: &str, effort: Effort) -> &'static str {
+    match effort {
+        Effort::Xhigh | Effort::Max if !is_gpt6(model_id) => "high",
+        _ => effort.as_str(),
+    }
 }
 
 /// Whether an OpenAI-family model actually honors `reasoning_effort`. Only the
@@ -131,19 +175,180 @@ pub fn build_request(req: &LlmRequest) -> Value {
         body["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
     }
     // Reasoning effort → OpenAI's `reasoning_effort`, but ONLY on models that
-    // honor it (o1/o3/o4, GPT-5, GPT-6). OpenAI exposes only low/medium/high, so the
-    // finer Anthropic levels (xhigh/max) fold to "high".
+    // honor it (o1/o3/o4, GPT-5, GPT-6), at the level each one takes (see
+    // `reasoning_effort_level`).
     if let Some(effort) = req.effort {
         if reasoning {
-            let level = match effort {
-                Effort::Low => "low",
-                Effort::Medium => "medium",
-                Effort::High | Effort::Xhigh | Effort::Max => "high",
-            };
-            body["reasoning_effort"] = json!(level);
+            body["reasoning_effort"] = json!(reasoning_effort_level(&req.model, effort));
         }
     }
     body
+}
+
+/// Build a Responses API body (GPT-6, see `uses_responses_api`). Stateless:
+/// `store: false` keeps OpenAI from retaining the conversation (Chat
+/// Completions doesn't store by default either), so every turn re-sends the
+/// whole history as input items, and tool calls are replayed by `call_id`.
+pub fn build_responses_request(req: &LlmRequest) -> Value {
+    let mut input: Vec<Value> = Vec::with_capacity(req.messages.len());
+    for m in &req.messages {
+        input.extend(message_to_responses(m));
+    }
+
+    let tools: Vec<Value> = req.tools.iter().map(|t| json!({
+        "type": "function",
+        "name": t.name,
+        "description": t.description,
+        "parameters": t.input_schema,
+    })).collect();
+
+    let mut body = json!({
+        "model": req.model,
+        "input": input,
+        // Unclamped, like `max_completion_tokens` on Chat Completions.
+        "max_output_tokens": req.max_tokens,
+        "store": false,
+    });
+    if !req.system.is_empty() {
+        body["instructions"] = json!(req.system);
+    }
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools);
+    }
+    if let Some(name) = &req.tool_choice {
+        body["tool_choice"] = json!({ "type": "function", "name": name });
+    }
+    if let Some(effort) = req.effort {
+        body["reasoning"] = json!({ "effort": reasoning_effort_level(&req.model, effort) });
+    }
+    body
+}
+
+/// Returns 1 or more Responses input items from a normalized LlmMessage. An
+/// assistant turn with tools becomes its text (if any) plus one
+/// `function_call` item per call; each tool result is a `function_call_output`.
+fn message_to_responses(msg: &LlmMessage) -> Vec<Value> {
+    match (&msg.role, &msg.content) {
+        (LlmRole::User, LlmContent::Text(t)) => vec![json!({ "role": "user", "content": t })],
+        (_, LlmContent::Multimodal(blocks)) => {
+            let parts: Vec<Value> = blocks
+                .iter()
+                .map(|b| match b {
+                    crate::providers::LlmBlock::Text(t) => json!({ "type": "input_text", "text": t }),
+                    crate::providers::LlmBlock::Image { media_type, data } => json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{media_type};base64,{data}"),
+                    }),
+                })
+                .collect();
+            vec![json!({ "role": "user", "content": parts })]
+        }
+        (LlmRole::Assistant, LlmContent::Text(t)) => vec![json!({ "role": "assistant", "content": t })],
+        (LlmRole::Assistant, LlmContent::AssistantWithTools { text, tool_uses, .. }) => {
+            let mut items = Vec::with_capacity(tool_uses.len() + 1);
+            if !text.is_empty() {
+                items.push(json!({ "role": "assistant", "content": text }));
+            }
+            // No item `id`: an `fc_…` id would make the API look for the
+            // reasoning item it came with, which a stateless request lacks.
+            items.extend(tool_uses.iter().map(|u| json!({
+                "type": "function_call",
+                "call_id": u.id,
+                "name": u.name,
+                "arguments": serde_json::to_string(&u.input).unwrap_or_else(|_| "{}".into()),
+            })));
+            items
+        }
+        (LlmRole::User, LlmContent::ToolResults(results)) => results.iter().map(|r| json!({
+            "type": "function_call_output",
+            "call_id": r.tool_use_id,
+            "output": r.content,
+        })).collect(),
+        // Defensive: malformed combinations
+        _ => vec![json!({ "role": "user", "content": "" })],
+    }
+}
+
+/// Parse a Responses API body: `output_text` parts of `message` items are the
+/// text, `function_call` items the tool uses (keyed by `call_id`, which the
+/// next turn's `function_call_output` answers). Reasoning items are dropped.
+pub fn parse_responses_response(response: Value) -> LlmResponse {
+    let mut text = String::new();
+    let mut tool_uses: Vec<LlmToolUse> = Vec::new();
+
+    let items = response.get("output").and_then(|o| o.as_array());
+    for item in items.into_iter().flatten() {
+        match item.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {
+                let parts = item.get("content").and_then(|c| c.as_array());
+                for part in parts.into_iter().flatten() {
+                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            text.push_str(t);
+                        }
+                    }
+                }
+            }
+            Some("function_call") => {
+                let field = |k: &str| item.get(k).and_then(|v| v.as_str()).unwrap_or("");
+                let input: Value = serde_json::from_str(field("arguments")).unwrap_or_else(|_| json!({}));
+                tool_uses.push(LlmToolUse {
+                    id: field("call_id").to_string(),
+                    name: field("name").to_string(),
+                    input,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // A response cut at `max_output_tokens` is `incomplete`, even when it
+    // got as far as a (possibly truncated) tool call.
+    let stop_reason = match response.get("status").and_then(|s| s.as_str()) {
+        Some("incomplete") => match response
+            .get("incomplete_details")
+            .and_then(|d| d.get("reason"))
+            .and_then(|r| r.as_str())
+        {
+            Some("max_output_tokens") => LlmStopReason::MaxTokens,
+            Some(other) => LlmStopReason::Other(other.to_string()),
+            None => LlmStopReason::Other("incomplete".to_string()),
+        },
+        Some(s) if s != "completed" => LlmStopReason::Other(s.to_string()),
+        _ if !tool_uses.is_empty() => LlmStopReason::ToolUse,
+        _ => LlmStopReason::EndTurn,
+    };
+
+    // Same accounting as Chat Completions under the Responses names:
+    // `input_tokens` includes the `input_tokens_details` cached / written
+    // slices (see `split_cached_input`).
+    let usage = response.get("usage");
+    let count = |k: &str| usage.and_then(|u| u.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let (input_tokens, cache_read_tokens, cache_creation_tokens) =
+        split_cached_input(count("input_tokens"), usage.and_then(|u| u.get("input_tokens_details")));
+
+    LlmResponse {
+        text,
+        tool_uses,
+        stop_reason,
+        input_tokens,
+        output_tokens: count("output_tokens"),
+        cache_read_tokens,
+        cache_creation_tokens,
+        rate_limit: None,
+        // Reasoning items aren't replayed (stateless, no encrypted content).
+        raw_content: vec![],
+    }
+}
+
+/// Split a full prompt count into `(fresh input, cache read, cache write)`
+/// from its details block (`cached_tokens`, `cache_write_tokens`). Both slices
+/// are inside the prompt count, so each is capped by what is left of it.
+fn split_cached_input(prompt_tokens: u64, details: Option<&Value>) -> (u64, u64, u64) {
+    let detail = |k: &str| details.and_then(|d| d.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
+    let cache_read = detail("cached_tokens").min(prompt_tokens);
+    let cache_write = detail("cache_write_tokens").min(prompt_tokens - cache_read);
+    (prompt_tokens - cache_read - cache_write, cache_read, cache_write)
 }
 
 /// Returns 1 or more OpenAI-format messages from a normalized LlmMessage.
@@ -274,10 +479,8 @@ pub fn parse_response(response: Value) -> LlmResponse {
     // full input rate and cache writes (1.25x input on GPT-5.6+) are
     // under-counted. Providers that omit a field report 0 (no change).
     let details = response.get("usage").and_then(|u| u.get("prompt_tokens_details"));
-    let detail = |k: &str| details.and_then(|d| d.get(k)).and_then(|v| v.as_u64()).unwrap_or(0);
-    let cache_read_tokens = detail("cached_tokens").min(prompt_tokens);
-    let cache_creation_tokens = detail("cache_write_tokens").min(prompt_tokens - cache_read_tokens);
-    let input_tokens = prompt_tokens - cache_read_tokens - cache_creation_tokens;
+    let (input_tokens, cache_read_tokens, cache_creation_tokens) =
+        split_cached_input(prompt_tokens, details);
 
     LlmResponse {
         text,
