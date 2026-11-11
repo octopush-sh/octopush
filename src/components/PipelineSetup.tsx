@@ -596,7 +596,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
               <p
                 data-tour="direct-launcher-model-floor"
                 data-testid="launcher-claude-model-floor"
-                title="A stage on this model fails at launch until Claude Code is updated. The run can still begin."
+                title="A stage on this model may not run until Claude Code is updated. The run can still begin."
                 className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
               >
                 {modelFloorLine}

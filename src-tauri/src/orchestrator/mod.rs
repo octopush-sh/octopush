@@ -1225,9 +1225,9 @@ impl Orchestrator {
                     let fresh_run = self.db.lock().get_run(&run.id)?;
                     if let Some(r) = fresh_run {
                         self.journal_notice(&run.id, &stage.id, &format!(
-                            "budget reached — ${:.2} of ${:.2} spent",
-                            r.cost_usd,
-                            r.budget_usd.unwrap_or(0.0)
+                            "budget reached — {} of {} spent",
+                            crate::token_engine::format_usd(r.cost_usd),
+                            crate::token_engine::format_usd(r.budget_usd.unwrap_or(0.0))
                         ));
                     }
                 }
@@ -1531,7 +1531,11 @@ impl Orchestrator {
                 "stageId": stage_id,
                 "entry": {
                     "kind": "notice",
-                    "text": format!("budget reached — ${cost:.2} of ${budget:.2} spent"),
+                    "text": format!(
+                        "budget reached — {} of {} spent",
+                        crate::token_engine::format_usd(cost),
+                        crate::token_engine::format_usd(budget)
+                    ),
                 },
             }),
         );
@@ -1561,7 +1565,11 @@ impl Orchestrator {
                 "stageId": stage_id,
                 "entry": {
                     "kind": "notice",
-                    "text": format!("{scope} budget reached — ${spent:.2} of ${limit:.2} spent"),
+                    "text": format!(
+                        "{scope} budget reached — {} of {} spent",
+                        crate::token_engine::format_usd(spent),
+                        crate::token_engine::format_usd(limit)
+                    ),
                 },
             }),
         );

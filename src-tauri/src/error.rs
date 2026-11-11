@@ -121,12 +121,17 @@ pub enum AppError {
     /// Returned when a backend budget gate blocks a spend (Phase 3 enforcement).
     /// The frontend detects `kind == "BudgetExceeded"` to surface the budget UI /
     /// override affordance. `scope` is a human string like "workspace daily".
-    #[error("budget exceeded: {scope} — spent ${spent:.2} of ${limit:.2}")]
+    #[error("budget exceeded: {scope} — spent {} of {}", usd(.spent), usd(.limit))]
     BudgetExceeded {
         scope: String,
         spent: f64,
         limit: f64,
     },
+}
+
+/// [`crate::token_engine::format_usd`] for a field borrowed by `#[error]`.
+fn usd(n: &f64) -> String {
+    crate::token_engine::format_usd(*n)
 }
 
 impl From<anyhow::Error> for AppError {
@@ -231,6 +236,25 @@ mod tests {
         assert_eq!(val["feature"], "direct.unlimited");
         assert_eq!(val["used"], 25);
         assert_eq!(val["limit"], 25);
+    }
+
+    #[test]
+    fn budget_exceeded_message_groups_dollars() {
+        let err = AppError::BudgetExceeded { scope: "workspace daily".into(), spent: 1234.5, limit: 1000.0 };
+        assert_eq!(err.to_string(), "budget exceeded: workspace daily — spent $1,234.50 of $1,000.00");
+    }
+
+    #[test]
+    fn format_usd_groups_thousands_like_the_frontend() {
+        use crate::token_engine::format_usd;
+        assert_eq!(format_usd(0.0), "$0.00");
+        assert_eq!(format_usd(0.004), "$0.00");
+        assert_eq!(format_usd(1.275), format!("${:.2}", 1.275));
+        assert_eq!(format_usd(999.999), "$1,000.00");
+        assert_eq!(format_usd(12345.6), "$12,345.60");
+        assert_eq!(format_usd(1234567.0), "$1,234,567.00");
+        assert_eq!(format_usd(-3.0), "-$3.00");
+        assert_eq!(format_usd(-0.001), "$0.00");
     }
 
     #[test]

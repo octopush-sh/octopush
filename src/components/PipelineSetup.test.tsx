@@ -502,6 +502,7 @@ describe("PipelineSetup Claude Code version preflight", () => {
     const line = await screen.findByTestId("launcher-claude-model-floor");
     expect(line).toHaveTextContent("Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316.");
     expect(line).toHaveClass("text-octo-warning");
+    expect(line).toHaveAttribute("title", "A stage on this model may not run until Claude Code is updated. The run can still begin.");
     // Only the CLI stages' models (and the escalation) are checked; the API stage isn't.
     expect(floorNoteMock).toHaveBeenCalledWith(["claude-sonnet-5-5", "claude-haiku-5-5", "claude-fable-5-2"]);
     fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));

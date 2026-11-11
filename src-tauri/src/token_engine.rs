@@ -643,6 +643,23 @@ pub fn cost_for_split(model: &str, input: u64, output: u64, cache_read: u64, cac
         .unwrap_or(0.0)
 }
 
+/// A dollar amount the way the frontend's `formatUsd` shows it: two decimals,
+/// thousands grouped ("$1,234.50", "-$3.00"), for budget messages the app
+/// shows verbatim.
+pub fn format_usd(n: f64) -> String {
+    let fixed = format!("{:.2}", n.abs());
+    let (int, frac) = fixed.split_once('.').unwrap_or((&fixed, "00"));
+    let mut grouped = String::with_capacity(int.len() + int.len() / 3);
+    for (i, d) in int.chars().enumerate() {
+        if i > 0 && (int.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(d);
+    }
+    let sign = if n < 0.0 && fixed != "0.00" { "-" } else { "" };
+    format!("{sign}${grouped}.{frac}")
+}
+
 // ─── Engine ───────────────────────────────────────────────────────────
 
 pub struct TokenEngine {

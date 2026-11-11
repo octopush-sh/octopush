@@ -92,6 +92,8 @@ pub enum OnQuit {
     /// Neither killed nor waited for: it outlives the app in its own group
     /// and finishes on its own. For `claude auth status`, which may be
     /// refreshing the OAuth token: a kill then can sign the user out.
+    /// Its stdout and stderr go to unlinked files rather than pipes, so a
+    /// write after the app exits can't fail.
     Leave,
 }
 
@@ -127,7 +129,20 @@ pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
 fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit, term_grace: Option<Duration>) -> Probe {
     let Some(mut cmd) = cmd else { return Probe::Missing };
     let io = || if capture { Stdio::piped() } else { Stdio::null() };
-    cmd.stdin(Stdio::null()).stdout(io()).stderr(io());
+    cmd.stdin(Stdio::null());
+    // An [`OnQuit::Leave`] probe outlives the app: on a pipe, a write after
+    // quit would hit a closed read end and could kill it mid-save. It writes
+    // to unlinked files instead, read once it exits.
+    let spool = match (capture && on_quit == OnQuit::Leave).then(spool_files).flatten() {
+        Some((files, [out, err])) => {
+            cmd.stdout(out).stderr(err);
+            Some(files)
+        }
+        None => {
+            cmd.stdout(io()).stderr(io());
+            None
+        }
+    };
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -180,8 +195,29 @@ fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: O
     // What it printed is already in the pipes; the floor gives the readers
     // time to take it.
     collect(&mut pipes, Instant::now() + DRAIN_FLOOR);
-    let output = pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect();
+    let output = match spool {
+        Some(files) => files.iter().map(read_spooled).collect(),
+        None => pipes.iter().map(|p| String::from_utf8_lossy(&p.bytes)).collect(),
+    };
     Probe::Exited { success, output }
+}
+
+/// Two unlinked temporary files for a probe's stdout and stderr, with the
+/// handles the child gets; `None` when they can't be made (it uses pipes).
+fn spool_files() -> Option<([std::fs::File; 2], [Stdio; 2])> {
+    let (out, err) = (tempfile::tempfile().ok()?, tempfile::tempfile().ok()?);
+    let child = [Stdio::from(out.try_clone().ok()?), Stdio::from(err.try_clone().ok()?)];
+    Some(([out, err], child))
+}
+
+/// The first [`OUTPUT_CAP`] bytes a probe wrote to a spool file.
+fn read_spooled(mut file: &std::fs::File) -> String {
+    use std::io::{Seek, SeekFrom};
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.take(OUTPUT_CAP as u64).read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// SIGTERM `child`'s group, then wait up to `grace` for it to exit. Only
@@ -860,6 +896,25 @@ mod tests {
         };
         assert!(started.elapsed() < Duration::from_secs(4));
         assert_eq!(output.len(), 2 * OUTPUT_CAP, "the first {OUTPUT_CAP} bytes of each stream");
+        assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
+    }
+
+    /// Issue #690: a probe left running at quit (`claude auth status`) writes
+    /// to files, never to a pipe the app's exit would close under it; its
+    /// output still reads the same, stdout first and capped.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_left_at_quit_writes_to_files_not_pipes() {
+        let streams = "[ -f /dev/stdout ] && [ -f /dev/stderr ] && echo files; [ -p /dev/stdout ] && echo pipe; echo err >&2";
+        let left = run_probe_on_quit(sh(streams), Duration::from_secs(5), OnQuit::Leave);
+        assert_eq!(left, Probe::Exited { success: true, output: "files\nerr\n".into() });
+        assert_eq!(probe(streams), Probe::Exited { success: true, output: "pipe\nerr\n".into() });
+
+        let big = "head -c 200000 /dev/zero | tr '\\0' o; head -c 200000 /dev/zero | tr '\\0' e >&2";
+        let Probe::Exited { success: true, output } = run_probe_on_quit(sh(big), Duration::from_secs(5), OnQuit::Leave) else {
+            panic!("a large reply must not read as a timeout");
+        };
+        assert_eq!(output.len(), 2 * OUTPUT_CAP);
         assert!(output.starts_with('o') && output.ends_with('e'), "stdout first, then stderr");
     }
 
