@@ -430,15 +430,24 @@ pub fn catalog() -> Option<Arc<crate::provider_router::ProviderRouter>> {
 /// the user deliberately priced at zero). A `provider/model` id whose prefix
 /// names a **local** catalog provider is free even when the model itself is
 /// not listed. Then the builtin table; `None` means genuinely unknown.
+///
+/// A catalog entry with a `$0` cache-write price but a non-zero input price
+/// (a user-added model: Settings → Models saves `cacheCreationCostPerM: 0`)
+/// prices its cache writes at the input rate, the way OpenAI-compatible
+/// usage was billed before cache writes were split out of the prompt total.
+/// A `$0` write column there means "not set", not "free"; an explicitly free
+/// model has a `$0` input price too and stays free. Every builtin catalog
+/// entry carries an explicit write price, so builtins are unaffected.
 pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model: &str) -> Option<ModelPrices> {
     if let Some(router) = router {
         if let Some((_, mi)) = router.find_model(model) {
+            let write_per_m = effective_write_per_m(mi.input_cost_per_m, mi.cache_creation_cost_per_m);
             return Some(ModelPrices {
                 input_per_m: mi.input_cost_per_m,
                 output_per_m: mi.output_cost_per_m,
                 cache_read_per_m: mi.cache_read_cost_per_m,
-                cache_creation_per_m: mi.cache_creation_cost_per_m,
-                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, mi.cache_creation_cost_per_m),
+                cache_creation_per_m: write_per_m,
+                cache_creation_1h_per_m: one_hour_write_per_m(&mi.id, mi.input_cost_per_m, write_per_m),
             });
         }
         if router.provider_for_prefix(model).is_some_and(|p| p.local) {
@@ -446,6 +455,16 @@ pub fn prices_in(router: Option<&crate::provider_router::ProviderRouter>, model:
         }
     }
     builtin_prices(model)
+}
+
+/// A catalog cache-write price, with an unset (`$0`) column on a paid model
+/// falling back to the input price (see [`prices_in`]).
+pub fn effective_write_per_m(input_per_m: f64, cache_creation_per_m: f64) -> f64 {
+    if cache_creation_per_m == 0.0 && input_per_m > 0.0 {
+        input_per_m
+    } else {
+        cache_creation_per_m
+    }
 }
 
 /// Resolve a model's prices, catalog-first (see [`prices_in`]). `None` means

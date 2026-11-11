@@ -14551,6 +14551,93 @@ mod pricing_table_tests {
         assert_eq!(crate::provider_router::migrate_stale_builtin_prices(&mut list, &providers), 1);
         assert_eq!(list[0].models[0].cache_creation_cost_per_m, 1.25);
     }
+
+    #[test]
+    fn cache_write_unset_on_a_custom_model_bills_at_the_input_price() {
+        use crate::provider_router::{builtin_providers, ProviderRouter};
+        use crate::token_engine::prices_in;
+        let mut map = builtin_providers();
+        // A user-added model through a LiteLLM gateway: the Models dialog
+        // saves cacheCreationCostPerM (and cacheReadCostPerM) as 0.
+        let mut gw = map["openai"].clone();
+        gw.name = "litellm".into();
+        gw.models.truncate(1);
+        let m = &mut gw.models[0];
+        m.id = "house-gpt".into();
+        (m.input_cost_per_m, m.output_cost_per_m, m.cache_read_cost_per_m, m.cache_creation_cost_per_m) = (2.0, 8.0, 0.0, 0.0);
+        map.insert("litellm".into(), gw);
+        // A deliberately free custom model stays free.
+        let mut free = map["openai"].clone();
+        free.name = "zero-co".into();
+        free.models.truncate(1);
+        let f = &mut free.models[0];
+        f.id = "house-free".into();
+        (f.input_cost_per_m, f.output_cost_per_m, f.cache_read_cost_per_m, f.cache_creation_cost_per_m) = (0.0, 0.0, 0.0, 0.0);
+        map.insert("zero-co".into(), free);
+        let router = ProviderRouter::from_map(map);
+
+        let p = prices_in(Some(&router), "house-gpt").expect("custom model is priced");
+        assert_eq!(p.cache_creation_per_m, 2.0, "unset write price falls back to input");
+        assert_eq!(p.cache_creation_1h_per_m, 2.0);
+        // 1M cache-write tokens bill like 1M input tokens, never $0.
+        let writes = p.cost(0, 0, 0, 1_000_000);
+        assert!((writes - 2.0).abs() < 1e-9, "cache writes: {writes}");
+        assert!((crate::token_engine::request_cost("house-gpt", p, 0, 0, 0, 1_000_000) - 2.0).abs() < 1e-9);
+        assert_eq!(prices_in(Some(&router), "house-free"), Some(ModelPrices::FREE));
+
+        // A builtin with an explicit write price keeps it: Terra at $1.25,
+        // and every paid builtin has a non-zero write price.
+        let t = prices_in(Some(&router), "gpt-6.1-terra").expect("terra is priced");
+        assert_eq!(t.cache_creation_per_m, 1.25);
+        assert!((t.cost(0, 0, 0, 1_000_000) - 1.25).abs() < 1e-9);
+        for (name, prov) in builtin_providers() {
+            if prov.local || name == "deepseek" {
+                continue;
+            }
+            for m in &prov.models {
+                assert!(m.cache_creation_cost_per_m > 0.0, "{} has no write price", m.id);
+                let c = prices_in(Some(&router), &m.id).unwrap();
+                assert_eq!(c.cache_creation_per_m, m.cache_creation_cost_per_m, "{}", m.id);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn saved_terra_entry_gets_vision_backfilled_and_keeps_user_edits() {
+        use crate::provider_router::{backfill_builtin_vision, builtin_providers, write_providers, ProviderRouter};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let defaults = builtin_providers();
+        let mut openai = defaults["openai"].clone();
+        for m in &mut openai.models {
+            if m.id == "gpt-6.1-terra" {
+                // As #664 saved it, plus a user edit to other fields.
+                m.supports_vision = false;
+                m.display_name = "Terra (team)".into();
+                m.tags = vec!["house".into()];
+                m.input_cost_per_m = 1.1;
+            }
+        }
+        // A custom provider reusing the id is not a builtin entry.
+        let mut other = openai.clone();
+        other.name = "litellm".into();
+        other.models.retain(|m| m.id == "gpt-6.1-terra");
+        let mut list = vec![openai, other];
+        assert_eq!(backfill_builtin_vision(&mut list.clone()), 1);
+
+        write_providers(&list).unwrap();
+        let router = ProviderRouter::load().unwrap();
+        let by_name = |n: &str| router.list_providers().into_iter().find(|p| p.name == n).cloned().unwrap();
+        let terra = by_name("openai").models.into_iter().find(|m| m.id == "gpt-6.1-terra").unwrap();
+        assert!(terra.supports_vision, "vision backfilled");
+        assert_eq!(terra.display_name, "Terra (team)");
+        assert_eq!(terra.tags, vec!["house".to_string()]);
+        assert_eq!(terra.input_cost_per_m, 1.1);
+        assert!(!by_name("litellm").models[0].supports_vision, "custom provider untouched");
+        // Idempotent.
+        list = router.list_providers().into_iter().cloned().collect();
+        assert_eq!(backfill_builtin_vision(&mut list), 0);
+    }
 }
 
 #[cfg(test)]

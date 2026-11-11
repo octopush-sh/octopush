@@ -188,6 +188,10 @@ impl ProviderRouter {
             // (left untouched when the user has edited them).
             migrate_stale_builtin_prices(&mut list, &defaults);
 
+            // Migration: builtins that shipped text-only and turned out to
+            // take image input (GPT-6.1 Terra, #664).
+            backfill_builtin_vision(&mut list);
+
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
             // provider is absent, so a pre-existing "anthropic" block would
@@ -512,6 +516,28 @@ pub(crate) fn migrate_stale_builtin_prices(
                 m.output_cost_per_m = d.output_cost_per_m;
                 m.cache_read_cost_per_m = d.cache_read_cost_per_m;
                 m.cache_creation_cost_per_m = d.cache_creation_cost_per_m;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
+/// Builtin models an earlier release saved with `supports_vision: false`
+/// that do take image input, as `(provider, model id)`. GPT-6.1 Terra shipped
+/// text-only in #664; OpenAI's model page lists image input.
+pub(crate) const VISION_BACKFILL: &[(&str, &str)] = &[("openai", "gpt-6.1-terra")];
+
+/// Turn `supports_vision` on for a saved [`VISION_BACKFILL`] entry. Only
+/// that flag changes, so prices, tags, context and display name the user
+/// edited stay as saved; the Models dialog has no vision toggle, so this
+/// never overrides a user choice. Returns how many models changed.
+pub(crate) fn backfill_builtin_vision(list: &mut [ProviderConfig]) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        for m in &mut p.models {
+            if !m.supports_vision && VISION_BACKFILL.iter().any(|(prov, id)| *prov == p.name && *id == m.id) {
+                m.supports_vision = true;
                 n += 1;
             }
         }
