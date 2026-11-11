@@ -48,6 +48,7 @@ yarn-error.log*
 # Test reports written by local runs (e.g. vitest --outputFile)
 *.tmp.json
 vitest-report*.json
+vitest-result*.json
 
 # Octopus runtime data
 ~/.octopus-sh/
