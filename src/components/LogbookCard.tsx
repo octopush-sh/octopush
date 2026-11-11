@@ -3,6 +3,7 @@ import { ChevronRight, Maximize2 } from "lucide-react";
 import { Reveal } from "./primitives/Reveal";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
+import { formatUsd } from "../lib/cost";
 
 /**
  * The Logbook card — the free per-mission slice of the Logbook. Shows worked
@@ -67,14 +68,14 @@ export function LogbookCard({
                 {fmtHours(row!.hoursSecs)}
               </span>
               <span className="octo-fade-in octo-tabular text-octo-brass" title="Spend on this mission">
-                ${row!.costUsd.toFixed(2)}
+                {formatUsd(row!.costUsd)}
               </span>
               {row!.savingsUsd > 0 && (
                 <span
                   className="octo-fade-in octo-tabular text-octo-verdigris"
                   title="Saved vs an all-premium baseline"
                 >
-                  saved ${row!.savingsUsd.toFixed(2)}
+                  saved {formatUsd(row!.savingsUsd)}
                 </span>
               )}
             </>

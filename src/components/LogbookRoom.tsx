@@ -7,6 +7,7 @@ import { useUpgradeStore } from "../stores/upgradeStore";
 import { useEntitlementStore } from "../stores/entitlementStore";
 import { copyToClipboard } from "../lib/clipboard";
 import { INTENT_ICON } from "../lib/missionIntent";
+import { formatUsd } from "../lib/cost";
 import {
   PERIODS,
   type PeriodKey,
@@ -135,11 +136,11 @@ export function LogbookRoom({ open, onClose, project }: Props) {
                     className="octo-tabular text-octo-verdigris"
                     title="Saved vs an all-premium baseline"
                   >
-                    saved ${totals.savingsUsd.toFixed(2)}
+                    saved {formatUsd(totals.savingsUsd)}
                   </span>
                 )}
                 <span className="octo-tabular text-octo-brass" title="Total spend">
-                  spent ${totals.costUsd.toFixed(2)}
+                  spent {formatUsd(totals.costUsd)}
                 </span>
               </span>
               <button
@@ -250,10 +251,10 @@ function LogbookTable({ rows }: { rows: LogbookMissionRow[] }) {
                 {fmtHours(r.hoursSecs)}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-brass">
-                ${r.costUsd.toFixed(2)}
+                {formatUsd(r.costUsd)}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-verdigris">
-                {r.savingsUsd > 0 ? `$${r.savingsUsd.toFixed(2)}` : "—"}
+                {r.savingsUsd > 0 ? formatUsd(r.savingsUsd) : "—"}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-mute">{r.runsCount}</td>
               <td className="octo-tabular py-2.5 text-right text-octo-mute">{r.messagesCount}</td>

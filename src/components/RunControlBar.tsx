@@ -8,6 +8,7 @@ import { Reveal } from "./primitives/Reveal";
 import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
 import { haltCause } from "../lib/stageHalt";
+import { formatUsd } from "../lib/cost";
 
 interface LoopState {
   iteration: number;
@@ -256,10 +257,11 @@ function DecisionBar({
   const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
-  const transient = failed && isTransientHalt(blockedStage.error);
+  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
+  // A cause that prefers a re-run (a deferred tool) is never a transient wait.
+  const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
   const canResume = blockedStage.substrate === "cli" && !!blockedStage.sessionId;
   const canDiscard = !!blockedStage.baselineCommit;
-  const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
   // Resume is the primary action when it can continue the session, unless the
   // cause says a fresh attempt is the likelier way forward (a deferred tool).
   const resumeFirst = canResume && !cause.preferRerun;
@@ -325,6 +327,12 @@ function DecisionBar({
                     Re-run
                   </button>
                 )}
+                {!resumeFirst && (
+                  <button type="button" onClick={() => setMode("reject")} data-tour="direct-halt-rerun-feedback"
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Re-run with feedback
+                  </button>
+                )}
                 {canResume && !resumeFirst && (
                   <button type="button" onClick={() => onResume(turns)}
                     className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
@@ -350,7 +358,7 @@ function DecisionBar({
                   <div className="mb-2 flex flex-wrap gap-x-3 gap-y-1 font-mono text-[10px] text-octo-mute">
                     {blockedStage.sessionId && <span>session {blockedStage.sessionId.slice(0, 8)}</span>}
                     <span className="octo-tabular">{(blockedStage.inputTokens + blockedStage.outputTokens).toLocaleString()} tokens</span>
-                    <span className="octo-tabular">${blockedStage.costUsd.toFixed(2)}</span>
+                    <span className="octo-tabular">{formatUsd(blockedStage.costUsd)}</span>
                   </div>
                   <pre className="mb-3 max-h-32 overflow-auto rounded-md border border-octo-hairline bg-octo-onyx px-2.5 py-2 font-mono text-[11px] text-octo-mute whitespace-pre-wrap">{blockedStage.error ?? "no detail"}</pre>
                   <div className="flex flex-wrap items-center gap-3">

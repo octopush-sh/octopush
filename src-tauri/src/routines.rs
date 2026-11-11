@@ -1006,8 +1006,8 @@ impl Orchestrator {
             self.emit_phase(r, PHASE_SETUP);
             let result = match ws.worktree_path.as_deref() {
                 Some(wt) => {
-                    // Conductor's variables for a template imported from a
-                    // `.conductor/settings.toml`, unless the app's env sets them.
+                    // Conductor's variables for every setup script, so scripts written
+                    // for Conductor work unchanged, unless the app's env sets them.
                     let env = crate::workspace_setup::conductor_env(&project_path, wt, &ws.name, |k| {
                         std::env::var_os(k).is_some()
                     });

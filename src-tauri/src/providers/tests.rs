@@ -534,6 +534,16 @@ mod effort {
     }
 
     #[test]
+    fn fable_5_2_and_mythos_5_2_take_the_effort_path_with_xhigh() {
+        for m in ["claude-fable-5-2", "claude-mythos-5-2"] {
+            let (thinking, oc) = plan(m);
+            assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }), "{m} = effort model");
+            assert!(oc.is_some(), "{m} must carry output_config");
+            assert_eq!(effective_effort_level(m, Effort::Xhigh), "xhigh", "{m}");
+        }
+    }
+
+    #[test]
     fn thinking_json_opus_uses_adaptive_and_effort() {
         let (thinking, output_config) = thinking_json("claude-opus-4-8", Some(Effort::High), 32768);
         assert_eq!(thinking.unwrap(), json!({ "type": "adaptive" }));
@@ -740,7 +750,7 @@ mod effort {
     #[test]
     fn openai_reasoning_effort_only_on_reasoning_models() {
         // Reasoning models get reasoning_effort…
-        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini"] {
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-5-mini", "gpt-6.1-terra"] {
             let mut req = sample_request();
             req.model = m.into();
             req.effort = Some(Effort::High);
@@ -770,7 +780,7 @@ mod effort {
     fn openai_reasoning_models_use_max_completion_tokens() {
         // Reasoning models reject `max_tokens` (400) — they want
         // `max_completion_tokens`, also unclamped.
-        for m in ["o1", "o3-mini", "o4-mini", "gpt-5"] {
+        for m in ["o1", "o3-mini", "o4-mini", "gpt-5", "gpt-6.1-terra"] {
             let mut req = sample_request();
             req.model = m.into();
             req.max_tokens = 48000;

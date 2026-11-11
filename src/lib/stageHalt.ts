@@ -8,11 +8,16 @@ export interface HaltCause {
 /** The markers `parse_cli_result` (cli_runner.rs) puts on a hook-deferred tool call. */
 const DEFERRED_MARKERS = ["(terminal_reason: tool_deferred)", "(terminal_reason: tool_deferred_unavailable)"];
 
+/** Whether a stage error is a hook-deferred tool halt (either marker). */
+export function isDeferredToolHalt(error: string | null): boolean {
+  return !!error && DEFERRED_MARKERS.some((m) => error.includes(m));
+}
+
 /** Map a backend stage error string to a plain-English cause + remedy. */
 export function haltCause(error: string | null, maxIterations: number): HaltCause {
   const raw = (error ?? "").trim();
   if (!raw) return { title: "Stage halted" };
-  if (DEFERRED_MARKERS.some((m) => raw.includes(m))) {
+  if (isDeferredToolHalt(raw)) {
     // The backend's first line is the whole explanation: "<cause>. <remedy>"
     // (the tool name can hold dots, the remedy can't).
     const line = raw.split("\n")[0];

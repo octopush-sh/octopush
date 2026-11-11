@@ -1,6 +1,7 @@
 import { listen } from "@tauri-apps/api/event";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { RUN_EVENTS, type Run } from "./ipc";
+import { formatUsd } from "./cost";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
 import { useNotifyPrefs } from "../stores/notifyPrefsStore";
@@ -52,7 +53,7 @@ export function decideCompletionNotification(
   if (!wasActive || run.status !== "completed") return null;
   return {
     title: "Crew finished",
-    body: `${describe(run, workspaceName)} · $${run.costUsd.toFixed(2)}`,
+    body: `${describe(run, workspaceName)} · ${formatUsd(run.costUsd)}`,
   };
 }
 

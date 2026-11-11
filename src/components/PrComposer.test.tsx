@@ -119,6 +119,18 @@ describe("PrComposer", () => {
     expect(note.textContent).not.toMatch(/\$/);
   });
 
+  it("a sub-cent draft cost keeps four decimals; a large one is grouped", async () => {
+    ready();
+    ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 0.0042 });
+    const { unmount } = renderComposer();
+    expect((await screen.findByText(/Drafted by claude-sonnet-4-6/)).textContent).toMatch(/ · \$0\.0042$/);
+    unmount();
+    ready();
+    ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 1234.5 });
+    renderComposer();
+    expect((await screen.findByText(/Drafted by claude-sonnet-4-6/)).textContent).toMatch(/ · \$1,234\.50$/);
+  });
+
   it("a failed draft keeps the form usable and says why", async () => {
     ready();
     ipcMock.aiComplete.mockRejectedValue("budget exceeded");

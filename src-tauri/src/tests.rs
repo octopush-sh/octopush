@@ -13492,6 +13492,34 @@ mod transcript_tests {
 
     #[test]
     #[serial_test::serial(pricing_catalog)]
+    fn ingest_prices_fable_5_2_transcripts_instead_of_leaving_them_unpriced() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/fable-5-2";
+        session_on(&db.lock(), "sess-f52", cwd);
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        // Fable 5.2: $8 in, $40 out, $0.20 hits, $10 5-minute writes.
+        std::fs::write(
+            pdir.join("cc-sess.jsonl"),
+            format!(
+                "{}\n",
+                line("assistant", "req_f52", "claude-fable-5-2", 1_000_000, 1_000_000, 1_000_000, 1_000_000, "2026-11-09T10:00:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        let rep = db.lock().usage_report(ALL.0, ALL.1, Some("run"), 0).unwrap();
+        assert_eq!(rep.unpriced_calls, 0);
+        let expected = 8.0 + 0.20 + 10.0 + 40.0;
+        assert!((rep.totals.cost_usd - expected).abs() < 1e-6, "{} vs {expected}", rep.totals.cost_usd);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
     fn ingest_prices_fast_mode_turns_at_the_fast_rate_and_stores_their_speed() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
         let _cfg = crate::provider_router::TestConfigDir::new();
@@ -14281,6 +14309,28 @@ mod pricing_table_tests {
     }
 
     #[test]
+    fn fable_5_2_and_mythos_5_2_are_priced_in_every_spelling() {
+        // Pricing page: $8 in / $10 5m write / $16 1h write / $0.20 hit / $40 out.
+        for m in [
+            "claude-fable-5-2",
+            "claude-fable-5.2[1m]",
+            "eu.anthropic.claude-fable-5-2-v1",
+            "claude-mythos-5-2",
+            "claude-mythos-5.2[1m]",
+            "us.anthropic.claude-mythos-5-2-v1:0",
+        ] {
+            assert_prices(m, 8.0, 10.0, 0.20, 40.0);
+            let p = builtin_prices(m).unwrap();
+            assert!((p.cache_creation_1h_per_m - 16.0).abs() < 1e-9, "{m}");
+        }
+        assert_eq!(crate::token_engine::normalize_model_id("eu.anthropic.claude-fable-5-2-v1"), "claude-fable-5-2");
+        // Mythos 5.2 is priced, not offered: it stays out of the catalog.
+        let catalog = crate::provider_router::builtin_providers();
+        assert!(catalog["anthropic"].models.iter().any(|m| m.id == "claude-fable-5-2"));
+        assert!(!catalog.values().flat_map(|p| &p.models).any(|m| m.id.contains("mythos")));
+    }
+
+    #[test]
     fn corrected_prices_for_opus_4_6_and_sonnet_5() {
         // Opus 4.6 was $15/$75 (Opus 4.1's tier); Sonnet 5 was $3/$15.
         assert_prices("claude-opus-4-6", 5.0, 6.25, 0.50, 25.0);
@@ -14635,6 +14685,58 @@ mod unpriced_ledger_tests {
         let d = db.lock();
         assert_eq!(cost_of(&d, "f"), (0.0, "computed".into()));
         assert!((cost_of(&d, "g").0 - 0.0225).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn concurrent_reprices_run_the_october_pass_once() {
+        // Several rounds: two passes started together overlap almost always
+        // without the reprice lock.
+        for round in 0..8 {
+            let db = Arc::new(Mutex::new(test_db()));
+            let run = {
+                let d = db.lock();
+                let now = chrono::Utc::now().to_rfc3339();
+                d.conn_ref()
+                    .execute("INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)", [&now])
+                    .unwrap();
+                d.conn_ref()
+                    .execute(
+                        "INSERT INTO workspaces (id,project_id,name,branch,created_at,last_active) VALUES ('w1','p1','W','main',?1,?1)",
+                        [&now],
+                    )
+                    .unwrap();
+                let pid = d.insert_pipeline("P", "d", false).unwrap();
+                d.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+                // A pre-v0.4.89 DIRECT stage billed at the stale $15/$75.
+                let run = d.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+                let stages = d.list_run_stages(&run).unwrap();
+                d.complete_run_stage(&stages[0].id, "done", 10_000, 2_000, 0, 0, 0.30, None).unwrap();
+                d.set_run_cost(&run, 0.30, 0.60).unwrap();
+                run
+            };
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let passes: Vec<_> = (0..2)
+                .map(|_| {
+                    let (db, barrier) = (Arc::clone(&db), Arc::clone(&barrier));
+                    std::thread::spawn(move || {
+                        // The test config dir is per thread.
+                        let _cfg = crate::provider_router::TestConfigDir::new();
+                        barrier.wait();
+                        crate::commands::reprice_ledger(&db).unwrap();
+                    })
+                })
+                .collect();
+            for p in passes {
+                p.join().unwrap();
+            }
+            let d = db.lock();
+            let stage = d.list_run_stages(&run).unwrap()[0].cost_usd;
+            assert!((stage - 0.10).abs() < 1e-9, "round {round}: stage scaled once to $0.10, got {stage}");
+            let r = d.get_run(&run).unwrap().unwrap();
+            assert!((r.cost_usd - 0.10).abs() < 1e-9, "round {round}: run cost {}", r.cost_usd);
+            assert!(d.meta_get("ledger_stale_price_fix_2026_10_v1").unwrap().is_some());
+        }
     }
 
     #[test]
@@ -16190,6 +16292,90 @@ mod crew_tests {
         let mut f = base.clone();
         f.pipeline.stages[0].instructions = Some("one\n\ttwo".into());
         assert!(crew::preview(&db, &f, &[]).unwrap().ok);
+    }
+
+    /// Issue #661: a crew whose text holds an ordinary emoji (`⚠️`, a ZWJ
+    /// sequence, a keycap) exports and imports back unchanged.
+    #[test]
+    fn emoji_with_a_variation_selector_or_joiner_round_trip() {
+        const WARN: &str = "\u{26A0}\u{FE0F}"; // ⚠️
+        const CHECK: &str = "\u{2714}\u{FE0F}"; // ✔️
+        const HEART: &str = "\u{2764}\u{FE0F}"; // ❤️
+        const CODER: &str = "\u{1F469}\u{200D}\u{1F4BB}"; // 👩‍💻
+        const RAINBOW: &str = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}"; // 🏳️‍🌈
+        const BACK_TEXT: &str = "\u{21A9}\u{FE0E}"; // ↩︎
+        const KEYCAP: &str = "1\u{FE0F}\u{20E3}"; // 1️⃣
+        let text = format!(
+            "{WARN} Never force-push. {CHECK} tests, {HEART} docs, {CODER} review, {RAINBOW} ok, {BACK_TEXT} back, {KEYCAP} first"
+        );
+        let name = format!("Relay {WARN}");
+        let description = format!("{HEART} {CODER}");
+        let prompt = format!("{WARN} Find the real defects.");
+        let (a, _ta) = test_db();
+        a.upsert_role(&triage(&prompt)).unwrap();
+        let mut stages = rich_stages();
+        stages[0].instructions = Some(WARN.into());
+        stages[1].instructions = Some(text.clone());
+        stages[2].custom_name = Some(format!("{CHECK} Triage"));
+        let pid = a.save_pipeline(None, &name, &description, &stages).unwrap();
+
+        let json = crew::to_json(&crew::export(&a, &pid).unwrap()).unwrap();
+        let parsed = crew::parse(&json).unwrap();
+        let (b, _tb) = test_db();
+        let p = crew::preview(&b, &parsed, &[]).unwrap();
+        assert!(p.ok, "{p:?}");
+        assert_eq!(p.stages[0].instructions.as_deref(), Some(WARN), "shown as written, not escaped");
+        assert_eq!(p.stages[1].instructions.as_deref(), Some(text.as_str()));
+        assert_eq!(p.name, name);
+        let new_id = crew::import(&b, &parsed, &[]).unwrap();
+        assert_eq!(as_json(&b.pipeline_stage_drafts(&new_id).unwrap()), as_json(&stages));
+        let head = b.list_pipelines().unwrap().into_iter().find(|p| p.id == new_id).unwrap();
+        assert_eq!((head.name.as_str(), head.description.as_str()), (name.as_str(), description.as_str()));
+        assert_eq!(b.get_role("triage").unwrap().unwrap().prompt_body, prompt);
+    }
+
+    /// Only one selector or joiner per visible emoji gets through: runs, other
+    /// selectors and joiners outside an emoji still block, and stay escaped.
+    #[test]
+    fn selectors_and_joiners_outside_an_emoji_still_block() {
+        let hostile = [
+            "\u{FE0F}",
+            "a\u{FE0F}",
+            "1\u{FE0F}",
+            "\u{26A0}\u{FE0F}\u{FE0F}",
+            "\u{26A0}\u{FE0E}\u{FE0F}",
+            "\u{26A0}\u{FE00}",
+            "\u{26A0}\u{E0100}",
+            "a\u{200D}b",
+            "\u{1F419}\u{200D}",
+            "\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}\u{200D}\u{1F419}",
+            "a\u{FE0F}\u{200D}\u{1F419}",
+            "\u{1F419}\u{200D}a",
+        ];
+        for s in hostile {
+            assert!(crew::first_hidden(s).is_some(), "{s:?} has a hidden character");
+            let (db, _t) = test_db();
+            let mut f = one_stage_file(vec![draft("plan")], vec![]);
+            f.pipeline.stages[0].instructions = Some(format!("ok {s}"));
+            let p = crew::preview(&db, &f, &[]).unwrap();
+            assert!(!p.ok, "{s:?} must block");
+            let shown = p.stages[0].instructions.clone().unwrap();
+            assert!(shown.contains("\\u{"), "{s:?} is escaped: {shown}");
+            assert!(crew::import(&db, &f, &[]).is_err(), "{s:?} must not import");
+        }
+        for ok in [
+            "\u{26A0}\u{FE0F}",                           // ⚠️
+            "\u{26A0}\u{FE0E}",                           // ⚠︎
+            "\u{1F469}\u{200D}\u{1F4BB}",                 // 👩‍💻
+            "\u{2764}\u{FE0F}\u{200D}\u{1F525}",          // ❤️‍🔥
+            "\u{1F468}\u{1F3FD}\u{200D}\u{1F4BB}",        // 👨🏽‍💻
+            "#\u{FE0F}\u{20E3}",                          // #️⃣
+            "\u{1F419}",                                  // 🐙
+        ] {
+            assert_eq!(crew::first_hidden(ok), None, "{ok:?} is an ordinary emoji");
+            assert_eq!(crew::escape_hidden(ok), ok);
+        }
     }
 
     #[test]

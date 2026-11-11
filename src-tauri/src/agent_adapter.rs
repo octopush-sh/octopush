@@ -189,7 +189,52 @@ pub const TESTED_CLAUDE_FLOOR: &str = "2.1.314";
 /// The release-watch routine adds a row when a changelog entry fixes one.
 pub const CLAUDE_SECURITY_FIXES: &[(&str, &str)] = &[
     ("2.1.319", "fixes a sandbox escape when creating a worktree"),
+    ("2.1.321", "fixes a read-only Bash command running outside the sandbox without a prompt"),
 ];
+
+/// Models a Claude Code CLI stage can only launch on a new enough CLI:
+/// (normalized model id, display name, oldest Claude Code that runs it). From
+/// the upstream model docs; matched on [`crate::token_engine::normalize_model_id`].
+pub const CLAUDE_MODEL_FLOORS: &[(&str, &str, &str)] = &[
+    ("claude-fable-5-2", "Fable 5.2", "2.1.321"),
+    ("claude-fable-5-1", "Fable 5.1", "2.1.257"),
+];
+
+/// A crew model the installed CLI is too old for — the Direct launcher's
+/// amber line. Never blocks a run.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeModelFloorNote {
+    /// Display name, e.g. "Fable 5.2".
+    pub label: String,
+    /// The oldest Claude Code that runs it.
+    pub needs: String,
+    /// The installed version.
+    pub installed: String,
+}
+
+/// The [`CLAUDE_MODEL_FLOORS`] row for `model`, if any: (label, version).
+pub fn claude_model_floor(model: &str) -> Option<(&'static str, &'static str)> {
+    let id = crate::token_engine::normalize_model_id(model);
+    CLAUDE_MODEL_FLOORS.iter().find(|(m, _, _)| *m == id).map(|(_, label, v)| (*label, *v))
+}
+
+/// The one model among `models` that needs the newest CLI the known
+/// `installed` version is below; `None` when every model runs on it, or the
+/// version is unknown (an unknown version never warns).
+pub fn model_floor_note(models: &[String], installed: Option<&str>) -> Option<ClaudeModelFloorNote> {
+    let installed = installed?;
+    models
+        .iter()
+        .filter_map(|m| claude_model_floor(m.as_str()))
+        .filter(|(_, needs)| version_below(installed, needs))
+        .max_by_key(|(_, needs)| version_key(needs))
+        .map(|(label, needs)| ClaudeModelFloorNote {
+            label: label.to_string(),
+            needs: needs.to_string(),
+            installed: installed.to_string(),
+        })
+}
 
 /// How long `claude --version` may take before the version counts as unknown.
 const VERSION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -456,8 +501,12 @@ pub const CLAUDE_LOGIN_END_SINCE: &str = "2.1.318";
 /// How long `claude auth status` may run. It may refresh the OAuth token,
 /// and interrupting that can sign the user out (Claude Code changelog
 /// 2.1.301 and 2.1.317), so it gets far longer than a Readiness check, a
-/// SIGTERM before the SIGKILL, and is let finish at quit.
+/// SIGTERM before the SIGKILL, and is left running at quit.
 pub const CLAUDE_AUTH_STATUS_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// What quitting does to a running `claude auth status`: nothing. It runs in
+/// its own group, so it finishes the refresh on its own after the app exits.
+pub const CLAUDE_AUTH_STATUS_ON_QUIT: crate::readiness::OnQuit = crate::readiness::OnQuit::Leave;
 
 /// How long a timed-out `claude auth status` has after SIGTERM to save what
 /// it was writing before its group is SIGKILLed.
@@ -512,13 +561,13 @@ pub fn parse_claude_auth_status(output: &str) -> ClaudeLoginProbe {
 /// `claude auth status --json` with the login-shell PATH and environment the
 /// CLI stages use, through the Readiness probe runner (output capped, its
 /// process group SIGTERMed then SIGKILLed after
-/// [`CLAUDE_AUTH_STATUS_TIMEOUT`], let finish at quit). What it prints (the
+/// [`CLAUDE_AUTH_STATUS_TIMEOUT`], left running at quit). What it prints (the
 /// account too) stays in memory: only the date and whether it is signed in
 /// are kept.
 pub fn probe_claude_login() -> ClaudeLoginProbe {
-    use crate::readiness::{local_command, run_probe_terminating, OnQuit, Probe};
+    use crate::readiness::{local_command, run_probe_terminating, Probe};
     let cmd = local_command("claude", &CLAUDE_AUTH_STATUS_ARGS);
-    match run_probe_terminating(cmd, CLAUDE_AUTH_STATUS_TIMEOUT, CLAUDE_AUTH_STATUS_TERM_GRACE, OnQuit::Finish) {
+    match run_probe_terminating(cmd, CLAUDE_AUTH_STATUS_TIMEOUT, CLAUDE_AUTH_STATUS_TERM_GRACE, CLAUDE_AUTH_STATUS_ON_QUIT) {
         Probe::Exited { output, .. } => parse_claude_auth_status(&output),
         Probe::Missing | Probe::TimedOut => ClaudeLoginProbe::Unknown,
     }
@@ -836,9 +885,9 @@ mod tests {
         let old = ClaudeCliVersion::new(Some("2.1.307".into()), "2.1.314");
         assert!(old.below_floor);
         let note = old.update_notice().expect("old CLI warns");
-        // The floor still trips the 2.1.319 security fix: recommend that.
+        // The floor still trips the 2.1.321 security fix: recommend that.
         assert!(note.contains("2.1.307") && note.contains("older than 2.1.314"), "{note}");
-        assert!(note.contains("2.1.319 or newer recommended"), "{note}");
+        assert!(note.contains("2.1.321 or newer recommended"), "{note}");
 
         let current = ClaudeCliVersion::new(Some("2.1.316".into()), "2.1.314");
         assert!(!current.below_floor);
@@ -1151,10 +1200,12 @@ mod tests {
         assert!(!below.below_floor, "independent of the tested floor");
         assert_eq!(
             below.security_notice().as_deref(),
-            Some("Update Claude Code: 2.1.319 fixes a sandbox escape when creating a worktree")
+            Some("Update Claude Code: 2.1.321 fixes a read-only Bash command running outside the sandbox without a prompt")
         );
-        assert_eq!(below.security_fix.as_ref().map(|f| f.version.as_str()), Some("2.1.319"));
-        assert_eq!(at(Some("2.1.319")).security_notice(), None);
+        assert_eq!(below.security_fix.as_ref().map(|f| f.version.as_str()), Some("2.1.321"));
+        // 2.1.319 has the worktree fix but not the Bash one.
+        assert_eq!(at(Some("2.1.319")).security_fix.map(|f| f.version).as_deref(), Some("2.1.321"));
+        assert_eq!(at(Some("2.1.321")).security_notice(), None);
         assert_eq!(at(Some("2.2.0")).security_notice(), None);
         assert_eq!(at(None).security_notice(), None, "an unknown version never warns");
         // Below the floor too: both notes exist; surfaces pick which to show.
@@ -1163,9 +1214,9 @@ mod tests {
         // A stage journals each notice once.
         let notes = below.stage_notices();
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("2.1.319 fixes a sandbox escape") && notes[0].contains("installed: 2.1.316"), "{notes:?}");
+        assert!(notes[0].contains("2.1.321 fixes a read-only Bash command") && notes[0].contains("installed: 2.1.316"), "{notes:?}");
         assert_eq!(at(Some("2.1.307")).stage_notices().len(), 2);
-        assert!(at(Some("2.1.319")).stage_notices().is_empty());
+        assert!(at(Some("2.1.321")).stage_notices().is_empty());
         assert!(at(None).stage_notices().is_empty());
     }
 
@@ -1195,10 +1246,50 @@ mod tests {
         let beta = parse_claude_version("2.1.319-beta.1 (Claude Code)");
         assert_eq!(beta.as_deref(), Some("2.1.319"), "the suffix is dropped");
         assert!(!version_below("2.1.319-beta.1", "2.1.319"));
-        let info = ClaudeCliVersion::new(beta, "2.1.314");
+        let info = ClaudeCliVersion::with_fixes(beta, "2.1.314", &[("2.1.319", "fixes a")]);
         assert_eq!(info.security_notice(), None);
         assert_eq!(info.security_fix, None);
         assert!(version_below("2.1.318-beta.1", "2.1.319"));
+    }
+
+    #[test]
+    fn every_model_floor_is_a_normalized_id_and_a_version() {
+        assert!(!CLAUDE_MODEL_FLOORS.is_empty());
+        for (model, label, v) in CLAUDE_MODEL_FLOORS {
+            assert_eq!(crate::token_engine::normalize_model_id(model), *model, "{model} must be normalized");
+            assert!(!label.trim().is_empty(), "{model}: a display name");
+            assert_eq!(parse_claude_version(v).as_deref(), Some(*v), "{v} must be x.y.z");
+        }
+    }
+
+    #[test]
+    fn version_below_each_model_floor() {
+        assert_eq!(claude_model_floor("claude-fable-5-2"), Some(("Fable 5.2", "2.1.321")));
+        assert_eq!(claude_model_floor("claude-fable-5-1"), Some(("Fable 5.1", "2.1.257")));
+        assert!(version_below("2.1.320", "2.1.321") && !version_below("2.1.321", "2.1.321"));
+        assert!(version_below("2.1.256", "2.1.257") && !version_below("2.1.257", "2.1.257"));
+        // Matched on the normalized id: gateway prefixes, dots, snapshots.
+        assert_eq!(claude_model_floor("anthropic/claude-fable-5.2").map(|f| f.1), Some("2.1.321"));
+        assert_eq!(claude_model_floor("claude-fable-5-2-20261101").map(|f| f.1), Some("2.1.321"));
+        assert_eq!(claude_model_floor("claude-fable-5"), None);
+        assert_eq!(claude_model_floor("claude-opus-5-5"), None);
+    }
+
+    #[test]
+    fn model_floor_note_names_the_newest_floor_still_missing() {
+        fn models(m: &[&str]) -> Vec<String> {
+            m.iter().map(|s| s.to_string()).collect()
+        }
+        let note = model_floor_note(&models(&["claude-sonnet-5-5", "claude-fable-5-1", "claude-fable-5-2"]), Some("2.1.316"))
+            .expect("5.2 needs a newer CLI");
+        assert_eq!((note.label.as_str(), note.needs.as_str(), note.installed.as_str()), ("Fable 5.2", "2.1.321", "2.1.316"));
+        let older = model_floor_note(&models(&["claude-fable-5-1"]), Some("2.1.200")).expect("5.1 too");
+        assert_eq!((older.label.as_str(), older.needs.as_str()), ("Fable 5.1", "2.1.257"));
+        assert_eq!(model_floor_note(&models(&["claude-fable-5-1"]), Some("2.1.316")), None);
+        assert_eq!(model_floor_note(&models(&["claude-fable-5-2"]), Some("2.1.321")), None);
+        assert_eq!(model_floor_note(&models(&["claude-opus-5-5"]), Some("2.1.100")), None);
+        assert_eq!(model_floor_note(&models(&["claude-fable-5-2"]), None), None, "the CLI isn't found: no line");
+        assert_eq!(model_floor_note(&[], Some("2.1.100")), None);
     }
 
     #[test]

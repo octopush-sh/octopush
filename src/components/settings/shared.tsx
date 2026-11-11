@@ -3,6 +3,7 @@
 // hook. Kept in one small module so panes stay focused on their own concern.
 import { useEffect, useState } from "react";
 import { useThemeStore } from "../../stores/themeStore";
+import { formatUsd } from "../../lib/cost";
 
 // ─── Headers ──────────────────────────────────────────────────────────
 
@@ -285,10 +286,18 @@ export function Row({ label, value }: { label: string; value: React.ReactNode })
   );
 }
 
+const WHOLE_USD = new Intl.NumberFormat("en-US", {
+  style: "currency",
+  currency: "USD",
+  minimumFractionDigits: 0,
+  maximumFractionDigits: 0,
+});
+
 /** A dollar figure at the page's precision: cents under $100, whole
- *  dollars from there — one rule for every Usage figure. */
+ *  dollars from there, thousands grouped ("$12,843") — one rule for every
+ *  Usage figure. */
 export function usd(n: number): string {
-  return `$${n.toFixed(n >= 100 ? 0 : 2)}`;
+  return n >= 100 ? WHOLE_USD.format(n) : formatUsd(n);
 }
 
 export function formatTokens(n: number): string {

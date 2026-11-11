@@ -21,6 +21,7 @@ import { JiraTicketPickerModal } from "./components/JiraTicketPickerModal";
 import { JiraProjectKeyModal } from "./components/JiraProjectKeyModal";
 import { ConfirmDialog } from "./components/ConfirmDialog";
 import { formatBytes } from "./lib/formatBytes";
+import { formatUsd } from "./lib/cost";
 import { BacklogRowContextMenu } from "./components/BacklogRowContextMenu";
 import { ProjectPickerModal } from "./components/ProjectPickerModal";
 import { ExistingWorkspaceAlertModal } from "./components/ExistingWorkspaceAlertModal";
@@ -567,19 +568,19 @@ function App() {
                   pushToast({
                     level: "error",
                     title: `Budget cap hit — Send blocked`,
-                    body: `${scopeLabel} ${b.period} budget: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${scopeLabel} ${b.period} budget: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 } else if (threshold === 80) {
                   pushToast({
                     level: "warning",
                     title: `80% of ${scopeLabel} budget used`,
-                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${b.period}: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 } else {
                   pushToast({
                     level: "info",
                     title: `50% of ${scopeLabel} budget used`,
-                    body: `${b.period}: $${snap.costUsd.toFixed(2)} / $${b.limitUsd.toFixed(2)}`,
+                    body: `${b.period}: ${formatUsd(snap.costUsd)} / ${formatUsd(b.limitUsd)}`,
                   });
                 }
               }

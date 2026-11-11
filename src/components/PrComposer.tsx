@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { GitBranch, Loader2, Sparkles } from "lucide-react";
 import { ipc } from "../lib/ipc";
+import { formatUsd } from "../lib/cost";
 import type { BranchList, Workspace } from "../lib/types";
 import {
   PR_SYSTEM,
@@ -117,7 +118,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
         // Never `$0` and never a missing figure: an unknown cost says so.
         const cost =
           typeof r.costUsd === "number" && r.costUsd > 0
-            ? ` · $${r.costUsd.toFixed(r.costUsd < 0.01 ? 4 : 2)}`
+            ? ` · ${r.costUsd < 0.01 ? `$${r.costUsd.toFixed(4)}` : formatUsd(r.costUsd)}`
             : " · unpriced";
         setDraftNote({
           tone: "mute",

@@ -5,7 +5,17 @@
  */
 import { describe, it, expect, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
-import { Switch, ToggleRow } from "./shared";
+import { Switch, ToggleRow, usd } from "./shared";
+
+describe("usd — the Usage page's dollar figure", () => {
+  it("keeps cents under $100 and whole dollars from there, grouped", () => {
+    expect(usd(4.2)).toBe("$4.20");
+    expect(usd(99.5)).toBe("$99.50");
+    expect(usd(100)).toBe("$100");
+    expect(usd(12843)).toBe("$12,843");
+    expect(usd(12843.27)).toBe("$12,843");
+  });
+});
 
 describe("Switch", () => {
   it("is named by ariaLabel and uses it as its tooltip", () => {

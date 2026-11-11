@@ -73,11 +73,15 @@ pub fn chat_completions_url(api_base: &str) -> String {
 }
 
 /// Whether an OpenAI-family model actually honors `reasoning_effort`. Only the
-/// reasoning models do (o1/o3/o4 series, GPT-5); on a chat model like gpt-4o
-/// the field is at best a no-op and at worst a 400, so we omit it there.
+/// reasoning models do (o1/o3/o4 series, GPT-5, GPT-6); on a chat model like
+/// gpt-4o the field is at best a no-op and at worst a 400, so we omit it there.
 fn openai_supports_reasoning(model_id: &str) -> bool {
     let id = model_id.to_ascii_lowercase();
-    id.starts_with("o1") || id.starts_with("o3") || id.starts_with("o4") || id.contains("gpt-5")
+    id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("o4")
+        || id.contains("gpt-5")
+        || id.contains("gpt-6")
 }
 
 pub fn build_request(req: &LlmRequest) -> Value {
@@ -110,7 +114,7 @@ pub fn build_request(req: &LlmRequest) -> Value {
         "model": req.model,
         "messages": messages,
     });
-    // Token cap key differs by model class: reasoning models (o1/o3/o4, GPT-5)
+    // Token cap key differs by model class: reasoning models (o1/o3/o4, GPT-5/6)
     // reject `max_tokens` with a 400 and want `max_completion_tokens`; chat
     // models want `max_tokens`. Either way the budget passes through UNCLAMPED —
     // TALK "deep" legitimately sends 64000, and the effort bump wants the larger
@@ -127,7 +131,7 @@ pub fn build_request(req: &LlmRequest) -> Value {
         body["tool_choice"] = json!({ "type": "function", "function": { "name": name } });
     }
     // Reasoning effort → OpenAI's `reasoning_effort`, but ONLY on models that
-    // honor it (o1/o3/o4, GPT-5). OpenAI exposes only low/medium/high, so the
+    // honor it (o1/o3/o4, GPT-5, GPT-6). OpenAI exposes only low/medium/high, so the
     // finer Anthropic levels (xhigh/max) fold to "high".
     if let Some(effort) = req.effort {
         if reasoning {

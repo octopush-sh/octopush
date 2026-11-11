@@ -328,12 +328,17 @@ impl ProviderRouter {
 
 /// The first builtin Anthropic model carrying `tag`. The builtin list leads
 /// with the current lineup, so this follows it when a new generation ships.
+/// With no model so tagged it falls back to the first builtin Anthropic model,
+/// never to a hardcoded id that can go stale.
 fn builtin_anthropic_model_tagged(tag: &str) -> String {
-    builtin_providers()
-        .get("anthropic")
-        .and_then(|p| p.models.iter().find(|m| m.tags.iter().any(|t| t == tag)))
+    let providers = builtin_providers();
+    let models = providers.get("anthropic").map(|p| p.models.as_slice()).unwrap_or_default();
+    models
+        .iter()
+        .find(|m| m.tags.iter().any(|t| t == tag))
+        .or_else(|| models.first())
         .map(|m| m.id.clone())
-        .unwrap_or_else(|| "claude-sonnet-5-5".into())
+        .unwrap_or_default()
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -526,14 +531,16 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 // Current lineup (platform.claude.com model overview, fetched
                 // 2026-10-29): 1M-token context, 128K max output. Prices must
-                // match `token_engine::builtin_prices`.
+                // match `token_engine::builtin_prices`. Fable 5.2: pricing page
+                // fetched 2026-11-09. Mythos 5.2 is priced there but not listed
+                // here (limited availability).
                 ModelInfo {
-                    id: "claude-fable-5-1".into(),
-                    display_name: "Claude Fable 5.1".into(),
-                    input_cost_per_m: 10.0,
-                    output_cost_per_m: 50.0,
-                    cache_read_cost_per_m: 0.25,
-                    cache_creation_cost_per_m: 12.50,
+                    id: "claude-fable-5-2".into(),
+                    display_name: "Claude Fable 5.2".into(),
+                    input_cost_per_m: 8.0,
+                    output_cost_per_m: 40.0,
+                    cache_read_cost_per_m: 0.20,
+                    cache_creation_cost_per_m: 10.0,
                     max_context: 1_000_000,
                     supports_vision: true,
                     supports_tools: true,
@@ -577,6 +584,18 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     supports_vision: true,
                     supports_tools: true,
                     tags: vec!["fast".into(), "cheap".into()],
+                },
+                ModelInfo {
+                    id: "claude-fable-5-1".into(),
+                    display_name: "Claude Fable 5.1".into(),
+                    input_cost_per_m: 10.0,
+                    output_cost_per_m: 50.0,
+                    cache_read_cost_per_m: 0.25,
+                    cache_creation_cost_per_m: 12.50,
+                    max_context: 1_000_000,
+                    supports_vision: true,
+                    supports_tools: true,
+                    tags: vec!["most capable".into(), "largest ctx".into()],
                 },
                 ModelInfo {
                     id: "claude-fable-5".into(),
@@ -821,44 +840,47 @@ mod tests {
         assert!(providers.contains_key("anthropic"));
         assert!(providers.contains_key("openai"));
         let anthropic = &providers["anthropic"];
-        // 4 current (fable-5-1, opus-5-5, sonnet-5-5, haiku-5-5) + 4 previous
-        // (fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy (opus-4-6, sonnet-4-6).
-        assert_eq!(anthropic.models.len(), 10);
+        // 4 current (fable-5-2, opus-5-5, sonnet-5-5, haiku-5-5) + 5 previous
+        // (fable-5-1, fable-5, opus-4-8, sonnet-5, haiku-4-5) + 2 legacy
+        // (opus-4-6, sonnet-4-6).
+        assert_eq!(anthropic.models.len(), 11);
         assert!(anthropic.enabled);
         // Current-generation ids must be present and priced (regression F2).
         for id in [
-            "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
-            "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5", "claude-haiku-4-5",
+            "claude-fable-5-2", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5",
+            "claude-fable-5-1", "claude-opus-4-8", "claude-sonnet-5", "claude-fable-5",
+            "claude-haiku-4-5",
         ] {
             assert!(anthropic.models.iter().any(|m| m.id == id), "missing {id}");
+        }
+        // Fable 5.2 leads the list (the newest Fable), Mythos stays out of it.
+        assert_eq!(anthropic.models[0].id, "claude-fable-5-2");
+        assert!(!anthropic.models.iter().any(|m| m.id.contains("mythos")));
+    }
+
+    #[test]
+    fn suggest_model_every_task_type() {
+        let router = ProviderRouter {
+            providers: builtin_providers(),
+        };
+        for (task, expected) in [
+            (TaskType::Architecture, "claude-opus-5-5"),
+            (TaskType::Debugging, "claude-opus-5-5"),
+            (TaskType::CodeReview, "claude-sonnet-5-5"),
+            (TaskType::Refactoring, "claude-sonnet-5-5"),
+            (TaskType::General, "claude-sonnet-5-5"),
+            (TaskType::QuickFix, "claude-haiku-5-5"),
+            (TaskType::Documentation, "claude-haiku-5-5"),
+            (TaskType::Testing, "claude-haiku-5-5"),
+        ] {
+            assert_eq!(router.suggest_model(&task).model_id, expected, "{task:?}");
         }
     }
 
     #[test]
-    fn suggest_model_architecture() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::Architecture);
-        assert_eq!(suggestion.model_id, "claude-opus-5-5");
-    }
-
-    #[test]
-    fn suggest_model_code_review() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::CodeReview);
-        assert_eq!(suggestion.model_id, "claude-sonnet-5-5");
-    }
-
-    #[test]
-    fn suggest_model_quick_fix() {
-        let router = ProviderRouter {
-            providers: builtin_providers(),
-        };
-        let suggestion = router.suggest_model(&TaskType::QuickFix);
-        assert_eq!(suggestion.model_id, "claude-haiku-5-5");
+    fn untagged_suggestion_falls_back_to_first_anthropic_builtin() {
+        let first = builtin_providers()["anthropic"].models[0].id.clone();
+        assert_eq!(builtin_anthropic_model_tagged("no such tag"), first);
     }
 
     #[test]

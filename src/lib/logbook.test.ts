@@ -79,6 +79,15 @@ describe("logbookToMarkdown", () => {
     expect(md).toContain("| Pricey | build | 2m | $9.00 | $3.00 | 2 | 0 |");
   });
 
+  it("groups thousands in every figure, like the ledger", () => {
+    const md = logbookToMarkdown([row({ title: "Big", costUsd: 12843.27, savingsUsd: 1500 })], {
+      scopeLabel: "s",
+      periodLabel: "p",
+    });
+    expect(md).toContain("$12,843.27 spent · saved $1,500.00");
+    expect(md).toContain("| $12,843.27 | $1,500.00 |");
+  });
+
   it("escapes pipes in a mission title so the table can't break", () => {
     const md = logbookToMarkdown([row({ title: "a | b" })], {
       scopeLabel: "s",

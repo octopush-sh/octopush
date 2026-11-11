@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
-import { CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewUsesClaudeCode, loadClaudeCliVersion } from "../lib/claudeCli";
+import {
+  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewClaudeModels, crewUsesClaudeCode, loadClaudeCliVersion, modelFloorLabel,
+} from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRunsStore } from "../stores/runsStore";
 import { usePerfStore } from "../stores/perfStore";
@@ -203,16 +205,35 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   // Preflight: a crew with a Claude Code CLI stage on an old CLI gets an
   // amber note under the foot. Informational only — it never gates Begin.
   const usesClaudeCode = !!selected && crewUsesClaudeCode(selected.stages, overrides);
+  // Every model that will run on Claude Code, escalations included — a Codex
+  // stage escalating to a Claude model still needs the version read below.
+  const claudeModels = selected ? crewClaudeModels(selected.stages, overrides) : [];
+  const claudeModelsKey = claudeModels.join("\n");
+  const needsCliVersion = usesClaudeCode || claudeModels.length > 0;
   const [cli, setCli] = useState<ClaudeCliVersion | null>(null);
   useEffect(() => {
-    if (!usesClaudeCode) return;
+    if (!needsCliVersion) return;
     let alive = true;
     void loadClaudeCliVersion().then((v) => { if (alive) setCli(v); });
     return () => { alive = false; };
-  }, [usesClaudeCode]);
+  }, [needsCliVersion]);
   const cliUpdate = usesClaudeCode ? claudeUpdateLabel(cli) : null;
   const cliSecurity = usesClaudeCode ? claudeSecurityLabel(cli) : null;
   const cliNote = cliUpdate ?? cliSecurity;
+  // A CLI stage (or its escalation) on a model this CLI is too old to launch
+  // — e.g. Fable 5.2 before 2.1.321. Once the version is known, the backend
+  // checks against its cached copy; an unknown version never warns.
+  const [floorNote, setFloorNote] = useState<ClaudeModelFloorNote | null>(null);
+  useEffect(() => {
+    setFloorNote(null);
+    if (!cli?.version || !claudeModelsKey) return;
+    let alive = true;
+    ipc.claudeModelFloorNote(claudeModelsKey.split("\n"))
+      .then((n) => { if (alive) setFloorNote(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [cli?.version, claudeModelsKey]);
+  const modelFloorLine = cli?.version ? modelFloorLabel(floorNote) : null;
 
   const estimateRange = estimate ? estimateRangeText(estimate) : "";
   const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
@@ -570,6 +591,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                   {cliUpdate ? `${CLAUDE_UPDATE_REASON} ` : ""}The run can still begin.
                 </p>
               </div>
+            )}
+            {modelFloorLine && (
+              <p
+                data-tour="direct-launcher-model-floor"
+                data-testid="launcher-claude-model-floor"
+                title="A stage on this model fails at launch until Claude Code is updated. The run can still begin."
+                className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {modelFloorLine}
+              </p>
             )}
           </>
         )}

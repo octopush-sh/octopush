@@ -6,6 +6,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
+import { formatUsd } from "../lib/cost";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -380,7 +381,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
                 ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
               </span>
             )}
-            <span className="octo-tabular text-xs text-octo-brass">${stage.costUsd.toFixed(2)}</span>
+            <span className="octo-tabular text-xs text-octo-brass">{formatUsd(stage.costUsd)}</span>
           </span>
         </div>
         <div className="truncate font-serif text-[15px] text-octo-ivory" title={stageTitle(stage)}>
@@ -449,7 +450,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
               )}
               {viewedRow.diffSnapshot != null && <SnapshotDiff diff={viewedRow.diffSnapshot} />}
               <div className="octo-tabular font-mono text-[11px] text-octo-mute">
-                ${viewedRow.costUsd.toFixed(2)}
+                {formatUsd(viewedRow.costUsd)}
               </div>
               {viewedRow.closingFeedback && (
                 <div className="flex flex-col gap-1">

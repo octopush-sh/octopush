@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import { parseKeyPhrase } from "../lib/parseKeyPhrase";
 import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
 import { splitBySkillTokens } from "../lib/skillMentions";
+import { formatUsd } from "../lib/cost";
 
 interface MessageProps {
   role: "user" | "assistant" | "tool" | "error" | string;
@@ -31,7 +32,7 @@ export function usageFooter(m: MessageProps): string {
   const prompt = uncached + read + written;
   if (read > 0 && prompt > 0) parts.push(`${Math.round((read / prompt) * 100)}% cached`);
   if (m.outputTokens != null) parts.push(`${formatTokenCount(m.outputTokens)} out`);
-  if (m.costUsd != null && m.costUsd > 0) parts.push(`$${m.costUsd < 0.01 ? m.costUsd.toFixed(3) : m.costUsd.toFixed(2)}`);
+  if (m.costUsd != null && m.costUsd > 0) parts.push(m.costUsd < 0.01 ? `$${m.costUsd.toFixed(3)}` : formatUsd(m.costUsd));
   return parts.join(" · ");
 }
 
