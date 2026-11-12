@@ -10173,7 +10173,7 @@ mod live_tests {
     }
 
     #[test]
-    fn compact_history_leaves_encrypted_reasoning_out_of_the_estimate() {
+    fn compact_history_counts_encrypted_reasoning_in_the_estimate() {
         use crate::orchestrator::agentic::compact_history_for_tests as compact;
         use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
         // A GPT-6 turn whose encrypted reasoning alone is over the budget.
@@ -10207,8 +10207,13 @@ mod live_tests {
             results("t3"),
             results("t4"),
         ];
-        // The visible history is ~30k chars: no compaction at a 100k budget.
-        assert_eq!(compact(&mut messages, 0, 100_000), 0);
+        // Reasoning still occupies the context window: ~150k decoded chars of
+        // it plus ~30k of tool output is over a 100k budget, so older tool
+        // output is compacted rather than letting the stage overflow.
+        assert!(compact(&mut messages, 0, 100_000) > 0);
+        // Without the reasoning, the same history fits.
+        let mut visible: Vec<_> = messages.iter().skip(1).cloned().collect();
+        assert_eq!(compact(&mut visible, 0, 100_000), 0);
     }
 
     #[tokio::test]

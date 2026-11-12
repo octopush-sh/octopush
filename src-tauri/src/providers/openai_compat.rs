@@ -341,8 +341,12 @@ pub fn responses_raw_chars(raw: &[Value]) -> usize {
     raw.iter()
         .skip(1)
         .map(|item| {
+            // Replayed reasoning still occupies the model's context window, so
+            // it must count. Count the decoded size of the base64 blob (3/4 of
+            // its length) rather than the base64 text itself: dropping it to 0
+            // would let a long reasoning stage overflow the window uncompacted.
             let enc = item.get("encrypted_content").and_then(|c| c.as_str()).map_or(0, str::len);
-            item.to_string().len().saturating_sub(enc)
+            item.to_string().len().saturating_sub(enc) + enc * 3 / 4
         })
         .sum()
 }
