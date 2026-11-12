@@ -14,7 +14,8 @@ const GPT6_EFFORT_NONE = ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"];
 export function apiEffortOffTitle(model: string): string {
   const id = model.trim().toLowerCase().split("/").pop() ?? "";
   if (!id.includes("gpt-6")) return EFFORT_OFF_TITLE;
-  return GPT6_EFFORT_NONE.some((m) => id === m || id.startsWith(`${m}-`))
+  // The bare id or a dated snapshot only: another variant may not take none.
+  return GPT6_EFFORT_NONE.some((m) => id.startsWith(m) && /^(-\d{4}-\d{2}-\d{2})?$/.test(id.slice(m.length)))
     ? "No reasoning (effort none on OpenAI; through a gateway, the model's default: medium)"
     : "OpenAI has no off level for this model, so it reasons at its default: medium";
 }

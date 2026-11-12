@@ -20,7 +20,13 @@ use crate::error::{AppError, AppResult, ProviderErrorKind};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-pub struct OpenAICompatibleProvider;
+pub struct OpenAICompatibleProvider {
+    /// The configured provider's name (`openai`, a custom provider…). With
+    /// the endpoint it tells which configured provider produced a Responses
+    /// turn's encrypted reasoning (see `responses_replay`). It names the
+    /// provider, not its key: a key changed on the same provider looks alike.
+    pub provider: String,
+}
 
 #[async_trait]
 impl LlmProvider for OpenAICompatibleProvider {
@@ -33,7 +39,7 @@ impl LlmProvider for OpenAICompatibleProvider {
     ) -> AppResult<LlmResponse> {
         let responses = uses_responses_api(&req.model, api_base);
         let (body, url) = if responses {
-            (build_responses_request(req), responses_url(api_base))
+            (build_responses_request(req, &self.provider, api_base), responses_url(api_base))
         } else {
             (build_request(req), chat_completions_url(api_base))
         };
@@ -72,7 +78,7 @@ impl LlmProvider for OpenAICompatibleProvider {
             .map_err(|e| AppError::Other(format!("JSON parse error: {e}")))?;
 
         Ok(if responses {
-            parse_responses_response(response, &req.model)
+            parse_responses_response(response, &req.model, &self.provider, api_base)
         } else {
             parse_response(response)
         })
@@ -144,15 +150,26 @@ pub fn reasoning_effort_level(model_id: &str, effort: Effort) -> &'static str {
 /// `effort: "none"` — but only GPT-6 Sol, GPT-6 Luna and GPT-6.1 Terra accept
 /// it; GPT-6 Astra and GPT-6.1 Sol return a 400, so they (and any GPT-6 id
 /// not listed here) get no `reasoning` and keep that default. Matches the bare
-/// id or a dated snapshot (`gpt-6-sol-2026-08-01`); `gpt-6-sol` is not a
-/// prefix of `gpt-6.1-sol`.
+/// id or a dated snapshot (`gpt-6-sol-2026-08-01`) only: another variant
+/// (`gpt-6-sol-pro`) may not accept `none`, and `gpt-6-sol` is not a prefix
+/// of `gpt-6.1-sol`.
 pub fn effort_off_level(model_id: &str) -> Option<&'static str> {
     let id = model_id.to_ascii_lowercase();
     let id = id.rsplit('/').next().unwrap_or(&id);
     ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"]
         .iter()
-        .any(|m| id == *m || id.strip_prefix(m).is_some_and(|rest| rest.starts_with('-')))
+        .any(|m| id.strip_prefix(m).is_some_and(|rest| rest.is_empty() || is_snapshot_suffix(rest)))
         .then_some("none")
+}
+
+/// Whether `rest` is a dated snapshot suffix, `-YYYY-MM-DD`.
+fn is_snapshot_suffix(rest: &str) -> bool {
+    let b = rest.as_bytes();
+    b.len() == 11
+        && b.iter().enumerate().all(|(i, c)| match i {
+            0 | 5 | 8 => *c == b'-',
+            _ => c.is_ascii_digit(),
+        })
 }
 
 /// Whether an OpenAI-family model actually honors `reasoning_effort`. Only the
@@ -231,11 +248,14 @@ pub fn build_request(req: &LlmRequest) -> Value {
 /// `include: ["reasoning.encrypted_content"]` has the API return each
 /// reasoning item's content encrypted, so a tool turn can pass it back
 /// (function-calling guide: reasoning items returned with tool calls "must
-/// also be passed back with tool call outputs").
-pub fn build_responses_request(req: &LlmRequest) -> Value {
+/// also be passed back with tool call outputs"). `provider` and `api_base`
+/// say where this request goes, so reasoning from elsewhere is not replayed.
+pub fn build_responses_request(req: &LlmRequest, provider: &str, api_base: &str) -> Value {
+    let base = responses_url(api_base);
+    let here = ResponsesOrigin { model: &req.model, provider, base: &base };
     let mut input: Vec<Value> = Vec::with_capacity(req.messages.len());
     for m in &req.messages {
-        input.extend(message_to_responses(m, &req.model));
+        input.extend(message_to_responses(m, &here));
     }
 
     // `strict: false` explicitly: an omitted `strict` makes Responses try to
@@ -277,9 +297,18 @@ pub fn build_responses_request(req: &LlmRequest) -> Value {
     body
 }
 
-/// The first item of a Responses turn's `raw_content`: which model produced
-/// the encrypted reasoning behind it. Never sent; see `responses_replay`.
+/// The first item of a Responses turn's `raw_content`: which model, provider
+/// and endpoint produced the encrypted reasoning behind it. Never sent; see
+/// `responses_replay`.
 const RESPONSES_ORIGIN: &str = "octopush.responses_origin";
+
+/// Where a Responses turn runs: its model, configured provider and
+/// `/responses` endpoint (`responses_url`).
+struct ResponsesOrigin<'a> {
+    model: &'a str,
+    provider: &'a str,
+    base: &'a str,
+}
 
 /// Whether a captured `raw` array came from the Responses API (so the
 /// Anthropic serializer must not replay it as content blocks).
@@ -288,21 +317,42 @@ pub fn is_responses_raw(raw: &[Value]) -> bool {
 }
 
 /// The output items to replay verbatim for an assistant tool turn, when its
-/// `raw` was captured from a Responses turn of this same `model`. Encrypted
-/// reasoning from another model (an escalation swap, a provider change) is
-/// never sent: those turns fall back to the rebuilt items.
-fn responses_replay<'a>(raw: &'a [Value], model: &str) -> Option<&'a [Value]> {
+/// `raw` was captured from a Responses turn of this same model, provider and
+/// endpoint. Encrypted reasoning only decrypts for the org that produced it,
+/// so reasoning from another model (an escalation swap), another configured
+/// provider, another endpoint, or an origin missing any of them is never
+/// sent: those turns fall back to the rebuilt items. The key isn't compared,
+/// so a key changed on the same provider and endpoint still replays.
+fn responses_replay<'a>(raw: &'a [Value], here: &ResponsesOrigin) -> Option<&'a [Value]> {
     let (origin, items) = raw.split_first()?;
-    let from = origin.get("model").and_then(|m| m.as_str())?;
-    (is_responses_raw(raw) && from.eq_ignore_ascii_case(model) && !items.is_empty()).then_some(items)
+    let field = |k: &str| origin.get(k).and_then(|v| v.as_str());
+    let same = field("model")?.eq_ignore_ascii_case(here.model)
+        && field("provider")? == here.provider
+        && field("base")?.eq_ignore_ascii_case(here.base);
+    (is_responses_raw(raw) && same && !items.is_empty()).then_some(items)
+}
+
+/// Model-visible size (chars) of a Responses turn's `raw`, for the context
+/// guard: the origin item is never sent, and each `encrypted_content` is left
+/// out. That base64 blob is far longer than the reasoning it carries, so
+/// counting it at chars/4 would set off compaction early, and compacting
+/// older tool results rewrites the history that reasoning came after.
+pub fn responses_raw_chars(raw: &[Value]) -> usize {
+    raw.iter()
+        .skip(1)
+        .map(|item| {
+            let enc = item.get("encrypted_content").and_then(|c| c.as_str()).map_or(0, str::len);
+            item.to_string().len().saturating_sub(enc)
+        })
+        .sum()
 }
 
 /// Returns 1 or more Responses input items from a normalized LlmMessage. An
 /// assistant turn with tools replays its captured output items (reasoning,
-/// message, `function_call`, in order) when they came from `model`, else
+/// message, `function_call`, in order) when they came from `here`, else
 /// becomes its text (if any) plus one `function_call` item per call; each
 /// tool result is a `function_call_output`.
-fn message_to_responses(msg: &LlmMessage, model: &str) -> Vec<Value> {
+fn message_to_responses(msg: &LlmMessage, here: &ResponsesOrigin) -> Vec<Value> {
     match (&msg.role, &msg.content) {
         (LlmRole::User, LlmContent::Text(t)) => vec![json!({ "role": "user", "content": t })],
         (_, LlmContent::Multimodal(blocks)) => {
@@ -323,7 +373,7 @@ fn message_to_responses(msg: &LlmMessage, model: &str) -> Vec<Value> {
             // Verbatim: the reasoning items sit right before the
             // `function_call` items they produced, and those keep their
             // `fc_…` ids, which the API ties to that reasoning.
-            if let Some(items) = responses_replay(raw, model) {
+            if let Some(items) = responses_replay(raw, here) {
                 return items.to_vec();
             }
             let mut items = Vec::with_capacity(tool_uses.len() + 1);
@@ -358,11 +408,12 @@ fn message_to_responses(msg: &LlmMessage, model: &str) -> Vec<Value> {
 ///
 /// When the turn carries reasoning, `raw_content` keeps its reasoning,
 /// message and `function_call` items verbatim and in order, behind an origin
-/// item naming `model` (see `responses_replay`), so the next tool turn passes
-/// the reasoning back. A reasoning item without `encrypted_content` can't be
-/// replayed statelessly (its id points at nothing stored), so then nothing is
-/// kept and the turn is rebuilt from text + tool uses.
-pub fn parse_responses_response(response: Value, model: &str) -> LlmResponse {
+/// item naming `model`, `provider` and the endpoint for `api_base` (see
+/// `responses_replay`), so the next tool turn passes the reasoning back. A
+/// reasoning item without `encrypted_content` can't be replayed statelessly
+/// (its id points at nothing stored), so then nothing is kept and the turn is
+/// rebuilt from text + tool uses.
+pub fn parse_responses_response(response: Value, model: &str, provider: &str, api_base: &str) -> LlmResponse {
     let mut text = String::new();
     let mut tool_uses: Vec<LlmToolUse> = Vec::new();
     let mut refused = false;
@@ -442,7 +493,12 @@ pub fn parse_responses_response(response: Value, model: &str) -> LlmResponse {
         split_cached_input(count("input_tokens"), usage.and_then(|u| u.get("input_tokens_details")));
 
     let raw_content = if reasoning && replayable {
-        let mut raw = vec![json!({ "type": RESPONSES_ORIGIN, "model": model })];
+        let mut raw = vec![json!({
+            "type": RESPONSES_ORIGIN,
+            "model": model,
+            "provider": provider,
+            "base": responses_url(api_base),
+        })];
         raw.extend(replay);
         raw
     } else {

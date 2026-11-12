@@ -474,6 +474,8 @@ fn message_chars(m: &LlmMessage) -> usize {
             // when the guard matters most.
             if raw.is_empty() {
                 text.len() + tool_uses.iter().map(|u| u.input.to_string().len()).sum::<usize>()
+            } else if crate::providers::openai_compat::is_responses_raw(raw) {
+                crate::providers::openai_compat::responses_raw_chars(raw)
             } else {
                 raw.iter().map(|v| v.to_string().len()).sum()
             }
