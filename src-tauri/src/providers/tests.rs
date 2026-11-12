@@ -1060,7 +1060,7 @@ fn openai_responses_replay_dropped_for_another_provider_or_endpoint() {
 }
 
 #[test]
-fn openai_responses_raw_size_leaves_out_encrypted_content() {
+fn openai_responses_raw_size_counts_encrypted_content_decoded() {
     let big = "A".repeat(100_000);
     let resp = parse_responses(json!({
         "status": "completed",
@@ -1070,7 +1070,9 @@ fn openai_responses_raw_size_leaves_out_encrypted_content() {
         ]
     }));
     let size = openai_compat::responses_raw_chars(&resp.raw_content);
-    assert!(size > 0 && size < 500, "{size}");
+    // Reasoning occupies context: it counts at its decoded size (3/4 of the
+    // base64 length), plus the small visible part of the items.
+    assert!((75_000..75_500).contains(&size), "{size}");
 }
 
 #[test]
