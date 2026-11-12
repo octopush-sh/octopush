@@ -9917,9 +9917,9 @@ mod live_tests {
     struct ResponsesRecorder { turns: Mutex<VecDeque<LlmResponse>>, bodies: Mutex<Vec<Value>> }
     #[async_trait::async_trait]
     impl LlmProvider for ResponsesRecorder {
-        async fn complete(&self, _b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
+        async fn complete(&self, b: &str, _k: Option<&str>, r: &LlmRequest, _c: &reqwest::Client)
             -> crate::error::AppResult<LlmResponse> {
-            self.bodies.lock().push(crate::providers::openai_compat::build_responses_request(r));
+            self.bodies.lock().push(crate::providers::openai_compat::build_responses_request(r, "openai", b));
             Ok(self.turns.lock().pop_front().expect("ResponsesRecorder ran out of turns"))
         }
     }
@@ -9935,7 +9935,7 @@ mod live_tests {
                 { "type": "function_call", "id": format!("fc-{call}"), "call_id": call, "name": "read_file",
                   "arguments": "{\"path\":\"a.rs\"}", "status": "completed" }
             ]
-        }), "gpt-6-sol");
+        }), "gpt-6-sol", "openai", "https://api.openai.com/v1");
         let mut cut = gpt_turn("rs_2", "call_2");
         cut.stop_reason = LlmStopReason::MaxTokens;
         let provider = ResponsesRecorder {
@@ -10170,6 +10170,45 @@ mod live_tests {
         // Already under budget → untouched.
         let mut small = vec![mk_results("a")];
         assert_eq!(compact(&mut small, 0, 1_000_000), 0);
+    }
+
+    #[test]
+    fn compact_history_leaves_encrypted_reasoning_out_of_the_estimate() {
+        use crate::orchestrator::agentic::compact_history_for_tests as compact;
+        use crate::providers::{LlmContent, LlmMessage, LlmRole, LlmToolResult};
+        // A GPT-6 turn whose encrypted reasoning alone is over the budget.
+        let gpt = crate::providers::openai_compat::parse_responses_response(json!({
+            "status": "completed",
+            "output": [
+                { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "A".repeat(200_000) },
+                { "type": "function_call", "id": "fc_1", "call_id": "c1", "name": "read_file", "arguments": "{}" }
+            ]
+        }), "gpt-6-sol", "openai", "https://api.openai.com/v1");
+        let results = |id: &str| LlmMessage {
+            role: LlmRole::User,
+            content: LlmContent::ToolResults(vec![LlmToolResult {
+                tool_use_id: id.into(),
+                content: "x".repeat(5_000),
+                is_error: false,
+            }]),
+        };
+        let mut messages = vec![
+            LlmMessage {
+                role: LlmRole::Assistant,
+                content: LlmContent::AssistantWithTools {
+                    raw: gpt.raw_content,
+                    text: String::new(),
+                    tool_uses: gpt.tool_uses,
+                },
+            },
+            results("c1"),
+            results("t1"),
+            results("t2"),
+            results("t3"),
+            results("t4"),
+        ];
+        // The visible history is ~30k chars: no compaction at a 100k budget.
+        assert_eq!(compact(&mut messages, 0, 100_000), 0);
     }
 
     #[tokio::test]

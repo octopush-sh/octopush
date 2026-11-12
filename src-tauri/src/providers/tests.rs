@@ -783,6 +783,8 @@ mod effort {
                 ]
             }),
             "gpt-6-sol",
+            "openai",
+            "https://api.openai.com/v1",
         );
         assert!(!gpt.raw_content.is_empty());
         let mut req = sample_request();
@@ -871,12 +873,12 @@ mod effort {
         let mut req = sample_request();
         req.model = "gpt-6.1-terra".into();
         req.effort = Some(Effort::Max);
-        let body = openai_compat::build_responses_request(&req);
+        let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
         assert_eq!(body["reasoning"], json!({ "effort": "max" }));
         assert!(body.get("reasoning_effort").is_none(), "Chat Completions key must not leak");
         // No effort on GPT-6.1 Terra → `none`, not the API's default `medium`.
         req.effort = None;
-        assert_eq!(openai_compat::build_responses_request(&req)["reasoning"], json!({ "effort": "none" }));
+        assert_eq!(openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1")["reasoning"], json!({ "effort": "none" }));
     }
 
     #[test]
@@ -886,21 +888,25 @@ mod effort {
             assert_eq!(openai_compat::effort_off_level(m), Some("none"), "{m}");
             let mut req = sample_request();
             req.model = m.into();
-            let body = openai_compat::build_responses_request(&req);
+            let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
             assert_eq!(body["reasoning"], json!({ "effort": "none" }), "{m}");
         }
         // GPT-6 Astra and GPT-6.1 Sol 400 on it: omitted, so they run at `medium`.
-        for m in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-sol-2026-10-01", "gpt-6-solar", "gpt-6.2-terra"] {
+        // Only a dated snapshot suffix counts: another variant may not take `none`.
+        for m in [
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-sol-2026-10-01", "gpt-6-solar", "gpt-6.2-terra",
+            "gpt-6-sol-pro", "gpt-6-luna-mini", "gpt-6-sol-2026-08", "gpt-6.1-terra-2026-08-01-pro",
+        ] {
             assert_eq!(openai_compat::effort_off_level(m), None, "{m}");
             let mut req = sample_request();
             req.model = m.into();
-            assert!(openai_compat::build_responses_request(&req).get("reasoning").is_none(), "{m}");
+            assert!(openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1").get("reasoning").is_none(), "{m}");
         }
         // A real effort is never replaced by `none`.
         let mut req = sample_request();
         req.model = "gpt-6-sol".into();
         req.effort = Some(Effort::Low);
-        assert_eq!(openai_compat::build_responses_request(&req)["reasoning"], json!({ "effort": "low" }));
+        assert_eq!(openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1")["reasoning"], json!({ "effort": "low" }));
     }
 
     #[test]
@@ -916,8 +922,15 @@ mod effort {
 
 // ─── OpenAI Responses API (GPT-6 tool calls, #689) ───────────────────────────
 
+const OPENAI_V1: &str = "https://api.openai.com/v1";
+
 fn parse_responses(body: serde_json::Value) -> super::LlmResponse {
-    openai_compat::parse_responses_response(body, "gpt-6-sol")
+    openai_compat::parse_responses_response(body, "gpt-6-sol", "openai", OPENAI_V1)
+}
+
+/// The Responses body for `req` sent through the `openai` provider.
+fn responses_body(req: &LlmRequest) -> serde_json::Value {
+    openai_compat::build_responses_request(req, "openai", OPENAI_V1)
 }
 
 /// A GPT-6 tool turn: reasoning, a short message, then two calls.
@@ -966,7 +979,7 @@ fn replay_request(resp: &super::LlmResponse, raw: Vec<serde_json::Value>, model:
 fn openai_responses_request_includes_encrypted_reasoning() {
     let mut req = sample_request();
     req.model = "gpt-6-sol".into();
-    let body = openai_compat::build_responses_request(&req);
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
     assert_eq!(body["store"], false);
     // Chat Completions never gets it.
@@ -982,9 +995,11 @@ fn openai_responses_reasoning_round_trips_in_order() {
     assert_eq!(resp.raw_content.len(), 6);
     assert!(openai_compat::is_responses_raw(&resp.raw_content));
     assert_eq!(resp.raw_content[0]["model"], "gpt-6-sol");
+    assert_eq!(resp.raw_content[0]["provider"], "openai");
+    assert_eq!(resp.raw_content[0]["base"], "https://api.openai.com/v1/responses");
 
     let raw = resp.raw_content.clone();
-    let body = openai_compat::build_responses_request(&replay_request(&resp, raw, "gpt-6-sol"));
+    let body = responses_body(&replay_request(&resp, raw, "gpt-6-sol"));
     let input = body["input"].as_array().unwrap();
     let output = gpt6_reasoning_turn()["output"].as_array().unwrap().clone();
     // user, the five items verbatim (fc ids kept), then the two outputs.
@@ -1007,7 +1022,7 @@ fn openai_responses_replay_dropped_for_another_model_or_empty_raw() {
         (resp.raw_content.clone(), "gpt-6-astra"),
         (vec![], "gpt-6-sol"),
     ] {
-        let body = openai_compat::build_responses_request(&replay_request(&resp, raw, model));
+        let body = responses_body(&replay_request(&resp, raw, model));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 6, "{model}: user, text, 2 calls, 2 outputs");
         assert_eq!(input[1], json!({ "role": "assistant", "content": "Reading both." }));
@@ -1017,8 +1032,45 @@ fn openai_responses_replay_dropped_for_another_model_or_empty_raw() {
     }
     // An Anthropic turn's raw (content blocks) is never sent to OpenAI either.
     let blocks = vec![json!({ "type": "thinking", "thinking": "t", "signature": "s" })];
-    let body = openai_compat::build_responses_request(&replay_request(&resp, blocks, "gpt-6-sol"));
+    let body = responses_body(&replay_request(&resp, blocks, "gpt-6-sol"));
     assert!(!body.to_string().contains("signature"));
+}
+
+#[test]
+fn openai_responses_replay_dropped_for_another_provider_or_endpoint() {
+    let resp = parse_responses(gpt6_reasoning_turn());
+    let req = replay_request(&resp, resp.raw_content.clone(), "gpt-6-sol");
+    // Same model, same endpoint (any pasted form of it): replayed.
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1/responses");
+    assert!(body.to_string().contains("enc-1"));
+    // Same model under another provider's key (maybe another org), or
+    // another endpoint: the reasoning might not decrypt, so it is dropped.
+    for (provider, base) in [("openai-work", OPENAI_V1), ("openai", "https://api.openai.com/v2")] {
+        let body = openai_compat::build_responses_request(&req, provider, base);
+        assert!(!body.to_string().contains("enc-1"), "{provider} {base}");
+        assert!(body["input"].as_array().unwrap().iter().all(|i| i["type"] != "reasoning"));
+    }
+    // An origin without provider or endpoint (written before they were
+    // recorded) is never trusted.
+    let mut old = resp.raw_content.clone();
+    old[0] = json!({ "type": "octopush.responses_origin", "model": "gpt-6-sol" });
+    assert!(openai_compat::is_responses_raw(&old));
+    let body = responses_body(&replay_request(&resp, old, "gpt-6-sol"));
+    assert!(!body.to_string().contains("enc-1"));
+}
+
+#[test]
+fn openai_responses_raw_size_leaves_out_encrypted_content() {
+    let big = "A".repeat(100_000);
+    let resp = parse_responses(json!({
+        "status": "completed",
+        "output": [
+            { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": big },
+            { "type": "function_call", "id": "fc_1", "call_id": "c", "name": "n", "arguments": "{}" }
+        ]
+    }));
+    let size = openai_compat::responses_raw_chars(&resp.raw_content);
+    assert!(size > 0 && size < 500, "{size}");
 }
 
 #[test]
@@ -1089,7 +1141,7 @@ fn openai_responses_request_shape() {
     let mut req = sample_request();
     req.model = "gpt-6-sol".into();
     req.max_tokens = 48000;
-    let body = openai_compat::build_responses_request(&req);
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     assert_eq!(body["model"], "gpt-6-sol");
     assert_eq!(body["instructions"], "You are helpful.");
     assert_eq!(body["input"][0], json!({ "role": "user", "content": "Hi there." }));
@@ -1106,7 +1158,7 @@ fn openai_responses_request_shape() {
     assert!(tool.get("function").is_none());
     assert!(body.get("tool_choice").is_none());
     req.tool_choice = Some("emit_result".into());
-    let body = openai_compat::build_responses_request(&req);
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     assert_eq!(body["tool_choice"], json!({ "type": "function", "name": "emit_result" }));
 }
 
@@ -1132,7 +1184,7 @@ fn openai_responses_replays_tool_turns_by_call_id() {
             LlmToolResult { tool_use_id: "call_2".into(), content: "ok2".into(), is_error: false },
         ]),
     });
-    let body = openai_compat::build_responses_request(&req);
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     let input = body["input"].as_array().unwrap();
     assert_eq!(input.len(), 6, "user, assistant text, 2 calls, 2 outputs");
     assert_eq!(input[1], json!({ "role": "assistant", "content": "let me read it" }));
@@ -1157,7 +1209,7 @@ fn openai_responses_multimodal_uses_input_parts() {
             LlmBlock::Image { media_type: "image/png".into(), data: "ZZ".into() },
         ]),
     }];
-    let body = openai_compat::build_responses_request(&req);
+    let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     let content = &body["input"][0]["content"];
     assert_eq!(content[0], json!({ "type": "input_text", "text": "hi" }));
     assert_eq!(content[1], json!({ "type": "input_image", "image_url": "data:image/png;base64,ZZ" }));

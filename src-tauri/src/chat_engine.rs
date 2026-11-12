@@ -1532,7 +1532,7 @@ pub(crate) fn resolve_provider(model: &str) -> AppResult<(Box<dyn LlmProvider>, 
 
     let impl_: Box<dyn LlmProvider> = match provider_cfg.protocol.as_str() {
         "anthropic" => Box::new(AnthropicProvider),
-        "openai-compatible" => Box::new(OpenAICompatibleProvider),
+        "openai-compatible" => Box::new(OpenAICompatibleProvider { provider: provider_cfg.name.clone() }),
         other => return Err(AppError::Other(format!("Unsupported protocol: {other}"))),
     };
 

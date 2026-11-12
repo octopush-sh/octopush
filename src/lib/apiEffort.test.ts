@@ -15,7 +15,7 @@ describe("apiEffortOffTitle", () => {
   });
 
   it("says Off keeps medium where OpenAI has no off level", () => {
-    for (const m of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-solar"]) {
+    for (const m of ["gpt-6-astra", "gpt-6.1-sol", "gpt-6-solar", "gpt-6-sol-pro", "gpt-6-luna-2026-08"]) {
       expect(apiEffortOffTitle(m)).toBe("OpenAI has no off level for this model, so it reasons at its default: medium");
     }
   });
