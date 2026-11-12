@@ -10,6 +10,7 @@ import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type 
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
 import { cliTooOldForEffort, codexEffortLevel, effortApplies, loadClaudeCliVersion, runsOnClaudeCode } from "../../lib/claudeCli";
+import { apiEffortOffTitle, EFFORT_OFF_TITLE } from "../../lib/apiEffort";
 import type { ClaudeCliVersion, Effort } from "../../lib/ipc";
 
 const SUBSTRATE_OPTIONS = [
@@ -20,10 +21,11 @@ const MODE_OPTIONS = [
   { value: "gated" as const, label: "Gated" },
   { value: "auto" as const, label: "Auto" },
 ];
-/** Reasoning-effort segments. `off` is the null state (no thinking). Labels are
- *  compact so all six fit the inspector's full-width track. */
+/** Reasoning-effort segments. `off` is the null state (no thinking; on GPT-6
+ *  see `apiEffortOptions`). Labels are compact so all six fit the inspector's
+ *  full-width track. */
 const EFFORT_OPTIONS = [
-  { value: "off" as const, label: "Off", title: "No extra thinking (fastest, cheapest)" },
+  { value: "off" as const, label: "Off", title: EFFORT_OFF_TITLE },
   { value: "low" as const, label: "Low", title: "A little reasoning before answering" },
   { value: "medium" as const, label: "Med", title: "Moderate reasoning" },
   { value: "high" as const, label: "High", title: "Deep reasoning (slower, pricier)" },
@@ -60,6 +62,13 @@ function codexEffortOptions(model: string) {
   ];
 }
 
+/** On an API stage, Off says what it does on this model (GPT-6 has no "no
+ *  reasoning" on every model; see `apiEffortOffTitle`). */
+function apiEffortOptions(model: string) {
+  const [off, ...levels] = EFFORT_OPTIONS;
+  return [{ ...off, title: apiEffortOffTitle(model) }, ...levels];
+}
+
 /** One effort segment (base or escalation). API: the full track. Claude Code
  *  CLI: the same levels, passed as `--effort`, hidden on a CLI older than the
  *  tested floor (it would not get the flag). Codex: the same levels, passed as
@@ -84,7 +93,7 @@ function EffortControl({
   // Auto on the CLI, where the null state is the CLI's own default.
   const claudeCli = isCli && runsOnClaudeCode(model);
   const tooOld = claudeCli && cliTooOldForEffort(cli);
-  const options = !isCli ? EFFORT_OPTIONS : claudeCli ? CLI_EFFORT_OPTIONS : codexEffortOptions(model);
+  const options = !isCli ? apiEffortOptions(model) : claudeCli ? CLI_EFFORT_OPTIONS : codexEffortOptions(model);
   return (
     <>
       <Reveal open={!tooOld}>
@@ -244,7 +253,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
           </div>
 
           {/* Reasoning effort — how hard the model thinks per turn. API: Off =
-              no thinking. CLI: passed as Claude Code's `--effort` or Codex's
+              no thinking (GPT-6: `none` or the model's default). CLI: passed as Claude Code's `--effort` or Codex's
               `model_reasoning_effort`, Auto = the CLI's default. */}
           <div className="flex flex-col gap-1" data-tour="builder-stage-reasoning">
             <span
@@ -252,7 +261,7 @@ export function StageInspector({ node, ancestors, loop, issue, onPatch, onSetLoo
               title={
                 isCli
                   ? "How hard the model thinks on this stage — the cost/quality lever. Claude Code gets it as --effort, Codex as model_reasoning_effort; Auto keeps the CLI's default for the model."
-                  : "How hard the model thinks on this stage — the cost/quality lever. Off adds no thinking."
+                  : `How hard the model thinks on this stage — the cost/quality lever. Off: ${apiEffortOffTitle(data.agentModel)}.`
               }
             >
               Reasoning

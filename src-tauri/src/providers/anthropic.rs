@@ -343,8 +343,9 @@ fn message_to_anthropic(msg: &LlmMessage) -> Value {
             // thinking survives and interleaved thinking/tool_use ordering is
             // preserved (reordering 400s the next request). Fall back to
             // rebuilding from text + tool_uses when no raw array was captured
-            // (TALK, the truncation path, OpenAI-origin turns).
-            if !raw.is_empty() {
+            // (TALK, the truncation path, OpenAI-origin turns: a Responses
+            // turn's raw holds OpenAI output items, never content blocks).
+            if !raw.is_empty() && !super::openai_compat::is_responses_raw(raw) {
                 return json!({ "role": role, "content": Value::Array(raw.clone()) });
             }
             let mut arr: Vec<Value> = Vec::new();

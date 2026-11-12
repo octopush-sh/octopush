@@ -461,6 +461,32 @@ fn openai_parse_response_ollama_no_finish_reason() {
     assert_eq!(resp.stop_reason, LlmStopReason::EndTurn);
 }
 
+#[test]
+fn openai_parse_response_refusal_is_visible() {
+    let resp = openai_compat::parse_response(json!({
+        "choices": [{
+            "message": { "content": null, "refusal": "I can't help with that." },
+            "finish_reason": "stop"
+        }]
+    }));
+    assert_eq!(resp.text, "I can't help with that.");
+    assert_eq!(resp.stop_reason, LlmStopReason::Other("refusal".into()), "never an empty EndTurn");
+    let mixed = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "Partly.", "refusal": "Not the rest." } }]
+    }));
+    assert_eq!(mixed.text, "Partly.\n\nNot the rest.");
+    assert_eq!(mixed.stop_reason, LlmStopReason::Other("refusal".into()));
+    // A cut turn keeps its reason; a null refusal changes nothing.
+    let cut = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "", "refusal": "No." }, "finish_reason": "length" }]
+    }));
+    assert_eq!(cut.stop_reason, LlmStopReason::MaxTokens);
+    let plain = openai_compat::parse_response(json!({
+        "choices": [{ "message": { "content": "Hello.", "refusal": null }, "finish_reason": "stop" }]
+    }));
+    assert_eq!((plain.text.as_str(), plain.stop_reason), ("Hello.", LlmStopReason::EndTurn));
+}
+
 // ─── tool_choice (forced structured output, G5 follow-up) ───────────────
 
 #[test]
@@ -745,6 +771,36 @@ mod effort {
         assert_eq!(content[1]["type"], "tool_use");
     }
 
+    #[test]
+    fn message_to_anthropic_never_replays_openai_responses_raw() {
+        // A GPT-6 turn's raw (OpenAI output items) is not Anthropic content.
+        let gpt = openai_compat::parse_responses_response(
+            json!({
+                "status": "completed",
+                "output": [
+                    { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc" },
+                    { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file", "arguments": "{}" }
+                ]
+            }),
+            "gpt-6-sol",
+        );
+        assert!(!gpt.raw_content.is_empty());
+        let mut req = sample_request();
+        req.messages = vec![LlmMessage {
+            role: LlmRole::Assistant,
+            content: LlmContent::AssistantWithTools {
+                raw: gpt.raw_content,
+                text: String::new(),
+                tool_uses: gpt.tool_uses,
+            },
+        }];
+        let body = build_request(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "tool_use");
+        assert_eq!(content[0]["id"], "call_1");
+    }
+
     // ─── OpenAI-compat effort gating + token-cap key ────────────────────
 
     #[test]
@@ -818,9 +874,33 @@ mod effort {
         let body = openai_compat::build_responses_request(&req);
         assert_eq!(body["reasoning"], json!({ "effort": "max" }));
         assert!(body.get("reasoning_effort").is_none(), "Chat Completions key must not leak");
-        // No effort → no reasoning block (the API's own default).
+        // No effort on GPT-6.1 Terra → `none`, not the API's default `medium`.
         req.effort = None;
-        assert!(openai_compat::build_responses_request(&req).get("reasoning").is_none());
+        assert_eq!(openai_compat::build_responses_request(&req)["reasoning"], json!({ "effort": "none" }));
+    }
+
+    #[test]
+    fn openai_responses_effort_off_is_none_only_where_accepted() {
+        // GPT-6 Sol, GPT-6 Luna and GPT-6.1 Terra take `none` (dated snapshots too).
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra", "GPT-6-Sol", "gpt-6-sol-2026-08-01"] {
+            assert_eq!(openai_compat::effort_off_level(m), Some("none"), "{m}");
+            let mut req = sample_request();
+            req.model = m.into();
+            let body = openai_compat::build_responses_request(&req);
+            assert_eq!(body["reasoning"], json!({ "effort": "none" }), "{m}");
+        }
+        // GPT-6 Astra and GPT-6.1 Sol 400 on it: omitted, so they run at `medium`.
+        for m in ["gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-sol-2026-10-01", "gpt-6-solar", "gpt-6.2-terra"] {
+            assert_eq!(openai_compat::effort_off_level(m), None, "{m}");
+            let mut req = sample_request();
+            req.model = m.into();
+            assert!(openai_compat::build_responses_request(&req).get("reasoning").is_none(), "{m}");
+        }
+        // A real effort is never replaced by `none`.
+        let mut req = sample_request();
+        req.model = "gpt-6-sol".into();
+        req.effort = Some(Effort::Low);
+        assert_eq!(openai_compat::build_responses_request(&req)["reasoning"], json!({ "effort": "low" }));
     }
 
     #[test]
@@ -835,6 +915,131 @@ mod effort {
 }
 
 // ─── OpenAI Responses API (GPT-6 tool calls, #689) ───────────────────────────
+
+fn parse_responses(body: serde_json::Value) -> super::LlmResponse {
+    openai_compat::parse_responses_response(body, "gpt-6-sol")
+}
+
+/// A GPT-6 tool turn: reasoning, a short message, then two calls.
+fn gpt6_reasoning_turn() -> serde_json::Value {
+    json!({
+        "status": "completed",
+        "output": [
+            { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc-1" },
+            { "type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+              "content": [{ "type": "output_text", "text": "Reading both.", "annotations": [] }] },
+            { "type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "read_file",
+              "arguments": "{\"path\":\"x\"}", "status": "completed" },
+            { "type": "reasoning", "id": "rs_2", "summary": [], "encrypted_content": "enc-2" },
+            { "type": "function_call", "id": "fc_2", "call_id": "call_2", "name": "read_file",
+              "arguments": "{\"path\":\"y\"}", "status": "completed" }
+        ]
+    })
+}
+
+/// A request whose history holds `resp` as an assistant tool turn (with
+/// `raw`) and its two results, sent to `model`.
+fn replay_request(resp: &super::LlmResponse, raw: Vec<serde_json::Value>, model: &str) -> LlmRequest {
+    let mut req = sample_request();
+    req.model = model.into();
+    req.messages.push(LlmMessage {
+        role: LlmRole::Assistant,
+        content: LlmContent::AssistantWithTools {
+            raw,
+            text: resp.text.clone(),
+            tool_uses: resp.tool_uses.clone(),
+        },
+    });
+    req.messages.push(LlmMessage {
+        role: LlmRole::User,
+        content: LlmContent::ToolResults(
+            resp.tool_uses
+                .iter()
+                .map(|u| LlmToolResult { tool_use_id: u.id.clone(), content: "ok".into(), is_error: false })
+                .collect(),
+        ),
+    });
+    req
+}
+
+#[test]
+fn openai_responses_request_includes_encrypted_reasoning() {
+    let mut req = sample_request();
+    req.model = "gpt-6-sol".into();
+    let body = openai_compat::build_responses_request(&req);
+    assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+    assert_eq!(body["store"], false);
+    // Chat Completions never gets it.
+    assert!(openai_compat::build_request(&req).get("include").is_none());
+}
+
+#[test]
+fn openai_responses_reasoning_round_trips_in_order() {
+    let resp = parse_responses(gpt6_reasoning_turn());
+    assert_eq!(resp.text, "Reading both.");
+    assert_eq!(resp.tool_uses.len(), 2);
+    // An origin item, then every reasoning / message / call item as returned.
+    assert_eq!(resp.raw_content.len(), 6);
+    assert!(openai_compat::is_responses_raw(&resp.raw_content));
+    assert_eq!(resp.raw_content[0]["model"], "gpt-6-sol");
+
+    let raw = resp.raw_content.clone();
+    let body = openai_compat::build_responses_request(&replay_request(&resp, raw, "gpt-6-sol"));
+    let input = body["input"].as_array().unwrap();
+    let output = gpt6_reasoning_turn()["output"].as_array().unwrap().clone();
+    // user, the five items verbatim (fc ids kept), then the two outputs.
+    assert_eq!(input.len(), 8);
+    assert_eq!(&input[1..6], &output[..]);
+    assert_eq!(input[3]["id"], "fc_1");
+    assert_eq!(input[6], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
+    assert_eq!(input[7]["call_id"], "call_2");
+    let text = body.to_string();
+    assert!(!text.contains("octopush."), "the origin item is never sent");
+}
+
+#[test]
+fn openai_responses_replay_dropped_for_another_model_or_empty_raw() {
+    let resp = parse_responses(gpt6_reasoning_turn());
+    // Escalated to another model, or the truncation retry's empty raw: the
+    // turn is rebuilt (text + calls, no fc ids) and no reasoning is sent.
+    for (raw, model) in [
+        (resp.raw_content.clone(), "gpt-6.1-terra"),
+        (resp.raw_content.clone(), "gpt-6-astra"),
+        (vec![], "gpt-6-sol"),
+    ] {
+        let body = openai_compat::build_responses_request(&replay_request(&resp, raw, model));
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 6, "{model}: user, text, 2 calls, 2 outputs");
+        assert_eq!(input[1], json!({ "role": "assistant", "content": "Reading both." }));
+        assert!(input[2].get("id").is_none() && input[3].get("id").is_none(), "{model}");
+        assert!(!body.to_string().contains("enc-1"), "{model}");
+        assert!(input.iter().all(|i| i["type"] != "reasoning"), "{model}");
+    }
+    // An Anthropic turn's raw (content blocks) is never sent to OpenAI either.
+    let blocks = vec![json!({ "type": "thinking", "thinking": "t", "signature": "s" })];
+    let body = openai_compat::build_responses_request(&replay_request(&resp, blocks, "gpt-6-sol"));
+    assert!(!body.to_string().contains("signature"));
+}
+
+#[test]
+fn openai_responses_keeps_no_raw_without_replayable_reasoning() {
+    // No reasoning at all: nothing to pass back.
+    let plain = parse_responses(json!({
+        "status": "completed",
+        "output": [{ "type": "function_call", "id": "fc_1", "call_id": "c", "name": "n", "arguments": "{}" }]
+    }));
+    assert!(plain.raw_content.is_empty());
+    // Reasoning without encrypted content can't be replayed statelessly.
+    let unencrypted = parse_responses(json!({
+        "status": "completed",
+        "output": [
+            { "type": "reasoning", "id": "rs_1", "summary": [], "encrypted_content": "enc" },
+            { "type": "reasoning", "id": "rs_2", "summary": [] },
+            { "type": "function_call", "id": "fc_1", "call_id": "c", "name": "n", "arguments": "{}" }
+        ]
+    }));
+    assert!(unencrypted.raw_content.is_empty());
+}
 
 #[test]
 fn openai_gpt6_models_use_the_responses_api() {
@@ -960,7 +1165,7 @@ fn openai_responses_multimodal_uses_input_parts() {
 
 #[test]
 fn openai_parse_responses_tool_calls() {
-    let resp = openai_compat::parse_responses_response(json!({
+    let resp = parse_responses(json!({
         "status": "completed",
         "output": [
             { "type": "reasoning", "id": "rs_1", "summary": [] },
@@ -984,21 +1189,21 @@ fn openai_parse_responses_tool_calls() {
 
 #[test]
 fn openai_parse_responses_stop_reasons() {
-    let text_only = openai_compat::parse_responses_response(json!({
+    let text_only = parse_responses(json!({
         "status": "completed",
         "output": [{ "type": "message", "content": [{ "type": "output_text", "text": "Done." }] }]
     }));
     assert_eq!(text_only.text, "Done.");
     assert_eq!(text_only.stop_reason, LlmStopReason::EndTurn);
     // Cut at the token cap, even mid tool call.
-    let cut = openai_compat::parse_responses_response(json!({
+    let cut = parse_responses(json!({
         "status": "incomplete",
         "incomplete_details": { "reason": "max_output_tokens" },
         "output": [{ "type": "function_call", "call_id": "c", "name": "n", "arguments": "{" }]
     }));
     assert_eq!(cut.stop_reason, LlmStopReason::MaxTokens);
     assert_eq!(cut.tool_uses[0].input, json!({}), "truncated arguments parse to {{}}");
-    let filtered = openai_compat::parse_responses_response(json!({
+    let filtered = parse_responses(json!({
         "status": "incomplete",
         "incomplete_details": { "reason": "content_filter" },
         "output": []
@@ -1008,7 +1213,7 @@ fn openai_parse_responses_stop_reasons() {
 
 #[test]
 fn openai_parse_responses_refusal_is_visible() {
-    let resp = openai_compat::parse_responses_response(json!({
+    let resp = parse_responses(json!({
         "status": "completed",
         "output": [{ "type": "message", "role": "assistant", "content": [
             { "type": "refusal", "refusal": "I can't help with that." }
@@ -1016,7 +1221,7 @@ fn openai_parse_responses_refusal_is_visible() {
     }));
     assert_eq!(resp.text, "I can't help with that.");
     assert_eq!(resp.stop_reason, LlmStopReason::Other("refusal".into()), "never an empty EndTurn");
-    let mixed = openai_compat::parse_responses_response(json!({
+    let mixed = parse_responses(json!({
         "status": "completed",
         "output": [{ "type": "message", "content": [
             { "type": "output_text", "text": "Partly." },
@@ -1029,7 +1234,7 @@ fn openai_parse_responses_refusal_is_visible() {
 
 #[test]
 fn openai_parse_responses_splits_cached_input() {
-    let resp = openai_compat::parse_responses_response(json!({
+    let resp = parse_responses(json!({
         "status": "completed",
         "output": [],
         "usage": {

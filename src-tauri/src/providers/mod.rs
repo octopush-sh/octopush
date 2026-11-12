@@ -105,9 +105,11 @@ pub enum LlmContent {
         /// they were interleaved). When thinking is on, the API requires each
         /// block replayed unchanged and in order (a signed thinking block can't
         /// be dropped, and reordering interleaved thinking/tool_use 400s the next
-        /// request). Empty for providers that don't emit raw blocks (OpenAI) and
-        /// for turns built without a captured response (TALK, the truncation
-        /// path) — the serializer then rebuilds from `text` + `tool_uses`.
+        /// request). On an OpenAI Responses turn with reasoning, its output items
+        /// behind an origin item instead (`openai_compat::parse_responses_response`).
+        /// Empty for Chat Completions and for turns built without a captured
+        /// response (TALK, the truncation path) — the serializer then rebuilds
+        /// from `text` + `tool_uses`.
         raw: Vec<serde_json::Value>,
         text: String,
         tool_uses: Vec<LlmToolUse>,
@@ -171,7 +173,9 @@ pub struct LlmResponse {
     /// (thinking/redacted_thinking with `signature`/`data`, text, tool_use).
     /// Replayed unchanged as the next assistant turn so signed thinking survives
     /// and interleaved thinking/tool_use ordering is preserved (reordering 400s).
-    /// Empty for OpenAI-compat (no such blocks).
+    /// For an OpenAI Responses turn with reasoning: an origin item naming the
+    /// model, then its reasoning / message / `function_call` output items in
+    /// order (replayed only to that same model). Empty for Chat Completions.
     pub raw_content: Vec<serde_json::Value>,
 }
 
