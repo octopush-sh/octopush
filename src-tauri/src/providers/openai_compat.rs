@@ -22,8 +22,9 @@ use serde_json::{json, Value};
 
 pub struct OpenAICompatibleProvider {
     /// The configured provider's name (`openai`, a custom provider…). With
-    /// the endpoint it tells which key, and so which OpenAI org, produced a
-    /// Responses turn's encrypted reasoning (see `responses_replay`).
+    /// the endpoint it tells which configured provider produced a Responses
+    /// turn's encrypted reasoning (see `responses_replay`). It names the
+    /// provider, not its key: a key changed on the same provider looks alike.
     pub provider: String,
 }
 
@@ -318,10 +319,10 @@ pub fn is_responses_raw(raw: &[Value]) -> bool {
 /// The output items to replay verbatim for an assistant tool turn, when its
 /// `raw` was captured from a Responses turn of this same model, provider and
 /// endpoint. Encrypted reasoning only decrypts for the org that produced it,
-/// so reasoning from another model (an escalation swap), another provider or
-/// key (a resumed transcript under another org), another endpoint, or an
-/// origin missing any of them is never sent: those turns fall back to the
-/// rebuilt items.
+/// so reasoning from another model (an escalation swap), another configured
+/// provider, another endpoint, or an origin missing any of them is never
+/// sent: those turns fall back to the rebuilt items. The key isn't compared,
+/// so a key changed on the same provider and endpoint still replays.
 fn responses_replay<'a>(raw: &'a [Value], here: &ResponsesOrigin) -> Option<&'a [Value]> {
     let (origin, items) = raw.split_first()?;
     let field = |k: &str| origin.get(k).and_then(|v| v.as_str());
