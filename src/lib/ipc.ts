@@ -1460,6 +1460,9 @@ export const ipc = {
    *  demand (B2). Null when the server has no detail for that run. Pro-gated. */
   historyRunDetail: (runId: string) =>
     invoke<SyncedRunDetail | null>("history_run_detail", { runId }),
+  /** The models among `models` this Mac has no price for (deduplicated). The
+   *  History sheet marks their synced stages "unpriced" instead of "$0.00". */
+  unpricedModels: (models: string[]) => invoke<string[]>("unpriced_models", { models }),
 
   // ─── Library sync (Pro): custom pipelines + roles follow the user ──
   /** Push the whole custom library (launch heal; idempotent LWW upserts). */
