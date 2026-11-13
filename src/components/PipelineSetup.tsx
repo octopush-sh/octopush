@@ -13,6 +13,7 @@ import { beaconAnchor } from "../lib/beacon";
 import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
+import { SupersededModelLine } from "./direct/SupersededModelLine";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
@@ -415,6 +416,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
 
             {selected && (
               <div className="mt-5">
+                <SupersededModelLine
+                  key={`superseded-${selected.pipeline.id}`}
+                  pipeline={selected}
+                  onSwitched={(id, fromId) => {
+                    // A builtin forks into a new crew with the same stages;
+                    // a launcher pick of the old model would undo the switch.
+                    setSelectedId(id);
+                    setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([, m]) => m !== fromId)));
+                  }}
+                />
                 {selected.pipeline.description && (
                   <p className="mb-3 font-serif text-[13px] text-octo-sage">{selected.pipeline.description}</p>
                 )}
