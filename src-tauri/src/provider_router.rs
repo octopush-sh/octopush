@@ -67,6 +67,11 @@ pub struct ModelInfo {
     /// model picker UI rests on these to help users choose between options.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// The builtin model that replaces this one, e.g. Fable 5.1 → Fable 5.2.
+    /// The Direct launcher offers the switch; nothing moves on its own.
+    /// Builtin metadata, re-applied on every load ([`backfill_superseded_by`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -191,6 +196,9 @@ impl ProviderRouter {
             // Migration: builtins that shipped text-only and turned out to
             // take image input (GPT-6.1 Terra, #664).
             backfill_builtin_vision(&mut list);
+
+            // Builtin metadata: which model replaces which (Fable 5.1 → 5.2).
+            backfill_superseded_by(&mut list, &defaults);
 
             // Migration: backfill missing BUILTIN models into an existing
             // provider. The whole-provider append below only fires when the
@@ -545,6 +553,25 @@ pub(crate) fn backfill_builtin_vision(list: &mut [ProviderConfig]) -> usize {
     n
 }
 
+/// Copy `superseded_by` from the builtins onto the saved models of the same
+/// provider and id. It is builtin metadata the user can't edit, so the
+/// builtin value always wins (a file written before the field existed has
+/// none). Returns how many models changed.
+pub(crate) fn backfill_superseded_by(list: &mut [ProviderConfig], defaults: &HashMap<String, ProviderConfig>) -> usize {
+    let mut n = 0;
+    for p in list.iter_mut() {
+        let Some(def) = defaults.get(&p.name) else { continue };
+        for m in &mut p.models {
+            let builtin = def.models.iter().find(|x| x.id == m.id).and_then(|x| x.superseded_by.clone());
+            if m.superseded_by != builtin {
+                m.superseded_by = builtin;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
     let mut map = HashMap::new();
 
@@ -562,6 +589,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // here (limited availability).
                 ModelInfo {
                     id: "claude-fable-5-2".into(),
+                    superseded_by: None,
                     display_name: "Claude Fable 5.2".into(),
                     input_cost_per_m: 8.0,
                     output_cost_per_m: 40.0,
@@ -574,6 +602,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 5.5".into(),
                     input_cost_per_m: 4.0,
                     output_cost_per_m: 20.0,
@@ -586,6 +615,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 5.5".into(),
                     input_cost_per_m: 2.0,
                     output_cost_per_m: 10.0,
@@ -601,6 +631,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                     // per-request paths apply the >100K tier
                     // (`token_engine::request_prices`).
                     id: "claude-haiku-5-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Haiku 5.5".into(),
                     input_cost_per_m: 0.10,
                     output_cost_per_m: 0.50,
@@ -613,6 +644,8 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-fable-5-1".into(),
+                    // Same prices × 0.8 on every column (token_engine).
+                    superseded_by: Some("claude-fable-5-2".into()),
                     display_name: "Claude Fable 5.1".into(),
                     input_cost_per_m: 10.0,
                     output_cost_per_m: 50.0,
@@ -625,6 +658,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-fable-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Fable 5".into(),
                     input_cost_per_m: 10.0,
                     output_cost_per_m: 50.0,
@@ -637,6 +671,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-opus-4-8".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 4.8".into(),
                     input_cost_per_m: 5.0,
                     output_cost_per_m: 25.0,
@@ -649,6 +684,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 5".into(),
                     input_cost_per_m: 2.0,
                     output_cost_per_m: 10.0,
@@ -661,6 +697,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-haiku-4-5".into(),
+                    superseded_by: None,
                     display_name: "Claude Haiku 4.5".into(),
                     input_cost_per_m: 1.0,
                     output_cost_per_m: 5.0,
@@ -674,6 +711,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // ── Legacy ids retained so historical runs still price correctly ──
                 ModelInfo {
                     id: "claude-opus-4-6".into(),
+                    superseded_by: None,
                     display_name: "Claude Opus 4.6".into(),
                     input_cost_per_m: 5.0,
                     output_cost_per_m: 25.0,
@@ -686,6 +724,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "claude-sonnet-4-6".into(),
+                    superseded_by: None,
                     display_name: "Claude Sonnet 4.6".into(),
                     input_cost_per_m: 3.0,
                     output_cost_per_m: 15.0,
@@ -719,6 +758,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // writes $1.25. Prices must match `token_engine::builtin_prices`.
                 ModelInfo {
                     id: "gpt-6.1-terra".into(),
+                    superseded_by: None,
                     display_name: "GPT-6.1 Terra".into(),
                     input_cost_per_m: 1.0,
                     output_cost_per_m: 5.0,
@@ -731,6 +771,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "gpt-4o".into(),
+                    superseded_by: None,
                     display_name: "GPT-4o".into(),
                     input_cost_per_m: 2.50,
                     output_cost_per_m: 10.0,
@@ -745,6 +786,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "gpt-4o-mini".into(),
+                    superseded_by: None,
                     display_name: "GPT-4o mini".into(),
                     input_cost_per_m: 0.15,
                     output_cost_per_m: 0.60,
@@ -772,6 +814,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 ModelInfo {
                     id: "deepseek-chat".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek Chat".into(),
                     input_cost_per_m: 0.14,
                     output_cost_per_m: 0.28,
@@ -784,6 +827,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-reasoner".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek Reasoner".into(),
                     input_cost_per_m: 0.55,
                     output_cost_per_m: 2.19,
@@ -811,6 +855,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             models: vec![
                 ModelInfo {
                     id: "llama3.3".into(),
+                    superseded_by: None,
                     display_name: "Llama 3.3".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -823,6 +868,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "qwen2.5-coder".into(),
+                    superseded_by: None,
                     display_name: "Qwen 2.5 Coder".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -835,6 +881,7 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 },
                 ModelInfo {
                     id: "deepseek-r1".into(),
+                    superseded_by: None,
                     display_name: "DeepSeek R1".into(),
                     input_cost_per_m: 0.0,
                     output_cost_per_m: 0.0,
@@ -882,6 +929,62 @@ mod tests {
         // Fable 5.2 leads the list (the newest Fable), Mythos stays out of it.
         assert_eq!(anthropic.models[0].id, "claude-fable-5-2");
         assert!(!anthropic.models.iter().any(|m| m.id.contains("mythos")));
+    }
+
+    #[test]
+    fn only_fable_5_1_is_superseded_and_by_a_cheaper_builtin() {
+        let providers = builtin_providers();
+        let superseded: Vec<(&str, &str)> = providers
+            .values()
+            .flat_map(|p| p.models.iter())
+            .filter_map(|m| m.superseded_by.as_deref().map(|to| (m.id.as_str(), to)))
+            .collect();
+        assert_eq!(superseded, vec![("claude-fable-5-1", "claude-fable-5-2")]);
+        let find = |id: &str| providers["anthropic"].models.iter().find(|m| m.id == id).unwrap().clone();
+        let (old, new) = (find("claude-fable-5-1"), find("claude-fable-5-2"));
+        // "about 20% cheaper per token" must stay true on every column.
+        for (a, b) in [
+            (old.input_cost_per_m, new.input_cost_per_m),
+            (old.output_cost_per_m, new.output_cost_per_m),
+            (old.cache_read_cost_per_m, new.cache_read_cost_per_m),
+            (old.cache_creation_cost_per_m, new.cache_creation_cost_per_m),
+        ] {
+            assert!((b - a * 0.8).abs() < 1e-9, "{b} is not 0.8 × {a}");
+        }
+    }
+
+    #[test]
+    fn superseded_by_is_backfilled_from_the_builtins_and_omitted_when_none() {
+        let defaults = builtin_providers();
+        let mut saved = defaults["anthropic"].clone();
+        for m in &mut saved.models {
+            m.superseded_by = None;
+        }
+        // A model the builtins don't mark loses a stray value.
+        saved.models.iter_mut().find(|m| m.id == "claude-opus-5-5").unwrap().superseded_by = Some("x".into());
+        let mut list = vec![saved];
+        assert_eq!(backfill_superseded_by(&mut list, &defaults), 2);
+        let get = |id: &str| list[0].models.iter().find(|m| m.id == id).unwrap().superseded_by.clone();
+        assert_eq!(get("claude-fable-5-1").as_deref(), Some("claude-fable-5-2"));
+        assert_eq!(get("claude-opus-5-5"), None);
+        assert_eq!(backfill_superseded_by(&mut list, &defaults), 0);
+
+        // An older providers.json without the field still loads, and only a
+        // superseded model writes it.
+        let json = serde_json::to_value(&list[0].models).unwrap();
+        let with_field: Vec<&str> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m.get("supersededBy").is_some())
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(with_field, vec!["claude-fable-5-1"]);
+        let old: ModelInfo = serde_json::from_str(
+            r#"{"id":"m","displayName":"M","inputCostPerM":1,"outputCostPerM":2,"maxContext":10}"#,
+        )
+        .unwrap();
+        assert_eq!(old.superseded_by, None);
     }
 
     #[test]

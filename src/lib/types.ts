@@ -783,6 +783,9 @@ export interface ModelInfo {
   supportsTools: boolean;
   /** Curated short labels rendered next to the model name in the picker. */
   tags?: string[];
+  /** The builtin model that replaces this one (Fable 5.1 → Fable 5.2);
+   *  absent for every other model. The launcher offers the switch. */
+  supersededBy?: string | null;
 }
 
 export interface ModelWithProvider {
