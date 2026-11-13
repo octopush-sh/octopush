@@ -443,6 +443,7 @@ pub fn run() {
             commands::history_sync_pull,
             commands::history_sync_push_all,
             commands::history_run_detail,
+            commands::unpriced_models,
             commands::library_sync_push_all,
             commands::library_sync_pull,
             // Accounts (P1)

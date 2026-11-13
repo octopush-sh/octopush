@@ -1,16 +1,62 @@
+import { useEffect, useState } from "react";
 import { RefreshCw, X, Laptop, ChevronLeft } from "lucide-react";
 import { useHistoryStore } from "../stores/historyStore";
 import { useSyncPrefsStore } from "../stores/syncPrefsStore";
 import { runStatusMeta, stageStatusWord } from "../lib/runStatus";
 import { formatRelTime } from "../lib/relTime";
 import { labelForRole } from "../lib/stageMeta";
-import { formatUsd } from "../lib/cost";
+import { formatUsd, unpricedTitle } from "../lib/cost";
 import { iconForRole, iconForTool } from "../lib/roleIcons";
 import { ModalShell } from "./ModalShell";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { StageDots } from "./direct/StageDots";
 import { DiffViewer } from "./DiffViewer";
-import type { SyncedRun, SyncedRunStageDetail } from "../lib/ipc";
+import { ipc, type SyncedRun, type SyncedRunStageDetail } from "../lib/ipc";
+
+const NO_MODELS: ReadonlySet<string> = new Set();
+
+/** The models among `models` this Mac can't price, asked once per distinct
+ *  model set. Synced stages carry no price flag (they were priced on another
+ *  Mac), so an unknown or gateway model must read "unpriced", never "$0.00". */
+function useUnpricedModels(models: (string | null)[]): ReadonlySet<string> {
+  const key = [...new Set(models.filter((m): m is string => !!m))].sort().join("\n");
+  const [found, setFound] = useState<{ key: string; models: ReadonlySet<string> }>({ key: "", models: NO_MODELS });
+  useEffect(() => {
+    if (!key) return;
+    let live = true;
+    ipc
+      .unpricedModels(key.split("\n"))
+      .then((list) => {
+        if (live) setFound({ key, models: new Set(list) });
+      })
+      .catch(() => {
+        // Can't tell — leave the figures as they are.
+      });
+    return () => {
+      live = false;
+    };
+  }, [key]);
+  return key ? found.models : NO_MODELS;
+}
+
+/** The unpriced models a run's stages used, in stage order, deduplicated. */
+function unpricedIn(stages: { model: string | null }[], unpriced: ReadonlySet<string>): string[] {
+  return [...new Set(stages.map((s) => s.model).filter((m): m is string => !!m && unpriced.has(m)))];
+}
+
+/** A run's total; " + unpriced" in mute when some of its stages can't be priced. */
+function RunTotal({ costUsd, unpricedModels }: { costUsd: number; unpricedModels: string[] }) {
+  return (
+    <>
+      {formatUsd(costUsd)}
+      {unpricedModels.length > 0 && (
+        <span className="text-octo-mute" title={unpricedTitle(unpricedModels)}>
+          {" "}+ unpriced
+        </span>
+      )}
+    </>
+  );
+}
 
 /** Global cross-machine run History (Pro-real Part B). The list (B1) shows the
  *  signed-in Pro user's terminal Direct runs from every machine; drilling into
@@ -30,6 +76,15 @@ export function HistorySheet() {
   const closeRun = useHistoryStore((s) => s.closeRun);
   const refresh = useHistoryStore((s) => s.refresh);
   const syncOn = useSyncPrefsStore((s) => s.historySync);
+  const viewedDetail = useHistoryStore((s) => (s.viewedRunId ? s.detailByRun[s.viewedRunId] : undefined));
+  const unpriced = useUnpricedModels(
+    open
+      ? [
+          ...runs.flatMap((r) => r.stages.map((s) => s.model)),
+          ...(viewedDetail?.stages.map((s) => s.model) ?? []),
+        ]
+      : [],
+  );
 
   if (!open) return null;
 
@@ -93,9 +148,9 @@ export function HistorySheet() {
 
         <FadeSwap swapKey={viewedRun ? viewedRun.run_id : "list"} className="min-h-0 flex-1 overflow-y-auto">
           {viewedRun ? (
-            <RunDetailView run={viewedRun} />
+            <RunDetailView run={viewedRun} unpriced={unpriced} />
           ) : (
-            <RunList runs={runs} loading={loading} error={error} syncOn={syncOn} />
+            <RunList runs={runs} loading={loading} error={error} syncOn={syncOn} unpriced={unpriced} />
           )}
         </FadeSwap>
       </div>
@@ -108,11 +163,13 @@ function RunList({
   loading,
   error,
   syncOn,
+  unpriced,
 }: {
   runs: SyncedRun[];
   loading: boolean;
   error: string | null;
   syncOn: boolean;
+  unpriced: ReadonlySet<string>;
 }) {
   const openRun = useHistoryStore((s) => s.openRun);
   if (!syncOn) {
@@ -162,7 +219,7 @@ function RunList({
                 <span className={`shrink-0 ${meta.className}`}>{meta.glyph}</span>
                 <span className="min-w-0 flex-1 truncate text-[13px] text-octo-ivory">{run.task}</span>
                 <span className="shrink-0 font-mono text-[12px] text-octo-brass octo-tabular">
-                  {formatUsd(run.cost_usd)}
+                  <RunTotal costUsd={run.cost_usd} unpricedModels={unpricedIn(run.stages, unpriced)} />
                 </span>
               </div>
               <div className="mt-1 flex items-center gap-1.5 font-mono text-[10px] text-octo-mute">
@@ -196,7 +253,7 @@ function RunList({
 }
 
 /** One synced run's full story, fetched lazily (B2). Read-only; inert text. */
-function RunDetailView({ run }: { run: SyncedRun }) {
+function RunDetailView({ run, unpriced }: { run: SyncedRun; unpriced: ReadonlySet<string> }) {
   const detail = useHistoryStore((s) => s.detailByRun[run.run_id]);
   const detailLoading = useHistoryStore((s) => s.detailLoading === run.run_id);
   const detailError = useHistoryStore((s) => s.detailError);
@@ -222,7 +279,12 @@ function RunDetailView({ run }: { run: SyncedRun }) {
           </>
         )}
         <span aria-hidden>·</span>
-        <span className="octo-tabular shrink-0 text-octo-brass">{formatUsd(run.cost_usd)}</span>
+        <span className="octo-tabular shrink-0 text-octo-brass">
+          <RunTotal
+            costUsd={run.cost_usd}
+            unpricedModels={unpricedIn([...run.stages, ...(detail?.stages ?? [])], unpriced)}
+          />
+        </span>
         {detail && detail.stages.length > 0 && (
           <StageDots
             className="ml-auto shrink-0"
@@ -263,7 +325,11 @@ function RunDetailView({ run }: { run: SyncedRun }) {
       {!detailLoading && !detailError && detail && detail.stages.length > 0 && (
         <div className="mt-3 flex flex-col gap-5">
           {detail.stages.map((stage) => (
-            <StageSection key={`${detail.run_id}-${stage.position}`} stage={stage} />
+            <StageSection
+              key={`${detail.run_id}-${stage.position}`}
+              stage={stage}
+              unpriced={!!stage.model && unpriced.has(stage.model)}
+            />
           ))}
         </div>
       )}
@@ -271,7 +337,7 @@ function RunDetailView({ run }: { run: SyncedRun }) {
   );
 }
 
-function StageSection({ stage }: { stage: SyncedRunStageDetail }) {
+function StageSection({ stage, unpriced }: { stage: SyncedRunStageDetail; unpriced: boolean }) {
   const RoleIcon = iconForRole(stage.role);
   const word = stageStatusWord(stage.status);
   return (
@@ -286,9 +352,15 @@ function StageSection({ stage }: { stage: SyncedRunStageDetail }) {
           {stage.position + 1}
           {stage.model ? ` · ${stage.model}` : ""} · {word}
         </span>
-        <span className="octo-tabular shrink-0 font-mono text-[11px] text-octo-brass">
-          {formatUsd(stage.cost_usd)}
-        </span>
+        {unpriced && stage.cost_usd === 0 ? (
+          <span className="shrink-0 font-mono text-[11px] text-octo-mute" title={unpricedTitle(stage.model ? [stage.model] : [])}>
+            unpriced
+          </span>
+        ) : (
+          <span className="octo-tabular shrink-0 font-mono text-[11px] text-octo-brass">
+            {formatUsd(stage.cost_usd)}
+          </span>
+        )}
       </div>
 
       {stage.error && (

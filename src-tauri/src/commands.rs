@@ -2342,6 +2342,27 @@ pub async fn history_run_detail(
     crate::sync::pull_run_detail(crate::chat_engine::shared_http_client(), &run_id).await
 }
 
+/// The models among `models` this Mac can't price (`prices_in` is `None`),
+/// deduplicated, in first-seen order. The History sheet asks this for synced
+/// stages so an unknown or gateway model reads "unpriced", never "$0.00".
+#[tauri::command]
+pub async fn unpriced_models(models: Vec<String>) -> AppResult<Vec<String>> {
+    Ok(unpriced_models_in(crate::token_engine::catalog().as_deref(), &models))
+}
+
+pub(crate) fn unpriced_models_in(
+    router: Option<&crate::provider_router::ProviderRouter>,
+    models: &[String],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .iter()
+        .filter(|m| seen.insert(m.as_str()))
+        .filter(|m| crate::token_engine::prices_in(router, m).is_none())
+        .cloned()
+        .collect()
+}
+
 /// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
 /// heal for edits made offline or whose fire-and-forget push failed. The server
 /// does per-item LWW, so re-pushing is idempotent and never regresses a newer
