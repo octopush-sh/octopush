@@ -60,6 +60,19 @@ export function needsYou(run: Pick<Run, "status">): boolean {
   return run.status === "paused";
 }
 
+/** The fleet split the chip shows: runs that need you, and runs in flight
+ *  (running, nobody waiting). The Dock badge counts the same `needsYou` in
+ *  Rust (`fleet_status::derive`); `needsYou.fixtures.json` pins the two. */
+export function fleetCounts(runs: Pick<Run, "status">[]): { needsYou: number; inFlight: number } {
+  let needs = 0;
+  let inFlight = 0;
+  for (const r of runs) {
+    if (needsYou(r)) needs += 1;
+    else if (r.status === "running") inFlight += 1;
+  }
+  return { needsYou: needs, inFlight };
+}
+
 /** Whether a halted stage's error is a *transient* substrate fault (rate
  *  limit, overload, 5xx, dropped connection) — recoverable by simply waiting
  *  and resuming — versus a standing fault the work itself caused.

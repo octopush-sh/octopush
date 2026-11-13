@@ -1,7 +1,7 @@
 import { useShallow } from "zustand/react/shallow";
 import { Activity, Check } from "lucide-react";
 import { useRunsStore } from "../stores/runsStore";
-import { needsYou } from "../lib/runStatus";
+import { fleetCounts } from "../lib/runStatus";
 
 /** The fleet chip — the top-bar entry to Mission Control. Attention split,
  *  per Law 2's fleet scope (the chip is the ONE thing outside Mission Control
@@ -19,14 +19,8 @@ export function RunsTray({ onOpen }: { onOpen: () => void }) {
   // settled count.
   const [needsYouCount, inFlightCount, settledCount] = useRunsStore(
     useShallow((s): [number, number, number] => {
-      const all = Object.values(s.runsByWs).flat();
-      let needs = 0;
-      let flight = 0;
-      for (const r of all) {
-        if (needsYou(r)) needs += 1;
-        else if (r.status === "running") flight += 1;
-      }
-      return [needs, flight, Object.keys(s.settledAt).length];
+      const { needsYou, inFlight } = fleetCounts(Object.values(s.runsByWs).flat());
+      return [needsYou, inFlight, Object.keys(s.settledAt).length];
     }),
   );
 
@@ -40,6 +34,7 @@ export function RunsTray({ onOpen }: { onOpen: () => void }) {
         onClick={onOpen}
         aria-label={label}
         title={label}
+        data-tour="fleet-chip"
         className="octo-pop-in octo-stage-pulse flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-brass transition hover:bg-[var(--brass-ghost)]"
       >
         <Activity size={12} className="shrink-0" />
@@ -56,6 +51,7 @@ export function RunsTray({ onOpen }: { onOpen: () => void }) {
         onClick={onOpen}
         aria-label={label}
         title={label}
+        data-tour="fleet-chip"
         className="octo-pop-in flex items-center gap-1.5 rounded border border-octo-hairline px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-sage transition hover:bg-octo-panel-2"
       >
         <Activity size={12} className="shrink-0" />
@@ -71,6 +67,7 @@ export function RunsTray({ onOpen }: { onOpen: () => void }) {
       onClick={onOpen}
       aria-label={label}
       title={label}
+      data-tour="fleet-chip"
       className="octo-pop-in flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-verdigris transition hover:bg-[var(--brass-ghost)]"
     >
       <Check size={12} className="shrink-0" />

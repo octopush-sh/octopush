@@ -1,5 +1,22 @@
 import { describe, it, expect } from "vitest";
-import { isTransientHalt, needsYou } from "./runStatus";
+import { fleetCounts, isTransientHalt, needsYou } from "./runStatus";
+import type { RunStatus } from "./ipc";
+import fixtures from "./needsYou.fixtures.json";
+
+describe("needsYou parity with the Dock badge (Rust fleet_status)", () => {
+  it("answers each status as the shared fixture says", () => {
+    for (const c of fixtures.statuses) {
+      expect(needsYou({ status: c.status as RunStatus }), c.status).toBe(c.needsYou);
+    }
+  });
+
+  it("splits each fleet as the shared fixture says", () => {
+    for (const f of fixtures.fleets) {
+      const counts = fleetCounts(f.statuses.map((status) => ({ status: status as RunStatus })));
+      expect(counts, f.statuses.join(",")).toEqual({ needsYou: f.needsYou, inFlight: f.inFlight });
+    }
+  });
+});
 
 describe("needsYou", () => {
   it("a paused run needs the director — the engine's one 'human must act' run status", () => {
