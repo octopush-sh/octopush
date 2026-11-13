@@ -49,6 +49,9 @@ pub fn affects_badge(event: &str) -> bool {
 }
 
 static PENDING: AtomicBool = AtomicBool::new(false);
+/// Whether a badge failure was logged already: on a platform without a Dock
+/// badge every refresh fails the same way, so it is logged once.
+static BADGE_ERROR_LOGGED: AtomicBool = AtomicBool::new(false);
 /// The count on the Dock now (0 = no badge).
 static SHOWN: AtomicI64 = AtomicI64::new(0);
 
@@ -86,8 +89,17 @@ pub fn refresh(app: &AppHandle) {
     };
     match win.set_badge_count(badge) {
         Ok(()) => SHOWN.store(count, Ordering::Release),
-        Err(e) => tracing::warn!(error = %e, "fleet status: setting the Dock badge failed"),
+        Err(e) => {
+            if first_badge_error(&BADGE_ERROR_LOGGED) {
+                tracing::warn!(error = %e, "fleet status: setting the Dock badge failed (logged once)");
+            }
+        }
     }
+}
+
+/// True only the first time it's called for `flag`.
+fn first_badge_error(flag: &AtomicBool) -> bool {
+    !flag.swap(true, Ordering::AcqRel)
 }
 
 #[cfg(test)]
@@ -126,5 +138,13 @@ mod tests {
             assert!(affects_badge(e), "{e}");
         }
         assert!(!affects_badge("run://log"));
+    }
+
+    #[test]
+    fn a_badge_failure_is_logged_once() {
+        let flag = AtomicBool::new(false);
+        assert!(first_badge_error(&flag));
+        assert!(!first_badge_error(&flag));
+        assert!(!first_badge_error(&flag));
     }
 }

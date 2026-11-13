@@ -550,6 +550,11 @@ pub fn run() {
                     )
                 {
                     api.prevent_close();
+                    // Hiding a fullscreen window leaves macOS on an empty black
+                    // Space: leave fullscreen first.
+                    if window.is_fullscreen().unwrap_or(false) {
+                        let _ = window.set_fullscreen(false);
+                    }
                     let _ = window.hide();
                 }
                 return;
