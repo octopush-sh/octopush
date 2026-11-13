@@ -275,6 +275,14 @@ pub fn main_visible(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether closing the main window hides it instead of destroying it. On
+/// macOS always: the app keeps running (Routines, runs, the Dock badge) and the
+/// Dock brings main back; ⌘Q / Quit never send a close request, so they still
+/// quit. Elsewhere only while Quick Views are open, so they can still reach it.
+pub fn hide_main_on_close(macos: bool, quick_views_open: bool) -> bool {
+    macos || quick_views_open
+}
+
 // ─── Commands ─────────────────────────────────────────────────────
 
 /// The file the calling Quick View window was opened for.
@@ -409,6 +417,15 @@ mod tests {
             workspace_name: ws.into(),
             root: PathBuf::from(p),
         }
+    }
+
+    #[test]
+    fn closing_main_on_macos_hides_it_so_the_app_keeps_running() {
+        assert!(hide_main_on_close(true, false));
+        assert!(hide_main_on_close(true, true));
+        // Elsewhere closing main still ends the app, unless Quick Views need it.
+        assert!(!hide_main_on_close(false, false));
+        assert!(hide_main_on_close(false, true));
     }
 
     #[test]

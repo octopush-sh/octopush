@@ -125,6 +125,7 @@ Current anchors:
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
+| `fleet-chip` | Top bar: the fleet chip (`2 needs you` · `1 in flight` · `✓ 3 done`; only while the board has something) | `RunsTray.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` · `mission-control-card-spent` | Mission Control crew card: its task title · the workspace name in its meta row · the spent figure in its ledger foot | `MissionControl.tsx` |
 | `mission-control-ask-toggle` · `mission-control-ask-accept` | Mission Control `?` card (an `ask_director` block): the questions disclosure · "Accept recommended" | `MissionControl.tsx` |

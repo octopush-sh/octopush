@@ -1,0 +1,17 @@
+{
+  "$comment": "Pins TS `needsYou`/`fleetCounts` (runStatus.ts) to Rust `fleet_status` (the Dock badge). Both test suites read this file.",
+  "statuses": [
+    { "status": "draft", "needsYou": false },
+    { "status": "running", "needsYou": false },
+    { "status": "paused", "needsYou": true },
+    { "status": "completed", "needsYou": false },
+    { "status": "aborted", "needsYou": false },
+    { "status": "failed", "needsYou": false }
+  ],
+  "fleets": [
+    { "statuses": [], "needsYou": 0, "inFlight": 0, "badge": null },
+    { "statuses": ["paused", "paused", "running"], "needsYou": 2, "inFlight": 1, "badge": 2 },
+    { "statuses": ["running", "running", "completed"], "needsYou": 0, "inFlight": 2, "badge": null },
+    { "statuses": ["paused", "failed", "aborted", "draft"], "needsYou": 1, "inFlight": 0, "badge": 1 }
+  ]
+}

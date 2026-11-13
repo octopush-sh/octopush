@@ -19,6 +19,7 @@ pub mod db;
 pub mod entitlement;
 pub mod error;
 mod file_open;
+mod fleet_status;
 pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
@@ -533,19 +534,29 @@ pub fn run() {
                 // the same guarded launch path as a user's Begin.
                 std::sync::Arc::clone(&orch).spawn_routine_scheduler();
                 app.manage(orch);
+                // Runs still parked from the last session badge the Dock now.
+                fleet_status::refresh_later(app.handle());
             }
 
             Ok(())
         })
         .on_window_event(|window, event| {
-            // Closing main while Quick Views are open hides it instead of
-            // destroying it, so Reopen / "Continue in the workspace" / a
-            // second launch can still bring it back.
+            // Closing main hides it instead of destroying it (always on macOS,
+            // elsewhere while Quick Views are open), so Reopen / "Continue in
+            // the workspace" / a second launch can still bring it back.
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() == "main"
-                    && !window.app_handle().state::<file_open::QuickViews>().is_empty()
+                    && file_open::hide_main_on_close(
+                        cfg!(target_os = "macos"),
+                        !window.app_handle().state::<file_open::QuickViews>().is_empty(),
+                    )
                 {
                     api.prevent_close();
+                    // Hiding a fullscreen window leaves macOS on an empty black
+                    // Space: leave fullscreen first.
+                    if window.is_fullscreen().unwrap_or(false) {
+                        let _ = window.set_fullscreen(false);
+                    }
                     let _ = window.hide();
                 }
                 return;

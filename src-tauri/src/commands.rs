@@ -1281,6 +1281,7 @@ fn install_claude_hooks_later(state: &AppState, ws: crate::db::WorkspaceRow) {
 
 #[tauri::command]
 pub async fn delete_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
     project_path: String,
@@ -1325,8 +1326,10 @@ pub async fn delete_workspace(
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
 
-    // Remove from DB
+    // Remove from DB. The row's runs cascade-delete without a run:// event, so
+    // a paused one would keep the Dock badge counting it: refresh it now.
     state.db.lock().delete_workspace(&workspace_id)?;
+    crate::fleet_status::refresh_later(&app);
     Ok(())
 }
 
@@ -3736,6 +3739,7 @@ pub async fn close_project(
 
 #[tauri::command]
 pub async fn delete_project(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
 ) -> AppResult<()> {
@@ -3755,6 +3759,7 @@ pub async fn delete_project(
     for workspace in workspaces {
         // Call the existing delete_workspace logic to properly clean up worktrees
         let _ = delete_workspace(
+            app.clone(),
             state.clone(),
             workspace.id,
             path.clone(),
@@ -3772,8 +3777,10 @@ pub async fn delete_project(
         })?;
     }
 
-    // Remove from database
+    // Remove from database. Workspaces not listed above (archived ones) and
+    // their runs cascade with the project, so refresh the Dock badge too.
     state.db.lock().delete_project(&project_id)?;
+    crate::fleet_status::refresh_later(&app);
     Ok(())
 }
 
