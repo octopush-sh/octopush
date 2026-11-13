@@ -56,6 +56,8 @@ pub mod readiness;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod claude_code_contract;
 
 use state::AppState;

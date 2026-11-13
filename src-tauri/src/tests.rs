@@ -2020,26 +2020,7 @@ mod pty_manager_reattach_tests {
     use tempfile::TempDir;
 
     fn find_daemon_bin() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let c = parent.join("octopush-pty-server");
-                if c.exists() { return c; }
-                if let Some(gp) = parent.parent() {
-                    let c = gp.join("octopush-pty-server");
-                    if c.exists() { return c; }
-                }
-            }
-        }
-        for rel in &[
-            "target/debug/octopush-pty-server",
-            "../target/debug/octopush-pty-server",
-        ] {
-            if let Ok(cwd) = std::env::current_dir() {
-                let c = cwd.join(rel);
-                if c.exists() { return c; }
-            }
-        }
-        panic!("octopush-pty-server binary not found — run `cargo build --bin octopush-pty-server` first");
+        crate::test_support::pty_server_bin()
     }
 
     fn start_daemon(home: &std::path::Path) -> std::process::Child {

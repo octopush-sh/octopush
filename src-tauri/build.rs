@@ -7,13 +7,10 @@ fn main() {
     //   `<manifest-dir>/<bin>-<target-triple>`
     // so the bundler can find it during `tauri build`.
     //
-    // Path computation for OUT_DIR:
-    //   OUT_DIR = .../target/<profile>/build/<pkg>-<hash>/out
-    //   ancestors():
-    //     nth(0) = .../target/<profile>/build/<pkg>-<hash>/out  (the dir itself)
-    //     nth(1) = .../target/<profile>/build/<pkg>-<hash>
-    //     nth(2) = .../target/<profile>/build
-    //     nth(3) = .../target/<profile>        ← this is what we want
+    // Path computation for OUT_DIR (see `profile_dir`):
+    //   Cargo < 1.100: OUT_DIR = .../target/<profile>/build/<pkg>-<hash>/out
+    //   Cargo ≥ 1.100: OUT_DIR = .../target/<profile>/build/<pkg>/<hash>/out
+    // Either way the profile dir is the parent of the nearest `build` ancestor.
 
     let target_triple = std::env::var("TARGET").unwrap_or_default();
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
@@ -41,7 +38,7 @@ fn stage_external_bin(bin: &str, target_triple: &str, manifest_dir: &Path, out_d
     // doesn't exist yet when this script runs in a clean tree), cargo re-runs
     // this script and we overwrite the empty placeholder with the real binary.
     // Without this, a 0-byte placeholder can survive into the bundle.
-    let src = out_dir.ancestors().nth(3).map(|p| p.join(bin));
+    let src = profile_dir(out_dir).map(|p| p.join(bin));
     if let Some(src) = &src {
         println!("cargo:rerun-if-changed={}", src.display());
     }
@@ -71,4 +68,17 @@ fn stage_external_bin(bin: &str, target_triple: &str, manifest_dir: &Path, out_d
         }
     }
     // If dst already exists but src is empty/missing, leave dst in place.
+}
+
+/// `target/<profile>` for this build: the parent of OUT_DIR's nearest `build`
+/// ancestor. Cargo 1.100 stabilized the new build-dir layout, which nests
+/// OUT_DIR one level deeper (`build/<pkg>/<hash>/out`), so a fixed
+/// `ancestors().nth(3)` pointed at `target/<profile>/build` and never found the
+/// built sidecars.
+fn profile_dir(out_dir: &Path) -> Option<PathBuf> {
+    out_dir
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "build"))
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
 }
