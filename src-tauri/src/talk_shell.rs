@@ -822,20 +822,7 @@ mod e2e {
     use tempfile::TempDir;
 
     fn find_daemon_bin() -> PathBuf {
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                for cand in [parent.join("octopush-pty-server"), {
-                    let mut p = parent.to_path_buf();
-                    p.pop();
-                    p.join("octopush-pty-server")
-                }] {
-                    if cand.exists() {
-                        return cand;
-                    }
-                }
-            }
-        }
-        panic!("octopush-pty-server not built; run `cargo build --bin octopush-pty-server`");
+        crate::test_support::pty_server_bin()
     }
 
     fn start_daemon(home: &std::path::Path) -> std::process::Child {
