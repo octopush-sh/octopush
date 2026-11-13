@@ -713,35 +713,7 @@ mod tests {
     }
 
     fn find_daemon_bin() -> PathBuf {
-        // Try sibling-of-exe.
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                let c = parent.join("octopush-pty-server");
-                if c.exists() {
-                    return c;
-                }
-                // In cargo test the exe is in deps/; try one level up.
-                if let Some(gp) = parent.parent() {
-                    let c = gp.join("octopush-pty-server");
-                    if c.exists() {
-                        return c;
-                    }
-                }
-            }
-        }
-        // Fallback: workspace target/debug.
-        if let Ok(cwd) = std::env::current_dir() {
-            for rel in &[
-                "target/debug/octopush-pty-server",
-                "../target/debug/octopush-pty-server",
-            ] {
-                let c = cwd.join(rel);
-                if c.exists() {
-                    return c;
-                }
-            }
-        }
-        panic!("octopush-pty-server binary not found; run `cargo build --bin octopush-pty-server` first");
+        crate::test_support::pty_server_bin()
     }
 
     /// Poll the socket until ready or timeout.
