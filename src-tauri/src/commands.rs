@@ -1950,12 +1950,13 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages) = {
+    let (run, stages, unreported) = {
         let db = state.db.lock();
-        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?)
+        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?, db.usage_unreported_stage_ids(&run_id)?)
     };
-    // Flag stages whose model has no price (resolved after the DB lock): the
-    // ledger shows them as unpriced and says the budget cannot see them.
+    // Flag stages whose model has no price (resolved after the DB lock), and
+    // stages whose CLI stopped before reporting usage: the ledger shows them
+    // as unpriced / usage not reported and says the budget cannot see them.
     let router = crate::token_engine::catalog();
     let mut priced: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut stages_json = serde_json::to_value(&stages)?;
@@ -1966,6 +1967,7 @@ pub async fn get_run(
                 .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
+                obj.insert("usageUnreported".into(), serde_json::Value::Bool(unreported.contains(&s.id)));
             }
         }
     }

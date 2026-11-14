@@ -87,6 +87,25 @@ export function unpricedTitle(models: string[]): string {
 }
 
 /**
+ * Tooltip for a stage whose CLI stopped before reporting its usage: the
+ * tokens it burned are unknown, so its cost is too.
+ */
+export const USAGE_UNREPORTED_TITLE =
+  "Codex stopped before reporting usage, so this stage's cost is unknown — it is not counted as spend or as savings.";
+
+/** The run-level tooltip for `n` stages with usage not reported. */
+export function usageUnreportedTitle(n: number): string {
+  if (n === 1) return USAGE_UNREPORTED_TITLE;
+  return `Codex stopped before reporting usage in ${n} stages, so their cost is unknown — it is not counted as spend or as savings.`;
+}
+
+/** The ledger strip's note that part of the spend is unknown. "" when none is. */
+export function usageUnreportedNote(n: number): string {
+  if (n <= 0) return "";
+  return `${n === 1 ? "1 stage" : `${n} stages`} usage not reported`;
+}
+
+/**
  * The cost cell of one model in a usage table. A model whose calls are all
  * unpriced reads "unpriced", never "$0.00"; a model with some unpriced
  * calls keeps its priced figure and says so in the tooltip.

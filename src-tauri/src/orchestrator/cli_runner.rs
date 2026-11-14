@@ -460,6 +460,18 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
+/// The marker line in the error of a Codex stage stopped (director stop,
+/// stall, 60-minute cap) before any `turn.completed` / `token_count` event:
+/// Codex reports usage only there, so the stage's spend is unknown, not $0.
+/// Also the journal line the drive writes for it.
+pub const USAGE_UNREPORTED: &str = "codex stopped before reporting usage, so this stage's cost is unknown";
+
+/// True when a stage error carries [`USAGE_UNREPORTED`]: the drive flags the
+/// stage `usage_unreported` so the ledger reads "usage not reported".
+pub fn is_usage_unreported(error: &str) -> bool {
+    error.contains(USAGE_UNREPORTED)
+}
+
 /// The `terminal_reason` of a run that ended because a PreToolUse hook
 /// deferred a tool call (`permissionDecision: "defer"`, Claude Code ≥ 2.1.319).
 /// The CLI reports it as a clean `success` with no text and exits 0 — the tool
@@ -2195,7 +2207,8 @@ impl CliRunner {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
-                return Ok(failed_stage_with_usage(
+                return Ok(stopped_stage(
+                    dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
                     &streamed_usage.lock(),
@@ -2223,7 +2236,8 @@ impl CliRunner {
         if let (Some(kind), false) = (timeout_kind.as_deref(), has_terminal) {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
-            return Ok(failed_stage_with_usage(
+            return Ok(stopped_stage(
+                dialect,
                 &format!("{bin} {kind}"),
                 &stage.agent_model,
                 &streamed_usage.lock(),
@@ -2394,6 +2408,22 @@ fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashM
     out.cache_creation_tokens = u.cache_creation_input_tokens;
     out.cost_usd = streamed_cost(model, map);
     out
+}
+
+/// The outcome of a stage stopped before it finished (director stop, stall,
+/// 60-minute cap): the streamed usage priced as an estimate. A Codex stage
+/// that streamed no usage event never reported its tokens — its error carries
+/// [`USAGE_UNREPORTED`] so its cost reads unknown instead of $0.00.
+pub(crate) fn stopped_stage(
+    dialect: CliDialect,
+    msg: &str,
+    model: &str,
+    map: &std::collections::HashMap<String, CliUsage>,
+) -> StageOutcome {
+    if dialect == CliDialect::Codex && map.is_empty() {
+        return failed_stage(&format!("{msg}\n{USAGE_UNREPORTED}"));
+    }
+    failed_stage_with_usage(msg, model, map)
 }
 
 fn failed_stage(msg: &str) -> StageOutcome {

@@ -75,6 +75,79 @@ describe("RunLedger", () => {
     expect(cell.parentElement!.textContent).not.toContain("$0.00");
   });
 
+  it("shows a Codex stage stopped before reporting usage as 'usage not reported', never $0.00", () => {
+    const withUnreported = [
+      ...stages,
+      { id: "s3", role: "implement", agentModel: "gpt-5", costUsd: 0, inputTokens: 0, outputTokens: 0, usageUnreported: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={withUnreported} />);
+    const note = screen.getByTestId("ledger-budget-unenforceable");
+    expect(note.textContent).toBe("· budget not enforceable: 1 stage unpriced");
+    expect(note.getAttribute("title")).toContain("Codex stopped before reporting usage");
+    expect(note.getAttribute("title")).not.toContain("No price for");
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    const cell = screen.getByText("usage not reported");
+    expect(cell.className).toContain("text-octo-mute");
+    expect(cell.getAttribute("title")).toContain("cost is unknown");
+    expect(cell.parentElement!.textContent).toBe("Implement usage not reported");
+  });
+
+  it("counts unpriced and unreported stages together in the budget note", () => {
+    const mixed = [
+      { id: "s3", role: "review", agentModel: "claude-mythos-1", costUsd: 0, inputTokens: 5000, outputTokens: 400, unpricedModel: true },
+      { id: "s4", role: "implement", agentModel: "gpt-5", costUsd: 0.2, inputTokens: 900, outputTokens: 80, usageUnreported: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={mixed} />);
+    const note = screen.getByTestId("ledger-budget-unenforceable");
+    expect(note.textContent).toBe("· budget not enforceable: 2 stages unpriced");
+    expect(note.getAttribute("title")).toContain("claude-mythos-1");
+    expect(note.getAttribute("title")).toContain("Codex stopped before reporting usage");
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    // A later attempt that reported keeps its figure and says part is unknown.
+    expect(screen.getByText("$0.20").parentElement!.textContent).toContain("$0.20 + usage not reported");
+  });
+
+  it("says on the collapsed strip that usage was not reported, even with no budget", () => {
+    const withUnreported = [
+      ...stages,
+      { id: "s3", role: "implement", agentModel: "gpt-5", costUsd: 0, inputTokens: 0, outputTokens: 0, usageUnreported: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, costUsd: 0, budgetUsd: null, detached: false } as Run} stages={withUnreported} />);
+    const strip = screen.getByRole("button", { name: /saved/i });
+    expect(strip).toHaveAttribute("aria-expanded", "false");
+    const frag = within(strip).getByTestId("ledger-usage-unreported");
+    expect(frag.textContent).toBe("· 1 stage usage not reported");
+    expect(frag.className).toContain("octo-tabular");
+    expect(frag.className).toContain("text-octo-mute");
+    expect(frag.getAttribute("title")).toContain("cost is unknown");
+    expect(frag.getAttribute("data-tour")).toBe("direct-ledger-usage-unreported");
+    // The spent figure is never left to read as $0.00 alone.
+    const spent = within(strip).getByText("spent");
+    expect(spent.nextElementSibling!.textContent).toBe("$0.00");
+    expect(spent.nextElementSibling!.nextElementSibling).toBe(frag);
+    expect(screen.queryByTestId("ledger-budget-unenforceable")).not.toBeInTheDocument();
+  });
+
+  it("words the strip note and its tooltip for several unreported stages", () => {
+    const two = [
+      { id: "s3", role: "implement", agentModel: "gpt-5", costUsd: 0, inputTokens: 0, outputTokens: 0, usageUnreported: true },
+      { id: "s4", role: "review", agentModel: "gpt-5", costUsd: 0, inputTokens: 0, outputTokens: 0, usageUnreported: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={two} />);
+    const frag = screen.getByTestId("ledger-usage-unreported");
+    expect(frag.textContent).toBe("· 2 stages usage not reported");
+    expect(frag.getAttribute("title")).toContain("in 2 stages, so their cost is unknown");
+    expect(screen.getByTestId("ledger-budget-unenforceable").getAttribute("title")).toContain("their cost is unknown");
+  });
+
+  it("leaves reported stages unchanged", () => {
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={stages} />);
+    expect(screen.queryByTestId("ledger-budget-unenforceable")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("ledger-usage-unreported")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    expect(screen.queryByText(/usage not reported/)).not.toBeInTheDocument();
+  });
+
   it("omits the budget fragment when the run has no budget", () => {
     render(<RunLedger run={{ ...baseRun, budgetUsd: null, detached: false } as Run} stages={stages} />);
     expect(screen.queryByText(/budget/)).not.toBeInTheDocument();

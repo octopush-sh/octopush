@@ -5078,6 +5078,57 @@ mod orchestrator_tests {
         assert!(artifact.refs_worktree);
     }
 
+    /// A Codex stage that stalled before any `turn.completed`, through the
+    /// real stopped-stage path: `map` is the usage it streamed (none).
+    struct CodexStalledRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexStalledRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{stopped_stage, CliDialect};
+            Ok(stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &Default::default()))
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_stage_stopped_before_reporting_usage_is_flagged_and_journaled_once() {
+        use crate::orchestrator::cli_runner::USAGE_UNREPORTED;
+        let (db, run) = esc_run(None, None, None);
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CodexStalledRunner));
+        assert_eq!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "failed");
+        assert_eq!((stage.input_tokens, stage.output_tokens, stage.cost_usd), (0, 0, 0.0));
+        let flagged = db.lock().usage_unreported_stage_ids(&run).unwrap();
+        assert!(flagged.contains(&stage.id), "the stage reads usage not reported, not $0.00");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert_eq!(log.iter().filter(|e| e.contains(USAGE_UNREPORTED)).count(), 1, "{log:?}");
+        assert!(
+            log.iter().any(|e| e.contains("Stage halted — codex timed out — no output for 5 minutes\"")),
+            "the halt line keeps the cause alone: {log:?}"
+        );
+
+        // Sticky: a re-run does not erase the unknown spend of the stopped attempt.
+        db.lock().reset_run_stage(&stage.id, None, None).unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().contains(&stage.id));
+    }
+
+    #[tokio::test]
+    async fn stages_that_reported_usage_are_never_flagged_unreported() {
+        let (db, run) = esc_run(None, None, None);
+        let calls = Arc::new(Mutex::new(0));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SessionNotSavedRunner { calls: Arc::clone(&calls) }));
+        orch.run_to_pause(&run).await.unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().is_empty());
+    }
+
     /// A Claude stage that ended on a hook-deferred tool call (Claude Code ≥
     /// 2.1.319), parsed by the real parser: `line` at exit `exit_success`.
     struct DeferredRunner {
@@ -9609,6 +9660,53 @@ mod cli_dialect_tests {
             {"input_tokens":500,"cached_input_tokens":100,"cache_write_input_tokens":200,"output_tokens":5}}}})).unwrap();
         assert_eq!(key.as_deref(), Some("token_count"));
         assert_eq!((u.input_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens), (200, 100, 200));
+    }
+
+    /// The per-stage usage map the runner streams a Codex stage into.
+    fn codex_stream_usage(
+        events: &[serde_json::Value],
+    ) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        let mut map = std::collections::HashMap::new();
+        for ev in events {
+            if let Some((id, u)) = codex_usage_from_event(ev) {
+                let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                map.insert(key, u);
+            }
+        }
+        map
+    }
+
+    #[test]
+    fn codex_stage_stopped_before_turn_completed_reports_usage_unreported_not_zero() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Assistant items streamed, then the stall: no turn.completed arrived.
+        let map = codex_stream_usage(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Reading the code."}}),
+            json!({"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls","status":"completed"}}),
+        ]);
+        let out = stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &map);
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("codex timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // With a turn.completed, the reported usage is kept, as before.
+        let map = codex_stream_usage(&[
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Next turn."}}),
+        ]);
+        let out = stopped_stage(CliDialect::Codex, "codex exceeded the 60-minute cap", "gpt-5", &map);
+        let err = out.error.as_deref().unwrap();
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!(err, "codex exceeded the 60-minute cap");
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+
+        // A Claude stage with nothing streamed is unchanged (it streams usage per message).
+        let out = stopped_stage(CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-sonnet-4-6", &Default::default());
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
     }
 
     #[test]

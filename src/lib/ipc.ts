@@ -312,6 +312,11 @@ export interface RunStage {
    *  reads "unpriced", is invisible to the run budget and never counts as
    *  saved. */
   unpricedModel?: boolean;
+  /** True when an attempt of this stage stopped before its CLI reported
+   *  usage (a Codex stage stopped before `turn.completed`; set by `get_run`):
+   *  its cost reads "usage not reported", never $0.00, and like an unpriced
+   *  stage it is invisible to the run budget. */
+  usageUnreported?: boolean;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
