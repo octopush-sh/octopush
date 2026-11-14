@@ -718,9 +718,8 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
 
 // ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
 
-/// A writer outside a sandboxed mission, in a linked worktree.
-const CODEX_WS: CodexWriteScope<'static> =
-    CodexWriteScope::Workspace { git_dirs: &["/repo/.git/worktrees/wt", "/repo/.git/objects"] };
+/// A writer outside a sandboxed mission.
+const CODEX_WS: CodexWriteScope = CodexWriteScope::Workspace;
 
 #[test]
 fn codex_writer_runs_in_its_workspace_write_sandbox() {
@@ -737,21 +736,17 @@ fn codex_writer_runs_in_its_workspace_write_sandbox() {
         "-c",
         "sandbox_workspace_write.network_access=true",
     ];
-    let roots = ["-c", "sandbox_workspace_write.writable_roots=[\"/repo/.git/worktrees/wt\",\"/repo/.git/objects\"]"];
     let plain = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CODEX_WS);
-    assert_eq!(plain, [&head[..], &sandbox[..], &roots[..], &["-"][..]].concat(), "{plain:?}");
+    assert_eq!(plain, [&head[..], &sandbox[..], &["-"][..]].concat(), "{plain:?}");
     assert!(!plain.iter().any(|a| a == "--ask-for-approval" || a == "--add-dir"), "{plain:?}");
+    // No extra writable roots: Codex can't deny a path inside one, so a
+    // worktree's git dir (its `commondir`, `config.worktree`) is never granted.
+    assert!(!plain.iter().any(|a| a.contains("writable_roots") || a.contains(".git")), "{plain:?}");
     // The effort override sits after the sandbox settings, before the stdin marker.
     let mut argv = plain.clone();
     CliDialect::Codex.push_effort_args(&mut argv, "gpt-6.1-terra", Some(Effort::High));
     let effort = ["-c", "model_reasoning_effort=\"high\""];
-    assert_eq!(argv, [&head[..], &sandbox[..], &roots[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
-    // A main checkout (no git dirs of its own) gets no extra roots: the shared `.git` is never added.
-    let main = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::Workspace { git_dirs: &[] });
-    assert_eq!(main, [&head[..], &sandbox[..], &["-"][..]].concat(), "{main:?}");
-    // A path is written as a TOML string, quotes and backslashes escaped.
-    let odd = CliDialect::Codex.argv("gpt-5", "s", 1, false, CodexWriteScope::Workspace { git_dirs: &["/a \"b\"\\c"] });
-    assert!(odd.contains(&"sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\"\\\\c\"]".to_string()), "{odd:?}");
+    assert_eq!(argv, [&head[..], &sandbox[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
     // Inside a sandboxed mission the bypass flag stays (Seatbelt confines it).
     let mission = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::MissionSandbox);
     assert_eq!(mission, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{mission:?}");

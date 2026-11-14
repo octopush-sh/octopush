@@ -201,8 +201,7 @@ fn ancestors_within(root: &str, path: &str) -> Vec<String> {
 }
 
 /// The shared git subtrees `git add`/`git commit`/`git stash` write: objects,
-/// refs, reflogs and the reftable. Never hooks, `info/` or config. One list for
-/// the Seatbelt rules and Codex's writable roots, so the two can't drift. Pure.
+/// refs, reflogs and the reftable. Never hooks, `info/` or config. Pure.
 fn shared_git_write_subpaths(common_dir: &str) -> [String; 4] {
     let c = common_dir.trim_end_matches('/');
     ["objects", "refs", "logs", "reftable"].map(|d| format!("{c}/{d}"))
@@ -360,28 +359,87 @@ fn resolve_git_layout(workspace: &str) -> AppResult<Option<GitLayout>> {
     Ok(Some(layout))
 }
 
-/// The git dirs a Codex writer stage in a linked worktree gets as extra
-/// writable roots, the same ones the Seatbelt rules allow: the worktree's own
-/// git dir (`<common>/worktrees/<name>`: index, HEAD) plus the shared objects,
-/// refs, reflogs and reftable, so `git add`, `git commit` and `git stash`
-/// work. Never the shared git dir itself, so hooks and config stay out of
-/// reach. A main checkout, whose git dir IS the shared one, gets none. Pure.
-fn codex_git_write_dirs(layout: &GitLayout) -> Vec<String> {
-    if layout.git_dir == layout.common_dir {
-        return Vec::new();
-    }
-    std::iter::once(layout.git_dir.clone()).chain(shared_git_write_subpaths(&layout.common_dir)).collect()
+/// A workspace's `.git` entry as a Codex writer stage found it. In a linked
+/// worktree it is a file holding `gitdir: <common>/worktrees/<name>`; an agent
+/// that rewrites it can point git at a dir it planted, with its own config
+/// (`core.fsmonitor`, `core.hooksPath`) and hooks, which the next git command
+/// run outside the sandbox would execute. The Seatbelt profile denies writing
+/// it; Codex's writable roots can't deny a path, so the runner records it
+/// before the stage and checks it after ([`restore_git_entry`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum GitEntry {
+    Missing,
+    Dir,
+    File(Vec<u8>),
+    Symlink(PathBuf),
+    Other,
 }
 
-/// [`codex_git_write_dirs`] for `workspace`, resolved like the Seatbelt
-/// profile's git rules, keeping only dirs that exist (a repo has a `reftable/`
-/// only in the reftable format). Empty when the workspace has no git dir of
-/// its own or git can't vouch for it: the stage then runs with the worktree alone.
-pub fn codex_writable_git_dirs(workspace: &str) -> Vec<String> {
-    let Ok(Some(layout)) = resolve_git_layout(workspace) else {
-        return Vec::new();
+impl GitEntry {
+    /// `<workspace>/.git`, without following a symlink.
+    pub fn read(workspace: &Path) -> GitEntry {
+        let path = workspace.join(".git");
+        match std::fs::symlink_metadata(&path) {
+            Err(_) => GitEntry::Missing,
+            Ok(m) if m.file_type().is_symlink() => {
+                std::fs::read_link(&path).map(GitEntry::Symlink).unwrap_or(GitEntry::Other)
+            }
+            Ok(m) if m.is_dir() => GitEntry::Dir,
+            Ok(m) if m.is_file() => std::fs::read(&path).map(GitEntry::File).unwrap_or(GitEntry::Other),
+            Ok(_) => GitEntry::Other,
+        }
+    }
+}
+
+/// Compare `<workspace>/.git` with `before`, recorded ahead of a Codex writer
+/// stage. `None` when it is unchanged, or when there was none (a stage may
+/// `git init` a plain dir). When a gitdir pointer file changed, the changed
+/// entry is moved aside to `.git.changed-by-stage` and the original written
+/// back, before anything runs git there again. Returns the stage's failure
+/// message whenever the entry changed, saying whether it was put back.
+pub fn restore_git_entry(workspace: &Path, before: &GitEntry) -> Option<String> {
+    let now = GitEntry::read(workspace);
+    if now == *before || *before == GitEntry::Missing {
+        return None;
+    }
+    let shown = workspace.display();
+    let GitEntry::File(original) = before else {
+        return Some(format!(
+            "This stage changed {shown}/.git, which tells git where the repository lives. \
+             Don't run git there until you have put it back."
+        ));
     };
-    codex_git_write_dirs(&layout).into_iter().filter(|d| Path::new(d).is_dir()).collect()
+    let git = workspace.join(".git");
+    let put_back = || -> std::io::Result<Option<PathBuf>> {
+        let aside = if now == GitEntry::Missing {
+            None
+        } else {
+            let aside = std::iter::once(".git.changed-by-stage".to_string())
+                .chain((2..100).map(|n| format!(".git.changed-by-stage-{n}")))
+                .map(|name| workspace.join(name))
+                .find(|p| std::fs::symlink_metadata(p).is_err())
+                .ok_or_else(|| std::io::Error::other("no free name to move the changed one to"))?;
+            std::fs::rename(&git, &aside)?;
+            Some(aside)
+        };
+        // `create_new`, so a symlink planted in the meantime is never followed.
+        let mut file = std::fs::OpenOptions::new().write(true).create_new(true).open(&git)?;
+        std::io::Write::write_all(&mut file, original)?;
+        Ok(aside)
+    };
+    Some(match put_back() {
+        Ok(Some(aside)) => format!(
+            "This stage changed the worktree's .git file, which tells git where the repository \
+             lives. Octopush put the original back and kept the changed one as {} for you to look at.",
+            aside.display()
+        ),
+        Ok(None) => "This stage removed the worktree's .git file. Octopush put it back.".to_string(),
+        Err(e) => format!(
+            "This stage changed the worktree's .git file, which tells git where the repository \
+             lives, and Octopush couldn't put it back ({e}). Don't run git in {shown} until .git \
+             holds its original gitdir line again."
+        ),
+    })
 }
 
 /// Render an SBPL profile that allows everything by default, denies all file
@@ -868,47 +926,54 @@ mod tests {
     }
 
     #[test]
-    fn codex_gets_the_seatbelt_git_write_dirs_but_never_hooks_or_config() {
-        let dirs = codex_git_write_dirs(&linked_layout());
-        assert_eq!(
-            dirs,
-            [
-                "/repo/.git/worktrees/wt",
-                "/repo/.git/objects",
-                "/repo/.git/refs",
-                "/repo/.git/logs",
-                "/repo/.git/reftable",
-            ]
-        );
-        // The same subtrees the Seatbelt profile allows, nothing more.
-        let seatbelt = git_write_rules("/wt", &linked_layout(), &[]);
-        for d in &dirs {
-            assert!(seatbelt.subpaths.contains(d), "{d} isn't a Seatbelt write root");
-        }
-        // Never the shared git dir itself, its hooks or its config.
-        for d in ["/repo/.git", "/repo/.git/hooks", "/repo/.git/config", "/repo/.git/info"] {
-            assert!(!dirs.iter().any(|x| x == d), "{d} must not be writable");
-        }
-        // A main checkout's git dir is the shared one: nothing is added.
-        assert!(codex_git_write_dirs(&main_layout()).is_empty());
+    fn a_redirected_gitdir_pointer_is_put_back_after_a_codex_stage() {
         let Some((_dir, main, wt)) = repo_with_worktree() else {
             eprintln!("git unavailable; skipping");
             return;
         };
-        let common = canonical_string(&main.join(".git"));
-        // No `reftable/` in a files-format repo, so it's left out.
-        assert_eq!(
-            codex_writable_git_dirs(wt.to_str().unwrap()),
-            [
-                format!("{common}/worktrees/wt"),
-                format!("{common}/objects"),
-                format!("{common}/refs"),
-                format!("{common}/logs"),
-            ]
-        );
-        assert!(codex_writable_git_dirs(main.to_str().unwrap()).is_empty());
+        let git_file = wt.join(".git");
+        let original = std::fs::read(&git_file).unwrap();
+        let before = GitEntry::read(&wt);
+        assert_eq!(before, GitEntry::File(original.clone()));
+        // Unchanged: the stage stands.
+        assert_eq!(restore_git_entry(&wt, &before), None);
+
+        // Repointed at a planted git dir: the original comes back, the changed
+        // one is kept aside, and git resolves the real worktree git dir again.
+        let planted = wt.join("planted");
+        std::fs::create_dir(&planted).unwrap();
+        std::fs::write(&git_file, format!("gitdir: {}\n", planted.display())).unwrap();
+        let msg = restore_git_entry(&wt, &before).expect("a changed .git fails the stage");
+        assert!(msg.contains("put the original back"), "{msg}");
+        assert_eq!(std::fs::read(&git_file).unwrap(), original);
+        let aside = std::fs::read_to_string(wt.join(".git.changed-by-stage")).unwrap();
+        assert!(aside.contains("planted"), "{aside}");
+        let layout = resolve_git_layout(wt.to_str().unwrap()).unwrap().unwrap();
+        assert_eq!(layout.git_dir, format!("{}/worktrees/wt", canonical_string(&main.join(".git"))));
+
+        // Replaced by a dir: moved aside under the next free name.
+        std::fs::remove_file(&git_file).unwrap();
+        std::fs::create_dir(&git_file).unwrap();
+        assert!(restore_git_entry(&wt, &before).is_some());
+        assert_eq!(std::fs::read(&git_file).unwrap(), original);
+        assert!(wt.join(".git.changed-by-stage-2").is_dir());
+
+        // Removed: written back.
+        std::fs::remove_file(&git_file).unwrap();
+        let msg = restore_git_entry(&wt, &before).unwrap();
+        assert!(msg.contains("put it back"), "{msg}");
+        assert_eq!(std::fs::read(&git_file).unwrap(), original);
+
+        // A main checkout's `.git` dir that stays a dir, and a plain dir that
+        // gains a repo, leave the stage alone.
+        let main_before = GitEntry::read(&main);
+        assert_eq!(main_before, GitEntry::Dir);
+        assert_eq!(restore_git_entry(&main, &main_before), None);
         let plain = tempfile::tempdir().unwrap();
-        assert!(codex_writable_git_dirs(plain.path().to_str().unwrap()).is_empty());
+        let plain_before = GitEntry::read(plain.path());
+        assert_eq!(plain_before, GitEntry::Missing);
+        std::fs::create_dir(plain.path().join(".git")).unwrap();
+        assert_eq!(restore_git_entry(plain.path(), &plain_before), None);
     }
 
     #[test]

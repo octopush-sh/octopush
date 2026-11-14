@@ -842,49 +842,37 @@ pub enum CliDialect {
 /// What confines a Codex writer stage's own commands (read-only stages always
 /// run in Codex's `read-only` sandbox; Claude stages ignore this).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum CodexWriteScope<'a> {
-    /// Codex's own `workspace-write` sandbox with the network on: the
-    /// worktree, plus a linked worktree's git write dirs as extra writable
-    /// roots (`sandbox::codex_writable_git_dirs`).
-    Workspace { git_dirs: &'a [&'a str] },
+pub enum CodexWriteScope {
+    /// Codex's own `workspace-write` sandbox with the network on and no extra
+    /// writable roots: the worktree and Codex's temp dirs only. A linked
+    /// worktree's git dir is left out on purpose: Codex's writable roots can't
+    /// deny a path inside a root, so granting `<common>/worktrees/<name>`
+    /// would hand over its `commondir` and `config.worktree`, which repoint
+    /// git at planted config and hooks. `git add`/`git commit` therefore fail
+    /// there. The worktree's own `.git` entry is checked after the stage
+    /// ([`guards_git_entry`]).
+    Workspace,
     /// The mission runs sandboxed: Octopush's Seatbelt profile already
     /// confines the process, and nesting Codex's Seatbelt inside it is untested.
     MissionSandbox,
 }
 
 /// The scope a Codex writer stage gets for the mission's `exec_isolation`:
-/// Octopush's Seatbelt profile under `sandbox`, else Codex's own sandbox with
-/// `git_dirs` writable. Pure.
-pub fn codex_write_scope<'a>(exec_isolation: &str, git_dirs: &'a [&'a str]) -> CodexWriteScope<'a> {
+/// Octopush's Seatbelt profile under `sandbox`, else Codex's own sandbox. Pure.
+pub fn codex_write_scope(exec_isolation: &str) -> CodexWriteScope {
     if exec_isolation == "sandbox" {
         CodexWriteScope::MissionSandbox
     } else {
-        CodexWriteScope::Workspace { git_dirs }
+        CodexWriteScope::Workspace
     }
 }
 
-/// Whether the runner resolves the worktree's git dirs for this stage: only
-/// for a Codex writer that runs in Codex's own sandbox. Pure.
-pub fn wants_codex_git_dirs(dialect: CliDialect, read_only: bool, exec_isolation: &str) -> bool {
-    dialect == CliDialect::Codex
-        && !read_only
-        && matches!(codex_write_scope(exec_isolation, &[]), CodexWriteScope::Workspace { .. })
-}
-
-/// `s` as a TOML basic string, for a `-c key=<toml>` override. Pure.
-fn toml_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
+/// Whether the runner checks the worktree's `.git` entry around this stage
+/// (`sandbox::GitEntry`): only for a Codex writer in Codex's own sandbox,
+/// which may not protect a `.git` *file* (a linked worktree's gitdir pointer)
+/// the way the Seatbelt profile's `{ws}/.git` deny does. Pure.
+pub fn guards_git_entry(dialect: CliDialect, read_only: bool, exec_isolation: &str) -> bool {
+    dialect == CliDialect::Codex && !read_only && codex_write_scope(exec_isolation) == CodexWriteScope::Workspace
 }
 
 /// Derive the dialect from the stage's model id. Unknown ids fall back to
@@ -989,15 +977,15 @@ impl CliDialect {
     /// (see [`CodexWriteScope`]); either way it never stops for approval,
     /// which would hang a headless stage. The writer's settings are `-c`
     /// config overrides, the mechanism the effort already uses, not flags
-    /// `codex exec` may not take: approval `never`, network on (Octopush's
-    /// Seatbelt profile confines writes only, too) and the extra writable roots.
+    /// `codex exec` may not take: approval `never` and network on (Octopush's
+    /// Seatbelt profile confines writes only, too). No extra writable roots.
     pub fn argv(
         &self,
         model: &str,
         system_prompt: &str,
         max_turns: i64,
         read_only: bool,
-        scope: CodexWriteScope<'_>,
+        scope: CodexWriteScope,
     ) -> Vec<String> {
         match self {
             CliDialect::Claude => build_cli_args(model, system_prompt, max_turns, read_only),
@@ -1011,23 +999,14 @@ impl CliDialect {
                 ];
                 match (read_only, scope) {
                     (true, _) => a.extend(["--sandbox".to_string(), "read-only".to_string()]),
-                    (false, CodexWriteScope::Workspace { git_dirs }) => {
-                        a.extend([
-                            "--sandbox".to_string(),
-                            "workspace-write".to_string(),
-                            "-c".to_string(),
-                            "approval_policy=\"never\"".to_string(),
-                            "-c".to_string(),
-                            "sandbox_workspace_write.network_access=true".to_string(),
-                        ]);
-                        if !git_dirs.is_empty() {
-                            let roots: Vec<String> = git_dirs.iter().map(|d| toml_string(d)).collect();
-                            a.extend([
-                                "-c".to_string(),
-                                format!("sandbox_workspace_write.writable_roots=[{}]", roots.join(",")),
-                            ]);
-                        }
-                    }
+                    (false, CodexWriteScope::Workspace) => a.extend([
+                        "--sandbox".to_string(),
+                        "workspace-write".to_string(),
+                        "-c".to_string(),
+                        "approval_policy=\"never\"".to_string(),
+                        "-c".to_string(),
+                        "sandbox_workspace_write.network_access=true".to_string(),
+                    ]),
                     (false, CodexWriteScope::MissionSandbox) => {
                         a.push("--dangerously-bypass-approvals-and-sandbox".to_string())
                     }
@@ -1041,9 +1020,9 @@ impl CliDialect {
 
     /// The launch line's sandbox label: Codex's own sandbox when it confines
     /// a writer stage; `None` otherwise.
-    pub fn sandbox_label(&self, read_only: bool, scope: CodexWriteScope<'_>) -> Option<&'static str> {
+    pub fn sandbox_label(&self, read_only: bool, scope: CodexWriteScope) -> Option<&'static str> {
         match (self, read_only, scope) {
-            (CliDialect::Codex, false, CodexWriteScope::Workspace { .. }) => Some("workspace-write sandbox"),
+            (CliDialect::Codex, false, CodexWriteScope::Workspace) => Some("workspace-write sandbox"),
             _ => None,
         }
     }
@@ -1643,9 +1622,61 @@ pub(crate) async fn stop_cli_child(
 /// The CLI substrate: runs a stage by shelling out to headless Claude Code.
 pub struct CliRunner;
 
+/// Whether a stage runs read-only: a worktree review stage's whole contract
+/// is to judge the diff, not to change it (Action-environment roles keep
+/// their write access — committing/pushing IS their job). Pure.
+fn stage_is_read_only(stage: &StageSpec) -> bool {
+    matches!(stage.artifact_kind, ArtifactKind::Review)
+        && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree)
+}
+
+/// `outcome` turned into a failure with `msg`, keeping the spend it burned so
+/// the run meter stays truthful. Pure.
+pub fn fail_keeping_usage(outcome: StageOutcome, msg: &str) -> StageOutcome {
+    StageOutcome {
+        input_tokens: outcome.input_tokens,
+        output_tokens: outcome.output_tokens,
+        cache_read_tokens: outcome.cache_read_tokens,
+        cache_creation_tokens: outcome.cache_creation_tokens,
+        cost_usd: outcome.cost_usd,
+        ..failed_stage(msg)
+    }
+}
+
 #[async_trait::async_trait]
 impl AgentRunner for CliRunner {
     async fn run(
+        &self,
+        stage: &StageSpec,
+        input: &StageInput,
+        ctx: &StageContext,
+    ) -> AppResult<StageOutcome> {
+        // A Codex writer in Codex's own sandbox: record the worktree's `.git`
+        // entry, and after the stage put a changed gitdir pointer back before
+        // anything runs git there (`sandbox::restore_git_entry`).
+        let dialect = dialect_for_model(&stage.agent_model);
+        if !guards_git_entry(dialect, stage_is_read_only(stage), &ctx.exec_isolation) {
+            return self.run_stage(stage, input, ctx).await;
+        }
+        let ws = ctx.workspace_path.clone();
+        let read_ws = ws.clone();
+        let before = tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::GitEntry::read(&read_ws))
+            .await
+            .map_err(|e| AppError::Other(format!("could not check the worktree's .git: {e}")))?;
+        let result = self.run_stage(stage, input, ctx).await;
+        let changed = tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::restore_git_entry(&ws, &before))
+            .await
+            .unwrap_or_else(|e| Some(format!("Octopush could not check the worktree's .git after the stage ({e}). Don't run git in it until you have checked it.")));
+        match (changed, result) {
+            (None, result) => result,
+            (Some(msg), Ok(outcome)) => Ok(fail_keeping_usage(outcome, &msg)),
+            (Some(msg), Err(_)) => Ok(failed_stage(&msg)),
+        }
+    }
+}
+
+impl CliRunner {
+    async fn run_stage(
         &self,
         stage: &StageSpec,
         input: &StageInput,
@@ -1662,11 +1693,7 @@ impl AgentRunner for CliRunner {
         // not that, so the body is inlined here rather than hoping the CLI
         // reads the token out of the brief.
         system.push_str(&crate::skills::skill_prompt_section(&ctx.skills));
-        // A worktree review stage runs read-only: its whole contract is to
-        // judge the diff, not to change it (Action-environment roles keep
-        // their write access — committing/pushing IS their job).
-        let read_only = matches!(stage.artifact_kind, ArtifactKind::Review)
-            && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree);
+        let read_only = stage_is_read_only(stage);
         // The MODEL selects the CLI dialect (B6): claude-* → Claude Code,
         // OpenAI-family ids → Codex CLI. See `dialect_for_model`.
         let dialect = dialect_for_model(&stage.agent_model);
@@ -1690,16 +1717,7 @@ impl AgentRunner for CliRunner {
         let resuming = resume_args.is_some();
         // A Codex writer outside a sandboxed mission runs in Codex's own
         // `workspace-write` sandbox, never the bypass flag.
-        let resolved_git_dirs = if wants_codex_git_dirs(dialect, read_only, &ctx.exec_isolation) {
-            let ws = ctx.workspace_path.to_string_lossy().into_owned();
-            tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::codex_writable_git_dirs(&ws))
-                .await
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        let codex_git_dirs: Vec<&str> = resolved_git_dirs.iter().map(String::as_str).collect();
-        let write_scope = codex_write_scope(&ctx.exec_isolation, &codex_git_dirs);
+        let write_scope = codex_write_scope(&ctx.exec_isolation);
         let (mut args, user) = match resume_args {
             Some(argv) => (
                 argv,
