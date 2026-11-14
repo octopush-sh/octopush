@@ -1034,11 +1034,8 @@ impl Orchestrator {
                 .map(|m| m.exec_isolation)
                 .unwrap_or_else(|| "none".to_string());
             let ws_str = workspace_path.to_string_lossy().into_owned();
-            let (exec_isolation, allowed_write_roots) =
-                match crate::orchestrator::sandbox::sandbox_write_roots(&git_isolation, &exec_choice, &ws_str) {
-                    Some(roots) => ("sandbox".to_string(), roots),
-                    None => (exec_choice, vec![ws_str]),
-                };
+            let crate::orchestrator::sandbox::StageIsolation { exec_isolation, exec_choice, allowed_write_roots } =
+                crate::orchestrator::sandbox::stage_isolation(&git_isolation, &exec_choice, &ws_str);
             // Resolve the brief's `/slug` references against THIS worktree, at
             // the moment the stage starts — a skill added (or edited) since the
             // run was created is picked up, and a run whose worktree has no
@@ -1063,6 +1060,7 @@ impl Orchestrator {
                 stage_id: stage.id.clone(),
                 cancel,
                 exec_isolation,
+                exec_choice,
                 allowed_write_roots,
                 skills,
                 spend_limit,

@@ -767,11 +767,13 @@ pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true}}"#;
 
 /// [`CLAUDE_STAGE_SETTINGS`] plus the read guard, for a Claude stage in a
-/// sandboxed mission: Read/Grep/Glob refuse paths outside the working
-/// directories too, so an agent can't pull `~/.ssh`, `~/.aws` or a sibling
-/// repo into its context. The Seatbelt profile only denies writes. Like the
-/// write guard it covers Claude Code's file tools, not `Bash`. Unsandboxed
-/// missions keep the write guard only: their agents read dependency sources
+/// mission whose own `exec_isolation` is `sandbox`: Read/Grep/Glob refuse
+/// paths outside the working directories too, so an agent can't pull
+/// `~/.ssh`, `~/.aws` or a sibling repo into its context. The Seatbelt
+/// profile only denies writes. Like the write guard it covers Claude Code's
+/// file tools, not `Bash`. Every other mission keeps the write guard only —
+/// a `readonly` (review/probe) mission with `exec_isolation = "none"` too,
+/// though its sandbox is forced on: its agents read dependency sources
 /// outside the worktree.
 pub const CLAUDE_SANDBOXED_STAGE_SETTINGS: &str =
     r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true,"blockReadsOutsideWorkingDirectories":true}}"#;
@@ -780,11 +782,12 @@ pub const CLAUDE_SANDBOXED_STAGE_SETTINGS: &str =
 /// older CLIs ignore the key.
 pub const CLAUDE_READ_GUARD_FLOOR: &str = "2.1.257";
 
-/// In a sandboxed mission, swap a Claude stage's `--settings` value (fresh or
-/// resumed argv) for [`CLAUDE_SANDBOXED_STAGE_SETTINGS`]. Returns whether it
-/// did; Codex stages and unsandboxed missions are left as they are. Pure.
-pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_isolation: &str, args: &mut [String]) -> bool {
-    if dialect != CliDialect::Claude || exec_isolation != "sandbox" {
+/// When the mission's own `exec_choice` is `sandbox` (not the effective tier a
+/// `readonly` mission forces on), swap a Claude stage's `--settings` value
+/// (fresh or resumed argv) for [`CLAUDE_SANDBOXED_STAGE_SETTINGS`]. Returns
+/// whether it did; Codex stages and other missions are left as they are. Pure.
+pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || exec_choice != "sandbox" {
         return false;
     }
     match args.iter().position(|a| a == "--settings") {
@@ -1980,8 +1983,10 @@ impl CliRunner {
                 ),
             ),
         };
-        // A sandboxed mission also confines the file tools' reads (fresh and resumed).
-        let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_isolation, &mut args);
+        // A mission the user chose to sandbox also confines the file tools'
+        // reads (fresh and resumed). Keyed on the choice, not the effective
+        // tier: a readonly mission's forced sandbox keeps the write guard only.
+        let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_choice, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).

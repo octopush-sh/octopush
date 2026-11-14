@@ -32,6 +32,10 @@ pub struct StageContext {
     /// substrate acts on it (it wraps the spawn in a sandbox); `ApiRunner`
     /// ignores it (it never spawns a subprocess).
     pub exec_isolation: String,
+    /// The mission's own `exec_isolation` choice. Differs from `exec_isolation`
+    /// for a `readonly` (review/probe) mission, whose sandbox is forced on;
+    /// the Claude read guard follows this choice, not the forced tier.
+    pub exec_choice: String,
     /// Directories a sandbox may write to (the workspace worktree at minimum).
     pub allowed_write_roots: Vec<String>,
     /// Skills the run's brief named (`/slug`), resolved against this worktree

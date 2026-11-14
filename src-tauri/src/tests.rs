@@ -9208,6 +9208,32 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn a_readonly_mission_gets_the_read_guard_only_when_its_user_chose_sandbox() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, CliDialect};
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #702 review: a readonly (review/probe) mission's sandbox is forced on,
+        // but the read guard follows the mission's own exec choice.
+        let read_guard = |git: &str, exec: &str| -> (String, bool) {
+            let iso = stage_isolation(git, exec, "/ws");
+            let mut args = build_cli_args("m", "sys", 10, true);
+            confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+            let at = args.iter().position(|a| a == "--settings").expect("--settings");
+            let v: serde_json::Value = serde_json::from_str(&args[at + 1]).expect("valid JSON");
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true));
+            (iso.exec_isolation, v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some())
+        };
+        assert_eq!(read_guard("readonly", "none"), ("sandbox".to_string(), false), "forced sandbox: write guard only");
+        assert_eq!(read_guard("readonly", "sandbox"), ("sandbox".to_string(), true));
+        assert_eq!(read_guard("worktree", "sandbox"), ("sandbox".to_string(), true));
+        assert_eq!(read_guard("worktree", "none"), ("none".to_string(), false));
+        // The derivation keeps the write roots the sandbox already used.
+        let ro = stage_isolation("readonly", "none", "/ws");
+        assert_eq!((ro.exec_choice.as_str(), ro.allowed_write_roots), ("none", Vec::<String>::new()));
+        assert_eq!(stage_isolation("worktree", "none", "/ws").allowed_write_roots, vec!["/ws".to_string()]);
+        assert_eq!(stage_isolation("worktree", "sandbox", "/ws").allowed_write_roots, vec!["/ws".to_string()]);
+    }
+
+    #[test]
     fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
         use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
         // #362: a run budget's remaining headroom caps the Claude stage.

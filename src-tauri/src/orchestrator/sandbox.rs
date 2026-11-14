@@ -511,6 +511,29 @@ pub fn sandbox_write_roots(
     }
 }
 
+/// A stage's isolation, derived from its mission (see [`stage_isolation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StageIsolation {
+    /// The effective tier: `sandbox` whenever [`sandbox_write_roots`] confines
+    /// the stage (a `readonly` mission included), else the mission's choice.
+    pub exec_isolation: String,
+    /// The mission's own `exec_isolation`, before a `readonly` mission forces
+    /// the sandbox on. Gates what only that choice asks for (the Claude read
+    /// guard, #702).
+    pub exec_choice: String,
+    pub allowed_write_roots: Vec<String>,
+}
+
+/// Derive a stage's [`StageIsolation`] from its mission's two isolation axes.
+/// Pure.
+pub fn stage_isolation(git_isolation: &str, exec_choice: &str, workspace_path: &str) -> StageIsolation {
+    let (exec_isolation, allowed_write_roots) = match sandbox_write_roots(git_isolation, exec_choice, workspace_path) {
+        Some(roots) => ("sandbox".to_string(), roots),
+        None => (exec_choice.to_string(), vec![workspace_path.to_string()]),
+    };
+    StageIsolation { exec_isolation, exec_choice: exec_choice.to_string(), allowed_write_roots }
+}
+
 /// Build the seatbelt profile text for a mission's write roots, resolving the
 /// system dirs from the environment and each workspace root's git layout. A
 /// readonly mission has no mission roots, so it gets no git rules (temp-only).
