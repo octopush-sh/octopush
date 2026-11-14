@@ -755,6 +755,23 @@ pub fn parse_cli_result(
 /// builds/tests), so this is a guardrail, not a sandbox.
 pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 
+/// Claude Code's interactive question tool, denied to EVERY Claude CLI stage.
+/// A headless `claude -p` stage has nobody to answer it (since 2.1.321 the CLI
+/// refuses it there and the model guesses). With the tool gone, a question can
+/// only come out in the final message, where [`detect_trailing_question`]
+/// parks it for the director.
+pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// The one `--disallowedTools` value for a Claude CLI stage: the question
+/// tool, plus the review denial on a read-only stage.
+pub fn cli_disallowed_tools(read_only: bool) -> String {
+    if read_only {
+        format!("{ASK_USER_QUESTION_TOOL},{REVIEW_DISALLOWED_TOOLS}")
+    } else {
+        ASK_USER_QUESTION_TOOL.to_string()
+    }
+}
+
 /// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
 /// as defence in depth). Since Claude Code 2.1.314, Write/Edit/NotebookEdit
 /// refuse paths outside the working directories in every permission mode,
@@ -771,10 +788,10 @@ pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWo
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
 /// independently and non-JSON log lines are simply skipped. Every stage
-/// carries [`CLAUDE_STAGE_SETTINGS`]; `read_only` adds the review-stage tool
-/// denial (see [`REVIEW_DISALLOWED_TOOLS`]).
+/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`];
+/// `read_only` adds the review-stage tool denial (see [`cli_disallowed_tools`]).
 pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
-    let mut args = vec![
+    vec![
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -789,19 +806,16 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_onl
         max_turns.max(1).to_string(),
         "--settings".to_string(),
         CLAUDE_STAGE_SETTINGS.to_string(),
-    ];
-    if read_only {
-        args.push("--disallowedTools".to_string());
-        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
-    }
-    args
+        "--disallowedTools".to_string(),
+        cli_disallowed_tools(read_only),
+    ]
 }
 
 /// Argv for resuming an existing headless session: continue the same
 /// conversation (`--resume <id>`) with a fresh turn budget. The continuation
 /// nudge is supplied via stdin by the caller.
 pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read_only: bool) -> Vec<String> {
-    let mut args = vec![
+    vec![
         "-p".to_string(),
         "--output-format".to_string(), "stream-json".to_string(),
         "--verbose".to_string(),
@@ -811,12 +825,8 @@ pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read
         "--max-turns".to_string(), max_turns.max(1).to_string(),
         // The resume path needs the guard too (2.1.314 fixed it for --resume).
         "--settings".to_string(), CLAUDE_STAGE_SETTINGS.to_string(),
-    ];
-    if read_only {
-        args.push("--disallowedTools".to_string());
-        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
-    }
-    args
+        "--disallowedTools".to_string(), cli_disallowed_tools(read_only),
+    ]
 }
 
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
