@@ -1,6 +1,7 @@
 import { Settings, NotebookPen, History } from "lucide-react";
 import { RunsTray } from "./RunsTray";
 import { OctoMark } from "./icons/OctoMark";
+import { MidTruncate } from "./primitives/MidTruncate";
 import { useHistoryStore } from "../stores/historyStore";
 import { useUpgradeStore } from "../stores/upgradeStore";
 import { useEntitlement } from "../hooks/useEntitlement";
@@ -30,6 +31,18 @@ interface Props {
   projectName?: string | null;
 }
 
+/** The project name's box in the top bar. */
+const PROJECT_NAME_PX = 180;
+/** 10px JetBrains Mono advances 0.6em (6px), plus 0.2em (2px) of tracking. */
+const PROJECT_NAME_PX_PER_CHAR = 8;
+/** Characters the project name keeps pinned at its end. */
+const PROJECT_NAME_TAIL = 12;
+
+/** Whether the project name renders whole in the top bar's 180px. */
+export function projectNameFits(name: string): boolean {
+  return name.length * PROJECT_NAME_PX_PER_CHAR <= PROJECT_NAME_PX;
+}
+
 export function AppTopBar({
   onOpenSettings,
   onToggleScratchpad,
@@ -40,6 +53,7 @@ export function AppTopBar({
   const showUpgrade = useUpgradeStore((s) => s.show);
   const { hasFeature } = useEntitlement();
   const mascot = useMascotState();
+  const nameFits = projectName != null && projectNameFits(projectName);
 
   const onHistoryClick = () => {
     if (hasFeature("history.sync")) {
@@ -91,9 +105,19 @@ export function AppTopBar({
               // tooltip, which is the only way to read a truncated name):
               // this span is the part of the group that reaches toward the
               // right-hand controls, so it trades width for clearance.
-              className="pointer-events-auto max-w-[180px] truncate font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage"
+              // A name that can't fit is MIDDLE-truncated (E1) — projects in
+              // one org share their head — inside a fixed width, because this
+              // centred group is shrink-to-fit and the MidTruncate box needs a
+              // definite one. The face is mono, so fitting is a character count.
+              className={`pointer-events-auto font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage ${
+                nameFits ? "max-w-[180px] truncate" : "flex w-[180px] min-w-0"
+              }`}
             >
-              {projectName}
+              {nameFits ? (
+                projectName
+              ) : (
+                <MidTruncate text={projectName} tail={PROJECT_NAME_TAIL} />
+              )}
             </span>
           </>
         )}

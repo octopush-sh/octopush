@@ -479,13 +479,19 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
             className="shrink-0"
             color={projectTint?.accent ?? "var(--color-octo-mute)"}
           />
+          {/* Middle-truncated (E1): projects in one org share their head, so
+              the tail is what tells them apart. `flex-1 min-w-0` gives the
+              MidTruncate box the definite width it elides into. The button's
+              fold title already carries the name; while a filter disables
+              folding, the name carries its own. */}
           <span
             data-testid="project-header"
-            className={`truncate font-serif text-[13px] leading-none transition-colors duration-[180ms] group-hover/head:text-octo-ivory ${
+            title={canFold ? undefined : project.name}
+            className={`flex min-w-0 flex-1 font-serif text-[13px] leading-none transition-colors duration-[180ms] group-hover/head:text-octo-ivory ${
               hasActive ? "text-octo-ivory" : "text-octo-sage"
             }`}
           >
-            {project.name}
+            <MidTruncate text={project.name} tail={RAIL_NAME_TAIL} />
           </span>
         </button>
 
@@ -522,14 +528,20 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
           )}
         </span>
 
-        <span className="flex shrink-0 items-center opacity-0 transition-opacity duration-[180ms] group-focus-within/head:opacity-100 group-hover/head:opacity-100">
+        {/* Hover actions — they take no width until hover/focus reveals them,
+            so a long name uses the whole line meanwhile. Clipped while they
+            grow, hence the inset focus rings. */}
+        <span
+          data-testid="project-header-actions"
+          className={`flex max-w-0 shrink-0 items-center overflow-hidden opacity-0 transition-[max-width,opacity] duration-[220ms] ${EASE} group-focus-within/head:max-w-[60px] group-focus-within/head:opacity-100 group-hover/head:max-w-[60px] group-hover/head:opacity-100`}
+        >
           {onNewWorkspaceForProject && (
             <button
               type="button"
               onClick={() => onNewWorkspaceForProject(project.id)}
               title={`New mission in ${project.name}`}
               aria-label={`New mission in ${project.name}`}
-              className={`${ICON_BTN} h-5 w-5`}
+              className={`${ICON_BTN} h-5 w-5 focus-visible:ring-inset`}
             >
               <Plus size={12} aria-hidden />
             </button>
@@ -542,7 +554,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
               {...listeners}
               aria-label={`Reorder ${project.name}`}
               title="Drag to reorder"
-              className={`${ICON_BTN} h-5 w-5 cursor-grab active:cursor-grabbing`}
+              className={`${ICON_BTN} h-5 w-5 cursor-grab focus-visible:ring-inset active:cursor-grabbing`}
             >
               <GripVertical size={12} aria-hidden />
             </button>
@@ -550,20 +562,29 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         </span>
         {/* The chevron is decoration for the pointer: the name button already
             is the one keyboard-reachable fold control, so this adds no second
-            tab stop. Hidden while a filter holds every project open. */}
+            tab stop. Hidden while a filter holds every project open. While
+            the project is open it takes no width until hover/focus, like the
+            actions beside it. */}
         {canFold && (
           <span
             aria-hidden
-            onClick={() => toggleProjectCollapsed(project.id)}
-            title={`${verb} ${project.name}`}
-            className={`${ICON_BTN} h-5 w-5 cursor-pointer ${
-              folded ? "opacity-100" : "opacity-0 group-focus-within/head:opacity-100 group-hover/head:opacity-100"
+            data-testid="project-header-chevron"
+            className={`flex shrink-0 overflow-hidden transition-[max-width] duration-[220ms] ${EASE} ${
+              folded ? "max-w-5" : "max-w-0 group-focus-within/head:max-w-5 group-hover/head:max-w-5"
             }`}
           >
-            <ChevronDown
-              size={12}
-              className={`transition-transform duration-[280ms] ${EASE} ${folded ? "-rotate-90" : ""}`}
-            />
+            <span
+              onClick={() => toggleProjectCollapsed(project.id)}
+              title={`${verb} ${project.name}`}
+              className={`${ICON_BTN} h-5 w-5 cursor-pointer ${
+                folded ? "opacity-100" : "opacity-0 group-focus-within/head:opacity-100 group-hover/head:opacity-100"
+              }`}
+            >
+              <ChevronDown
+                size={12}
+                className={`transition-transform duration-[280ms] ${EASE} ${folded ? "-rotate-90" : ""}`}
+              />
+            </span>
           </span>
         )}
       </div>
