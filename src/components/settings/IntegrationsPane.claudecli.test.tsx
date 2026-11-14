@@ -68,6 +68,20 @@ describe("Claude Code card — CLI version", () => {
     expect(screen.queryByTestId("claude-cli-update")).not.toBeInTheDocument();
   });
 
+  it("draws Connect and Copy as ghost buttons, leaving the page's brass CTA to Jira's Save changes", async () => {
+    cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
+    const { container } = render(<IntegrationsPane />);
+    const connect = await screen.findByRole("button", { name: "Reconnect to Claude Code" });
+    const copy = screen.getByRole("button", { name: "Copy" });
+    for (const btn of [connect, copy]) {
+      expect(btn.className).toContain("border-octo-border-strong");
+      expect(btn.className).not.toContain("border-octo-hairline");
+      expect(btn.className).toContain("text-octo-sage");
+      expect(btn.className).not.toContain("text-octo-brass");
+    }
+    expect(container.querySelector("button.text-octo-brass")).toBeNull();
+  });
+
   it("shows nothing when the CLI isn't found", async () => {
     cliVersionMock.mockResolvedValue({ version: null, floor: "2.1.314", belowFloor: false });
     const { container } = render(<IntegrationsPane />);
