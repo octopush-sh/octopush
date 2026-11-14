@@ -114,6 +114,7 @@ Current anchors:
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
+| `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-appearance-legacy` | Settings › Appearance: the Legacy theme group (Dark, Midnight, Solarized Dark; only when the theme list has any) | `settings/AppearancePane.tsx` |

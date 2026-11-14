@@ -1196,7 +1196,7 @@ impl Orchestrator {
 
 /// Parse the stored `[[position, model], …]` JSON overrides into the shape
 /// `create_run` wants. A malformed blob degrades to no overrides.
-fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
+pub(crate) fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
     let Some(json) = json else { return Vec::new() };
     serde_json::from_str::<Vec<(i64, String)>>(json).unwrap_or_default()
 }
