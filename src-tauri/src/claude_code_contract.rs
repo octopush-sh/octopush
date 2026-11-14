@@ -28,7 +28,7 @@ use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
     build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
     plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect,
-    CodexWriteScope, ReadEnd, ReadLimits,
+    CodexWriteScope, OpenTools, ReadEnd, ReadLimits,
 };
 use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
@@ -306,6 +306,17 @@ fn stream_json_tool_use_journals_the_call_and_its_result() {
             .unwrap_or_else(|| panic!("[{fx}] no user tool_result block"));
         require(&fx, &tool_result, "tool_use_id");
         require(&fx, &tool_result, "content");
+
+        // The idle clock pairs each call with its result by id
+        // (`OpenTools`): a recorded call opens, and its result closes it.
+        let mut open = OpenTools::default();
+        let mut was_open = false;
+        for e in &events {
+            open.observe(e);
+            was_open |= open.latest().is_some_and(|t| t.name == "Read");
+        }
+        assert!(was_open, "[{fx}] the Read tool_use never registered as an open call");
+        assert_eq!(open.latest(), None, "[{fx}] a call stayed open after its tool_result");
 
         let (entries, usage_by_msg, outcome) = replay(&fx, &events);
         let tools = kind_entries(&entries, "tool");
@@ -594,6 +605,7 @@ fn stream_json_missing_fields_degrade_without_panicking() {
 /// Short limits so a settle is observable in a test; idle and cap far away.
 const TEST_LIMITS: ReadLimits = ReadLimits {
     idle: std::time::Duration::from_secs(20),
+    command_idle: std::time::Duration::from_secs(20),
     cap: std::time::Duration::from_secs(60),
     settle: std::time::Duration::from_millis(150),
 };
@@ -606,7 +618,7 @@ async fn read_bounded<R: tokio::io::AsyncRead + Unpin>(stream: R, dialect: CliDi
     let mut seen = 0usize;
     let end = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        read_stream(stream, dialect, TEST_LIMITS, |_| seen += 1),
+        read_stream(stream, dialect, TEST_LIMITS, |_| seen += 1, |_| {}),
     )
     .await
     .expect("read_stream did not settle — it is waiting for the process to exit");

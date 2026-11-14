@@ -19,6 +19,12 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 /// Fail a CLI stage if it emits NO output for this long — a hung CLI, not a
 /// busy one. A stage that keeps streaming (a long build/release) stays alive.
 const IDLE_TIMEOUT_SECS: u64 = 300; // 5 minutes of silence
+/// Claude Code's default ceiling on one foreground Bash/PowerShell command
+/// (`BASH_MAX_TIMEOUT_MS`, 10 minutes). While such a call is open the CLI is
+/// silent by design, so the idle window stretches to it ([`command_idle_window`]).
+const BASH_MAX_TIMEOUT_DEFAULT_MS: u64 = 600_000;
+/// Slack on top of the command ceiling for the CLI to report the result.
+const COMMAND_RESULT_SLACK_SECS: u64 = 60;
 /// Absolute backstop: even a trickle of output can't run forever.
 const ABS_CAP_SECS: u64 = 3600; // 60 minutes total
 /// Claude Code only: how long the process may stay open after its terminal
@@ -1485,11 +1491,149 @@ pub(crate) fn build_codex_outcome(
     }
 }
 
+/// A tool call a Claude stream started and hasn't reported a result for yet.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct OpenTool {
+    pub id: String,
+    pub name: String,
+    /// A Bash/PowerShell call's command: its first line, shortened.
+    pub command: Option<String>,
+}
+
+impl OpenTool {
+    /// A foreground command Claude Code may wait on for up to `BASH_MAX_TIMEOUT_MS`.
+    fn is_command(&self) -> bool {
+        matches!(self.name.as_str(), "Bash" | "PowerShell")
+    }
+
+    /// `Bash `npm test`` for a command, the bare tool name otherwise.
+    pub(crate) fn label(&self) -> String {
+        match &self.command {
+            Some(c) => format!("{} `{c}`", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// The tool calls still open in a Claude stream: each `tool_use` block of an
+/// `assistant` event opens one, the `tool_result` with its id in a `user`
+/// event closes it. A result for an id that never opened changes nothing.
+#[derive(Debug, Default)]
+pub(crate) struct OpenTools(Vec<OpenTool>);
+
+impl OpenTools {
+    pub(crate) fn observe(&mut self, v: &Value) {
+        let kind = v.get("type").and_then(Value::as_str);
+        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for b in blocks {
+            match (kind, b.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    let Some(id) = b.get("id").and_then(Value::as_str) else { continue };
+                    if self.0.iter().any(|t| t.id == id) {
+                        continue;
+                    }
+                    let name = b.get("name").and_then(Value::as_str).unwrap_or("a tool").to_string();
+                    let mut tool = OpenTool { id: id.to_string(), name, command: None };
+                    if tool.is_command() {
+                        tool.command = b.pointer("/input/command").and_then(Value::as_str).map(short_command);
+                    }
+                    self.0.push(tool);
+                }
+                (Some("user"), Some("tool_result")) => {
+                    if let Some(id) = b.get("tool_use_id").and_then(Value::as_str) {
+                        self.0.retain(|t| t.id != id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// True while a Bash/PowerShell call is open.
+    pub(crate) fn command_open(&self) -> bool {
+        self.0.iter().any(OpenTool::is_command)
+    }
+
+    /// The call a stall is blamed on: the latest open command, else the latest open tool.
+    pub(crate) fn latest(&self) -> Option<&OpenTool> {
+        self.0.iter().rev().find(|t| t.is_command()).or_else(|| self.0.last())
+    }
+}
+
+/// A command's first non-empty line, at most 60 characters.
+fn short_command(cmd: &str) -> String {
+    let line = cmd.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("");
+    let multi = cmd.trim().lines().count() > 1;
+    if line.chars().count() > 60 {
+        format!("{}…", line.chars().take(59).collect::<String>())
+    } else if multi {
+        format!("{line} …")
+    } else {
+        line.to_string()
+    }
+}
+
+/// How long a Claude stage may stay silent while a Bash/PowerShell call is
+/// open: the CLI's own command ceiling (`BASH_MAX_TIMEOUT_MS` from the stage
+/// env, default 10 minutes; never below the plain idle window) plus a minute
+/// for the result. An unreadable value counts as unset.
+pub(crate) fn command_idle_window(bash_max_timeout_ms: Option<&str>) -> std::time::Duration {
+    let ms = bash_max_timeout_ms
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(BASH_MAX_TIMEOUT_DEFAULT_MS);
+    std::time::Duration::from_millis(ms).max(std::time::Duration::from_secs(IDLE_TIMEOUT_SECS))
+        + std::time::Duration::from_secs(COMMAND_RESULT_SLACK_SECS)
+}
+
+/// A variable as the stage's CLI process sees it: the login-shell env, which
+/// the spawn sets over the app's own, else the app's.
+fn stage_env_value(key: &str) -> Option<String> {
+    login_shell_env()
+        .iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(key).ok())
+}
+
+/// Whole minutes, rounded up: `5 minutes`, `11 minutes`, `1 minute`.
+fn minutes(d: std::time::Duration) -> u64 {
+    d.as_secs().div_ceil(60).max(1)
+}
+
+/// What an idle stall found: the tool call still open when it tripped (if
+/// any) and the silence it waited.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct IdleStall {
+    pub tool: Option<OpenTool>,
+    pub window: std::time::Duration,
+}
+
+/// The stage error for an idle stall, after the CLI's name: "timed out — no
+/// output for 5 minutes", or naming the open call ("timed out — Bash `npm
+/// test` gave no result for 11 minutes").
+pub(crate) fn idle_timeout_message(stall: &IdleStall) -> String {
+    let m = minutes(stall.window);
+    let unit = if m == 1 { "minute" } else { "minutes" };
+    match &stall.tool {
+        Some(t) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
+        None => format!("timed out — no output for {m} {unit}"),
+    }
+}
+
+/// The journal line when a stage stays silent past the plain idle window
+/// because a command is still running.
+pub(crate) fn long_command_notice(window: std::time::Duration) -> String {
+    format!("waiting on a long command (up to {} min)", minutes(window))
+}
+
 /// How the stdout read loop ended — drives the post-loop handling.
 #[derive(Debug)]
 pub(crate) enum ReadEnd {
     Eof(Option<String>, std::collections::VecDeque<String>),
-    Idle(Option<String>, std::collections::VecDeque<String>),
+    Idle(Option<String>, std::collections::VecDeque<String>, IdleStall),
     AbsCap(Option<String>, std::collections::VecDeque<String>),
     /// Claude emitted its `result` line and the process was still open
     /// [`ReadLimits::settle`] later (waiting on background work).
@@ -1501,6 +1645,9 @@ pub(crate) enum ReadEnd {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ReadLimits {
     pub idle: std::time::Duration,
+    /// The idle window while a Bash/PowerShell call is open (Claude only;
+    /// never shorter than `idle`).
+    pub command_idle: std::time::Duration,
     pub cap: std::time::Duration,
     pub settle: std::time::Duration,
 }
@@ -1508,9 +1655,16 @@ pub(crate) struct ReadLimits {
 impl ReadLimits {
     pub(crate) const STAGE: ReadLimits = ReadLimits {
         idle: std::time::Duration::from_secs(IDLE_TIMEOUT_SECS),
+        command_idle: std::time::Duration::from_secs(BASH_MAX_TIMEOUT_DEFAULT_MS / 1000 + COMMAND_RESULT_SLACK_SECS),
         cap: std::time::Duration::from_secs(ABS_CAP_SECS),
         settle: std::time::Duration::from_secs(SETTLE_AFTER_RESULT_SECS),
     };
+
+    /// [`ReadLimits::STAGE`] with the command window from the stage env's
+    /// `BASH_MAX_TIMEOUT_MS` ([`command_idle_window`]).
+    pub(crate) fn for_stage(bash_max_timeout_ms: Option<&str>) -> ReadLimits {
+        ReadLimits { command_idle: command_idle_window(bash_max_timeout_ms), ..ReadLimits::STAGE }
+    }
 }
 
 /// Read the CLI's stdout line by line until EOF, an idle stall, the absolute
@@ -1521,11 +1675,18 @@ impl ReadLimits {
 /// (losing the result event). Non-JSON lines (debug logs) are skipped, and a
 /// bounded tail of recent lines is kept for diagnostics when no result event
 /// ever arrives.
+///
+/// Claude: while a Bash/PowerShell call is open ([`OpenTools`]) the idle
+/// window is [`ReadLimits::command_idle`] — Claude Code itself waits that
+/// long on a foreground command that prints nothing to the stream. The first
+/// time a stage stays silent past `idle` on that account, `on_long_wait` gets
+/// the window (the journal line). Codex keeps the plain idle window.
 pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     dialect: CliDialect,
     limits: ReadLimits,
     mut on_event: impl FnMut(&Value),
+    mut on_long_wait: impl FnMut(std::time::Duration),
 ) -> ReadEnd {
     let mut reader = tokio::io::BufReader::new(stdout);
     let mut result_line: Option<String> = None;
@@ -1537,6 +1698,8 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     let mut raw: Vec<u8> = Vec::new();
     let started = std::time::Instant::now();
     let settled = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() >= limits.settle);
+    let mut open = OpenTools::default();
+    let mut long_wait_noted = false;
     loop {
         if settled(result_at) {
             if let Some(line) = result_line.take() {
@@ -1548,11 +1711,28 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             return ReadEnd::AbsCap(result_line, tail);
         }
         raw.clear();
-        let mut wait = limits.idle.min(limits.cap - elapsed);
+        let window = if open.command_open() { limits.command_idle.max(limits.idle) } else { limits.idle };
+        let mut wait = window.min(limits.cap - elapsed);
         if let Some(at) = result_at {
             wait = wait.min(limits.settle.saturating_sub(at.elapsed()));
         }
-        let read = tokio::time::timeout(wait, reader.read_until(b'\n', &mut raw)).await;
+        let read = if wait > limits.idle {
+            // Only an open command waits past `idle`: say so once when it
+            // does, then wait out the rest. `raw` keeps a partial line.
+            let first = tokio::time::timeout(limits.idle, reader.read_until(b'\n', &mut raw)).await;
+            match first {
+                Err(_) => {
+                    if !long_wait_noted {
+                        long_wait_noted = true;
+                        on_long_wait(window);
+                    }
+                    tokio::time::timeout(wait - limits.idle, reader.read_until(b'\n', &mut raw)).await
+                }
+                done => done,
+            }
+        } else {
+            tokio::time::timeout(wait, reader.read_until(b'\n', &mut raw)).await
+        };
         match read {
             Err(_) => {
                 // Timed out after `wait`: the settle grace ran out, the
@@ -1563,7 +1743,7 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                 if started.elapsed() >= limits.cap {
                     return ReadEnd::AbsCap(result_line, tail);
                 }
-                return ReadEnd::Idle(result_line, tail);
+                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window });
             }
             Ok(Ok(0)) => break,  // EOF
             Ok(Ok(_)) => {}
@@ -1581,9 +1761,12 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
         let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
-        if dialect == CliDialect::Claude && is_result_event(&value) {
-            result_line = Some(trimmed.to_string());
-            result_at.get_or_insert_with(std::time::Instant::now);
+        if dialect == CliDialect::Claude {
+            open.observe(&value);
+            if is_result_event(&value) {
+                result_line = Some(trimmed.to_string());
+                result_at.get_or_insert_with(std::time::Instant::now);
+            }
         }
         on_event(&value);
     }
@@ -1977,13 +2160,16 @@ impl CliRunner {
                 }
             }
         };
-        let read_loop = read_stream(stdout, dialect, ReadLimits::STAGE, on_event);
+        let limits = ReadLimits::for_stage(stage_env_value("BASH_MAX_TIMEOUT_MS").as_deref());
+        let on_long_wait = |window: std::time::Duration| emitter.notice(&long_command_notice(window));
+        let read_loop = read_stream(stdout, dialect, limits, on_event, on_long_wait);
 
         // Race the child's output against the director's stop signal: poll the
         // cancel flag every ~500ms and, when set, stop the child's process
         // group (`stop_cli_child`) and fail the stage with the director message
         // and the usage streamed so far. An idle timeout fires when NO output arrives
-        // for IDLE_TIMEOUT_SECS; an absolute cap fires after ABS_CAP_SECS total.
+        // for IDLE_TIMEOUT_SECS (longer while a Claude Bash/PowerShell call is
+        // open, see `read_stream`); an absolute cap fires after ABS_CAP_SECS total.
         let cancel = std::sync::Arc::clone(&ctx.cancel);
         let cancel_watch = async move {
             loop {
@@ -2009,8 +2195,8 @@ impl CliRunner {
         let bin = dialect.binary();
         let (result_line, tail, timeout_kind, settled) = match read_end {
             ReadEnd::Eof(r, t) => (r, t, None, false),
-            ReadEnd::Idle(r, t) => (r, t, Some("timed out — no output for 5 minutes"), false),
-            ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap"), false),
+            ReadEnd::Idle(r, t, stall) => (r, t, Some(idle_timeout_message(&stall)), false),
+            ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap".to_string()), false),
             ReadEnd::Settled(r, t) => (Some(r), t, None, true),
         };
         // Is there a salvageable terminal state? Claude: a captured `result`
@@ -2024,7 +2210,7 @@ impl CliRunner {
             CliDialect::Claude => result_line.is_some(),
             CliDialect::Codex => false,
         };
-        if let (Some(kind), false) = (timeout_kind, has_terminal) {
+        if let (Some(kind), false) = (timeout_kind.as_deref(), has_terminal) {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
             return Ok(failed_stage_with_usage(

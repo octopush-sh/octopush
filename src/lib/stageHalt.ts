@@ -49,6 +49,14 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
   if (raw.includes("error_during_execution")) {
     return { title: "Claude hit an execution error mid-run", remedy: "Resume or re-run to continue." };
   }
+  // "claude timed out — Bash `npm test` gave no result for 11 minutes" (cli_runner.rs `idle_timeout_message`).
+  const stalled = /timed out — (.+) gave no result for (\d+ minutes?)/.exec(raw.split("\n")[0]);
+  if (stalled) {
+    return {
+      title: `${stalled[1]} gave no result for ${stalled[2]}`,
+      remedy: "Claude Code was still waiting on it. Check why it hangs, then resume or re-run.",
+    };
+  }
   if (/no output for/i.test(raw)) {
     return { title: "Claude produced no output and timed out", remedy: "The CLI stalled — resume or re-run." };
   }
