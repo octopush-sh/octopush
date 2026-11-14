@@ -719,24 +719,39 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
 // ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
 
 /// A writer outside a sandboxed mission, in a linked worktree.
-const CODEX_WS: CodexWriteScope<'static> = CodexWriteScope::Workspace { git_dir: Some("/repo/.git/worktrees/wt") };
+const CODEX_WS: CodexWriteScope<'static> =
+    CodexWriteScope::Workspace { git_dirs: &["/repo/.git/worktrees/wt", "/repo/.git/objects"] };
 
 #[test]
 fn codex_writer_runs_in_its_workspace_write_sandbox() {
     use crate::providers::Effort;
     let head = ["exec", "--json", "--skip-git-repo-check", "-m", "gpt-6.1-terra"];
-    let sandbox = ["--sandbox", "workspace-write", "--ask-for-approval", "never"];
-    let add_dir = ["--add-dir", "/repo/.git/worktrees/wt"];
+    // Only `--sandbox` is a flag (the read-only path has always passed it);
+    // the rest are `-c` config overrides, which `codex exec` takes like the
+    // effort, rather than `--ask-for-approval`/`--add-dir`, which it may not.
+    let sandbox = [
+        "--sandbox",
+        "workspace-write",
+        "-c",
+        "approval_policy=\"never\"",
+        "-c",
+        "sandbox_workspace_write.network_access=true",
+    ];
+    let roots = ["-c", "sandbox_workspace_write.writable_roots=[\"/repo/.git/worktrees/wt\",\"/repo/.git/objects\"]"];
     let plain = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CODEX_WS);
-    assert_eq!(plain, [&head[..], &sandbox[..], &add_dir[..], &["-"][..]].concat(), "{plain:?}");
-    // The effort override sits after the sandbox flags, before the stdin marker.
+    assert_eq!(plain, [&head[..], &sandbox[..], &roots[..], &["-"][..]].concat(), "{plain:?}");
+    assert!(!plain.iter().any(|a| a == "--ask-for-approval" || a == "--add-dir"), "{plain:?}");
+    // The effort override sits after the sandbox settings, before the stdin marker.
     let mut argv = plain.clone();
     CliDialect::Codex.push_effort_args(&mut argv, "gpt-6.1-terra", Some(Effort::High));
     let effort = ["-c", "model_reasoning_effort=\"high\""];
-    assert_eq!(argv, [&head[..], &sandbox[..], &add_dir[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
-    // A main checkout (no own git dir) gets no `--add-dir`: the shared `.git` is never added.
-    let main = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::Workspace { git_dir: None });
+    assert_eq!(argv, [&head[..], &sandbox[..], &roots[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
+    // A main checkout (no git dirs of its own) gets no extra roots: the shared `.git` is never added.
+    let main = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::Workspace { git_dirs: &[] });
     assert_eq!(main, [&head[..], &sandbox[..], &["-"][..]].concat(), "{main:?}");
+    // A path is written as a TOML string, quotes and backslashes escaped.
+    let odd = CliDialect::Codex.argv("gpt-5", "s", 1, false, CodexWriteScope::Workspace { git_dirs: &["/a \"b\"\\c"] });
+    assert!(odd.contains(&"sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\"\\\\c\"]".to_string()), "{odd:?}");
     // Inside a sandboxed mission the bypass flag stays (Seatbelt confines it).
     let mission = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::MissionSandbox);
     assert_eq!(mission, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{mission:?}");
@@ -769,7 +784,7 @@ fn codex_argv_without_an_effort_keeps_codexs_own_default() {
     let mut argv = plain.clone();
     CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", None);
     assert_eq!(argv, plain);
-    assert!(!argv.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")), "{argv:?}");
+    assert!(!argv.iter().any(|a| a.contains("model_reasoning_effort")), "{argv:?}");
 }
 
 #[test]
@@ -784,7 +799,7 @@ fn codex_argv_on_a_model_outside_the_catalog_carries_no_override() {
             let mut argv = plain.clone();
             CliDialect::Codex.push_effort_args(&mut argv, model, Some(effort));
             assert_eq!(argv, plain, "[{model} {effort:?}]");
-            assert!(!argv.iter().any(|a| a == "-c" || a.contains("model_reasoning_effort")), "{argv:?}");
+            assert!(!argv.iter().any(|a| a.contains("model_reasoning_effort")), "{argv:?}");
         }
     }
 }

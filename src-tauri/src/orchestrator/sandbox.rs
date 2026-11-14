@@ -200,6 +200,14 @@ fn ancestors_within(root: &str, path: &str) -> Vec<String> {
         .collect()
 }
 
+/// The shared git subtrees `git add`/`git commit`/`git stash` write: objects,
+/// refs, reflogs and the reftable. Never hooks, `info/` or config. One list for
+/// the Seatbelt rules and Codex's writable roots, so the two can't drift. Pure.
+fn shared_git_write_subpaths(common_dir: &str) -> [String; 4] {
+    let c = common_dir.trim_end_matches('/');
+    ["objects", "refs", "logs", "reftable"].map(|d| format!("{c}/{d}"))
+}
+
 /// The git write rules for a workspace. Allows what `git add`/`git commit` need
 /// — the per-worktree git dir plus the shared objects, refs, reflogs and
 /// packed-refs (or reftable) — which a linked worktree keeps outside its own
@@ -240,13 +248,7 @@ fn git_write_rules(workspace: &str, layout: &GitLayout, write_roots: &[String]) 
         deny_literals.extend(ancestors_within(root, hooks));
     }
     let mut rules = WriteRules {
-        subpaths: vec![
-            g.to_string(),
-            format!("{c}/objects"),
-            format!("{c}/refs"),
-            format!("{c}/logs"),
-            format!("{c}/reftable"),
-        ],
+        subpaths: std::iter::once(g.to_string()).chain(shared_git_write_subpaths(c)).collect(),
         literals: vec![format!("{c}/packed-refs"), format!("{c}/packed-refs.lock")],
         deny_subpaths: vec![
             hooks.to_string(),
@@ -358,20 +360,28 @@ fn resolve_git_layout(workspace: &str) -> AppResult<Option<GitLayout>> {
     Ok(Some(layout))
 }
 
-/// The extra dir a Codex writer stage gets with `--add-dir`: a linked
-/// worktree's own git dir (`<common>/worktrees/<name>`: index, HEAD), so
-/// `git add`/`git stash` there can update its index. Never the shared git dir,
-/// so hooks and config stay out of reach — a main checkout, whose git dir IS
-/// the shared one, gets none. Pure.
-fn codex_git_write_dir(layout: &GitLayout) -> Option<String> {
-    (layout.git_dir != layout.common_dir).then(|| layout.git_dir.clone())
+/// The git dirs a Codex writer stage in a linked worktree gets as extra
+/// writable roots, the same ones the Seatbelt rules allow: the worktree's own
+/// git dir (`<common>/worktrees/<name>`: index, HEAD) plus the shared objects,
+/// refs, reflogs and reftable, so `git add`, `git commit` and `git stash`
+/// work. Never the shared git dir itself, so hooks and config stay out of
+/// reach. A main checkout, whose git dir IS the shared one, gets none. Pure.
+fn codex_git_write_dirs(layout: &GitLayout) -> Vec<String> {
+    if layout.git_dir == layout.common_dir {
+        return Vec::new();
+    }
+    std::iter::once(layout.git_dir.clone()).chain(shared_git_write_subpaths(&layout.common_dir)).collect()
 }
 
-/// [`codex_git_write_dir`] for `workspace`, resolved like the Seatbelt
-/// profile's git rules. `None` when the workspace has no git dir of its own or
-/// git can't vouch for it: the stage then runs with the worktree alone.
-pub fn codex_add_dir(workspace: &str) -> Option<String> {
-    resolve_git_layout(workspace).ok().flatten().as_ref().and_then(codex_git_write_dir)
+/// [`codex_git_write_dirs`] for `workspace`, resolved like the Seatbelt
+/// profile's git rules, keeping only dirs that exist (a repo has a `reftable/`
+/// only in the reftable format). Empty when the workspace has no git dir of
+/// its own or git can't vouch for it: the stage then runs with the worktree alone.
+pub fn codex_writable_git_dirs(workspace: &str) -> Vec<String> {
+    let Ok(Some(layout)) = resolve_git_layout(workspace) else {
+        return Vec::new();
+    };
+    codex_git_write_dirs(&layout).into_iter().filter(|d| Path::new(d).is_dir()).collect()
 }
 
 /// Render an SBPL profile that allows everything by default, denies all file
@@ -858,19 +868,47 @@ mod tests {
     }
 
     #[test]
-    fn codex_gets_only_a_linked_worktrees_own_git_dir() {
-        assert_eq!(codex_git_write_dir(&linked_layout()).as_deref(), Some("/repo/.git/worktrees/wt"));
-        // A main checkout's git dir is the shared one: never added.
-        assert_eq!(codex_git_write_dir(&main_layout()), None);
+    fn codex_gets_the_seatbelt_git_write_dirs_but_never_hooks_or_config() {
+        let dirs = codex_git_write_dirs(&linked_layout());
+        assert_eq!(
+            dirs,
+            [
+                "/repo/.git/worktrees/wt",
+                "/repo/.git/objects",
+                "/repo/.git/refs",
+                "/repo/.git/logs",
+                "/repo/.git/reftable",
+            ]
+        );
+        // The same subtrees the Seatbelt profile allows, nothing more.
+        let seatbelt = git_write_rules("/wt", &linked_layout(), &[]);
+        for d in &dirs {
+            assert!(seatbelt.subpaths.contains(d), "{d} isn't a Seatbelt write root");
+        }
+        // Never the shared git dir itself, its hooks or its config.
+        for d in ["/repo/.git", "/repo/.git/hooks", "/repo/.git/config", "/repo/.git/info"] {
+            assert!(!dirs.iter().any(|x| x == d), "{d} must not be writable");
+        }
+        // A main checkout's git dir is the shared one: nothing is added.
+        assert!(codex_git_write_dirs(&main_layout()).is_empty());
         let Some((_dir, main, wt)) = repo_with_worktree() else {
             eprintln!("git unavailable; skipping");
             return;
         };
         let common = canonical_string(&main.join(".git"));
-        assert_eq!(codex_add_dir(wt.to_str().unwrap()), Some(format!("{common}/worktrees/wt")));
-        assert_eq!(codex_add_dir(main.to_str().unwrap()), None);
+        // No `reftable/` in a files-format repo, so it's left out.
+        assert_eq!(
+            codex_writable_git_dirs(wt.to_str().unwrap()),
+            [
+                format!("{common}/worktrees/wt"),
+                format!("{common}/objects"),
+                format!("{common}/refs"),
+                format!("{common}/logs"),
+            ]
+        );
+        assert!(codex_writable_git_dirs(main.to_str().unwrap()).is_empty());
         let plain = tempfile::tempdir().unwrap();
-        assert_eq!(codex_add_dir(plain.path().to_str().unwrap()), None);
+        assert!(codex_writable_git_dirs(plain.path().to_str().unwrap()).is_empty());
     }
 
     #[test]
