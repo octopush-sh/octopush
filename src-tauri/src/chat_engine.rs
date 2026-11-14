@@ -1162,7 +1162,7 @@ pub(crate) fn execute_tool_cancellable(
                     Ok(p) => {
                         let mut c = std::process::Command::new(&p.program);
                         c.args(&p.args);
-                        // Redirect build-tool caches into the mission's own
+                        // Redirect build-tool caches into the workspace's own
                         // cache root, not the user's real ~/.cargo etc. (which
                         // the profile doesn't expose).
                         c.envs(p.env);

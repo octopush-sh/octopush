@@ -2027,8 +2027,8 @@ impl CliRunner {
         for (k, v) in login_shell_env() {
             command.env(k, v);
         }
-        // Sandboxed: redirect build-tool caches into the mission's own cache
-        // root so builds work without exposing the real ~/.cargo etc. Overrides
+        // Sandboxed: redirect build-tool caches into the stage's own cache
+        // root (per workspace and access mode) so builds work without exposing the real ~/.cargo etc. Overrides
         // any cache vars the login shell set.
         for (k, v) in sandbox_env {
             command.env(k, v);
