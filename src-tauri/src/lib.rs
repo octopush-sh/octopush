@@ -386,6 +386,7 @@ pub fn run() {
             commands::create_tag,
             commands::list_tags,
             commands::find_pr_for_branch,
+            commands::pr_failed_check_logs,
             commands::open_prs_for_project,
             commands::list_prs,
             commands::list_github_issues,

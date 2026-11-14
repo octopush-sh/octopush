@@ -875,3 +875,46 @@ describe("ContextHeader", () => {
     }
   });
 });
+
+describe("ContextHeader — PR chip checks", () => {
+  const pr: Pr = { number: 7, title: "Feat", url: "https://x/7", isDraft: false, state: "open" };
+
+  function renderWithChecks(checks: Pr["checks"], onFixChecks?: (p: Pr) => void) {
+    return render(
+      <ContextHeader
+        workspaceName="X"
+        branch="feat/x"
+        gitStatus={null}
+        pr={{ ...pr, checks }}
+        onFixChecks={onFixChecks}
+      />,
+    );
+  }
+
+  it("shows no checks glyph when the checks couldn't be read", () => {
+    const { container } = renderWithChecks(undefined, vi.fn());
+    expect(container.querySelector('[data-tour="pr-chip-checks"]')).toBeNull();
+    expect(screen.queryByRole("button", { name: "Fix failing checks…" })).not.toBeInTheDocument();
+  });
+
+  it("tints the glyph by state: sage passing, amber pending", () => {
+    const { unmount } = renderWithChecks({ state: "passing", failing: [] });
+    expect(screen.getByRole("img", { name: "Checks passing" })).toHaveClass("text-octo-sage");
+    unmount();
+    renderWithChecks({ state: "pending", failing: [] }, vi.fn());
+    expect(screen.getByRole("img", { name: "Checks running" })).toHaveClass("text-octo-warning");
+    expect(screen.queryByRole("button", { name: "Fix failing checks…" })).not.toBeInTheDocument();
+  });
+
+  it("on failing checks: rouge glyph naming them, and Fix failing checks… hands the PR over", async () => {
+    const onFix = vi.fn();
+    const checks = { state: "failing" as const, failing: [{ name: "test", runId: 3 }, { name: "lint", runId: null }] };
+    renderWithChecks(checks, onFix);
+    const glyph = screen.getByRole("img", { name: "Checks failing: test, lint" });
+    expect(glyph).toHaveClass("text-octo-rouge");
+    expect(glyph).toHaveAttribute("title", "Checks failing: test, lint");
+    await userEvent.click(screen.getByRole("button", { name: "Fix failing checks…" }));
+    expect(onFix).toHaveBeenCalledWith({ ...pr, checks });
+    expect(ipc.openFileInSystem).not.toHaveBeenCalledWith("https://x/7");
+  });
+});

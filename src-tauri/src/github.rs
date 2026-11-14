@@ -33,6 +33,169 @@ pub struct Pr {
     pub url: String,
     pub is_draft: bool,
     pub state: PrState,
+    /// The CI checks on the PR's head commit, for open and draft PRs. `None`
+    /// when the PR has no checks or they couldn't be read (no `gh`, no token).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checks: Option<PrChecks>,
+}
+
+/// The rolled-up state of a PR's CI checks: any failing check makes the PR
+/// failing, else any unfinished one makes it pending.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ChecksState {
+    Passing,
+    Pending,
+    Failing,
+}
+
+/// One failing check: its name and, for a GitHub Actions check, the workflow
+/// run id `gh run view <id> --log-failed` reads its log from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FailingCheck {
+    pub name: String,
+    pub run_id: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrChecks {
+    pub state: ChecksState,
+    /// Failing checks in GitHub's order, one per name.
+    pub failing: Vec<FailingCheck>,
+}
+
+/// How one check counts toward the rollup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    Ok,
+    Pending,
+    Failed,
+}
+
+/// Classify a check-run (`status` + `conclusion`) or a commit status
+/// (`state`), case-insensitively: `gh` says `COMPLETED`/`FAILURE`, REST says
+/// `completed`/`failure`. Cancelled, neutral, skipped and stale don't fail a
+/// PR (a cancelled run is usually one a newer push superseded).
+fn check_outcome(status: Option<&str>, conclusion: Option<&str>, state: Option<&str>) -> CheckOutcome {
+    if let Some(state) = state {
+        return match state.to_ascii_lowercase().as_str() {
+            "failure" | "error" => CheckOutcome::Failed,
+            "pending" | "expected" => CheckOutcome::Pending,
+            _ => CheckOutcome::Ok,
+        };
+    }
+    let status = status.unwrap_or("completed").to_ascii_lowercase();
+    if status != "completed" {
+        return CheckOutcome::Pending;
+    }
+    match conclusion.unwrap_or("").to_ascii_lowercase().as_str() {
+        "failure" | "timed_out" | "action_required" | "startup_failure" => CheckOutcome::Failed,
+        _ => CheckOutcome::Ok,
+    }
+}
+
+/// The workflow run id in a GitHub Actions URL
+/// (`https://github.com/o/r/actions/runs/123/job/456` → 123).
+pub fn actions_run_id(url: &str) -> Option<u64> {
+    let rest = url.split("/actions/runs/").nth(1)?;
+    rest.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+}
+
+/// Roll up `(name, outcome, details url)` triples. `None` with no checks.
+fn rollup(checks: impl Iterator<Item = (String, CheckOutcome, Option<String>)>) -> Option<PrChecks> {
+    let mut any = false;
+    let mut pending = false;
+    let mut failing: Vec<FailingCheck> = Vec::new();
+    for (name, outcome, url) in checks {
+        any = true;
+        match outcome {
+            CheckOutcome::Ok => {}
+            CheckOutcome::Pending => pending = true,
+            CheckOutcome::Failed => {
+                if !failing.iter().any(|f| f.name == name) {
+                    failing.push(FailingCheck { name, run_id: url.as_deref().and_then(actions_run_id) });
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let state = if !failing.is_empty() {
+        ChecksState::Failing
+    } else if pending {
+        ChecksState::Pending
+    } else {
+        ChecksState::Passing
+    };
+    Some(PrChecks { state, failing })
+}
+
+/// Parse `gh pr … --json statusCheckRollup`'s array, which mixes check runs
+/// (`__typename: "CheckRun"`: `name`, `status`, `conclusion`, `detailsUrl`)
+/// and commit statuses (`"StatusContext"`: `context`, `state`, `targetUrl`).
+pub fn checks_from_gh_rollup(rollup_json: &serde_json::Value) -> Option<PrChecks> {
+    let items = rollup_json.as_array()?;
+    rollup(items.iter().map(|c| {
+        let is_status = c["__typename"].as_str() == Some("StatusContext")
+            || (c.get("context").is_some() && c.get("conclusion").is_none());
+        if is_status {
+            (
+                c["context"].as_str().unwrap_or("status").to_string(),
+                check_outcome(None, None, Some(c["state"].as_str().unwrap_or("pending"))),
+                c["targetUrl"].as_str().map(str::to_string),
+            )
+        } else {
+            (
+                c["name"].as_str().unwrap_or("check").to_string(),
+                check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
+                c["detailsUrl"].as_str().map(str::to_string),
+            )
+        }
+    }))
+}
+
+/// Parse the REST `GET /repos/{o}/{r}/commits/{sha}/check-runs` body
+/// (`{ "check_runs": [{ name, status, conclusion, details_url, html_url }] }`).
+pub fn checks_from_rest_check_runs(body: &serde_json::Value) -> Option<PrChecks> {
+    let runs = body["check_runs"].as_array()?;
+    rollup(runs.iter().map(|c| {
+        (
+            c["name"].as_str().unwrap_or("check").to_string(),
+            check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
+            c["details_url"].as_str().or_else(|| c["html_url"].as_str()).map(str::to_string),
+        )
+    }))
+}
+
+/// The most a "Fix failing checks" brief carries of the failed-step logs.
+pub const FAILED_LOG_MAX_CHARS: usize = 8_000;
+
+/// The last `max` chars of `s` (char-safe), whole when it already fits.
+pub fn tail_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    s.chars().skip(count - max).collect()
+}
+
+/// Join each run's `gh run view --log-failed` output under a `run <id>`
+/// header, splitting the budget evenly and keeping each log's TAIL (where the
+/// failure is). Empty logs are left out.
+pub fn join_failed_logs(logs: &[(u64, String)], max: usize) -> String {
+    let logs: Vec<&(u64, String)> = logs.iter().filter(|(_, l)| !l.trim().is_empty()).collect();
+    if logs.is_empty() {
+        return String::new();
+    }
+    let per = max / logs.len();
+    let parts: Vec<String> = logs
+        .iter()
+        .map(|(id, log)| format!("run {id}\n{}", tail_chars(log.trim_end(), per)))
+        .collect();
+    tail_chars(&parts.join("\n\n"), max)
 }
 
 /// Map a raw GitHub PR JSON value (from the REST API or `gh pr list`) into
@@ -131,6 +294,7 @@ pub fn pr_from_json(v: &serde_json::Value) -> Pr {
         title,
         is_draft,
         state,
+        checks: None,
     }
 }
 
@@ -285,6 +449,7 @@ pub fn pr_from_create_output(stdout: &str, title: &str, draft: bool) -> Option<P
         url: url.to_string(),
         is_draft: draft,
         state: if draft { PrState::Draft } else { PrState::Open },
+        checks: None,
     })
 }
 

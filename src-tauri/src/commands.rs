@@ -5272,7 +5272,7 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt --limit 1",
+        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,statusCheckRollup --limit 1",
         branch.replace('\'', "'\\''"),
     );
 
@@ -5303,7 +5303,16 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     if let Some(merged_at) = pr.get("mergedAt").cloned() {
         pr["merged_at"] = merged_at;
     }
-    Some(crate::github::pr_from_json(&pr))
+    let mut out = crate::github::pr_from_json(&pr);
+    if pr_wants_checks(&out) {
+        out.checks = crate::github::checks_from_gh_rollup(&pr["statusCheckRollup"]);
+    }
+    Some(out)
+}
+
+/// Only a live PR's checks are worth a glyph; a merged or closed one is done.
+fn pr_wants_checks(pr: &crate::github::Pr) -> bool {
+    matches!(pr.state, crate::github::PrState::Open | crate::github::PrState::Draft)
 }
 
 /// Look up the most recent pull request for the current branch on GitHub
@@ -5412,7 +5421,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .map_err(|e| AppError::Other(format!("http client: {e}")))?;
 
     let mut req = client.get(&api).header("Accept", "application/vnd.github+json");
-    if let Some(tok) = token {
+    if let Some(tok) = &token {
         req = req.header("Authorization", format!("Bearer {}", tok));
     }
 
@@ -5449,7 +5458,69 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         return Ok(None);
     };
 
-    Ok(Some(crate::github::pr_from_json(&pr)))
+    let mut out = crate::github::pr_from_json(&pr);
+    // Checks cost a second request, so only with a token: unauthenticated,
+    // the 60/hour limit is already spent by the 60s poll above.
+    if let (true, Some(tok), Some(sha)) = (pr_wants_checks(&out), &token, pr["head"]["sha"].as_str()) {
+        out.checks = rest_check_runs(&client, tok, &owner, &repo_name, sha).await;
+    }
+    Ok(Some(out))
+}
+
+/// The check runs on `sha` through REST, rolled up. `None` on any error — the
+/// chip then just shows no checks glyph.
+async fn rest_check_runs(
+    client: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Option<crate::github::PrChecks> {
+    let url = format!(
+        "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
+    );
+    let resp = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("Authorization", format!("Bearer {token}"))
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        tracing::info!(status = %resp.status(), "find_pr_for_branch: check-runs not readable");
+        return None;
+    }
+    let body: serde_json::Value = resp.json().await.ok()?;
+    crate::github::checks_from_rest_check_runs(&body)
+}
+
+/// The tail of the failed steps' logs of these GitHub Actions runs
+/// (`gh run view <id> --log-failed`), joined and capped at
+/// `FAILED_LOG_MAX_CHARS`, for the "Fix failing checks…" brief. Empty — never
+/// an error — without `gh` or when a log can't be read.
+#[tauri::command]
+pub async fn pr_failed_check_logs(workspace_path: String, run_ids: Vec<u64>) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut logs: Vec<(u64, String)> = Vec::new();
+    // At most three runs: the budget split further would leave each too little.
+    for id in run_ids.into_iter().take(3) {
+        // `id` is a number, so it is safe in the command line.
+        let run = tokio::process::Command::new(&shell)
+            .arg("-l")
+            .arg("-c")
+            .arg(format!("gh run view {id} --log-failed"))
+            .current_dir(&workspace_path)
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(30), run).await {
+            Ok(Ok(out)) if out.status.success() => {
+                logs.push((id, String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            _ => tracing::info!(run_id = id, "pr_failed_check_logs: log not readable"),
+        }
+    }
+    Ok(crate::github::join_failed_logs(&logs, crate::github::FAILED_LOG_MAX_CHARS))
 }
 
 /// Batch: all OPEN pull requests for the project's GitHub repo, keyed by head

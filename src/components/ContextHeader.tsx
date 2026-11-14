@@ -1,7 +1,9 @@
 import { useEffect } from "react";
-import { Copy, GitBranch, Hammer, Shield } from "lucide-react";
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Shield, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
-import type { GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
+import { checksTitle } from "../lib/prChecks";
+import type { ChecksState, GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
@@ -42,6 +44,13 @@ const PR_STATE_STYLE: Record<PrState, { color: string; bg: string; border: strin
     border: "var(--rouge-border)",
     glyph: "✕",
   },
+};
+
+/** The PR chip's CI checks glyph: sage passing, amber pending, rouge failing. */
+const CHECKS_STYLE: Record<ChecksState, { color: string; Icon: LucideIcon }> = {
+  passing: { color: "text-octo-sage", Icon: CircleCheck },
+  pending: { color: "text-octo-warning", Icon: CircleDashed },
+  failing: { color: "text-octo-rouge", Icon: CircleX },
 };
 
 /** Mute `·` between eyebrow atoms. Never a connector glyph — `⟶` is retired. */
@@ -85,6 +94,9 @@ interface Props {
   /** Called with the PR's html_url when the chip is clicked. Typically
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
+  /** "Fix failing checks…": shown on the chip only while the PR's checks
+   *  fail. Seeds the Direct launcher; the user still picks the crew. */
+  onFixChecks?: (pr: Pr) => void;
   /** The active workspace. A manually linked ticket (linkedIssueKey) wins;
    *  otherwise a branch-detected key gated on the project's Jira key
    *  (detectIssueKeyForProject). */
@@ -130,6 +142,7 @@ export function ContextHeader({
   gitStatus,
   pr,
   onOpenPr,
+  onFixChecks,
   workspace = null,
   issueTrackerConfigured = false,
   jiraProjectKey = null,
@@ -350,6 +363,36 @@ export function ContextHeader({
                 <span className={style.color}>PR · #{pr.number}</span>
                 <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>↗</span>
               </button>
+              {pr.checks && (() => {
+                const checks = CHECKS_STYLE[pr.checks.state];
+                const title = checksTitle(pr.checks);
+                return (
+                  <span
+                    key={pr.checks.state}
+                    data-tour="pr-chip-checks"
+                    role="img"
+                    aria-label={title}
+                    title={title}
+                    className={`octo-pop-in flex items-center px-0.5 ${checks.color}`}
+                  >
+                    <checks.Icon size={11} aria-hidden />
+                  </span>
+                );
+              })()}
+              {pr.checks?.state === "failing" && onFixChecks && (
+                <button
+                  type="button"
+                  aria-label="Fix failing checks…"
+                  title="Fix failing checks…"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onFixChecks(pr);
+                  }}
+                  className="octo-pop-in flex shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                >
+                  <Wrench size={11} />
+                </button>
+              )}
               <button
                 type="button"
                 aria-label="Copy PR URL"
