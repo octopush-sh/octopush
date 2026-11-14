@@ -9163,6 +9163,51 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn only_a_sandboxed_mission_blocks_file_reads_outside_the_worktree() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, read_guard_label, CliDialect, CodexWriteScope};
+        // #702: the Seatbelt profile denies writes only; a sandboxed mission's
+        // Claude stages also get the read guard, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        let argvs = || {
+            vec![
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ]
+        };
+        for mut args in argvs() {
+            assert!(confine_reads_in_sandbox(CliDialect::Claude, "sandbox", &mut args));
+            let v = settings(&args);
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+            assert_eq!(v["permissions"]["blockReadsOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+        }
+        for mut args in argvs() {
+            assert!(!confine_reads_in_sandbox(CliDialect::Claude, "none", &mut args));
+            let v = settings(&args);
+            assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+            assert!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_none(), "{args:?}");
+        }
+        // Codex has no `--settings`; its argv is left alone even when sandboxed.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let mut swapped = codex.clone();
+        assert!(!confine_reads_in_sandbox(CliDialect::Codex, "sandbox", &mut swapped));
+        assert_eq!(swapped, codex);
+        // The launch line says so only on a known CLI too old for the read guard.
+        assert_eq!(
+            read_guard_label(true, Some("2.1.250")).as_deref(),
+            Some("file reads not confined (Claude Code 2.1.257+ needed)")
+        );
+        assert_eq!(read_guard_label(true, Some("2.1.257")), None);
+        assert_eq!(read_guard_label(true, None), None, "an unknown version never warns");
+        assert_eq!(read_guard_label(false, Some("2.1.250")), None, "unsandboxed: nothing was asked for");
+    }
+
+    #[test]
     fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
         use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
         // #362: a run budget's remaining headroom caps the Claude stage.

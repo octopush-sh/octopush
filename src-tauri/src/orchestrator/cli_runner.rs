@@ -766,6 +766,45 @@ pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 /// straight to `Command::args` with no shell, so the JSON needs no quoting.
 pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true}}"#;
 
+/// [`CLAUDE_STAGE_SETTINGS`] plus the read guard, for a Claude stage in a
+/// sandboxed mission: Read/Grep/Glob refuse paths outside the working
+/// directories too, so an agent can't pull `~/.ssh`, `~/.aws` or a sibling
+/// repo into its context. The Seatbelt profile only denies writes. Like the
+/// write guard it covers Claude Code's file tools, not `Bash`. Unsandboxed
+/// missions keep the write guard only: their agents read dependency sources
+/// outside the worktree.
+pub const CLAUDE_SANDBOXED_STAGE_SETTINGS: &str =
+    r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true,"blockReadsOutsideWorkingDirectories":true}}"#;
+
+/// The oldest Claude Code that honours `blockReadsOutsideWorkingDirectories`;
+/// older CLIs ignore the key.
+pub const CLAUDE_READ_GUARD_FLOOR: &str = "2.1.257";
+
+/// In a sandboxed mission, swap a Claude stage's `--settings` value (fresh or
+/// resumed argv) for [`CLAUDE_SANDBOXED_STAGE_SETTINGS`]. Returns whether it
+/// did; Codex stages and unsandboxed missions are left as they are. Pure.
+pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_isolation: &str, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || exec_isolation != "sandbox" {
+        return false;
+    }
+    match args.iter().position(|a| a == "--settings") {
+        Some(i) if i + 1 < args.len() => {
+            args[i + 1] = CLAUDE_SANDBOXED_STAGE_SETTINGS.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The launch line's note when the read guard was asked for but the known
+/// CLI is too old to honour it; `None` otherwise (an unknown version never
+/// warns). Pure.
+pub fn read_guard_label(reads_confined: bool, cli_version: Option<&str>) -> Option<String> {
+    let v = cli_version.filter(|_| reads_confined)?;
+    crate::agent_adapter::version_below(v, CLAUDE_READ_GUARD_FLOOR)
+        .then(|| format!("file reads not confined (Claude Code {CLAUDE_READ_GUARD_FLOOR}+ needed)"))
+}
+
 /// Build the argv (after the program name) for a headless `claude -p` run.
 /// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
@@ -1941,6 +1980,8 @@ impl CliRunner {
                 ),
             ),
         };
+        // A sandboxed mission also confines the file tools' reads (fresh and resumed).
+        let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_isolation, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).
@@ -2063,11 +2104,14 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}",
+            "launching {} · {}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
             dialect.sandbox_label(read_only, write_scope).map(|s| format!(" · {s}")).unwrap_or_default(),
+            read_guard_label(reads_confined, cli_version.as_ref().and_then(|v| v.version.as_deref()))
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {
