@@ -9,7 +9,15 @@ import { Reveal } from "../primitives/Reveal";
 import { archetypes, archetypeFor, MAX_LOOP_ITERATIONS, stageLabel, TOOLS, type StageNode, type StageNodeData } from "./graph";
 import { iconForRole } from "../../lib/roleIcons";
 import { useRolesStore } from "../../stores/rolesStore";
-import { cliTooOldForEffort, codexEffortLevel, effortApplies, loadClaudeCliVersion, runsOnClaudeCode } from "../../lib/claudeCli";
+import {
+  cliTooOldForEffort,
+  codexClampTitle,
+  codexEffortLevel,
+  codexEffortLevels,
+  effortApplies,
+  loadClaudeCliVersion,
+  runsOnClaudeCode,
+} from "../../lib/claudeCli";
 import { apiEffortOffTitle, EFFORT_OFF_TITLE } from "../../lib/apiEffort";
 import type { ClaudeCliVersion, Effort } from "../../lib/ipc";
 
@@ -40,24 +48,24 @@ const CLI_EFFORT_OPTIONS = [
 ];
 /** On a Codex stage no effort means Codex's own default (its config file's
  *  `model_reasoning_effort`), and a level the model doesn't list in Codex's
- *  catalog runs as the highest one it does. A model the catalog doesn't know
- *  gets no effort at all (the control is disabled), so Auto says why. */
+ *  catalog runs as the one `clampToListedLevels` picks. A model without known
+ *  levels gets no effort at all (the control is disabled), and the control
+ *  says why (`codexEffortOffTitle`). */
 const CODEX_LEVEL_LABELS: Record<string, string> = { low: "Low", medium: "Med", high: "High", xhigh: "XHi", max: "Max" };
+const codexLevelLabel = (level: string) => CODEX_LEVEL_LABELS[level] ?? level;
+function codexEffortOffTitle(model: string): string | null {
+  if (codexEffortLevel(model, "low") !== null) return null;
+  return codexEffortLevels(model)
+    ? "Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default"
+    : "This model isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's own default";
+}
 function codexEffortOptions(model: string) {
-  const known = codexEffortLevel(model, "low") !== null;
+  const listed = codexEffortLevels(model) ?? [];
   return [
-    {
-      value: "off" as const,
-      label: "Auto",
-      title: known
-        ? "Codex's own default effort for this model"
-        : "Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default",
-    },
+    { value: "off" as const, label: "Auto", title: codexEffortOffTitle(model) ?? "Codex's own default effort for this model" },
     ...EFFORT_OPTIONS.slice(1).map((o) => {
-      const runs = codexEffortLevel(model, o.value);
-      return runs && runs !== o.value
-        ? { ...o, title: `Runs as ${CODEX_LEVEL_LABELS[runs] ?? runs}, the highest level this model lists in Codex` }
-        : o;
+      const title = codexClampTitle(listed, o.value, codexLevelLabel);
+      return title ? { ...o, title } : o;
     }),
   ];
 }
@@ -97,14 +105,22 @@ function EffortControl({
   return (
     <>
       <Reveal open={!tooOld}>
-        <SegmentedControl
-          fill
-          disabled={!applies}
-          options={options}
-          value={value ?? "off"}
-          onChange={(v) => onChange(v === "off" ? null : v)}
-          ariaLabel={ariaLabel}
-        />
+        {/* A disabled button may fire no mouse events in WebKit, so the
+            reason rides this wrapper, and the pointer passes through the
+            disabled control to it. */}
+        <div
+          title={!applies ? (codexEffortOffTitle(model) ?? undefined) : undefined}
+          className={!applies ? "cursor-not-allowed *:pointer-events-none" : undefined}
+        >
+          <SegmentedControl
+            fill
+            disabled={!applies}
+            options={options}
+            value={value ?? "off"}
+            onChange={(v) => onChange(v === "off" ? null : v)}
+            ariaLabel={ariaLabel}
+          />
+        </div>
       </Reveal>
       <Reveal open={tooOld}>
         <span className="font-mono text-[9px] text-octo-mute">

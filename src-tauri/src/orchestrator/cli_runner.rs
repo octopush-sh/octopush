@@ -931,10 +931,21 @@ fn codex_effort_table() -> &'static std::collections::HashMap<String, Vec<String
     })
 }
 
-/// The levels Codex lists for `model` (case-insensitive slug match), or `None`
-/// for a model missing from its catalog. An empty list = a non-reasoning model.
+/// The levels Codex lists for `model`, or `None` for a model missing from its
+/// catalog. An empty list = a non-reasoning model. Matched the way Codex finds
+/// a model's info: case-insensitively, the longest catalog slug that prefixes
+/// the id (so `gpt-5.5-2026-03-01` gets `gpt-5.5`'s levels), then once more
+/// with one leading `namespace/` stripped (`openai/gpt-5.5`).
 pub fn codex_effort_levels(model: &str) -> Option<&'static [String]> {
-    codex_effort_table().get(&model.trim().to_ascii_lowercase()).map(Vec::as_slice)
+    let id = model.trim().to_ascii_lowercase();
+    let longest_prefix = |id: &str| {
+        codex_effort_table()
+            .iter()
+            .filter(|(slug, _)| id.starts_with(slug.as_str()))
+            .max_by_key(|(slug, _)| slug.len())
+            .map(|(_, levels)| levels.as_slice())
+    };
+    longest_prefix(&id).or_else(|| longest_prefix(id.split_once('/')?.1))
 }
 
 /// The level Codex gets for `effort` on `model`: the effort itself when the
@@ -1107,8 +1118,13 @@ impl CliDialect {
         let e = effort?;
         (*self == CliDialect::Codex && self.effort_level(model, Some(e)).is_none()).then(|| {
             format!(
-                "This stage's {} effort is not passed to Codex: its model catalog lists no reasoning levels for {model}, so it runs at Codex's default effort.",
-                e.as_str()
+                "This stage's {} effort is not passed to Codex: {model} {}, so it runs at Codex's default effort.",
+                e.as_str(),
+                if codex_effort_levels(model).is_some() {
+                    "lists no reasoning levels in Codex's model catalog"
+                } else {
+                    "isn't in Octopush's copy of Codex's model catalog"
+                }
             )
         })
     }
