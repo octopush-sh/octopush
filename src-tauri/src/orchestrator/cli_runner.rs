@@ -1066,14 +1066,22 @@ impl CliDialect {
     /// Code moves it to the background right away", and a stage settled on its
     /// `result` could otherwise hand on work that is still running. The
     /// changelog scopes that to the terminal, so this is a defensive pin; an
-    /// older CLI ignores the unknown variable. Set on fresh and `--resume` runs
-    /// alike; Run-mode terminals never get it — backgrounding is theirs to keep.
+    /// older CLI ignores the unknown variable. Skills stay as the stage found
+    /// them (`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`): 2.1.321 "changed headless
+    /// sessions to reload mods in `.claude/skills` when their files change",
+    /// so a stage that writes (or is tricked into planting) a skill in the
+    /// worktree it edits would change its own instructions mid-stage, and a
+    /// reviewer would certify work done under other rules than it started
+    /// with; an older CLI ignores this one too. All are set on fresh and
+    /// `--resume` runs alike; Run-mode terminals never get them — backgrounding
+    /// and skill reloads are theirs to keep, since a human is directing there.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
                 ("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", BG_WAIT_CEILING_MS.to_string()),
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
                 ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
+                ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
         }

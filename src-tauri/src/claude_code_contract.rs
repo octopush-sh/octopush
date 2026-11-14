@@ -716,6 +716,17 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND"));
 }
 
+#[test]
+fn claude_stage_env_keeps_the_skills_the_stage_started_with() {
+    // 2.1.321 reloads `.claude/skills` in headless sessions when their files
+    // change; a stage writing its own worktree must not rewrite its own rules.
+    // `stage_env` takes no resume flag, so fresh and `--resume` spawns match.
+    let env = CliDialect::Claude.stage_env();
+    let pin = env.iter().find(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH").map(|(_, v)| v.as_str());
+    assert_eq!(pin, Some("0"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH"));
+}
+
 // ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
 
 /// A writer outside a sandboxed mission.
