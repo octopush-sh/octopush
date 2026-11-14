@@ -1531,6 +1531,10 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** The models among `models` with a published retirement date
+   *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
+  modelRetirements: (models: string[]) =>
+    invoke<ModelRetirement[]>("model_retirements", { models }),
   /** Settings › General readiness card: local checks, each bounded at 3 s, never cached.
    *  `askClaude` (an explicit Check again) also runs `claude auth status`. */
   readinessCheck: (askClaude = false) =>
@@ -1539,7 +1543,8 @@ export const ipc = {
 
 /** One row of the readiness card (mirrors Rust `readiness::ReadinessCheck`). */
 export interface ReadinessCheck {
-  id: "claude" | "auth" | "codex" | "git" | "gh" | "disk" | "ollama";
+  /** `models` is built in the frontend (`modelRetirement.readinessRetirementCheck`), not by the backend. */
+  id: "claude" | "auth" | "codex" | "git" | "gh" | "disk" | "ollama" | "models";
   label: string;
   status: "ok" | "warn" | "fail";
   /** The live value: a version, "Token found", "No answer in 3 s"… */
@@ -1625,6 +1630,19 @@ export interface ClaudeModelFloorNote {
   /** The oldest Claude Code that runs it. */
   needs: string;
   installed: string;
+}
+
+/** A crew model with a published retirement date (mirrors Rust
+ *  `token_engine::ModelRetirement`). */
+export interface ModelRetirement {
+  /** The id as the stage names it, e.g. "claude-sonnet-4-5-20250929". */
+  model: string;
+  /** Display name, e.g. "Sonnet 4.5". */
+  label: string;
+  /** `YYYY-MM-DD`; requests fail after this day. */
+  retires: string;
+  replacement: string;
+  replacementLabel: string;
 }
 
 /** Result of a one-click "Connect to Claude Code". */

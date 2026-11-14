@@ -251,6 +251,61 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
     })
 }
 
+/// Models with a published retirement date: (normalized id prefix, display
+/// name, retirement date `YYYY-MM-DD`, replacement id, replacement name).
+///
+/// Source: Anthropic's model deprecations page
+/// (<https://platform.claude.com/docs/en/about-claude/model-deprecations>,
+/// fetched 2026-11-12): requests to a model past its retirement date fail.
+/// A prefix matches the id itself and any longer id after a `-` (the dated
+/// `claude-sonnet-4-5-20250929`), via [`normalize_model_id`].
+pub const MODEL_RETIREMENTS: &[(&str, &str, &str, &str, &str)] = &[
+    ("claude-sonnet-4-5", "Sonnet 4.5", "2026-11-30", "claude-sonnet-5-5", "Sonnet 5.5"),
+];
+
+/// A crew model that retires — the launcher, Readiness and Routines line.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelRetirement {
+    /// The id as the stage names it.
+    pub model: String,
+    /// Display name, e.g. "Sonnet 4.5".
+    pub label: String,
+    /// `YYYY-MM-DD`; requests fail after this day.
+    pub retires: String,
+    pub replacement: String,
+    pub replacement_label: String,
+}
+
+/// The [`MODEL_RETIREMENTS`] row for `model`, if any.
+pub fn model_retirement(model: &str) -> Option<ModelRetirement> {
+    let id = normalize_model_id(model);
+    MODEL_RETIREMENTS
+        .iter()
+        .find(|(prefix, ..)| id == *prefix || id.strip_prefix(*prefix).is_some_and(|rest| rest.starts_with('-')))
+        .map(|(_, label, retires, replacement, replacement_label)| ModelRetirement {
+            model: model.to_string(),
+            label: label.to_string(),
+            retires: retires.to_string(),
+            replacement: replacement.to_string(),
+            replacement_label: replacement_label.to_string(),
+        })
+}
+
+/// The retiring models among `models`, each id once, in order.
+pub fn model_retirements(models: &[String]) -> Vec<ModelRetirement> {
+    let mut out: Vec<ModelRetirement> = Vec::new();
+    for m in models {
+        if out.iter().any(|r| r.model == *m) {
+            continue;
+        }
+        if let Some(r) = model_retirement(m) {
+            out.push(r);
+        }
+    }
+    out
+}
+
 /// The 1-hour cache-write price per million tokens. Anthropic's pricing page
 /// (fetched 2026-10-31): a 1-hour write costs 2× the model's base input
 /// price, a 5-minute write 1.25× — e.g. Fable 5.1 $20 vs $12.50. Derived
@@ -1233,5 +1288,47 @@ mod pty_scan_tests {
     fn summary_scan_needs_the_word_total() {
         assert!(scan_pty_output("s", b"\x1b[2Gcost:\x1b[8G$1.00").is_none());
         assert!(scan_pty_output("s", b"\x1b[2GTotal\x1b[8Gcost:\x1b[24G$1.00").is_some());
+    }
+}
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[test]
+    fn every_retirement_is_a_normalized_id_a_date_and_a_priced_replacement() {
+        for (prefix, label, retires, replacement, replacement_label) in MODEL_RETIREMENTS {
+            assert_eq!(normalize_model_id(prefix), *prefix, "{prefix} is normalized");
+            assert!(chrono::NaiveDate::parse_from_str(retires, "%Y-%m-%d").is_ok(), "{retires} is a date");
+            assert!(builtin_prices(replacement).is_some(), "{replacement} is priced");
+            assert!(model_retirement(replacement).is_none(), "{replacement} doesn't retire itself");
+            assert!(!label.is_empty() && !replacement_label.is_empty());
+        }
+    }
+
+    #[test]
+    fn sonnet_4_5_retires_by_prefix_dated_id_included() {
+        let r = model_retirement("claude-sonnet-4-5-20250929").expect("the dated id matches the prefix");
+        assert_eq!(r.model, "claude-sonnet-4-5-20250929");
+        assert_eq!(r.label, "Sonnet 4.5");
+        assert_eq!(r.retires, "2026-11-30");
+        assert_eq!(r.replacement, "claude-sonnet-5-5");
+        assert_eq!(r.replacement_label, "Sonnet 5.5");
+        assert!(model_retirement("claude-sonnet-4-5").is_some());
+        assert!(model_retirement("anthropic/claude-sonnet-4.5").is_some());
+        assert!(model_retirement("claude-sonnet-4-6").is_none());
+        assert!(model_retirement("claude-sonnet-4-50").is_none(), "a prefix only ends at a dash");
+        assert!(model_retirement("claude-sonnet-5-5").is_none());
+    }
+
+    #[test]
+    fn model_retirements_lists_each_retiring_id_once() {
+        let models: Vec<String> = ["claude-sonnet-4-5", "claude-opus-5-5", "claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let ids: Vec<String> = model_retirements(&models).into_iter().map(|r| r.model).collect();
+        assert_eq!(ids, vec!["claude-sonnet-4-5", "claude-sonnet-4-5-20250929"]);
+        assert!(model_retirements(&[]).is_empty());
     }
 }

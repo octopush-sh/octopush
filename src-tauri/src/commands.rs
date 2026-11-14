@@ -6589,6 +6589,14 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
 }
 
+/// Direct launcher, Readiness and Routines: the models among `models` with a
+/// published retirement date (`token_engine::MODEL_RETIREMENTS`), each once.
+/// The caller decides from the date whether to say anything.
+#[tauri::command]
+pub fn model_retirements(models: Vec<String>) -> AppResult<Vec<crate::token_engine::ModelRetirement>> {
+    Ok(crate::token_engine::model_retirements(&models))
+}
+
 /// Settings › General readiness card: local checks (claude, auth mode, codex,
 /// git, gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
 /// (an explicit Check again) also runs `claude auth status` (and

@@ -62,8 +62,8 @@ export function keepLabel(s: Supersession): string {
   return `Keep ${shortModelName(s.from).split(/\s+/).pop()}`;
 }
 
-function toDraft(s: PipelineStage, fromId: string, toId: string): StageDraft {
-  const swap = (id: string) => (id === fromId ? toId : id);
+function toDraft(s: PipelineStage, fromIds: readonly string[], toId: string): StageDraft {
+  const swap = (id: string) => (fromIds.includes(id) ? toId : id);
   return {
     role: s.role,
     agentModel: swap(s.agentModel),
@@ -85,16 +85,17 @@ function toDraft(s: PipelineStage, fromId: string, toId: string): StageDraft {
   };
 }
 
-/** The save that moves every stage of this pipeline on `fromId` — model and
- *  escalation model — to `toId`, leaving everything else as saved. A builtin
- *  is forked under the name the builder gives its copy. */
-export function switchedDraft(pipeline: PipelineWithStages, fromId: string, toId: string): PipelineDraft {
+/** The save that moves every stage of this pipeline on `fromId` (or any of
+ *  several ids) — model and escalation model — to `toId`, leaving everything
+ *  else as saved. A builtin is forked under the name the builder gives its copy. */
+export function switchedDraft(pipeline: PipelineWithStages, fromId: string | readonly string[], toId: string): PipelineDraft {
   const { id, name, description, isBuiltin } = pipeline.pipeline;
+  const fromIds = typeof fromId === "string" ? [fromId] : fromId;
   return {
     pipelineId: id,
     name: isBuiltin ? `${name} (custom)` : name,
     description,
-    stages: [...pipeline.stages].sort((a, b) => a.position - b.position).map((s) => toDraft(s, fromId, toId)),
+    stages: [...pipeline.stages].sort((a, b) => a.position - b.position).map((s) => toDraft(s, fromIds, toId)),
   };
 }
 
