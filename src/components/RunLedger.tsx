@@ -4,7 +4,7 @@ import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 import { OctoMark } from "./icons/OctoMark";
-import { budgetUnenforceableNote, formatUsd, unpricedTitle } from "../lib/cost";
+import { budgetUnenforceableNote, formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
 
 interface Props {
   run: Run;
@@ -37,9 +37,19 @@ export function RunLedger({ run, stages }: Props) {
     prevStatus.current = run.status;
   }, [run.status, run.baselineUsd]);
 
-  const billed = stages.filter((s) => s.costUsd > 0 || (s.unpricedModel && s.inputTokens + s.outputTokens > 0));
-  const unpriced = stages.filter((s) => s.unpricedModel);
-  const unpricedModels = [...new Set(unpriced.map((s) => s.agentModel))];
+  const billed = stages.filter(
+    (s) => s.costUsd > 0 || s.usageUnreported || (s.unpricedModel && s.inputTokens + s.outputTokens > 0),
+  );
+  // Spend the budget cannot see: an unpriced model, or a stage whose CLI
+  // stopped before it reported usage.
+  const unpriced = stages.filter((s) => s.unpricedModel || s.usageUnreported);
+  const unpricedModels = [...new Set(stages.filter((s) => s.unpricedModel).map((s) => s.agentModel))];
+  const unreported = stages.filter((s) => s.usageUnreported).length;
+  const unenforceableTitle = [
+    "The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend.",
+    unpricedModels.length > 0 ? unpricedTitle(unpricedModels) : "",
+    unreported > 0 ? USAGE_UNREPORTED_TITLE : "",
+  ].filter(Boolean).join(" ");
 
   return (
     <div className="border-t border-octo-hairline bg-octo-panel">
@@ -47,6 +57,7 @@ export function RunLedger({ run, stages }: Props) {
         type="button"
         aria-expanded={expanded}
         onClick={() => setExpanded((e) => !e)}
+        data-tour="direct-ledger-strip"
         className="flex w-full items-center gap-2 px-4 py-2 text-left font-mono text-[11px]"
       >
         <span className="text-octo-mute">saved</span>
@@ -72,7 +83,7 @@ export function RunLedger({ run, stages }: Props) {
         {run.budgetUsd != null && unpriced.length > 0 && (
           <span
             className="octo-tabular text-octo-rouge"
-            title={`The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend. ${unpricedTitle(unpricedModels)}`}
+            title={unenforceableTitle}
             data-testid="ledger-budget-unenforceable"
           >
             · {budgetUnenforceableNote(unpriced.length)}
@@ -96,10 +107,19 @@ export function RunLedger({ run, stages }: Props) {
           {billed.map((s) => (
             <span key={s.id}>
               {labelForRole(s.role)}{" "}
-              {s.unpricedModel && s.costUsd === 0 ? (
+              {s.usageUnreported && s.costUsd === 0 ? (
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported">
+                  usage not reported
+                </span>
+              ) : s.unpricedModel && s.costUsd === 0 ? (
                 <span className="text-octo-mute" title={unpricedTitle([s.agentModel])}>unpriced</span>
               ) : (
                 <span className="octo-tabular text-octo-sage">{formatUsd(s.costUsd)}</span>
+              )}
+              {s.usageUnreported && s.costUsd > 0 && (
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported">
+                  {" "}+ usage not reported
+                </span>
               )}
               {(s.inputTokens > 0 || s.outputTokens > 0) && (
                 <span className="octo-tabular text-octo-mute"> · ↑{fmtTokens(s.inputTokens)} ↓{fmtTokens(s.outputTokens)}</span>

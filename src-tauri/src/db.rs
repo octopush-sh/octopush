@@ -784,6 +784,10 @@ impl Db {
         // reports the conversation's whole total, so its budget cap sits on
         // top. 0 for every pre-existing row.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_prior_cost_usd REAL NOT NULL DEFAULT 0")?;
+        // #712: 1 once an attempt of this stage stopped before its CLI reported
+        // usage (Codex) — its cost is unknown, not $0. Sticky across re-runs:
+        // the unknown spend was burned all the same.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN usage_unreported INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -5708,6 +5712,25 @@ impl Db {
             params![stage_id, escalated as i64],
         )?;
         Ok(())
+    }
+
+    /// Mark a run-stage whose CLI stopped before reporting usage (sticky; see
+    /// the `usage_unreported` column).
+    pub fn set_run_stage_usage_unreported(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET usage_unreported = 1 WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    /// Ids of the run's stages flagged `usage_unreported`.
+    pub fn usage_unreported_stage_ids(&self, run_id: &str) -> AppResult<std::collections::HashSet<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM run_stages WHERE run_id = ?1 AND usage_unreported != 0")?;
+        let rows = stmt.query_map(params![run_id], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
     }
 
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
