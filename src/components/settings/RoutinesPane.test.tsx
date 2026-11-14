@@ -71,6 +71,26 @@ describe("RoutinesPane retiring models", () => {
     expect(lines[1]).not.toHaveAttribute("data-tour");
   });
 
+  it("names only the fix the app offers for each kind of Routine", () => {
+    const factory = crew("factory", "claude-sonnet-4-5");
+    factory.pipeline = { ...factory.pipeline, name: "Feature Factory", isBuiltin: true };
+    usePipelineStore.setState({ pipelines: [crew("old", "claude-sonnet-4-5"), crew("new", "claude-sonnet-5-5"), factory] });
+    useRoutinesStore.setState({
+      routines: [routine("Nightly", "old"), routine("Picked", "new", '[[0,"claude-sonnet-4-5"]]'), routine("Built", "factory")],
+    });
+    render(<RoutinesPane />);
+    const [inherits, override, builtin] = screen.getAllByTestId("routine-model-retirement");
+    expect(inherits).toHaveAttribute("title", "Switch this routine's crew, old, to Sonnet 5.5 from the Direct launcher.");
+    expect(override).toHaveAttribute(
+      "title",
+      "This routine's own stage overrides pick Sonnet 4.5, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.",
+    );
+    expect(builtin).toHaveAttribute(
+      "title",
+      "Feature Factory is a built-in crew: switching it to Sonnet 5.5 from the Direct launcher saves a copy, Feature Factory (custom), and this routine keeps the built-in one until you edit it to use the copy.",
+    );
+  });
+
   it("turns rouge once the model has retired", () => {
     vi.setSystemTime(new Date("2026-12-01T06:00:00Z"));
     useRoutinesStore.setState({ routines: [routine("Nightly", "old")] });

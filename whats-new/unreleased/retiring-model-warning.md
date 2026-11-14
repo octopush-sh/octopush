@@ -18,4 +18,5 @@ steps:
 ---
 When a crew uses a model with a published retirement date (today Sonnet 4.5, on Nov 30), the Direct
 launcher, Readiness and Settings › Routines warn you in its last 30 days and after it. **Switch to
-Sonnet 5.5** moves only that crew, and only after you confirm.
+Sonnet 5.5** moves only that crew, and only after you confirm. A Routine on a built-in crew, or one
+that picks the model in its own stage overrides, says what fixes it instead.

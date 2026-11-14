@@ -7,6 +7,7 @@ vi.mock("./ipc", () => ({ ipc: ipcMock }));
 const {
   crewModels, crewRetirements, daysUntilRetirement, libraryModels, loadModelRetirements, readinessRetirementCheck,
   resetModelRetirementCache, retirementDay, retirementLine, retirementPhase, routineOverrides, routineRetirement,
+  routineRetirementFix,
 } = await import("./modelRetirement");
 
 const sonnet45 = (model = "claude-sonnet-4-5"): ModelRetirement => ({
@@ -23,8 +24,8 @@ function stage(position: number, agentModel: string, escalateModel: string | nul
   };
 }
 
-function crew(id: string, name: string, stages: PipelineStage[]): PipelineWithStages {
-  return { pipeline: { id, name, description: "", isBuiltin: false, createdAt: "t" }, stages };
+function crew(id: string, name: string, stages: PipelineStage[], isBuiltin = false): PipelineWithStages {
+  return { pipeline: { id, name, description: "", isBuiltin, createdAt: "t" }, stages };
 }
 
 function routine(name: string, pipelineId: string, stageOverrides: string | null = null): Routine {
@@ -120,6 +121,36 @@ describe("crews on a retiring model", () => {
     expect(libraryModels(pipelines, [routine("Nightly", "p", '[[0,"claude-sonnet-4-5"]]')]))
       .toEqual(["claude-sonnet-5-5", "claude-sonnet-4-5"]);
   });
+
+  describe("what fixes a Routine", () => {
+    const fixOf = (r: Routine, pipelines: PipelineWithStages[]) => routineRetirementFix(routineRetirement(r, pipelines, [sonnet45()], now)!);
+
+    it("one that inherits a custom crew's model: the launcher switch", () => {
+      const n = routineRetirement(routine("Nightly", "a"), [crew("a", "Relay", [stage(0, "claude-sonnet-4-5")])], [sonnet45()], now);
+      expect(n).toMatchObject({ crewName: "Relay", viaCrew: true, builtinCrew: false, viaOverride: false });
+      expect(routineRetirementFix(n!)).toBe("Switch this routine's crew, Relay, to Sonnet 5.5 from the Direct launcher.");
+    });
+
+    it("one whose own override picks it: compose it again, not the launcher", () => {
+      const fix = fixOf(routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]'), [crew("b", "Scout", [stage(0, "claude-sonnet-5-5")])]);
+      expect(fix).toBe(
+        "This routine's own stage overrides pick Sonnet 4.5, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.",
+      );
+      expect(fix).not.toContain("launcher");
+    });
+
+    it("one on a builtin crew: the switch saves a copy the routine must be pointed at", () => {
+      expect(fixOf(routine("Nightly", "f"), [crew("f", "Feature Factory", [stage(0, "claude-sonnet-4-5")], true)])).toBe(
+        "Feature Factory is a built-in crew: switching it to Sonnet 5.5 from the Direct launcher saves a copy, Feature Factory (custom), and this routine keeps the built-in one until you edit it to use the copy.",
+      );
+    });
+
+    it("an override over a crew stage that's fine still counts the crew's escalation model", () => {
+      const pipelines = [crew("a", "Relay", [stage(0, "claude-sonnet-4-5", "claude-sonnet-4-5")])];
+      expect(routineRetirement(routine("Nightly", "a", '[[0,"claude-opus-5-5"]]'), pipelines, [sonnet45()], now))
+        .toMatchObject({ viaCrew: true, viaOverride: false });
+    });
+  });
 });
 
 describe("the Readiness row", () => {
@@ -129,11 +160,29 @@ describe("the Readiness row", () => {
   ];
 
   it("names the crews and Routines that will fail, amber before the day", () => {
-    const row = readinessRetirementCheck(pipelines, [routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]')], [sonnet45()], at("2026-11-14T00:00:00Z"));
+    const row = readinessRetirementCheck(pipelines, [routine("Dawn", "a")], [sonnet45()], at("2026-11-14T00:00:00Z"));
     expect(row).toMatchObject({ id: "models", label: "Crew models", status: "warn", value: "Sonnet 4.5 · retires Nov 30", command: null });
     expect(row?.fix).toBe(
-      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Relay, Routine Nightly. Switch each to Sonnet 5.5 from the Direct launcher.",
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Relay, Routine Dawn. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Dawn follows its crew.",
     );
+  });
+
+  it("doesn't promise the launcher switch fixes a Routine's own override", () => {
+    const row = readinessRetirementCheck(pipelines, [routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]')], [sonnet45()], at("2026-11-14T00:00:00Z"));
+    expect(row?.fix).toBe(
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Relay, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Nightly's own stage overrides pick Sonnet 4.5, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.",
+    );
+    expect(readinessRetirementCheck([pipelines[1]], [routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]')], [sonnet45()], at("2026-11-14T00:00:00Z"))?.fix)
+      .not.toContain("Direct launcher");
+  });
+
+  it("tells a Routine on a builtin crew to use the switched copy", () => {
+    const builtin = crew("f", "Feature Factory", [stage(0, "claude-sonnet-4-5")], true);
+    const row = readinessRetirementCheck([builtin], [routine("Nightly", "f")], [sonnet45()], at("2026-11-14T00:00:00Z"));
+    expect(row?.fix).toBe(
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Feature Factory, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Feature Factory is a built-in crew: switching it to Sonnet 5.5 from the Direct launcher saves a copy, Feature Factory (custom), and Routine Nightly keeps the built-in one until you edit it to use the copy.",
+    );
+    expect(row?.fix).not.toContain("follows its crew");
   });
 
   it("fails after the day, and is absent when nothing uses it", () => {

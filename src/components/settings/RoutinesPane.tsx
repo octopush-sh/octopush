@@ -16,7 +16,13 @@ import { pushToast } from "../Toasts";
 import { ClaudeLoginNote } from "../ClaudeLoginNote";
 import { tourId } from "../../lib/tour/ids";
 import { formatRelTime } from "../../lib/relTime";
-import { libraryModels, retirementLine, routineRetirement, type RetirementNotice } from "../../lib/modelRetirement";
+import {
+  libraryModels,
+  retirementLine,
+  routineRetirement,
+  routineRetirementFix,
+  type RoutineRetirementNotice,
+} from "../../lib/modelRetirement";
 import { useModelRetirements } from "../../hooks/useModelRetirements";
 import {
   draftFromRoutine,
@@ -254,15 +260,15 @@ export function RoutinesPane() {
 }
 
 /** "Sonnet 4.5 retires Nov 30, so this routine will fail after that." — amber
- *  in the last 30 days, rouge after. */
-function RetirementLine({ notice, now, tour }: { notice: RetirementNotice; now: Date; tour: boolean }) {
+ *  in the last 30 days, rouge after; the tooltip names what fixes it. */
+function RetirementLine({ notice, now, tour }: { notice: RoutineRetirementNotice; now: Date; tour: boolean }) {
   const { retirement, phase } = notice;
   return (
     <div
       data-tour={tour ? tourId("routines-model-retirement") : undefined}
       data-testid="routine-model-retirement"
       data-phase={phase.kind}
-      title={`Switch its crew to ${retirement.replacementLabel} from the Direct launcher, or pick another model for those stages in this routine.`}
+      title={routineRetirementFix(notice)}
       className={`octo-fade-in octo-tabular mt-0.5 font-mono text-[10px] ${phase.kind === "retired" ? "text-octo-rouge" : "text-octo-warning"}`}
     >
       {retirementLine(retirement, phase, now, "this routine")}

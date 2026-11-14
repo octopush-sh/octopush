@@ -112,16 +112,78 @@ export function routineOverrides(json: string | null | undefined): Record<number
   }
 }
 
-/** The notice a Routine's crew gets, with the Routine's model overrides. */
+/** A Routine's notice, with how it reaches the model: what fixes it differs.
+ *  The launcher switch edits only the crew's stages, and forks a builtin
+ *  crew the Routine keeps pointing at; the Routine's own overrides stay. */
+export interface RoutineRetirementNotice extends RetirementNotice {
+  crewName: string;
+  /** The crew's own stage or escalation models name it. */
+  viaCrew: boolean;
+  builtinCrew: boolean;
+  /** The Routine's stage overrides name it. */
+  viaOverride: boolean;
+}
+
+function routineNotice(n: RetirementNotice, crew: PipelineWithStages, overrides: Record<number, string>): RoutineRetirementNotice {
+  const ids = new Set(n.ids);
+  return {
+    ...n,
+    crewName: crew.pipeline.name,
+    viaCrew: crew.stages.some((s) => (!overrides[s.position] && ids.has(s.agentModel)) || ids.has(s.escalateModel ?? "")),
+    builtinCrew: crew.pipeline.isBuiltin,
+    viaOverride: crew.stages.some((s) => ids.has(overrides[s.position] ?? "")),
+  };
+}
+
+/** The notices a Routine's crew gets, with the Routine's model overrides. */
+function routineRetirements(
+  routine: Routine,
+  pipelines: PipelineWithStages[],
+  table: ModelRetirement[],
+  now: Date,
+): RoutineRetirementNotice[] {
+  const crew = pipelines.find((p) => p.pipeline.id === routine.pipelineId);
+  if (!crew) return [];
+  const overrides = routineOverrides(routine.stageOverrides);
+  return crewRetirements(crew.stages, table, now, overrides).map((n) => routineNotice(n, crew, overrides));
+}
+
+/** The most urgent notice a Routine's crew gets, with its overrides. */
 export function routineRetirement(
   routine: Routine,
   pipelines: PipelineWithStages[],
   table: ModelRetirement[],
   now: Date,
-): RetirementNotice | null {
-  const crew = pipelines.find((p) => p.pipeline.id === routine.pipelineId);
-  if (!crew) return null;
-  return crewRetirements(crew.stages, table, now, routineOverrides(routine.stageOverrides))[0] ?? null;
+): RoutineRetirementNotice | null {
+  return routineRetirements(routine, pipelines, table, now)[0] ?? null;
+}
+
+const capitalize = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** What fixes a Routine the launcher switch alone doesn't: a builtin crew
+ *  (the switch saves a copy the Routine must be pointed at) and its own
+ *  overrides (the routine editor doesn't show them; a new one has none). */
+function routineOnlyFixes(n: RoutineRetirementNotice, who: string): string[] {
+  const out: string[] = [];
+  if (n.viaCrew && n.builtinCrew) {
+    out.push(
+      `${n.crewName} is a built-in crew: switching it to ${n.retirement.replacementLabel} from the Direct launcher saves a copy, ${n.crewName} (custom), and ${who} keeps the built-in one until you edit it to use the copy.`,
+    );
+  }
+  if (n.viaOverride) {
+    out.push(
+      `${capitalize(who)}'s own stage overrides pick ${n.retirement.label}, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.`,
+    );
+  }
+  return out;
+}
+
+/** The Routines row tooltip: each action the app offers that fixes it. */
+export function routineRetirementFix(n: RoutineRetirementNotice, who = "this routine"): string {
+  const crewSwitch = n.viaCrew && !n.builtinCrew
+    ? [`Switch ${who}'s crew, ${n.crewName}, to ${n.retirement.replacementLabel} from the Direct launcher.`]
+    : [];
+  return capitalize([...crewSwitch, ...routineOnlyFixes(n, who)].join(" "));
 }
 
 /** Every model the saved crews and the Routines' overrides name — what the
@@ -145,7 +207,8 @@ export function readinessRetirementCheck(
   table: ModelRetirement[],
   now: Date,
 ): ReadinessCheck | null {
-  type Hit = { notice: RetirementNotice; crews: string[]; routines: string[] };
+  type OnRoutine = { name: string; notice: RoutineRetirementNotice };
+  type Hit = { notice: RetirementNotice; crews: string[]; routines: OnRoutine[] };
   const hits = new Map<string, Hit>();
   const hit = (n: RetirementNotice) => {
     const h = hits.get(n.retirement.label) ?? { notice: n, crews: [], routines: [] };
@@ -156,9 +219,7 @@ export function readinessRetirementCheck(
     for (const n of crewRetirements(p.stages, table, now)) hit(n).crews.push(p.pipeline.name);
   }
   for (const r of routines) {
-    const crew = pipelines.find((p) => p.pipeline.id === r.pipelineId);
-    if (!crew) continue;
-    for (const n of crewRetirements(crew.stages, table, now, routineOverrides(r.stageOverrides))) hit(n).routines.push(r.name);
+    for (const n of routineRetirements(r, pipelines, table, now)) hit(n).routines.push({ name: r.name, notice: n });
   }
   const order = (h: Hit) => (h.notice.phase.kind === "retired" ? -1 : h.notice.phase.daysLeft);
   const first = [...hits.values()].sort((a, b) => order(a) - order(b))[0];
@@ -167,14 +228,21 @@ export function readinessRetirementCheck(
   const subjects = [crews.length ? plural(crews.length, "crew") : "", onRoutines.length ? plural(onRoutines.length, "Routine") : ""]
     .filter(Boolean)
     .join(" and ");
-  const names = [...crews, ...onRoutines.map((n) => `Routine ${n}`)].join(", ");
+  const names = [...crews, ...onRoutines.map((r) => `Routine ${r.name}`)].join(", ");
+  // The launcher switch fixes the crews, and the Routines that only inherit
+  // a custom crew's model; builtin-crew and override Routines need more.
+  const fixes: string[] = [];
+  if (crews.length) fixes.push(`Switch each crew to ${notice.retirement.replacementLabel} from the Direct launcher.`);
+  const following = onRoutines.filter((r) => !r.notice.viaOverride && !r.notice.builtinCrew).map((r) => `Routine ${r.name}`);
+  if (following.length) fixes.push(`${following.join(", ")} ${following.length === 1 ? "follows its crew" : "follow their crews"}.`);
+  for (const r of onRoutines) fixes.push(...routineOnlyFixes(r.notice, `Routine ${r.name}`));
   const more = hits.size > 1 ? ` ${plural(hits.size - 1, "more model")} also retire.` : "";
   return {
     id: "models",
     label: "Crew models",
     status: notice.phase.kind === "retired" ? "fail" : "warn",
     value: `${notice.retirement.label} · ${notice.phase.kind === "retired" ? "retired" : "retires"} ${retirementDay(notice.retirement.retires, now)}`,
-    fix: `${retirementLine(notice.retirement, notice.phase, now, `${subjects} on it`)} ${names}. Switch each to ${notice.retirement.replacementLabel} from the Direct launcher.${more}`,
+    fix: `${retirementLine(notice.retirement, notice.phase, now, `${subjects} on it`)} ${names}. ${fixes.join(" ")}${more}`,
     command: null,
     timedOut: false,
   };
