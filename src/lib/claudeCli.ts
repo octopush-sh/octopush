@@ -48,11 +48,20 @@ const EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"] as const;
 /** The levels Codex lists for `model` in its bundled catalog
  *  (`codexEffortLevels.json`, shared with `cli_runner::codex_effort_levels`,
  *  which cites the openai/codex `models.json` commit), or undefined for a
- *  model the catalog doesn't know. Empty = a non-reasoning model. */
+ *  model the catalog doesn't know. Empty = a non-reasoning model. Matched
+ *  like Codex does: the longest slug that prefixes the id (`gpt-5.5-<date>`
+ *  → `gpt-5.5`), then once more with one leading `namespace/` stripped. */
 export function codexEffortLevels(model: string): readonly string[] | undefined {
   const table = codexCatalog.models as Record<string, readonly string[]>;
-  const key = model.trim().toLowerCase();
-  return Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+  const longestPrefix = (id: string) => {
+    const slug = Object.keys(table)
+      .filter((s) => id.startsWith(s))
+      .reduce<string | undefined>((best, s) => (best === undefined || s.length > best.length ? s : best), undefined);
+    return slug === undefined ? undefined : table[slug];
+  };
+  const id = model.trim().toLowerCase();
+  const slash = id.indexOf("/");
+  return longestPrefix(id) ?? (slash >= 0 ? longestPrefix(id.slice(slash + 1)) : undefined);
 }
 
 /** The level a Codex CLI stage actually gets (mirrors
@@ -62,11 +71,30 @@ export function codexEffortLevels(model: string): readonly string[] | undefined 
  *  doesn't know or one without reasoning. */
 export function codexEffortLevel(model: string, effort: string): string | null {
   const listed = codexEffortLevels(model);
-  if (!listed) return null;
+  return listed ? clampToListedLevels(listed, effort) : null;
+}
+
+/** `codexEffortLevel`'s clamp on an explicit level list (mirrors
+ *  `cli_runner::clamp_to_listed_levels`): null when the list holds none of
+ *  Octopush's levels (a non-reasoning model). */
+export function clampToListedLevels(listed: readonly string[], effort: string): string | null {
   const supported = EFFORT_ORDER.filter((e) => listed.includes(e));
   const rank = EFFORT_ORDER.indexOf(effort as (typeof EFFORT_ORDER)[number]);
   const below = supported.filter((e) => EFFORT_ORDER.indexOf(e) <= rank);
   return below[below.length - 1] ?? supported[0] ?? null;
+}
+
+/** The tooltip for an effort segment that Codex runs as another level on a
+ *  model listing `listed` ("Runs as XHi on this model in Codex, the highest
+ *  level it lists below Max", or "…, the lowest level it lists" when clamped
+ *  up); null when the level passes as is or nothing passes. `label` names a
+ *  level the way the segments do. */
+export function codexClampTitle(listed: readonly string[], effort: string, label: (level: string) => string): string | null {
+  const runs = clampToListedLevels(listed, effort);
+  if (!runs || runs === effort) return null;
+  const up = EFFORT_ORDER.indexOf(runs as (typeof EFFORT_ORDER)[number]) > EFFORT_ORDER.indexOf(effort as (typeof EFFORT_ORDER)[number]);
+  const why = up ? "the lowest level it lists" : `the highest level it lists below ${label(effort)}`;
+  return `Runs as ${label(runs)} on this model in Codex, ${why}`;
 }
 
 /** True when any CLI stage of the crew (with the launcher's per-position

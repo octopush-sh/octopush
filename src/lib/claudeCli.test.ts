@@ -8,6 +8,8 @@ const {
   claudeSecurityLabel,
   claudeUpdateLabel,
   cliTooOldForEffort,
+  clampToListedLevels,
+  codexClampTitle,
   codexEffortLevel,
   codexEffortLevels,
   crewClaudeModels,
@@ -143,6 +145,50 @@ describe("effortApplies", () => {
       expect(codexEffortLevels(m)).toBeUndefined();
       for (const e of ["low", "medium", "high", "xhigh", "max"]) expect(codexEffortLevel(m, e)).toBeNull();
     }
+  });
+
+  it("matches ids like Codex: longest prefix, then one namespace strip", () => {
+    const gpt55 = codexEffortLevels("gpt-5.5");
+    expect(gpt55).toBeDefined();
+    expect(codexEffortLevels("gpt-5.5-2026-03-01")).toBe(gpt55);
+    expect(codexEffortLevels("gpt-6-luna-preview")).toBe(codexEffortLevels("gpt-6-luna"));
+    expect(codexEffortLevels("openai/gpt-5.5")).toBe(gpt55);
+    expect(codexEffortLevels("OpenAI/GPT-5.5-2026-03-01")).toBe(gpt55);
+    expect(codexEffortLevels("a/b/gpt-5.5")).toBeUndefined();
+    for (const m of ["gpt-5-codex", "o3", "gpt-6", "openai/o3"]) {
+      expect(codexEffortLevels(m), m).toBeUndefined();
+      expect(codexEffortLevel(m, "high"), m).toBeNull();
+    }
+    expect(codexEffortLevel("gpt-5.5-2026-03-01", "max")).toBe("xhigh");
+    expect(effortApplies("cli", "gpt-5.5-2026-03-01")).toBe(true);
+  });
+
+  it("clamps to a listed level like the Rust helper", () => {
+    // Mirrors `codex_clamps_to_the_highest_listed_level_below` in tests.rs.
+    for (const e of ["low", "medium", "high", "xhigh", "max"]) {
+      expect(clampToListedLevels([], e), e).toBeNull();
+      expect(clampToListedLevels(["none", "minimal"], e), e).toBeNull();
+    }
+    expect(clampToListedLevels(["low", "medium", "high"], "max")).toBe("high");
+    expect(clampToListedLevels(["low", "medium", "high"], "xhigh")).toBe("high");
+    expect(clampToListedLevels(["medium", "high"], "low")).toBe("medium");
+    expect(clampToListedLevels(["low", "high"], "medium")).toBe("low");
+  });
+
+  it("says where a clamped Codex level lands, down or up", () => {
+    const label = (l: string) => l.toUpperCase();
+    expect(codexClampTitle(["low", "high"], "medium", label)).toBe(
+      "Runs as LOW on this model in Codex, the highest level it lists below MEDIUM",
+    );
+    expect(codexClampTitle(["high", "xhigh"], "low", label)).toBe(
+      "Runs as HIGH on this model in Codex, the lowest level it lists",
+    );
+    expect(codexClampTitle(["low", "medium", "high"], "max", label)).toBe(
+      "Runs as HIGH on this model in Codex, the highest level it lists below MAX",
+    );
+    expect(codexClampTitle(["low", "high"], "high", label)).toBeNull();
+    expect(codexClampTitle(["none", "minimal"], "high", label)).toBeNull();
+    expect(codexClampTitle([], "low", label)).toBeNull();
   });
 
   it("reads the table the Rust side reads (one shared file)", () => {

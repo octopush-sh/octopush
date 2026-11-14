@@ -9278,6 +9278,34 @@ mod cli_dialect_tests {
     }
 
     #[test]
+    fn codex_effort_levels_match_like_codex_longest_prefix_then_one_namespace() {
+        use crate::orchestrator::cli_runner::codex_effort_levels;
+        use crate::providers::Effort::High;
+        let gpt55 = codex_effort_levels("gpt-5.5");
+        assert!(gpt55.is_some());
+        // A dated or suffixed id takes its longest-prefix slug's levels.
+        assert_eq!(codex_effort_levels("gpt-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("gpt-6-luna-preview"), codex_effort_levels("gpt-6-luna"));
+        // One `namespace/` is stripped, and only one.
+        assert_eq!(codex_effort_levels("openai/gpt-5.5"), gpt55);
+        assert_eq!(codex_effort_levels("OpenAI/GPT-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("a/b/gpt-5.5"), None);
+        // Unknown ids still get no `-c`, and the journal says why.
+        for m in ["gpt-5-codex", "o3", "gpt-6", "openai/o3"] {
+            assert_eq!(codex_effort_levels(m), None, "{m}");
+            assert!(CliDialect::Codex.effort_args(m, Some(High)).is_empty(), "{m}");
+        }
+        assert_eq!(
+            CliDialect::Codex.unpassed_effort_notice("o3", Some(High)).as_deref(),
+            Some("This stage's high effort is not passed to Codex: o3 isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's default effort.")
+        );
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5.5-2026-03-01", Some(High)),
+            vec!["-c".to_string(), "model_reasoning_effort=\"high\"".to_string()]
+        );
+    }
+
+    #[test]
     fn codex_effort_follows_the_catalog_for_every_model() {
         use crate::providers::Effort::*;
         let all = [Low, Medium, High, Xhigh, Max];
