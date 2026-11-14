@@ -6587,9 +6587,10 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
 }
 
-/// Settings › General readiness card: local checks (claude, auth mode, git,
-/// gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
-/// (an explicit Check again) also runs `claude auth status`; the sign-in end
+/// Settings › General readiness card: local checks (claude, auth mode, codex,
+/// git, gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
+/// (an explicit Check again) also runs `claude auth status` (and
+/// `codex login status` when the Codex row shows); the sign-in end
 /// it reports is stored like a stage's, so the launcher and notes agree.
 #[tauri::command]
 pub async fn readiness_check(
@@ -6599,8 +6600,10 @@ pub async fn readiness_check(
 ) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
     // The stored sign-in end, read before the blocking probes.
     let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
+    // The Codex CLI row only when a saved crew or Routine runs a Codex stage.
+    let want_codex = crate::readiness::wants_codex(&state.db.lock());
     let ask_claude = ask_claude.unwrap_or(false);
-    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude))
+    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude, want_codex))
         .await
         .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))?;
     // Signed in with a date: stored. Signed out: the stored end is cleared,

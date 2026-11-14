@@ -156,6 +156,18 @@ describe("ReadinessCard", () => {
     expect(within(screen.getByTestId("readiness-row-gh")).queryByRole("button")).toBeNull();
   });
 
+  it("anchors the Codex CLI row for the tour and offers its sign-in command", async () => {
+    readinessCheck.mockResolvedValue([
+      row({ id: "codex", label: "Codex CLI", status: "warn", value: "Not signed in", fix: "Sign Codex in.", command: "codex login" }),
+      row({ id: "git", label: "git", value: "2.39.3" }),
+    ]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-codex");
+    expect(r).toHaveAttribute("data-tour", "settings-readiness-codex");
+    expect(within(r).getByText("codex login")).toBeInTheDocument();
+    expect(screen.getByTestId("readiness-row-git")).not.toHaveAttribute("data-tour");
+  });
+
   it("shows an ok disk row with no link", async () => {
     readinessCheck.mockResolvedValue([row({ id: "disk", label: "Disk space", value: "84 GB free" })]);
     render(<ReadinessCard onShowCaches={vi.fn()} />);
