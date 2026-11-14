@@ -9108,14 +9108,39 @@ mod cli_args_tests {
     fn read_only_review_stages_disallow_write_tools() {
         // B9: a worktree review stage must not be able to edit files — the API
         // substrate enforces this via its allowlist; the CLI does it with
-        // --disallowedTools. Non-review stages carry no denial.
-        let ro = build_cli_args("m", "sys", 10, true);
-        let i = ro.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
-        assert!(ro[i + 1].contains("Write") && ro[i + 1].contains("Edit"), "{ro:?}");
-        let rw = build_cli_args("m", "sys", 10, false);
-        assert!(!rw.contains(&"--disallowedTools".to_string()));
-        let ro_resume = build_cli_args_resume("m", "sess", 10, true);
-        assert!(ro_resume.contains(&"--disallowedTools".to_string()));
+        // --disallowedTools. Writer stages deny no file tool.
+        let denied = |args: &[String]| -> Vec<String> {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            args[i + 1].split(',').map(str::to_string).collect()
+        };
+        for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
+            let tools = denied(&ro[..]);
+            for t in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+                assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
+            }
+        }
+        for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
+            assert!(!denied(&rw[..]).iter().any(|x| x.contains("Write") || x.contains("Edit")), "{rw:?}");
+        }
+    }
+
+    #[test]
+    fn every_claude_stage_disallows_ask_user_question_once() {
+        // #701: headless, nobody answers AskUserQuestion; with it denied, a
+        // question can only reach the final message and the trailing-question
+        // guard. Writer, reviewer, fresh and resumed: one flag, the tool once.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--disallowedTools").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --disallowedTools: {args:?}");
+            let n = args[at[0] + 1].split(',').filter(|t| *t == "AskUserQuestion").count();
+            assert_eq!(n, 1, "AskUserQuestion exactly once: {args:?}");
+            assert_eq!(args.iter().filter(|a| a.contains("AskUserQuestion")).count(), 1, "{args:?}");
+        }
     }
 
     #[test]
@@ -10660,6 +10685,28 @@ mod live_tests {
         // result/system → none
         assert!(entries_from_stream_event(&json!({"type":"result","subtype":"success"})).is_empty());
         assert!(entries_from_stream_event(&json!({"type":"system","subtype":"init"})).is_empty());
+    }
+
+    #[test]
+    fn entries_from_stream_event_journals_a_refused_ask_user_question() {
+        // #701: an older CLI may still offer the tool; the journal says the
+        // question was refused, right after the tool entry.
+        let ask = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_q","name":"AskUserQuestion","input":{"questions":[{"question":"Postgres or SQLite?"}]}}
+        ]}});
+        let es = entries_from_stream_event(&ask);
+        assert_eq!(es.len(), 2, "{es:?}");
+        assert_eq!(es[0]["kind"], "tool");
+        assert_eq!(es[1], json!({"kind":"notice","text":"the agent tried to ask a question; it was refused"}));
+        // Inside a sub-agent the notice nests under its spawner too.
+        let mut sub = ask.clone();
+        sub["parent_tool_use_id"] = json!("toolu_agent_1");
+        assert_eq!(entries_from_stream_event(&sub)[1]["parent"], "toolu_agent_1");
+        // Other tools add no notice.
+        let read = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"a"}}
+        ]}});
+        assert_eq!(entries_from_stream_event(&read).len(), 1);
     }
 
     #[test]
