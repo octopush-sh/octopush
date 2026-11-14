@@ -4,7 +4,14 @@ import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
 import { OctoMark } from "./icons/OctoMark";
-import { budgetUnenforceableNote, formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
+import {
+  budgetUnenforceableNote,
+  formatUsd,
+  unpricedTitle,
+  USAGE_UNREPORTED_TITLE,
+  usageUnreportedNote,
+  usageUnreportedTitle,
+} from "../lib/cost";
 
 interface Props {
   run: Run;
@@ -48,7 +55,7 @@ export function RunLedger({ run, stages }: Props) {
   const unenforceableTitle = [
     "The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend.",
     unpricedModels.length > 0 ? unpricedTitle(unpricedModels) : "",
-    unreported > 0 ? USAGE_UNREPORTED_TITLE : "",
+    unreported > 0 ? usageUnreportedTitle(unreported) : "",
   ].filter(Boolean).join(" ");
 
   return (
@@ -71,6 +78,16 @@ export function RunLedger({ run, stages }: Props) {
         )}
         <span className="ml-auto text-octo-mute">spent</span>
         <span className="octo-tabular text-octo-brass">{formatUsd(run.costUsd)}</span>
+        {unreported > 0 && (
+          <span
+            className="octo-tabular text-octo-mute"
+            title={usageUnreportedTitle(unreported)}
+            data-testid="ledger-usage-unreported"
+            data-tour="direct-ledger-usage-unreported"
+          >
+            · {usageUnreportedNote(unreported)}
+          </span>
+        )}
         {run.budgetUsd != null && (
           <span
             className={`octo-tabular ${
@@ -108,7 +125,7 @@ export function RunLedger({ run, stages }: Props) {
             <span key={s.id}>
               {labelForRole(s.role)}{" "}
               {s.usageUnreported && s.costUsd === 0 ? (
-                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported">
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported-stage">
                   usage not reported
                 </span>
               ) : s.unpricedModel && s.costUsd === 0 ? (
@@ -117,7 +134,7 @@ export function RunLedger({ run, stages }: Props) {
                 <span className="octo-tabular text-octo-sage">{formatUsd(s.costUsd)}</span>
               )}
               {s.usageUnreported && s.costUsd > 0 && (
-                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported">
+                <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported-stage">
                   {" "}+ usage not reported
                 </span>
               )}

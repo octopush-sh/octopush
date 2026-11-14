@@ -76,7 +76,7 @@ Current anchors:
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-waiting` | Direct run track, only while a running stage has no activity yet: its card's live line "waiting for first tool call" | `RunFlow.tsx` |
-| `direct-ledger-strip` · `direct-ledger-usage-unreported` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · a stage's "usage not reported" cell (only on a Codex stage stopped before it reported usage, once unfolded) | `RunLedger.tsx` |
+| `direct-ledger-strip` · `direct-ledger-usage-unreported` · `direct-ledger-usage-unreported-stage` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · the strip's "· N stage(s) usage not reported" fragment after the spent figure (only when a Codex stage stopped before it reported usage; visible collapsed, budget or not) · that stage's "usage not reported" cell (once unfolded) | `RunLedger.tsx` |
 | `direct-launcher-import-crew` · `direct-launcher-repo-crews` | Direct launcher: the "import a crew" link beside the ensemble eyebrow · the "from this repo" group (only when the worktree has `.octopush/crews/*.octocrew.json`) | `PipelineSetup.tsx` |
 | `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
