@@ -53,4 +53,15 @@ describe("fixChecksBrief", () => {
     expect(brief).not.toContain("x".repeat(FAILED_LOG_MAX_CHARS));
     expect(brief.length).toBeLessThan(FAILED_LOG_MAX_CHARS + 600);
   });
+
+  it("caps by code points, never splitting a surrogate pair", () => {
+    // 8000 emoji then one ASCII char: the cap drops the first emoji whole,
+    // where a UTF-16 slice would start on the low half of a pair.
+    const log = "🐙".repeat(FAILED_LOG_MAX_CHARS) + "x";
+    const brief = fixChecksBrief(failing, log);
+    const fenced = brief.slice(brief.indexOf("```\n") + 4, brief.lastIndexOf("\n```"));
+    expect(Array.from(fenced)).toHaveLength(FAILED_LOG_MAX_CHARS);
+    expect(fenced).toBe("🐙".repeat(FAILED_LOG_MAX_CHARS - 1) + "x");
+    expect(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(brief)).toBe(false);
+  });
 });

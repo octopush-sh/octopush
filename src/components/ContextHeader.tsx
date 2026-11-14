@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef, useState } from "react";
 import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Shield, Wrench } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
@@ -95,8 +95,10 @@ interface Props {
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
   /** "Fix failing checks…": shown on the chip only while the PR's checks
-   *  fail. Seeds the Direct launcher; the user still picks the crew. */
-  onFixChecks?: (pr: Pr) => void;
+   *  fail. Seeds the Direct launcher; nothing starts until the user presses
+   *  Start. While the returned promise is pending the button is busy and
+   *  ignores further clicks. */
+  onFixChecks?: (pr: Pr) => void | Promise<void>;
   /** The active workspace. A manually linked ticket (linkedIssueKey) wins;
    *  otherwise a branch-detected key gated on the project's Jira key
    *  (detectIssueKeyForProject). */
@@ -179,6 +181,25 @@ export function ContextHeader({
   // The name line: the ticket's summary when one resolves, else the workspace's
   // own name. Keyed so a workspace switch re-runs the entrance.
   const name = activeIssue ? activeIssue.summary : workspaceName;
+
+  // "Fix failing checks…" reads up to 3 failed logs before the launcher
+  // opens, so the button says so and ignores clicks until it is done. The
+  // ref guards the clicks that land before React re-renders it disabled.
+  const [fixBusy, setFixBusy] = useState(false);
+  const fixBusyRef = useRef(false);
+  const fixChecks = async (target: Pr) => {
+    if (!onFixChecks || fixBusyRef.current) return;
+    fixBusyRef.current = true;
+    setFixBusy(true);
+    try {
+      await onFixChecks(target);
+    } catch {
+      // The handler surfaces its own errors; the button just frees up.
+    } finally {
+      fixBusyRef.current = false;
+      setFixBusy(false);
+    }
+  };
 
   return (
     <div className="octo-header my-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
@@ -383,12 +404,14 @@ export function ContextHeader({
                 <button
                   type="button"
                   aria-label="Fix failing checks…"
-                  title="Fix failing checks…"
+                  title={fixBusy ? "Reading the failed logs…" : "Fix failing checks…"}
+                  aria-busy={fixBusy}
+                  disabled={fixBusy}
                   onClick={(e) => {
                     e.stopPropagation();
-                    onFixChecks(pr);
+                    void fixChecks(pr);
                   }}
-                  className="octo-pop-in flex shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                  className="octo-pop-in flex shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-octo-mute"
                 >
                   <Wrench size={11} />
                 </button>

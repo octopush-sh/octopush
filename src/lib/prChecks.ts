@@ -35,7 +35,10 @@ export function fixChecksBrief(pr: Pr, log: string): string {
   ];
   const tail = log.trim();
   if (tail) {
-    const capped = tail.length > FAILED_LOG_MAX_CHARS ? tail.slice(tail.length - FAILED_LOG_MAX_CHARS) : tail;
+    // Cap by code points, as the backend does, so an emoji is never split
+    // into half a surrogate pair.
+    const chars = Array.from(tail);
+    const capped = chars.length > FAILED_LOG_MAX_CHARS ? chars.slice(-FAILED_LOG_MAX_CHARS).join("") : tail;
     lines.push("", "Tail of the failed steps' logs (gh run view --log-failed):", "```", capped, "```");
   }
   return lines.join("\n");

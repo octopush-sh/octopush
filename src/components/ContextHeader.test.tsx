@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ContextHeader } from "./ContextHeader";
 import { useIssuesStore } from "../stores/issuesStore";
@@ -916,5 +916,35 @@ describe("ContextHeader — PR chip checks", () => {
     await userEvent.click(screen.getByRole("button", { name: "Fix failing checks…" }));
     expect(onFix).toHaveBeenCalledWith({ ...pr, checks });
     expect(ipc.openFileInSystem).not.toHaveBeenCalledWith("https://x/7");
+  });
+
+  it("while the logs load: the fix button is busy, says so, and ignores clicks", async () => {
+    let finish!: () => void;
+    const onFix = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    renderWithChecks({ state: "failing", failing: [{ name: "test", runId: 3 }] }, onFix);
+    const button = screen.getByRole("button", { name: "Fix failing checks…" });
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
+    expect(button).not.toBeDisabled();
+
+    fireEvent.click(button);
+    fireEvent.click(button);
+    expect(onFix).toHaveBeenCalledTimes(1);
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(button).toHaveAttribute("title", "Reading the failed logs…");
+
+    finish();
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
+  });
+
+  it("frees the fix button again when the handler fails", async () => {
+    const onFix = vi.fn().mockRejectedValue(new Error("boom"));
+    renderWithChecks({ state: "failing", failing: [{ name: "test", runId: 3 }] }, onFix);
+    const button = screen.getByRole("button", { name: "Fix failing checks…" });
+    fireEvent.click(button);
+    await waitFor(() => expect(button).not.toBeDisabled());
+    expect(button).toHaveAttribute("title", "Fix failing checks…");
   });
 });
