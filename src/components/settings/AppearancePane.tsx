@@ -1,32 +1,45 @@
 // Settings → Appearance — the theme picker. Each card renders a live preview
 // built from the theme's real palette; the card is the swatch, so no hex caption.
+// The pre-redesign palettes sit in their own Legacy group below the current family.
 import { Check } from "lucide-react";
 import { useThemeStore } from "../../stores/themeStore";
+import { isLegacyTheme, themeLabel } from "../../lib/themeNames";
 import type { ThemeConfig } from "../../lib/types";
 import { PaneHeader, SectionLabel } from "./shared";
 
 export function AppearancePane() {
   const { themes, theme: current, apply } = useThemeStore();
+  const family = themes.filter((t) => !isLegacyTheme(t.name));
+  const legacy = themes.filter((t) => isLegacyTheme(t.name));
+
+  // Only promise legacy themes when the list really has some to show.
+  const subtitle = legacy.length > 0
+    ? "Octopush ships with Atelier (Onyx & Brass) and its sibling palettes. The legacy themes are listed below them."
+    : "Octopush ships with Atelier (Onyx & Brass) and its sibling palettes.";
+
+  const grid = (list: ThemeConfig[]) =>
+    list.map((t) => (
+      <ThemeCard
+        key={t.name}
+        theme={t}
+        active={current?.name === t.name}
+        onSelect={() => apply(t)}
+      />
+    ));
 
   return (
     <>
-      <PaneHeader
-        eyebrow="Appearance"
-        title="A palette to live in."
-        subtitle="Octopush ships with Atelier (Onyx & Brass). Legacy themes remain available for power users."
-      />
+      <PaneHeader eyebrow="Appearance" title="A palette to live in." subtitle={subtitle} />
 
       <SectionLabel>Theme</SectionLabel>
-      <div className="grid max-w-[680px] grid-cols-2 gap-3">
-        {themes.map((t) => (
-          <ThemeCard
-            key={t.name}
-            theme={t}
-            active={current?.name === t.name}
-            onSelect={() => apply(t)}
-          />
-        ))}
-      </div>
+      <div className="grid max-w-[680px] grid-cols-2 gap-3">{grid(family)}</div>
+
+      {legacy.length > 0 && (
+        <section className="mt-8" data-tour="settings-appearance-legacy">
+          <SectionLabel>Legacy</SectionLabel>
+          <div className="grid max-w-[680px] grid-cols-2 gap-3">{grid(legacy)}</div>
+        </section>
+      )}
     </>
   );
 }
@@ -67,7 +80,7 @@ function ThemeCard({ theme, active, onSelect }: {
 
       <div className="flex items-center justify-between">
         <span className={`font-serif text-[14px] ${active ? "text-octo-brass" : "text-octo-ivory"}`}>
-          {theme.name}
+          {themeLabel(theme.name)}
         </span>
         {active && (
           <span className="octo-pop-in text-octo-brass" aria-label="Active theme">
