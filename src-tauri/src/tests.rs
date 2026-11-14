@@ -9186,10 +9186,12 @@ mod cli_args_tests {
 
     #[test]
     fn codex_stages_carry_no_claude_settings() {
-        use crate::orchestrator::cli_runner::CliDialect;
+        use crate::orchestrator::cli_runner::{CliDialect, CodexWriteScope};
         for ro in [false, true] {
-            let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro);
-            assert!(!args.contains(&"--settings".to_string()), "{args:?}");
+            for scope in [CodexWriteScope::Workspace { git_dir: None }, CodexWriteScope::MissionSandbox] {
+                let args = CliDialect::Codex.argv("gpt-5", "sys", 10, ro, scope);
+                assert!(!args.contains(&"--settings".to_string()), "{args:?}");
+            }
         }
     }
 
@@ -9221,7 +9223,7 @@ mod cli_args_tests {
 mod cli_dialect_tests {
     use crate::orchestrator::cli_runner::{
         build_codex_outcome, codex_fold_event, codex_usage_from_event, dialect_for_model,
-        CliDialect, CodexAccum,
+        CliDialect, CodexAccum, CodexWriteScope,
     };
     use crate::orchestrator::types::{ArtifactKind, StageStatus};
     use serde_json::json;
@@ -9376,19 +9378,50 @@ mod cli_dialect_tests {
     }
 
     #[test]
+    fn a_codex_writer_outside_a_sandboxed_mission_never_bypasses_codexs_sandbox() {
+        for git_dir in [None, Some("/repo/.git/worktrees/wt")] {
+            let scope = CodexWriteScope::Workspace { git_dir };
+            for model in ["gpt-5", "gpt-6.1-terra", "o3", "gpt-5-codex"] {
+                let argv = CliDialect::Codex.argv(model, "sys", 25, false, scope);
+                assert!(!argv.iter().any(|a| a.contains("dangerously")), "{argv:?}");
+                assert!(argv.windows(2).any(|w| w[0] == "--ask-for-approval" && w[1] == "never"), "{argv:?}");
+            }
+            assert_eq!(CliDialect::Codex.sandbox_label(false, scope), Some("workspace-write sandbox"));
+            assert_eq!(CliDialect::Codex.sandbox_label(true, scope), None);
+            assert_eq!(CliDialect::Claude.sandbox_label(false, scope), None);
+        }
+        assert_eq!(CliDialect::Codex.sandbox_label(false, CodexWriteScope::MissionSandbox), None);
+        // Claude stages ignore the scope.
+        let ws = CodexWriteScope::Workspace { git_dir: Some("/g") };
+        assert_eq!(
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws),
+            CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, CodexWriteScope::MissionSandbox)
+        );
+    }
+
+    #[test]
     fn codex_argv_maps_read_only_to_its_native_sandbox() {
-        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false);
+        let ws = CodexWriteScope::Workspace { git_dir: None };
+        let rw = CliDialect::Codex.argv("gpt-5", "system prompt", 25, false, ws);
         assert_eq!(rw[0], "exec");
         assert!(rw.contains(&"--json".to_string()));
-        assert!(rw.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(rw.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "workspace-write"), "{rw:?}");
         assert!(rw.windows(2).any(|w| w[0] == "-m" && w[1] == "gpt-5"), "{rw:?}");
         assert_eq!(rw.last().map(String::as_str), Some("-"), "prompt rides stdin");
         // System prompt never appears in argv (codex has no flag for it).
         assert!(!rw.iter().any(|a| a.contains("system prompt")));
 
-        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true);
-        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
-        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        for scope in [ws, CodexWriteScope::MissionSandbox] {
+            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope);
+            assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+            assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+            assert!(!ro.contains(&"--add-dir".to_string()), "{ro:?}");
+        }
+
+        // Inside a sandboxed mission, Octopush's Seatbelt profile confines it.
+        let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox);
+        assert!(mission.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{mission:?}");
+        assert!(!mission.contains(&"--sandbox".to_string()), "{mission:?}");
 
         // Codex has no confirmed resume contract → fresh-run fallback.
         assert!(CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false).is_none());

@@ -27,8 +27,8 @@ use std::path::{Path, PathBuf};
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
     build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
-    plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect, ReadEnd,
-    ReadLimits,
+    plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect,
+    CodexWriteScope, ReadEnd, ReadLimits,
 };
 use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
@@ -718,11 +718,40 @@ fn claude_stage_env_keeps_mcp_tasks_inside_their_tool_call() {
 
 // ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────
 
+/// A writer outside a sandboxed mission, in a linked worktree.
+const CODEX_WS: CodexWriteScope<'static> = CodexWriteScope::Workspace { git_dir: Some("/repo/.git/worktrees/wt") };
+
+#[test]
+fn codex_writer_runs_in_its_workspace_write_sandbox() {
+    use crate::providers::Effort;
+    let head = ["exec", "--json", "--skip-git-repo-check", "-m", "gpt-6.1-terra"];
+    let sandbox = ["--sandbox", "workspace-write", "--ask-for-approval", "never"];
+    let add_dir = ["--add-dir", "/repo/.git/worktrees/wt"];
+    let plain = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CODEX_WS);
+    assert_eq!(plain, [&head[..], &sandbox[..], &add_dir[..], &["-"][..]].concat(), "{plain:?}");
+    // The effort override sits after the sandbox flags, before the stdin marker.
+    let mut argv = plain.clone();
+    CliDialect::Codex.push_effort_args(&mut argv, "gpt-6.1-terra", Some(Effort::High));
+    let effort = ["-c", "model_reasoning_effort=\"high\""];
+    assert_eq!(argv, [&head[..], &sandbox[..], &add_dir[..], &effort[..], &["-"][..]].concat(), "{argv:?}");
+    // A main checkout (no own git dir) gets no `--add-dir`: the shared `.git` is never added.
+    let main = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::Workspace { git_dir: None });
+    assert_eq!(main, [&head[..], &sandbox[..], &["-"][..]].concat(), "{main:?}");
+    // Inside a sandboxed mission the bypass flag stays (Seatbelt confines it).
+    let mission = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::MissionSandbox);
+    assert_eq!(mission, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{mission:?}");
+    // Read-only is unchanged, in or out of a sandboxed mission.
+    for scope in [CODEX_WS, CodexWriteScope::MissionSandbox] {
+        let ro = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, true, scope);
+        assert_eq!(ro, [&head[..], &["--sandbox", "read-only", "-"][..]].concat(), "{ro:?}");
+    }
+}
+
 #[test]
 fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
     use crate::providers::Effort;
     for read_only in [false, true] {
-        let mut argv = CliDialect::Codex.argv("gpt-5.5", "system", 25, read_only);
+        let mut argv = CliDialect::Codex.argv("gpt-5.5", "system", 25, read_only, CODEX_WS);
         CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", Some(Effort::High));
         let n = argv.len();
         assert_eq!(argv[n - 1], "-", "the prompt still comes from stdin: {argv:?}");
@@ -736,7 +765,7 @@ fn codex_argv_carries_the_effort_override_before_the_stdin_marker() {
 
 #[test]
 fn codex_argv_without_an_effort_keeps_codexs_own_default() {
-    let plain = CliDialect::Codex.argv("gpt-5.5", "system", 25, false);
+    let plain = CliDialect::Codex.argv("gpt-5.5", "system", 25, false, CODEX_WS);
     let mut argv = plain.clone();
     CliDialect::Codex.push_effort_args(&mut argv, "gpt-5.5", None);
     assert_eq!(argv, plain);
@@ -751,7 +780,7 @@ fn codex_argv_on_a_model_outside_the_catalog_carries_no_override() {
     use crate::providers::Effort;
     for model in ["gpt-5-codex", "o3", "o4-mini", "gpt-4o"] {
         for effort in [Effort::Low, Effort::High, Effort::Xhigh, Effort::Max] {
-            let plain = CliDialect::Codex.argv(model, "system", 25, false);
+            let plain = CliDialect::Codex.argv(model, "system", 25, false, CODEX_WS);
             let mut argv = plain.clone();
             CliDialect::Codex.push_effort_args(&mut argv, model, Some(effort));
             assert_eq!(argv, plain, "[{model} {effort:?}]");
@@ -766,7 +795,7 @@ fn codex_argv_maps_max_to_the_models_top_level() {
     // Levels per Codex's catalog (models.json @ a7a9d82): gpt-5.5 tops out at
     // xhigh; gpt-5.6-sol, gpt-6.1-terra and codex-auto-review list max.
     for (model, level) in [("gpt-5.5", "xhigh"), ("gpt-6.1-terra", "max"), ("gpt-5.6-sol", "max"), ("codex-auto-review", "max")] {
-        let mut argv = CliDialect::Codex.argv(model, "system", 25, false);
+        let mut argv = CliDialect::Codex.argv(model, "system", 25, false, CODEX_WS);
         CliDialect::Codex.push_effort_args(&mut argv, model, Some(Effort::Max));
         let want = format!("model_reasoning_effort=\"{level}\"");
         assert!(argv.contains(&want), "[{model}] {argv:?}");

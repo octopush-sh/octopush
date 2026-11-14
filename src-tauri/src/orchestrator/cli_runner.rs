@@ -839,6 +839,18 @@ pub enum CliDialect {
     Codex,
 }
 
+/// What confines a Codex writer stage's own commands (read-only stages always
+/// run in Codex's `read-only` sandbox; Claude stages ignore this).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CodexWriteScope<'a> {
+    /// Codex's own `workspace-write` sandbox: the worktree, plus the linked
+    /// worktree's own git dir when there is one (`sandbox::codex_add_dir`).
+    Workspace { git_dir: Option<&'a str> },
+    /// The mission runs sandboxed: Octopush's Seatbelt profile already
+    /// confines the process, and nesting Codex's Seatbelt inside it is untested.
+    MissionSandbox,
+}
+
 /// Derive the dialect from the stage's model id. Unknown ids fall back to
 /// Claude (the historical behavior — and `claude` is the CLI most likely to
 /// be configured for a proxy model).
@@ -936,8 +948,18 @@ impl CliDialect {
     /// equivalent: the system prompt rides stdin (see [`CliDialect::stdin_payload`])
     /// and the turn budget is bounded by the runner's idle/absolute timeouts.
     /// `read_only` maps to each CLI's native mechanism: Claude denies the edit
-    /// tools; Codex runs in its own `read-only` sandbox.
-    pub fn argv(&self, model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
+    /// tools; Codex runs in its own `read-only` sandbox. A Codex writer runs in
+    /// its `workspace-write` sandbox, or bypasses it inside a sandboxed mission
+    /// (see [`CodexWriteScope`]); either way it never stops for approval,
+    /// which would hang a headless stage.
+    pub fn argv(
+        &self,
+        model: &str,
+        system_prompt: &str,
+        max_turns: i64,
+        read_only: bool,
+        scope: CodexWriteScope<'_>,
+    ) -> Vec<String> {
         match self {
             CliDialect::Claude => build_cli_args(model, system_prompt, max_turns, read_only),
             CliDialect::Codex => {
@@ -948,18 +970,36 @@ impl CliDialect {
                     "-m".to_string(),
                     model.to_string(),
                 ];
-                if read_only {
-                    a.push("--sandbox".to_string());
-                    a.push("read-only".to_string());
-                } else {
-                    // The Octopush worktree + mission sandbox own isolation;
-                    // codex's approval prompts would hang a headless stage.
-                    a.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+                match (read_only, scope) {
+                    (true, _) => a.extend(["--sandbox".to_string(), "read-only".to_string()]),
+                    (false, CodexWriteScope::Workspace { git_dir }) => {
+                        a.extend([
+                            "--sandbox".to_string(),
+                            "workspace-write".to_string(),
+                            "--ask-for-approval".to_string(),
+                            "never".to_string(),
+                        ]);
+                        if let Some(dir) = git_dir {
+                            a.extend(["--add-dir".to_string(), dir.to_string()]);
+                        }
+                    }
+                    (false, CodexWriteScope::MissionSandbox) => {
+                        a.push("--dangerously-bypass-approvals-and-sandbox".to_string())
+                    }
                 }
                 // `-` = read the prompt from stdin.
                 a.push("-".to_string());
                 a
             }
+        }
+    }
+
+    /// The launch line's sandbox label: Codex's own sandbox when it confines
+    /// a writer stage; `None` otherwise.
+    pub fn sandbox_label(&self, read_only: bool, scope: CodexWriteScope<'_>) -> Option<&'static str> {
+        match (self, read_only, scope) {
+            (CliDialect::Codex, false, CodexWriteScope::Workspace { .. }) => Some("workspace-write sandbox"),
+            _ => None,
         }
     }
 
@@ -1603,6 +1643,22 @@ impl AgentRunner for CliRunner {
             .as_deref()
             .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only));
         let resuming = resume_args.is_some();
+        // A Codex writer outside a sandboxed mission runs in Codex's own
+        // `workspace-write` sandbox, never the bypass flag.
+        let codex_git_dir = if dialect == CliDialect::Codex && !read_only && ctx.exec_isolation != "sandbox" {
+            let ws = ctx.workspace_path.to_string_lossy().into_owned();
+            tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::codex_add_dir(&ws))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+        let write_scope = if ctx.exec_isolation == "sandbox" {
+            CodexWriteScope::MissionSandbox
+        } else {
+            CodexWriteScope::Workspace { git_dir: codex_git_dir.as_deref() }
+        };
         let (mut args, user) = match resume_args {
             Some(argv) => (
                 argv,
@@ -1620,7 +1676,7 @@ impl AgentRunner for CliRunner {
                 },
             ),
             None => (
-                dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only),
+                dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only, write_scope),
                 dialect.stdin_payload(
                     &system,
                     &user_input_for(&stage.role, &ctx.task, input, stage.feedback.as_deref()),
@@ -1749,10 +1805,11 @@ impl AgentRunner for CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}",
+            "launching {} · {}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
+            dialect.sandbox_label(read_only, write_scope).map(|s| format!(" · {s}")).unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {

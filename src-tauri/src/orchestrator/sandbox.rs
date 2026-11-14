@@ -358,6 +358,22 @@ fn resolve_git_layout(workspace: &str) -> AppResult<Option<GitLayout>> {
     Ok(Some(layout))
 }
 
+/// The extra dir a Codex writer stage gets with `--add-dir`: a linked
+/// worktree's own git dir (`<common>/worktrees/<name>`: index, HEAD), so
+/// `git add`/`git stash` there can update its index. Never the shared git dir,
+/// so hooks and config stay out of reach — a main checkout, whose git dir IS
+/// the shared one, gets none. Pure.
+fn codex_git_write_dir(layout: &GitLayout) -> Option<String> {
+    (layout.git_dir != layout.common_dir).then(|| layout.git_dir.clone())
+}
+
+/// [`codex_git_write_dir`] for `workspace`, resolved like the Seatbelt
+/// profile's git rules. `None` when the workspace has no git dir of its own or
+/// git can't vouch for it: the stage then runs with the worktree alone.
+pub fn codex_add_dir(workspace: &str) -> Option<String> {
+    resolve_git_layout(workspace).ok().flatten().as_ref().and_then(codex_git_write_dir)
+}
+
 /// Render an SBPL profile that allows everything by default, denies all file
 /// writes, then re-allows writes under `subpaths` (directory subtrees) and to
 /// `literals` (individual files), and finally denies writes to and hardlinks
@@ -839,6 +855,22 @@ mod tests {
         // A plain directory is not a git workspace.
         let plain = tempfile::tempdir().unwrap();
         assert_eq!(resolve(plain.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn codex_gets_only_a_linked_worktrees_own_git_dir() {
+        assert_eq!(codex_git_write_dir(&linked_layout()).as_deref(), Some("/repo/.git/worktrees/wt"));
+        // A main checkout's git dir is the shared one: never added.
+        assert_eq!(codex_git_write_dir(&main_layout()), None);
+        let Some((_dir, main, wt)) = repo_with_worktree() else {
+            eprintln!("git unavailable; skipping");
+            return;
+        };
+        let common = canonical_string(&main.join(".git"));
+        assert_eq!(codex_add_dir(wt.to_str().unwrap()), Some(format!("{common}/worktrees/wt")));
+        assert_eq!(codex_add_dir(main.to_str().unwrap()), None);
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(codex_add_dir(plain.path().to_str().unwrap()), None);
     }
 
     #[test]
