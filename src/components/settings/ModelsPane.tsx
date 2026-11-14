@@ -216,8 +216,7 @@ export function ModelsPane() {
             type="button"
             data-tour="settings-models-add-provider"
             onClick={() => setShowAddProvider(true)}
-            className="mt-2 flex items-center rounded-md px-3 py-2 font-serif text-[13px] text-octo-brass transition"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            className="mt-2 flex items-center rounded-md border border-octo-hairline px-3 py-2 font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory"
           >
             Connect another provider
           </button>
@@ -498,8 +497,7 @@ function ProviderDetail({
             type="button"
             data-tour="settings-models-add-model"
             onClick={onAddModel}
-            className="flex items-center rounded-md px-2.5 py-1 font-serif text-[12px] text-octo-brass transition"
-            style={{ background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }}
+            className="flex items-center rounded-md border border-octo-hairline px-2.5 py-1 font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
           >
             Bring in another model
           </button>
