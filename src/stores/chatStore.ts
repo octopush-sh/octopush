@@ -9,6 +9,7 @@ import { isBudgetExceeded } from "../lib/budgetError";
 import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
 import { deriveChatTitle } from "../lib/chatTitle";
+import { helperModelNow } from "../lib/helperModels";
 
 export interface ToolExecution {
   toolName: string;
@@ -948,7 +949,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     pendingCapsByWs: {},
     continuingCalls: {},
     continueErrorByCall: {},
-    model: "claude-sonnet-4-6",
+    model: helperModelNow("review"),
     effort: "standard",
 
     getMessages: (workspaceId) => get().messagesByWs[workspaceId] ?? EMPTY_MESSAGES,

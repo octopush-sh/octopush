@@ -4186,56 +4186,62 @@ impl Db {
     /// Insert the three curated pipelines if they are not already present.
     /// Idempotent: keyed on the builtin name.
     pub fn seed_builtin_pipelines(&self) -> AppResult<()> {
+        // Models come from the builtin lineup's tags, so a fresh install seeds
+        // current models. Crews already seeded are never rewritten (keyed on the
+        // name below): a saved crew's cost doesn't change silently.
+        let fast = crate::provider_router::builtin_anthropic_model_tagged("fast");
+        let balanced = crate::provider_router::builtin_anthropic_model_tagged("balanced");
+        let (fast, balanced) = (fast.as_str(), balanced.as_str());
         // (name, description, [(role, model, substrate, checkpoint, loop_target, loop_max, loop_mode)])
         let defs: &[(&str, &str, &[(&str, &str, &str, bool, Option<i64>, i64, Option<&str>)])] = &[
             (
                 "Feature Factory",
                 "Full build: plan, review, implement, review, test.",
                 &[
-                    ("plan",        "claude-haiku-4-5",   "api", false, None,    0, None),
-                    ("plan_review", "claude-haiku-4-5",   "api", false, None,    0, None),
-                    ("implement",   "claude-sonnet-4-6",  "api", true,  None,    0, None),
-                    ("code_review", "claude-haiku-4-5",   "api", true,  Some(2), 2, Some("gated")),
-                    ("test",        "claude-haiku-4-5",   "api", true,  None,    0, None),
+                    ("plan",        fast,     "api", false, None,    0, None),
+                    ("plan_review", fast,     "api", false, None,    0, None),
+                    ("implement",   balanced, "api", true,  None,    0, None),
+                    ("code_review", fast,     "api", true,  Some(2), 2, Some("gated")),
+                    ("test",        fast,     "api", true,  None,    0, None),
                 ],
             ),
             (
                 "Bugfix relay",
                 "Reproduce, fix, verify. Lean and fast.",
                 &[
-                    ("repro",  "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("fix",    "claude-sonnet-4-6",  "api", true,  None,    0, None),
-                    ("verify", "claude-haiku-4-5",   "api", true,  Some(1), 2, Some("gated")),
+                    ("repro",  fast,     "api", false, None,    0, None),
+                    ("fix",    balanced, "api", true,  None,    0, None),
+                    ("verify", fast,     "api", true,  Some(1), 2, Some("gated")),
                 ],
             ),
             (
                 "Plan & review",
                 "Thinking only — no code is written.",
                 &[
-                    ("plan",     "claude-sonnet-4-6", "api", false, None, 0, None),
-                    ("critique", "claude-haiku-4-5",  "api", false, None, 0, None),
-                    ("refine",   "claude-sonnet-4-6", "api", true,  None, 0, None),
+                    ("plan",     balanced, "api", false, None, 0, None),
+                    ("critique", fast,     "api", false, None, 0, None),
+                    ("refine",   balanced, "api", true,  None, 0, None),
                 ],
             ),
             (
                 "Ship it",
                 "Issue to pull request: plan, implement, review, test, open the PR.",
                 &[
-                    ("plan",         "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("implement",    "claude-sonnet-4-6", "api", true,  None,    0, None),
-                    ("code_review",  "claude-haiku-4-5",  "api", true,  Some(1), 2, Some("gated")),
-                    ("test",         "claude-haiku-4-5",  "api", true,  None,    0, None),
-                    ("pull_request", "claude-sonnet-4-6", "cli", true,  None,    0, None),
+                    ("plan",         fast,     "api", false, None,    0, None),
+                    ("implement",    balanced, "api", true,  None,    0, None),
+                    ("code_review",  fast,     "api", true,  Some(1), 2, Some("gated")),
+                    ("test",         fast,     "api", true,  None,    0, None),
+                    ("pull_request", balanced, "cli", true,  None,    0, None),
                 ],
             ),
             (
                 "Claude Code build",
                 "Plan via API, then implement, review, and test with Claude Code (CLI).",
                 &[
-                    ("plan",        "claude-haiku-4-5",  "api", false, None,    0, None),
-                    ("implement",   "claude-sonnet-4-6", "cli", true,  None,    0, None),
-                    ("code_review", "claude-haiku-4-5",  "cli", true,  Some(1), 2, Some("gated")),
-                    ("test",        "claude-haiku-4-5",  "cli", true,  None,    0, None),
+                    ("plan",        fast,     "api", false, None,    0, None),
+                    ("implement",   balanced, "cli", true,  None,    0, None),
+                    ("code_review", fast,     "cli", true,  Some(1), 2, Some("gated")),
+                    ("test",        fast,     "cli", true,  None,    0, None),
                 ],
             ),
         ];
@@ -4307,10 +4313,13 @@ impl Db {
             "From a prompt to a first working slice of a brand-new project.",
             true,
         )?;
+        let fast = crate::provider_router::builtin_anthropic_model_tagged("fast");
+        let balanced = crate::provider_router::builtin_anthropic_model_tagged("balanced");
+        let (fast, balanced) = (fast.as_str(), balanced.as_str());
         // (role, custom_name, model, checkpoint, loop_target, loop_max, loop_mode, instructions)
         let stages: &[(&str, &str, &str, bool, Option<i64>, i64, Option<&str>, &str)] = &[
             (
-                "plan", "Choose the stack", "claude-sonnet-4-6", true, None, 0, None,
+                "plan", "Choose the stack", balanced, true, None, 0, None,
                 "This is a GREENFIELD project — the repository is empty. Read the brief and choose the \
                  SIMPLEST language, framework, and structure that genuinely satisfies it (bias to what \
                  can be verified locally with common toolchains). Propose the directory structure and a \
@@ -4319,26 +4328,26 @@ impl Db {
                  director approves before the build begins.",
             ),
             (
-                "implement", "Scaffold", "claude-sonnet-4-6", false, None, 0, None,
+                "implement", "Scaffold", balanced, false, None, 0, None,
                 "Scaffold ONLY the structure the approved plan chose: directories, dependency manifests, \
                  config, and a sensible .gitignore. Do not implement features yet — create the skeleton \
                  that installs/builds cleanly. Prefer standard, well-known project layouts for the chosen \
                  stack.",
             ),
             (
-                "implement", "First increment", "claude-sonnet-4-6", true, None, 0, None,
+                "implement", "First increment", balanced, true, None, 0, None,
                 "Implement the FIRST working increment from the plan — the smallest slice that actually \
                  runs: a passing test, a server that responds, a CLI that does one thing, or a view that \
                  compiles. Keep it minimal and real. This is a starting point a developer can build on, \
                  not a finished product.",
             ),
             (
-                "code_review", "Review the increment", "claude-haiku-4-5", true, Some(2), 2, Some("gated"),
+                "code_review", "Review the increment", fast, true, Some(2), 2, Some("gated"),
                 "Review the increment for correctness and obvious issues. Keep the bar at 'a competent \
                  first slice', not 'production-ready' — this is a greenfield starting point.",
             ),
             (
-                "test", "Verify honestly", "claude-sonnet-4-6", true, None, 0, None,
+                "test", "Verify honestly", balanced, true, None, 0, None,
                 "Run whatever can be run to verify the increment. Then write a README.md that is HONEST: \
                  how to run it, what you actually verified (e.g. 'tests pass', 'the server responds on \
                  :3000'), and what you could NOT verify in this environment (e.g. 'no iOS simulator \
@@ -4389,6 +4398,7 @@ impl Db {
         // write — but a tight allowlist keeps the agent from even trying.)
         let profile_tools = r#"["read_file","list_files","run_command"]"#;
         let read_tools = r#"["read_file","list_files"]"#;
+        let model = crate::provider_router::builtin_anthropic_model_tagged("balanced");
         // (custom_name, checkpoint, instructions, tools_json)
         let stages: &[(&str, bool, &str, &str)] = &[
             (
@@ -4422,8 +4432,8 @@ impl Db {
                     (id, pipeline_id, position, role, agent_model, substrate, checkpoint,
                      loop_target_position, loop_max_iterations, loop_mode, max_iterations,
                      custom_name, instructions, tools)
-                 VALUES (?1,?2,?3,'critique','claude-sonnet-4-6','api',?4,NULL,0,NULL,25,?5,?6,?7)",
-                params![id, pid, i as i64, *checkpoint as i64, custom_name, instructions, tools],
+                 VALUES (?1,?2,?3,'critique',?8,'api',?4,NULL,0,NULL,25,?5,?6,?7)",
+                params![id, pid, i as i64, *checkpoint as i64, custom_name, instructions, tools, model],
             )?;
         }
         Ok(())

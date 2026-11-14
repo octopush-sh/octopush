@@ -16,6 +16,7 @@
 
 import type { Node, Edge } from "@xyflow/react";
 import type { AgentSubstrate, Effort, PipelineWithStages, PipelineStage, Role, StageDraft } from "../../lib/ipc";
+import { helperModelNow } from "../../lib/helperModelIds";
 
 /** The most loop-backs a review stage may take. Matches Rust
  *  `db::MAX_LOOP_ITERATIONS`, which the stage validator enforces. */
@@ -153,7 +154,6 @@ export interface EdgeData {
 export type StageEdge = Edge<EdgeData>;
 
 export const DEFAULT_MAX_TURNS = 25;
-const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 /** Whether a model id maps to a CLI dialect the backend can run — mirrors
  *  `dialect_for_model` in src-tauri/src/orchestrator/cli_runner.rs:
@@ -186,7 +186,7 @@ export function newStageData(role: string): StageNodeData {
   return {
     role,
     customName: null,
-    agentModel: DEFAULT_MODEL,
+    agentModel: helperModelNow("review"),
     effort: null,
     escalateModel: null,
     escalateEffort: null,

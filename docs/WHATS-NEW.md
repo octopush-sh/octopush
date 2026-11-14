@@ -110,6 +110,7 @@ Current anchors:
 | `review-file-viewed` · `review-file-changed` | Review diff, file header: "mark viewed" / "✓ viewed" · the "changed since viewed" chip (only after a viewed file changed) | `review/FileDiffSection.tsx` |
 | `review-open-pr` | Review: "Open a pull request" (published branch, no PR yet, `gh` signed in) | `ChangesPanel.tsx` |
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |
+| `pr-composer-draft-note` | PR composer, once a draft answered: the note under the form ("Drafted by claude-sonnet-5-5 · $0.02") | `PrComposer.tsx` |
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |

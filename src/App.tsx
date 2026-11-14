@@ -65,6 +65,7 @@ import { FirstRunInvite } from "./components/FirstRunInvite";
 import { useFirstRunStore, crewProviderReady } from "./stores/firstRunStore";
 import { initCrewNotifications } from "./lib/crewNotifications";
 import { initGenesisRename } from "./lib/genesisRename";
+import { resolveHelperModel } from "./lib/helperModels";
 import { deriveProjectName } from "./lib/genesis";
 import { useSyncPrefsStore } from "./stores/syncPrefsStore";
 import { runSyncBackfill } from "./lib/syncBackfill";
@@ -188,6 +189,10 @@ function App() {
     // Post-build rename: a one-shot suggestion after a genesis project's first
     // crew ships (the built thing knows what it is).
     initGenesisRename();
+    // Look up the helper models once, so new builder stages and the AI review
+    // default use the builtin lineup's ids.
+    void resolveHelperModel("review");
+    void resolveHelperModel("fast");
   }, [loadActiveRuns]);
 
   // Cloud sync is OPT-IN (Settings › Account › Sync; both off by default).
