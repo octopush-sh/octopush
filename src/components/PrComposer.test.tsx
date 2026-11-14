@@ -14,6 +14,7 @@ const ipcMock = {
   pushBranch: vi.fn(),
   createPullRequest: vi.fn(),
   openFileInSystem: vi.fn(),
+  suggestModel: vi.fn(),
 };
 vi.mock("../lib/ipc", () => ({ ipc: ipcMock }));
 const pushToast = vi.fn();
@@ -21,6 +22,7 @@ vi.mock("./Toasts", () => ({ pushToast }));
 
 const { PrComposer } = await import("./PrComposer");
 const { usePrStore } = await import("../stores/prStore");
+const { _resetHelperModelsForTests } = await import("../lib/helperModels");
 
 const WS: Workspace = {
   id: "ws-1",
@@ -72,6 +74,7 @@ const renderComposer = (onClose = vi.fn()) =>
 
 beforeEach(() => {
   Object.values(ipcMock).forEach((m) => m.mockReset());
+  _resetHelperModelsForTests();
   pushToast.mockReset();
   usePrStore.setState({ byWorkspace: {}, composerFor: null });
 });
@@ -114,21 +117,30 @@ describe("PrComposer", () => {
     ready();
     ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 0 });
     renderComposer();
-    const note = await screen.findByText(/Drafted by claude-sonnet-4-6/);
+    const note = await screen.findByText(/Drafted by claude-sonnet-5-5/);
     expect(note.textContent).toMatch(/ · unpriced$/);
     expect(note.textContent).not.toMatch(/\$/);
+  });
+
+  it("drafts with the review tier from the builtin tag lookup and names it", async () => {
+    ready();
+    ipcMock.suggestModel.mockResolvedValue({ modelId: "claude-sonnet-9", provider: "anthropic", reason: "", estimatedCostTier: "medium" });
+    renderComposer();
+    expect(await screen.findByText(/Drafted by claude-sonnet-9/)).toBeTruthy();
+    expect(ipcMock.suggestModel).toHaveBeenCalledWith("code_review");
+    expect(ipcMock.aiComplete.mock.calls[0][0]).toBe("claude-sonnet-9");
   });
 
   it("a sub-cent draft cost keeps four decimals; a large one is grouped", async () => {
     ready();
     ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 0.0042 });
     const { unmount } = renderComposer();
-    expect((await screen.findByText(/Drafted by claude-sonnet-4-6/)).textContent).toMatch(/ · \$0\.0042$/);
+    expect((await screen.findByText(/Drafted by claude-sonnet-5-5/)).textContent).toMatch(/ · \$0\.0042$/);
     unmount();
     ready();
     ipcMock.aiComplete.mockResolvedValue({ text: "Add CSV export\n\nBody.", inputTokens: 1, outputTokens: 1, costUsd: 1234.5 });
     renderComposer();
-    expect((await screen.findByText(/Drafted by claude-sonnet-4-6/)).textContent).toMatch(/ · \$1,234\.50$/);
+    expect((await screen.findByText(/Drafted by claude-sonnet-5-5/)).textContent).toMatch(/ · \$1,234\.50$/);
   });
 
   it("a failed draft keeps the form usable and says why", async () => {

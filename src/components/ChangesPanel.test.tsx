@@ -13,6 +13,7 @@ const { ipcMock, pushToast } = vi.hoisted(() => ({
     resolveConflictTake: vi.fn(), markConflictResolved: vi.fn(),
     continueOperation: vi.fn(), abortOperation: vi.fn(),
     githubShipReadiness: vi.fn(), listBranches: vi.fn(), findPrForBranch: vi.fn(),
+    suggestModel: vi.fn(),
   },
   pushToast: vi.fn(),
 }));
@@ -36,6 +37,7 @@ vi.mock("./HistoryModal", () => ({
 
 import { ChangesPanel } from "./ChangesPanel";
 import { usePrStore } from "../stores/prStore";
+import { _resetHelperModelsForTests } from "../lib/helperModels";
 
 const STATUS = {
   branch: "main", ahead: 0, behind: 0, hasUpstream: true,
@@ -48,17 +50,21 @@ const STATUS = {
 
 beforeEach(() => {
   vi.clearAllMocks();
+  _resetHelperModelsForTests();
   ipcMock.getGitStatus.mockResolvedValue(STATUS);
 });
 
 describe("ChangesPanel G4", () => {
   it("Draft fills the message from the staged diff via aiComplete", async () => {
     ipcMock.getStagedDiff.mockResolvedValue("DIFF");
+    ipcMock.suggestModel.mockResolvedValueOnce({ modelId: "claude-sonnet-9", provider: "anthropic", reason: "", estimatedCostTier: "medium" });
     ipcMock.aiComplete.mockResolvedValue({ text: "feat: drafted", inputTokens: 1, outputTokens: 1, costUsd: 0 });
     render(<ChangesPanel projectPath="/repo" />);
     await screen.findByText("a.ts");
     await userEvent.click(screen.getByRole("button", { name: /draft/i }));
     await waitFor(() => expect(ipcMock.aiComplete).toHaveBeenCalled());
+    expect(ipcMock.suggestModel).toHaveBeenCalledWith("code_review");
+    expect(ipcMock.aiComplete.mock.calls[0][0]).toBe("claude-sonnet-9");
     expect(ipcMock.getStagedDiff).toHaveBeenCalledWith("/repo");
     expect((screen.getByPlaceholderText(/describe the change/i) as HTMLTextAreaElement).value).toBe("feat: drafted");
   });
@@ -342,7 +348,7 @@ describe("ChangesPanel G7 conflicts", () => {
     await screen.findByText(/2 conflicts · merge/i);
     await userEvent.click(screen.getAllByRole("button", { name: /resolve with ai/i })[0]);
     const modal = await screen.findByTestId("conflict-ai-modal");
-    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-4-6");
+    expect(modal.textContent).toBe("src/a.ts:claude-sonnet-5-5");
   });
 
   it("Pencil routes through the panel's file-open path", async () => {

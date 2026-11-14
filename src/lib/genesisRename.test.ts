@@ -9,6 +9,7 @@ vi.mock("./ipc", async (importOriginal) => {
       claimGenesisRename: vi.fn(),
       aiComplete: vi.fn(),
       updateProjectCustomization: vi.fn(),
+      suggestModel: vi.fn(),
     },
   };
 });
@@ -48,6 +49,8 @@ describe("genesis post-build rename", () => {
     expect(m.candidate).toHaveBeenCalledWith("w1");
     const toast = pushToastMock.mock.calls[0][0];
     expect(toast.body).toContain("task-tracker");
+    // Named with the fast tier of the builtin lineup (no backend here → its fallback).
+    expect(m.ai.mock.calls[0][0]).toBe("claude-haiku-5-5");
     // The action performs the rename.
     toast.action.onClick();
     expect(m.rename).toHaveBeenCalledWith("proj1", "task-tracker", null);

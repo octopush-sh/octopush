@@ -35,6 +35,7 @@ import { ConflictAiModal } from "./ConflictAiModal";
 import { GitOpsMenu } from "./GitOpsMenu";
 import { HistoryModal } from "./HistoryModal";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
+import { resolveHelperModel } from "../lib/helperModels";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useAiReview } from "../stores/aiReviewStore";
@@ -215,7 +216,8 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     setDrafting(true);
     try {
       const d = await ipc.getStagedDiff(projectPath);
-      const r = await ipc.aiComplete("claude-sonnet-4-6", COMMIT_SYSTEM, buildCommitPrompt(d), {
+      const model = await resolveHelperModel("review");
+      const r = await ipc.aiComplete(model, COMMIT_SYSTEM, buildCommitPrompt(d), {
         workspaceId,
       });
       setCommitMessage(r.text.trim());

@@ -33,8 +33,7 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { TogglePill } from "./controls/TogglePill";
 import { pushToast } from "./Toasts";
-
-const DRAFT_MODEL = "claude-sonnet-4-6";
+import { resolveHelperModel } from "../lib/helperModels";
 
 type Phase =
   | { kind: "checking" }
@@ -97,8 +96,9 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
             model: i < 12 ? ((await ipc.getMessage(t.messageId).catch(() => null))?.model ?? null) : null,
           })),
         );
+        const draftModel = await resolveHelperModel("review");
         const r = await ipc.aiComplete(
-          DRAFT_MODEL,
+          draftModel,
           PR_SYSTEM,
           buildPrPrompt({
             diff: ctx.diff,
@@ -122,7 +122,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
             : " · unpriced";
         setDraftNote({
           tone: "mute",
-          text: `Drafted by ${DRAFT_MODEL}${ctx.template ? " from the repo's template" : ""}${cost}`,
+          text: `Drafted by ${draftModel}${ctx.template ? " from the repo's template" : ""}${cost}`,
         });
       } catch (e) {
         if (gen !== draftGen.current) return;
@@ -321,6 +321,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
                 </div>
                 {draftNote && (
                   <p
+                    data-tour="pr-composer-draft-note"
                     className={`octo-rise-in font-mono text-[10px] ${draftNote.tone === "rouge" ? "text-octo-rouge" : "text-octo-mute"}`}
                   >
                     {draftNote.text}
