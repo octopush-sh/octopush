@@ -98,6 +98,17 @@ describe("WhatsNewModal", () => {
     expect(document.querySelectorAll("[data-dot]")).toHaveLength(2);
   });
 
+  it("marks the current page as the only brass dot", () => {
+    render(<WhatsNewModal />);
+    act(() => useWhatsNewStore.getState().open([tip("a"), tip("b"), tip("c")]));
+    act(() => useWhatsNewStore.getState().goTo(1));
+    const dots = document.querySelectorAll("[data-dot]");
+    const brass = document.querySelectorAll("[data-dot].bg-octo-brass");
+    expect(brass).toHaveLength(1);
+    expect(brass[0]).toBe(dots[1]);
+    expect(dots[1].getAttribute("title")).toBe("Title b");
+  });
+
   it("Show me appears only with steps, runs the tour, then returns at the next tip", async () => {
     const target = document.createElement("button");
     target.setAttribute("data-tour", "about-whats-new");

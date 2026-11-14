@@ -75,4 +75,24 @@ describe("StageDots — the universal micro-track", () => {
     expect(dots[1].className).toContain("ring-1");
     expect(dots[1].getAttribute("title")).toBe("Pauses for your approval");
   });
+
+  it("pager tone makes the current page the one brass dot, with no halo", () => {
+    const { container } = render(
+      <StageDots
+        tone="pager"
+        stages={[
+          { status: "seen", title: "One" },
+          { status: "current", title: "Two" },
+          { status: "upcoming", title: "Three" },
+        ]}
+      />,
+    );
+    const dots = container.querySelectorAll("span[data-dot]");
+    expect(dots[0].className).toContain("bg-octo-verdigris");
+    expect(dots[1].className).toContain("bg-octo-brass");
+    expect(dots[1].className).not.toContain("ring-1");
+    expect(dots[2].className).toContain("bg-octo-hairline");
+    expect(dots[1].getAttribute("title")).toBe("Two");
+    expect(container.querySelectorAll("span[data-dot].bg-octo-brass")).toHaveLength(1);
+  });
 });
