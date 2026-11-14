@@ -1215,6 +1215,11 @@ export const ipc = {
   findPrForBranch: (workspacePath: string) =>
     invoke<Pr | null>("find_pr_for_branch", { workspacePath }),
 
+  /** The tail of these Actions runs' failed-step logs (`gh run view
+   *  --log-failed`), capped at 8k chars. Empty without `gh`. */
+  prFailedCheckLogs: (workspacePath: string, runIds: number[]) =>
+    invoke<string>("pr_failed_check_logs", { workspacePath, runIds }),
+
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
 

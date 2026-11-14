@@ -107,7 +107,8 @@ import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
-import type { GitStatus, TintName, Issue, ProjectInfo } from "./lib/types";
+import type { GitStatus, TintName, Issue, ProjectInfo, Pr } from "./lib/types";
+import { prefillFixChecks } from "./lib/fixChecks";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
 import { revealDiffTarget, stripDiffPrefix } from "./lib/diffJump";
@@ -1686,6 +1687,18 @@ function App() {
     setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
   }, [activeWorkspaceId, workspaces]);
 
+  // PR chip "Fix failing checks…": seed the Direct launcher on this workspace
+  // with a brief naming the failed checks and their log tail. The launcher
+  // keeps its usual crew selection; nothing starts until the user presses Start.
+  const handleFixChecks = useCallback(async (pr: Pr) => {
+    const wsId = activeWorkspaceId;
+    const ws = workspaces.find((w) => w.id === wsId);
+    const path = ws?.worktreePath ?? project?.path;
+    if (!wsId || !path || !pr.checks) return;
+    await prefillFixChecks(pr, wsId, path);
+    setModePerWorkspace((p) => ({ ...p, [wsId]: "direct" }));
+  }, [activeWorkspaceId, workspaces, project]);
+
   // Prompt genesis: a prompt becomes a project + a staged crew (intent before
   // the repo). Composes create_project (born in <1s, local) with the same crew
   // handoff FirstRunInvite uses. Genesis projects live in a visible ~/Octopush —
@@ -2120,6 +2133,7 @@ function App() {
             gitStatus={gitStatus}
             pr={openPrByWs[activeWorkspace.id] ?? null}
             onOpenPr={(url) => ipc.openFileInSystem(url)}
+            onFixChecks={handleFixChecks}
             workspace={activeWorkspace}
             issueTrackerConfigured={issueTrackerConfigured}
             jiraProjectKey={activeProject?.jiraProjectKey ?? null}

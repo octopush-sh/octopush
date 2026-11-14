@@ -2544,6 +2544,128 @@ mod editor_detection_tests {
 }
 
 #[cfg(test)]
+mod pr_checks_tests {
+    use crate::github::{
+        actions_run_id, checks_from_gh_rollup, checks_from_rest_check_runs, join_failed_logs,
+        tail_chars, ChecksState, FailingCheck,
+    };
+
+    #[test]
+    fn gh_rollup_failing_names_each_failed_check_once_with_its_run() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "detailsUrl": "https://github.com/o/r/actions/runs/11/job/1" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/2" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/3" },
+            { "__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": "" },
+            { "__typename": "StatusContext", "context": "ci/circle", "state": "ERROR",
+              "targetUrl": "https://circleci.com/x" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(
+            checks.failing,
+            vec![
+                FailingCheck { name: "test".into(), run_id: Some(12) },
+                FailingCheck { name: "ci/circle".into(), run_id: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn gh_rollup_pending_when_something_still_runs() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "test", "status": "QUEUED", "conclusion": "" },
+        ]);
+        assert_eq!(checks_from_gh_rollup(&raw).unwrap().state, ChecksState::Pending);
+        let status = serde_json::json!([{ "__typename": "StatusContext", "context": "deploy", "state": "PENDING" }]);
+        assert_eq!(checks_from_gh_rollup(&status).unwrap().state, ChecksState::Pending);
+    }
+
+    #[test]
+    fn gh_rollup_passing_counts_skipped_neutral_and_cancelled_as_ok() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "b", "status": "COMPLETED", "conclusion": "SKIPPED" },
+            { "__typename": "CheckRun", "name": "c", "status": "COMPLETED", "conclusion": "NEUTRAL" },
+            { "__typename": "CheckRun", "name": "d", "status": "COMPLETED", "conclusion": "CANCELLED" },
+            { "__typename": "StatusContext", "context": "e", "state": "SUCCESS" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Passing);
+        assert!(checks.failing.is_empty());
+    }
+
+    #[test]
+    fn gh_rollup_none_without_checks() {
+        assert!(checks_from_gh_rollup(&serde_json::json!([])).is_none());
+        assert!(checks_from_gh_rollup(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn rest_check_runs_shape_rolls_up_the_same_way() {
+        let body = serde_json::json!({
+            "total_count": 3,
+            "check_runs": [
+                { "name": "build", "status": "completed", "conclusion": "success" },
+                { "name": "test", "status": "completed", "conclusion": "timed_out",
+                  "details_url": "https://github.com/o/r/actions/runs/77/job/9" },
+                { "name": "lint", "status": "in_progress", "conclusion": null }
+            ]
+        });
+        let checks = checks_from_rest_check_runs(&body).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "test".into(), run_id: Some(77) }]);
+
+        let pending = serde_json::json!({ "check_runs": [
+            { "name": "build", "status": "queued", "conclusion": null }
+        ]});
+        assert_eq!(checks_from_rest_check_runs(&pending).unwrap().state, ChecksState::Pending);
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "check_runs": [] })).is_none());
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "message": "Not Found" })).is_none());
+    }
+
+    #[test]
+    fn actions_run_id_reads_the_run_out_of_the_url() {
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/123/job/456"), Some(123));
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/9"), Some(9));
+        assert_eq!(actions_run_id("https://circleci.com/gh/o/r/1"), None);
+    }
+
+    #[test]
+    fn pr_checks_serialize_camel_case_and_absent_when_none() {
+        let raw = serde_json::json!({ "number": 1, "url": "u", "title": "t", "state": "open" });
+        let mut pr = crate::github::pr_from_json(&raw);
+        assert!(serde_json::to_value(&pr).unwrap().get("checks").is_none());
+        pr.checks = Some(crate::github::PrChecks {
+            state: ChecksState::Failing,
+            failing: vec![FailingCheck { name: "test".into(), run_id: Some(5) }],
+        });
+        let v = serde_json::to_value(&pr).unwrap();
+        assert_eq!(v["checks"]["state"], "failing");
+        assert_eq!(v["checks"]["failing"][0]["runId"], 5);
+    }
+
+    #[test]
+    fn failed_logs_keep_each_tail_within_the_budget() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 3), "ab");
+        assert_eq!(tail_chars("ñandú", 2), "dú");
+
+        let long = format!("{}FAILED here", "x".repeat(20_000));
+        let out = join_failed_logs(&[(1, long), (2, "  \n".into()), (3, "boom".into())], 8_000);
+        assert!(out.chars().count() <= 8_000);
+        assert!(out.contains("FAILED here"));
+        assert!(out.contains("run 3\nboom"));
+        assert!(!out.contains("run 2"));
+        assert_eq!(join_failed_logs(&[], 8_000), "");
+    }
+}
+
+#[cfg(test)]
 mod pr_state_tests {
     #[test]
     fn pr_state_open_when_open_not_draft() {
