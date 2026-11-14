@@ -335,6 +335,22 @@ describe("MissionControl", () => {
     expect(screen.getByText(/holds the gate/)).toBeTruthy();
   });
 
+  it("keeps brass dots to needs-you gates: in-flight running dots are verdigris", () => {
+    const busy = mkRun("a", "running");
+    const gated = mkRun("b", "paused");
+    useRunsStore.setState({
+      runsByWs: { "ws-a": [busy, gated] },
+      detailByRun: {
+        a: { run: busy, stages: [mkStage("s1", "a", 0, "done"), mkStage("s2", "a", 1, "running")] },
+        b: { run: gated, stages: [mkStage("s3", "b", 0, "done"), mkStage("s4", "b", 1, "awaiting_checkpoint")] },
+      },
+    });
+    const { container } = renderRoom();
+    const brassDots = container.querySelectorAll("[data-dot].bg-octo-brass");
+    expect(brassDots).toHaveLength(1);
+    expect(brassDots[0].getAttribute("title")).toMatch(/review$/);
+  });
+
   it("keeps a needs-you card's brass to its border and glyph: the ticker is sage, the spend mute", () => {
     const run = mkRun("a", "paused", { costUsd: 0.41 });
     const stages = [mkStage("s1", "a", 0, "done"), mkStage("s2", "a", 1, "awaiting_checkpoint")];
