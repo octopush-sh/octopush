@@ -13,4 +13,13 @@ describe("ShortcutsPane", () => {
       expect(chip.className).not.toMatch(/brass/);
     }
   });
+
+  it("shows each key exactly once, with no escape leaking into a label", () => {
+    const { container } = render(<ShortcutsPane />);
+    const labels = Array.from(container.querySelectorAll("kbd")).map((k) => k.textContent);
+    expect(labels).toContain("⌘\\");
+    for (const label of labels) {
+      expect(label).not.toContain("\\\\");
+    }
+  });
 });
