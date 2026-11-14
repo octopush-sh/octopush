@@ -27,7 +27,7 @@ describe("crew stage lines", () => {
       {},
     ]).stages;
     expect(cliShellLine(claude)).toBe("Full shell · Claude Code (all permissions)");
-    expect(cliShellLine(codex)).toBe("Full shell · Codex (no sandbox)");
+    expect(cliShellLine(codex)).toBe("Full shell · Codex (workspace-write sandbox)");
     expect(cliShellLine(codexRo)).toBe("Shell · Codex (read-only sandbox)");
     expect(cliShellLine(api)).toBeNull();
   });

@@ -102,7 +102,7 @@ describe("CrewImportSheet", () => {
     useCrewImportStore.getState().show("{crew}", null);
     render(<CrewImportHost />);
     expect(await screen.findByText("Full shell · Claude Code (all permissions)")).toBeInTheDocument();
-    expect(screen.getByText("Full shell · Codex (no sandbox)")).toBeInTheDocument();
+    expect(screen.getByText("Full shell · Codex (workspace-write sandbox)")).toBeInTheDocument();
     expect(screen.getByText("Shell · Codex (read-only sandbox)")).toBeInTheDocument();
     expect(screen.getByText(/3 with a full shell \(CLI\)/)).toBeInTheDocument();
     expect(screen.getByTestId("crew-cli-note").textContent).toMatch(/\.claude\/settings\.json hooks and \.mcp\.json/);

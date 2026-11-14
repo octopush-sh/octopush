@@ -122,11 +122,12 @@ export const POWER_TOOLS = new Set(["run_command", "write_file", "edit_file"]);
 type StagePreview = CrewPreview["stages"][number];
 
 /** A CLI stage's real power, in place of a tool list the CLI never applies:
- *  Claude Code runs with every permission granted, Codex without its sandbox
- *  (or in its read-only sandbox for a read-only review). Null on API. */
+ *  Claude Code runs with every permission granted, Codex in its
+ *  workspace-write sandbox (or its read-only one for a read-only review).
+ *  Null on API. */
 export function cliShellLine(s: StagePreview): string | null {
   if (s.cliDialect === "claude") return "Full shell · Claude Code (all permissions)";
-  if (s.cliDialect === "codex") return s.readOnly ? "Shell · Codex (read-only sandbox)" : "Full shell · Codex (no sandbox)";
+  if (s.cliDialect === "codex") return s.readOnly ? "Shell · Codex (read-only sandbox)" : "Full shell · Codex (workspace-write sandbox)";
   return null;
 }
 
