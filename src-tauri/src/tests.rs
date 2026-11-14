@@ -9077,12 +9077,13 @@ wait
 
         let limits = ReadLimits {
             idle: Duration::from_secs(20),
+            command_idle: Duration::from_secs(20),
             cap: Duration::from_secs(60),
             settle: Duration::from_millis(200),
         };
         let end = tokio::time::timeout(
             Duration::from_secs(10),
-            read_stream(stdout, CliDialect::Claude, limits, |_| {}),
+            read_stream(stdout, CliDialect::Claude, limits, |_| {}, |_| {}),
         )
         .await
         .expect("read_stream did not settle — it is waiting for the process to exit");
@@ -16870,5 +16871,196 @@ mod crew_tests {
         std::fs::write(&exact, "{}").unwrap();
         assert_eq!(crew::read_file(&link, true).unwrap(), "{}");
         assert!(crew::read_file(&link, false).unwrap_err().to_string().contains("link"));
+    }
+}
+
+#[cfg(test)]
+mod cli_command_idle_tests {
+    use crate::orchestrator::cli_runner::{
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
+        OpenTool, OpenTools, ReadEnd, ReadLimits,
+    };
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+
+    const LIMITS: ReadLimits = ReadLimits {
+        idle: Duration::from_millis(200),
+        command_idle: Duration::from_millis(1500),
+        cap: Duration::from_secs(20),
+        settle: Duration::from_secs(5),
+    };
+
+    fn tool_use(id: &str, name: &str, command: &str) -> Value {
+        json!({"type": "assistant", "message": {"id": format!("msg_{id}"), "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": {"command": command}}
+        ]}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+        ]}})
+    }
+
+    fn result() -> Value {
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"})
+    }
+
+    /// A stdout that writes `script` (`Some(line)` or `None` = pause), then
+    /// stays open and silent unless `eof`.
+    fn stdout(script: Vec<Option<Value>>, pause: Duration, eof: bool) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            for step in script {
+                match step {
+                    Some(v) => tx.write_all(format!("{v}\n").as_bytes()).await.unwrap(),
+                    None => tokio::time::sleep(pause).await,
+                }
+            }
+            if !eof {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        (rx, task)
+    }
+
+    async fn read(script: Vec<Option<Value>>, pause: Duration, eof: bool, dialect: CliDialect) -> (ReadEnd, Vec<Duration>, Duration) {
+        let (rx, task) = stdout(script, pause, eof);
+        let started = Instant::now();
+        let mut notes = Vec::new();
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_stream(rx, dialect, LIMITS, |_| {}, |w| notes.push(w)),
+        )
+        .await
+        .expect("read_stream never ended");
+        task.abort();
+        (end, notes, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_outlives_the_idle_window_and_settles_normally() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), None, Some(tool_result("toolu_1")), Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert_eq!(notes, vec![LIMITS.command_idle], "one journal line, naming the window");
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_still_times_out_after_the_command_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.window, LIMITS.command_idle);
+        assert_eq!(stall.tool.as_ref().map(OpenTool::label).as_deref(), Some("Bash `npm test`"));
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_call_trips_idle_at_the_plain_window() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), Some(tool_result("toolu_1"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_tool_result_does_not_extend_the_window() {
+        let (end, notes, took) = read(vec![Some(tool_result("toolu_ghost"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.tool, None);
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_open_non_command_tool_keeps_the_plain_window_but_is_named() {
+        let (end, _, took) = read(vec![Some(tool_use("toolu_1", "Read", ""))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(idle_timeout_message(&stall), "timed out — Read gave no result for 1 minute");
+    }
+
+    #[tokio::test]
+    async fn codex_keeps_the_plain_idle_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn open_tools_pair_calls_with_their_results() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", "cargo build\ncargo test"));
+        open.observe(&tool_use("b", "Read", ""));
+        assert!(open.command_open());
+        // The latest command is blamed, not a later non-command tool.
+        assert_eq!(open.latest().map(OpenTool::label).as_deref(), Some("Bash `cargo build …`"));
+        open.observe(&tool_result("ghost"));
+        assert!(open.command_open(), "an unmatched result closes nothing");
+        open.observe(&tool_result("a"));
+        assert!(!open.command_open());
+        assert_eq!(open.latest().map(|t| t.name.as_str()), Some("Read"));
+        open.observe(&tool_result("b"));
+        assert_eq!(open.latest(), None);
+        // A tool_result inside an assistant event is not a result.
+        open.observe(&tool_use("c", "PowerShell", "Invoke-Pester"));
+        open.observe(&json!({"type": "assistant", "message": {"content": [{"type": "tool_result", "tool_use_id": "c"}]}}));
+        assert!(open.command_open());
+    }
+
+    #[test]
+    fn a_long_command_is_shortened_in_the_label() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", &"x".repeat(100)));
+        let label = open.latest().unwrap().label();
+        assert_eq!(label, format!("Bash `{}…`", "x".repeat(59)));
+    }
+
+    #[test]
+    fn the_command_window_follows_bash_max_timeout_ms() {
+        assert_eq!(command_idle_window(None), Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.command_idle, Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.idle, Duration::from_secs(300));
+        assert_eq!(command_idle_window(Some("900000")), Duration::from_secs(960));
+        // Never below the plain idle window.
+        assert_eq!(command_idle_window(Some("60000")), Duration::from_secs(360));
+        assert_eq!(command_idle_window(Some(" 1200000 ")), Duration::from_secs(1260));
+        assert_eq!(command_idle_window(Some("junk")), Duration::from_secs(660));
+        assert_eq!(command_idle_window(Some("0")), Duration::from_secs(660));
+        assert_eq!(ReadLimits::for_stage(Some("900000")).command_idle, Duration::from_secs(960));
+        assert_eq!(ReadLimits::for_stage(None).cap, ReadLimits::STAGE.cap);
+    }
+
+    #[test]
+    fn idle_messages_name_the_open_call() {
+        let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
+        assert_eq!(
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            "timed out — Bash `npm test` gave no result for 11 minutes"
+        );
+        assert_eq!(
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            "timed out — no output for 5 minutes"
+        );
+        assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
     }
 }

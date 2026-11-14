@@ -314,7 +314,7 @@ function DecisionBar({
             <div className="flex flex-col gap-2">
               <div className="flex items-center gap-3">
                 <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">✕ stage halted</span>
-                <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined}>
+                <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={blockedStage.error ?? undefined} data-tour="direct-halt-cause">
                   <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {cause.title}
                 </span>
                 <button type="button" onClick={() => (resumeFirst ? onResume(turns) : onReject("", turns))}
