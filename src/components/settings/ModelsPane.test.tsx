@@ -26,7 +26,8 @@ describe("ModelsPane — brass budget", () => {
       const btn = container.querySelector(`[data-tour="${id}"]`) as HTMLElement;
       expect(btn).not.toBeNull();
       expect(btn.className).toContain("font-serif");
-      expect(btn.className).toContain("border-octo-hairline");
+      expect(btn.className).toContain("border-octo-border-strong");
+      expect(btn.className).not.toContain("border-octo-hairline");
       expect(btn.className).toContain("text-octo-sage");
       expect(btn.className).not.toContain("text-octo-brass");
       expect(btn.style.background).toBe("");

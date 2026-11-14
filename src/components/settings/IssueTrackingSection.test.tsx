@@ -25,7 +25,8 @@ describe("IssueTrackingSection — project links", () => {
   it("keeps \"Save changes\" as the one brass CTA; the link save is a ghost button", async () => {
     const { container } = render(<IssueTrackingSection />);
     const link = await screen.findByRole("button", { name: "Save the link for octopush" });
-    expect(link.className).toContain("border-octo-hairline");
+    expect(link.className).toContain("border-octo-border-strong");
+    expect(link.className).not.toContain("border-octo-hairline");
     expect(link.className).toContain("text-octo-sage");
     expect(link.className).not.toContain("text-octo-brass");
 

@@ -150,7 +150,7 @@ function ClaudeCodeCard() {
             type="button"
             onClick={() => void connect()}
             disabled={busy}
-            className="min-w-[200px] rounded-md border border-octo-hairline px-4 py-2 text-center font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-50"
+            className="min-w-[200px] rounded-md border border-octo-border-strong px-4 py-2 text-center font-serif text-[13px] text-octo-sage transition-colors hover:text-octo-ivory disabled:opacity-50"
           >
             {busy ? "Connecting…" : registered ? "Reconnect to Claude Code" : "Connect to Claude Code"}
           </button>
@@ -175,7 +175,7 @@ function ClaudeCodeCard() {
             <button
               type="button"
               onClick={() => void copyCommand()}
-              className="min-w-[80px] rounded-md border border-octo-hairline px-3 py-2 text-center font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
+              className="min-w-[80px] rounded-md border border-octo-border-strong px-3 py-2 text-center font-serif text-[12px] text-octo-sage transition-colors hover:text-octo-ivory"
             >
               {copied ? "✓ Copied" : "Copy"}
             </button>

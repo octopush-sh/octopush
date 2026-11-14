@@ -74,7 +74,8 @@ describe("Claude Code card — CLI version", () => {
     const connect = await screen.findByRole("button", { name: "Reconnect to Claude Code" });
     const copy = screen.getByRole("button", { name: "Copy" });
     for (const btn of [connect, copy]) {
-      expect(btn.className).toContain("border-octo-hairline");
+      expect(btn.className).toContain("border-octo-border-strong");
+      expect(btn.className).not.toContain("border-octo-hairline");
       expect(btn.className).toContain("text-octo-sage");
       expect(btn.className).not.toContain("text-octo-brass");
     }
