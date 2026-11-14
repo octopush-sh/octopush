@@ -16,6 +16,8 @@ import { pushToast } from "../Toasts";
 import { ClaudeLoginNote } from "../ClaudeLoginNote";
 import { tourId } from "../../lib/tour/ids";
 import { formatRelTime } from "../../lib/relTime";
+import { libraryModels, retirementLine, routineRetirement, type RetirementNotice } from "../../lib/modelRetirement";
+import { useModelRetirements } from "../../hooks/useModelRetirements";
 import {
   draftFromRoutine,
   draftToInput,
@@ -64,6 +66,18 @@ export function RoutinesPane() {
     void loadRecent();
     void loadPipelines();
   }, [load, loadRecent, loadPipelines]);
+
+  // A Routine whose crew (with its model overrides) is on a retiring model
+  // fails from that day on, overnight; its row says so beforehand.
+  const retirements = useModelRetirements(libraryModels(pipelines, routines));
+  const now = new Date();
+  const retiringById = new Map(
+    routines.flatMap((r) => {
+      const n = routineRetirement(r, pipelines, retirements, now);
+      return n ? [[r.id, n] as const] : [];
+    }),
+  );
+  const firstRetiring = routines.find((r) => retiringById.has(r.id))?.id;
 
   const projectName = useMemo(() => {
     const m = new Map(recent.map((p) => [p.id, p.name]));
@@ -172,6 +186,9 @@ export function RoutinesPane() {
                           <div className="mt-0.5 font-mono text-[10px] text-octo-mute">{lastCheckLabel(r)}</div>
                         )
                       )}
+                      {retiringById.has(r.id) && (
+                        <RetirementLine notice={retiringById.get(r.id)!} now={now} tour={r.id === firstRetiring} />
+                      )}
                     </div>
                     <div className="flex shrink-0 items-center gap-1">
                       {/* Run-now and enable need entitlement; pause and delete
@@ -233,6 +250,23 @@ export function RoutinesPane() {
         />
       )}
     </>
+  );
+}
+
+/** "Sonnet 4.5 retires Nov 30, so this routine will fail after that." — amber
+ *  in the last 30 days, rouge after. */
+function RetirementLine({ notice, now, tour }: { notice: RetirementNotice; now: Date; tour: boolean }) {
+  const { retirement, phase } = notice;
+  return (
+    <div
+      data-tour={tour ? tourId("routines-model-retirement") : undefined}
+      data-testid="routine-model-retirement"
+      data-phase={phase.kind}
+      title={`Switch its crew to ${retirement.replacementLabel} from the Direct launcher, or pick another model for those stages in this routine.`}
+      className={`octo-fade-in octo-tabular mt-0.5 font-mono text-[10px] ${phase.kind === "retired" ? "text-octo-rouge" : "text-octo-warning"}`}
+    >
+      {retirementLine(retirement, phase, now, "this routine")}
+    </div>
   );
 }
 

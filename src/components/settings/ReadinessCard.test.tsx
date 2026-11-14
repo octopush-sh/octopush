@@ -2,13 +2,21 @@
  * ReadinessCard — checks run once on open and on "Check again"; each row
  * shows its status, and a failing row its fix and a copyable command.
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import type { ReadinessCheck } from "../../lib/ipc";
 
 const readinessCheck = vi.fn();
+const listPipelines = vi.fn();
+const listRoutines = vi.fn();
+const modelRetirements = vi.fn();
 vi.mock("../../lib/ipc", () => ({
-  ipc: { readinessCheck: (...args: unknown[]) => readinessCheck(...args) },
+  ipc: {
+    readinessCheck: (...args: unknown[]) => readinessCheck(...args),
+    listPipelines: (...args: unknown[]) => listPipelines(...args),
+    listRoutines: (...args: unknown[]) => listRoutines(...args),
+    modelRetirements: (...args: unknown[]) => modelRetirements(...args),
+  },
 }));
 const copyToClipboard = vi.fn();
 vi.mock("../../lib/clipboard", () => ({
@@ -17,6 +25,9 @@ vi.mock("../../lib/clipboard", () => ({
 
 const { ReadinessCard } = await import("./ReadinessCard");
 const { useReadinessStore } = await import("../../stores/readinessStore");
+const { usePipelineStore } = await import("../../stores/pipelineStore");
+const { useRoutinesStore } = await import("../../stores/routinesStore");
+const { resetModelRetirementCache } = await import("../../lib/modelRetirement");
 
 function row(over: Partial<ReadinessCheck> & Pick<ReadinessCheck, "id">): ReadinessCheck {
   return { label: over.id, status: "ok", value: "", fix: null, command: null, timedOut: false, ...over };
@@ -28,6 +39,57 @@ beforeEach(() => {
   useReadinessStore.setState({ checks: null, checkedAt: null, loading: false, error: null, check: realCheck });
   readinessCheck.mockReset();
   copyToClipboard.mockReset().mockResolvedValue(true);
+  usePipelineStore.setState({ pipelines: [], loaded: false, error: null });
+  useRoutinesStore.setState({ routines: [], loaded: false });
+  resetModelRetirementCache();
+  listPipelines.mockReset().mockResolvedValue([]);
+  listRoutines.mockReset().mockResolvedValue([]);
+  modelRetirements.mockReset().mockImplementation(async (models: string[]) =>
+    models.filter((m) => m.startsWith("claude-sonnet-4-5")).map((model) => ({
+      model, label: "Sonnet 4.5", retires: "2026-11-30", replacement: "claude-sonnet-5-5", replacementLabel: "Sonnet 5.5",
+    })),
+  );
+});
+
+function relay(agentModel: string) {
+  return {
+    pipeline: { id: "p", name: "Relay", description: "", isBuiltin: false, createdAt: "t" },
+    stages: [{
+      id: "s0", pipelineId: "p", position: 0, role: "implement", agentModel, escalateModel: null, substrate: "api",
+      checkpoint: false, loopTargetPosition: null, loopMaxIterations: 0, loopMode: null, maxIterations: 25,
+      posX: null, posY: null, parents: [], tools: null, customName: null, instructions: null,
+    }],
+  };
+}
+
+describe("ReadinessCard · crew models", () => {
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-11-14T12:00:00Z"));
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("adds a warning row for a saved crew on a model that retires within 30 days", async () => {
+    listPipelines.mockResolvedValue([relay("claude-sonnet-4-5-20250929")]);
+    readinessCheck.mockResolvedValue([row({ id: "git", value: "2.39.3" })]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-models");
+    expect(r).toHaveAttribute("data-status", "warn");
+    expect(r).toHaveAttribute("data-tour", "settings-readiness-models");
+    expect(within(r).getByText("Sonnet 4.5 · retires Nov 30")).toBeInTheDocument();
+    expect(within(r).getByText(/so 1 crew on it will fail after that\. Relay\./)).toBeInTheDocument();
+  });
+
+  it("shows no row when no crew uses a retiring model", async () => {
+    listPipelines.mockResolvedValue([relay("claude-sonnet-5-5")]);
+    readinessCheck.mockResolvedValue([row({ id: "git", value: "2.39.3" })]);
+    render(<ReadinessCard />);
+    await screen.findByTestId("readiness-row-git");
+    await waitFor(() => expect(listPipelines).toHaveBeenCalled());
+    expect(screen.queryByTestId("readiness-row-models")).toBeNull();
+  });
 });
 
 describe("ReadinessCard", () => {

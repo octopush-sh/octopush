@@ -72,6 +72,7 @@ Current anchors:
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
 | `pipeline-model-superseded` | Direct launcher, above the selected crew's description: "Fable 5.1 → Fable 5.2: about 20% cheaper per token." with "Switch this crew" / "Keep 5.1" (only while a stage or escalation of that crew uses a superseded model and the user hasn't kept it) | `direct/SupersededModelLine.tsx` via `PipelineSetup.tsx` |
+| `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail after that." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
@@ -97,6 +98,7 @@ Current anchors:
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
 | `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
+| `routines-model-retirement` | Settings › Routines: the first row's "Sonnet 4.5 retires Nov 30, so this routine will fail after that." (only while a Routine's crew uses a model within 30 days of its retirement, or past it) | `settings/RoutinesPane.tsx` |
 | `routines-upsell-cta` | Settings › Routines, Free only: the upgrade banner's "Put your crews on a schedule with Pro" | `settings/RoutinesPane.tsx` |
 | `logbook-upsell-cta` | Logbook room, Free only: "Open the full logbook with Pro" | `LogbookRoom.tsx` |
 | `review-mode-tail` | Review: the mode band's status tail ("2 files changed · +2 −1"; only with changes) | `ReviewTail.tsx` |
@@ -118,6 +120,7 @@ Current anchors:
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
+| `settings-readiness-models` | Settings › General, Readiness card: the Crew models row (only while a saved crew or Routine uses a model within 30 days of its retirement, or past it) | `settings/ReadinessCard.tsx` |
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-appearance-legacy` | Settings › Appearance: the Legacy theme group (Dark, Midnight, Solarized Dark; only when the theme list has any) | `settings/AppearancePane.tsx` |

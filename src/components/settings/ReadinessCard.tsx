@@ -6,6 +6,10 @@ import { AlertTriangle, CheckCircle, Circle, Clock, Copy, Loader2, XCircle } fro
 import type { ReadinessCheck } from "../../lib/ipc";
 import { copyToClipboard } from "../../lib/clipboard";
 import { useReadinessStore } from "../../stores/readinessStore";
+import { usePipelineStore } from "../../stores/pipelineStore";
+import { useRoutinesStore } from "../../stores/routinesStore";
+import { useModelRetirements } from "../../hooks/useModelRetirements";
+import { libraryModels, readinessRetirementCheck } from "../../lib/modelRetirement";
 import { tourId } from "../../lib/tour/ids";
 import { SectionLabel, formatRelative } from "./shared";
 
@@ -24,6 +28,7 @@ const PENDING: StatusStyle = { word: "Unknown", tone: "text-octo-mute", Icon: Ci
 const ROW_TOUR: Partial<Record<ReadinessCheck["id"], string>> = {
   disk: tourId("settings-readiness-disk"),
   codex: tourId("settings-readiness-codex"),
+  models: tourId("settings-readiness-models"),
 };
 
 /** `onShowCaches` closes Settings and opens the footer's Workspace Caches;
@@ -47,6 +52,22 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
     const id = setInterval(() => setTick((t) => t + 1), 30_000);
     return () => clearInterval(id);
   }, [checkedAt]);
+
+  // Saved crews and Routines on a model that retires: a row of its own,
+  // built here from the library (the backend only knows the table).
+  const pipelines = usePipelineStore((s) => s.pipelines);
+  const pipelinesLoaded = usePipelineStore((s) => s.loaded);
+  const loadPipelines = usePipelineStore((s) => s.load);
+  const routines = useRoutinesStore((s) => s.routines);
+  const routinesLoaded = useRoutinesStore((s) => s.loaded);
+  const loadRoutines = useRoutinesStore((s) => s.load);
+  useEffect(() => {
+    if (!pipelinesLoaded) void loadPipelines();
+    if (!routinesLoaded) void loadRoutines();
+  }, [pipelinesLoaded, loadPipelines, routinesLoaded, loadRoutines]);
+  const retirements = useModelRetirements(libraryModels(pipelines, routines));
+  const modelsRow = readinessRetirementCheck(pipelines, routines, retirements, new Date());
+  const rows = checks && checks.length > 0 && modelsRow ? [...checks, modelsRow] : checks;
 
   const neverChecked = !checks && !loading && !error;
 
@@ -98,9 +119,9 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
           </p>
         )}
 
-        {checks && checks.length > 0 && (
+        {rows && rows.length > 0 && (
           <ul className="mt-3 divide-y divide-octo-hairline">
-            {checks.map((c, i) => (
+            {rows.map((c, i) => (
               <ReadinessRow key={c.id ?? i} check={c} index={i} onShowCaches={c.id === "disk" ? onShowCaches : undefined} />
             ))}
           </ul>
