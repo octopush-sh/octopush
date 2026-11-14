@@ -1983,21 +1983,22 @@ impl CliRunner {
             .unwrap_or_else(|| dialect.binary().into());
 
         // Seatbelt sandbox (macOS): when the mission asks for it, wrap the spawn
-        // in `sandbox-exec -f <profile> claude …`. NO silent fallback — if the
+        // in `sandbox-exec -p <profile> claude …`. NO silent fallback — if the
         // sandbox can't be set up the stage fails rather than running unconfined.
-        // The profile guard lives to the end of this fn (past `child.wait`).
-        let mut _profile_guard: Option<crate::orchestrator::sandbox::ProfileGuard> = None;
+        let mut sandbox_env: Vec<(String, String)> = Vec::new();
         let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
             match ctx.exec_isolation.as_str() {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
+                    let scope = ctx.workspace_path.to_string_lossy();
                     match crate::orchestrator::sandbox::prepare(
                         &ctx.allowed_write_roots,
+                        Some(&*scope),
                         &real_program,
                         &args,
                     ) {
                         Ok(prepared) => {
-                            _profile_guard = Some(prepared.guard);
+                            sandbox_env = prepared.env;
                             (prepared.program, prepared.args)
                         }
                         Err(e) => {
@@ -2026,16 +2027,11 @@ impl CliRunner {
         for (k, v) in login_shell_env() {
             command.env(k, v);
         }
-        // Sandboxed (guard is Some): redirect build-tool caches into the confined
-        // temp so builds work without exposing the real ~/.cargo etc. Overrides
+        // Sandboxed: redirect build-tool caches into the mission's own cache
+        // root so builds work without exposing the real ~/.cargo etc. Overrides
         // any cache vars the login shell set.
-        if _profile_guard.is_some() {
-            if let Ok(tmp) = std::env::var("TMPDIR") {
-                let scope = ctx.workspace_path.to_string_lossy();
-                for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
-                    command.env(k, v);
-                }
-            }
+        for (k, v) in sandbox_env {
+            command.env(k, v);
         }
         for (k, v) in dialect.stage_env() {
             command.env(k, v);

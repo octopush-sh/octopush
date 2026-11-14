@@ -906,7 +906,7 @@ fn tool_definitions() -> serde_json::Value {
 /// target that escapes the workspace (a lexical check can't see through a
 /// symlink). The target is passed as a positional arg (`$1`), never interpolated
 /// into the script. Fail-closed: if the sandbox can't be set up, nothing is
-/// written. The profile guard lives until the child exits.
+/// written.
 fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> (String, bool) {
     use std::io::Write;
     // `$0` is a label; `$1` is the (untrusted) absolute target path.
@@ -918,7 +918,7 @@ fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> 
         full.to_string_lossy().into_owned(),
     ];
     let prepared =
-        match crate::orchestrator::sandbox::prepare(roots, std::ffi::OsStr::new("bash"), &args) {
+        match crate::orchestrator::sandbox::prepare(roots, None, std::ffi::OsStr::new("bash"), &args) {
             Ok(p) => p,
             Err(e) => {
                 return (
@@ -1151,17 +1151,21 @@ pub(crate) fn execute_tool_cancellable(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(RUN_COMMAND_TIMEOUT_SECS)
                 .clamp(1, RUN_COMMAND_TIMEOUT_MAX);
-            let _guard;
             let mut command = if let Some(roots) = sandbox_roots {
+                let scope = workspace_path.to_string_lossy();
                 match crate::orchestrator::sandbox::prepare(
                     roots,
+                    Some(&*scope),
                     std::ffi::OsStr::new("bash"),
                     &["-c".to_string(), cmd.to_string()],
                 ) {
                     Ok(p) => {
                         let mut c = std::process::Command::new(&p.program);
                         c.args(&p.args);
-                        _guard = Some(p.guard);
+                        // Redirect build-tool caches into the mission's own
+                        // cache root, not the user's real ~/.cargo etc. (which
+                        // the profile doesn't expose).
+                        c.envs(p.env);
                         c
                     }
                     Err(e) => {
@@ -1172,22 +1176,10 @@ pub(crate) fn execute_tool_cancellable(
                     }
                 }
             } else {
-                _guard = None;
                 let mut c = std::process::Command::new("bash");
                 c.arg("-c").arg(cmd);
                 c
             };
-            // Sandboxed: redirect build-tool caches into the confined temp so a
-            // sandboxed `npm install` writes there, not to the user's real
-            // ~/.cargo etc. (which the profile no longer exposes).
-            if sandbox_roots.is_some() {
-                if let Ok(tmp) = std::env::var("TMPDIR") {
-                    let scope = workspace_path.to_string_lossy();
-                    for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
-                        command.env(k, v);
-                    }
-                }
-            }
             command.current_dir(workspace_path);
             wait_command_bounded(command, timeout_secs, cancel)
         }

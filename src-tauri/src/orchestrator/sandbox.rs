@@ -1,9 +1,10 @@
 //! macOS seatbelt sandboxing for agent CLI execution.
 //!
 //! When a mission's `exec_isolation = "sandbox"`, the CLI substrate's process is
-//! wrapped in `sandbox-exec -f <profile> …` under a generated SBPL profile that
-//! **confines writes** to the mission's workspace (plus the temp dirs and CLI
-//! session dir a real agent needs) while leaving reads and network intact — the
+//! wrapped in `sandbox-exec -p <profile> …` under a generated SBPL profile that
+//! **confines writes** to the mission's workspace (plus the temp dirs, CLI
+//! session dir and the mission's own build cache a real agent needs) while
+//! leaving reads and network intact — the
 //! agents need both. The core security property: a sandboxed agent cannot modify
 //! files outside its own mission (other worktrees, `~/.ssh`, `~/Documents`,
 //! system paths stay read-only). Nor can it touch the repo's git hooks, `info/`,
@@ -54,8 +55,8 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
     // agent could plant a `~/.cargo/config.toml` rustc-wrapper or a
     // `~/.gradle/init.d/*.gradle` that runs OUTSIDE the sandbox on the user's
     // next build (a full confinement escape). Instead, a sandboxed BUILD is made
-    // to write its caches into the already-allowed temp via env redirection —
-    // see `sandbox_cache_env`.
+    // to write its caches into its own per-mission cache root via env
+    // redirection — see `sandbox_cache_env` and `mission_cache_root`.
     v
 }
 
@@ -69,20 +70,32 @@ fn scope_key(s: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Where every mission's build cache lives: the user cache dir
+/// (`~/Library/Caches/octopush/build-cache`), which is NOT a write root. Only
+/// the mission's own subtree is added to its profile, so a sandboxed stage can
+/// never write another mission's cache (as it could when they all sat in the
+/// shared, writable `$TMPDIR`).
+fn build_cache_base() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("octopush").join("build-cache"))
+}
+
+/// A mission's own cache root under `base`, keyed by `scope` (its workspace)
+/// and its write roots, so a readonly mission on a workspace doesn't share the
+/// writer's cache either. Pure.
+fn mission_cache_root(base: &Path, scope: &str, write_roots: &[String]) -> PathBuf {
+    base.join(scope_key(&format!("{scope}\0{}", write_roots.join("\0"))))
+}
+
 /// Env vars that redirect common build toolchains' WRITE caches into a confined
-/// **per-mission** subtree of `$TMPDIR` (already an allowed write root), so a
-/// sandboxed `npm install`/`cargo build` works WITHOUT exposing the user's real
-/// `~/.cargo` etc. AND without two sandboxed missions sharing (and poisoning)
-/// one cache — `scope` (the workspace path) keys the subtree. Read-only global
+/// **per-mission** cache root (`mission_cache_root`, the one cache subtree that
+/// mission's profile may write), so a sandboxed `npm install`/`cargo build`
+/// works WITHOUT exposing the user's real `~/.cargo` etc. AND without two
+/// sandboxed missions sharing (and poisoning) one cache. Read-only global
 /// installs (toolchains, tool binaries on PATH) still work — reads are open;
-/// only writes are redirected. Applied by the CLI substrate and TALK's sandboxed
-/// `run_command`. Pure over its inputs.
-pub fn sandbox_cache_env(tmpdir: &str, scope: &str) -> Vec<(String, String)> {
-    let base = format!(
-        "{}/octopush-build-cache/{}",
-        tmpdir.trim_end_matches('/'),
-        scope_key(scope)
-    );
+/// only writes are redirected. Returned by `prepare` for the CLI substrate and
+/// TALK's sandboxed `run_command`. Pure over its inputs.
+fn sandbox_cache_env(cache_root: &str) -> Vec<(String, String)> {
+    let base = cache_root.trim_end_matches('/');
     vec![
         ("CARGO_HOME".into(), format!("{base}/cargo")), // rust: registry/git/config/bin (fresh, confined)
         ("npm_config_cache".into(), format!("{base}/npm")),
@@ -514,12 +527,15 @@ pub fn sandbox_write_roots(
 /// Build the seatbelt profile text for a mission's write roots, resolving the
 /// system dirs from the environment and each workspace root's git layout. A
 /// readonly mission has no mission roots, so it gets no git rules (temp-only).
-/// Errors when a workspace's git layout can't be resolved (fail closed).
-pub fn build_seatbelt_profile(mission_write_roots: &[String]) -> AppResult<String> {
+/// `cache_roots` (the mission's own build cache) are writable too but never
+/// treated as workspaces. Errors when a workspace's git layout can't be
+/// resolved (fail closed).
+pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[String]) -> AppResult<String> {
     let home = std::env::var("HOME").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
+    let all_roots: Vec<String> = mission_write_roots.iter().chain(cache_roots).cloned().collect();
     let mut rules = WriteRules {
-        subpaths: assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref()),
+        subpaths: assemble_write_roots(&all_roots, home.as_deref(), tmpdir.as_deref()),
         literals: system_write_files(home.as_deref()),
         ..WriteRules::default()
     };
@@ -533,12 +549,14 @@ pub fn build_seatbelt_profile(mission_write_roots: &[String]) -> AppResult<Strin
     Ok(render_profile(&rules))
 }
 
-/// Wrap a program + args as a `sandbox-exec -f <profile> <program> <args…>` argv.
-/// Pure — returns the new program and full arg vector.
-fn sandbox_argv(program: &OsStr, args: &[String], profile_path: &Path) -> (OsString, Vec<OsString>) {
+/// Wrap a program + args as a `sandbox-exec -p <profile> <program> <args…>` argv.
+/// The profile text travels inline, so no profile file exists that a stage
+/// already running (with its temp dir writable) could overwrite before this
+/// one starts. Pure — returns the new program and full arg vector.
+fn sandbox_argv(program: &OsStr, args: &[String], profile: &str) -> (OsString, Vec<OsString>) {
     let mut wrapped: Vec<OsString> = Vec::with_capacity(args.len() + 3);
-    wrapped.push(OsString::from("-f"));
-    wrapped.push(profile_path.as_os_str().to_os_string());
+    wrapped.push(OsString::from("-p"));
+    wrapped.push(OsString::from(profile));
     wrapped.push(program.to_os_string());
     for a in args {
         wrapped.push(OsString::from(a));
@@ -546,30 +564,40 @@ fn sandbox_argv(program: &OsStr, args: &[String], profile_path: &Path) -> (OsStr
     (OsString::from(SANDBOX_EXEC), wrapped)
 }
 
-/// Removes the generated profile file when the stage's command finishes.
-pub struct ProfileGuard {
-    path: PathBuf,
-}
-
-impl Drop for ProfileGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
-/// The wrapped command ready to spawn, plus the profile-cleanup guard (hold it
-/// until after the child exits).
+/// The wrapped command ready to spawn, plus the env that points its build
+/// caches at the mission's own cache root (empty when none was asked for).
 pub struct Prepared {
     pub program: OsString,
     pub args: Vec<OsString>,
-    pub guard: ProfileGuard,
+    pub env: Vec<(String, String)>,
 }
 
-/// Prepare a sandboxed launch: verify the platform + driver, write a fresh
-/// seatbelt profile, and return the wrapped argv. Errors (no silent fallback) if
-/// sandboxing is unavailable or the profile can't be written. Shared by the CLI
+/// Create a mission's cache root and make it and the shared base owner-only
+/// (0700).
+fn ensure_cache_root(root: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(root)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dir in [root, root.parent().unwrap_or(root)] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+/// Prepare a sandboxed launch: verify the platform + driver, build a fresh
+/// seatbelt profile, and return the wrapped argv. With `cache_scope` (the
+/// workspace), the mission's own build-cache root is created, made writable in
+/// the profile, and returned as `env`. Errors (no silent fallback) if
+/// sandboxing is unavailable or the cache root can't be made. Shared by the CLI
 /// substrate (wrapping `claude`) and in-process `run_command` (wrapping `bash`).
-pub fn prepare(write_roots: &[String], program: &OsStr, args: &[String]) -> AppResult<Prepared> {
+pub fn prepare(
+    write_roots: &[String],
+    cache_scope: Option<&str>,
+    program: &OsStr,
+    args: &[String],
+) -> AppResult<Prepared> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::Other(
             "sandboxed execution is only available on macOS".into(),
@@ -580,15 +608,24 @@ pub fn prepare(write_roots: &[String], program: &OsStr, args: &[String]) -> AppR
             "the sandbox driver ({SANDBOX_EXEC}) was not found"
         )));
     }
-    let profile = build_seatbelt_profile(write_roots)?;
-    let path = std::env::temp_dir().join(format!("octopush-sandbox-{}.sb", uuid::Uuid::new_v4()));
-    std::fs::write(&path, profile)
-        .map_err(|e| AppError::Other(format!("could not write the sandbox profile: {e}")))?;
-    let (prog, wrapped) = sandbox_argv(program, args, &path);
+    let cache_root = match cache_scope {
+        Some(scope) => {
+            let base = build_cache_base()
+                .ok_or_else(|| AppError::Other("the sandbox found no cache directory for builds".into()))?;
+            let root = mission_cache_root(&base, scope, write_roots);
+            ensure_cache_root(&root)
+                .map_err(|e| AppError::Other(format!("could not create the sandbox build cache: {e}")))?;
+            Some(root.to_string_lossy().into_owned())
+        }
+        None => None,
+    };
+    let cache_roots: Vec<String> = cache_root.iter().cloned().collect();
+    let profile = build_seatbelt_profile(write_roots, &cache_roots)?;
+    let (prog, wrapped) = sandbox_argv(program, args, &profile);
     Ok(Prepared {
         program: prog,
         args: wrapped,
-        guard: ProfileGuard { path },
+        env: cache_root.as_deref().map(sandbox_cache_env).unwrap_or_default(),
     })
 }
 
@@ -859,7 +896,7 @@ mod tests {
     #[test]
     fn readonly_profile_has_no_git_rules() {
         // A readonly mission has no mission roots: still temp-only, no git allows.
-        let p = build_seatbelt_profile(&[]).unwrap();
+        let p = build_seatbelt_profile(&[], &[]).unwrap();
         assert!(!p.contains("/objects\""));
         assert!(!p.contains("(deny file-write*\n"));
         assert!(!p.contains("(deny file-link"));
@@ -1001,7 +1038,7 @@ mod tests {
         std::fs::write(main.join(".git/worktrees/wt/HEAD"), "junk\n").unwrap();
         let wt_root = vec![wt.to_string_lossy().into_owned()];
         assert!(resolve_git_layout(&wt_root[0]).is_err());
-        assert!(build_seatbelt_profile(&wt_root).is_err());
+        assert!(build_seatbelt_profile(&wt_root, &[]).is_err());
         // A `.git` file pointing at a git dir git wouldn't use for it.
         let odd = dir.path().join("odd");
         std::fs::create_dir(&odd).unwrap();
@@ -1021,7 +1058,7 @@ mod tests {
         let run = |ws: &Path, script: &str| -> bool {
             let roots = vec![ws.to_string_lossy().into_owned()];
             let args = vec!["-c".to_string(), script.to_string()];
-            let prepared = prepare(&roots, OsStr::new("bash"), &args).unwrap();
+            let prepared = prepare(&roots, None, OsStr::new("bash"), &args).unwrap();
             std::process::Command::new(&prepared.program)
                 .args(&prepared.args)
                 .current_dir(ws)
@@ -1142,22 +1179,86 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_cache_env_redirects_into_the_confined_temp() {
+    fn sandbox_cache_env_redirects_into_the_mission_cache_root() {
         let env: std::collections::HashMap<String, String> =
-            sandbox_cache_env("/tmp/session", "/ws-a").into_iter().collect();
-        // Every redirect points under the confined temp, never at ~.
+            sandbox_cache_env("/c/build-cache/abc/").into_iter().collect();
+        // Every redirect points under the mission's cache root, never at ~.
         for (k, v) in &env {
-            assert!(v.starts_with("/tmp/session/octopush-build-cache/"), "{k}={v} escaped temp");
+            assert!(v.starts_with("/c/build-cache/abc/"), "{k}={v} escaped the cache root");
         }
         assert!(env.get("CARGO_HOME").unwrap().ends_with("/cargo"));
         assert!(env.contains_key("npm_config_cache"));
         assert!(env.contains_key("GOPATH"));
         assert!(env.contains_key("GRADLE_USER_HOME"));
-        // Per-mission isolation: a DIFFERENT workspace gets a DIFFERENT cache
-        // subtree, so one sandboxed mission can't poison another's build cache.
-        let other: std::collections::HashMap<String, String> =
-            sandbox_cache_env("/tmp/session", "/ws-b").into_iter().collect();
-        assert_ne!(env.get("CARGO_HOME"), other.get("CARGO_HOME"));
+    }
+
+    #[test]
+    fn each_mission_gets_its_own_cache_root_outside_every_shared_write_root() {
+        let home = "/home/u";
+        let tmpdir = "/private/var/folders/xy/T";
+        let base = Path::new("/home/u/Library/Caches/octopush/build-cache");
+        let ws_a = vec!["/ws-a".to_string()];
+        let a = mission_cache_root(base, "/ws-a", &ws_a);
+        let b = mission_cache_root(base, "/ws-b", &["/ws-b".to_string()]);
+        // A different workspace, or a readonly mission on the same one, gets a
+        // different root, so no mission writes another's cache.
+        assert_ne!(a, b);
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
+        assert_eq!(a.parent(), Some(base));
+        // The base sits outside every root all missions share (temp, ~/.claude,
+        // ~/.cache), so only the own subtree is ever writable.
+        let shared = system_write_roots(Some(home), Some(tmpdir));
+        for r in &shared {
+            assert!(!base.starts_with(r), "the cache base {} is inside the write root {r}", base.display());
+        }
+        let a_str = a.to_string_lossy().into_owned();
+        let b_str = b.to_string_lossy().into_owned();
+        let roots = assemble_write_roots(&[ws_a[0].clone(), a_str.clone()], Some(home), Some(tmpdir));
+        assert!(roots.contains(&a_str));
+        assert!(!roots.iter().any(|r| Path::new(&b_str).starts_with(r)), "mission B's cache is writable to A");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_real_cache_base_is_outside_every_shared_write_root() {
+        let base = build_cache_base().expect("a user cache dir");
+        let home = std::env::var("HOME").ok();
+        let tmpdir = std::env::var("TMPDIR").ok();
+        let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref());
+        let real = canonical_lenient(&base);
+        for r in &shared {
+            assert!(!base.starts_with(r) && !real.starts_with(r), "{} is inside {r}", base.display());
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_lets_a_mission_write_only_its_own_build_cache() {
+        let ws = tempfile::tempdir().unwrap();
+        let roots = vec![ws.path().to_string_lossy().into_owned()];
+        let scope = format!("{}-cache-test", roots[0]);
+        let args = vec!["-c".to_string(), "mkdir -p \"$CARGO_HOME\" && echo x > \"$CARGO_HOME/probe\"".to_string()];
+        let prepared = prepare(&roots, Some(scope.as_str()), OsStr::new("bash"), &args).unwrap();
+        let ok = std::process::Command::new(&prepared.program)
+            .args(&prepared.args)
+            .envs(prepared.env.iter().cloned())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(ok, "the mission's own cache is writable");
+        // A sibling under the shared base is another mission's cache.
+        let base = build_cache_base().unwrap();
+        let sibling = base.join("not-this-mission");
+        let plant = vec!["-c".to_string(), format!("mkdir -p '{}'", sibling.display())];
+        let prepared = prepare(&roots, Some(scope.as_str()), OsStr::new("bash"), &plant).unwrap();
+        let planted = std::process::Command::new(&prepared.program)
+            .args(&prepared.args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        assert!(!planted && !sibling.exists(), "another mission's cache is denied");
+        let own = mission_cache_root(&base, &scope, &roots);
+        let _ = std::fs::remove_dir_all(own);
     }
 
     #[test]
@@ -1192,18 +1293,22 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_argv_prepends_driver_flags_then_program() {
+    fn sandbox_argv_passes_the_profile_inline_then_program() {
+        // Inline (`-p`), never a profile file (`-f`) another sandboxed stage
+        // could overwrite between its write and this spawn.
+        let profile = "(version 1)\n(allow default)\n";
         let (prog, args) = sandbox_argv(
             OsStr::new("/usr/local/bin/claude"),
             &["-p".to_string(), "hi".to_string()],
-            Path::new("/tmp/p.sb"),
+            profile,
         );
         assert_eq!(prog, OsString::from(SANDBOX_EXEC));
+        assert!(!args.contains(&OsString::from("-f")));
         assert_eq!(
             args,
             vec![
-                OsString::from("-f"),
-                OsString::from("/tmp/p.sb"),
+                OsString::from("-p"),
+                OsString::from(profile),
                 OsString::from("/usr/local/bin/claude"),
                 OsString::from("-p"),
                 OsString::from("hi"),
