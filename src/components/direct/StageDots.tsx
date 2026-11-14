@@ -9,9 +9,12 @@ export interface DotStage {
   title?: string;
 }
 
+// Brass is the "needs you" mark (the gate); a running stage takes the running
+// colour, verdigris, like the run track's running border — five busy crews
+// must not put five brass dots on screen.
 const DOT: Record<string, string> = {
   done: "bg-octo-verdigris",
-  running: "bg-octo-brass",
+  running: "bg-octo-verdigris",
   awaiting_checkpoint: "bg-octo-brass",
   failed: "bg-octo-rouge",
   pending: "bg-octo-hairline",
@@ -47,14 +50,19 @@ export function StageDots({
             : s.title
               ? `${s.title} — ${word}`
               : word;
+        // The gate ring wins; otherwise a running dot carries a faint verdigris
+        // halo so it still reads apart from the done dots before it.
+        const ring = s.checkpoint
+          ? "ring-1 ring-[var(--brass-dim)]"
+          : tone === "status" && s.status === "running"
+            ? "ring-1 ring-[var(--verdigris-strong)]"
+            : "";
         return (
           <span
             key={i}
             data-dot
             title={title}
-            className={`h-[5px] w-[5px] shrink-0 rounded-full ${color} ${
-              s.checkpoint ? "ring-1 ring-[var(--brass-dim)]" : ""
-            }`}
+            className={`h-[5px] w-[5px] shrink-0 rounded-full ${color} ${ring}`}
           />
         );
       })}
