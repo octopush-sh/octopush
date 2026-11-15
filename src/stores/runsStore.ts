@@ -32,6 +32,21 @@ export interface LauncherPrefill {
    *  prefill parked while another workspace's launcher mounts must never
    *  leak someone else's brief into it. Absent = any launcher (legacy). */
   workspaceId?: string;
+  /** When set, the task is added below whatever the launcher's brief already
+   *  holds instead of replacing it, so text the user typed is never lost.
+   *  Absent = replace (Run it again). */
+  append?: boolean;
+}
+
+/** The launcher brief after a prefill lands on `current`: the prefill's task,
+ *  or with `append`, `current` + a blank line + the task — unchanged when it
+ *  already ends with that task (the same prefill twice adds nothing). */
+export function prefilledTask(current: string, prefill: Pick<LauncherPrefill, "task" | "append">): string {
+  if (!prefill.append) return prefill.task;
+  const kept = current.trimEnd();
+  if (!kept) return prefill.task;
+  if (kept.endsWith(prefill.task.trimEnd())) return current;
+  return `${kept}\n\n${prefill.task}`;
 }
 
 const inflightDetail = new Set<string>();

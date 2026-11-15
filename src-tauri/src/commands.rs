@@ -5286,12 +5286,12 @@ pub async fn ensure_pr_branch(
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
-async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github::Pr> {
+async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,statusCheckRollup --limit 1",
+        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
         branch.replace('\'', "'\\''"),
     );
 
@@ -5324,9 +5324,45 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     }
     let mut out = crate::github::pr_from_json(&pr);
     if pr_wants_checks(&out) {
-        out.checks = crate::github::checks_from_gh_rollup(&pr["statusCheckRollup"]);
+        let rollup = &pr["statusCheckRollup"];
+        out.checks = crate::github::checks_from_gh_rollup(rollup);
+        // A full rollup may hide checks past gh's cap: re-read every check
+        // run on the head commit, keeping the rollup's answer if that fails.
+        if crate::github::gh_rollup_may_be_capped(rollup) {
+            if let Some(runs) = gh_check_runs(&shell, workspace_path, owner, repo, pr["headRefOid"].as_str()).await {
+                if let Some(checks) = crate::github::checks_from_gh_rollup_and_runs(rollup, &runs) {
+                    out.checks = Some(checks);
+                }
+            }
+        }
     }
     Some(out)
+}
+
+/// Every check run on `sha` through `gh api --paginate`. `None` without a
+/// sha, when gh fails or when the first page can't be read.
+async fn gh_check_runs(
+    shell: &str,
+    workspace_path: &str,
+    owner: &str,
+    repo: &str,
+    sha: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let output = tokio::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(workspace_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "find_pr_for_branch: gh api check-runs failed, keeping the rollup",
+        );
+        return None;
+    }
+    crate::github::check_runs_from_gh_pages(&output.stdout)
 }
 
 /// Only a live PR's checks are worth a glyph; a merged or closed one is done.
@@ -5401,7 +5437,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     //    have an authed `gh`, no extra setup required. Runs in their login
     //    shell so PATH and macOS keychain credential storage work as if
     //    they invoked `gh` from a terminal.
-    if let Some(pr) = try_gh_cli(&workspace_path, &branch).await {
+    if let Some(pr) = try_gh_cli(&workspace_path, &branch, &owner, &repo_name).await {
         tracing::info!(number = pr.number, "find_pr_for_branch: resolved via gh cli");
         return Ok(Some(pr));
     }
@@ -5486,8 +5522,10 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     Ok(Some(out))
 }
 
-/// The check runs on `sha` through REST, rolled up. `None` on any error — the
-/// chip then just shows no checks glyph.
+/// The check runs on `sha` through REST, every page up to
+/// `CHECK_RUNS_MAX_PAGES`, rolled up. `None` when the first page can't be
+/// read — the chip then just shows no checks glyph; a later page that fails
+/// keeps the runs read so far.
 async fn rest_check_runs(
     client: &reqwest::Client,
     token: &str,
@@ -5495,22 +5533,43 @@ async fn rest_check_runs(
     repo: &str,
     sha: &str,
 ) -> Option<crate::github::PrChecks> {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
-    );
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::info!(status = %resp.status(), "find_pr_for_branch: check-runs not readable");
-        return None;
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=crate::github::CHECK_RUNS_MAX_PAGES {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={}&page={page}",
+            crate::github::CHECK_RUNS_PER_PAGE,
+        );
+        let resp = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::info!(status = %r.status(), page, "find_pr_for_branch: check-runs not readable");
+                if page == 1 { return None; }
+                break;
+            }
+            Err(_) if page == 1 => return None,
+            Err(_) => break,
+        };
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            if page == 1 { return None; }
+            break;
+        };
+        let Some(page_runs) = body["check_runs"].as_array() else {
+            if page == 1 { return None; }
+            break;
+        };
+        let page_len = page_runs.len();
+        runs.extend(page_runs.iter().cloned());
+        if !crate::github::more_check_run_pages(body["total_count"].as_u64(), runs.len(), page_len) {
+            break;
+        }
     }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    crate::github::checks_from_rest_check_runs(&body)
+    crate::github::checks_from_rest_check_runs(&serde_json::json!({ "check_runs": runs }))
 }
 
 /// The tail of the failed steps' logs of these GitHub Actions runs

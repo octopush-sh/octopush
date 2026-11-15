@@ -403,6 +403,19 @@ describe("PipelineSetup launcher prefill (R3)", () => {
     // default pipeline, no stale overrides
     expect(onBegin).toHaveBeenCalledWith("p1", "ghost pipeline run", [], null);
   });
+
+  it("an append prefill keeps the brief the user already typed and adds below it", () => {
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const brief = screen.getByRole("textbox", { name: /brief/i }) as HTMLTextAreaElement;
+    fireEvent.change(brief, { target: { value: "keep my notes" } });
+    act(() => {
+      useRunsStore.getState().setLauncherPrefill({
+        task: "CI checks are failing", pipelineId: "", overrides: [], workspaceId: "w1", append: true,
+      });
+    });
+    expect(brief.value).toBe("keep my notes\n\nCI checks are failing");
+    expect(useRunsStore.getState().launcherPrefill).toBeNull();
+  });
 });
 
 describe("PipelineSetup Claude Code version preflight", () => {
