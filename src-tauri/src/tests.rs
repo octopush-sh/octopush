@@ -9514,6 +9514,50 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn a_read_confined_stage_adds_its_temp_dirs_and_build_cache_as_working_dirs() {
+        use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, sandbox_read_dir_args, CliDialect};
+        // #743 review: the read guard must not refuse the stage's own `$TMPDIR`
+        // and the build-cache root `sandbox_cache_env` points npm/cargo at.
+        let dirs = vec![
+            "/private/var/folders/xy/T".to_string(),
+            "/var/folders/xy/T/".to_string(),
+            "/Users/u/Library/Caches/octopush/build-cache/0123abcd".to_string(),
+            "/private/var/folders/xy/T/".to_string(),
+            "  ".to_string(),
+        ];
+        let added = |args: &[String]| -> Vec<String> {
+            args.iter().enumerate().filter(|(_, a)| *a == "--add-dir").map(|(i, _)| args[i + 1].clone()).collect()
+        };
+        for (choice, want) in [
+            ("sandbox", vec![
+                "/private/var/folders/xy/T",
+                "/var/folders/xy/T",
+                "/Users/u/Library/Caches/octopush/build-cache/0123abcd",
+            ]),
+            ("none", vec![]),
+        ] {
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                let reads = confine_reads_in_sandbox(CliDialect::Claude, choice, &mut args);
+                args.extend(sandbox_read_dir_args(reads, &dirs));
+                assert_eq!(added(&args), want, "{choice}: {args:?}");
+                assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1, "{args:?}");
+            }
+        }
+        // A readonly mission whose own choice is `none` isn't read-confined, so
+        // it gets no `--add-dir` either, even though its sandbox is forced on.
+        let iso = crate::orchestrator::sandbox::stage_isolation("readonly", "none", "/ws");
+        let mut args = build_cli_args("m", "sys", 10, true);
+        let reads = confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args);
+        assert!(sandbox_read_dir_args(reads, &dirs).is_empty());
+        assert!(sandbox_read_dir_args(true, &[]).is_empty());
+    }
+
+    #[test]
     fn a_readonly_mission_gets_the_read_guard_only_when_its_user_chose_sandbox() {
         use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, CliDialect};
         use crate::orchestrator::sandbox::stage_isolation;

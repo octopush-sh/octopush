@@ -799,9 +799,12 @@ pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWo
 /// [`CLAUDE_STAGE_SETTINGS`] plus the read guard, for a Claude stage in a
 /// mission whose own `exec_isolation` is `sandbox`: Read/Grep/Glob refuse
 /// paths outside the working directories too, so an agent can't pull
-/// `~/.ssh`, `~/.aws` or a sibling repo into its context. The Seatbelt
-/// profile only denies writes. Like the write guard it covers Claude Code's
-/// file tools, not `Bash`. Every other mission keeps the write guard only —
+/// `~/.ssh`, `~/.aws` or a sibling repo into its context. Claude Code also
+/// asks before a Bash command it sees reading outside them, which a headless
+/// stage refuses; reads it can't see still go through (the Seatbelt profile
+/// only denies writes). The stage's temp dirs and build-cache root are added
+/// as working dirs (`--add-dir`, [`sandbox_read_dir_args`]), so it can still
+/// read what it writes there. Every other mission keeps the write guard only —
 /// a `readonly` (review/probe) mission with `exec_isolation = "none"` too,
 /// though its sandbox is forced on: its agents read dependency sources
 /// outside the worktree.
@@ -827,6 +830,46 @@ pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &m
         }
         _ => false,
     }
+}
+
+/// `--add-dir` flags for a read-confined Claude stage (`reads_confined`, see
+/// [`confine_reads_in_sandbox`]): its temp dirs and build-cache root, which
+/// the Seatbelt profile lets it write and `sandbox_cache_env` points npm,
+/// cargo & co. at. Without them the read guard would refuse the stage's own
+/// temp files and redirected caches. One flag per dir, blanks and repeats
+/// (trailing `/` ignored) dropped; nothing when reads aren't confined. Pure.
+pub fn sandbox_read_dir_args(reads_confined: bool, dirs: &[String]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    if !reads_confined {
+        return out;
+    }
+    for d in dirs {
+        let t = d.trim();
+        let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
+        if t.is_empty() || seen.contains(&t) {
+            continue;
+        }
+        seen.push(t);
+        out.push("--add-dir".to_string());
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// The dirs [`sandbox_read_dir_args`] names for a sandboxed stage: `$TMPDIR`
+/// (and its realpath, the form Seatbelt matches, when it differs) and the
+/// stage's build-cache root.
+fn sandbox_read_dirs(cache_root: Option<&str>) -> Vec<String> {
+    let mut dirs = Vec::new();
+    if let Some(t) = std::env::var("TMPDIR").ok().filter(|t| !t.trim().is_empty()) {
+        if let Ok(c) = std::fs::canonicalize(&t) {
+            dirs.push(c.to_string_lossy().into_owned());
+        }
+        dirs.push(t);
+    }
+    dirs.extend(cache_root.map(str::to_string));
+    dirs
 }
 
 /// The launch line's note when the read guard was asked for but the known
@@ -2122,11 +2165,14 @@ impl CliRunner {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
                     let scope = ctx.workspace_path.to_string_lossy();
-                    match crate::orchestrator::sandbox::prepare(
+                    // A read-confined stage names its temp dirs and cache
+                    // root as working dirs, or the read guard refuses them.
+                    match crate::orchestrator::sandbox::prepare_with(
                         &ctx.allowed_write_roots,
                         Some(&*scope),
                         &real_program,
                         &args,
+                        |cache_root| sandbox_read_dir_args(reads_confined, &sandbox_read_dirs(cache_root)),
                     ) {
                         Ok(prepared) => {
                             sandbox_env = prepared.env;

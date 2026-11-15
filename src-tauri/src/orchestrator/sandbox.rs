@@ -688,6 +688,20 @@ pub fn prepare(
     program: &OsStr,
     args: &[String],
 ) -> AppResult<Prepared> {
+    prepare_with(write_roots, cache_scope, program, args, |_| Vec::new())
+}
+
+/// [`prepare`], with `extra_args` appended to the wrapped program's argv once
+/// the stage's cache root (`None` without a `cache_scope`) is known. A
+/// read-confined Claude stage uses it to name that root as a working
+/// directory (`--add-dir`), so it can read the caches its builds write.
+pub fn prepare_with(
+    write_roots: &[String],
+    cache_scope: Option<&str>,
+    program: &OsStr,
+    args: &[String],
+    extra_args: impl FnOnce(Option<&str>) -> Vec<String>,
+) -> AppResult<Prepared> {
     if !cfg!(target_os = "macos") {
         return Err(AppError::Other(
             "sandboxed execution is only available on macOS".into(),
@@ -710,7 +724,9 @@ pub fn prepare(
     };
     let cache_roots: Vec<String> = cache_root.iter().cloned().collect();
     let profile = build_seatbelt_profile(write_roots, &cache_roots)?;
-    let (prog, wrapped) = sandbox_argv(program, args, &profile);
+    let mut args = args.to_vec();
+    args.extend(extra_args(cache_root.as_deref()));
+    let (prog, wrapped) = sandbox_argv(program, &args, &profile);
     Ok(Prepared {
         program: prog,
         args: wrapped,
