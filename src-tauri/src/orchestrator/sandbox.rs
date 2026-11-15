@@ -1881,8 +1881,9 @@ mod tests {
         let add = sandbox_read_dir_args(true, &claude.dirs());
         assert_eq!(add, vec!["--add-dir".to_string(), root.clone(), "--add-dir".to_string(), tmp.clone()]);
 
-        // Without `private_tmp` (TALK's `run_command`, a Codex stage): the
-        // same cache root, no temp dir, no TMPDIR.
+        // Without `private_tmp`, for the same tenant: the same cache root, no
+        // temp dir, no TMPDIR. (TALK's `run_command` and Codex stages have
+        // tenants of their own, so roots of their own.)
         let plain = StageDirs::make(&roots, Some(scope.as_str()), RC, false).unwrap();
         assert_eq!(plain.dirs(), vec![root.clone()]);
         assert_eq!(plain.env(), sandbox_cache_env(&root));

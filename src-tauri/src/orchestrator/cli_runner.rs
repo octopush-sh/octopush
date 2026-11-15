@@ -848,13 +848,13 @@ pub fn cli_cache_tenant(exec_choice: &str, reads_confined: bool) -> crate::orche
 /// [`confine_reads_in_sandbox`]): its build-cache root and own temp dir
 /// (`dirs`, from `sandbox::prepare_with`), which `sandbox_cache_env` /
 /// `TMPDIR` point npm, cargo & co. at. Both are keyed by workspace, write
-/// roots, exec choice and read guard ([`cli_cache_tenant`]), so the only
-/// launches that can write them are read-confined Claude stages of the same
-/// workspace, access mode and exec choice: no Codex stage, no exec-`none`
-/// readonly stage, no TALK or API-substrate `run_command`, and no Codex
-/// writer outside the sandbox. That matters most for a readonly mission,
-/// whose stages can't write the worktree: these dirs would otherwise be the
-/// one place another launch could plant `.claude/skills`, agents or commands
+/// roots, exec choice and read guard ([`cli_cache_tenant`]), which no
+/// sandboxed launch of another kind can write: of those, only read-confined
+/// Claude stages of the same workspace, access mode and exec choice can —
+/// no Codex stage, no exec-`none` readonly stage, no TALK or API-substrate
+/// `run_command`, and no Codex writer in Codex's own sandbox. That matters
+/// most for a readonly mission, whose stages can't write the worktree: these
+/// dirs would otherwise be the one place another sandboxed launch could plant `.claude/skills`, agents or commands
 /// that Claude Code loads from an `--add-dir` dir. Without them the read
 /// guard would refuse the stage's own temp files and redirected caches. One
 /// flag per dir, blanks and repeats (trailing `/` ignored) dropped; nothing
