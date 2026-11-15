@@ -10028,7 +10028,7 @@ mod cli_dialect_tests {
     #[test]
     fn codex_failure_before_any_turn_is_not_flagged_usage_unreported() {
         use crate::orchestrator::cli_runner::is_usage_unreported;
-        // An `error` event before any `turn.started` (expired login, unknown model).
+        // An `error` event before Codex starts a turn: nothing was spent.
         let (accum, map) = codex_stream(&[
             json!({"type":"thread.started","thread_id":"th"}),
             json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
@@ -10040,6 +10040,24 @@ mod cli_dialect_tests {
         let err = out.error.as_deref().unwrap();
         assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
         assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // The real stream of an expired login or an unknown model: Codex
+        // starts the turn before the request, so the turn is open when it
+        // fails and the stage is flagged (the stream can't show the spend).
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+            json!({"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized"}}),
+        ]);
+        assert!(accum.turn_open && accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
         assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
 
         // A bad exit with only stderr (a bad flag): nothing streamed at all.
@@ -10056,7 +10074,7 @@ mod cli_dialect_tests {
         // A legacy-schema error before any agent event is not flagged either…
         let (accum, _) = codex_stream(&[
             json!({"msg":{"type":"session_configured","session_id":"s"}}),
-            json!({"msg":{"type":"error","message":"model not found"}}),
+            json!({"msg":{"type":"error","message":"not logged in"}}),
         ]);
         let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
         assert!(!is_usage_unreported(out.error.as_deref().unwrap()));

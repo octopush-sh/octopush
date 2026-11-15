@@ -1272,7 +1272,10 @@ pub(crate) struct CodexAccum {
     pub turn_open: bool,
     /// The model did work: a `turn.started`, an `item.*` event, or a legacy
     /// agent `msg` (the legacy schema has no `turn.started`). A failure before
-    /// any of these (bad login, unknown model, bad flag) provably spent nothing.
+    /// any of these (a bad flag, no login at launch, an `error` before
+    /// `turn.started`) provably spent nothing. A turn that started and then
+    /// failed (a 401 or an unknown model) is flagged: the stream can't show
+    /// whether it spent anything.
     pub activity: bool,
 }
 
