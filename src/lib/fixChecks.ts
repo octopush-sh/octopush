@@ -6,7 +6,8 @@ import { useRunsStore } from "../stores/runsStore";
 /** PR chip "Fix failing checks…": read the failed runs' log tail, then seed
  *  this workspace's Direct launcher with the brief and show the launcher. The
  *  empty `pipelineId` fills in the brief only, so the launcher keeps its usual
- *  crew selection; nothing starts until the user presses Start. A log that
+ *  crew selection; `append` keeps whatever brief the user already typed and
+ *  adds this one below it. Nothing starts until the user presses Start. A log that
  *  can't be read, or checks with no Actions run, still give a brief that
  *  names the failed checks — just without the log section. */
 export async function prefillFixChecks(pr: Pr, workspaceId: string, workspacePath: string): Promise<void> {
@@ -21,6 +22,7 @@ export async function prefillFixChecks(pr: Pr, workspaceId: string, workspacePat
     pipelineId: "",
     overrides: [],
     workspaceId,
+    append: true,
   });
   runs.selectRun(workspaceId, null);
 }

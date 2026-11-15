@@ -170,6 +170,24 @@ pub fn checks_from_rest_check_runs(body: &serde_json::Value) -> Option<PrChecks>
     }))
 }
 
+/// Check runs per page of the REST `check-runs` list (GitHub's maximum).
+pub const CHECK_RUNS_PER_PAGE: usize = 100;
+
+/// The most pages of check runs read for one commit (1,000 runs).
+pub const CHECK_RUNS_MAX_PAGES: u32 = 10;
+
+/// Whether to read another page of check runs: the last page was full and,
+/// when GitHub sent `total_count`, fewer than that have been read so far.
+pub fn more_check_run_pages(total_count: Option<u64>, read: usize, page_len: usize) -> bool {
+    if page_len < CHECK_RUNS_PER_PAGE {
+        return false;
+    }
+    match total_count {
+        Some(total) => (read as u64) < total,
+        None => true,
+    }
+}
+
 /// The most a "Fix failing checks" brief carries of the failed-step logs.
 pub const FAILED_LOG_MAX_CHARS: usize = 8_000;
 

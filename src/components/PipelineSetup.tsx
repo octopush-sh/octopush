@@ -7,7 +7,7 @@ import {
 } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
-import { useRunsStore } from "../stores/runsStore";
+import { prefilledTask, useRunsStore } from "../stores/runsStore";
 import { usePerfStore } from "../stores/perfStore";
 import { lowDiskLine } from "../lib/diskSpace";
 import { beaconAnchor } from "../lib/beacon";
@@ -138,7 +138,7 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     if (pendingPrefill.workspaceId && pendingPrefill.workspaceId !== workspaceId) return;
     const prefill = consumeLauncherPrefill();
     if (!prefill) return;
-    setTask(prefill.task);
+    setTask((current) => prefilledTask(current, prefill));
     if (pipelines.some((p) => p.pipeline.id === prefill.pipelineId)) {
       setSelectedId(prefill.pipelineId);
       setOverrides(Object.fromEntries(prefill.overrides));

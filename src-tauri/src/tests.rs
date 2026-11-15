@@ -2574,8 +2574,23 @@ mod editor_detection_tests {
 mod pr_checks_tests {
     use crate::github::{
         actions_run_id, checks_from_gh_rollup, checks_from_rest_check_runs, join_failed_logs,
-        tail_chars, ChecksState, FailingCheck,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE,
     };
+
+    #[test]
+    fn check_runs_read_another_page_only_after_a_full_one_below_the_total() {
+        let full = CHECK_RUNS_PER_PAGE;
+        // 250 runs: pages of 100, 100, 50.
+        assert!(more_check_run_pages(Some(250), 100, full));
+        assert!(more_check_run_pages(Some(250), 200, full));
+        assert!(!more_check_run_pages(Some(250), 250, 50));
+        // Exactly 100: the total says there is nothing more.
+        assert!(!more_check_run_pages(Some(100), 100, full));
+        // No total: a full page is the only hint, a short one ends it.
+        assert!(more_check_run_pages(None, 100, full));
+        assert!(!more_check_run_pages(None, 130, 30));
+        assert!(!more_check_run_pages(Some(500), 0, 0));
+    }
 
     #[test]
     fn gh_rollup_failing_names_each_failed_check_once_with_its_run() {

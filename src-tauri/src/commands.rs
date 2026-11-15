@@ -5474,8 +5474,10 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     Ok(Some(out))
 }
 
-/// The check runs on `sha` through REST, rolled up. `None` on any error — the
-/// chip then just shows no checks glyph.
+/// The check runs on `sha` through REST, every page up to
+/// `CHECK_RUNS_MAX_PAGES`, rolled up. `None` when the first page can't be
+/// read — the chip then just shows no checks glyph; a later page that fails
+/// keeps the runs read so far.
 async fn rest_check_runs(
     client: &reqwest::Client,
     token: &str,
@@ -5483,22 +5485,43 @@ async fn rest_check_runs(
     repo: &str,
     sha: &str,
 ) -> Option<crate::github::PrChecks> {
-    let url = format!(
-        "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page=100"
-    );
-    let resp = client
-        .get(&url)
-        .header("Accept", "application/vnd.github+json")
-        .header("Authorization", format!("Bearer {token}"))
-        .send()
-        .await
-        .ok()?;
-    if !resp.status().is_success() {
-        tracing::info!(status = %resp.status(), "find_pr_for_branch: check-runs not readable");
-        return None;
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=crate::github::CHECK_RUNS_MAX_PAGES {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={}&page={page}",
+            crate::github::CHECK_RUNS_PER_PAGE,
+        );
+        let resp = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::info!(status = %r.status(), page, "find_pr_for_branch: check-runs not readable");
+                if page == 1 { return None; }
+                break;
+            }
+            Err(_) if page == 1 => return None,
+            Err(_) => break,
+        };
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            if page == 1 { return None; }
+            break;
+        };
+        let Some(page_runs) = body["check_runs"].as_array() else {
+            if page == 1 { return None; }
+            break;
+        };
+        let page_len = page_runs.len();
+        runs.extend(page_runs.iter().cloned());
+        if !crate::github::more_check_run_pages(body["total_count"].as_u64(), runs.len(), page_len) {
+            break;
+        }
     }
-    let body: serde_json::Value = resp.json().await.ok()?;
-    crate::github::checks_from_rest_check_runs(&body)
+    crate::github::checks_from_rest_check_runs(&serde_json::json!({ "check_runs": runs }))
 }
 
 /// The tail of the failed steps' logs of these GitHub Actions runs
