@@ -9998,7 +9998,7 @@ mod cli_dialect_tests {
         let usage = Default::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
-            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false },
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
             usage, true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
@@ -10008,7 +10008,7 @@ mod cli_dialect_tests {
 
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
-            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false },
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
             usage, true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
@@ -10019,6 +10019,57 @@ mod cli_dialect_tests {
         let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
         assert!(matches!(empty.status, StageStatus::Failed));
         assert!(empty.error.as_deref().unwrap().contains("no final message"));
+        assert!(
+            !crate::orchestrator::cli_runner::is_usage_unreported(empty.error.as_deref().unwrap()),
+            "no turn ran, so the cost is known to be $0"
+        );
+    }
+
+    #[test]
+    fn codex_failure_before_any_turn_is_not_flagged_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // An `error` event before any `turn.started` (expired login, unknown model).
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+        ]);
+        assert!(!accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A bad exit with only stderr (a bad flag): nothing streamed at all.
+        let out = build_codex_outcome(
+            &CodexAccum::default(), Default::default(), false, ArtifactKind::Note, "gpt-5",
+            "error: unexpected argument '--bogus' found",
+        );
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A legacy-schema error before any agent event is not flagged either…
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"session_configured","session_id":"s"}}),
+            json!({"msg":{"type":"error","message":"model not found"}}),
+        ]);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+
+        // …but one after agent activity with no `token_count` is (the legacy
+        // schema has no `turn.started`).
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"exec_command_begin","command":["ls"]}}),
+            json!({"msg":{"type":"error","message":"stream disconnected"}}),
+        ]);
+        assert!(accum.activity && !accum.turn_open);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
     }
 }
 

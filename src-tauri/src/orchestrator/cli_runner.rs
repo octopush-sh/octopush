@@ -1270,13 +1270,18 @@ pub(crate) struct CodexAccum {
     /// A `turn.started` with no `turn.completed` after it: Codex reports a
     /// turn's usage only on `turn.completed`, so this turn's tokens are unknown.
     pub turn_open: bool,
+    /// The model did work: a `turn.started`, an `item.*` event, or a legacy
+    /// agent `msg` (the legacy schema has no `turn.started`). A failure before
+    /// any of these (bad login, unknown model, bad flag) provably spent nothing.
+    pub activity: bool,
 }
 
 impl CodexAccum {
     /// True when the stage's spend can't be known from the stream: the last
-    /// turn never completed, or no usage event arrived at all.
+    /// turn never completed, or the model did work and no usage event arrived.
+    /// A stage that failed before any turn or model activity is not flagged.
     pub fn usage_unreported(&self, reported: &CliUsage) -> bool {
-        self.turn_open || *reported == CliUsage::default()
+        self.turn_open || (self.activity && *reported == CliUsage::default())
     }
 }
 
@@ -1313,7 +1318,10 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                     accum.session_id = Some(id.to_string());
                 }
             }
-            "turn.started" => accum.turn_open = true,
+            "turn.started" => {
+                accum.turn_open = true;
+                accum.activity = true;
+            }
             "turn.completed" => accum.turn_open = false,
             "turn.failed" | "error" => {
                 let msg = v
@@ -1326,6 +1334,7 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                 entries.push(json!({ "kind": "notice", "text": format!("codex error — {msg}") }));
             }
             "item.started" | "item.updated" | "item.completed" => {
+                accum.activity = true;
                 if let Some(item) = v.get("item") {
                     let itype = item
                         .get("item_type")
@@ -1399,7 +1408,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
     }
     // ── Legacy experimental schema ──
     if let Some(msg) = v.get("msg") {
-        match msg.get("type").and_then(Value::as_str).unwrap_or("") {
+        let mtype = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mtype, "" | "session_configured" | "error") {
+            accum.activity = true;
+        }
+        match mtype {
             "agent_message" => {
                 if let Some(text) = msg.get("message").and_then(Value::as_str) {
                     if !text.trim().is_empty() {

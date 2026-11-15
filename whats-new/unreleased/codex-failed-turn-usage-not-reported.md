@@ -13,4 +13,4 @@ steps:
   - target: direct-ledger-usage-unreported-stage
     caption: That stage reads "usage not reported", or its known cost "+ usage not reported".
 ---
-A Codex stage that fails or crashes before Codex reports its last turn's tokens now reads **usage not reported** in the run ledger, like a stopped one. A stage stopped partway through a later turn keeps its earlier turns' cost and adds "+ usage not reported".
+A Codex stage that fails or crashes before Codex reports its last turn's tokens now reads **usage not reported** in the run ledger, like a stopped one. A stage stopped partway through a later turn keeps its earlier turns' cost and adds "+ usage not reported". A stage that fails before any turn starts, such as on an expired login or an unknown model, still reads $0.00, because nothing was spent.
