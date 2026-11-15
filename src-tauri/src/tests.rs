@@ -206,6 +206,21 @@ mod db_tests {
     }
 
     #[test]
+    fn unpriced_models_lists_only_unknown_models_once() {
+        // No catalog: the builtin table decides. Known models are dropped,
+        // unknown ones kept once each, in first-seen order.
+        let models: Vec<String> = ["claude-opus-5-5", "gw/mystery-1", "gpt-4o", "gw/mystery-1", "other-unknown-xyz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::commands::unpriced_models_in(None, &models),
+            vec!["gw/mystery-1".to_string(), "other-unknown-xyz".to_string()]
+        );
+        assert!(crate::commands::unpriced_models_in(None, &[]).is_empty());
+    }
+
+    #[test]
     #[serial_test::serial(pricing_catalog)]
     fn cost_for_prices_current_and_dated_models() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
