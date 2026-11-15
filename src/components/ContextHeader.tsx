@@ -1,7 +1,9 @@
-import { useEffect } from "react";
-import { Copy, GitBranch, Hammer, Shield } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { CircleCheck, CircleDashed, CircleX, Copy, GitBranch, Hammer, Shield, Wrench } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { INTENT_ICON } from "../lib/missionIntent";
-import type { GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
+import { checksTitle } from "../lib/prChecks";
+import type { ChecksState, GitStatus, Issue, Pr, PrState, StatusCategory, Workspace } from "../lib/types";
 import { useParentIssuesStore } from "../stores/parentIssuesStore";
 import { useActiveIssue } from "../hooks/useActiveIssue";
 import { ipc } from "../lib/ipc";
@@ -42,6 +44,13 @@ const PR_STATE_STYLE: Record<PrState, { color: string; bg: string; border: strin
     border: "var(--rouge-border)",
     glyph: "✕",
   },
+};
+
+/** The PR chip's CI checks glyph: sage passing, amber pending, rouge failing. */
+const CHECKS_STYLE: Record<ChecksState, { color: string; Icon: LucideIcon }> = {
+  passing: { color: "text-octo-sage", Icon: CircleCheck },
+  pending: { color: "text-octo-warning", Icon: CircleDashed },
+  failing: { color: "text-octo-rouge", Icon: CircleX },
 };
 
 /** Mute `·` between eyebrow atoms. Never a connector glyph — `⟶` is retired. */
@@ -85,6 +94,11 @@ interface Props {
   /** Called with the PR's html_url when the chip is clicked. Typically
    *  routes through `ipc.openFileInSystem` to launch the browser. */
   onOpenPr?: (url: string) => void;
+  /** "Fix failing checks…": shown on the chip only while the PR's checks
+   *  fail. Seeds the Direct launcher; nothing starts until the user presses
+   *  Start. While the returned promise is pending the button is busy and
+   *  ignores further clicks. */
+  onFixChecks?: (pr: Pr) => void | Promise<void>;
   /** The active workspace. A manually linked ticket (linkedIssueKey) wins;
    *  otherwise a branch-detected key gated on the project's Jira key
    *  (detectIssueKeyForProject). */
@@ -130,6 +144,7 @@ export function ContextHeader({
   gitStatus,
   pr,
   onOpenPr,
+  onFixChecks,
   workspace = null,
   issueTrackerConfigured = false,
   jiraProjectKey = null,
@@ -166,6 +181,25 @@ export function ContextHeader({
   // The name line: the ticket's summary when one resolves, else the workspace's
   // own name. Keyed so a workspace switch re-runs the entrance.
   const name = activeIssue ? activeIssue.summary : workspaceName;
+
+  // "Fix failing checks…" reads up to 3 failed logs before the launcher
+  // opens, so the button says so and ignores clicks until it is done. The
+  // ref guards the clicks that land before React re-renders it disabled.
+  const [fixBusy, setFixBusy] = useState(false);
+  const fixBusyRef = useRef(false);
+  const fixChecks = async (target: Pr) => {
+    if (!onFixChecks || fixBusyRef.current) return;
+    fixBusyRef.current = true;
+    setFixBusy(true);
+    try {
+      await onFixChecks(target);
+    } catch {
+      // The handler surfaces its own errors; the button just frees up.
+    } finally {
+      fixBusyRef.current = false;
+      setFixBusy(false);
+    }
+  };
 
   return (
     <div className="octo-header my-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
@@ -350,6 +384,38 @@ export function ContextHeader({
                 <span className={style.color}>PR · #{pr.number}</span>
                 <span aria-hidden style={{ fontSize: 9, opacity: 0.6 }}>↗</span>
               </button>
+              {pr.checks && (() => {
+                const checks = CHECKS_STYLE[pr.checks.state];
+                const title = checksTitle(pr.checks);
+                return (
+                  <span
+                    key={pr.checks.state}
+                    data-tour="pr-chip-checks"
+                    role="img"
+                    aria-label={title}
+                    title={title}
+                    className={`octo-pop-in flex items-center px-0.5 ${checks.color}`}
+                  >
+                    <checks.Icon size={11} aria-hidden />
+                  </span>
+                );
+              })()}
+              {pr.checks?.state === "failing" && onFixChecks && (
+                <button
+                  type="button"
+                  aria-label="Fix failing checks…"
+                  title={fixBusy ? "Reading the failed logs…" : "Fix failing checks…"}
+                  aria-busy={fixBusy}
+                  disabled={fixBusy}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    void fixChecks(pr);
+                  }}
+                  className="octo-pop-in flex shrink-0 items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:cursor-default disabled:opacity-50 disabled:hover:bg-transparent disabled:hover:text-octo-mute"
+                >
+                  <Wrench size={11} />
+                </button>
+              )}
               <button
                 type="button"
                 aria-label="Copy PR URL"

@@ -64,6 +64,7 @@ Current anchors:
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |
+| `pr-chip-checks` | Workspace header, PR chip: the CI checks glyph (only on an open/draft PR whose checks could be read; failing adds "Fix failing checks…" beside it) | `ContextHeader.tsx` |
 | `genesis-key-save` · `genesis-begin` · `genesis-sketch` | Genesis block (Welcome / New-project "From a prompt"): the inline API-key field (only with no key) · the one primary CTA ("Set a crew on it", or "Wake the crew" with a key and no brief) · "or think it through first" | `GenesisPrompt.tsx` |
 | `welcome-new-study` | Welcome: "Begin a new study" on the secondary line | `WelcomeScreen.tsx` |
 | `direct-launcher-brief` | Direct launcher: the brief | `PipelineSetup.tsx` |
@@ -71,13 +72,14 @@ Current anchors:
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
+| `direct-launcher-codex-commit` | Direct launcher: the amber "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push." line (only when an Action-role CLI stage runs on Codex outside a sandboxed mission) | `PipelineSetup.tsx` |
 | `pipeline-model-superseded` | Direct launcher, above the selected crew's description: "Fable 5.1 → Fable 5.2: about 20% cheaper per token." with "Switch this crew" / "Keep 5.1" (only while a stage or escalation of that crew uses a superseded model and the user hasn't kept it) | `direct/SupersededModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-waiting` | Direct run track, only while a running stage has no activity yet: its card's live line "waiting for first tool call" | `RunFlow.tsx` |
-| `direct-ledger-strip` · `direct-ledger-usage-unreported` · `direct-ledger-usage-unreported-stage` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · the strip's "· N stage(s) usage not reported" fragment after the spent figure (only when a Codex stage stopped before it reported usage; visible collapsed, budget or not) · that stage's "usage not reported" cell (once unfolded) | `RunLedger.tsx` |
+| `direct-ledger-strip` · `direct-ledger-usage-unreported` · `direct-ledger-usage-unreported-stage` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · the strip's "· N stage(s) usage not reported" fragment after the spent figure (only when a Codex stage ended before its last turn reported usage; visible collapsed, budget or not) · that stage's "usage not reported" cell (once unfolded) | `RunLedger.tsx` |
 | `direct-launcher-import-crew` · `direct-launcher-repo-crews` | Direct launcher: the "import a crew" link beside the ensemble eyebrow · the "from this repo" group (only when the worktree has `.octopush/crews/*.octocrew.json`) | `PipelineSetup.tsx` |
 | `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
@@ -134,6 +136,7 @@ Current anchors:
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
+| `fleet-chip` | Top bar: the fleet chip (`2 needs you` · `1 in flight` · `✓ 3 done`; only while the board has something) | `RunsTray.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` · `mission-control-card-spent` | Mission Control crew card: its task title · the workspace name in its meta row · the spent figure in its ledger foot | `MissionControl.tsx` |
 | `mission-control-ask-toggle` · `mission-control-ask-accept` | Mission Control `?` card (an `ask_director` block): the questions disclosure · "Accept recommended" | `MissionControl.tsx` |

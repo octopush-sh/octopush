@@ -421,6 +421,22 @@ export interface Pr {
   url: string;
   isDraft: boolean;
   state: PrState;
+  /** CI checks on the head commit (open/draft PRs). Absent when the PR has
+   *  none or they couldn't be read (no `gh`, no token). */
+  checks?: PrChecks;
+}
+
+export type ChecksState = "passing" | "pending" | "failing";
+
+export interface FailingCheck {
+  name: string;
+  /** The GitHub Actions run behind it, for `gh run view --log-failed`. */
+  runId: number | null;
+}
+
+export interface PrChecks {
+  state: ChecksState;
+  failing: FailingCheck[];
 }
 
 /** @deprecated Use `Pr` instead. */

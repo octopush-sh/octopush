@@ -11,6 +11,8 @@ import {
   channelCreateArgs,
   compareVersions,
   nextPatch,
+  notaryPreflightArgs,
+  notaryPreflightHint,
   parseChannel,
   releaseBody,
   shouldRefreshBetaManifest,
@@ -116,4 +118,26 @@ test("pending changesets ignore the README", async () => {
   assert.deepEqual(pendingChangesets(root), []);
   writeFileSync(join(root, "unreleased", "a-thing.md"), "x");
   assert.deepEqual(pendingChangesets(root), ["a-thing.md"]);
+});
+
+test("notary preflight checks the same credential set Tauri notarizes with", () => {
+  assert.deepEqual(
+    notaryPreflightArgs({ APPLE_ID: "a@b.c", APPLE_PASSWORD: "pw", APPLE_TEAM_ID: "T1", APPLE_API_KEY: "K" }),
+    ["notarytool", "history", "--apple-id", "a@b.c", "--team-id", "T1", "--password", "pw"],
+  );
+  assert.deepEqual(
+    notaryPreflightArgs({ APPLE_API_ISSUER: "iss", APPLE_API_KEY: "KID", APPLE_API_KEY_PATH: "/k.p8" }),
+    ["notarytool", "history", "--key", "/k.p8", "--key-id", "KID", "--issuer", "iss"],
+  );
+  assert.equal(notaryPreflightArgs({ APPLE_ID: "a@b.c", APPLE_TEAM_ID: "T1" }), null);
+  assert.equal(notaryPreflightArgs({}), null);
+});
+
+test("an expired Apple agreement is reported as an Account Holder action, not a code bug", () => {
+  // Verbatim from the v0.4.123 release log (run 43617104178).
+  const apple =
+    "Error: HTTP status code: 403. A required agreement is missing or has expired. This request requires an in-effect agreement that has not been signed or has expired.";
+  assert.match(notaryPreflightHint(apple), /Account Holder accepts the current Apple Developer Program License Agreement/);
+  assert.match(notaryPreflightHint("HTTP status code: 401. Unauthorized"), /credentials were rejected/);
+  assert.match(notaryPreflightHint("network timeout"), /could not validate/);
 });
