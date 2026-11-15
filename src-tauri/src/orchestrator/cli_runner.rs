@@ -796,6 +796,97 @@ pub fn cli_disallowed_tools(read_only: bool) -> String {
 /// straight to `Command::args` with no shell, so the JSON needs no quoting.
 pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true}}"#;
 
+/// [`CLAUDE_STAGE_SETTINGS`] plus the read guard, for a Claude stage in a
+/// mission whose own `exec_isolation` is `sandbox`: Read/Grep/Glob refuse
+/// paths outside the working directories too, so an agent can't pull
+/// `~/.ssh`, `~/.aws` or a sibling repo into its context. Claude Code also
+/// asks before a Bash command it sees reading outside them, which a headless
+/// stage refuses; reads it can't see still go through (the Seatbelt profile
+/// only denies writes). The stage's build-cache root and its own temp dir
+/// (`TMPDIR`, see `sandbox::prepare_with`) are added as working dirs
+/// (`--add-dir`, [`sandbox_read_dir_args`]), so it can still read what it
+/// writes there. The user-wide `$TMPDIR` is not: every app and stage writes
+/// there, and Claude Code loads `.claude/skills`, agents and commands from an
+/// `--add-dir` dir, so it would let anything plant skills into the stage.
+/// Every other mission keeps the write guard only — a `readonly`
+/// (review/probe) mission with `exec_isolation = "none"` too, though its
+/// sandbox is forced on: its agents read dependency sources outside the
+/// worktree.
+pub const CLAUDE_SANDBOXED_STAGE_SETTINGS: &str =
+    r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true,"blockReadsOutsideWorkingDirectories":true}}"#;
+
+/// The oldest Claude Code that honours `blockReadsOutsideWorkingDirectories`;
+/// older CLIs ignore the key.
+pub const CLAUDE_READ_GUARD_FLOOR: &str = "2.1.257";
+
+/// When the mission's own `exec_choice` is `sandbox` (not the effective tier a
+/// `readonly` mission forces on), swap a Claude stage's `--settings` value
+/// (fresh or resumed argv) for [`CLAUDE_SANDBOXED_STAGE_SETTINGS`]. Returns
+/// whether it did; Codex stages and other missions are left as they are. Pure.
+pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || exec_choice != "sandbox" {
+        return false;
+    }
+    match args.iter().position(|a| a == "--settings") {
+        Some(i) if i + 1 < args.len() => {
+            args[i + 1] = CLAUDE_SANDBOXED_STAGE_SETTINGS.to_string();
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The [`CacheTenant`](crate::orchestrator::sandbox::CacheTenant) a sandboxed
+/// CLI stage's cache root and temp dir are keyed by: the mission's own exec
+/// choice and whether the stage is read-confined (the `bool`
+/// [`confine_reads_in_sandbox`] returned). Pure.
+pub fn cli_cache_tenant(exec_choice: &str, reads_confined: bool) -> crate::orchestrator::sandbox::CacheTenant<'_> {
+    crate::orchestrator::sandbox::CacheTenant::Cli { exec_choice, reads_confined }
+}
+
+/// `--add-dir` flags for a read-confined Claude stage (`reads_confined`, see
+/// [`confine_reads_in_sandbox`]): its build-cache root and own temp dir
+/// (`dirs`, from `sandbox::prepare_with`), which `sandbox_cache_env` /
+/// `TMPDIR` point npm, cargo & co. at. Both are keyed by workspace, write
+/// roots, exec choice and read guard ([`cli_cache_tenant`]), so the only
+/// launches that can write them are read-confined Claude stages of the same
+/// workspace, access mode and exec choice: no Codex stage, no exec-`none`
+/// readonly stage, no TALK or API-substrate `run_command`, and no Codex
+/// writer outside the sandbox. That matters most for a readonly mission,
+/// whose stages can't write the worktree: these dirs would otherwise be the
+/// one place another launch could plant `.claude/skills`, agents or commands
+/// that Claude Code loads from an `--add-dir` dir. Without them the read
+/// guard would refuse the stage's own temp files and redirected caches. One
+/// flag per dir, blanks and repeats (trailing `/` ignored) dropped; nothing
+/// when reads aren't confined. Pure.
+pub fn sandbox_read_dir_args(reads_confined: bool, dirs: &[String]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    if !reads_confined {
+        return out;
+    }
+    for d in dirs {
+        let t = d.trim();
+        let t = if t.len() > 1 { t.trim_end_matches('/') } else { t };
+        if t.is_empty() || seen.contains(&t) {
+            continue;
+        }
+        seen.push(t);
+        out.push("--add-dir".to_string());
+        out.push(t.to_string());
+    }
+    out
+}
+
+/// The launch line's note when the read guard was asked for but the known
+/// CLI is too old to honour it; `None` otherwise (an unknown version never
+/// warns). Pure.
+pub fn read_guard_label(reads_confined: bool, cli_version: Option<&str>) -> Option<String> {
+    let v = cli_version.filter(|_| reads_confined)?;
+    crate::agent_adapter::version_below(v, CLAUDE_READ_GUARD_FLOOR)
+        .then(|| format!("file reads not confined (Claude Code {CLAUDE_READ_GUARD_FLOOR}+ needed)"))
+}
+
 /// Build the argv (after the program name) for a headless `claude -p` run.
 /// The user prompt is supplied via stdin, not as an arg. We stream NDJSON
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
@@ -2041,6 +2132,10 @@ impl CliRunner {
                 ),
             ),
         };
+        // A mission the user chose to sandbox also confines the file tools'
+        // reads (fresh and resumed). Keyed on the choice, not the effective
+        // tier: a readonly mission's forced sandbox keeps the write guard only.
+        let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_choice, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).
@@ -2084,11 +2179,20 @@ impl CliRunner {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
                     let scope = ctx.workspace_path.to_string_lossy();
-                    match crate::orchestrator::sandbox::prepare(
+                    // A Claude stage gets its own temp dir (`TMPDIR`) beside
+                    // its cache root; a read-confined one names both as
+                    // working dirs, or the read guard refuses them. Both are
+                    // keyed by the exec choice and the read guard too, so no
+                    // stage with open reads (a Codex stage, an exec-`none`
+                    // review) shares a read-confined stage's dirs.
+                    match crate::orchestrator::sandbox::prepare_with(
                         &ctx.allowed_write_roots,
                         Some(&*scope),
+                        cli_cache_tenant(&ctx.exec_choice, reads_confined),
                         &real_program,
                         &args,
+                        dialect == CliDialect::Claude,
+                        |own_dirs| sandbox_read_dir_args(reads_confined, own_dirs),
                     ) {
                         Ok(prepared) => {
                             sandbox_env = prepared.env;
@@ -2184,11 +2288,14 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}",
+            "launching {} · {}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
             dialect.sandbox_label(read_only, write_scope).map(|s| format!(" · {s}")).unwrap_or_default(),
+            read_guard_label(reads_confined, cli_version.as_ref().and_then(|v| v.version.as_deref()))
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {
