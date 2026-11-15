@@ -460,9 +460,10 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
-/// The marker line in the error of a Codex stage stopped (director stop,
-/// stall, 60-minute cap) before any `turn.completed` / `token_count` event:
-/// Codex reports usage only there, so the stage's spend is unknown, not $0.
+/// The marker line in the error of a Codex stage that ended (director stop,
+/// stall, 60-minute cap, `turn.failed`, a crash) with its last turn missing
+/// its `turn.completed` / `token_count` event: Codex reports usage only there,
+/// so (that part of) the stage's spend is unknown, not $0.
 /// Also the journal line the drive writes for it.
 pub const USAGE_UNREPORTED: &str = "codex stopped before reporting usage, so this stage's cost is unknown";
 
@@ -1266,6 +1267,25 @@ pub(crate) struct CodexAccum {
     pub final_message: Option<String>,
     pub error: Option<String>,
     pub session_id: Option<String>,
+    /// A `turn.started` with no `turn.completed` after it: Codex reports a
+    /// turn's usage only on `turn.completed`, so this turn's tokens are unknown.
+    pub turn_open: bool,
+    /// The model did work: a `turn.started`, an `item.*` event, or a legacy
+    /// agent `msg` (the legacy schema has no `turn.started`). A failure before
+    /// any of these (a bad flag, no login at launch, an `error` before
+    /// `turn.started`) provably spent nothing. A turn that started and then
+    /// failed (a 401 or an unknown model) is flagged: the stream can't show
+    /// whether it spent anything.
+    pub activity: bool,
+}
+
+impl CodexAccum {
+    /// True when the stage's spend can't be known from the stream: the last
+    /// turn never completed, or the model did work and no usage event arrived.
+    /// A stage that failed before any turn or model activity is not flagged.
+    pub fn usage_unreported(&self, reported: &CliUsage) -> bool {
+        self.turn_open || (self.activity && *reported == CliUsage::default())
+    }
 }
 
 /// A string field that may be a plain string or an array of strings (codex
@@ -1301,6 +1321,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                     accum.session_id = Some(id.to_string());
                 }
             }
+            "turn.started" => {
+                accum.turn_open = true;
+                accum.activity = true;
+            }
+            "turn.completed" => accum.turn_open = false,
             "turn.failed" | "error" => {
                 let msg = v
                     .get("error")
@@ -1312,6 +1337,7 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                 entries.push(json!({ "kind": "notice", "text": format!("codex error — {msg}") }));
             }
             "item.started" | "item.updated" | "item.completed" => {
+                accum.activity = true;
                 if let Some(item) = v.get("item") {
                     let itype = item
                         .get("item_type")
@@ -1385,7 +1411,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
     }
     // ── Legacy experimental schema ──
     if let Some(msg) = v.get("msg") {
-        match msg.get("type").and_then(Value::as_str).unwrap_or("") {
+        let mtype = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mtype, "" | "session_configured" | "error") {
+            accum.activity = true;
+        }
+        match mtype {
             "agent_message" => {
                 if let Some(text) = msg.get("message").and_then(Value::as_str) {
                     if !text.trim().is_empty() {
@@ -1497,6 +1527,9 @@ pub(crate) fn build_codex_outcome(
         if !tail.is_empty() {
             error.push_str(&format!("\n— stderr —\n{tail}"));
         }
+        if accum.usage_unreported(&usage) {
+            error.push_str(&format!("\n{USAGE_UNREPORTED}"));
+        }
         let mut out = failed_stage(&error);
         out.input_tokens = usage.input_tokens;
         out.output_tokens = usage.output_tokens;
@@ -1531,10 +1564,14 @@ pub(crate) fn build_codex_outcome(
             }
         }
         None => {
-            let mut out = failed_stage(&format!(
+            let mut error = format!(
                 "codex produced no final message: {}",
                 failure_detail(stderr_text, "the stream ended without an assistant message")
-            ));
+            );
+            if accum.usage_unreported(&usage) {
+                error.push_str(&format!("\n{USAGE_UNREPORTED}"));
+            }
+            let mut out = failed_stage(&error);
             out.input_tokens = usage.input_tokens;
             out.output_tokens = usage.output_tokens;
             out.cache_read_tokens = usage.cache_read_input_tokens;
@@ -2266,6 +2303,7 @@ impl CliRunner {
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
                     &streamed_usage.lock(),
+                    codex_accum.lock().turn_open,
                 ));
             }
         };
@@ -2295,6 +2333,7 @@ impl CliRunner {
                 &format!("{bin} {kind}"),
                 &stage.agent_model,
                 &streamed_usage.lock(),
+                codex_accum.lock().turn_open,
             ));
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -2400,7 +2439,7 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
 }
 
 /// Sum the per-message usage map into one total (see `usage_from_stream_event`).
-fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
+pub(crate) fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
     let mut total = CliUsage::default();
     for u in map.values() {
         total.add(u);
@@ -2466,16 +2505,18 @@ fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashM
 
 /// The outcome of a stage stopped before it finished (director stop, stall,
 /// 60-minute cap): the streamed usage priced as an estimate. A Codex stage
-/// that streamed no usage event never reported its tokens — its error carries
-/// [`USAGE_UNREPORTED`] so its cost reads unknown instead of $0.00.
+/// whose last turn never completed (`turn_open`) or that streamed no usage
+/// event never reported those tokens — its error carries [`USAGE_UNREPORTED`]
+/// so its cost reads unknown (or "+ usage not reported") instead of a total.
 pub(crate) fn stopped_stage(
     dialect: CliDialect,
     msg: &str,
     model: &str,
     map: &std::collections::HashMap<String, CliUsage>,
+    turn_open: bool,
 ) -> StageOutcome {
-    if dialect == CliDialect::Codex && map.is_empty() {
-        return failed_stage(&format!("{msg}\n{USAGE_UNREPORTED}"));
+    if dialect == CliDialect::Codex && (turn_open || map.is_empty()) {
+        return failed_stage_with_usage(&format!("{msg}\n{USAGE_UNREPORTED}"), model, map);
     }
     failed_stage_with_usage(msg, model, map)
 }

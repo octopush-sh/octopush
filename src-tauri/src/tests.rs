@@ -5239,7 +5239,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             use crate::orchestrator::cli_runner::{stopped_stage, CliDialect};
-            Ok(stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &Default::default()))
+            Ok(stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &Default::default(), true))
         }
     }
 
@@ -9860,37 +9860,137 @@ mod cli_dialect_tests {
         map
     }
 
+    /// Fold a Codex stream the way the runner does: the accumulator and the
+    /// per-stage usage map.
+    fn codex_stream(
+        events: &[serde_json::Value],
+    ) -> (CodexAccum, std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage>) {
+        let mut accum = CodexAccum::default();
+        for ev in events {
+            codex_fold_event(&mut accum, ev);
+        }
+        (accum, codex_stream_usage(events))
+    }
+
     #[test]
     fn codex_stage_stopped_before_turn_completed_reports_usage_unreported_not_zero() {
         use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
         // Assistant items streamed, then the stall: no turn.completed arrived.
-        let map = codex_stream_usage(&[
+        let (accum, map) = codex_stream(&[
             json!({"type":"thread.started","thread_id":"th"}),
             json!({"type":"turn.started"}),
             json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Reading the code."}}),
             json!({"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls","status":"completed"}}),
         ]);
-        let out = stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &map);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &map, accum.turn_open);
         assert!(matches!(out.status, StageStatus::Failed));
         let err = out.error.as_deref().unwrap();
         assert!(is_usage_unreported(err), "{err}");
         assert!(err.starts_with("codex timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
         assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
 
-        // With a turn.completed, the reported usage is kept, as before.
-        let map = codex_stream_usage(&[
+        // Stopped between turns: every turn reported, so the usage is kept unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Done with turn one."}}),
             json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
-            json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Next turn."}}),
         ]);
-        let out = stopped_stage(CliDialect::Codex, "codex exceeded the 60-minute cap", "gpt-5", &map);
+        assert!(!accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex exceeded the 60-minute cap", "gpt-5", &map, accum.turn_open);
         let err = out.error.as_deref().unwrap();
         assert!(!is_usage_unreported(err), "{err}");
         assert_eq!(err, "codex exceeded the 60-minute cap");
         assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
 
         // A Claude stage with nothing streamed is unchanged (it streams usage per message).
-        let out = stopped_stage(CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-sonnet-4-6", &Default::default());
+        let out = stopped_stage(CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-sonnet-4-6", &Default::default(), false);
         assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn codex_stage_stopped_mid_turn_keeps_earlier_turns_usage_and_is_flagged() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Turn one reported its usage; turn two was stopped before turn.completed.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"Working on turn two."}}),
+        ]);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "Stopped by the director", "gpt-5", &map, accum.turn_open);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "the open turn's tokens are unknown: {err}");
+        assert!(err.starts_with("Stopped by the director\n"), "{err}");
+        assert_eq!(
+            (out.input_tokens, out.cache_read_tokens, out.output_tokens),
+            (400, 600, 50),
+            "the turns that reported keep their usage"
+        );
+    }
+
+    #[test]
+    fn codex_turn_failed_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Starting."}}),
+            json!({"type":"turn.failed","error":{"message":"stream disconnected"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("stream disconnected"), "the cause stays the first line: {err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // An earlier turn's usage is kept; the failed turn still flags it.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.failed","error":{"message":"rate limited"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+    }
+
+    #[test]
+    fn codex_crash_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // The process died mid-turn: no message, no turn.completed, a bad exit.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Note, "gpt-5", "thread 'main' panicked");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(out.session_id.as_deref(), Some("th"));
+
+        // A clean exit that ended without a message, after a completed turn, stays unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        let err = out.error.as_deref().unwrap();
+        assert!(err.contains("no final message"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+
+        // The same stream crashing mid-turn instead is flagged.
+        let (accum, _) = codex_stream(&[json!({"type":"turn.started"})]);
+        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
     }
 
     #[test]
@@ -9898,7 +9998,7 @@ mod cli_dialect_tests {
         let usage = Default::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
-            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()) },
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
             usage, true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
@@ -9908,7 +10008,7 @@ mod cli_dialect_tests {
 
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
-            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None },
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
             usage, true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
@@ -9919,6 +10019,75 @@ mod cli_dialect_tests {
         let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
         assert!(matches!(empty.status, StageStatus::Failed));
         assert!(empty.error.as_deref().unwrap().contains("no final message"));
+        assert!(
+            !crate::orchestrator::cli_runner::is_usage_unreported(empty.error.as_deref().unwrap()),
+            "no turn ran, so the cost is known to be $0"
+        );
+    }
+
+    #[test]
+    fn codex_failure_before_any_turn_is_not_flagged_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // An `error` event before Codex starts a turn: nothing was spent.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+        ]);
+        assert!(!accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // The real stream of an expired login or an unknown model: Codex
+        // starts the turn before the request, so the turn is open when it
+        // fails and the stage is flagged (the stream can't show the spend).
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+            json!({"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized"}}),
+        ]);
+        assert!(accum.turn_open && accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A bad exit with only stderr (a bad flag): nothing streamed at all.
+        let out = build_codex_outcome(
+            &CodexAccum::default(), Default::default(), false, ArtifactKind::Note, "gpt-5",
+            "error: unexpected argument '--bogus' found",
+        );
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A legacy-schema error before any agent event is not flagged either…
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"session_configured","session_id":"s"}}),
+            json!({"msg":{"type":"error","message":"not logged in"}}),
+        ]);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+
+        // …but one after agent activity with no `token_count` is (the legacy
+        // schema has no `turn.started`).
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"exec_command_begin","command":["ls"]}}),
+            json!({"msg":{"type":"error","message":"stream disconnected"}}),
+        ]);
+        assert!(accum.activity && !accum.turn_open);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
     }
 }
 
