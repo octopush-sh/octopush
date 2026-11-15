@@ -213,9 +213,12 @@ impl RetryThrottle {
     }
 }
 
+/// The journal line after a stage's `AskUserQuestion` tool call.
+pub const ASK_USER_QUESTION_REFUSED: &str = "the agent tried to ask a question; it was refused";
+
 /// Map ONE claude `--output-format stream-json` event to zero or more entries
 /// (as the JSON values `LiveEmitter` would emit). `assistant` → text + tool
-/// entries; `user` tool_result → tool_result entries; `system/api_retry` →
+/// entries (an `AskUserQuestion` call adds [`ASK_USER_QUESTION_REFUSED`]); `user` tool_result → tool_result entries; `system/api_retry` →
 /// a retry notice; `system/notification` → its message; `system/init` → a
 /// notice per MCP server / plugin that failed to load; everything else → none.
 ///
@@ -285,6 +288,11 @@ pub fn entries_from_stream_event(v: &Value) -> Vec<Value> {
                             }
                         }
                         out.push(entry);
+                        // Every Claude stage disallows the question tool; an
+                        // older CLI may still offer it, and headless nobody answers.
+                        if name == crate::orchestrator::cli_runner::ASK_USER_QUESTION_TOOL {
+                            out.push(json!({ "kind": "notice", "text": ASK_USER_QUESTION_REFUSED }));
+                        }
                     }
                     _ => {}
                 }

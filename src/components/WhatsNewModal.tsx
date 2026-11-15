@@ -187,8 +187,9 @@ export function WhatsNewModal() {
         <div className="flex items-center gap-2 px-6 pb-5 pt-3">
           {tips.length > 1 && (
             <StageDots
+              tone="pager"
               stages={tips.map((t, i) => ({
-                status: i < index ? "done" : i === index ? "running" : "pending",
+                status: i < index ? "seen" : i === index ? "current" : "upcoming",
                 title: t.title,
               }))}
             />

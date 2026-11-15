@@ -19,7 +19,7 @@ export function ShortcutsPane() {
           <Shortcut keys="⌘⇧D" desc="Direct mode" />
           <Shortcut keys="⌘⇧M" desc="Mission Control" />
           <Shortcut keys="⌘⇧L" desc="Logbook Room" />
-          <Shortcut keys="⌘\\" desc="Toggle companion" />
+          <Shortcut keys={"⌘\\"} desc="Toggle companion" />
         </ShortcutGroup>
 
         <ShortcutGroup title="Actions">

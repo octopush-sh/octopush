@@ -25,7 +25,7 @@ vi.mock("../lib/ipc", async () => {
 });
 
 import { ipc, type Run, type RunStage } from "../lib/ipc";
-import { useRunsStore, EMPTY_RUNS } from "./runsStore";
+import { useRunsStore, EMPTY_RUNS, prefilledTask } from "./runsStore";
 
 const RUN: Run = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
@@ -249,6 +249,15 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().consumeLauncherPrefill()).toEqual(prefill);
     expect(useRunsStore.getState().launcherPrefill).toBeNull();
     expect(useRunsStore.getState().consumeLauncherPrefill()).toBeNull();
+  });
+
+  it("prefilledTask replaces by default and appends below typed text with `append`", () => {
+    expect(prefilledTask("typed", { task: "again" })).toBe("again");
+    expect(prefilledTask("", { task: "brief", append: true })).toBe("brief");
+    expect(prefilledTask("  \n", { task: "brief", append: true })).toBe("brief");
+    expect(prefilledTask("my notes\n", { task: "brief", append: true })).toBe("my notes\n\nbrief");
+    // The same brief twice is added once.
+    expect(prefilledTask("my notes\n\nbrief", { task: "brief", append: true })).toBe("my notes\n\nbrief");
   });
 
   it("stopStage fires the stop_stage IPC for the run (R2)", async () => {

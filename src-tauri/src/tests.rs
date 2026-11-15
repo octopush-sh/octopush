@@ -410,6 +410,33 @@ mod workspace_tests {
     }
 
     #[test]
+    fn deleting_a_workspace_drops_its_paused_run_from_the_dock_badge() {
+        // The workspace's runs cascade-delete with no run:// event, which is
+        // why `delete_workspace` / `delete_project` refresh the badge: the
+        // recount after the delete must clear it.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let a = db.create_run("ws1", &pipeline_id, "task a", None, None, &[]).unwrap();
+        let b = db.create_run("ws2", &pipeline_id, "task b", None, None, &[]).unwrap();
+        db.set_run_status(&a, "paused", false).unwrap();
+        db.set_run_status(&b, "paused", false).unwrap();
+        let badge = |db: &Db| {
+            let runs = db.list_active_runs().unwrap();
+            crate::fleet_status::derive(runs.iter().map(|r| r.status.as_str())).badge()
+        };
+        assert_eq!(badge(&db), Some(2));
+
+        db.delete_workspace("ws1").unwrap();
+        assert_eq!(badge(&db), Some(1));
+
+        db.delete_project("p2").unwrap();
+        assert_eq!(badge(&db), None, "a project delete cascades its runs too");
+    }
+
+    #[test]
     fn list_runs_settled_since_returns_runs_finished_after_the_marker() {
         // "While you were away": only completed/aborted runs whose finish is
         // strictly after `since`. A run that finished exactly at the quit
@@ -2540,6 +2567,209 @@ mod editor_detection_tests {
         #[cfg(unix)]
         assert!(binary_on_path("sh"));
         assert!(!binary_on_path("definitely-not-a-real-binary-xyz"));
+    }
+}
+
+#[cfg(test)]
+mod pr_checks_tests {
+    use crate::github::{
+        actions_run_id, check_runs_from_gh_pages, checks_from_gh_rollup, checks_from_gh_rollup_and_runs,
+        checks_from_rest_check_runs, gh_check_runs_command, gh_rollup_may_be_capped, join_failed_logs,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_ROLLUP_CAP,
+    };
+
+    #[test]
+    fn gh_rollup_is_re_read_only_when_it_comes_back_full() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let rollup = |n: usize| serde_json::Value::Array(vec![ok.clone(); n]);
+        assert!(!gh_rollup_may_be_capped(&rollup(0)));
+        assert!(!gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP - 1)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP + 5)));
+        assert!(!gh_rollup_may_be_capped(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn gh_check_runs_command_needs_a_hex_sha_and_quotes_the_path() {
+        assert_eq!(
+            gh_check_runs_command("o", "r", "abc123").as_deref(),
+            Some("gh api --paginate 'repos/o/r/commits/abc123/check-runs?per_page=100'"),
+        );
+        assert!(gh_check_runs_command("o", "r", "").is_none());
+        assert!(gh_check_runs_command("o", "r", "abc; rm -rf ~").is_none());
+        assert_eq!(
+            gh_check_runs_command("o'x", "r", "ab").as_deref(),
+            Some("gh api --paginate 'repos/o'\\''x/r/commits/ab/check-runs?per_page=100'"),
+        );
+    }
+
+    #[test]
+    fn gh_pages_concatenate_check_runs_and_keep_what_was_read() {
+        let raw = br#"{"total_count":3,"check_runs":[{"name":"a"},{"name":"b"}]}
+{"total_count":3,"check_runs":[{"name":"c"}]}"#;
+        let runs = check_runs_from_gh_pages(raw).unwrap();
+        let names: Vec<&str> = runs.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // Pages printed back to back, without a newline.
+        let tight = br#"{"check_runs":[{"name":"a"}]}{"check_runs":[{"name":"b"}]}"#;
+        assert_eq!(check_runs_from_gh_pages(tight).unwrap().len(), 2);
+        // A broken later page keeps the first.
+        let broken = br#"{"check_runs":[{"name":"a"}]}{"check_runs":"#;
+        assert_eq!(check_runs_from_gh_pages(broken).unwrap().len(), 1);
+        assert!(check_runs_from_gh_pages(b"").is_none());
+        assert!(check_runs_from_gh_pages(br#"{"message":"Not Found"}"#).is_none());
+    }
+
+    #[test]
+    fn capped_rollup_with_every_run_shows_a_failure_past_the_cap() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let mut items = vec![ok; GH_ROLLUP_CAP - 1];
+        items.push(serde_json::json!({ "__typename": "StatusContext", "context": "ci/ext", "state": "SUCCESS" }));
+        let rollup = serde_json::Value::Array(items);
+        assert_eq!(checks_from_gh_rollup(&rollup).unwrap().state, ChecksState::Passing);
+
+        let mut runs = vec![serde_json::json!({ "name": "a", "status": "completed", "conclusion": "success" }); 120];
+        runs.push(serde_json::json!({ "name": "late", "status": "completed", "conclusion": "failure",
+            "details_url": "https://github.com/o/r/actions/runs/5/job/1" }));
+        let checks = checks_from_gh_rollup_and_runs(&rollup, &runs).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "late".into(), run_id: Some(5) }]);
+
+        // Commit statuses still come from the rollup.
+        let failing_status = serde_json::json!([
+            { "__typename": "StatusContext", "context": "ci/ext", "state": "FAILURE" }
+        ]);
+        let checks = checks_from_gh_rollup_and_runs(&failing_status, &runs[..1]).unwrap();
+        assert_eq!(checks.failing, vec![FailingCheck { name: "ci/ext".into(), run_id: None }]);
+    }
+
+    #[test]
+    fn check_runs_read_another_page_only_after_a_full_one_below_the_total() {
+        let full = CHECK_RUNS_PER_PAGE;
+        // 250 runs: pages of 100, 100, 50.
+        assert!(more_check_run_pages(Some(250), 100, full));
+        assert!(more_check_run_pages(Some(250), 200, full));
+        assert!(!more_check_run_pages(Some(250), 250, 50));
+        // Exactly 100: the total says there is nothing more.
+        assert!(!more_check_run_pages(Some(100), 100, full));
+        // No total: a full page is the only hint, a short one ends it.
+        assert!(more_check_run_pages(None, 100, full));
+        assert!(!more_check_run_pages(None, 130, 30));
+        assert!(!more_check_run_pages(Some(500), 0, 0));
+    }
+
+    #[test]
+    fn gh_rollup_failing_names_each_failed_check_once_with_its_run() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS",
+              "detailsUrl": "https://github.com/o/r/actions/runs/11/job/1" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/2" },
+            { "__typename": "CheckRun", "name": "test", "status": "COMPLETED", "conclusion": "FAILURE",
+              "detailsUrl": "https://github.com/o/r/actions/runs/12/job/3" },
+            { "__typename": "CheckRun", "name": "lint", "status": "IN_PROGRESS", "conclusion": "" },
+            { "__typename": "StatusContext", "context": "ci/circle", "state": "ERROR",
+              "targetUrl": "https://circleci.com/x" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(
+            checks.failing,
+            vec![
+                FailingCheck { name: "test".into(), run_id: Some(12) },
+                FailingCheck { name: "ci/circle".into(), run_id: None },
+            ]
+        );
+    }
+
+    #[test]
+    fn gh_rollup_pending_when_something_still_runs() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "build", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "test", "status": "QUEUED", "conclusion": "" },
+        ]);
+        assert_eq!(checks_from_gh_rollup(&raw).unwrap().state, ChecksState::Pending);
+        let status = serde_json::json!([{ "__typename": "StatusContext", "context": "deploy", "state": "PENDING" }]);
+        assert_eq!(checks_from_gh_rollup(&status).unwrap().state, ChecksState::Pending);
+    }
+
+    #[test]
+    fn gh_rollup_passing_counts_skipped_neutral_and_cancelled_as_ok() {
+        let raw = serde_json::json!([
+            { "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" },
+            { "__typename": "CheckRun", "name": "b", "status": "COMPLETED", "conclusion": "SKIPPED" },
+            { "__typename": "CheckRun", "name": "c", "status": "COMPLETED", "conclusion": "NEUTRAL" },
+            { "__typename": "CheckRun", "name": "d", "status": "COMPLETED", "conclusion": "CANCELLED" },
+            { "__typename": "StatusContext", "context": "e", "state": "SUCCESS" }
+        ]);
+        let checks = checks_from_gh_rollup(&raw).unwrap();
+        assert_eq!(checks.state, ChecksState::Passing);
+        assert!(checks.failing.is_empty());
+    }
+
+    #[test]
+    fn gh_rollup_none_without_checks() {
+        assert!(checks_from_gh_rollup(&serde_json::json!([])).is_none());
+        assert!(checks_from_gh_rollup(&serde_json::Value::Null).is_none());
+    }
+
+    #[test]
+    fn rest_check_runs_shape_rolls_up_the_same_way() {
+        let body = serde_json::json!({
+            "total_count": 3,
+            "check_runs": [
+                { "name": "build", "status": "completed", "conclusion": "success" },
+                { "name": "test", "status": "completed", "conclusion": "timed_out",
+                  "details_url": "https://github.com/o/r/actions/runs/77/job/9" },
+                { "name": "lint", "status": "in_progress", "conclusion": null }
+            ]
+        });
+        let checks = checks_from_rest_check_runs(&body).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "test".into(), run_id: Some(77) }]);
+
+        let pending = serde_json::json!({ "check_runs": [
+            { "name": "build", "status": "queued", "conclusion": null }
+        ]});
+        assert_eq!(checks_from_rest_check_runs(&pending).unwrap().state, ChecksState::Pending);
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "check_runs": [] })).is_none());
+        assert!(checks_from_rest_check_runs(&serde_json::json!({ "message": "Not Found" })).is_none());
+    }
+
+    #[test]
+    fn actions_run_id_reads_the_run_out_of_the_url() {
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/123/job/456"), Some(123));
+        assert_eq!(actions_run_id("https://github.com/o/r/actions/runs/9"), Some(9));
+        assert_eq!(actions_run_id("https://circleci.com/gh/o/r/1"), None);
+    }
+
+    #[test]
+    fn pr_checks_serialize_camel_case_and_absent_when_none() {
+        let raw = serde_json::json!({ "number": 1, "url": "u", "title": "t", "state": "open" });
+        let mut pr = crate::github::pr_from_json(&raw);
+        assert!(serde_json::to_value(&pr).unwrap().get("checks").is_none());
+        pr.checks = Some(crate::github::PrChecks {
+            state: ChecksState::Failing,
+            failing: vec![FailingCheck { name: "test".into(), run_id: Some(5) }],
+        });
+        let v = serde_json::to_value(&pr).unwrap();
+        assert_eq!(v["checks"]["state"], "failing");
+        assert_eq!(v["checks"]["failing"][0]["runId"], 5);
+    }
+
+    #[test]
+    fn failed_logs_keep_each_tail_within_the_budget() {
+        assert_eq!(tail_chars("abcdef", 3), "def");
+        assert_eq!(tail_chars("ab", 3), "ab");
+        assert_eq!(tail_chars("ñandú", 2), "dú");
+
+        let long = format!("{}FAILED here", "x".repeat(20_000));
+        let out = join_failed_logs(&[(1, long), (2, "  \n".into()), (3, "boom".into())], 8_000);
+        assert!(out.chars().count() <= 8_000);
+        assert!(out.contains("FAILED here"));
+        assert!(out.contains("run 3\nboom"));
+        assert!(!out.contains("run 2"));
+        assert_eq!(join_failed_logs(&[], 8_000), "");
     }
 }
 
@@ -5076,6 +5306,57 @@ mod orchestrator_tests {
         assert_eq!(artifact.text, "Implemented the feature.");
         assert_eq!(artifact.kind, ArtifactKind::Diff);
         assert!(artifact.refs_worktree);
+    }
+
+    /// A Codex stage that stalled before any `turn.completed`, through the
+    /// real stopped-stage path: `map` is the usage it streamed (none).
+    struct CodexStalledRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexStalledRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{stopped_stage, CliDialect};
+            Ok(stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &Default::default(), true))
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_stage_stopped_before_reporting_usage_is_flagged_and_journaled_once() {
+        use crate::orchestrator::cli_runner::USAGE_UNREPORTED;
+        let (db, run) = esc_run(None, None, None);
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CodexStalledRunner));
+        assert_eq!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+        assert_eq!(stage.status, "failed");
+        assert_eq!((stage.input_tokens, stage.output_tokens, stage.cost_usd), (0, 0, 0.0));
+        let flagged = db.lock().usage_unreported_stage_ids(&run).unwrap();
+        assert!(flagged.contains(&stage.id), "the stage reads usage not reported, not $0.00");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert_eq!(log.iter().filter(|e| e.contains(USAGE_UNREPORTED)).count(), 1, "{log:?}");
+        assert!(
+            log.iter().any(|e| e.contains("Stage halted — codex timed out — no output for 5 minutes\"")),
+            "the halt line keeps the cause alone: {log:?}"
+        );
+
+        // Sticky: a re-run does not erase the unknown spend of the stopped attempt.
+        db.lock().reset_run_stage(&stage.id, None, None).unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().contains(&stage.id));
+    }
+
+    #[tokio::test]
+    async fn stages_that_reported_usage_are_never_flagged_unreported() {
+        let (db, run) = esc_run(None, None, None);
+        let calls = Arc::new(Mutex::new(0));
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db), sink, Box::new(SessionNotSavedRunner { calls: Arc::clone(&calls) }));
+        orch.run_to_pause(&run).await.unwrap();
+        assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().is_empty());
     }
 
     /// A Claude stage that ended on a hook-deferred tool call (Claude Code ≥
@@ -9077,12 +9358,13 @@ wait
 
         let limits = ReadLimits {
             idle: Duration::from_secs(20),
+            command_idle: Duration::from_secs(20),
             cap: Duration::from_secs(60),
             settle: Duration::from_millis(200),
         };
         let end = tokio::time::timeout(
             Duration::from_secs(10),
-            read_stream(stdout, CliDialect::Claude, limits, |_| {}),
+            read_stream(stdout, CliDialect::Claude, limits, |_| {}, |_| {}),
         )
         .await
         .expect("read_stream did not settle — it is waiting for the process to exit");
@@ -9107,14 +9389,39 @@ mod cli_args_tests {
     fn read_only_review_stages_disallow_write_tools() {
         // B9: a worktree review stage must not be able to edit files — the API
         // substrate enforces this via its allowlist; the CLI does it with
-        // --disallowedTools. Non-review stages carry no denial.
-        let ro = build_cli_args("m", "sys", 10, true);
-        let i = ro.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
-        assert!(ro[i + 1].contains("Write") && ro[i + 1].contains("Edit"), "{ro:?}");
-        let rw = build_cli_args("m", "sys", 10, false);
-        assert!(!rw.contains(&"--disallowedTools".to_string()));
-        let ro_resume = build_cli_args_resume("m", "sess", 10, true);
-        assert!(ro_resume.contains(&"--disallowedTools".to_string()));
+        // --disallowedTools. Writer stages deny no file tool.
+        let denied = |args: &[String]| -> Vec<String> {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            args[i + 1].split(',').map(str::to_string).collect()
+        };
+        for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
+            let tools = denied(&ro[..]);
+            for t in ["Write", "Edit", "MultiEdit", "NotebookEdit"] {
+                assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
+            }
+        }
+        for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
+            assert!(!denied(&rw[..]).iter().any(|x| x.contains("Write") || x.contains("Edit")), "{rw:?}");
+        }
+    }
+
+    #[test]
+    fn every_claude_stage_disallows_ask_user_question_once() {
+        // #701: headless, nobody answers AskUserQuestion; with it denied, a
+        // question can only reach the final message and the trailing-question
+        // guard. Writer, reviewer, fresh and resumed: one flag, the tool once.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--disallowedTools").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --disallowedTools: {args:?}");
+            let n = args[at[0] + 1].split(',').filter(|t| *t == "AskUserQuestion").count();
+            assert_eq!(n, 1, "AskUserQuestion exactly once: {args:?}");
+            assert_eq!(args.iter().filter(|a| a.contains("AskUserQuestion")).count(), 1, "{args:?}");
+        }
     }
 
     #[test]
@@ -9278,6 +9585,34 @@ mod cli_dialect_tests {
     }
 
     #[test]
+    fn codex_effort_levels_match_like_codex_longest_prefix_then_one_namespace() {
+        use crate::orchestrator::cli_runner::codex_effort_levels;
+        use crate::providers::Effort::High;
+        let gpt55 = codex_effort_levels("gpt-5.5");
+        assert!(gpt55.is_some());
+        // A dated or suffixed id takes its longest-prefix slug's levels.
+        assert_eq!(codex_effort_levels("gpt-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("gpt-6-luna-preview"), codex_effort_levels("gpt-6-luna"));
+        // One `namespace/` is stripped, and only one.
+        assert_eq!(codex_effort_levels("openai/gpt-5.5"), gpt55);
+        assert_eq!(codex_effort_levels("OpenAI/GPT-5.5-2026-03-01"), gpt55);
+        assert_eq!(codex_effort_levels("a/b/gpt-5.5"), None);
+        // Unknown ids still get no `-c`, and the journal says why.
+        for m in ["gpt-5-codex", "o3", "gpt-6", "openai/o3"] {
+            assert_eq!(codex_effort_levels(m), None, "{m}");
+            assert!(CliDialect::Codex.effort_args(m, Some(High)).is_empty(), "{m}");
+        }
+        assert_eq!(
+            CliDialect::Codex.unpassed_effort_notice("o3", Some(High)).as_deref(),
+            Some("This stage's high effort is not passed to Codex: o3 isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's default effort.")
+        );
+        assert_eq!(
+            CliDialect::Codex.effort_args("gpt-5.5-2026-03-01", Some(High)),
+            vec!["-c".to_string(), "model_reasoning_effort=\"high\"".to_string()]
+        );
+    }
+
+    #[test]
     fn codex_effort_follows_the_catalog_for_every_model() {
         use crate::providers::Effort::*;
         let all = [Low, Medium, High, Xhigh, Max];
@@ -9387,7 +9722,8 @@ mod cli_dialect_tests {
             assert!(config("approval_policy=\"never\""), "{argv:?}");
             // The network stays on, as under Octopush's own Seatbelt profile.
             assert!(config("sandbox_workspace_write.network_access=true"), "{argv:?}");
-            // Never an extra writable root (a worktree's git dir would hand over its `commondir`).
+            // No writable root of its own (a worktree's git dir would hand over
+            // its `commondir`); the runner adds only the build-cache root.
             assert!(!argv.iter().any(|a| a.starts_with("sandbox_workspace_write.writable_roots")), "{argv:?}");
         }
         assert_eq!(CliDialect::Codex.sandbox_label(false, ws), Some("workspace-write sandbox"));
@@ -9420,6 +9756,40 @@ mod cli_dialect_tests {
         assert!(!none.iter().any(|a| a.contains("dangerously")), "{none:?}");
         let sandboxed = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("sandbox"));
         assert!(sandboxed.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{sandboxed:?}");
+    }
+
+    #[test]
+    fn a_codex_writers_build_cache_root_is_its_one_extra_writable_root_before_the_prompt() {
+        use crate::orchestrator::cli_runner::codex_writable_root_args;
+        let flags = codex_writable_root_args("/Users/u/Library/Caches/octopush/build-cache/ab12");
+        assert_eq!(
+            flags,
+            vec![
+                "-c".to_string(),
+                "sandbox_workspace_write.writable_roots=[\"/Users/u/Library/Caches/octopush/build-cache/ab12\"]".to_string()
+            ]
+        );
+        // A quote or backslash in the path stays inside one TOML string.
+        let odd = codex_writable_root_args("/a \"b\\c");
+        assert_eq!(odd[1], "sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\\c\"]");
+        let mut argv = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::Workspace);
+        CliDialect::Codex.push_flags(&mut argv, flags.clone());
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "prompt still rides stdin");
+        assert!(argv.windows(2).any(|w| w[0] == "-c" && w[1] == flags[1]), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| a.starts_with("sandbox_workspace_write.writable_roots")).count(), 1);
+    }
+
+    #[test]
+    fn an_action_role_on_a_codex_writer_in_codexs_sandbox_is_told_it_cant_commit() {
+        use crate::orchestrator::cli_runner::codex_git_notice;
+        use crate::orchestrator::types::RoleEnvironment::{Action, Worktree};
+        let ws = CodexWriteScope::Workspace;
+        let note = codex_git_notice(CliDialect::Codex, false, ws, Action).unwrap();
+        assert!(note.contains("can't commit"), "{note}");
+        assert!(codex_git_notice(CliDialect::Codex, false, ws, Worktree).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, false, CodexWriteScope::MissionSandbox, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, true, ws, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Claude, false, ws, Action).is_none());
     }
 
     #[test]
@@ -9557,12 +9927,159 @@ mod cli_dialect_tests {
         assert_eq!((u.input_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens), (200, 100, 200));
     }
 
+    /// The per-stage usage map the runner streams a Codex stage into.
+    fn codex_stream_usage(
+        events: &[serde_json::Value],
+    ) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        let mut map = std::collections::HashMap::new();
+        for ev in events {
+            if let Some((id, u)) = codex_usage_from_event(ev) {
+                let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
+                map.insert(key, u);
+            }
+        }
+        map
+    }
+
+    /// Fold a Codex stream the way the runner does: the accumulator and the
+    /// per-stage usage map.
+    fn codex_stream(
+        events: &[serde_json::Value],
+    ) -> (CodexAccum, std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage>) {
+        let mut accum = CodexAccum::default();
+        for ev in events {
+            codex_fold_event(&mut accum, ev);
+        }
+        (accum, codex_stream_usage(events))
+    }
+
+    #[test]
+    fn codex_stage_stopped_before_turn_completed_reports_usage_unreported_not_zero() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Assistant items streamed, then the stall: no turn.completed arrived.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Reading the code."}}),
+            json!({"type":"item.completed","item":{"id":"i1","type":"command_execution","command":"ls","status":"completed"}}),
+        ]);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex timed out — no output for 5 minutes", "gpt-5", &map, accum.turn_open);
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("codex timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // Stopped between turns: every turn reported, so the usage is kept unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"Done with turn one."}}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+        ]);
+        assert!(!accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "codex exceeded the 60-minute cap", "gpt-5", &map, accum.turn_open);
+        let err = out.error.as_deref().unwrap();
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!(err, "codex exceeded the 60-minute cap");
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+
+        // A Claude stage with nothing streamed is unchanged (it streams usage per message).
+        let out = stopped_stage(CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-sonnet-4-6", &Default::default(), false);
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn codex_stage_stopped_mid_turn_keeps_earlier_turns_usage_and_is_flagged() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage};
+        // Turn one reported its usage; turn two was stopped before turn.completed.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i3","type":"agent_message","text":"Working on turn two."}}),
+        ]);
+        assert!(accum.turn_open);
+        let out = stopped_stage(CliDialect::Codex, "Stopped by the director", "gpt-5", &map, accum.turn_open);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "the open turn's tokens are unknown: {err}");
+        assert!(err.starts_with("Stopped by the director\n"), "{err}");
+        assert_eq!(
+            (out.input_tokens, out.cache_read_tokens, out.output_tokens),
+            (400, 600, 50),
+            "the turns that reported keep their usage"
+        );
+    }
+
+    #[test]
+    fn codex_turn_failed_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"item.completed","item":{"id":"i0","type":"agent_message","text":"Starting."}}),
+            json!({"type":"turn.failed","error":{"message":"stream disconnected"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("stream disconnected"), "the cause stays the first line: {err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // An earlier turn's usage is kept; the failed turn still flags it.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":1000,"cached_input_tokens":600,"output_tokens":50}}),
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.failed","error":{"message":"rate limited"}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (400, 600, 50));
+    }
+
+    #[test]
+    fn codex_crash_without_turn_completed_reports_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // The process died mid-turn: no message, no turn.completed, a bad exit.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Note, "gpt-5", "thread 'main' panicked");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(out.session_id.as_deref(), Some("th"));
+
+        // A clean exit that ended without a message, after a completed turn, stays unflagged.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"turn.started"}),
+            json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
+        ]);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        let err = out.error.as_deref().unwrap();
+        assert!(err.contains("no final message"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+
+        // The same stream crashing mid-turn instead is flagged.
+        let (accum, _) = codex_stream(&[json!({"type":"turn.started"})]);
+        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+    }
+
     #[test]
     fn codex_outcome_is_the_last_message_or_an_honest_failure() {
         let usage = Default::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
-            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()) },
+            &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
             usage, true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
@@ -9572,7 +10089,7 @@ mod cli_dialect_tests {
 
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
-            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None },
+            &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
             usage, true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
@@ -9583,6 +10100,75 @@ mod cli_dialect_tests {
         let empty = build_codex_outcome(&CodexAccum::default(), usage, true, ArtifactKind::Note, "gpt-5", "stderr says hi");
         assert!(matches!(empty.status, StageStatus::Failed));
         assert!(empty.error.as_deref().unwrap().contains("no final message"));
+        assert!(
+            !crate::orchestrator::cli_runner::is_usage_unreported(empty.error.as_deref().unwrap()),
+            "no turn ran, so the cost is known to be $0"
+        );
+    }
+
+    #[test]
+    fn codex_failure_before_any_turn_is_not_flagged_usage_unreported() {
+        use crate::orchestrator::cli_runner::is_usage_unreported;
+        // An `error` event before Codex starts a turn: nothing was spent.
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+        ]);
+        assert!(!accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // The real stream of an expired login or an unknown model: Codex
+        // starts the turn before the request, so the turn is open when it
+        // fails and the stage is flagged (the stream can't show the spend).
+        let (accum, map) = codex_stream(&[
+            json!({"type":"thread.started","thread_id":"th"}),
+            json!({"type":"turn.started"}),
+            json!({"type":"error","message":"unexpected status 401 Unauthorized"}),
+            json!({"type":"turn.failed","error":{"message":"unexpected status 401 Unauthorized"}}),
+        ]);
+        assert!(accum.turn_open && accum.activity);
+        let usage = crate::orchestrator::cli_runner::sum_usage(&map);
+        let out = build_codex_outcome(&accum, usage, false, ArtifactKind::Diff, "gpt-5", "");
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("unexpected status 401 Unauthorized"), "{err}");
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A bad exit with only stderr (a bad flag): nothing streamed at all.
+        let out = build_codex_outcome(
+            &CodexAccum::default(), Default::default(), false, ArtifactKind::Note, "gpt-5",
+            "error: unexpected argument '--bogus' found",
+        );
+        assert!(matches!(out.status, StageStatus::Failed));
+        let err = out.error.as_deref().unwrap();
+        assert!(err.starts_with("codex exited with an error"), "{err}");
+        assert!(!is_usage_unreported(err), "{err}");
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+
+        // A legacy-schema error before any agent event is not flagged either…
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"session_configured","session_id":"s"}}),
+            json!({"msg":{"type":"error","message":"not logged in"}}),
+        ]);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+
+        // …but one after agent activity with no `token_count` is (the legacy
+        // schema has no `turn.started`).
+        let (accum, _) = codex_stream(&[
+            json!({"msg":{"type":"exec_command_begin","command":["ls"]}}),
+            json!({"msg":{"type":"error","message":"stream disconnected"}}),
+        ]);
+        assert!(accum.activity && !accum.turn_open);
+        let out = build_codex_outcome(&accum, Default::default(), false, ArtifactKind::Note, "gpt-5", "");
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
     }
 }
 
@@ -10631,6 +11217,28 @@ mod live_tests {
         // result/system → none
         assert!(entries_from_stream_event(&json!({"type":"result","subtype":"success"})).is_empty());
         assert!(entries_from_stream_event(&json!({"type":"system","subtype":"init"})).is_empty());
+    }
+
+    #[test]
+    fn entries_from_stream_event_journals_a_refused_ask_user_question() {
+        // #701: an older CLI may still offer the tool; the journal says the
+        // question was refused, right after the tool entry.
+        let ask = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","id":"toolu_q","name":"AskUserQuestion","input":{"questions":[{"question":"Postgres or SQLite?"}]}}
+        ]}});
+        let es = entries_from_stream_event(&ask);
+        assert_eq!(es.len(), 2, "{es:?}");
+        assert_eq!(es[0]["kind"], "tool");
+        assert_eq!(es[1], json!({"kind":"notice","text":"the agent tried to ask a question; it was refused"}));
+        // Inside a sub-agent the notice nests under its spawner too.
+        let mut sub = ask.clone();
+        sub["parent_tool_use_id"] = json!("toolu_agent_1");
+        assert_eq!(entries_from_stream_event(&sub)[1]["parent"], "toolu_agent_1");
+        // Other tools add no notice.
+        let read = json!({"type":"assistant","message":{"content":[
+            {"type":"tool_use","name":"Read","input":{"file_path":"a"}}
+        ]}});
+        assert_eq!(entries_from_stream_event(&read).len(), 1);
     }
 
     #[test]
@@ -16842,5 +17450,196 @@ mod crew_tests {
         std::fs::write(&exact, "{}").unwrap();
         assert_eq!(crew::read_file(&link, true).unwrap(), "{}");
         assert!(crew::read_file(&link, false).unwrap_err().to_string().contains("link"));
+    }
+}
+
+#[cfg(test)]
+mod cli_command_idle_tests {
+    use crate::orchestrator::cli_runner::{
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
+        OpenTool, OpenTools, ReadEnd, ReadLimits,
+    };
+    use serde_json::{json, Value};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+
+    const LIMITS: ReadLimits = ReadLimits {
+        idle: Duration::from_millis(200),
+        command_idle: Duration::from_millis(1500),
+        cap: Duration::from_secs(20),
+        settle: Duration::from_secs(5),
+    };
+
+    fn tool_use(id: &str, name: &str, command: &str) -> Value {
+        json!({"type": "assistant", "message": {"id": format!("msg_{id}"), "content": [
+            {"type": "tool_use", "id": id, "name": name, "input": {"command": command}}
+        ]}})
+    }
+
+    fn tool_result(id: &str) -> Value {
+        json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": id, "content": "ok"}
+        ]}})
+    }
+
+    fn result() -> Value {
+        json!({"type": "result", "subtype": "success", "is_error": false, "result": "done"})
+    }
+
+    /// A stdout that writes `script` (`Some(line)` or `None` = pause), then
+    /// stays open and silent unless `eof`.
+    fn stdout(script: Vec<Option<Value>>, pause: Duration, eof: bool) -> (tokio::io::DuplexStream, tokio::task::JoinHandle<()>) {
+        let (mut tx, rx) = tokio::io::duplex(4096);
+        let task = tokio::spawn(async move {
+            for step in script {
+                match step {
+                    Some(v) => tx.write_all(format!("{v}\n").as_bytes()).await.unwrap(),
+                    None => tokio::time::sleep(pause).await,
+                }
+            }
+            if !eof {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+        (rx, task)
+    }
+
+    async fn read(script: Vec<Option<Value>>, pause: Duration, eof: bool, dialect: CliDialect) -> (ReadEnd, Vec<Duration>, Duration) {
+        let (rx, task) = stdout(script, pause, eof);
+        let started = Instant::now();
+        let mut notes = Vec::new();
+        let end = tokio::time::timeout(
+            Duration::from_secs(10),
+            read_stream(rx, dialect, LIMITS, |_| {}, |w| notes.push(w)),
+        )
+        .await
+        .expect("read_stream never ended");
+        task.abort();
+        (end, notes, started.elapsed())
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_outlives_the_idle_window_and_settles_normally() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), None, Some(tool_result("toolu_1")), Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert_eq!(notes, vec![LIMITS.command_idle], "one journal line, naming the window");
+    }
+
+    #[tokio::test]
+    async fn an_open_bash_call_still_times_out_after_the_command_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.window, LIMITS.command_idle);
+        assert_eq!(stall.tool.as_ref().map(OpenTool::label).as_deref(), Some("Bash `npm test`"));
+        assert_eq!(notes.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_closed_call_trips_idle_at_the_plain_window() {
+        let (end, notes, took) = read(
+            vec![Some(tool_use("toolu_1", "Bash", "npm test")), Some(tool_result("toolu_1"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unmatched_tool_result_does_not_extend_the_window() {
+        let (end, notes, took) = read(vec![Some(tool_result("toolu_ghost"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall.tool, None);
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_open_non_command_tool_keeps_the_plain_window_but_is_named() {
+        let (end, _, took) = read(vec![Some(tool_use("toolu_1", "Read", ""))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(idle_timeout_message(&stall), "timed out — Read gave no result for 1 minute");
+    }
+
+    #[tokio::test]
+    async fn codex_keeps_the_plain_idle_window() {
+        let (end, notes, took) =
+            read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < LIMITS.command_idle, "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert!(notes.is_empty());
+    }
+
+    #[test]
+    fn open_tools_pair_calls_with_their_results() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", "cargo build\ncargo test"));
+        open.observe(&tool_use("b", "Read", ""));
+        assert!(open.command_open());
+        // The latest command is blamed, not a later non-command tool.
+        assert_eq!(open.latest().map(OpenTool::label).as_deref(), Some("Bash `cargo build …`"));
+        open.observe(&tool_result("ghost"));
+        assert!(open.command_open(), "an unmatched result closes nothing");
+        open.observe(&tool_result("a"));
+        assert!(!open.command_open());
+        assert_eq!(open.latest().map(|t| t.name.as_str()), Some("Read"));
+        open.observe(&tool_result("b"));
+        assert_eq!(open.latest(), None);
+        // A tool_result inside an assistant event is not a result.
+        open.observe(&tool_use("c", "PowerShell", "Invoke-Pester"));
+        open.observe(&json!({"type": "assistant", "message": {"content": [{"type": "tool_result", "tool_use_id": "c"}]}}));
+        assert!(open.command_open());
+    }
+
+    #[test]
+    fn a_long_command_is_shortened_in_the_label() {
+        let mut open = OpenTools::default();
+        open.observe(&tool_use("a", "Bash", &"x".repeat(100)));
+        let label = open.latest().unwrap().label();
+        assert_eq!(label, format!("Bash `{}…`", "x".repeat(59)));
+    }
+
+    #[test]
+    fn the_command_window_follows_bash_max_timeout_ms() {
+        assert_eq!(command_idle_window(None), Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.command_idle, Duration::from_secs(660));
+        assert_eq!(ReadLimits::STAGE.idle, Duration::from_secs(300));
+        assert_eq!(command_idle_window(Some("900000")), Duration::from_secs(960));
+        // Never below the plain idle window.
+        assert_eq!(command_idle_window(Some("60000")), Duration::from_secs(360));
+        assert_eq!(command_idle_window(Some(" 1200000 ")), Duration::from_secs(1260));
+        assert_eq!(command_idle_window(Some("junk")), Duration::from_secs(660));
+        assert_eq!(command_idle_window(Some("0")), Duration::from_secs(660));
+        assert_eq!(ReadLimits::for_stage(Some("900000")).command_idle, Duration::from_secs(960));
+        assert_eq!(ReadLimits::for_stage(None).cap, ReadLimits::STAGE.cap);
+    }
+
+    #[test]
+    fn idle_messages_name_the_open_call() {
+        let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
+        assert_eq!(
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            "timed out — Bash `npm test` gave no result for 11 minutes"
+        );
+        assert_eq!(
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            "timed out — no output for 5 minutes"
+        );
+        assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
     }
 }

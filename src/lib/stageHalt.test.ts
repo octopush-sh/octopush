@@ -56,6 +56,11 @@ describe("haltCause", () => {
   it("explains an idle timeout", () => {
     expect(haltCause("claude timed out — no output for 5 minutes", 25).title).toMatch(/no output/i);
   });
+  it("names the command an idle timeout waited on", () => {
+    const c = haltCause("claude timed out — Bash `npm test` gave no result for 11 minutes", 25);
+    expect(c.title).toBe("Bash `npm test` gave no result for 11 minutes");
+    expect(c.remedy).toMatch(/still waiting on it/);
+  });
   it("falls back to the first line", () => {
     expect(haltCause("something weird\nsecond line", 25).title).toBe("something weird");
   });

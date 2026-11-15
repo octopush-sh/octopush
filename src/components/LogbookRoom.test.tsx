@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
-import { LogbookRoom } from "./LogbookRoom";
+import { LogbookRoom, optionLabelFits } from "./LogbookRoom";
+import type { ProjectInfo } from "../lib/types";
 import { useEntitlementStore } from "../stores/entitlementStore";
 
 vi.mock("../lib/ipc", () => ({
@@ -54,5 +55,24 @@ describe("LogbookRoom", () => {
     expect(scopeId).toBeNull();
     // No upsell for an entitled user.
     expect(screen.queryByText("Open the full logbook with Pro")).not.toBeInTheDocument();
+  });
+
+  it("middle-truncates a long project name in the scope switch (E1)", () => {
+    setPlan(["logbook.reports"]);
+    const name = "octopush-enterprise-monorepo";
+    render(
+      <LogbookRoom open onClose={vi.fn()} project={{ id: "p1", name } as ProjectInfo} />,
+    );
+    const option = screen.getByTitle(name);
+    expect(option).toHaveClass("flex", "w-[160px]", "min-w-0");
+    expect(option).not.toHaveClass("truncate");
+    expect(option.querySelector(".octo-midtrunc-tail")).toHaveTextContent("e-monorepo");
+    // Short labels keep the plain line.
+    expect(screen.getByRole("button", { name: "All missions" })).toHaveClass("truncate");
+  });
+
+  it("fits an option label by its mono character count", () => {
+    expect(optionLabelFits("x".repeat(19))).toBe(true);
+    expect(optionLabelFits("x".repeat(20))).toBe(false);
   });
 });

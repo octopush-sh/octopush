@@ -312,6 +312,11 @@ export interface RunStage {
    *  reads "unpriced", is invisible to the run budget and never counts as
    *  saved. */
   unpricedModel?: boolean;
+  /** True when an attempt of this stage stopped before its CLI reported
+   *  usage (a Codex stage stopped before `turn.completed`; set by `get_run`):
+   *  its cost reads "usage not reported", never $0.00, and like an unpriced
+   *  stage it is invisible to the run budget. */
+  usageUnreported?: boolean;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -1210,6 +1215,11 @@ export const ipc = {
   findPrForBranch: (workspacePath: string) =>
     invoke<Pr | null>("find_pr_for_branch", { workspacePath }),
 
+  /** The tail of these Actions runs' failed-step logs (`gh run view
+   *  --log-failed`), capped at 8k chars. Empty without `gh`. */
+  prFailedCheckLogs: (workspacePath: string, runIds: number[]) =>
+    invoke<string>("pr_failed_check_logs", { workspacePath, runIds }),
+
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
 
@@ -1534,7 +1544,7 @@ export const ipc = {
 
 /** One row of the readiness card (mirrors Rust `readiness::ReadinessCheck`). */
 export interface ReadinessCheck {
-  id: "claude" | "auth" | "git" | "gh" | "disk" | "ollama";
+  id: "claude" | "auth" | "codex" | "git" | "gh" | "disk" | "ollama";
   label: string;
   status: "ok" | "warn" | "fail";
   /** The live value: a version, "Token found", "No answer in 3 s"… */

@@ -1281,6 +1281,7 @@ fn install_claude_hooks_later(state: &AppState, ws: crate::db::WorkspaceRow) {
 
 #[tauri::command]
 pub async fn delete_workspace(
+    app: AppHandle,
     state: State<'_, AppState>,
     workspace_id: String,
     project_path: String,
@@ -1325,8 +1326,10 @@ pub async fn delete_workspace(
         let _ = crate::git_ops::delete_branch(std::path::Path::new(&project_path), &branch);
     }
 
-    // Remove from DB
+    // Remove from DB. The row's runs cascade-delete without a run:// event, so
+    // a paused one would keep the Dock badge counting it: refresh it now.
     state.db.lock().delete_workspace(&workspace_id)?;
+    crate::fleet_status::refresh_later(&app);
     Ok(())
 }
 
@@ -1950,12 +1953,13 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages) = {
+    let (run, stages, unreported) = {
         let db = state.db.lock();
-        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?)
+        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?, db.usage_unreported_stage_ids(&run_id)?)
     };
-    // Flag stages whose model has no price (resolved after the DB lock): the
-    // ledger shows them as unpriced and says the budget cannot see them.
+    // Flag stages whose model has no price (resolved after the DB lock), and
+    // stages whose CLI stopped before reporting usage: the ledger shows them
+    // as unpriced / usage not reported and says the budget cannot see them.
     let router = crate::token_engine::catalog();
     let mut priced: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     let mut stages_json = serde_json::to_value(&stages)?;
@@ -1966,6 +1970,7 @@ pub async fn get_run(
                 .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
+                obj.insert("usageUnreported".into(), serde_json::Value::Bool(unreported.contains(&s.id)));
             }
         }
     }
@@ -3736,6 +3741,7 @@ pub async fn close_project(
 
 #[tauri::command]
 pub async fn delete_project(
+    app: AppHandle,
     state: State<'_, AppState>,
     project_id: String,
 ) -> AppResult<()> {
@@ -3755,6 +3761,7 @@ pub async fn delete_project(
     for workspace in workspaces {
         // Call the existing delete_workspace logic to properly clean up worktrees
         let _ = delete_workspace(
+            app.clone(),
             state.clone(),
             workspace.id,
             path.clone(),
@@ -3772,8 +3779,10 @@ pub async fn delete_project(
         })?;
     }
 
-    // Remove from database
+    // Remove from database. Workspaces not listed above (archived ones) and
+    // their runs cascade with the project, so refresh the Dock badge too.
     state.db.lock().delete_project(&project_id)?;
+    crate::fleet_status::refresh_later(&app);
     Ok(())
 }
 
@@ -5265,12 +5274,12 @@ pub async fn ensure_pr_branch(
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
-async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github::Pr> {
+async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt --limit 1",
+        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
         branch.replace('\'', "'\\''"),
     );
 
@@ -5301,7 +5310,52 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     if let Some(merged_at) = pr.get("mergedAt").cloned() {
         pr["merged_at"] = merged_at;
     }
-    Some(crate::github::pr_from_json(&pr))
+    let mut out = crate::github::pr_from_json(&pr);
+    if pr_wants_checks(&out) {
+        let rollup = &pr["statusCheckRollup"];
+        out.checks = crate::github::checks_from_gh_rollup(rollup);
+        // A full rollup may hide checks past gh's cap: re-read every check
+        // run on the head commit, keeping the rollup's answer if that fails.
+        if crate::github::gh_rollup_may_be_capped(rollup) {
+            if let Some(runs) = gh_check_runs(&shell, workspace_path, owner, repo, pr["headRefOid"].as_str()).await {
+                if let Some(checks) = crate::github::checks_from_gh_rollup_and_runs(rollup, &runs) {
+                    out.checks = Some(checks);
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Every check run on `sha` through `gh api --paginate`. `None` without a
+/// sha, when gh fails or when the first page can't be read.
+async fn gh_check_runs(
+    shell: &str,
+    workspace_path: &str,
+    owner: &str,
+    repo: &str,
+    sha: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let output = tokio::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(workspace_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "find_pr_for_branch: gh api check-runs failed, keeping the rollup",
+        );
+        return None;
+    }
+    crate::github::check_runs_from_gh_pages(&output.stdout)
+}
+
+/// Only a live PR's checks are worth a glyph; a merged or closed one is done.
+fn pr_wants_checks(pr: &crate::github::Pr) -> bool {
+    matches!(pr.state, crate::github::PrState::Open | crate::github::PrState::Draft)
 }
 
 /// Look up the most recent pull request for the current branch on GitHub
@@ -5371,7 +5425,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     //    have an authed `gh`, no extra setup required. Runs in their login
     //    shell so PATH and macOS keychain credential storage work as if
     //    they invoked `gh` from a terminal.
-    if let Some(pr) = try_gh_cli(&workspace_path, &branch).await {
+    if let Some(pr) = try_gh_cli(&workspace_path, &branch, &owner, &repo_name).await {
         tracing::info!(number = pr.number, "find_pr_for_branch: resolved via gh cli");
         return Ok(Some(pr));
     }
@@ -5410,7 +5464,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         .map_err(|e| AppError::Other(format!("http client: {e}")))?;
 
     let mut req = client.get(&api).header("Accept", "application/vnd.github+json");
-    if let Some(tok) = token {
+    if let Some(tok) = &token {
         req = req.header("Authorization", format!("Bearer {}", tok));
     }
 
@@ -5447,7 +5501,92 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
         return Ok(None);
     };
 
-    Ok(Some(crate::github::pr_from_json(&pr)))
+    let mut out = crate::github::pr_from_json(&pr);
+    // Checks cost a second request, so only with a token: unauthenticated,
+    // the 60/hour limit is already spent by the 60s poll above.
+    if let (true, Some(tok), Some(sha)) = (pr_wants_checks(&out), &token, pr["head"]["sha"].as_str()) {
+        out.checks = rest_check_runs(&client, tok, &owner, &repo_name, sha).await;
+    }
+    Ok(Some(out))
+}
+
+/// The check runs on `sha` through REST, every page up to
+/// `CHECK_RUNS_MAX_PAGES`, rolled up. `None` when the first page can't be
+/// read — the chip then just shows no checks glyph; a later page that fails
+/// keeps the runs read so far.
+async fn rest_check_runs(
+    client: &reqwest::Client,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    sha: &str,
+) -> Option<crate::github::PrChecks> {
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    for page in 1..=crate::github::CHECK_RUNS_MAX_PAGES {
+        let url = format!(
+            "https://api.github.com/repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={}&page={page}",
+            crate::github::CHECK_RUNS_PER_PAGE,
+        );
+        let resp = match client
+            .get(&url)
+            .header("Accept", "application/vnd.github+json")
+            .header("Authorization", format!("Bearer {token}"))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            Ok(r) => {
+                tracing::info!(status = %r.status(), page, "find_pr_for_branch: check-runs not readable");
+                if page == 1 { return None; }
+                break;
+            }
+            Err(_) if page == 1 => return None,
+            Err(_) => break,
+        };
+        let Ok(body) = resp.json::<serde_json::Value>().await else {
+            if page == 1 { return None; }
+            break;
+        };
+        let Some(page_runs) = body["check_runs"].as_array() else {
+            if page == 1 { return None; }
+            break;
+        };
+        let page_len = page_runs.len();
+        runs.extend(page_runs.iter().cloned());
+        if !crate::github::more_check_run_pages(body["total_count"].as_u64(), runs.len(), page_len) {
+            break;
+        }
+    }
+    crate::github::checks_from_rest_check_runs(&serde_json::json!({ "check_runs": runs }))
+}
+
+/// The tail of the failed steps' logs of these GitHub Actions runs
+/// (`gh run view <id> --log-failed`), joined and capped at
+/// `FAILED_LOG_MAX_CHARS`, for the "Fix failing checks…" brief. Empty — never
+/// an error — without `gh` or when a log can't be read.
+#[tauri::command]
+pub async fn pr_failed_check_logs(workspace_path: String, run_ids: Vec<u64>) -> AppResult<String> {
+    let workspace_path = expand_tilde(&workspace_path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let mut logs: Vec<(u64, String)> = Vec::new();
+    // At most three runs: the budget split further would leave each too little.
+    for id in run_ids.into_iter().take(3) {
+        // `id` is a number, so it is safe in the command line.
+        let run = tokio::process::Command::new(&shell)
+            .arg("-l")
+            .arg("-c")
+            .arg(format!("gh run view {id} --log-failed"))
+            .current_dir(&workspace_path)
+            .kill_on_drop(true)
+            .output();
+        match tokio::time::timeout(std::time::Duration::from_secs(30), run).await {
+            Ok(Ok(out)) if out.status.success() => {
+                logs.push((id, String::from_utf8_lossy(&out.stdout).into_owned()));
+            }
+            _ => tracing::info!(run_id = id, "pr_failed_check_logs: log not readable"),
+        }
+    }
+    Ok(crate::github::join_failed_logs(&logs, crate::github::FAILED_LOG_MAX_CHARS))
 }
 
 /// Batch: all OPEN pull requests for the project's GitHub repo, keyed by head
@@ -6587,9 +6726,10 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
 }
 
-/// Settings › General readiness card: local checks (claude, auth mode, git,
-/// gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
-/// (an explicit Check again) also runs `claude auth status`; the sign-in end
+/// Settings › General readiness card: local checks (claude, auth mode, codex,
+/// git, gh, Ollama), each bounded at 3 s, re-probed on every call. `ask_claude`
+/// (an explicit Check again) also runs `claude auth status` (and
+/// `codex login status` when the Codex row shows); the sign-in end
 /// it reports is stored like a stage's, so the launcher and notes agree.
 #[tauri::command]
 pub async fn readiness_check(
@@ -6599,8 +6739,10 @@ pub async fn readiness_check(
 ) -> AppResult<Vec<crate::readiness::ReadinessCheck>> {
     // The stored sign-in end, read before the blocking probes.
     let login = crate::claude_login::load(&state.db.lock()).ok().flatten().map(|l| l.expires_at);
+    // The Codex CLI row only when a saved crew or Routine runs a Codex stage.
+    let want_codex = crate::readiness::wants_codex(&state.db.lock());
     let ask_claude = ask_claude.unwrap_or(false);
-    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude))
+    let (checks, probed) = tokio::task::spawn_blocking(move || crate::readiness::run_all(login, ask_claude, want_codex))
         .await
         .map_err(|e| AppError::Other(format!("readiness task failed: {e}")))?;
     // Signed in with a date: stored. Signed out: the stored end is cleared,

@@ -20,6 +20,12 @@ const STATUS: Record<ReadinessCheck["status"], StatusStyle> = {
 /** A status this build doesn't know (an older or newer backend): mute, never a verdict. */
 const PENDING: StatusStyle = { word: "Unknown", tone: "text-octo-mute", Icon: Circle };
 
+/** The rows a tour can point at. */
+const ROW_TOUR: Partial<Record<ReadinessCheck["id"], string>> = {
+  disk: tourId("settings-readiness-disk"),
+  codex: tourId("settings-readiness-codex"),
+};
+
 /** `onShowCaches` closes Settings and opens the footer's Workspace Caches;
  *  the disk row links to it when space runs low. */
 export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = {}) {
@@ -130,7 +136,7 @@ function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; i
 
   return (
     <li
-      data-tour={check.id === "disk" ? tourId("settings-readiness-disk") : undefined}
+      data-tour={ROW_TOUR[check.id]}
       data-testid={`readiness-row-${check.id}`}
       data-status={check.status}
       className="octo-rise-in py-2.5"

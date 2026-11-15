@@ -67,6 +67,12 @@ function tedge(source: string, target: string): StageEdge {
   return { id: `f-${source}-${target}`, source, target, type: "flow", data: { kind: "flow" } };
 }
 
+describe("newStageData", () => {
+  it("defaults a new stage to the current review tier, never Sonnet 4.6", () => {
+    expect(newStageData("implement").agentModel).toBe("claude-sonnet-5-5");
+  });
+});
+
 // ─── Task 8 new tests ────────────────────────────────────────────────────────
 
 describe("archetypeFromRole", () => {

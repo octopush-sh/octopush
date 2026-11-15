@@ -223,6 +223,45 @@ describe("WorkspaceRail", () => {
     expect(backend).toHaveClass("text-octo-sage");
   });
 
+  it("middle-truncates a long project name and lets it take the line while the actions are hidden (E1)", () => {
+    const name = "octopush-enterprise-monorepo";
+    const projects: ProjectGroup[] = [
+      { id: "proj-1", name, workspaces: [makeWorkspace({ id: "a", name: "Alpha" })] },
+    ];
+    render(
+      <WorkspaceRail
+        projects={projects}
+        activeWorkspaceId="a"
+        onSelect={vi.fn()}
+        isCollapsed={false}
+        onCustomize={vi.fn()}
+        onNewWorkspaceForProject={vi.fn()}
+      />,
+    );
+    const header = screen.getByTestId("project-header");
+    // A definite width for the MidTruncate box, never end-truncation.
+    expect(header).toHaveClass("flex", "min-w-0", "flex-1");
+    expect(header).not.toHaveClass("truncate");
+    expect(header.querySelector(".octo-midtrunc-tail")).toHaveTextContent("prise-monorepo");
+    expect(header).toHaveTextContent(name);
+    // The fold control carries the full name as its tooltip.
+    expect(screen.getByRole("button", { name, expanded: true })).toHaveAttribute(
+      "title",
+      `Collapse ${name}`,
+    );
+    // The hover actions and the open project's chevron take no width until
+    // hover/focus reveals them.
+    expect(screen.getByTestId("project-header-actions")).toHaveClass(
+      "max-w-0",
+      "group-hover/head:max-w-[60px]",
+      "group-focus-within/head:max-w-[60px]",
+    );
+    expect(screen.getByTestId("project-header-chevron")).toHaveClass(
+      "max-w-0",
+      "group-hover/head:max-w-5",
+    );
+  });
+
   it("should hide project headers when collapsed", () => {
     const workspaces = [
       makeWorkspace({ id: "a", name: "Alpha" }),

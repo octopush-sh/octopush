@@ -133,7 +133,11 @@ describe("StageInspector — reasoning on CLI stages", () => {
     expect(group.querySelector("[title=\"Codex's own default effort for this model\"]")).not.toBeNull();
     expect(group.querySelector("[title=\"Claude Code's own default effort for this model\"]")).toBeNull();
     // gpt-5.5 lists no max in Codex's catalog: the segment says what it runs as.
-    expect(group.querySelector("[title=\"Runs as XHi, the highest level this model lists in Codex\"]")).not.toBeNull();
+    expect(
+      group.querySelector("[title=\"Runs as XHi on this model in Codex, the highest level it lists below Max\"]"),
+    ).not.toBeNull();
+    // An enabled control carries no wrapper reason.
+    expect(group.parentElement?.getAttribute("title")).toBeNull();
     fireEvent.click(within(group).getByText("High"));
     expect(onPatch).toHaveBeenCalledWith({ effort: "high" });
   });
@@ -152,9 +156,20 @@ describe("StageInspector — reasoning on CLI stages", () => {
     renderInspector({ substrate: "cli", agentModel: "gpt-5-codex", effort: null });
     const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
     expect(group.getAttribute("aria-disabled")).toBe("true");
-    expect(
-      group.querySelector("[title=\"Codex's catalog lists no reasoning levels for this model, so it runs at Codex's own default\"]"),
-    ).not.toBeNull();
+    const why = "This model isn't in Octopush's copy of Codex's model catalog, so it runs at Codex's own default";
+    expect(group.querySelector(`[title="${why}"]`)).not.toBeNull();
+    // The disabled buttons may never hover in WebKit: the enabled wrapper says why.
+    const wrapper = group.parentElement!;
+    expect(wrapper.getAttribute("title")).toBe(why);
+    expect(wrapper.hasAttribute("disabled")).toBe(false);
+    expect(wrapper.className).toContain("*:pointer-events-none");
+  });
+
+  it("gives a dated Codex id its catalog slug's levels", () => {
+    renderInspector({ substrate: "cli", agentModel: "gpt-5.5-2026-03-01", effort: null });
+    const group = screen.getByRole("radiogroup", { name: "Reasoning effort" });
+    expect(group.getAttribute("aria-disabled")).not.toBe("true");
+    expect(group.querySelector("[title^=\"Runs as XHi\"]")).not.toBeNull();
   });
 
   it("never shows the Claude Code update hint on a Codex stage", async () => {

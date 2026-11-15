@@ -341,8 +341,9 @@ impl ProviderRouter {
 /// The first builtin Anthropic model carrying `tag`. The builtin list leads
 /// with the current lineup, so this follows it when a new generation ships.
 /// With no model so tagged it falls back to the first builtin Anthropic model,
-/// never to a hardcoded id that can go stale.
-fn builtin_anthropic_model_tagged(tag: &str) -> String {
+/// never to a hardcoded id that can go stale. The built-in crews seed from it
+/// too (`db::seed_builtin_pipelines`).
+pub(crate) fn builtin_anthropic_model_tagged(tag: &str) -> String {
     let providers = builtin_providers();
     let models = providers.get("anthropic").map(|p| p.models.as_slice()).unwrap_or_default();
     models
@@ -1014,7 +1015,25 @@ mod tests {
 
     #[test]
     fn every_suggested_model_is_a_builtin() {
+        const LEGACY: [&str; 3] = ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"];
         let providers = builtin_providers();
+        let is_builtin = |id: &str| providers["anthropic"].models.iter().any(|m| m.id == id);
+        // The helper tiers (drafting, review, rename) and every seeded crew stage.
+        for tag in ["fast", "balanced"] {
+            let id = builtin_anthropic_model_tagged(tag);
+            assert!(is_builtin(&id), "{tag}: {id} is not a builtin");
+            assert!(!LEGACY.contains(&id.as_str()), "{tag}: resolved to the legacy {id}");
+        }
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        for p in db.list_pipelines().unwrap() {
+            for s in db.get_pipeline_stages(&p.id).unwrap() {
+                assert!(is_builtin(&s.agent_model), "{} · {}: {} is not a builtin", p.name, s.role, s.agent_model);
+                assert!(!LEGACY.contains(&s.agent_model.as_str()), "{} · {}: seeds the legacy {}", p.name, s.role, s.agent_model);
+            }
+        }
+
         let router = ProviderRouter { providers: providers.clone() };
         for task in [
             TaskType::CodeReview,
@@ -1033,9 +1052,7 @@ mod tests {
                 "{task:?}: suggested {} is not in builtin_providers()",
                 s.model_id
             );
-            for legacy in ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"] {
-                assert_ne!(s.model_id, legacy, "{task:?}: suggested a legacy id");
-            }
+            assert!(!LEGACY.contains(&s.model_id.as_str()), "{task:?}: suggested a legacy id");
         }
     }
 

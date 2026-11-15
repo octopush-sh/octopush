@@ -3,7 +3,9 @@
 //! port; disk space: the footer's volume reading) within 3 s, in parallel,
 //! never cached and with no telemetry. On an explicit Check again,
 //! `claude auth status` runs too, with up to 15 s (it may refresh the OAuth
-//! token, which must not be cut short).
+//! token, which must not be cut short). The Codex CLI row shows only when a
+//! saved crew or Routine has a Codex CLI stage; `codex login status` runs on
+//! an explicit Check again only, and only its exit code is read.
 
 use crate::agent_adapter::{
     parse_claude_version, version_below, ClaudeCliVersion, ClaudeLoginProbe, CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
@@ -37,7 +39,7 @@ pub enum CheckStatus {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ReadinessCheck {
-    /// `claude` | `auth` | `git` | `gh` | `disk` | `ollama`.
+    /// `claude` | `auth` | `codex` | `git` | `gh` | `disk` | `ollama`.
     pub id: String,
     pub label: String,
     pub status: CheckStatus,
@@ -124,6 +126,12 @@ pub fn run_probe_terminating(cmd: Option<Command>, timeout: Duration, term_grace
 /// Like [`run_probe`], but output goes to `/dev/null` and is never read.
 pub fn run_status_probe(cmd: Option<Command>, timeout: Duration) -> Probe {
     probe_with(cmd, timeout, false, OnQuit::Kill, None)
+}
+
+/// [`run_probe_terminating`] with output to `/dev/null`, never read: only
+/// the exit status counts (`codex login status`).
+pub fn run_status_probe_terminating(cmd: Option<Command>, timeout: Duration, term_grace: Duration, on_quit: OnQuit) -> Probe {
+    probe_with(cmd, timeout, false, on_quit, Some(term_grace))
 }
 
 fn probe_with(cmd: Option<Command>, timeout: Duration, capture: bool, on_quit: OnQuit, term_grace: Option<Duration>) -> Probe {
@@ -629,6 +637,68 @@ pub fn gh_check(probe: Probe) -> ReadinessCheck {
     }
 }
 
+pub const INSTALL_CODEX: &str = "npm i -g @openai/codex";
+pub const CODEX_LOGIN: &str = "codex login";
+/// Exits 0 when credentials are present; what it prints (the auth mode) is
+/// never read: it runs under [`run_status_probe_terminating`].
+pub const CODEX_LOGIN_STATUS_ARGS: [&str; 2] = ["login", "status"];
+pub const CODEX_LOGIN_STATUS: &str = "codex login status";
+/// SIGTERM before SIGKILL at the timeout, and left running at quit: like
+/// `claude auth status`, it may be refreshing a token.
+pub const CODEX_TERM_GRACE: Duration = Duration::from_secs(1);
+pub const CODEX_LOGIN_STATUS_ON_QUIT: OnQuit = OnQuit::Leave;
+
+/// Whether a stage with this substrate and model runs `codex`.
+pub fn stage_runs_codex(substrate: &str, model: &str) -> bool {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    use crate::orchestrator::AgentSubstrate;
+    matches!(AgentSubstrate::from_db(substrate), Some(AgentSubstrate::Cli)) && dialect_for_model(model) == CliDialect::Codex
+}
+
+/// Whether a run of this pipeline, with a Routine's per-position model
+/// `overrides` (none for a plain crew), has a Codex CLI stage: its model,
+/// overridden or not, or its escalation model.
+pub fn pipeline_runs_codex(stages: &[crate::db::PipelineStageRow], overrides: &[(i64, String)]) -> bool {
+    stages.iter().any(|s| {
+        let model = overrides.iter().find(|(pos, _)| *pos == s.position).map_or(s.agent_model.as_str(), |(_, m)| m.as_str());
+        stage_runs_codex(&s.substrate, model) || s.escalate_model.as_deref().is_some_and(|m| stage_runs_codex(&s.substrate, m))
+    })
+}
+
+/// Whether the Codex CLI row shows: a saved pipeline, or a Routine with its
+/// model overrides, has a Codex CLI stage. A db error hides the row.
+pub fn wants_codex(db: &crate::db::Db) -> bool {
+    let crews = db.list_pipelines().unwrap_or_default();
+    let routines = db.list_routines().unwrap_or_default();
+    let stages = |id: &str| db.get_pipeline_stages(id).unwrap_or_default();
+    crews.iter().any(|p| pipeline_runs_codex(&stages(&p.id), &[]))
+        || routines.iter().any(|r| {
+            let overrides = crate::routines::parse_stage_overrides(r.stage_overrides.as_deref());
+            !overrides.is_empty() && pipeline_runs_codex(&stages(&r.pipeline_id), &overrides)
+        })
+}
+
+/// `codex` on the login-shell PATH (`found`), and what `codex login status`
+/// said (`login`; `None` when not asked): its exit code only.
+pub fn codex_check(found: bool, login: Option<Probe>) -> ReadinessCheck {
+    const ID: &str = "codex";
+    const LABEL: &str = "Codex CLI";
+    let warn = |value, fix, command| ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, value, fix, Some(command));
+    let missing = || warn("Not found", "Codex CLI stages run codex. Install it, then check again.", INSTALL_CODEX);
+    if !found {
+        return missing();
+    }
+    match login {
+        None => ReadinessCheck::ok(ID, LABEL, "Found"),
+        Some(Probe::Missing) => missing(),
+        Some(Probe::TimedOut) => ReadinessCheck::timed_out(ID, LABEL, CODEX_LOGIN_STATUS),
+        Some(Probe::Exited { success: true, .. }) => ReadinessCheck::ok(ID, LABEL, "Signed in"),
+        Some(Probe::Exited { success: false, .. }) => {
+            warn("Not signed in", "Sign Codex in so its stages don't fail mid-run.", CODEX_LOGIN)
+        }
+    }
+}
+
 pub const CLAUDE_LOGIN: &str = "claude auth login";
 
 /// `12 Dec` in the Mac's time zone.
@@ -808,9 +878,19 @@ pub fn auth_row(has_anthropic_key: bool, probed: ClaudeLoginProbe, stored: Optio
 /// clear. Blocking: call it off the async runtime. `stored_login` is the
 /// stored claude.ai sign-in end (`claude_login`). `ask_claude` runs
 /// `claude auth status` too: only on an explicit Check again, since whether
-/// it contacts the network isn't known.
-pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessCheck>, ClaudeLoginProbe) {
+/// it contacts the network isn't known; `codex login status` likewise.
+/// `want_codex` ([`wants_codex`]) adds the Codex CLI row.
+pub fn run_all(stored_login: Option<i64>, ask_claude: bool, want_codex: bool) -> (Vec<ReadinessCheck>, ClaudeLoginProbe) {
     let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login));
+    let codex = want_codex.then(|| {
+        std::thread::spawn(move || {
+            let cmd = local_command("codex", &CODEX_LOGIN_STATUS_ARGS);
+            let found = cmd.is_some();
+            let login = (found && ask_claude)
+                .then(|| run_status_probe_terminating(cmd, CHECK_TIMEOUT, CODEX_TERM_GRACE, CODEX_LOGIN_STATUS_ON_QUIT));
+            codex_check(found, login)
+        })
+    });
     let claude = std::thread::spawn(|| {
         // Its answer may be newer than the session's cached version (the
         // user just updated): the launcher and the next stage probe again.
@@ -845,9 +925,12 @@ pub fn run_all(stored_login: Option<i64>, ask_claude: bool) -> (Vec<ReadinessChe
             chrono::Utc::now().timestamp(),
             cli_version.as_deref(),
         ),
+    ];
+    checks.extend(codex.map(|t| t.join().unwrap_or_else(|_| lost("codex", "Codex CLI"))));
+    checks.extend([
         git.join().unwrap_or_else(|_| lost("git", "git")),
         gh.join().unwrap_or_else(|_| lost("gh", "GitHub CLI")),
-    ];
+    ]);
     checks.extend(disk_check(&crate::perf::home_disk()));
     if let Ok(Some(c)) = ollama.join() {
         checks.push(c);
@@ -1278,6 +1361,103 @@ mod tests {
         assert_eq!((missing.status, missing.command.as_deref()), (CheckStatus::Warn, Some("brew install gh")));
         let hung = gh_check(Probe::TimedOut);
         assert_eq!((hung.timed_out, hung.command.as_deref()), (true, Some(GH_PROBE)));
+    }
+
+    fn stage(position: i64, substrate: &str, model: &str, escalate: Option<&str>) -> crate::db::PipelineStageRow {
+        crate::db::PipelineStageRow {
+            id: format!("s{position}"),
+            pipeline_id: "p".into(),
+            position,
+            role: "implement".into(),
+            agent_model: model.into(),
+            substrate: substrate.into(),
+            checkpoint: false,
+            loop_target_position: None,
+            loop_max_iterations: 0,
+            loop_mode: None,
+            max_iterations: 25,
+            pos_x: None,
+            pos_y: None,
+            parents: vec![],
+            tools: None,
+            custom_name: None,
+            instructions: None,
+            effort: None,
+            escalate_model: escalate.map(Into::into),
+            escalate_effort: None,
+        }
+    }
+
+    #[test]
+    fn the_codex_row_shows_only_for_a_codex_cli_stage() {
+        assert!(stage_runs_codex("cli", "gpt-6.1-terra"));
+        assert!(stage_runs_codex("cli", "gpt-5-codex"));
+        assert!(!stage_runs_codex("cli", "sonnet"), "a Claude Code stage");
+        assert!(!stage_runs_codex("api", "gpt-6.1-terra"), "an API stage never runs codex");
+
+        let claude = [stage(0, "cli", "sonnet", None), stage(1, "api", "gpt-6.1-terra", None)];
+        assert!(!pipeline_runs_codex(&claude, &[]));
+        let codex = [stage(0, "api", "claude-haiku-4-5", None), stage(1, "cli", "gpt-6.1-terra", None)];
+        assert!(pipeline_runs_codex(&codex, &[]));
+        // A stage escalating to a Codex model runs codex on the retry.
+        assert!(pipeline_runs_codex(&[stage(0, "cli", "sonnet", Some("gpt-6.1-terra"))], &[]));
+
+        // A Routine's override puts a CLI stage on Codex, or takes it off.
+        let over = |pos: i64, m: &str| vec![(pos, m.to_string())];
+        assert!(pipeline_runs_codex(&claude, &over(0, "gpt-6.1-terra")));
+        assert!(!pipeline_runs_codex(&claude, &over(1, "gpt-5.5")), "position 1 is an API stage");
+        assert!(!pipeline_runs_codex(&codex, &over(1, "sonnet")));
+        assert!(pipeline_runs_codex(&codex, &over(7, "sonnet")), "an override for no stage changes nothing");
+    }
+
+    #[test]
+    fn a_saved_codex_crew_adds_the_codex_row() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        assert!(!wants_codex(&db), "no built-in crew runs codex");
+        let draft = |substrate: &str, model: &str| crate::db::StageDraft {
+            role: "plan".into(), agent_model: model.into(), substrate: substrate.into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 25, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+        };
+        db.save_pipeline(None, "API only", "d", &[draft("api", "gpt-6.1-terra")]).unwrap();
+        assert!(!wants_codex(&db));
+        db.save_pipeline(None, "Codex build", "d", &[draft("cli", "gpt-6.1-terra")]).unwrap();
+        assert!(wants_codex(&db));
+    }
+
+    #[test]
+    fn codex_found_signed_in_signed_out_missing_and_timeout() {
+        // The automatic pass never asks: found is all it knows.
+        let found = codex_check(true, None);
+        assert_eq!((found.id.as_str(), found.label.as_str()), ("codex", "Codex CLI"));
+        assert_eq!((found.status, found.value.as_str(), found.fix), (CheckStatus::Ok, "Found", None));
+
+        let missing = codex_check(false, None);
+        assert_eq!((missing.status, missing.value.as_str()), (CheckStatus::Warn, "Not found"));
+        assert_eq!(missing.command.as_deref(), Some(INSTALL_CODEX));
+        assert_eq!(INSTALL_CODEX, "npm i -g @openai/codex");
+
+        // Only the exit code counts; what it prints is never read.
+        let ask = |script: &str| run_status_probe_terminating(sh(script), CHECK_TIMEOUT, CODEX_TERM_GRACE, OnQuit::Kill);
+        let printed = ask("echo 'Logged in using ChatGPT'; exit 0");
+        assert_eq!(printed, Probe::Exited { success: true, output: String::new() });
+        let signed_in = codex_check(true, Some(printed));
+        assert_eq!((signed_in.status, signed_in.value.as_str(), signed_in.command), (CheckStatus::Ok, "Signed in", None));
+
+        let signed_out = codex_check(true, Some(ask("echo 'Not logged in' >&2; exit 1")));
+        assert_eq!((signed_out.status, signed_out.value.as_str()), (CheckStatus::Warn, "Not signed in"));
+        assert_eq!(signed_out.command.as_deref(), Some(CODEX_LOGIN));
+
+        let hung = codex_check(true, Some(run_status_probe_terminating(sh("sleep 5"), Duration::from_millis(100), Duration::from_millis(100), OnQuit::Kill)));
+        assert_eq!((hung.status, hung.timed_out, hung.command.as_deref()), (CheckStatus::Warn, true, Some(CODEX_LOGIN_STATUS)));
+        assert_eq!(codex_check(true, Some(Probe::Missing)).command.as_deref(), Some(INSTALL_CODEX));
+
+        assert_eq!(CODEX_LOGIN_STATUS, format!("codex {}", CODEX_LOGIN_STATUS_ARGS.join(" ")));
+        assert_eq!(CODEX_LOGIN_STATUS_ON_QUIT, OnQuit::Leave, "quitting must not cut a token refresh short");
     }
 
     #[test]

@@ -1197,6 +1197,12 @@ impl Orchestrator {
                 if session_not_saved {
                     self.db.lock().set_stage_session(&stage.id, None)?;
                 }
+                // A Codex stage stopped before it reported usage: its cost is
+                // unknown, never $0 — flag it for the ledger and say so once.
+                if crate::orchestrator::cli_runner::is_usage_unreported(&err) {
+                    self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
+                    self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+                }
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
                 // then mark the failure. Reset-on-rerun retires it as usual.
