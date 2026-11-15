@@ -79,7 +79,7 @@ describe("ReadinessCard · crew models", () => {
     expect(r).toHaveAttribute("data-status", "warn");
     expect(r).toHaveAttribute("data-tour", "settings-readiness-models");
     expect(within(r).getByText("Sonnet 4.5 · retires Nov 30")).toBeInTheDocument();
-    expect(within(r).getByText(/so 1 crew on it will fail after that\. Relay\./)).toBeInTheDocument();
+    expect(within(r).getByText(/so 1 crew on it will fail from then on\. Relay\./)).toBeInTheDocument();
   });
 
   it("shows no row when no crew uses a retiring model", async () => {

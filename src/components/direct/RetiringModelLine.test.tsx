@@ -58,7 +58,7 @@ describe("RetiringModelLine", () => {
     render(<RetiringModelLine pipeline={p} overrides={{}} onSwitched={vi.fn()} />);
     const line = await screen.findByTestId("launcher-model-retirement");
     expect(line).toHaveAttribute("data-phase", "soon");
-    expect(screen.getByText("Sonnet 4.5 retires Nov 30, so 2 stages on it will fail after that.")).toHaveClass("text-octo-warning");
+    expect(screen.getByText("Sonnet 4.5 retires Nov 30, so 2 stages on it will fail from then on.")).toHaveClass("text-octo-warning");
     expect(screen.getByRole("button", { name: "Switch to Sonnet 5.5" })).toBeInTheDocument();
   });
 

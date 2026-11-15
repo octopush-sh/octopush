@@ -259,7 +259,7 @@ export function RoutinesPane() {
   );
 }
 
-/** "Sonnet 4.5 retires Nov 30, so this routine will fail after that." — amber
+/** "Sonnet 4.5 retires Nov 30, so this routine will fail from then on." — amber
  *  in the last 30 days, rouge after; the tooltip names what fixes it. */
 function RetirementLine({ notice, now, tour }: { notice: RoutineRetirementNotice; now: Date; tour: boolean }) {
   const { retirement, phase } = notice;

@@ -257,8 +257,13 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
 /// Source: Anthropic's model deprecations page
 /// (<https://platform.claude.com/docs/en/about-claude/model-deprecations>,
 /// fetched 2026-11-12): requests to a model past its retirement date fail.
-/// A prefix matches the id itself and any longer id after a `-` (the dated
-/// `claude-sonnet-4-5-20250929`), via [`normalize_model_id`].
+/// A prefix matches first-party Claude API ids only: the id itself, or the
+/// id followed by `-` and a `YYYYMMDD` snapshot date (the dated
+/// `claude-sonnet-4-5-20250929`). Bedrock and Vertex ids
+/// (`us.anthropic.claude-sonnet-4-5-20250929-v1:0`,
+/// `claude-sonnet-4-5@20250929`) never match: the page says partner
+/// platforms set their own schedules, and switching such an id to a bare
+/// first-party one would silently change the provider.
 pub const MODEL_RETIREMENTS: &[(&str, &str, &str, &str, &str)] = &[
     ("claude-sonnet-4-5", "Sonnet 4.5", "2026-11-30", "claude-sonnet-5-5", "Sonnet 5.5"),
 ];
@@ -279,10 +284,13 @@ pub struct ModelRetirement {
 
 /// The [`MODEL_RETIREMENTS`] row for `model`, if any.
 pub fn model_retirement(model: &str) -> Option<ModelRetirement> {
-    let id = normalize_model_id(model);
+    let id = model.trim();
+    let is_date = |d: &str| d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit());
     MODEL_RETIREMENTS
         .iter()
-        .find(|(prefix, ..)| id == *prefix || id.strip_prefix(*prefix).is_some_and(|rest| rest.starts_with('-')))
+        .find(|(prefix, ..)| {
+            id == *prefix || id.strip_prefix(*prefix).and_then(|rest| rest.strip_prefix('-')).is_some_and(is_date)
+        })
         .map(|(_, label, retires, replacement, replacement_label)| ModelRetirement {
             model: model.to_string(),
             label: label.to_string(),
@@ -1315,10 +1323,25 @@ mod retirement_tests {
         assert_eq!(r.replacement, "claude-sonnet-5-5");
         assert_eq!(r.replacement_label, "Sonnet 5.5");
         assert!(model_retirement("claude-sonnet-4-5").is_some());
-        assert!(model_retirement("anthropic/claude-sonnet-4.5").is_some());
+        assert!(model_retirement(" claude-sonnet-4-5 ").is_some(), "the raw id is trimmed");
         assert!(model_retirement("claude-sonnet-4-6").is_none());
         assert!(model_retirement("claude-sonnet-4-50").is_none(), "a prefix only ends at a dash");
         assert!(model_retirement("claude-sonnet-5-5").is_none());
+        assert!(model_retirement("claude-sonnet-4-5-latest").is_none(), "only a dated snapshot follows the dash");
+    }
+
+    #[test]
+    fn partner_platform_ids_never_retire_on_the_first_party_date() {
+        // Bedrock and Vertex set their own schedules, and Switch would rewrite
+        // these to a bare first-party id, changing the provider.
+        for id in [
+            "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "anthropic.claude-sonnet-4-5-20250929-v1:0",
+            "claude-sonnet-4-5@20250929",
+        ] {
+            assert!(model_retirement(id).is_none(), "{id}");
+        }
+        assert!(model_retirements(&["claude-sonnet-4-5@20250929".to_string()]).is_empty());
     }
 
     #[test]

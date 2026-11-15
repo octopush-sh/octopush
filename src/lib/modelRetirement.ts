@@ -44,13 +44,13 @@ export function retirementDay(retires: string, now: Date): string {
   return day.y === now.getUTCFullYear() ? short : `${short}, ${day.y}`;
 }
 
-/** "Sonnet 4.5 retires Nov 30, so a stage on it will fail after that." /
+/** "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." /
  *  "Sonnet 4.5 retired Nov 30, so a stage on it will fail." */
 export function retirementLine(r: ModelRetirement, phase: RetirementPhase, now: Date, subject: string): string {
   const day = retirementDay(r.retires, now);
   return phase.kind === "retired"
     ? `${r.label} retired ${day}, so ${subject} will fail.`
-    : `${r.label} retires ${day}, so ${subject} will fail after that.`;
+    : `${r.label} retires ${day}, so ${subject} will fail from then on.`;
 }
 
 /** A retiring model a crew uses, folded over its dated and undated ids. */

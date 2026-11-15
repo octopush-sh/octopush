@@ -72,7 +72,7 @@ Current anchors:
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
 | `pipeline-model-superseded` | Direct launcher, above the selected crew's description: "Fable 5.1 → Fable 5.2: about 20% cheaper per token." with "Switch this crew" / "Keep 5.1" (only while a stage or escalation of that crew uses a superseded model and the user hasn't kept it) | `direct/SupersededModelLine.tsx` via `PipelineSetup.tsx` |
-| `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail after that." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
+| `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
@@ -98,7 +98,7 @@ Current anchors:
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
 | `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
-| `routines-model-retirement` | Settings › Routines: the first row's "Sonnet 4.5 retires Nov 30, so this routine will fail after that." (only while a Routine's crew uses a model within 30 days of its retirement, or past it) | `settings/RoutinesPane.tsx` |
+| `routines-model-retirement` | Settings › Routines: the first row's "Sonnet 4.5 retires Nov 30, so this routine will fail from then on." (only while a Routine's crew uses a model within 30 days of its retirement, or past it) | `settings/RoutinesPane.tsx` |
 | `routines-upsell-cta` | Settings › Routines, Free only: the upgrade banner's "Put your crews on a schedule with Pro" | `settings/RoutinesPane.tsx` |
 | `logbook-upsell-cta` | Logbook room, Free only: "Open the full logbook with Pro" | `LogbookRoom.tsx` |
 | `review-mode-tail` | Review: the mode band's status tail ("2 files changed · +2 −1"; only with changes) | `ReviewTail.tsx` |

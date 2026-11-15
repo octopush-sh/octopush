@@ -73,7 +73,7 @@ describe("retirement date math", () => {
   it("says what will fail, before and after", () => {
     const now = at("2026-11-14T00:00:00Z");
     expect(retirementLine(sonnet45(), { kind: "soon", daysLeft: 16 }, now, "a stage on it"))
-      .toBe("Sonnet 4.5 retires Nov 30, so a stage on it will fail after that.");
+      .toBe("Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on.");
     expect(retirementLine(sonnet45(), { kind: "retired" }, now, "this routine"))
       .toBe("Sonnet 4.5 retired Nov 30, so this routine will fail.");
   });
@@ -163,14 +163,14 @@ describe("the Readiness row", () => {
     const row = readinessRetirementCheck(pipelines, [routine("Dawn", "a")], [sonnet45()], at("2026-11-14T00:00:00Z"));
     expect(row).toMatchObject({ id: "models", label: "Crew models", status: "warn", value: "Sonnet 4.5 · retires Nov 30", command: null });
     expect(row?.fix).toBe(
-      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Relay, Routine Dawn. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Dawn follows its crew.",
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail from then on. Relay, Routine Dawn. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Dawn follows its crew.",
     );
   });
 
   it("doesn't promise the launcher switch fixes a Routine's own override", () => {
     const row = readinessRetirementCheck(pipelines, [routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]')], [sonnet45()], at("2026-11-14T00:00:00Z"));
     expect(row?.fix).toBe(
-      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Relay, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Nightly's own stage overrides pick Sonnet 4.5, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.",
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail from then on. Relay, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Routine Nightly's own stage overrides pick Sonnet 4.5, and the routine editor can't change them: compose it again (a new routine has none) and delete the old one.",
     );
     expect(readinessRetirementCheck([pipelines[1]], [routine("Nightly", "b", '[[0,"claude-sonnet-4-5"]]')], [sonnet45()], at("2026-11-14T00:00:00Z"))?.fix)
       .not.toContain("Direct launcher");
@@ -180,7 +180,7 @@ describe("the Readiness row", () => {
     const builtin = crew("f", "Feature Factory", [stage(0, "claude-sonnet-4-5")], true);
     const row = readinessRetirementCheck([builtin], [routine("Nightly", "f")], [sonnet45()], at("2026-11-14T00:00:00Z"));
     expect(row?.fix).toBe(
-      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail after that. Feature Factory, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Feature Factory is a built-in crew: switching it to Sonnet 5.5 from the Direct launcher saves a copy, Feature Factory (custom), and Routine Nightly keeps the built-in one until you edit it to use the copy.",
+      "Sonnet 4.5 retires Nov 30, so 1 crew and 1 Routine on it will fail from then on. Feature Factory, Routine Nightly. Switch each crew to Sonnet 5.5 from the Direct launcher. Feature Factory is a built-in crew: switching it to Sonnet 5.5 from the Direct launcher saves a copy, Feature Factory (custom), and Routine Nightly keeps the built-in one until you edit it to use the copy.",
     );
     expect(row?.fix).not.toContain("follows its crew");
   });

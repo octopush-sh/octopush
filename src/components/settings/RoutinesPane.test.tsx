@@ -65,7 +65,7 @@ describe("RoutinesPane retiring models", () => {
     render(<RoutinesPane />);
     const lines = screen.getAllByTestId("routine-model-retirement");
     expect(lines).toHaveLength(2);
-    expect(lines[0]).toHaveTextContent("Sonnet 4.5 retires Nov 30, so this routine will fail after that.");
+    expect(lines[0]).toHaveTextContent("Sonnet 4.5 retires Nov 30, so this routine will fail from then on.");
     expect(lines[0]).toHaveAttribute("data-tour", "routines-model-retirement");
     expect(lines[0]).toHaveClass("text-octo-warning");
     expect(lines[1]).not.toHaveAttribute("data-tour");
