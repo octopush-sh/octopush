@@ -39,13 +39,30 @@ function useUnpricedModels(models: (string | null)[]): ReadonlySet<string> {
   return key ? found.models : NO_MODELS;
 }
 
-/** The unpriced models a run's stages used, in stage order, deduplicated. */
-function unpricedIn(stages: { model: string | null }[], unpriced: ReadonlySet<string>): string[] {
-  return [...new Set(stages.map((s) => s.model).filter((m): m is string => !!m && unpriced.has(m)))];
+/** The unpriced models a run's stages used, in stage order, deduplicated.
+ *  Only stages with no cost count: a stage priced on its origin Mac keeps its
+ *  figure even when this Mac doesn't know its model. */
+function unpricedIn(stages: { model: string | null; cost_usd: number }[], unpriced: ReadonlySet<string>): string[] {
+  return [
+    ...new Set(
+      stages
+        .filter((s) => s.cost_usd === 0)
+        .map((s) => s.model)
+        .filter((m): m is string => !!m && unpriced.has(m)),
+    ),
+  ];
 }
 
-/** A run's total; " + unpriced" in mute when some of its stages can't be priced. */
+/** A run's total; " + unpriced" in mute when some of its stages can't be
+ *  priced, or just "unpriced" when none of them could (never "$0.00"). */
 function RunTotal({ costUsd, unpricedModels }: { costUsd: number; unpricedModels: string[] }) {
+  if (costUsd === 0 && unpricedModels.length > 0) {
+    return (
+      <span className="text-octo-mute" title={unpricedTitle(unpricedModels)}>
+        unpriced
+      </span>
+    );
+  }
   return (
     <>
       {formatUsd(costUsd)}

@@ -120,4 +120,57 @@ describe("HistorySheet unpriced stages", () => {
     expect(screen.getAllByText("$0.00").length).toBe(2);
     expect(screen.queryByText(/unpriced/)).toBeNull();
   });
+
+  it("shows an all-unpriced run total as 'unpriced', never '$0.00 + unpriced'", async () => {
+    const dark = mkRun("r4", "Dark run", [{ role: "plan", model: "gw/mystery-1", status: "done", cost_usd: 0 }], 0);
+    useHistoryStore.setState({ runs: [dark] });
+    const { unmount } = render(<HistorySheet />);
+    const row = screen.getByText("Dark run").closest("button")!;
+    await waitFor(() => expect(within(row).getByText("unpriced")).toBeInTheDocument());
+    expect(within(row).getByText("unpriced")).toHaveAttribute("title", expect.stringContaining("No price for gw/mystery-1"));
+    expect(within(row).getByText("unpriced")).toHaveClass("text-octo-mute");
+    expect(within(row).queryByText("$0.00")).toBeNull();
+    expect(within(row).queryByText(/\+ unpriced/)).toBeNull();
+    unmount();
+
+    // The detail header and the stage both read "unpriced".
+    useHistoryStore.setState({
+      viewedRunId: "r4",
+      detailByRun: {
+        r4: { run_id: "r4", stages: [{ ...dark.stages[0], position: 0, error: null, artifact: null, journal: [], diff: null }] },
+      },
+    });
+    render(<HistorySheet />);
+    await waitFor(() => expect(screen.getAllByText("unpriced").length).toBe(2));
+    expect(screen.queryByText("$0.00")).toBeNull();
+    expect(screen.queryByText(/\+ unpriced/)).toBeNull();
+  });
+
+  it("does not add ' + unpriced' for a stage priced on its origin Mac", async () => {
+    const origin = mkRun(
+      "r5",
+      "Origin-priced run",
+      [
+        { role: "plan", model: "claude-opus-5-5", status: "done", cost_usd: 0.1 },
+        { role: "implement", model: "gw/mystery-1", status: "done", cost_usd: 0.25 },
+      ],
+      0.35,
+    );
+    useHistoryStore.setState({
+      runs: [origin],
+      viewedRunId: "r5",
+      detailByRun: {
+        r5: {
+          run_id: "r5",
+          stages: origin.stages.map((s, position) => ({ ...s, position, error: null, artifact: null, journal: [], diff: null })),
+        },
+      },
+    });
+    render(<HistorySheet />);
+    await waitFor(() => expect(unpricedModelsMock).toHaveBeenCalled());
+    await unpricedModelsMock.mock.results[0].value;
+    await screen.findByText("$0.25");
+    expect(screen.getByText("$0.35")).toBeInTheDocument();
+    expect(screen.queryByText(/unpriced/)).toBeNull();
+  });
 });
