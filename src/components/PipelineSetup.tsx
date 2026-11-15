@@ -3,9 +3,10 @@ import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type PipelineWit
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import {
-  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, crewClaudeModels, crewUsesClaudeCode, loadClaudeCliVersion, modelFloorLabel,
+  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, crewClaudeModels, crewUsesClaudeCode, loadClaudeCliVersion, modelFloorLabel,
 } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
+import { useRolesStore } from "../stores/rolesStore";
 import { useRunsStore } from "../stores/runsStore";
 import { usePerfStore } from "../stores/perfStore";
 import { lowDiskLine } from "../lib/diskSpace";
@@ -96,6 +97,14 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   const missionIntent = useMissionsStore((s) =>
     workspaceId ? s.missionByWorkspaceId[workspaceId]?.intent ?? null : null,
   );
+  const execIsolation = useMissionsStore((s) =>
+    workspaceId ? s.missionByWorkspaceId[workspaceId]?.execIsolation ?? null : null,
+  );
+  const roles = useRolesStore((s) => s.roles);
+  const rolesLoaded = useRolesStore((s) => s.loaded);
+  useEffect(() => {
+    if (!rolesLoaded) void useRolesStore.getState().load().catch(() => {});
+  }, [rolesLoaded]);
 
   useEffect(() => { if (!loaded) void load(); }, [loaded, load]);
   useEffect(() => {
@@ -235,6 +244,8 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     return () => { alive = false; };
   }, [cli?.version, claudeModelsKey]);
   const modelFloorLine = cli?.version ? modelFloorLabel(floorNote) : null;
+  // An Action stage on Codex outside a sandboxed mission can't commit.
+  const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
 
   const estimateRange = estimate ? estimateRangeText(estimate) : "";
   const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
@@ -611,6 +622,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
               >
                 {modelFloorLine}
+              </p>
+            )}
+            {codexCommitLine && (
+              <p
+                data-tour="direct-launcher-codex-commit"
+                data-testid="launcher-codex-commit"
+                title="Codex keeps the worktree's git data read-only in its own sandbox. The run can still begin."
+                className="octo-rise-in m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {codexCommitLine}
               </p>
             )}
           </>

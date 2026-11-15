@@ -542,6 +542,27 @@ describe("PipelineSetup Claude Code version preflight", () => {
     expect(screen.queryByTestId("launcher-claude-cli-update")).not.toBeInTheDocument();
   });
 
+  it("warns that a Codex Action stage can't commit outside a sandboxed mission, and still lets the run begin", async () => {
+    const { useRolesStore } = await import("../stores/rolesStore");
+    useRolesStore.setState({
+      roles: [{ key: "ship", label: "Ship", environment: "action" } as any, { key: "implement", label: "Implement", environment: "worktree" } as any],
+      loaded: true,
+    });
+    const pipe = cliPipe("gpt-5-codex");
+    pipe.stages.push({ ...pipe.stages[0], id: "c1", position: 1, role: "ship" });
+    storeState.pipelines = [pipe];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = screen.getByTestId("launcher-codex-commit");
+    expect(line).toHaveTextContent("Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push.");
+    expect(line).toHaveClass("text-octo-warning");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+    // A sandboxed mission confines it with Octopush's own profile instead.
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox" } as any } }));
+    expect(screen.queryByTestId("launcher-codex-commit")).not.toBeInTheDocument();
+  });
+
   it("does not probe for crews without a Claude Code CLI stage", async () => {
     storeState.pipelines = [cliPipe("gpt-5-codex")];
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });

@@ -111,6 +111,26 @@ fn sandbox_cache_env(cache_root: &str) -> Vec<(String, String)> {
     ]
 }
 
+/// The cache root of a Codex writer stage in Codex's own `workspace-write`
+/// sandbox, keyed by the workspace and a fixed mode tag so it never shares a
+/// sandboxed mission's root. Pure.
+fn codex_cache_root(base: &Path, scope: &str) -> PathBuf {
+    mission_cache_root(base, scope, &["codex:workspace-write".to_string()])
+}
+
+/// Set up the build cache of a Codex writer stage outside a sandboxed
+/// mission: `npm install`, `cargo build` & co. can't write `~/.npm` or
+/// `~/.cargo` under Codex's `workspace-write` sandbox, so their caches go to
+/// this stage's own root, which the runner adds to Codex's writable roots.
+/// Returns the root and the same env as a sandboxed stage gets
+/// (`sandbox_cache_env`). Same checks as `prepare`'s cache root.
+pub fn codex_build_cache(scope: &str) -> std::io::Result<(String, Vec<(String, String)>)> {
+    let base = build_cache_base().ok_or_else(|| std::io::Error::other("no cache directory for builds"))?;
+    let root = ensure_cache_root(&codex_cache_root(&base, scope))?.to_string_lossy().into_owned();
+    let env = sandbox_cache_env(&root);
+    Ok((root, env))
+}
+
 /// Writable individual *files* (as opposed to subtrees). Seatbelt's `subpath`
 /// won't cover a bare file sibling of an allowed dir, so the CLI's top-level
 /// `~/.claude.json` state file needs its own `literal` rule.
@@ -1236,6 +1256,37 @@ mod tests {
         assert!(env.contains_key("npm_config_cache"));
         assert!(env.contains_key("GOPATH"));
         assert!(env.contains_key("GRADLE_USER_HOME"));
+    }
+
+    #[test]
+    fn a_codex_workspace_write_stage_gets_its_own_cache_root_per_workspace() {
+        let base = Path::new("/home/u/Library/Caches/octopush/build-cache");
+        let a = codex_cache_root(base, "/ws-a");
+        assert_eq!(a, codex_cache_root(base, "/ws-a"));
+        assert_ne!(a, codex_cache_root(base, "/ws-b"));
+        // Never the root a sandboxed mission on the same workspace builds with.
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &["/ws-a".to_string()]));
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
+        assert_eq!(a.parent(), Some(base));
+    }
+
+    #[test]
+    fn codex_build_cache_makes_a_private_root_and_redirects_into_it() {
+        let ws = tempfile::tempdir().unwrap();
+        let scope = ws.path().join("octopush-codex-cache-test").to_string_lossy().into_owned();
+        let Ok((root, env)) = codex_build_cache(&scope) else { return };
+        assert!(Path::new(&root).is_dir());
+        for (k, v) in &env {
+            assert!(v.starts_with(&format!("{root}/")), "{k}={v} escaped the cache root");
+        }
+        assert!(env.iter().any(|(k, _)| k == "npm_config_cache"));
+        assert!(env.iter().any(|(k, _)| k == "CARGO_HOME"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
+        }
+        let _ = std::fs::remove_dir(&root);
     }
 
     #[test]
