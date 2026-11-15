@@ -1328,8 +1328,20 @@ pub async fn delete_workspace(
 
     // Remove from DB. The row's runs cascade-delete without a run:// event, so
     // a paused one would keep the Dock badge counting it: refresh it now.
+    let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
     state.db.lock().delete_workspace(&workspace_id)?;
     crate::fleet_status::refresh_later(&app);
+
+    // Its sandbox build caches go with it, unless another workspace still
+    // sits at the same path (they key the cache by path).
+    if let Some(path) = db_path {
+        let shared = state.db.lock().workspace_by_path(&path).ok().flatten().is_some();
+        if !shared {
+            if let Err(e) = crate::orchestrator::sandbox::remove_workspace_build_caches(&path) {
+                tracing::warn!(error = %e, "could not remove the workspace's build caches");
+            }
+        }
+    }
     Ok(())
 }
 

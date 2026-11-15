@@ -79,12 +79,95 @@ fn build_cache_base() -> Option<PathBuf> {
     dirs::cache_dir().map(|d| d.join("octopush").join("build-cache"))
 }
 
-/// A cache root under `base`, keyed by `scope` (the workspace) and the write
-/// roots, so a readonly mission on a workspace doesn't share the writer's
-/// cache. Missions with the same workspace and access mode (two readonly
-/// reviews, say) share one. Pure.
+/// How long a build cache may go unused before launch removes it
+/// (`prune_build_caches`).
+pub const BUILD_CACHE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The directory under `base` holding every cache root of one workspace
+/// (`scope`), so deleting the workspace removes them all
+/// (`remove_workspace_build_caches`). A trailing `/` doesn't make another
+/// workspace. Pure.
+fn workspace_cache_dir(base: &Path, scope: &str) -> PathBuf {
+    let trimmed = scope.trim_end_matches('/');
+    base.join(scope_key(if trimmed.is_empty() { scope } else { trimmed }))
+}
+
+/// A cache root under `base`: `<workspace dir>/<key of the write roots>`, so
+/// a readonly mission on a workspace doesn't share the writer's cache.
+/// Missions with the same workspace and access mode (two readonly reviews,
+/// say) share one. Pure.
 fn mission_cache_root(base: &Path, scope: &str, write_roots: &[String]) -> PathBuf {
-    base.join(scope_key(&format!("{scope}\0{}", write_roots.join("\0"))))
+    workspace_cache_dir(base, scope).join(scope_key(&write_roots.join("\0")))
+}
+
+/// Remove every build cache of the workspace at `scope` (all its access
+/// modes). Called when the workspace is deleted. Never follows a symlink in
+/// the workspace dir's place; a missing dir is fine.
+pub fn remove_workspace_build_caches(scope: &str) -> std::io::Result<()> {
+    let Some(base) = build_cache_base() else { return Ok(()) };
+    remove_cache_dir(&workspace_cache_dir(&base, scope))
+}
+
+fn remove_cache_dir(dir: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(dir),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove the build caches unused for longer than `max_age`; returns how
+/// many cache roots went. Run once on launch, off the main thread.
+pub fn prune_build_caches(max_age: std::time::Duration) -> usize {
+    match build_cache_base() {
+        Some(base) => prune_cache_base(&base, std::time::SystemTime::now(), max_age),
+        None => 0,
+    }
+}
+
+/// Whether `p` (not followed if a link) was last modified more than
+/// `max_age` before `now`.
+fn is_stale(p: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> bool {
+    std::fs::symlink_metadata(p)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > max_age))
+}
+
+/// `prune_build_caches` over `base`: each workspace dir's entries older than
+/// `max_age` are removed (a cache root's mtime is refreshed every time a stage
+/// uses it, `ensure_cache_root`), then the workspace dir if that left it empty
+/// and it was itself stale. Links are removed, never followed. Pre-#762 flat
+/// roots (`<base>/<key>/cargo`…) are pruned the same way.
+fn prune_cache_base(base: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> usize {
+    let Ok(dirs) = std::fs::read_dir(base) else { return 0 };
+    let mut removed = 0;
+    for ws in dirs.flatten() {
+        if !ws.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let ws_dir = ws.path();
+        let ws_stale = is_stale(&ws_dir, now, max_age);
+        let Ok(roots) = std::fs::read_dir(&ws_dir) else { continue };
+        for root in roots.flatten() {
+            let path = root.path();
+            if !is_stale(&path, now, max_age) {
+                continue;
+            }
+            let gone = match root.file_type() {
+                Ok(t) if t.is_dir() => std::fs::remove_dir_all(&path),
+                _ => std::fs::remove_file(&path),
+            };
+            if gone.is_ok() {
+                removed += 1;
+            }
+        }
+        if ws_stale {
+            // Only succeeds when empty.
+            let _ = std::fs::remove_dir(&ws_dir);
+        }
+    }
+    removed
 }
 
 /// Env vars that redirect common build toolchains' WRITE caches into a confined
@@ -629,26 +712,54 @@ fn own_dir_0700(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Create the cache root `root` (`<base>/<key>`) and return it as
-/// `<realpath of base>/<key>`. Fails closed when the base or the root is a
-/// symlink, not a directory, or not owned by this user: a stage can write
-/// inside its root, and a root it replaced with a link must never get chmodded
-/// or put in the next profile. Both end up 0700.
+/// `create_dir`, not `create_dir_all`: it never follows a link in `dir`'s
+/// place; an existing entry is left for `own_dir_0700` to check.
+fn create_dir_once(dir: &Path) -> std::io::Result<()> {
+    match std::fs::create_dir(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// Mark `dir` as just used (its mtime), so `prune_build_caches` keeps it.
+/// Best-effort, and never through a link.
+#[cfg(unix)]
+fn touch_dir(dir: &Path) {
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Ok(handle) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(dir)
+    {
+        let _ = handle.set_modified(std::time::SystemTime::now());
+    }
+}
+
+#[cfg(not(unix))]
+fn touch_dir(_dir: &Path) {}
+
+/// Create the cache root `root` (`<base>/<workspace>/<key>`) and return it as
+/// `<realpath of base>/<workspace>/<key>`. Fails closed when the base, the
+/// workspace dir or the root is a symlink, not a directory, or not owned by
+/// this user: a stage can write inside its root, and a root it replaced with
+/// a link must never get chmodded or put in the next profile. All three end
+/// up 0700; the workspace dir and the root are marked as just used.
 fn ensure_cache_root(root: &Path) -> std::io::Result<PathBuf> {
-    let (Some(base), Some(key)) = (root.parent(), root.file_name()) else {
-        return Err(std::io::Error::other(format!("{} is not a cache root", root.display())));
+    let not_a_root = || std::io::Error::other(format!("{} is not a cache root", root.display()));
+    let ws_dir = root.parent().ok_or_else(not_a_root)?;
+    let (Some(base), Some(ws), Some(key)) = (ws_dir.parent(), ws_dir.file_name(), root.file_name()) else {
+        return Err(not_a_root());
     };
     std::fs::create_dir_all(base)?;
     own_dir_0700(base)?;
-    let root = std::fs::canonicalize(base)?.join(key);
-    // `create_dir`, not `create_dir_all`: it never follows a link in the
-    // root's place; an existing entry is checked below.
-    if let Err(e) = std::fs::create_dir(&root) {
-        if e.kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(e);
-        }
-    }
+    let ws_dir = std::fs::canonicalize(base)?.join(ws);
+    create_dir_once(&ws_dir)?;
+    own_dir_0700(&ws_dir)?;
+    let root = ws_dir.join(key);
+    create_dir_once(&root)?;
     own_dir_0700(&root)?;
+    touch_dir(&ws_dir);
+    touch_dir(&root);
     Ok(root)
 }
 
@@ -1267,7 +1378,8 @@ mod tests {
         // Never the root a sandboxed mission on the same workspace builds with.
         assert_ne!(a, mission_cache_root(base, "/ws-a", &["/ws-a".to_string()]));
         assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
-        assert_eq!(a.parent(), Some(base));
+        // In the workspace's dir, so deleting the workspace removes it too.
+        assert_eq!(a.parent(), Some(workspace_cache_dir(base, "/ws-a").as_path()));
     }
 
     #[test]
@@ -1286,7 +1398,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(std::fs::metadata(&root).unwrap().permissions().mode() & 0o777, 0o700);
         }
-        let _ = std::fs::remove_dir(&root);
+        let _ = remove_workspace_build_caches(&scope);
+        assert!(!Path::new(&root).exists(), "deleting the workspace removes its cache");
     }
 
     #[test]
@@ -1304,7 +1417,13 @@ mod tests {
         assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
         // Missions with the same workspace and access mode share one root.
         assert_eq!(mission_cache_root(base, "/ws-a", &[]), mission_cache_root(base, "/ws-a", &[]));
-        assert_eq!(a.parent(), Some(base));
+        // Every mode's root sits in the one dir of its workspace.
+        let ws_dir = workspace_cache_dir(base, "/ws-a");
+        assert_eq!(a.parent(), Some(ws_dir.as_path()));
+        assert_eq!(mission_cache_root(base, "/ws-a", &[]).parent(), Some(ws_dir.as_path()));
+        assert_eq!(ws_dir.parent(), Some(base));
+        assert_ne!(ws_dir, workspace_cache_dir(base, "/ws-b"));
+        assert_eq!(ws_dir, workspace_cache_dir(base, "/ws-a/"), "a trailing slash is the same workspace");
         // The base sits outside every root all missions share (temp, ~/.claude,
         // ~/.cache), so only the own subtree is ever writable.
         let shared = system_write_roots(Some(home), Some(tmpdir));
@@ -1355,11 +1474,12 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("build-cache");
-        let root = base.join("key");
+        let root = base.join("ws").join("key");
         let made = ensure_cache_root(&root).unwrap();
-        assert_eq!(made, std::fs::canonicalize(&base).unwrap().join("key"));
+        assert_eq!(made, std::fs::canonicalize(&base).unwrap().join("ws").join("key"));
         assert_eq!(std::fs::canonicalize(&made).unwrap(), made, "the returned root is its own realpath");
         assert_eq!(mode(&made), 0o700);
+        assert_eq!(mode(&base.join("ws")), 0o700);
         assert_eq!(mode(&base), 0o700);
         // Idempotent for a real dir.
         assert_eq!(ensure_cache_root(&root).unwrap(), made);
@@ -1385,9 +1505,93 @@ mod tests {
         // A symlinked base is refused too.
         let link_base = dir.path().join("link-base");
         std::os::unix::fs::symlink(&target, &link_base).unwrap();
-        assert!(ensure_cache_root(&link_base.join("key")).is_err(), "a symlinked base is refused");
+        assert!(ensure_cache_root(&link_base.join("ws").join("key")).is_err(), "a symlinked base is refused");
+        assert_eq!(mode(&target), 0o755);
+        assert!(!target.join("ws").exists());
+
+        // And a symlinked workspace dir.
+        let other = base.join("other");
+        std::os::unix::fs::symlink(&target, &other).unwrap();
+        assert!(ensure_cache_root(&other.join("key")).is_err(), "a symlinked workspace dir is refused");
         assert_eq!(mode(&target), 0o755);
         assert!(!target.join("key").exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_cache_root_marks_the_root_as_just_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("build-cache").join("ws").join("key");
+        let made = ensure_cache_root(&root).unwrap();
+        let old = std::time::SystemTime::now() - 2 * BUILD_CACHE_MAX_AGE;
+        let set_old = |p: &Path| std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+        set_old(&made);
+        set_old(made.parent().unwrap());
+        let now = std::time::SystemTime::now();
+        assert!(is_stale(&made, now, BUILD_CACHE_MAX_AGE));
+        ensure_cache_root(&root).unwrap();
+        assert!(!is_stale(&made, now, BUILD_CACHE_MAX_AGE), "a used root is fresh again");
+        assert!(!is_stale(made.parent().unwrap(), now, BUILD_CACHE_MAX_AGE));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn pruning_removes_only_caches_unused_past_the_max_age() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("build-cache");
+        let now = std::time::SystemTime::now();
+        let old = now - 2 * BUILD_CACHE_MAX_AGE;
+        let set_old = |p: &Path| std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+
+        // Workspace A: a stale readonly root beside a fresh writer root. The
+        // stale one holds a link to a dir outside the base.
+        let stale = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[])).unwrap();
+        let fresh = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()])).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::fs::create_dir_all(stale.join("cargo")).unwrap();
+        std::os::unix::fs::symlink(&outside, stale.join("cargo/link")).unwrap();
+        set_old(&stale);
+        set_old(stale.parent().unwrap());
+        // Workspace B: only stale roots, so its dir goes too.
+        let gone = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[])).unwrap();
+        set_old(&gone);
+        let ws_b = gone.parent().unwrap().to_path_buf();
+        set_old(&ws_b);
+
+        assert_eq!(prune_cache_base(&base, now, BUILD_CACHE_MAX_AGE), 2);
+        assert!(!stale.exists());
+        assert!(fresh.is_dir(), "a cache used recently stays");
+        assert!(stale.parent().unwrap().is_dir(), "a workspace with a fresh cache keeps its dir");
+        assert!(!ws_b.exists(), "an emptied stale workspace dir is removed");
+        assert!(outside.join("keep").exists(), "nothing behind a link is touched");
+        // Nothing left to prune.
+        assert_eq!(prune_cache_base(&base, now, BUILD_CACHE_MAX_AGE), 0);
+        assert_eq!(prune_cache_base(&dir.path().join("missing"), now, BUILD_CACHE_MAX_AGE), 0);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn removing_a_workspaces_caches_takes_every_mode_and_spares_other_workspaces() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("build-cache");
+        let a_ro = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[])).unwrap();
+        let a_rw = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()])).unwrap();
+        let a_codex = ensure_cache_root(&codex_cache_root(&base, "/ws-a")).unwrap();
+        let b = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[])).unwrap();
+        remove_cache_dir(&workspace_cache_dir(&base, "/ws-a/")).unwrap();
+        assert!(!a_ro.exists() && !a_rw.exists() && !a_codex.exists());
+        assert!(!workspace_cache_dir(&base, "/ws-a").exists());
+        assert!(b.is_dir(), "another workspace's cache stays");
+        // Already gone, or never made: fine.
+        remove_cache_dir(&workspace_cache_dir(&base, "/ws-a")).unwrap();
+        // A link in the workspace dir's place is left alone, its target too.
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, workspace_cache_dir(&base, "/ws-c")).unwrap();
+        remove_cache_dir(&workspace_cache_dir(&base, "/ws-c")).unwrap();
+        assert!(target.is_dir());
     }
 
     #[test]
@@ -1428,6 +1632,7 @@ mod tests {
         assert!(prepare(&roots, Some(scope.as_str()), OsStr::new("bash"), &probe).is_err());
         let target_mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         let _ = std::fs::remove_file(&own);
+        let _ = std::fs::remove_dir_all(workspace_cache_dir(&base, &scope));
         let _ = std::fs::remove_dir_all(&target);
         assert_eq!(target_mode, 0o755, "the link's target wasn't chmodded");
     }
@@ -1471,8 +1676,7 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         assert!(!planted && !sibling.exists(), "another mission's cache is denied");
-        let own = mission_cache_root(&base, &scope, &roots);
-        let _ = std::fs::remove_dir_all(own);
+        let _ = std::fs::remove_dir_all(workspace_cache_dir(&base, &scope));
     }
 
     #[test]
