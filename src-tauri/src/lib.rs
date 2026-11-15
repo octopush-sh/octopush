@@ -507,6 +507,14 @@ pub fn run() {
                 });
             }
 
+            // Sandbox build caches nobody used for 30 days.
+            tauri::async_runtime::spawn_blocking(|| {
+                let n = orchestrator::sandbox::prune_build_caches(orchestrator::sandbox::BUILD_CACHE_MAX_AGE);
+                if n > 0 {
+                    tracing::info!(count = n, "pruned unused build caches");
+                }
+            });
+
             // Direct-mode orchestrator: seed builtin pipelines + register engine.
             {
                 let st = app.state::<AppState>();
