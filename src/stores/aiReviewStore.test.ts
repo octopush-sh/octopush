@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../lib/ipc", () => ({
-  ipc: { aiComplete: vi.fn(), listProviders: vi.fn() },
+  ipc: { aiComplete: vi.fn(), listProviders: vi.fn(), suggestModel: vi.fn() },
 }));
 vi.mock("../components/Toasts", () => ({ pushToast: vi.fn() }));
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { useAiReview, diffHash, reconcileAiReviewModels, _resetReconcileForTests } from "./aiReviewStore";
+import { _resetHelperModelsForTests } from "../lib/helperModels";
 
 const okJson = JSON.stringify({ summary: "s", findings: [{ severity: "high", category: "bug", title: "t", detail: "d", file: "a.ts", line: 3 }] });
 
@@ -14,11 +15,28 @@ beforeEach(() => {
   localStorage.clear();
   useAiReview.setState({ models: {}, reviews: {}, runGen: {} });
   (ipc.aiComplete as any).mockReset();
+  (ipc.suggestModel as any).mockReset().mockRejectedValue(new Error("no backend"));
+  _resetHelperModelsForTests();
 });
 
 describe("aiReviewStore", () => {
-  it("defaults the model to claude-sonnet-4-6 per workspace", () => {
-    expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+  it("defaults the model to the current review tier per workspace", () => {
+    expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-5-5");
+  });
+  it("an unpicked workspace reviews with the builtin tag lookup's model", async () => {
+    (ipc.suggestModel as any).mockResolvedValue({ modelId: "claude-sonnet-9", provider: "anthropic", reason: "", estimatedCostTier: "medium" });
+    (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    await useAiReview.getState().run("w1", "DIFF");
+    expect((ipc.aiComplete as any).mock.calls[0][0]).toBe("claude-sonnet-9");
+    expect(ipc.suggestModel).toHaveBeenCalledWith("code_review");
+    expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-9");
+  });
+  it("a picked model is used as is", async () => {
+    (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    useAiReview.getState().setModel("w1", "claude-opus-5-5");
+    await useAiReview.getState().run("w1", "DIFF");
+    expect((ipc.aiComplete as any).mock.calls[0][0]).toBe("claude-opus-5-5");
+    expect(ipc.suggestModel).not.toHaveBeenCalled();
   });
   it("setModel persists per workspace", () => {
     useAiReview.getState().setModel("w1", "claude-opus-4-6");
@@ -66,17 +84,19 @@ describe("aiReviewStore", () => {
     it("retired ids fall back to the default with a one-time info toast", async () => {
       useAiReview.setState({ models: { w1: "claude-3-retired", w2: "claude-opus-4-6" } });
       await reconcileAiReviewModels();
-      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+      expect(useAiReview.getState().models).toEqual({ w2: "claude-opus-4-6" }); // the default isn't pinned
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-5-5");
       expect(useAiReview.getState().modelFor("w2")).toBe("claude-opus-4-6"); // valid id untouched
       expect(pushToast).toHaveBeenCalledTimes(1);
       expect((pushToast as any).mock.calls[0][0]).toMatchObject({ level: "info" });
       expect((pushToast as any).mock.calls[0][0].body).toContain("claude-3-retired");
+      expect((pushToast as any).mock.calls[0][0].body).toContain("using claude-sonnet-5-5");
     });
 
     it("models from disabled providers are treated as retired", async () => {
       useAiReview.setState({ models: { w1: "disabled-model" } });
       await reconcileAiReviewModels();
-      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-5-5");
     });
 
     it("runs once per session and never fetches when nothing is persisted", async () => {
@@ -102,7 +122,7 @@ describe("aiReviewStore", () => {
       await reconcileAiReviewModels();
       expect(useAiReview.getState().modelFor("w1")).toBe("claude-3-retired"); // untouched
       await reconcileAiReviewModels(); // retry succeeds
-      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-4-6");
+      expect(useAiReview.getState().modelFor("w1")).toBe("claude-sonnet-5-5");
     });
   });
 

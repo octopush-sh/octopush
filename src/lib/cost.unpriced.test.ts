@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { budgetUnenforceableNote, modelCostCell, unpricedTitle } from "./cost";
+import {
+  budgetUnenforceableNote,
+  modelCostCell,
+  unpricedTitle,
+  USAGE_UNREPORTED_TITLE,
+  usageUnreportedNote,
+  usageUnreportedTitle,
+} from "./cost";
 
 const usd = (n: number) => `$${n.toFixed(2)}`;
 
@@ -40,5 +47,15 @@ describe("budgetUnenforceableNote", () => {
     expect(budgetUnenforceableNote(0)).toBe("");
     expect(budgetUnenforceableNote(1)).toBe("budget not enforceable: 1 stage unpriced");
     expect(budgetUnenforceableNote(3)).toBe("budget not enforceable: 3 stages unpriced");
+  });
+});
+
+describe("usageUnreportedNote / usageUnreportedTitle", () => {
+  it("is empty when every stage reported and words one or several stages", () => {
+    expect(usageUnreportedNote(0)).toBe("");
+    expect(usageUnreportedNote(1)).toBe("1 stage usage not reported");
+    expect(usageUnreportedNote(2)).toBe("2 stages usage not reported");
+    expect(usageUnreportedTitle(1)).toBe(USAGE_UNREPORTED_TITLE);
+    expect(usageUnreportedTitle(2)).toMatch(/^Codex stopped before reporting usage in 2 stages, so their cost is unknown/);
   });
 });

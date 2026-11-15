@@ -460,6 +460,19 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
+/// The marker line in the error of a Codex stage that ended (director stop,
+/// stall, 60-minute cap, `turn.failed`, a crash) with its last turn missing
+/// its `turn.completed` / `token_count` event: Codex reports usage only there,
+/// so (that part of) the stage's spend is unknown, not $0.
+/// Also the journal line the drive writes for it.
+pub const USAGE_UNREPORTED: &str = "codex stopped before reporting usage, so this stage's cost is unknown";
+
+/// True when a stage error carries [`USAGE_UNREPORTED`]: the drive flags the
+/// stage `usage_unreported` so the ledger reads "usage not reported".
+pub fn is_usage_unreported(error: &str) -> bool {
+    error.contains(USAGE_UNREPORTED)
+}
+
 /// The `terminal_reason` of a run that ended because a PreToolUse hook
 /// deferred a tool call (`permissionDecision: "defer"`, Claude Code ≥ 2.1.319).
 /// The CLI reports it as a clean `success` with no text and exits 0 — the tool
@@ -755,6 +768,23 @@ pub fn parse_cli_result(
 /// builds/tests), so this is a guardrail, not a sandbox.
 pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 
+/// Claude Code's interactive question tool, denied to EVERY Claude CLI stage.
+/// A headless `claude -p` stage has nobody to answer it (since 2.1.321 the CLI
+/// refuses it there and the model guesses). With the tool gone, a question can
+/// only come out in the final message, where [`detect_trailing_question`]
+/// parks it for the director.
+pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
+/// The one `--disallowedTools` value for a Claude CLI stage: the question
+/// tool, plus the review denial on a read-only stage.
+pub fn cli_disallowed_tools(read_only: bool) -> String {
+    if read_only {
+        format!("{ASK_USER_QUESTION_TOOL},{REVIEW_DISALLOWED_TOOLS}")
+    } else {
+        ASK_USER_QUESTION_TOOL.to_string()
+    }
+}
+
 /// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
 /// as defence in depth). Since Claude Code 2.1.314, Write/Edit/NotebookEdit
 /// refuse paths outside the working directories in every permission mode,
@@ -813,10 +843,10 @@ pub fn read_guard_label(reads_confined: bool, cli_version: Option<&str>) -> Opti
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
 /// independently and non-JSON log lines are simply skipped. Every stage
-/// carries [`CLAUDE_STAGE_SETTINGS`]; `read_only` adds the review-stage tool
-/// denial (see [`REVIEW_DISALLOWED_TOOLS`]).
+/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`];
+/// `read_only` adds the review-stage tool denial (see [`cli_disallowed_tools`]).
 pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
-    let mut args = vec![
+    vec![
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
@@ -831,19 +861,16 @@ pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_onl
         max_turns.max(1).to_string(),
         "--settings".to_string(),
         CLAUDE_STAGE_SETTINGS.to_string(),
-    ];
-    if read_only {
-        args.push("--disallowedTools".to_string());
-        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
-    }
-    args
+        "--disallowedTools".to_string(),
+        cli_disallowed_tools(read_only),
+    ]
 }
 
 /// Argv for resuming an existing headless session: continue the same
 /// conversation (`--resume <id>`) with a fresh turn budget. The continuation
 /// nudge is supplied via stdin by the caller.
 pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read_only: bool) -> Vec<String> {
-    let mut args = vec![
+    vec![
         "-p".to_string(),
         "--output-format".to_string(), "stream-json".to_string(),
         "--verbose".to_string(),
@@ -853,12 +880,8 @@ pub fn build_cli_args_resume(model: &str, session_id: &str, max_turns: i64, read
         "--max-turns".to_string(), max_turns.max(1).to_string(),
         // The resume path needs the guard too (2.1.314 fixed it for --resume).
         "--settings".to_string(), CLAUDE_STAGE_SETTINGS.to_string(),
-    ];
-    if read_only {
-        args.push("--disallowedTools".to_string());
-        args.push(REVIEW_DISALLOWED_TOOLS.to_string());
-    }
-    args
+        "--disallowedTools".to_string(), cli_disallowed_tools(read_only),
+    ]
 }
 
 /// True if `v` is the terminal `type:"result"` NDJSON event (carries the final
@@ -891,14 +914,17 @@ pub enum CliDialect {
 /// run in Codex's `read-only` sandbox; Claude stages ignore this).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CodexWriteScope {
-    /// Codex's own `workspace-write` sandbox with the network on and no extra
-    /// writable roots: the worktree and Codex's temp dirs only. A linked
-    /// worktree's git dir is left out on purpose: Codex's writable roots can't
-    /// deny a path inside a root, so granting `<common>/worktrees/<name>`
-    /// would hand over its `commondir` and `config.worktree`, which repoint
-    /// git at planted config and hooks. `git add`/`git commit` therefore fail
-    /// there. The worktree's own `.git` entry is checked after the stage
-    /// ([`guards_git_entry`]).
+    /// Codex's own `workspace-write` sandbox with the network on: the
+    /// worktree, Codex's temp dirs and the stage's own build-cache root
+    /// ([`codex_writable_root_args`]). Codex keeps `<worktree>/.git` and the
+    /// gitdir it resolves to read-only, and a linked worktree's objects and
+    /// refs live in the common dir outside the worktree, so `git add`,
+    /// `commit`, `stash`, `fetch` and `checkout -b` fail in every such stage.
+    /// The git dirs are left out on purpose: Codex's writable roots can't deny
+    /// a path inside a root, so granting `<common>/worktrees/<name>` would hand
+    /// over its `commondir` and `config.worktree`, which repoint git at
+    /// planted config and hooks. The worktree's own `.git` entry is also
+    /// checked after the stage ([`guards_git_entry`]).
     Workspace,
     /// The mission runs sandboxed: Octopush's Seatbelt profile already
     /// confines the process, and nesting Codex's Seatbelt inside it is untested.
@@ -915,12 +941,36 @@ pub fn codex_write_scope(exec_isolation: &str) -> CodexWriteScope {
     }
 }
 
+/// The `-c` override that adds `root` (the stage's build-cache root,
+/// `sandbox::codex_build_cache`) to Codex's `workspace-write` writable roots.
+/// The value is a TOML array; a JSON string array is one. Pure.
+pub fn codex_writable_root_args(root: &str) -> Vec<String> {
+    let list = serde_json::to_string(&[root]).unwrap_or_else(|_| "[]".to_string());
+    vec!["-c".to_string(), format!("sandbox_workspace_write.writable_roots={list}")]
+}
+
 /// Whether the runner checks the worktree's `.git` entry around this stage
-/// (`sandbox::GitEntry`): only for a Codex writer in Codex's own sandbox,
-/// which may not protect a `.git` *file* (a linked worktree's gitdir pointer)
-/// the way the Seatbelt profile's `{ws}/.git` deny does. Pure.
+/// (`sandbox::GitEntry`): only for a Codex writer in Codex's own sandbox.
+/// Codex already keeps `<worktree>/.git` and the gitdir it points to
+/// read-only; the check is a second guard, so a changed pointer never
+/// reaches the git commands Octopush runs after the stage. Pure.
 pub fn guards_git_entry(dialect: CliDialect, read_only: bool, exec_isolation: &str) -> bool {
     dialect == CliDialect::Codex && !read_only && codex_write_scope(exec_isolation) == CodexWriteScope::Workspace
+}
+
+/// The journal notice for an Action role (one that may commit and push) on a
+/// Codex writer in Codex's own sandbox, where git can't write `.git`. Pure.
+pub fn codex_git_notice(
+    dialect: CliDialect,
+    read_only: bool,
+    scope: CodexWriteScope,
+    environment: crate::orchestrator::types::RoleEnvironment,
+) -> Option<&'static str> {
+    let action = environment == crate::orchestrator::types::RoleEnvironment::Action;
+    (dialect == CliDialect::Codex && !read_only && scope == CodexWriteScope::Workspace && action).then_some(
+        "Codex's sandbox keeps .git read-only, so this stage can't commit, stash or push. \
+         Run the mission sandboxed or give this stage a Claude model.",
+    )
 }
 
 /// Derive the dialect from the stage's model id. Unknown ids fall back to
@@ -1037,7 +1087,8 @@ impl CliDialect {
     /// which would hang a headless stage. The writer's settings are `-c`
     /// config overrides, the mechanism the effort already uses, not flags
     /// `codex exec` may not take: approval `never` and network on (Octopush's
-    /// Seatbelt profile confines writes only, too). No extra writable roots.
+    /// Seatbelt profile confines writes only, too). The runner adds the
+    /// build-cache root to the writable roots ([`codex_writable_root_args`]).
     pub fn argv(
         &self,
         model: &str,
@@ -1193,7 +1244,12 @@ impl CliDialect {
     /// Code (fresh and resumed runs alike), and on Codex placed before the
     /// trailing `-` so the stdin-prompt marker stays the last argument.
     pub fn push_effort_args(&self, args: &mut Vec<String>, model: &str, effort: Option<crate::providers::Effort>) {
-        let flags = self.effort_args(model, effort);
+        self.push_flags(args, self.effort_args(model, effort));
+    }
+
+    /// Append `flags` to the argv, before Codex's trailing `-` (the prompt on
+    /// stdin) so they stay flags.
+    pub fn push_flags(&self, args: &mut Vec<String>, flags: Vec<String>) {
         let at = match self {
             CliDialect::Codex if args.last().is_some_and(|a| a == "-") => args.len() - 1,
             _ => args.len(),
@@ -1253,6 +1309,25 @@ pub(crate) struct CodexAccum {
     pub final_message: Option<String>,
     pub error: Option<String>,
     pub session_id: Option<String>,
+    /// A `turn.started` with no `turn.completed` after it: Codex reports a
+    /// turn's usage only on `turn.completed`, so this turn's tokens are unknown.
+    pub turn_open: bool,
+    /// The model did work: a `turn.started`, an `item.*` event, or a legacy
+    /// agent `msg` (the legacy schema has no `turn.started`). A failure before
+    /// any of these (a bad flag, no login at launch, an `error` before
+    /// `turn.started`) provably spent nothing. A turn that started and then
+    /// failed (a 401 or an unknown model) is flagged: the stream can't show
+    /// whether it spent anything.
+    pub activity: bool,
+}
+
+impl CodexAccum {
+    /// True when the stage's spend can't be known from the stream: the last
+    /// turn never completed, or the model did work and no usage event arrived.
+    /// A stage that failed before any turn or model activity is not flagged.
+    pub fn usage_unreported(&self, reported: &CliUsage) -> bool {
+        self.turn_open || (self.activity && *reported == CliUsage::default())
+    }
 }
 
 /// A string field that may be a plain string or an array of strings (codex
@@ -1288,6 +1363,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                     accum.session_id = Some(id.to_string());
                 }
             }
+            "turn.started" => {
+                accum.turn_open = true;
+                accum.activity = true;
+            }
+            "turn.completed" => accum.turn_open = false,
             "turn.failed" | "error" => {
                 let msg = v
                     .get("error")
@@ -1299,6 +1379,7 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
                 entries.push(json!({ "kind": "notice", "text": format!("codex error — {msg}") }));
             }
             "item.started" | "item.updated" | "item.completed" => {
+                accum.activity = true;
                 if let Some(item) = v.get("item") {
                     let itype = item
                         .get("item_type")
@@ -1372,7 +1453,11 @@ pub(crate) fn codex_fold_event(accum: &mut CodexAccum, v: &Value) -> Vec<Value> 
     }
     // ── Legacy experimental schema ──
     if let Some(msg) = v.get("msg") {
-        match msg.get("type").and_then(Value::as_str).unwrap_or("") {
+        let mtype = msg.get("type").and_then(Value::as_str).unwrap_or("");
+        if !matches!(mtype, "" | "session_configured" | "error") {
+            accum.activity = true;
+        }
+        match mtype {
             "agent_message" => {
                 if let Some(text) = msg.get("message").and_then(Value::as_str) {
                     if !text.trim().is_empty() {
@@ -1484,6 +1569,9 @@ pub(crate) fn build_codex_outcome(
         if !tail.is_empty() {
             error.push_str(&format!("\n— stderr —\n{tail}"));
         }
+        if accum.usage_unreported(&usage) {
+            error.push_str(&format!("\n{USAGE_UNREPORTED}"));
+        }
         let mut out = failed_stage(&error);
         out.input_tokens = usage.input_tokens;
         out.output_tokens = usage.output_tokens;
@@ -1518,10 +1606,14 @@ pub(crate) fn build_codex_outcome(
             }
         }
         None => {
-            let mut out = failed_stage(&format!(
+            let mut error = format!(
                 "codex produced no final message: {}",
                 failure_detail(stderr_text, "the stream ended without an assistant message")
-            ));
+            );
+            if accum.usage_unreported(&usage) {
+                error.push_str(&format!("\n{USAGE_UNREPORTED}"));
+            }
+            let mut out = failed_stage(&error);
             out.input_tokens = usage.input_tokens;
             out.output_tokens = usage.output_tokens;
             out.cache_read_tokens = usage.cache_read_input_tokens;
@@ -2000,6 +2092,21 @@ impl CliRunner {
         };
         args.extend(max_budget_args(budget_cap));
         dialect.push_effort_args(&mut args, &stage.agent_model, effort);
+        // A Codex writer in Codex's own sandbox can't write `~/.npm` or
+        // `~/.cargo`: its build caches go to its own root, made writable.
+        let mut cache_env: Vec<(String, String)> = Vec::new();
+        let mut cache_note: Option<String> = None;
+        if dialect == CliDialect::Codex && !read_only && write_scope == CodexWriteScope::Workspace {
+            let scope = ctx.workspace_path.to_string_lossy().into_owned();
+            match tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::codex_build_cache(&scope)).await {
+                Ok(Ok((root, env))) => {
+                    dialect.push_flags(&mut args, codex_writable_root_args(&root));
+                    cache_env = env;
+                }
+                Ok(Err(e)) => cache_note = Some(e.to_string()),
+                Err(e) => cache_note = Some(e.to_string()),
+            }
+        }
 
         let path_env = resolved_cli_path();
         let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
@@ -2007,21 +2114,22 @@ impl CliRunner {
             .unwrap_or_else(|| dialect.binary().into());
 
         // Seatbelt sandbox (macOS): when the mission asks for it, wrap the spawn
-        // in `sandbox-exec -f <profile> claude …`. NO silent fallback — if the
+        // in `sandbox-exec -p <profile> claude …`. NO silent fallback — if the
         // sandbox can't be set up the stage fails rather than running unconfined.
-        // The profile guard lives to the end of this fn (past `child.wait`).
-        let mut _profile_guard: Option<crate::orchestrator::sandbox::ProfileGuard> = None;
+        let mut sandbox_env: Vec<(String, String)> = cache_env;
         let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
             match ctx.exec_isolation.as_str() {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
+                    let scope = ctx.workspace_path.to_string_lossy();
                     match crate::orchestrator::sandbox::prepare(
                         &ctx.allowed_write_roots,
+                        Some(&*scope),
                         &real_program,
                         &args,
                     ) {
                         Ok(prepared) => {
-                            _profile_guard = Some(prepared.guard);
+                            sandbox_env = prepared.env;
                             (prepared.program, prepared.args)
                         }
                         Err(e) => {
@@ -2050,16 +2158,12 @@ impl CliRunner {
         for (k, v) in login_shell_env() {
             command.env(k, v);
         }
-        // Sandboxed (guard is Some): redirect build-tool caches into the confined
-        // temp so builds work without exposing the real ~/.cargo etc. Overrides
-        // any cache vars the login shell set.
-        if _profile_guard.is_some() {
-            if let Ok(tmp) = std::env::var("TMPDIR") {
-                let scope = ctx.workspace_path.to_string_lossy();
-                for (k, v) in crate::orchestrator::sandbox::sandbox_cache_env(&tmp, &scope) {
-                    command.env(k, v);
-                }
-            }
+        // Sandboxed, or a Codex writer in its own sandbox: redirect build-tool
+        // caches into the stage's own cache root (per workspace and access
+        // mode) so builds work without exposing the real ~/.cargo etc.
+        // Overrides any cache vars the login shell set.
+        for (k, v) in sandbox_env {
+            command.env(k, v);
         }
         for (k, v) in dialect.stage_env() {
             command.env(k, v);
@@ -2100,6 +2204,15 @@ impl CliRunner {
         }
         if let Some(note) = dialect.unpassed_effort_notice(&stage.agent_model, effort) {
             emitter.notice(&note);
+        }
+        if let Some(e) = cache_note {
+            emitter.notice(&format!(
+                "Octopush could not set up this stage's build cache ({e}). In Codex's sandbox, npm, cargo and \
+                 other package managers may fail to write their caches."
+            ));
+        }
+        if let Some(note) = codex_git_notice(dialect, read_only, write_scope, stage.role_environment) {
+            emitter.notice(note);
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -2234,10 +2347,12 @@ impl CliRunner {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
-                return Ok(failed_stage_with_usage(
+                return Ok(stopped_stage(
+                    dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
                     &streamed_usage.lock(),
+                    codex_accum.lock().turn_open,
                 ));
             }
         };
@@ -2262,10 +2377,12 @@ impl CliRunner {
         if let (Some(kind), false) = (timeout_kind.as_deref(), has_terminal) {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
-            return Ok(failed_stage_with_usage(
+            return Ok(stopped_stage(
+                dialect,
                 &format!("{bin} {kind}"),
                 &stage.agent_model,
                 &streamed_usage.lock(),
+                codex_accum.lock().turn_open,
             ));
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -2371,7 +2488,7 @@ fn stderr_tail(stderr: &str, n: usize) -> String {
 }
 
 /// Sum the per-message usage map into one total (see `usage_from_stream_event`).
-fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
+pub(crate) fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> CliUsage {
     let mut total = CliUsage::default();
     for u in map.values() {
         total.add(u);
@@ -2433,6 +2550,24 @@ fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashM
     out.cache_creation_tokens = u.cache_creation_input_tokens;
     out.cost_usd = streamed_cost(model, map);
     out
+}
+
+/// The outcome of a stage stopped before it finished (director stop, stall,
+/// 60-minute cap): the streamed usage priced as an estimate. A Codex stage
+/// whose last turn never completed (`turn_open`) or that streamed no usage
+/// event never reported those tokens — its error carries [`USAGE_UNREPORTED`]
+/// so its cost reads unknown (or "+ usage not reported") instead of a total.
+pub(crate) fn stopped_stage(
+    dialect: CliDialect,
+    msg: &str,
+    model: &str,
+    map: &std::collections::HashMap<String, CliUsage>,
+    turn_open: bool,
+) -> StageOutcome {
+    if dialect == CliDialect::Codex && (turn_open || map.is_empty()) {
+        return failed_stage_with_usage(&format!("{msg}\n{USAGE_UNREPORTED}"), model, map);
+    }
+    failed_stage_with_usage(msg, model, map)
 }
 
 fn failed_stage(msg: &str) -> StageOutcome {

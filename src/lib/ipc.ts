@@ -312,6 +312,11 @@ export interface RunStage {
    *  reads "unpriced", is invisible to the run budget and never counts as
    *  saved. */
   unpricedModel?: boolean;
+  /** True when an attempt of this stage stopped before its CLI reported
+   *  usage (a Codex stage stopped before `turn.completed`; set by `get_run`):
+   *  its cost reads "usage not reported", never $0.00, and like an unpriced
+   *  stage it is invisible to the run budget. */
+  usageUnreported?: boolean;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -1209,6 +1214,11 @@ export const ipc = {
    *  network error — UI is expected to hide the chip silently. */
   findPrForBranch: (workspacePath: string) =>
     invoke<Pr | null>("find_pr_for_branch", { workspacePath }),
+
+  /** The tail of these Actions runs' failed-step logs (`gh run view
+   *  --log-failed`), capped at 8k chars. Empty without `gh`. */
+  prFailedCheckLogs: (workspacePath: string, runIds: number[]) =>
+    invoke<string>("pr_failed_check_logs", { workspacePath, runIds }),
 
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
