@@ -115,12 +115,71 @@ fn workspace_cache_dir(base: &Path, scope: &str) -> PathBuf {
     base.join(scope_key(if trimmed.is_empty() { scope } else { trimmed }))
 }
 
-/// A cache root under `base`: `<workspace dir>/<key of the write roots>`, so
-/// a readonly mission on a workspace doesn't share the writer's cache.
-/// Missions with the same workspace and access mode (two readonly reviews,
-/// say) share one. Pure.
-fn mission_cache_root(base: &Path, scope: &str, write_roots: &[String]) -> PathBuf {
-    workspace_cache_dir(base, scope).join(scope_key(&write_roots.join("\0")))
+/// Who a sandboxed launch shares its cache root (and the temp dir keyed by
+/// it, `stage_tmp_dir`) with, besides launches on the same workspace with the
+/// same write roots. A read-confined Claude stage names both dirs with
+/// `--add-dir`, and Claude Code loads `.claude/skills`, agents and commands
+/// from an `--add-dir` dir. A readonly mission's stages can't write the
+/// worktree, so for them these dirs are the only place another launch could
+/// plant such files. Each kind of launch therefore gets its own dirs: only
+/// read-confined Claude stages of the same workspace, write roots and exec
+/// choice write the dirs such a stage loads from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTenant<'a> {
+    /// A CLI stage (Claude or Codex) in a sandboxed mission. `exec_choice` is
+    /// the mission's own choice (`StageIsolation::exec_choice`), before a
+    /// `readonly` mission forces the sandbox on; `reads_confined` is whether
+    /// it is a Claude stage with the read guard (`confine_reads_in_sandbox`),
+    /// the only kind that `--add-dir`s its dirs.
+    Cli { exec_choice: &'a str, reads_confined: bool },
+    /// TALK's inline `run_command` and an API-substrate DIRECT stage's
+    /// (`chat_engine::execute_tool`): reads open, no `--add-dir`.
+    InProcess,
+    /// A Codex writer in Codex's own `workspace-write` sandbox, outside a
+    /// sandboxed mission (`codex_build_cache`).
+    CodexWorkspaceWrite,
+}
+
+impl CacheTenant<'_> {
+    /// The tenant's part of the cache root's key. Pure.
+    fn tag(&self) -> String {
+        match self {
+            CacheTenant::Cli { exec_choice, reads_confined } => {
+                format!("cli:exec={exec_choice}:reads={}", if *reads_confined { "confined" } else { "open" })
+            }
+            CacheTenant::InProcess => "in-process".to_string(),
+            CacheTenant::CodexWorkspaceWrite => "codex:workspace-write".to_string(),
+        }
+    }
+}
+
+/// A cache root under `base`: `<workspace dir>/<key of the write roots and
+/// the tenant>`, so a readonly mission on a workspace doesn't share the
+/// writer's cache, and no other kind of launch shares a read-confined Claude
+/// stage's ([`CacheTenant`]). Launches with the same workspace, write roots
+/// and tenant (two read-confined readonly reviews, say) share one. Pure.
+fn mission_cache_root(base: &Path, scope: &str, write_roots: &[String], tenant: CacheTenant) -> PathBuf {
+    // `\0` can't occur in a path, so roots and tag can't run into each other.
+    let key = format!("{}\0\0{}", write_roots.join("\0"), tenant.tag());
+    workspace_cache_dir(base, scope).join(scope_key(&key))
+}
+
+/// The dirs a sandboxed launch on the workspace `scope` with `write_roots`
+/// and `tenant` writes besides its write roots, before they are created: its
+/// cache root and, with `private_tmp`, its temp dir. `None` for the temp dir
+/// only when the root has no names to key it by. Pure; `StageDirs::make`
+/// creates exactly these.
+pub(crate) fn stage_dir_paths(
+    cache_base: &Path,
+    tmp_base: &Path,
+    scope: &str,
+    write_roots: &[String],
+    tenant: CacheTenant,
+    private_tmp: bool,
+) -> (PathBuf, Option<PathBuf>) {
+    let root = mission_cache_root(cache_base, scope, write_roots, tenant);
+    let tmp = if private_tmp { stage_tmp_dir(tmp_base, &root) } else { None };
+    (root, tmp)
 }
 
 /// Remove every build cache of the workspace at `scope` (all its access
@@ -275,10 +334,10 @@ fn sandbox_cache_env(cache_root: &str) -> Vec<(String, String)> {
 }
 
 /// The cache root of a Codex writer stage in Codex's own `workspace-write`
-/// sandbox, keyed by the workspace and a fixed mode tag so it never shares a
+/// sandbox, keyed by the workspace and its own tenant so it never shares a
 /// sandboxed mission's root. Pure.
-fn codex_cache_root(base: &Path, scope: &str) -> PathBuf {
-    mission_cache_root(base, scope, &["codex:workspace-write".to_string()])
+pub(crate) fn codex_cache_root(base: &Path, scope: &str) -> PathBuf {
+    mission_cache_root(base, scope, &[], CacheTenant::CodexWorkspaceWrite)
 }
 
 /// Set up the build cache of a Codex writer stage outside a sandboxed
@@ -915,25 +974,36 @@ struct StageDirs {
 }
 
 impl StageDirs {
-    /// Create the dirs for `write_roots` on the workspace `cache_scope`; the
-    /// temp dir only with `private_tmp` (and a cache root to key it by).
+    /// Create the dirs for `write_roots` and `tenant` on the workspace
+    /// `cache_scope` (the paths `stage_dir_paths` gives); the temp dir only
+    /// with `private_tmp` (and a cache root to key it by).
     /// Errors, so the launch fails closed, when one can't be made or isn't a
     /// real directory of the user's.
-    fn make(write_roots: &[String], cache_scope: Option<&str>, private_tmp: bool) -> AppResult<StageDirs> {
+    fn make(
+        write_roots: &[String],
+        cache_scope: Option<&str>,
+        tenant: CacheTenant,
+        private_tmp: bool,
+    ) -> AppResult<StageDirs> {
         let Some(scope) = cache_scope else { return Ok(StageDirs::default()) };
         let base = build_cache_base()
             .ok_or_else(|| AppError::Other("the sandbox found no cache directory for builds".into()))?;
-        let root = ensure_cache_root(&mission_cache_root(&base, scope, write_roots))
+        let no_tmp = || AppError::Other("the sandbox found no directory for the stage's temp files".into());
+        let tmp_base = match private_tmp {
+            true => stage_tmp_base().ok_or_else(no_tmp)?,
+            false => PathBuf::new(),
+        };
+        let (root, tmp) = stage_dir_paths(&base, &tmp_base, scope, write_roots, tenant, private_tmp);
+        let root = ensure_cache_root(&root)
             .map_err(|e| AppError::Other(format!("could not set up the sandbox build cache: {e}")))?;
-        let tmp = if private_tmp {
-            let dir = stage_tmp_base()
-                .and_then(|b| stage_tmp_dir(&b, &root))
-                .ok_or_else(|| AppError::Other("the sandbox found no directory for the stage's temp files".into()))?;
-            let dir = ensure_stage_tmp(&dir)
-                .map_err(|e| AppError::Other(format!("could not set up the stage's temp dir: {e}")))?;
-            Some(dir.to_string_lossy().into_owned())
-        } else {
-            None
+        let tmp = match (private_tmp, tmp) {
+            (false, _) => None,
+            (true, None) => return Err(no_tmp()),
+            (true, Some(dir)) => {
+                let dir = ensure_stage_tmp(&dir)
+                    .map_err(|e| AppError::Other(format!("could not set up the stage's temp dir: {e}")))?;
+                Some(dir.to_string_lossy().into_owned())
+            }
         };
         Ok(StageDirs { cache_root: Some(root.to_string_lossy().into_owned()), tmp })
     }
@@ -955,23 +1025,25 @@ impl StageDirs {
     }
 }
 
-/// Prepare a sandboxed launch: verify the platform + driver, build a fresh
-/// seatbelt profile, and return the wrapped argv. With `cache_scope` (the
-/// workspace), the build-cache root for that workspace and these write roots is
-/// created, made writable in the profile, and returned as `env`. Errors (no
+/// Prepare an in-process sandboxed launch (`chat_engine`'s `run_command`
+/// and `write_file`, wrapping `bash`): verify the platform + driver, build a
+/// fresh seatbelt profile, and return the wrapped argv. With `cache_scope`
+/// (the workspace), the build-cache root for that workspace, these write
+/// roots and [`CacheTenant::InProcess`] is created, made writable in the
+/// profile, and returned as `env`; it is never a CLI stage's root. Errors (no
 /// silent fallback) if sandboxing is unavailable or the cache root can't be
-/// made or isn't a real directory of the user's. Shared by the CLI
-/// substrate (wrapping `claude`) and in-process `run_command` (wrapping `bash`).
+/// made or isn't a real directory of the user's.
 pub fn prepare(
     write_roots: &[String],
     cache_scope: Option<&str>,
     program: &OsStr,
     args: &[String],
 ) -> AppResult<Prepared> {
-    prepare_with(write_roots, cache_scope, program, args, false, |_| Vec::new())
+    prepare_with(write_roots, cache_scope, CacheTenant::InProcess, program, args, false, |_| Vec::new())
 }
 
-/// [`prepare`] for a Claude CLI stage. With `private_tmp` (and a
+/// [`prepare`] for a CLI stage, whose dirs are keyed by `tenant`
+/// ([`CacheTenant::Cli`]). With `private_tmp` (and a
 /// `cache_scope`), the stage also gets its own temp dir (`stage_tmp_dir`,
 /// 0700, writable in the profile) and `TMPDIR` pointing at it, instead of the
 /// user-wide `$TMPDIR` every app and stage shares. `extra_args` gets the
@@ -982,6 +1054,7 @@ pub fn prepare(
 pub fn prepare_with(
     write_roots: &[String],
     cache_scope: Option<&str>,
+    tenant: CacheTenant,
     program: &OsStr,
     args: &[String],
     private_tmp: bool,
@@ -997,7 +1070,7 @@ pub fn prepare_with(
             "the sandbox driver ({SANDBOX_EXEC}) was not found"
         )));
     }
-    let stage_dirs = StageDirs::make(write_roots, cache_scope, private_tmp)?;
+    let stage_dirs = StageDirs::make(write_roots, cache_scope, tenant, private_tmp)?;
     let own_dirs = stage_dirs.dirs();
     let profile = build_seatbelt_profile(write_roots, &own_dirs)?;
     let mut args = args.to_vec();
@@ -1038,6 +1111,9 @@ pub fn is_write_allowed(target: &Path, write_roots: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read-confined Claude stage's tenant (a `sandbox` mission).
+    const RC: CacheTenant<'static> = CacheTenant::Cli { exec_choice: "sandbox", reads_confined: true };
 
     #[test]
     fn sbpl_string_escapes_quotes_and_backslashes() {
@@ -1576,8 +1652,8 @@ mod tests {
         assert_eq!(a, codex_cache_root(base, "/ws-a"));
         assert_ne!(a, codex_cache_root(base, "/ws-b"));
         // Never the root a sandboxed mission on the same workspace builds with.
-        assert_ne!(a, mission_cache_root(base, "/ws-a", &["/ws-a".to_string()]));
-        assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &["/ws-a".to_string()], RC));
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &[], RC));
         // In the workspace's dir, so deleting the workspace removes it too.
         assert_eq!(a.parent(), Some(workspace_cache_dir(base, "/ws-a").as_path()));
     }
@@ -1611,19 +1687,34 @@ mod tests {
         let tmpdir = "/private/var/folders/xy/T";
         let base = Path::new("/home/u/Library/Caches/octopush/build-cache");
         let ws_a = vec!["/ws-a".to_string()];
-        let a = mission_cache_root(base, "/ws-a", &ws_a);
-        let b = mission_cache_root(base, "/ws-b", &["/ws-b".to_string()]);
+        let a = mission_cache_root(base, "/ws-a", &ws_a, RC);
+        let b = mission_cache_root(base, "/ws-b", &["/ws-b".to_string()], RC);
         // A different workspace, or a readonly mission on the same one, gets a
         // different root, so a readonly review never builds with a cache a
         // writer on that workspace (or any other workspace) filled.
         assert_ne!(a, b);
-        assert_ne!(a, mission_cache_root(base, "/ws-a", &[]));
+        assert_ne!(a, mission_cache_root(base, "/ws-a", &[], RC));
         // Missions with the same workspace and access mode share one root.
-        assert_eq!(mission_cache_root(base, "/ws-a", &[]), mission_cache_root(base, "/ws-a", &[]));
+        assert_eq!(mission_cache_root(base, "/ws-a", &[], RC), mission_cache_root(base, "/ws-a", &[], RC));
+        // ...but only launches of the same tenant: an exec-`none` readonly
+        // stage, a Codex stage of a sandboxed readonly mission and an
+        // in-process `run_command` each get their own, in the same dir.
+        let tenants = [
+            RC,
+            CacheTenant::Cli { exec_choice: "none", reads_confined: false },
+            CacheTenant::Cli { exec_choice: "sandbox", reads_confined: false },
+            CacheTenant::InProcess,
+            CacheTenant::CodexWorkspaceWrite,
+        ];
+        let roots: Vec<PathBuf> = tenants.iter().map(|t| mission_cache_root(base, "/ws-a", &[], *t)).collect();
+        for (i, r) in roots.iter().enumerate() {
+            assert!(roots.iter().skip(i + 1).all(|o| o != r), "{:?} shares a root", tenants[i]);
+            assert_eq!(r.parent(), Some(workspace_cache_dir(base, "/ws-a").as_path()));
+        }
         // Every mode's root sits in the one dir of its workspace.
         let ws_dir = workspace_cache_dir(base, "/ws-a");
         assert_eq!(a.parent(), Some(ws_dir.as_path()));
-        assert_eq!(mission_cache_root(base, "/ws-a", &[]).parent(), Some(ws_dir.as_path()));
+        assert_eq!(mission_cache_root(base, "/ws-a", &[], RC).parent(), Some(ws_dir.as_path()));
         assert_eq!(ws_dir.parent(), Some(base));
         assert_ne!(ws_dir, workspace_cache_dir(base, "/ws-b"));
         assert_eq!(ws_dir, workspace_cache_dir(base, "/ws-a/"), "a trailing slash is the same workspace");
@@ -1725,9 +1816,9 @@ mod tests {
         let home = "/Users/abcdefgh";
         let base = PathBuf::from(format!("{home}/Library/Caches/octopush/build-cache"));
         let tmp_base = PathBuf::from(format!("{home}/Library/Caches/octopush/tmp"));
-        let writer = mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()]);
-        let reader = mission_cache_root(&base, "/ws-a", &[]);
-        let other_ws = mission_cache_root(&base, "/ws-b", &["/ws-b".to_string()]);
+        let writer = mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()], RC);
+        let reader = mission_cache_root(&base, "/ws-a", &[], RC);
+        let other_ws = mission_cache_root(&base, "/ws-b", &["/ws-b".to_string()], RC);
         let t = stage_tmp_dir(&tmp_base, &writer).unwrap();
         assert_eq!(t.parent(), Some(tmp_base.as_path()));
         assert_eq!(stage_tmp_dir(&tmp_base, &writer), Some(t.clone()), "stable");
@@ -1757,7 +1848,7 @@ mod tests {
         let ws = tempfile::tempdir().unwrap();
         let roots = vec![ws.path().to_string_lossy().into_owned()];
         let scope = format!("{}-stage-tmp-test", roots[0]);
-        let Ok(claude) = StageDirs::make(&roots, Some(scope.as_str()), true) else { return };
+        let Ok(claude) = StageDirs::make(&roots, Some(scope.as_str()), RC, true) else { return };
         let root = claude.cache_root.clone().unwrap();
         let tmp = claude.tmp.clone().unwrap();
         assert_eq!(claude.dirs(), vec![root.clone(), tmp.clone()], "cache root, then temp dir");
@@ -1792,11 +1883,11 @@ mod tests {
 
         // Without `private_tmp` (TALK's `run_command`, a Codex stage): the
         // same cache root, no temp dir, no TMPDIR.
-        let plain = StageDirs::make(&roots, Some(scope.as_str()), false).unwrap();
+        let plain = StageDirs::make(&roots, Some(scope.as_str()), RC, false).unwrap();
         assert_eq!(plain.dirs(), vec![root.clone()]);
         assert_eq!(plain.env(), sandbox_cache_env(&root));
         // No cache scope: nothing at all, even when a temp dir was asked for.
-        let none = StageDirs::make(&roots, None, true).unwrap();
+        let none = StageDirs::make(&roots, None, RC, true).unwrap();
         assert!(none.dirs().is_empty() && none.env().is_empty());
 
         // Deleting the workspace removes its temp dirs with its caches.
@@ -1878,8 +1969,8 @@ mod tests {
 
         // Workspace A: a stale readonly root beside a fresh writer root. The
         // stale one holds a link to a dir outside the base.
-        let stale = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[])).unwrap();
-        let fresh = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()])).unwrap();
+        let stale = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[], RC)).unwrap();
+        let fresh = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()], RC)).unwrap();
         let outside = dir.path().join("outside");
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(outside.join("keep"), "x").unwrap();
@@ -1888,7 +1979,7 @@ mod tests {
         set_old(&stale);
         set_old(stale.parent().unwrap());
         // Workspace B: only stale roots, so its dir goes too.
-        let gone = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[])).unwrap();
+        let gone = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[], RC)).unwrap();
         set_old(&gone);
         let ws_b = gone.parent().unwrap().to_path_buf();
         set_old(&ws_b);
@@ -1946,12 +2037,16 @@ mod tests {
     fn removing_a_workspaces_caches_takes_every_mode_and_spares_other_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("build-cache");
-        let a_ro = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[])).unwrap();
-        let a_rw = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()])).unwrap();
+        let a_ro = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[], RC)).unwrap();
+        let a_rw = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &["/ws-a".to_string()], RC)).unwrap();
         let a_codex = ensure_cache_root(&codex_cache_root(&base, "/ws-a")).unwrap();
-        let b = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[])).unwrap();
+        // Every tenant's root sits in the same workspace dir.
+        let open = CacheTenant::Cli { exec_choice: "none", reads_confined: false };
+        let a_open = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[], open)).unwrap();
+        let a_talk = ensure_cache_root(&mission_cache_root(&base, "/ws-a", &[], CacheTenant::InProcess)).unwrap();
+        let b = ensure_cache_root(&mission_cache_root(&base, "/ws-b", &[], RC)).unwrap();
         remove_cache_dir(&workspace_cache_dir(&base, "/ws-a/")).unwrap();
-        assert!(!a_ro.exists() && !a_rw.exists() && !a_codex.exists());
+        assert!(!a_ro.exists() && !a_rw.exists() && !a_codex.exists() && !a_open.exists() && !a_talk.exists());
         assert!(!workspace_cache_dir(&base, "/ws-a").exists());
         assert!(b.is_dir(), "another workspace's cache stays");
         // Already gone, or never made: fine.
@@ -2016,7 +2111,7 @@ mod tests {
         let run = |script: &str| {
             let mut seen: Vec<String> = Vec::new();
             let args = vec!["-c".to_string(), script.to_string()];
-            let prepared = prepare_with(&roots, Some(scope.as_str()), OsStr::new("bash"), &args, true, |dirs| {
+            let prepared = prepare_with(&roots, Some(scope.as_str()), RC, OsStr::new("bash"), &args, true, |dirs| {
                 seen = dirs.to_vec();
                 Vec::new()
             })
@@ -2100,9 +2195,12 @@ mod tests {
                 .map(|o| o.status.success())
                 .unwrap_or(false)
         };
-        let readonly = mission_cache_root(&base, &scope, &[]);
+        let readonly = mission_cache_root(&base, &scope, &[], RC);
         let codex = codex_cache_root(&base, &scope);
-        for other in [&readonly, &codex] {
+        // Nor the root a read-confined Claude stage with the same write roots
+        // loads with `--add-dir`: an in-process `run_command` has its own.
+        let claude_same_roots = mission_cache_root(&base, &scope, &roots, RC);
+        for other in [&readonly, &codex, &claude_same_roots] {
             assert!(!run(format!("mkdir '{}'", other.display())), "{} can't be created", other.display());
             assert!(!other.exists());
             let made = ensure_cache_root(other).unwrap();

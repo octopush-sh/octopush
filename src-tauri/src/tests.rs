@@ -9597,6 +9597,105 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn only_equally_confined_claude_stages_can_write_the_dirs_a_read_confined_stage_add_dirs() {
+        use crate::orchestrator::cli_runner::{cli_cache_tenant, confine_reads_in_sandbox, CliDialect};
+        use crate::orchestrator::sandbox::{
+            codex_cache_root, sandbox_write_roots, stage_dir_paths, stage_isolation, CacheTenant,
+        };
+        use std::path::{Path, PathBuf};
+        // #743 review: every readonly mission had write roots `[]`, so an
+        // exec-`none` review (reads open, untrusted diffs) shared its cache
+        // root and temp dir with a read-confined readonly stage, which loads
+        // `.claude/skills` from both through `--add-dir`. This pins, for
+        // every kind of launch that writes these dirs, that none can write a
+        // dir a read-confined Claude stage `--add-dir`s unless it is itself a
+        // read-confined Claude stage of the same workspace, access mode and
+        // exec choice.
+        let cache_base = Path::new("/Users/u/Library/Caches/octopush/build-cache");
+        let tmp_base = Path::new("/Users/u/Library/Caches/octopush/tmp");
+        #[derive(Debug, Clone, PartialEq)]
+        struct Launch {
+            who: &'static str,
+            ws: &'static str,
+            git: &'static str,
+            exec: &'static str,
+            reads_confined: bool,
+            writes: Vec<PathBuf>,
+        }
+        let mut launches: Vec<Launch> = Vec::new();
+        let dirs = |ws: &str, roots: &[String], tenant: CacheTenant, private_tmp: bool| -> Vec<PathBuf> {
+            let (root, tmp) = stage_dir_paths(cache_base, tmp_base, ws, roots, tenant, private_tmp);
+            assert_eq!(tmp.is_some(), private_tmp);
+            std::iter::once(root).chain(tmp).collect()
+        };
+        for ws in ["/ws-a", "/ws-b"] {
+            for git in ["worktree", "readonly"] {
+                for exec in ["none", "sandbox"] {
+                    let iso = stage_isolation(git, exec, ws);
+                    // CLI stages, as `CliRunner` launches them.
+                    if iso.exec_isolation == "sandbox" {
+                        for (who, dialect) in [("claude-cli", CliDialect::Claude), ("codex-cli", CliDialect::Codex)] {
+                            let mut args = build_cli_args("m", "sys", 10, true);
+                            let reads = confine_reads_in_sandbox(dialect, &iso.exec_choice, &mut args);
+                            let tenant = cli_cache_tenant(&iso.exec_choice, reads);
+                            let private_tmp = dialect == CliDialect::Claude;
+                            let writes = dirs(ws, &iso.allowed_write_roots, tenant, private_tmp);
+                            launches.push(Launch { who, ws, git, exec, reads_confined: reads, writes });
+                        }
+                        // An API-substrate DIRECT stage's `run_command`
+                        // (`StageContext.allowed_write_roots`, `sandbox::prepare`).
+                        let writes = dirs(ws, &iso.allowed_write_roots, CacheTenant::InProcess, false);
+                        launches.push(Launch { who: "api-run-command", ws, git, exec, reads_confined: false, writes });
+                    }
+                    // TALK's `run_command` (`send_agentic`, `sandbox::prepare`).
+                    if let Some(roots) = sandbox_write_roots(git, exec, ws) {
+                        let writes = dirs(ws, &roots, CacheTenant::InProcess, false);
+                        launches.push(Launch { who: "talk-run-command", ws, git, exec, reads_confined: false, writes });
+                    }
+                    // A Codex writer in its own sandbox (`codex_build_cache`).
+                    if iso.exec_isolation == "none" {
+                        let writes = vec![codex_cache_root(cache_base, ws)];
+                        launches.push(Launch { who: "codex-workspace-write", ws, git, exec, reads_confined: false, writes });
+                    }
+                }
+            }
+        }
+        let readers: Vec<&Launch> = launches.iter().filter(|l| l.reads_confined).collect();
+        // Read-confined stages: Claude in a mission whose own choice is sandbox.
+        assert_eq!(readers.len(), 4, "{readers:?}");
+        assert!(readers.iter().all(|r| r.who == "claude-cli" && r.exec == "sandbox"));
+        for r in &readers {
+            // What the stage passes with `--add-dir` is exactly what it writes.
+            assert_eq!(r.writes.len(), 2);
+            for w in &launches {
+                let shared: Vec<&PathBuf> = w.writes.iter().filter(|d| r.writes.contains(d)).collect();
+                let equally_confined =
+                    w.who == "claude-cli" && w.reads_confined && w.ws == r.ws && w.git == r.git && w.exec == r.exec;
+                if equally_confined {
+                    assert_eq!(shared.len(), 2, "{w:?} should share {r:?}'s dirs");
+                } else {
+                    assert!(shared.is_empty(), "{} ({} {} {}) can write {shared:?}, which {r:?} --add-dirs", w.who, w.ws, w.git, w.exec);
+                }
+            }
+        }
+        // The case the review found: a readonly exec-`none` review stage no
+        // longer shares a readonly sandboxed stage's cache root or temp dir.
+        let ro_open = launches
+            .iter()
+            .find(|l| l.who == "claude-cli" && l.ws == "/ws-a" && l.git == "readonly" && l.exec == "none")
+            .unwrap();
+        assert!(!ro_open.reads_confined && ro_open.writes.len() == 2, "it keeps its own temp dir");
+        let ro_confined = readers.iter().find(|l| l.ws == "/ws-a" && l.git == "readonly").unwrap();
+        assert!(ro_open.writes.iter().all(|d| !ro_confined.writes.contains(d)));
+        // Every dir still sits in its workspace's cache dir (or the temp base),
+        // keyed so `remove_workspace_build_caches` and the prune find it.
+        for l in &launches {
+            assert!(l.writes[0].starts_with(cache_base), "{l:?}");
+            assert!(l.writes.iter().skip(1).all(|t| t.parent() == Some(tmp_base)), "{l:?}");
+        }
+    }
+
+    #[test]
     fn budget_cap_becomes_max_budget_usd_only_with_a_limit() {
         use crate::orchestrator::cli_runner::{cli_budget_cap, max_budget_args};
         // #362: a run budget's remaining headroom caps the Claude stage.

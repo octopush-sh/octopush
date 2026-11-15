@@ -836,14 +836,29 @@ pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &m
     }
 }
 
+/// The [`CacheTenant`](crate::orchestrator::sandbox::CacheTenant) a sandboxed
+/// CLI stage's cache root and temp dir are keyed by: the mission's own exec
+/// choice and whether the stage is read-confined (the `bool`
+/// [`confine_reads_in_sandbox`] returned). Pure.
+pub fn cli_cache_tenant(exec_choice: &str, reads_confined: bool) -> crate::orchestrator::sandbox::CacheTenant<'_> {
+    crate::orchestrator::sandbox::CacheTenant::Cli { exec_choice, reads_confined }
+}
+
 /// `--add-dir` flags for a read-confined Claude stage (`reads_confined`, see
 /// [`confine_reads_in_sandbox`]): its build-cache root and own temp dir
-/// (`dirs`, from `sandbox::prepare_with`), which only stages of the same
-/// workspace and access mode can write and `sandbox_cache_env` / `TMPDIR`
-/// point npm, cargo & co. at. Without them the read guard would refuse the
-/// stage's own temp files and redirected caches. One flag per dir, blanks
-/// and repeats (trailing `/` ignored) dropped; nothing when reads aren't
-/// confined. Pure.
+/// (`dirs`, from `sandbox::prepare_with`), which `sandbox_cache_env` /
+/// `TMPDIR` point npm, cargo & co. at. Both are keyed by workspace, write
+/// roots, exec choice and read guard ([`cli_cache_tenant`]), so the only
+/// launches that can write them are read-confined Claude stages of the same
+/// workspace, access mode and exec choice: no Codex stage, no exec-`none`
+/// readonly stage, no TALK or API-substrate `run_command`, and no Codex
+/// writer outside the sandbox. That matters most for a readonly mission,
+/// whose stages can't write the worktree: these dirs would otherwise be the
+/// one place another launch could plant `.claude/skills`, agents or commands
+/// that Claude Code loads from an `--add-dir` dir. Without them the read
+/// guard would refuse the stage's own temp files and redirected caches. One
+/// flag per dir, blanks and repeats (trailing `/` ignored) dropped; nothing
+/// when reads aren't confined. Pure.
 pub fn sandbox_read_dir_args(reads_confined: bool, dirs: &[String]) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
     let mut out = Vec::new();
@@ -2166,10 +2181,14 @@ impl CliRunner {
                     let scope = ctx.workspace_path.to_string_lossy();
                     // A Claude stage gets its own temp dir (`TMPDIR`) beside
                     // its cache root; a read-confined one names both as
-                    // working dirs, or the read guard refuses them.
+                    // working dirs, or the read guard refuses them. Both are
+                    // keyed by the exec choice and the read guard too, so no
+                    // stage with open reads (a Codex stage, an exec-`none`
+                    // review) shares a read-confined stage's dirs.
                     match crate::orchestrator::sandbox::prepare_with(
                         &ctx.allowed_write_roots,
                         Some(&*scope),
+                        cli_cache_tenant(&ctx.exec_choice, reads_confined),
                         &real_program,
                         &args,
                         dialect == CliDialect::Claude,
