@@ -33,6 +33,7 @@ describe("prefillFixChecks", () => {
     const prefill = useRunsStore.getState().launcherPrefill!;
     expect(prefill.workspaceId).toBe("w1");
     expect(prefill.pipelineId).toBe("");
+    expect(prefill.append).toBe(true); // never wipes a brief the user typed
     expect(prefill.task).toContain("- test\n- lint");
     expect(prefill.task).toContain("```\nError: expected 2, got 3\n```");
     expect(useRunsStore.getState().selectedRunIdByWs.w1).toBeNull();

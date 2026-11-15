@@ -138,36 +138,115 @@ fn rollup(checks: impl Iterator<Item = (String, CheckOutcome, Option<String>)>) 
 /// and commit statuses (`"StatusContext"`: `context`, `state`, `targetUrl`).
 pub fn checks_from_gh_rollup(rollup_json: &serde_json::Value) -> Option<PrChecks> {
     let items = rollup_json.as_array()?;
-    rollup(items.iter().map(|c| {
-        let is_status = c["__typename"].as_str() == Some("StatusContext")
-            || (c.get("context").is_some() && c.get("conclusion").is_none());
-        if is_status {
-            (
-                c["context"].as_str().unwrap_or("status").to_string(),
-                check_outcome(None, None, Some(c["state"].as_str().unwrap_or("pending"))),
-                c["targetUrl"].as_str().map(str::to_string),
-            )
-        } else {
-            (
-                c["name"].as_str().unwrap_or("check").to_string(),
-                check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
-                c["detailsUrl"].as_str().map(str::to_string),
-            )
-        }
-    }))
+    rollup(items.iter().map(gh_rollup_item))
+}
+
+/// Whether a rollup item is a commit status rather than a check run.
+fn is_gh_status_context(c: &serde_json::Value) -> bool {
+    c["__typename"].as_str() == Some("StatusContext")
+        || (c.get("context").is_some() && c.get("conclusion").is_none())
+}
+
+fn gh_rollup_item(c: &serde_json::Value) -> (String, CheckOutcome, Option<String>) {
+    if is_gh_status_context(c) {
+        (
+            c["context"].as_str().unwrap_or("status").to_string(),
+            check_outcome(None, None, Some(c["state"].as_str().unwrap_or("pending"))),
+            c["targetUrl"].as_str().map(str::to_string),
+        )
+    } else {
+        (
+            c["name"].as_str().unwrap_or("check").to_string(),
+            check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
+            c["detailsUrl"].as_str().map(str::to_string),
+        )
+    }
+}
+
+fn rest_check_run_item(c: &serde_json::Value) -> (String, CheckOutcome, Option<String>) {
+    (
+        c["name"].as_str().unwrap_or("check").to_string(),
+        check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
+        c["details_url"].as_str().or_else(|| c["html_url"].as_str()).map(str::to_string),
+    )
 }
 
 /// Parse the REST `GET /repos/{o}/{r}/commits/{sha}/check-runs` body
 /// (`{ "check_runs": [{ name, status, conclusion, details_url, html_url }] }`).
 pub fn checks_from_rest_check_runs(body: &serde_json::Value) -> Option<PrChecks> {
     let runs = body["check_runs"].as_array()?;
-    rollup(runs.iter().map(|c| {
-        (
-            c["name"].as_str().unwrap_or("check").to_string(),
-            check_outcome(c["status"].as_str(), c["conclusion"].as_str(), None),
-            c["details_url"].as_str().or_else(|| c["html_url"].as_str()).map(str::to_string),
-        )
-    }))
+    rollup(runs.iter().map(rest_check_run_item))
+}
+
+/// The most entries `gh pr … --json statusCheckRollup` returns; a rollup this
+/// long may have more checks behind it.
+pub const GH_ROLLUP_CAP: usize = 100;
+
+/// Whether `statusCheckRollup` came back full, so the check runs must be
+/// re-read page by page to see every one.
+pub fn gh_rollup_may_be_capped(rollup_json: &serde_json::Value) -> bool {
+    rollup_json.as_array().is_some_and(|a| a.len() >= GH_ROLLUP_CAP)
+}
+
+/// The `gh api --paginate` command line that lists every check run on `sha`.
+/// `None` unless `sha` is a hex commit id; owner and repo are single-quoted.
+pub fn gh_check_runs_command(owner: &str, repo: &str, sha: &str) -> Option<String> {
+    if sha.is_empty() || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let path = format!("repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={CHECK_RUNS_PER_PAGE}");
+    Some(format!("gh api --paginate '{}'", path.replace('\'', "'\\''")))
+}
+
+/// The check runs in `gh api --paginate`'s output, which prints each page's
+/// `{ "total_count", "check_runs": [...] }` object one after another. `None`
+/// when the first page isn't readable; a broken later page keeps the runs
+/// read before it.
+pub fn check_runs_from_gh_pages(raw: &[u8]) -> Option<Vec<serde_json::Value>> {
+    let mut runs: Vec<serde_json::Value> = Vec::new();
+    let mut pages = 0;
+    for page in serde_json::Deserializer::from_slice(raw).into_iter::<serde_json::Value>() {
+        let Some(page_runs) = page.ok().and_then(|p| p["check_runs"].as_array().cloned()) else {
+            break;
+        };
+        pages += 1;
+        runs.extend(page_runs);
+    }
+    (pages > 0).then_some(runs)
+}
+
+/// Roll up a capped `statusCheckRollup` with every check run on the commit:
+/// the commit statuses come from the rollup, the check runs from `runs`
+/// (REST shape), so a failing check past the cap still shows.
+pub fn checks_from_gh_rollup_and_runs(
+    rollup_json: &serde_json::Value,
+    runs: &[serde_json::Value],
+) -> Option<PrChecks> {
+    let statuses = rollup_json
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|c| is_gh_status_context(c))
+        .map(gh_rollup_item);
+    rollup(statuses.chain(runs.iter().map(rest_check_run_item)))
+}
+
+/// Check runs per page of the REST `check-runs` list (GitHub's maximum).
+pub const CHECK_RUNS_PER_PAGE: usize = 100;
+
+/// The most pages of check runs read for one commit (1,000 runs).
+pub const CHECK_RUNS_MAX_PAGES: u32 = 10;
+
+/// Whether to read another page of check runs: the last page was full and,
+/// when GitHub sent `total_count`, fewer than that have been read so far.
+pub fn more_check_run_pages(total_count: Option<u64>, read: usize, page_len: usize) -> bool {
+    if page_len < CHECK_RUNS_PER_PAGE {
+        return false;
+    }
+    match total_count {
+        Some(total) => (read as u64) < total,
+        None => true,
+    }
 }
 
 /// The most a "Fix failing checks" brief carries of the failed-step logs.
