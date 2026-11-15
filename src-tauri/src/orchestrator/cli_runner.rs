@@ -802,12 +802,16 @@ pub const CLAUDE_STAGE_SETTINGS: &str = r#"{"permissions":{"blockWritesOutsideWo
 /// `~/.ssh`, `~/.aws` or a sibling repo into its context. Claude Code also
 /// asks before a Bash command it sees reading outside them, which a headless
 /// stage refuses; reads it can't see still go through (the Seatbelt profile
-/// only denies writes). The stage's temp dirs and build-cache root are added
-/// as working dirs (`--add-dir`, [`sandbox_read_dir_args`]), so it can still
-/// read what it writes there. Every other mission keeps the write guard only —
-/// a `readonly` (review/probe) mission with `exec_isolation = "none"` too,
-/// though its sandbox is forced on: its agents read dependency sources
-/// outside the worktree.
+/// only denies writes). The stage's build-cache root and its own temp dir
+/// (`TMPDIR`, see `sandbox::prepare_with`) are added as working dirs
+/// (`--add-dir`, [`sandbox_read_dir_args`]), so it can still read what it
+/// writes there. The user-wide `$TMPDIR` is not: every app and stage writes
+/// there, and Claude Code loads `.claude/skills`, agents and commands from an
+/// `--add-dir` dir, so it would let anything plant skills into the stage.
+/// Every other mission keeps the write guard only — a `readonly`
+/// (review/probe) mission with `exec_isolation = "none"` too, though its
+/// sandbox is forced on: its agents read dependency sources outside the
+/// worktree.
 pub const CLAUDE_SANDBOXED_STAGE_SETTINGS: &str =
     r#"{"permissions":{"blockWritesOutsideWorkingDirectories":true,"blockReadsOutsideWorkingDirectories":true}}"#;
 
@@ -833,11 +837,13 @@ pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &m
 }
 
 /// `--add-dir` flags for a read-confined Claude stage (`reads_confined`, see
-/// [`confine_reads_in_sandbox`]): its temp dirs and build-cache root, which
-/// the Seatbelt profile lets it write and `sandbox_cache_env` points npm,
-/// cargo & co. at. Without them the read guard would refuse the stage's own
-/// temp files and redirected caches. One flag per dir, blanks and repeats
-/// (trailing `/` ignored) dropped; nothing when reads aren't confined. Pure.
+/// [`confine_reads_in_sandbox`]): its build-cache root and own temp dir
+/// (`dirs`, from `sandbox::prepare_with`), which only stages of the same
+/// workspace and access mode can write and `sandbox_cache_env` / `TMPDIR`
+/// point npm, cargo & co. at. Without them the read guard would refuse the
+/// stage's own temp files and redirected caches. One flag per dir, blanks
+/// and repeats (trailing `/` ignored) dropped; nothing when reads aren't
+/// confined. Pure.
 pub fn sandbox_read_dir_args(reads_confined: bool, dirs: &[String]) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
     let mut out = Vec::new();
@@ -855,21 +861,6 @@ pub fn sandbox_read_dir_args(reads_confined: bool, dirs: &[String]) -> Vec<Strin
         out.push(t.to_string());
     }
     out
-}
-
-/// The dirs [`sandbox_read_dir_args`] names for a sandboxed stage: `$TMPDIR`
-/// (and its realpath, the form Seatbelt matches, when it differs) and the
-/// stage's build-cache root.
-fn sandbox_read_dirs(cache_root: Option<&str>) -> Vec<String> {
-    let mut dirs = Vec::new();
-    if let Some(t) = std::env::var("TMPDIR").ok().filter(|t| !t.trim().is_empty()) {
-        if let Ok(c) = std::fs::canonicalize(&t) {
-            dirs.push(c.to_string_lossy().into_owned());
-        }
-        dirs.push(t);
-    }
-    dirs.extend(cache_root.map(str::to_string));
-    dirs
 }
 
 /// The launch line's note when the read guard was asked for but the known
@@ -1219,14 +1210,22 @@ impl CliDialect {
     /// Code moves it to the background right away", and a stage settled on its
     /// `result` could otherwise hand on work that is still running. The
     /// changelog scopes that to the terminal, so this is a defensive pin; an
-    /// older CLI ignores the unknown variable. Set on fresh and `--resume` runs
-    /// alike; Run-mode terminals never get it — backgrounding is theirs to keep.
+    /// older CLI ignores the unknown variable. Skills stay as the stage found
+    /// them (`CLAUDE_CODE_PLUGIN_DIR_WATCH=0`): 2.1.321 "changed headless
+    /// sessions to reload mods in `.claude/skills` when their files change",
+    /// so a stage that writes (or is tricked into planting) a skill in the
+    /// worktree it edits would change its own instructions mid-stage, and a
+    /// reviewer would certify work done under other rules than it started
+    /// with; an older CLI ignores this one too. All are set on fresh and
+    /// `--resume` runs alike; Run-mode terminals never get them — backgrounding
+    /// and skill reloads are theirs to keep, since a human is directing there.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
                 ("CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS", BG_WAIT_CEILING_MS.to_string()),
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
                 ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
+                ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
         }
@@ -2165,14 +2164,16 @@ impl CliRunner {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
                     let scope = ctx.workspace_path.to_string_lossy();
-                    // A read-confined stage names its temp dirs and cache
-                    // root as working dirs, or the read guard refuses them.
+                    // A Claude stage gets its own temp dir (`TMPDIR`) beside
+                    // its cache root; a read-confined one names both as
+                    // working dirs, or the read guard refuses them.
                     match crate::orchestrator::sandbox::prepare_with(
                         &ctx.allowed_write_roots,
                         Some(&*scope),
                         &real_program,
                         &args,
-                        |cache_root| sandbox_read_dir_args(reads_confined, &sandbox_read_dirs(cache_root)),
+                        dialect == CliDialect::Claude,
+                        |own_dirs| sandbox_read_dir_args(reads_confined, own_dirs),
                     ) {
                         Ok(prepared) => {
                             sandbox_env = prepared.env;

@@ -1328,8 +1328,26 @@ pub async fn delete_workspace(
 
     // Remove from DB. The row's runs cascade-delete without a run:// event, so
     // a paused one would keep the Dock badge counting it: refresh it now.
+    let db_path = state.db.lock().conn_ref_path(&workspace_id).ok().flatten();
     state.db.lock().delete_workspace(&workspace_id)?;
     crate::fleet_status::refresh_later(&app);
+
+    // Its sandbox build caches go with it, unless another workspace still
+    // sits at the same path (they key the cache by path, a trailing `/`
+    // ignored). Off the IPC thread: a cargo or npm cache can be large.
+    if let Some(path) = db_path {
+        let trimmed = path.trim_end_matches('/').to_string();
+        let shared = [trimmed.clone(), format!("{trimmed}/")]
+            .iter()
+            .any(|p| state.db.lock().workspace_by_path(p).ok().flatten().is_some());
+        if !shared {
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = crate::orchestrator::sandbox::remove_workspace_build_caches(&path) {
+                    tracing::warn!(error = %e, "could not remove the workspace's build caches");
+                }
+            });
+        }
+    }
     Ok(())
 }
 
@@ -2345,6 +2363,27 @@ pub async fn history_run_detail(
 ) -> AppResult<Option<crate::sync::SyncRunDetail>> {
     require_history_sync()?;
     crate::sync::pull_run_detail(crate::chat_engine::shared_http_client(), &run_id).await
+}
+
+/// The models among `models` this Mac can't price (`prices_in` is `None`),
+/// deduplicated, in first-seen order. The History sheet asks this for synced
+/// stages so an unknown or gateway model reads "unpriced", never "$0.00".
+#[tauri::command]
+pub async fn unpriced_models(models: Vec<String>) -> AppResult<Vec<String>> {
+    Ok(unpriced_models_in(crate::token_engine::catalog().as_deref(), &models))
+}
+
+pub(crate) fn unpriced_models_in(
+    router: Option<&crate::provider_router::ProviderRouter>,
+    models: &[String],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    models
+        .iter()
+        .filter(|m| seen.insert(m.as_str()))
+        .filter(|m| crate::token_engine::prices_in(router, m).is_none())
+        .cloned()
+        .collect()
 }
 
 /// Push the WHOLE custom library (pipelines + roles) to the cloud — the launch
@@ -6724,6 +6763,14 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
     Ok(crate::agent_adapter::claude_cli_version_cached()
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher, Readiness and Routines: the models among `models` with a
+/// published retirement date (`token_engine::MODEL_RETIREMENTS`), each once.
+/// The caller decides from the date whether to say anything.
+#[tauri::command]
+pub fn model_retirements(models: Vec<String>) -> AppResult<Vec<crate::token_engine::ModelRetirement>> {
+    Ok(crate::token_engine::model_retirements(&models))
 }
 
 /// Settings › General readiness card: local checks (claude, auth mode, codex,

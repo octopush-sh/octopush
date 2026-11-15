@@ -415,6 +415,7 @@ pub fn run() {
             commands::connect_claude_code,
             commands::claude_cli_version,
             commands::claude_model_floor_note,
+            commands::model_retirements,
             commands::readiness_check,
             // Role commands
             commands::list_roles,
@@ -447,6 +448,7 @@ pub fn run() {
             commands::history_sync_pull,
             commands::history_sync_push_all,
             commands::history_run_detail,
+            commands::unpriced_models,
             commands::library_sync_push_all,
             commands::library_sync_pull,
             // Accounts (P1)
@@ -506,6 +508,14 @@ pub fn run() {
                     }
                 });
             }
+
+            // Sandbox build caches nobody used for 30 days.
+            tauri::async_runtime::spawn_blocking(|| {
+                let n = orchestrator::sandbox::prune_build_caches(orchestrator::sandbox::BUILD_CACHE_MAX_AGE);
+                if n > 0 {
+                    tracing::info!(count = n, "pruned unused build caches");
+                }
+            });
 
             // Direct-mode orchestrator: seed builtin pipelines + register engine.
             {

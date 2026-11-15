@@ -206,6 +206,21 @@ mod db_tests {
     }
 
     #[test]
+    fn unpriced_models_lists_only_unknown_models_once() {
+        // No catalog: the builtin table decides. Known models are dropped,
+        // unknown ones kept once each, in first-seen order.
+        let models: Vec<String> = ["claude-opus-5-5", "gw/mystery-1", "gpt-4o", "gw/mystery-1", "other-unknown-xyz"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::commands::unpriced_models_in(None, &models),
+            vec!["gw/mystery-1".to_string(), "other-unknown-xyz".to_string()]
+        );
+        assert!(crate::commands::unpriced_models_in(None, &[]).is_empty());
+    }
+
+    #[test]
     #[serial_test::serial(pricing_catalog)]
     fn cost_for_prices_current_and_dated_models() {
         // Isolated catalog: never the owner's ~/.octopush/providers.json.
@@ -9514,26 +9529,20 @@ mod cli_args_tests {
     }
 
     #[test]
-    fn a_read_confined_stage_adds_its_temp_dirs_and_build_cache_as_working_dirs() {
+    fn a_read_confined_stage_adds_only_its_own_cache_root_and_temp_dir_as_working_dirs() {
         use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, sandbox_read_dir_args, CliDialect};
-        // #743 review: the read guard must not refuse the stage's own `$TMPDIR`
-        // and the build-cache root `sandbox_cache_env` points npm/cargo at.
-        let dirs = vec![
-            "/private/var/folders/xy/T".to_string(),
-            "/var/folders/xy/T/".to_string(),
-            "/Users/u/Library/Caches/octopush/build-cache/0123abcd".to_string(),
-            "/private/var/folders/xy/T/".to_string(),
-            "  ".to_string(),
-        ];
+        // #743 review: the read guard must not refuse the stage's own temp dir
+        // and the build-cache root `sandbox_cache_env` points npm/cargo at,
+        // and must not add the user-wide `$TMPDIR`: every app and stage writes
+        // there, and Claude Code loads `.claude/skills` from an `--add-dir`.
+        let root = "/Users/u/Library/Caches/octopush/build-cache/0123abcd/4567ef01";
+        let tmp = "/Users/u/Library/Caches/octopush/tmp/89abcdef01234567";
+        let dirs = vec![root.to_string(), tmp.to_string(), format!("{root}/"), "  ".to_string()];
         let added = |args: &[String]| -> Vec<String> {
             args.iter().enumerate().filter(|(_, a)| *a == "--add-dir").map(|(i, _)| args[i + 1].clone()).collect()
         };
         for (choice, want) in [
-            ("sandbox", vec![
-                "/private/var/folders/xy/T",
-                "/var/folders/xy/T",
-                "/Users/u/Library/Caches/octopush/build-cache/0123abcd",
-            ]),
+            ("sandbox", vec![root, tmp]),
             ("none", vec![]),
         ] {
             for mut args in [
@@ -9545,6 +9554,10 @@ mod cli_args_tests {
                 let reads = confine_reads_in_sandbox(CliDialect::Claude, choice, &mut args);
                 args.extend(sandbox_read_dir_args(reads, &dirs));
                 assert_eq!(added(&args), want, "{choice}: {args:?}");
+                assert!(
+                    !added(&args).iter().any(|d| d.contains("/var/folders") || d.starts_with("/tmp") || d.starts_with("/private/tmp")),
+                    "{args:?}"
+                );
                 assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1, "{args:?}");
             }
         }
