@@ -9641,7 +9641,8 @@ mod cli_dialect_tests {
             assert!(config("approval_policy=\"never\""), "{argv:?}");
             // The network stays on, as under Octopush's own Seatbelt profile.
             assert!(config("sandbox_workspace_write.network_access=true"), "{argv:?}");
-            // Never an extra writable root (a worktree's git dir would hand over its `commondir`).
+            // No writable root of its own (a worktree's git dir would hand over
+            // its `commondir`); the runner adds only the build-cache root.
             assert!(!argv.iter().any(|a| a.starts_with("sandbox_workspace_write.writable_roots")), "{argv:?}");
         }
         assert_eq!(CliDialect::Codex.sandbox_label(false, ws), Some("workspace-write sandbox"));
@@ -9674,6 +9675,40 @@ mod cli_dialect_tests {
         assert!(!none.iter().any(|a| a.contains("dangerously")), "{none:?}");
         let sandboxed = CliDialect::Codex.argv("gpt-5", "s", 1, false, codex_write_scope("sandbox"));
         assert!(sandboxed.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{sandboxed:?}");
+    }
+
+    #[test]
+    fn a_codex_writers_build_cache_root_is_its_one_extra_writable_root_before_the_prompt() {
+        use crate::orchestrator::cli_runner::codex_writable_root_args;
+        let flags = codex_writable_root_args("/Users/u/Library/Caches/octopush/build-cache/ab12");
+        assert_eq!(
+            flags,
+            vec![
+                "-c".to_string(),
+                "sandbox_workspace_write.writable_roots=[\"/Users/u/Library/Caches/octopush/build-cache/ab12\"]".to_string()
+            ]
+        );
+        // A quote or backslash in the path stays inside one TOML string.
+        let odd = codex_writable_root_args("/a \"b\\c");
+        assert_eq!(odd[1], "sandbox_workspace_write.writable_roots=[\"/a \\\"b\\\\c\"]");
+        let mut argv = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::Workspace);
+        CliDialect::Codex.push_flags(&mut argv, flags.clone());
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "prompt still rides stdin");
+        assert!(argv.windows(2).any(|w| w[0] == "-c" && w[1] == flags[1]), "{argv:?}");
+        assert_eq!(argv.iter().filter(|a| a.starts_with("sandbox_workspace_write.writable_roots")).count(), 1);
+    }
+
+    #[test]
+    fn an_action_role_on_a_codex_writer_in_codexs_sandbox_is_told_it_cant_commit() {
+        use crate::orchestrator::cli_runner::codex_git_notice;
+        use crate::orchestrator::types::RoleEnvironment::{Action, Worktree};
+        let ws = CodexWriteScope::Workspace;
+        let note = codex_git_notice(CliDialect::Codex, false, ws, Action).unwrap();
+        assert!(note.contains("can't commit"), "{note}");
+        assert!(codex_git_notice(CliDialect::Codex, false, ws, Worktree).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, false, CodexWriteScope::MissionSandbox, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Codex, true, ws, Action).is_none());
+        assert!(codex_git_notice(CliDialect::Claude, false, ws, Action).is_none());
     }
 
     #[test]

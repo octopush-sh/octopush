@@ -871,14 +871,17 @@ pub enum CliDialect {
 /// run in Codex's `read-only` sandbox; Claude stages ignore this).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum CodexWriteScope {
-    /// Codex's own `workspace-write` sandbox with the network on and no extra
-    /// writable roots: the worktree and Codex's temp dirs only. A linked
-    /// worktree's git dir is left out on purpose: Codex's writable roots can't
-    /// deny a path inside a root, so granting `<common>/worktrees/<name>`
-    /// would hand over its `commondir` and `config.worktree`, which repoint
-    /// git at planted config and hooks. `git add`/`git commit` therefore fail
-    /// there. The worktree's own `.git` entry is checked after the stage
-    /// ([`guards_git_entry`]).
+    /// Codex's own `workspace-write` sandbox with the network on: the
+    /// worktree, Codex's temp dirs and the stage's own build-cache root
+    /// ([`codex_writable_root_args`]). Codex keeps `<worktree>/.git` and the
+    /// gitdir it resolves to read-only, and a linked worktree's objects and
+    /// refs live in the common dir outside the worktree, so `git add`,
+    /// `commit`, `stash`, `fetch` and `checkout -b` fail in every such stage.
+    /// The git dirs are left out on purpose: Codex's writable roots can't deny
+    /// a path inside a root, so granting `<common>/worktrees/<name>` would hand
+    /// over its `commondir` and `config.worktree`, which repoint git at
+    /// planted config and hooks. The worktree's own `.git` entry is also
+    /// checked after the stage ([`guards_git_entry`]).
     Workspace,
     /// The mission runs sandboxed: Octopush's Seatbelt profile already
     /// confines the process, and nesting Codex's Seatbelt inside it is untested.
@@ -895,12 +898,36 @@ pub fn codex_write_scope(exec_isolation: &str) -> CodexWriteScope {
     }
 }
 
+/// The `-c` override that adds `root` (the stage's build-cache root,
+/// `sandbox::codex_build_cache`) to Codex's `workspace-write` writable roots.
+/// The value is a TOML array; a JSON string array is one. Pure.
+pub fn codex_writable_root_args(root: &str) -> Vec<String> {
+    let list = serde_json::to_string(&[root]).unwrap_or_else(|_| "[]".to_string());
+    vec!["-c".to_string(), format!("sandbox_workspace_write.writable_roots={list}")]
+}
+
 /// Whether the runner checks the worktree's `.git` entry around this stage
-/// (`sandbox::GitEntry`): only for a Codex writer in Codex's own sandbox,
-/// which may not protect a `.git` *file* (a linked worktree's gitdir pointer)
-/// the way the Seatbelt profile's `{ws}/.git` deny does. Pure.
+/// (`sandbox::GitEntry`): only for a Codex writer in Codex's own sandbox.
+/// Codex already keeps `<worktree>/.git` and the gitdir it points to
+/// read-only; the check is a second guard, so a changed pointer never
+/// reaches the git commands Octopush runs after the stage. Pure.
 pub fn guards_git_entry(dialect: CliDialect, read_only: bool, exec_isolation: &str) -> bool {
     dialect == CliDialect::Codex && !read_only && codex_write_scope(exec_isolation) == CodexWriteScope::Workspace
+}
+
+/// The journal notice for an Action role (one that may commit and push) on a
+/// Codex writer in Codex's own sandbox, where git can't write `.git`. Pure.
+pub fn codex_git_notice(
+    dialect: CliDialect,
+    read_only: bool,
+    scope: CodexWriteScope,
+    environment: crate::orchestrator::types::RoleEnvironment,
+) -> Option<&'static str> {
+    let action = environment == crate::orchestrator::types::RoleEnvironment::Action;
+    (dialect == CliDialect::Codex && !read_only && scope == CodexWriteScope::Workspace && action).then_some(
+        "Codex's sandbox keeps .git read-only, so this stage can't commit, stash or push. \
+         Run the mission sandboxed or give this stage a Claude model.",
+    )
 }
 
 /// Derive the dialect from the stage's model id. Unknown ids fall back to
@@ -1017,7 +1044,8 @@ impl CliDialect {
     /// which would hang a headless stage. The writer's settings are `-c`
     /// config overrides, the mechanism the effort already uses, not flags
     /// `codex exec` may not take: approval `never` and network on (Octopush's
-    /// Seatbelt profile confines writes only, too). No extra writable roots.
+    /// Seatbelt profile confines writes only, too). The runner adds the
+    /// build-cache root to the writable roots ([`codex_writable_root_args`]).
     pub fn argv(
         &self,
         model: &str,
@@ -1173,7 +1201,12 @@ impl CliDialect {
     /// Code (fresh and resumed runs alike), and on Codex placed before the
     /// trailing `-` so the stdin-prompt marker stays the last argument.
     pub fn push_effort_args(&self, args: &mut Vec<String>, model: &str, effort: Option<crate::providers::Effort>) {
-        let flags = self.effort_args(model, effort);
+        self.push_flags(args, self.effort_args(model, effort));
+    }
+
+    /// Append `flags` to the argv, before Codex's trailing `-` (the prompt on
+    /// stdin) so they stay flags.
+    pub fn push_flags(&self, args: &mut Vec<String>, flags: Vec<String>) {
         let at = match self {
             CliDialect::Codex if args.last().is_some_and(|a| a == "-") => args.len() - 1,
             _ => args.len(),
@@ -1976,6 +2009,21 @@ impl CliRunner {
         };
         args.extend(max_budget_args(budget_cap));
         dialect.push_effort_args(&mut args, &stage.agent_model, effort);
+        // A Codex writer in Codex's own sandbox can't write `~/.npm` or
+        // `~/.cargo`: its build caches go to its own root, made writable.
+        let mut cache_env: Vec<(String, String)> = Vec::new();
+        let mut cache_note: Option<String> = None;
+        if dialect == CliDialect::Codex && !read_only && write_scope == CodexWriteScope::Workspace {
+            let scope = ctx.workspace_path.to_string_lossy().into_owned();
+            match tokio::task::spawn_blocking(move || crate::orchestrator::sandbox::codex_build_cache(&scope)).await {
+                Ok(Ok((root, env))) => {
+                    dialect.push_flags(&mut args, codex_writable_root_args(&root));
+                    cache_env = env;
+                }
+                Ok(Err(e)) => cache_note = Some(e.to_string()),
+                Err(e) => cache_note = Some(e.to_string()),
+            }
+        }
 
         let path_env = resolved_cli_path();
         let real_program: std::ffi::OsString = resolve_executable(dialect.binary(), &path_env)
@@ -1985,7 +2033,7 @@ impl CliRunner {
         // Seatbelt sandbox (macOS): when the mission asks for it, wrap the spawn
         // in `sandbox-exec -p <profile> claude …`. NO silent fallback — if the
         // sandbox can't be set up the stage fails rather than running unconfined.
-        let mut sandbox_env: Vec<(String, String)> = Vec::new();
+        let mut sandbox_env: Vec<(String, String)> = cache_env;
         let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
             match ctx.exec_isolation.as_str() {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
@@ -2027,9 +2075,10 @@ impl CliRunner {
         for (k, v) in login_shell_env() {
             command.env(k, v);
         }
-        // Sandboxed: redirect build-tool caches into the stage's own cache
-        // root (per workspace and access mode) so builds work without exposing the real ~/.cargo etc. Overrides
-        // any cache vars the login shell set.
+        // Sandboxed, or a Codex writer in its own sandbox: redirect build-tool
+        // caches into the stage's own cache root (per workspace and access
+        // mode) so builds work without exposing the real ~/.cargo etc.
+        // Overrides any cache vars the login shell set.
         for (k, v) in sandbox_env {
             command.env(k, v);
         }
@@ -2072,6 +2121,15 @@ impl CliRunner {
         }
         if let Some(note) = dialect.unpassed_effort_notice(&stage.agent_model, effort) {
             emitter.notice(&note);
+        }
+        if let Some(e) = cache_note {
+            emitter.notice(&format!(
+                "Octopush could not set up this stage's build cache ({e}). In Codex's sandbox, npm, cargo and \
+                 other package managers may fail to write their caches."
+            ));
+        }
+        if let Some(note) = codex_git_notice(dialect, read_only, write_scope, stage.role_environment) {
+            emitter.notice(note);
         }
         let mut child = match command.spawn() {
             Ok(c) => c,

@@ -10,6 +10,7 @@ const {
   cliTooOldForEffort,
   clampToListedLevels,
   codexClampTitle,
+  codexCommitNote,
   codexEffortLevel,
   codexEffortLevels,
   crewClaudeModels,
@@ -42,6 +43,35 @@ describe("crewClaudeModels", () => {
       "claude-opus-5-5",
     ]);
     expect(crewClaudeModels(stages.slice(2, 3), {})).toEqual([]);
+  });
+});
+
+describe("codexCommitNote", () => {
+  const roles = [
+    { key: "ship", label: "Ship", environment: "action" },
+    { key: "release", label: "Release", environment: "action" },
+    { key: "implement", label: "Implement", environment: "worktree" },
+  ];
+  const stages = [
+    { position: 0, role: "implement", substrate: "cli", agentModel: "gpt-5-codex" },
+    { position: 1, role: "ship", substrate: "cli", agentModel: "gpt-5-codex" },
+    { position: 2, role: "release", substrate: "cli", agentModel: "claude-sonnet-5-5", customName: "Tag it" },
+    { position: 3, role: "release", substrate: "api", agentModel: "gpt-5" },
+  ];
+
+  it("names each Action stage that runs on Codex outside a sandboxed mission", () => {
+    expect(codexCommitNote(stages, {}, roles, "none")).toBe(
+      "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push. Run the mission sandboxed or pick a Claude model.",
+    );
+    // A launcher override onto Codex counts; one onto Claude clears it.
+    expect(codexCommitNote(stages, { 2: "gpt-5" }, roles, null)).toMatch(/^Ship and Tag it run on Codex, .* so they can't commit/);
+    expect(codexCommitNote(stages, { 1: "claude-opus-5-5" }, roles, "none")).toBeNull();
+  });
+
+  it("stays quiet in a sandboxed mission, or with no Codex Action stage", () => {
+    expect(codexCommitNote(stages, {}, roles, "sandbox")).toBeNull();
+    expect(codexCommitNote(stages.slice(0, 1), {}, roles, "none")).toBeNull();
+    expect(codexCommitNote(stages, {}, [], "none")).toBeNull();
   });
 });
 
