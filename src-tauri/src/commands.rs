@@ -1333,13 +1333,19 @@ pub async fn delete_workspace(
     crate::fleet_status::refresh_later(&app);
 
     // Its sandbox build caches go with it, unless another workspace still
-    // sits at the same path (they key the cache by path).
+    // sits at the same path (they key the cache by path, a trailing `/`
+    // ignored). Off the IPC thread: a cargo or npm cache can be large.
     if let Some(path) = db_path {
-        let shared = state.db.lock().workspace_by_path(&path).ok().flatten().is_some();
+        let trimmed = path.trim_end_matches('/').to_string();
+        let shared = [trimmed.clone(), format!("{trimmed}/")]
+            .iter()
+            .any(|p| state.db.lock().workspace_by_path(p).ok().flatten().is_some());
         if !shared {
-            if let Err(e) = crate::orchestrator::sandbox::remove_workspace_build_caches(&path) {
-                tracing::warn!(error = %e, "could not remove the workspace's build caches");
-            }
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(e) = crate::orchestrator::sandbox::remove_workspace_build_caches(&path) {
+                    tracing::warn!(error = %e, "could not remove the workspace's build caches");
+                }
+            });
         }
     }
     Ok(())

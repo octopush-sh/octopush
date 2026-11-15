@@ -138,8 +138,19 @@ fn is_stale(p: &Path, now: std::time::SystemTime, max_age: std::time::Duration) 
 /// `max_age` are removed (a cache root's mtime is refreshed every time a stage
 /// uses it, `ensure_cache_root`), then the workspace dir if that left it empty
 /// and it was itself stale. Links are removed, never followed. Pre-#762 flat
-/// roots (`<base>/<key>/cargo`…) are pruned the same way.
+/// roots (`<base>/<key>/cargo`…) are pruned the same way. Prunes nothing
+/// unless `base` and its parent (`…/Caches/octopush`) are real directories
+/// owned by this user: through a link it would delete old entries wherever
+/// the link points.
+///
+/// A stage starting meanwhile (a detached worker, a resumed run) may have its
+/// root removed between the staleness check and the removal, or its workspace
+/// dir between `ensure_cache_root`'s two `create_dir`s. Its `ensure_cache_root`
+/// or its build then fails closed; nothing escapes the sandbox.
 fn prune_cache_base(base: &Path, now: std::time::SystemTime, max_age: std::time::Duration) -> usize {
+    if check_own_dir(base).is_err() || !base.parent().is_some_and(|p| check_own_dir(p).is_ok()) {
+        return 0;
+    }
     let Ok(dirs) = std::fs::read_dir(base) else { return 0 };
     let mut removed = 0;
     for ws in dirs.flatten() {
@@ -687,7 +698,20 @@ pub struct Prepared {
 /// the app never chmods wherever a link points.
 #[cfg(unix)]
 fn own_dir_0700(dir: &Path) -> std::io::Result<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::PermissionsExt;
+    open_own_dir(dir)?.set_permissions(std::fs::Permissions::from_mode(0o700))
+}
+
+#[cfg(not(unix))]
+fn own_dir_0700(dir: &Path) -> std::io::Result<()> {
+    check_own_dir(dir)
+}
+
+/// Open `dir` through an `O_NOFOLLOW` handle, refusing unless it is a real
+/// directory (not a symlink) owned by this user.
+#[cfg(unix)]
+fn open_own_dir(dir: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let refuse = |why: String| std::io::Error::other(format!("{} must be a directory you own ({why})", dir.display()));
     let handle = std::fs::OpenOptions::new()
         .read(true)
@@ -700,11 +724,17 @@ fn own_dir_0700(dir: &Path) -> std::io::Result<()> {
     if !meta.is_dir() || meta.uid() != uid {
         return Err(refuse(format!("owner uid {}", meta.uid())));
     }
-    handle.set_permissions(std::fs::Permissions::from_mode(0o700))
+    Ok(handle)
+}
+
+/// `own_dir_0700`'s checks without the chmod.
+#[cfg(unix)]
+fn check_own_dir(dir: &Path) -> std::io::Result<()> {
+    open_own_dir(dir).map(drop)
 }
 
 #[cfg(not(unix))]
-fn own_dir_0700(dir: &Path) -> std::io::Result<()> {
+fn check_own_dir(dir: &Path) -> std::io::Result<()> {
     let meta = std::fs::symlink_metadata(dir)?;
     if meta.file_type().is_symlink() || !meta.is_dir() {
         return Err(std::io::Error::other(format!("{} must be a real directory", dir.display())));
@@ -1573,6 +1603,43 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn pruning_through_a_symlinked_base_or_parent_removes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = std::time::SystemTime::now() - 2 * BUILD_CACHE_MAX_AGE;
+        let set_old = |p: &Path| std::fs::File::open(p).unwrap().set_modified(old).unwrap();
+        // Old user data two levels down in the dir a link points at.
+        let target = dir.path().join("target");
+        let entry = target.join("project").join("src");
+        std::fs::create_dir_all(&entry).unwrap();
+        std::fs::write(entry.join("main.rs"), "x").unwrap();
+        set_old(&entry);
+        set_old(entry.parent().unwrap());
+        let now = std::time::SystemTime::now();
+
+        // `build-cache` itself is the link.
+        let link_base = dir.path().join("build-cache");
+        std::os::unix::fs::symlink(&target, &link_base).unwrap();
+        assert_eq!(prune_cache_base(&link_base, now, BUILD_CACHE_MAX_AGE), 0);
+        assert!(entry.join("main.rs").exists(), "the link's target keeps its old entries");
+
+        // `…/Caches/octopush` is the link, `build-cache` a real dir inside.
+        let real_parent = dir.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        std::fs::rename(&target, real_parent.join("build-cache")).unwrap();
+        let link_parent = dir.path().join("octopush");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let moved = real_parent.join("build-cache").join("project").join("src");
+        assert_eq!(prune_cache_base(&link_parent.join("build-cache"), now, BUILD_CACHE_MAX_AGE), 0);
+        assert!(moved.join("main.rs").exists(), "nothing behind a linked parent is pruned");
+
+        // The same tree reached directly is pruned, so the refusals above are
+        // the base check and not the entries being fresh.
+        assert_eq!(prune_cache_base(&real_parent.join("build-cache"), now, BUILD_CACHE_MAX_AGE), 1);
+        assert!(!moved.exists());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn removing_a_workspaces_caches_takes_every_mode_and_spares_other_workspaces() {
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().join("build-cache");
@@ -1676,7 +1743,42 @@ mod tests {
             .map(|o| o.status.success())
             .unwrap_or(false);
         assert!(!planted && !sibling.exists(), "another mission's cache is denied");
-        let _ = std::fs::remove_dir_all(workspace_cache_dir(&base, &scope));
+
+        // The same workspace's roots for other access modes sit beside this
+        // one in its workspace dir: the stage can neither create them nor,
+        // once they exist, write inside them.
+        let run = |script: String| {
+            let args = vec!["-c".to_string(), script];
+            let prepared = prepare(&roots, Some(scope.as_str()), OsStr::new("bash"), &args).unwrap();
+            std::process::Command::new(&prepared.program)
+                .args(&prepared.args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let readonly = mission_cache_root(&base, &scope, &[]);
+        let codex = codex_cache_root(&base, &scope);
+        for other in [&readonly, &codex] {
+            assert!(!run(format!("mkdir '{}'", other.display())), "{} can't be created", other.display());
+            assert!(!other.exists());
+            let made = ensure_cache_root(other).unwrap();
+            assert!(!run(format!("echo x > '{}/probe'", made.display())), "{} can't be written", made.display());
+            assert!(!made.join("probe").exists());
+            assert!(!run(format!("mkdir '{}/cargo'", made.display())));
+            assert!(!made.join("cargo").exists());
+        }
+        // Nor any new entry in its own workspace dir.
+        let ws_dir = workspace_cache_dir(&base, &scope);
+        let planted_dir = ws_dir.join("planted-dir");
+        let planted_file = ws_dir.join("planted-file");
+        let planted_link = ws_dir.join("planted-link");
+        assert!(!run(format!("mkdir '{}'", planted_dir.display())));
+        assert!(!run(format!("echo x > '{}'", planted_file.display())));
+        assert!(!run(format!("ln -s /tmp '{}'", planted_link.display())));
+        for p in [&planted_dir, &planted_file, &planted_link] {
+            assert!(std::fs::symlink_metadata(p).is_err(), "{} was created", p.display());
+        }
+        let _ = std::fs::remove_dir_all(&ws_dir);
     }
 
     #[test]
