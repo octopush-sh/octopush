@@ -410,6 +410,33 @@ mod workspace_tests {
     }
 
     #[test]
+    fn deleting_a_workspace_drops_its_paused_run_from_the_dock_badge() {
+        // The workspace's runs cascade-delete with no run:// event, which is
+        // why `delete_workspace` / `delete_project` refresh the badge: the
+        // recount after the delete must clear it.
+        let db = test_db();
+        setup_workspace(&db, "p1", "ws1");
+        setup_workspace(&db, "p2", "ws2");
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline_id = db.list_pipelines().unwrap()[0].id.clone();
+        let a = db.create_run("ws1", &pipeline_id, "task a", None, None, &[]).unwrap();
+        let b = db.create_run("ws2", &pipeline_id, "task b", None, None, &[]).unwrap();
+        db.set_run_status(&a, "paused", false).unwrap();
+        db.set_run_status(&b, "paused", false).unwrap();
+        let badge = |db: &Db| {
+            let runs = db.list_active_runs().unwrap();
+            crate::fleet_status::derive(runs.iter().map(|r| r.status.as_str())).badge()
+        };
+        assert_eq!(badge(&db), Some(2));
+
+        db.delete_workspace("ws1").unwrap();
+        assert_eq!(badge(&db), Some(1));
+
+        db.delete_project("p2").unwrap();
+        assert_eq!(badge(&db), None, "a project delete cascades its runs too");
+    }
+
+    #[test]
     fn list_runs_settled_since_returns_runs_finished_after_the_marker() {
         // "While you were away": only completed/aborted runs whose finish is
         // strictly after `since`. A run that finished exactly at the quit
