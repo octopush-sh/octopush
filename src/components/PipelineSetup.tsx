@@ -15,6 +15,7 @@ import { useEntitlement } from "../hooks/useEntitlement";
 import { PipelineTicket } from "./direct/PipelineTicket";
 import { StageFlow } from "./direct/StageFlow";
 import { SupersededModelLine } from "./direct/SupersededModelLine";
+import { RetiringModelLine } from "./direct/RetiringModelLine";
 import { GithubIssuePicker } from "./GithubIssuePicker";
 import { composeIssueTask } from "../lib/shipIssue";
 import { pushToast } from "./Toasts";
@@ -624,6 +625,17 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 {modelFloorLine}
               </p>
             )}
+            <RetiringModelLine
+              key={`retiring-${selected.pipeline.id}`}
+              pipeline={selected}
+              overrides={overrides}
+              onSwitched={(id, fromIds) => {
+                // As with a superseded model: follow a builtin's fork, and drop
+                // launcher picks of the retiring model.
+                setSelectedId(id);
+                setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([, m]) => !fromIds.includes(m))));
+              }}
+            />
             {codexCommitLine && (
               <p
                 data-tour="direct-launcher-codex-commit"
