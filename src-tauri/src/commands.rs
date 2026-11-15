@@ -5274,12 +5274,12 @@ pub async fn ensure_pr_branch(
 /// `None` if gh isn't installed, isn't authed, or there's no matching PR.
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
-async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github::Pr> {
+async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,statusCheckRollup --limit 1",
+        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
         branch.replace('\'', "'\\''"),
     );
 
@@ -5312,9 +5312,45 @@ async fn try_gh_cli(workspace_path: &str, branch: &str) -> Option<crate::github:
     }
     let mut out = crate::github::pr_from_json(&pr);
     if pr_wants_checks(&out) {
-        out.checks = crate::github::checks_from_gh_rollup(&pr["statusCheckRollup"]);
+        let rollup = &pr["statusCheckRollup"];
+        out.checks = crate::github::checks_from_gh_rollup(rollup);
+        // A full rollup may hide checks past gh's cap: re-read every check
+        // run on the head commit, keeping the rollup's answer if that fails.
+        if crate::github::gh_rollup_may_be_capped(rollup) {
+            if let Some(runs) = gh_check_runs(&shell, workspace_path, owner, repo, pr["headRefOid"].as_str()).await {
+                if let Some(checks) = crate::github::checks_from_gh_rollup_and_runs(rollup, &runs) {
+                    out.checks = Some(checks);
+                }
+            }
+        }
     }
     Some(out)
+}
+
+/// Every check run on `sha` through `gh api --paginate`. `None` without a
+/// sha, when gh fails or when the first page can't be read.
+async fn gh_check_runs(
+    shell: &str,
+    workspace_path: &str,
+    owner: &str,
+    repo: &str,
+    sha: Option<&str>,
+) -> Option<Vec<serde_json::Value>> {
+    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let output = tokio::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(&cmd)
+        .current_dir(workspace_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        tracing::info!(
+            stderr = %String::from_utf8_lossy(&output.stderr).chars().take(200).collect::<String>(),
+            "find_pr_for_branch: gh api check-runs failed, keeping the rollup",
+        );
+        return None;
+    }
+    crate::github::check_runs_from_gh_pages(&output.stdout)
 }
 
 /// Only a live PR's checks are worth a glyph; a merged or closed one is done.
@@ -5389,7 +5425,7 @@ pub async fn find_pr_for_branch(workspace_path: String) -> AppResult<Option<crat
     //    have an authed `gh`, no extra setup required. Runs in their login
     //    shell so PATH and macOS keychain credential storage work as if
     //    they invoked `gh` from a terminal.
-    if let Some(pr) = try_gh_cli(&workspace_path, &branch).await {
+    if let Some(pr) = try_gh_cli(&workspace_path, &branch, &owner, &repo_name).await {
         tracing::info!(number = pr.number, "find_pr_for_branch: resolved via gh cli");
         return Ok(Some(pr));
     }

@@ -2573,9 +2573,75 @@ mod editor_detection_tests {
 #[cfg(test)]
 mod pr_checks_tests {
     use crate::github::{
-        actions_run_id, checks_from_gh_rollup, checks_from_rest_check_runs, join_failed_logs,
-        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE,
+        actions_run_id, check_runs_from_gh_pages, checks_from_gh_rollup, checks_from_gh_rollup_and_runs,
+        checks_from_rest_check_runs, gh_check_runs_command, gh_rollup_may_be_capped, join_failed_logs,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_ROLLUP_CAP,
     };
+
+    #[test]
+    fn gh_rollup_is_re_read_only_when_it_comes_back_full() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let rollup = |n: usize| serde_json::Value::Array(vec![ok.clone(); n]);
+        assert!(!gh_rollup_may_be_capped(&rollup(0)));
+        assert!(!gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP - 1)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP)));
+        assert!(gh_rollup_may_be_capped(&rollup(GH_ROLLUP_CAP + 5)));
+        assert!(!gh_rollup_may_be_capped(&serde_json::Value::Null));
+    }
+
+    #[test]
+    fn gh_check_runs_command_needs_a_hex_sha_and_quotes_the_path() {
+        assert_eq!(
+            gh_check_runs_command("o", "r", "abc123").as_deref(),
+            Some("gh api --paginate 'repos/o/r/commits/abc123/check-runs?per_page=100'"),
+        );
+        assert!(gh_check_runs_command("o", "r", "").is_none());
+        assert!(gh_check_runs_command("o", "r", "abc; rm -rf ~").is_none());
+        assert_eq!(
+            gh_check_runs_command("o'x", "r", "ab").as_deref(),
+            Some("gh api --paginate 'repos/o'\\''x/r/commits/ab/check-runs?per_page=100'"),
+        );
+    }
+
+    #[test]
+    fn gh_pages_concatenate_check_runs_and_keep_what_was_read() {
+        let raw = br#"{"total_count":3,"check_runs":[{"name":"a"},{"name":"b"}]}
+{"total_count":3,"check_runs":[{"name":"c"}]}"#;
+        let runs = check_runs_from_gh_pages(raw).unwrap();
+        let names: Vec<&str> = runs.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["a", "b", "c"]);
+        // Pages printed back to back, without a newline.
+        let tight = br#"{"check_runs":[{"name":"a"}]}{"check_runs":[{"name":"b"}]}"#;
+        assert_eq!(check_runs_from_gh_pages(tight).unwrap().len(), 2);
+        // A broken later page keeps the first.
+        let broken = br#"{"check_runs":[{"name":"a"}]}{"check_runs":"#;
+        assert_eq!(check_runs_from_gh_pages(broken).unwrap().len(), 1);
+        assert!(check_runs_from_gh_pages(b"").is_none());
+        assert!(check_runs_from_gh_pages(br#"{"message":"Not Found"}"#).is_none());
+    }
+
+    #[test]
+    fn capped_rollup_with_every_run_shows_a_failure_past_the_cap() {
+        let ok = serde_json::json!({ "__typename": "CheckRun", "name": "a", "status": "COMPLETED", "conclusion": "SUCCESS" });
+        let mut items = vec![ok; GH_ROLLUP_CAP - 1];
+        items.push(serde_json::json!({ "__typename": "StatusContext", "context": "ci/ext", "state": "SUCCESS" }));
+        let rollup = serde_json::Value::Array(items);
+        assert_eq!(checks_from_gh_rollup(&rollup).unwrap().state, ChecksState::Passing);
+
+        let mut runs = vec![serde_json::json!({ "name": "a", "status": "completed", "conclusion": "success" }); 120];
+        runs.push(serde_json::json!({ "name": "late", "status": "completed", "conclusion": "failure",
+            "details_url": "https://github.com/o/r/actions/runs/5/job/1" }));
+        let checks = checks_from_gh_rollup_and_runs(&rollup, &runs).unwrap();
+        assert_eq!(checks.state, ChecksState::Failing);
+        assert_eq!(checks.failing, vec![FailingCheck { name: "late".into(), run_id: Some(5) }]);
+
+        // Commit statuses still come from the rollup.
+        let failing_status = serde_json::json!([
+            { "__typename": "StatusContext", "context": "ci/ext", "state": "FAILURE" }
+        ]);
+        let checks = checks_from_gh_rollup_and_runs(&failing_status, &runs[..1]).unwrap();
+        assert_eq!(checks.failing, vec![FailingCheck { name: "ci/ext".into(), run_id: None }]);
+    }
 
     #[test]
     fn check_runs_read_another_page_only_after_a_full_one_below_the_total() {
