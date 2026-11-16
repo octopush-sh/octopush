@@ -9,6 +9,7 @@ import type { Scenario } from "./types";
 import type { PipelineWithStages, Run } from "../../../src/lib/ipc";
 import type { ChatThread, ModelWithProvider, ProjectInfo, TokenReport, Workspace, WorkspaceGitSummary } from "../../../src/lib/types";
 import { defaultScenario, DEFAULT_FIXTURES as F } from "./default";
+import { logbookSummary, missionFor } from "./logbook";
 
 const LONG = [
   "Production deploy (octopush-api)",
@@ -49,7 +50,7 @@ const PIPELINES: PipelineWithStages[] = Array.from({ length: 12 }, (_, i) => {
 
 const RUNS: Run[] = Array.from({ length: 18 }, (_, i) => ({
   ...F.RUN,
-  id: i === 0 ? F.RUN.id : `run-${i}`,
+  id: i === 0 ? F.RUN.id : `run-${i + 1}`, // unique: F.RUN.id is run-1
   workspaceId: ACTIVE.id,
   task: i === 0 ? F.RUN.task : `${pick(i)}: ${"fix the flaky integration tests and update the docs ".repeat(1 + (i % 3))}`.trim(),
   status: (["completed", "failed", "running", "aborted", "paused"] as const)[i % 5],
@@ -59,10 +60,16 @@ const RUNS: Run[] = Array.from({ length: 18 }, (_, i) => ({
 
 const THREADS: ChatThread[] = Array.from({ length: 15 }, (_, i) => ({
   ...F.THREAD,
-  id: i === 0 ? F.THREAD.id : `th-${i}`,
+  id: i === 0 ? F.THREAD.id : `th-${i + 1}`, // unique: F.THREAD.id is th-1
   workspaceId: ACTIVE.id,
   title: i === 0 ? F.THREAD.title : `${pick(i)} — ${"why does the build break on CI but not locally ".repeat(1 + (i % 2))}`.trim(),
 }));
+
+// The Logbook rolls up the same runs and chats as the Direct companion and Talk:
+// all of them belong to the active workspace's mission (#673).
+const LOGBOOK = logbookSummary([
+  { mission: missionFor(ACTIVE, F.EARLIER), runs: RUNS, threads: THREADS, messages: F.MESSAGES },
+]);
 
 const MODELS: ModelWithProvider[] = [
   ...F.MODELS,
@@ -109,6 +116,7 @@ export const stress: Scenario = {
     list_active_runs: RUNS.filter((r) => r.status === "running" || r.status === "paused"),
     list_chat_threads: (a) => (a.workspaceId === ACTIVE.id ? THREADS : []),
     list_chat_messages: (a) => (a.threadId === F.THREAD.id ? F.MESSAGES : []),
+    logbook_summary: LOGBOOK,
     list_models: MODELS,
     get_token_report: TOKEN_REPORT,
     direct_run_usage: { used: 1_284, limit: null, remaining: null },

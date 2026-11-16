@@ -34,6 +34,7 @@ import type {
   WorkspaceGitSummary,
 } from "../../../src/lib/types";
 import { ATELIER, NOW } from "./shared";
+import { logbookSummary, missionFor } from "./logbook";
 
 const EARLIER = "2026-10-28T14:12:00Z";
 
@@ -216,6 +217,11 @@ const RUN_STAGES: RunStage[] = PIPELINE_STAGES.map((s, i) => ({
 }));
 const RUN_DETAIL: RunDetail = { run: RUN, stages: RUN_STAGES };
 
+// ─── Logbook ─────────────────────────────────────────────────────────────
+// The run and the Talk thread above belong to the active workspace's mission,
+// so the Logbook reads the same ledger as the Direct companion and Talk.
+const MISSION = missionFor(ACTIVE, EARLIER);
+
 // ─── Account & usage ─────────────────────────────────────────────────────
 const AUTH: AuthStatus = { signedIn: true, email: "dev@example.com", name: "Demo Developer" };
 const ENTITLEMENT: Entitlement = { plan: "pro", features: ["direct.unlimited", "runs.parallel", "history.sync", "library.sync", "runs.detached", "routines.scheduled", "logbook.reports"], directRunsPerMonth: null };
@@ -300,6 +306,8 @@ export const defaultScenario: Scenario = {
     list_active_runs: [],
     has_ever_started_run: true,
     estimate_run_cost: { estimateUsd: 0.43, baselineUsd: 1.95 },
+    // logbook
+    logbook_summary: logbookSummary([{ mission: MISSION, runs: [RUN], threads: [THREAD], messages: MESSAGES }]),
     // account & usage
     auth_status: AUTH,
     auth_refresh: AUTH,
@@ -313,4 +321,4 @@ export const defaultScenario: Scenario = {
 };
 
 /** The building blocks above, for scenarios that vary them (e.g. `stress`). */
-export const DEFAULT_FIXTURES = { PROJECT, WORKSPACES, GIT_SUMMARIES, PIPELINES, ROLES, RUN, RUN_STAGES, THREAD, MESSAGES, PROVIDERS, MODELS };
+export const DEFAULT_FIXTURES = { EARLIER, PROJECT, WORKSPACES, GIT_SUMMARIES, PIPELINES, ROLES, RUN, RUN_STAGES, THREAD, MESSAGES, PROVIDERS, MODELS };
