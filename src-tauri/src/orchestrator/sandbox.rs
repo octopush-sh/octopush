@@ -32,7 +32,8 @@ fn sbpl_string(s: &str) -> String {
 }
 
 /// The writable directory *subtrees* a real CLI process needs regardless of the
-/// mission — the temp dir, `/dev`, and the Claude CLI's own session/cache dirs.
+/// mission — the temp dir, `/dev`, the Claude CLI's own session/cache dirs and
+/// Codex's session dir.
 /// Kept deliberately narrow: `~/.ssh`, `~/.aws`, `~/.config` (credentials),
 /// documents, and every other project stay read-only. Pure over its inputs.
 ///
@@ -49,6 +50,11 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
         // The CLI's own session + generic tool caches — needed for it to run.
         v.push(format!("{h}/.claude"));
         v.push(format!("{h}/.cache"));
+        // Codex's session rollouts: `codex exec` fails at start when it can't
+        // write them. Only this subtree; the rest of `~/.codex` (config.toml,
+        // AGENTS.md, prompts/, auth.json, rules/) stays read-only, as a
+        // planted file there would run in the user's next unsandboxed session.
+        v.push(format!("{h}/.codex/sessions"));
     }
     // NB: we do NOT add the global package-manager dirs (~/.cargo, ~/.gradle, …)
     // to the write roots — several are config/executable dirs, and a sandboxed
@@ -1618,6 +1624,20 @@ mod tests {
     }
 
     #[test]
+    fn codex_may_write_its_sessions_but_nothing_else_in_codex_home() {
+        // `codex exec` makes a rollout it can't write a fatal start error.
+        for mission in [vec!["/ws".to_string()], Vec::new()] {
+            let roots = assemble_write_roots(&mission, Some("/home/u"), None);
+            assert!(roots.contains(&"/home/u/.codex/sessions".to_string()), "{roots:?}");
+            // Never the Codex home itself: config.toml, AGENTS.md, prompts/,
+            // rules/ and auth.json there shape the user's later sessions.
+            let codex: Vec<&str> = roots.iter().map(String::as_str).filter(|r| r.starts_with("/home/u/.codex")).collect();
+            assert_eq!(codex, vec!["/home/u/.codex/sessions"]);
+        }
+        assert!(!system_write_files(Some("/home/u")).iter().any(|f| f.contains(".codex")));
+    }
+
+    #[test]
     fn readonly_missions_get_no_write_roots_beyond_temp() {
         // A readonly (review/probe) mission is `Some(vec![])` → temp-only. It must
         // NOT gain the workspace OR any package-manager dir. (The gap that let
@@ -2140,6 +2160,45 @@ mod tests {
         assert!(!planted && !sibling.exists());
         let _ = remove_workspace_build_caches(&scope);
         assert!(!Path::new(&tmp).exists());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_lets_a_codex_stage_write_its_sessions_but_not_its_config() {
+        // A stub for `codex exec`'s session start: it writes a rollout under
+        // `~/.codex/sessions/YYYY/MM/DD`. Every probe outside that subtree is
+        // a fresh name, so a failing deny never touches the user's own files.
+        let home = std::env::var("HOME").expect("HOME");
+        let codex_home = Path::new(&home).join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let tag = format!("octopush-seatbelt-{}", std::process::id());
+        let ws = tempfile::tempdir().unwrap();
+        let run = |mission: Vec<String>, script: &str| -> bool {
+            let args = vec!["-c".to_string(), script.to_string()];
+            let prepared = prepare(&mission, None, OsStr::new("bash"), &args).unwrap();
+            std::process::Command::new(&prepared.program)
+                .args(&prepared.args)
+                .current_dir(ws.path())
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let day = codex_home.join("sessions").join(&tag).join("11").join("16");
+        let rollout = format!("mkdir -p '{}' && echo '{{}}' >> '{}/rollout-x.jsonl'", day.display(), day.display());
+        let denied = [
+            codex_home.join(format!("{tag}.toml")),
+            codex_home.join(format!("prompts-{tag}")),
+            codex_home.join(format!("{tag}-AGENTS.md")),
+        ];
+        // A writer mission and a readonly (temp-only) one alike.
+        for mission in [vec![ws.path().to_string_lossy().into_owned()], Vec::new()] {
+            assert!(run(mission.clone(), &rollout), "the rollout is writable");
+            for p in &denied {
+                assert!(!run(mission.clone(), &format!("echo x > '{}'", p.display())), "{}", p.display());
+                assert!(std::fs::symlink_metadata(p).is_err(), "{} was created", p.display());
+            }
+        }
+        let _ = std::fs::remove_dir_all(codex_home.join("sessions").join(&tag));
     }
 
     #[test]
