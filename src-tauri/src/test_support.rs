@@ -11,10 +11,13 @@ const PTY_SERVER: &str = "octopush-pty-server";
 ///
 /// 1. `OCTOPUSH_PTY_SERVER_BIN`, an explicit override;
 /// 2. `CARGO_BIN_EXE_octopush-pty-server`, which newer Cargo sets when it runs tests;
-/// 3. every ancestor directory of the test executable. Before Cargo 1.100 the
-///    test binary lived in `target/debug/deps/`, so the parent's parent was
-///    `target/debug/`. Since 1.100 (the stabilized build-dir layout) it lives in
-///    `target/debug/build/<pkg>/<hash>/out/`, three levels further down;
+/// 3. every ancestor directory of the test executable, up to and including the
+///    first one named `target` (or `CARGO_TARGET_DIR`), so a stray binary in the
+///    repo root or `$HOME` is never picked up. Before Cargo 1.100 the test
+///    binary lived in `target/debug/deps/`, so the parent's parent was
+///    `target/debug/`. Since 1.100 (the new build-dir layout is now the
+///    default) it lives in `target/debug/build/<pkg>/<hash>/out/`, three levels
+///    further down. Cargo calls that layout "not a stable interface";
 /// 4. `target/debug/` under the crate (`CARGO_TARGET_DIR` first, if set).
 ///
 /// Only a non-empty, executable regular file counts, so neither a directory nor
@@ -30,13 +33,18 @@ pub(crate) fn pty_server_bin() -> PathBuf {
             candidates.push(PathBuf::from(p));
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from);
+    let exe = std::env::current_exe().ok();
+    if let Some(exe) = &exe {
         for dir in exe.ancestors().skip(1) {
             candidates.push(dir.join(PTY_SERVER));
+            if is_target_root(dir, target_dir.as_deref()) {
+                break;
+            }
         }
     }
-    if let Some(dir) = std::env::var_os("CARGO_TARGET_DIR") {
-        candidates.push(PathBuf::from(dir).join("debug").join(PTY_SERVER));
+    if let Some(dir) = &target_dir {
+        candidates.push(dir.join("debug").join(PTY_SERVER));
     }
     candidates.push(
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -55,12 +63,27 @@ pub(crate) fn pty_server_bin() -> PathBuf {
             Some(_) => {}
         }
     }
+    let exe_desc = exe.as_deref().map_or_else(
+        || "<unknown test executable>".into(),
+        |p| p.display().to_string(),
+    );
+    let target_desc = target_dir.as_deref().map_or_else(
+        || "CARGO_TARGET_DIR unset".into(),
+        |p| format!("{}/debug", p.display()),
+    );
     panic!(
         "{PTY_SERVER} not found; run `cargo build --bin {PTY_SERVER}` first. \
-         Looked next to {:?} and its ancestors and in target/debug. Rejected: [{}]",
-        std::env::current_exe().ok(),
+         Looked next to {exe_desc} and its ancestors up to the first `target` dir, \
+         in $CARGO_TARGET_DIR ({target_desc}) and in {}/target/debug. Rejected: [{}]",
+        env!("CARGO_MANIFEST_DIR"),
         rejected.join(", ")
     );
+}
+
+/// Whether `dir` is the Cargo target root, where the ancestor walk stops: the
+/// first directory named `target`, or `CARGO_TARGET_DIR` when it has another name.
+fn is_target_root(dir: &Path, target_dir: Option<&Path>) -> bool {
+    dir.file_name().is_some_and(|n| n == "target") || target_dir.is_some_and(|t| t == dir)
 }
 
 /// `None` when `p` is a spawnable binary; otherwise why it isn't.
@@ -88,8 +111,22 @@ fn why_unusable(p: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::why_unusable;
+    use super::{is_target_root, why_unusable};
     use std::fs;
+    use std::path::Path;
+
+    #[test]
+    fn ancestor_walk_stops_at_the_target_root() {
+        assert!(is_target_root(Path::new("/repo/src-tauri/target"), None));
+        assert!(!is_target_root(Path::new("/repo/src-tauri"), None));
+        assert!(!is_target_root(
+            Path::new("/repo/src-tauri/target/debug"),
+            None
+        ));
+        let custom = Path::new("/tmp/cargo-out");
+        assert!(is_target_root(custom, Some(custom)));
+        assert!(!is_target_root(Path::new("/tmp"), Some(custom)));
+    }
 
     #[test]
     fn rejects_missing_dirs_placeholders_and_non_executables() {

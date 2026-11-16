@@ -10,7 +10,10 @@ fn main() {
     // Path computation for OUT_DIR (see `profile_dir`):
     //   Cargo < 1.100: OUT_DIR = .../target/<profile>/build/<pkg>-<hash>/out
     //   Cargo ≥ 1.100: OUT_DIR = .../target/<profile>/build/<pkg>/<hash>/out
+    //                  (the new build-dir layout is now the default)
     // Either way the profile dir is the parent of the nearest `build` ancestor.
+    // Cargo documents the build-dir layout as "not a stable interface", so this
+    // lookup may break again on a future Cargo.
 
     let target_triple = std::env::var("TARGET").unwrap_or_default();
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap_or_default());
@@ -71,10 +74,12 @@ fn stage_external_bin(bin: &str, target_triple: &str, manifest_dir: &Path, out_d
 }
 
 /// `target/<profile>` for this build: the parent of OUT_DIR's nearest `build`
-/// ancestor. Cargo 1.100 stabilized the new build-dir layout, which nests
-/// OUT_DIR one level deeper (`build/<pkg>/<hash>/out`), so a fixed
+/// ancestor. In Cargo 1.100 the new build-dir layout is now the default; it
+/// nests OUT_DIR one level deeper (`build/<pkg>/<hash>/out`), so a fixed
 /// `ancestors().nth(3)` pointed at `target/<profile>/build` and never found the
-/// built sidecars.
+/// built sidecars. Cargo calls this layout "not a stable interface", so the
+/// lookup could break again; if sidecars stop being staged after a toolchain
+/// bump, check OUT_DIR's shape first.
 fn profile_dir(out_dir: &Path) -> Option<PathBuf> {
     out_dir
         .ancestors()
