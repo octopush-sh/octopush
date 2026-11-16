@@ -1778,6 +1778,35 @@ mod tests {
 
     #[test]
     #[cfg(target_os = "macos")]
+    fn zz_probe_file_link_semantics() {
+        let parent = tempfile::tempdir().unwrap();
+        let base = canonical_string(parent.path());
+        let out = format!("{base}/out");
+        let root = format!("{base}/root");
+        std::fs::create_dir(&out).unwrap();
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(format!("{out}/f"), "o\n").unwrap();
+        let cases = [
+            ("deny file-link on source dir", format!("(version 1)\n(allow default)\n(deny file-link (subpath {}))\n", sbpl_string(&out))),
+            ("deny file-link on dest dir", format!("(version 1)\n(allow default)\n(deny file-link (subpath {}))\n", sbpl_string(&root))),
+            ("deny file-write* on source dir", format!("(version 1)\n(allow default)\n(deny file-write* (subpath {}))\n", sbpl_string(&out))),
+            ("deny file-write-create on source dir", format!("(version 1)\n(allow default)\n(deny file-write-create (subpath {}))\n", sbpl_string(&out))),
+            ("deny file-write-data on source dir", format!("(version 1)\n(allow default)\n(deny file-write-data (subpath {}))\n", sbpl_string(&out))),
+            ("deny file-write* on dest dir", format!("(version 1)\n(allow default)\n(deny file-write* (subpath {}))\n", sbpl_string(&root))),
+            ("old-style profile, root only", format!("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (subpath {}))\n", sbpl_string(&root))),
+        ];
+        let mut report = String::new();
+        for (i, (name, profile)) in cases.iter().enumerate() {
+            let dest = format!("{root}/x{i}");
+            let (prog, args) = sandbox_argv(OsStr::new("/bin/ln"), &[format!("{out}/f"), dest.clone()], profile);
+            let o = std::process::Command::new(prog).args(args).output().unwrap();
+            report.push_str(&format!("{name}: ln ok={} err={}\n", o.status.success(), String::from_utf8_lossy(&o.stderr).trim()));
+        }
+        panic!("PROBE\n{report}");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
     fn seatbelt_allows_hard_links_only_to_files_inside_the_write_roots() {
         // A root and a file beside it, outside every root of the profile.
         let parent = tempfile::tempdir().unwrap();
