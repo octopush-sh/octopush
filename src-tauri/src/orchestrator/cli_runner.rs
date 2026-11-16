@@ -638,6 +638,7 @@ pub fn parse_cli_result(
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
         return Ok(StageOutcome {
+            cli: Default::default(),
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
                 text: String::new(),
@@ -677,6 +678,7 @@ pub fn parse_cli_result(
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
         return Ok(StageOutcome {
+            cli: Default::default(),
             artifact: StageArtifact {
                 kind,
                 text: parsed.result.clone(),
@@ -716,6 +718,7 @@ pub fn parse_cli_result(
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
         return Ok(StageOutcome {
+            cli: Default::default(),
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
                 text: String::new(),
@@ -739,6 +742,7 @@ pub fn parse_cli_result(
     }
 
     Ok(StageOutcome {
+        cli: Default::default(),
         artifact: StageArtifact {
             kind,
             text: parsed.result.clone(),
@@ -1189,18 +1193,74 @@ impl CliDialect {
     /// Resume argv, for dialects with a confirmed session-continuation
     /// contract. `None` ⇒ the runner falls back to a fresh run (worktree
     /// preserved, feedback in the prompt) — the already-graceful path.
+    ///
+    /// Codex: `codex exec <the fresh run's flags> resume <session_id> -`,
+    /// pinned by the recorded `codex exec resume --help`
+    /// (`tests/fixtures/codex/<version>/`). `resume` takes `SESSION_ID`,
+    /// `PROMPT` (`-` = stdin), `-c`, `-m`, `--json` and
+    /// `--skip-git-repo-check`, but not `-s/--sandbox`, so every flag of the
+    /// fresh argv stays in front of the subcommand, where `codex exec` reads
+    /// them. A resumed thread takes this invocation's sandbox, approval policy
+    /// and model (openai/codex `exec/src/lib.rs`
+    /// `thread_resume_params_from_config`), so a read-only review stays
+    /// read-only and a writer keeps its `workspace-write` settings. The
+    /// effort and writable-root `-c` overrides go in before the trailing `-`
+    /// ([`CliDialect::push_flags`]), which `resume` accepts too.
     pub fn resume_argv(
         &self,
         model: &str,
         session_id: &str,
         max_turns: i64,
         read_only: bool,
+        scope: CodexWriteScope,
     ) -> Option<Vec<String>> {
         match self {
             CliDialect::Claude => Some(build_cli_args_resume(model, session_id, max_turns, read_only)),
-            // Codex has a `codex exec resume` in newer builds, but the contract
-            // isn't stable enough to bet a stage on — fresh re-run instead.
-            CliDialect::Codex => None,
+            CliDialect::Codex => {
+                let mut a = self.argv(model, "", max_turns, read_only, scope);
+                // The fresh argv ends with `-` (prompt on stdin); the resumed
+                // one ends `resume <id> -`.
+                if a.last().is_some_and(|x| x == "-") {
+                    a.pop();
+                }
+                a.extend(["resume".to_string(), session_id.to_string(), "-".to_string()]);
+                Some(a)
+            }
+        }
+    }
+
+    /// The prompt a resumed session gets. Claude: the director's answers (or
+    /// a plain continue) with a fresh turn budget. Codex has no turn budget,
+    /// and its resume also carries a reviewer's loop-back findings, so its
+    /// nudge names the feedback as being about the session's own earlier work.
+    pub fn resume_prompt(&self, feedback: Option<&str>) -> String {
+        let fb = feedback.filter(|f| !f.trim().is_empty());
+        match (self, fb) {
+            (CliDialect::Claude, Some(fb)) => format!(
+                "{fb}\n\nContinue the task from where you left off with these decisions. \
+                 You have a fresh turn budget; finish the remaining work, then stop."
+            ),
+            (CliDialect::Claude, None) => "Continue the task from where you left off. You have a fresh turn budget; \
+                     finish the remaining work, then stop."
+                .to_string(),
+            // Answered questions (an answered block's feedback, see
+            // `format_blocker_feedback`) are decisions, not a critique of
+            // the earlier work: they get their own wording.
+            (CliDialect::Codex, Some(fb)) => match fb.strip_prefix(crate::orchestrator::BLOCKER_FEEDBACK_HEADER) {
+                Some(answers) => format!(
+                    "Your director answered your questions:\n{}\n\nProceed with these decisions and do not ask again \
+                     unless a new blocking ambiguity arises. Pick up from where you left off, finish the remaining \
+                     work, then end with your final message as before.",
+                    answers.trim_end()
+                ),
+                None => format!(
+                    "A reviewer sent your earlier work in this session back with these findings:\n\n{fb}\n\n\
+                     Pick up from where you left off, act on the findings, then end with your final message as before."
+                ),
+            },
+            (CliDialect::Codex, None) => "Continue the task from where you left off: finish the remaining work, \
+                     then end with your final message as before."
+                .to_string(),
         }
     }
 
@@ -1642,6 +1702,7 @@ pub(crate) fn build_codex_outcome(
         Some(text) => {
             let refs_worktree = matches!(artifact_kind, ArtifactKind::Diff | ArtifactKind::Tests);
             StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: artifact_kind,
                     text: text.to_string(),
@@ -2024,6 +2085,7 @@ fn stage_is_read_only(stage: &StageSpec) -> bool {
 /// the run meter stays truthful. Pure.
 pub fn fail_keeping_usage(outcome: StageOutcome, msg: &str) -> StageOutcome {
     StageOutcome {
+        cli: Default::default(),
         input_tokens: outcome.input_tokens,
         output_tokens: outcome.output_tokens,
         cache_read_tokens: outcome.cache_read_tokens,
@@ -2066,11 +2128,48 @@ impl AgentRunner for CliRunner {
 }
 
 impl CliRunner {
+    /// One stage, with the Codex resume fallback: a Codex stage with a
+    /// session to resume runs `codex exec resume` when the installed CLI has
+    /// it ([`crate::agent_adapter::codex_exec_resume_supported`]) and the
+    /// session's reported total is known (the cost baseline). When the resume
+    /// fails before any assistant message, or Codex answers with another
+    /// session, the stage runs fresh ONCE with the feedback in the prompt, and
+    /// the journal says why. Both attempts' spend is kept.
     async fn run_stage(
         &self,
         stage: &StageSpec,
         input: &StageInput,
         ctx: &StageContext,
+    ) -> AppResult<StageOutcome> {
+        let dialect = dialect_for_model(&stage.agent_model);
+        if dialect != CliDialect::Codex || stage.resume_session.is_none() {
+            return self.run_attempt(stage, input, ctx, true, &mut AttemptReport::default()).await;
+        }
+        let emitter = crate::orchestrator::live::LiveEmitter::new(ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
+        let supported = tokio::task::spawn_blocking(crate::agent_adapter::codex_exec_resume_supported)
+            .await
+            .unwrap_or(false);
+        if let Some(why) = codex_resume_skip_reason(supported, stage.resume_baseline.is_some()) {
+            emitter.notice(&format!("Not resuming this stage's Codex session: {why}. It runs fresh, with the feedback in the prompt."));
+            return self.run_attempt(stage, input, ctx, false, &mut AttemptReport::default()).await;
+        }
+        let mut report = AttemptReport::default();
+        let resumed = self.run_attempt(stage, input, ctx, true, &mut report).await?;
+        let Some(why) = report.resume_failure else {
+            return Ok(resumed);
+        };
+        emitter.notice(&codex_resume_failure_notice(&why));
+        let fresh = self.run_attempt(stage, input, ctx, false, &mut AttemptReport::default()).await?;
+        Ok(merge_resume_fallback(resumed, fresh))
+    }
+
+    async fn run_attempt(
+        &self,
+        stage: &StageSpec,
+        input: &StageInput,
+        ctx: &StageContext,
+        allow_resume: bool,
+        report: &mut AttemptReport,
     ) -> AppResult<StageOutcome> {
         // The CLI substrate (Claude Code) owns its own tool surface, so the
         // per-stage tool allowlist does not apply here; the author's free-form
@@ -2100,29 +2199,27 @@ impl CliRunner {
         // Resume only on dialects with a confirmed continuation contract; a
         // dialect without one falls back to a fresh run (worktree preserved,
         // feedback in the prompt) even when a session id is on the row.
+        // A Codex writer outside a sandboxed mission runs in Codex's own
+        // `workspace-write` sandbox, never the bypass flag — resumed or not.
+        let write_scope = codex_write_scope(&ctx.exec_isolation);
         let resume_args = stage
             .resume_session
             .as_deref()
-            .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only));
+            .filter(|_| allow_resume)
+            .and_then(|sid| dialect.resume_argv(&stage.agent_model, sid, stage.max_iterations, read_only, write_scope));
         let resuming = resume_args.is_some();
-        // A Codex writer outside a sandboxed mission runs in Codex's own
-        // `workspace-write` sandbox, never the bypass flag.
-        let write_scope = codex_write_scope(&ctx.exec_isolation);
+        // A resumed Codex session reports the thread's running total: the
+        // tokens it had already reported are subtracted (see `usage_since`).
+        let baseline = if resuming && dialect == CliDialect::Codex { stage.resume_baseline } else { None };
         let (mut args, user) = match resume_args {
             Some(argv) => (
                 argv,
                 // An answered question-block resumes with the director's
                 // decisions in the nudge — the CLI counterpart of the API
-                // substrate's transcript continuation. A plain halt-recovery
-                // resume has no feedback and keeps the generic nudge.
-                match stage.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
-                    Some(fb) => format!(
-                        "{fb}\n\nContinue the task from where you left off with these decisions. \
-                         You have a fresh turn budget; finish the remaining work, then stop."
-                    ),
-                    None => "Continue the task from where you left off. You have a fresh turn budget; \
-                             finish the remaining work, then stop.".to_string(),
-                },
+                // substrate's transcript continuation; a Codex loop-back with
+                // the reviewer's findings. A plain halt-recovery resume has no
+                // feedback and keeps the generic nudge.
+                dialect.resume_prompt(stage.feedback.as_deref()),
             ),
             None => (
                 dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only, write_scope),
@@ -2388,6 +2485,16 @@ impl CliRunner {
                 }
             }
         };
+        // This attempt's own usage (a resume's baseline taken off), and why
+        // the baseline couldn't be trusted, if it couldn't (see `usage_since`).
+        let counted_usage = || {
+            usage_since(
+                &streamed_usage.lock(),
+                baseline,
+                stage.resume_session.as_deref(),
+                codex_accum.lock().session_id.as_deref(),
+            )
+        };
         let limits = ReadLimits::for_stage(stage_env_value("BASH_MAX_TIMEOUT_MS").as_deref());
         let on_long_wait = |window: std::time::Duration| emitter.notice(&long_command_notice(window));
         let read_loop = read_stream(stdout, dialect, limits, on_event, on_long_wait);
@@ -2413,13 +2520,16 @@ impl CliRunner {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
-                return Ok(stopped_stage(
+                let (counted, drift) = counted_usage();
+                let mut out = stopped_stage(
                     dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
                     &stage.agent_model,
-                    &streamed_usage.lock(),
+                    &counted,
                     codex_accum.lock().turn_open,
-                ));
+                );
+                flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                return Ok(out);
             }
         };
         let bin = dialect.binary();
@@ -2443,13 +2553,16 @@ impl CliRunner {
         if let (Some(kind), false) = (timeout_kind.as_deref(), has_terminal) {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
-            return Ok(stopped_stage(
+            let (counted, drift) = counted_usage();
+            let mut out = stopped_stage(
                 dialect,
                 &format!("{bin} {kind}"),
                 &stage.agent_model,
-                &streamed_usage.lock(),
+                &counted,
                 codex_accum.lock().turn_open,
-            ));
+            );
+            flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+            return Ok(out);
         }
         // Settled: the CLI declared itself finished and then stayed open on
         // background work it started — the `result` is the hand-off.
@@ -2500,8 +2613,10 @@ impl CliRunner {
         match dialect {
             CliDialect::Codex => {
                 let accum = codex_accum.lock().clone();
-                let u = sum_usage(&streamed_usage.lock());
-                let outcome = build_codex_outcome(
+                let total = sum_usage(&streamed_usage.lock());
+                let (counted, drift) = counted_usage();
+                let u = sum_usage(&counted);
+                let mut outcome = build_codex_outcome(
                     &accum,
                     u,
                     exit_success,
@@ -2509,6 +2624,16 @@ impl CliRunner {
                     &stage.agent_model,
                     &stderr_out,
                 );
+                outcome.cli.session_usage = codex_session_usage(&accum, &total);
+                flag_usage_drift(&mut outcome, drift.as_deref(), &emitter);
+                if resuming {
+                    report.resume_failure = codex_resume_failure(
+                        stage.resume_session.as_deref().unwrap_or_default(),
+                        &accum,
+                        matches!(outcome.status, StageStatus::Failed),
+                        &stderr_out,
+                    );
+                }
                 Ok(apply_question_guard(outcome))
             }
             CliDialect::Claude => match result_line {
@@ -2537,6 +2662,199 @@ impl CliRunner {
             },
         }
     }
+}
+
+/// What [`CliRunner::run_attempt`] tells [`CliRunner::run_stage`] beyond
+/// the outcome.
+#[derive(Debug, Default)]
+pub(crate) struct AttemptReport {
+    /// Why a `codex exec resume` attempt counts as failed to resume (see
+    /// [`codex_resume_failure`]); `None` on a fresh run, a resume that
+    /// worked, or a stop/timeout (never retried).
+    pub resume_failure: Option<String>,
+}
+
+/// Why a Codex stage with a session to resume runs fresh without trying:
+/// the installed `codex` has no `exec resume` (the help probe), or the
+/// session's reported total is unknown, so the resumed run's thread-wide
+/// usage couldn't be told apart from what was already counted. Pure.
+pub fn codex_resume_skip_reason(exec_resume_supported: bool, baseline_known: bool) -> Option<&'static str> {
+    if !exec_resume_supported {
+        Some("the installed Codex CLI has no `codex exec resume`")
+    } else if !baseline_known {
+        Some("its earlier run never reported usage, so the resumed run's cost couldn't be counted")
+    } else {
+        None
+    }
+}
+
+/// Why a finished `codex exec resume` attempt didn't resume, so the stage
+/// should run fresh once; `None` when it did. Two cases:
+/// - Codex streamed a different session id than the one asked for (a
+///   UUID is resumed as is in 0.169.0, so this is a guard, not an expected path);
+/// - the attempt failed before any assistant message: an unknown session
+///   (exit 1, no JSONL, `thread/resume failed: no rollout found …` on
+///   stderr), an argument error, or a `turn.failed` on the first request
+///   (e.g. the resumed history no longer fits the context window).
+/// A failure after an assistant message is the stage's own outcome. Pure.
+pub(crate) fn codex_resume_failure(requested: &str, accum: &CodexAccum, failed: bool, stderr: &str) -> Option<String> {
+    if let Some(got) = accum.session_id.as_deref().filter(|got| *got != requested) {
+        return Some(format!("Codex answered with session {got}, not {requested}"));
+    }
+    if !failed || accum.final_message.is_some() {
+        return None;
+    }
+    let stderr_error = stderr
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("Error:") || l.starts_with("error:"))
+        .map(|l| l.trim_start_matches("Error:").trim_start_matches("error:").trim().to_string());
+    Some(
+        accum
+            .error
+            .clone()
+            .or(stderr_error)
+            .unwrap_or_else(|| "it failed before any assistant message".to_string()),
+    )
+}
+
+/// True when a [`codex_resume_failure`] reason is clearly about resuming the
+/// session itself: another session id, an unknown session (`no rollout
+/// found`, `thread/resume`), an argument error on `codex exec resume`, or a
+/// resumed history that no longer fits the context window. Anything else
+/// (quota, auth, network…) is a failure that happened to hit the resumed
+/// run, not proof the session can't be continued. Pure.
+pub(crate) fn is_resume_problem(why: &str) -> bool {
+    let w = why.to_ascii_lowercase();
+    w.starts_with("codex answered with session")
+        || w.contains("no rollout found")
+        || w.contains("thread/resume")
+        || w.contains("unexpected argument")
+        || w.contains("context window")
+}
+
+/// The journal line before a failed resume's fresh run: "could not resume"
+/// only when the reason is a resume problem ([`is_resume_problem`]),
+/// otherwise a neutral "failed before answering on the resumed session". Pure.
+pub(crate) fn codex_resume_failure_notice(why: &str) -> String {
+    if is_resume_problem(why) {
+        format!(
+            "Codex could not resume this stage's session ({why}). Running the stage fresh once, with the feedback in the prompt."
+        )
+    } else {
+        format!(
+            "Codex failed before answering on the resumed session ({why}); running fresh once, with the feedback in the prompt."
+        )
+    }
+}
+
+/// `map`'s usage with `baseline` (the session's earlier reported total)
+/// taken off, as one entry; `map` unchanged without a baseline. A resumed
+/// Codex run's `turn.completed` reports the thread's running total (openai/codex
+/// `exec/src/event_processor_with_jsonl_output.rs` `usage_from_last_total`,
+/// seeded from the rollout on resume), so without this the earlier runs'
+/// tokens, already retired onto the run, would be counted again.
+///
+/// The subtraction is only trusted when the stream is the requested
+/// session's continuation. When Codex answered with another session id
+/// (`got` ≠ `requested`), or any field of the reported total is below the
+/// baseline (usage drift), nothing is subtracted: `map` comes back unchanged
+/// with `Some(why)`, and the caller flags the stage `usage_unreported` and
+/// journals `why` — the raw usage may double-count, but the stage never
+/// records ~0 for work it really did. Pure.
+pub(crate) fn usage_since(
+    map: &std::collections::HashMap<String, CliUsage>,
+    baseline: Option<crate::orchestrator::types::SessionUsage>,
+    requested: Option<&str>,
+    got: Option<&str>,
+) -> (std::collections::HashMap<String, CliUsage>, Option<String>) {
+    let Some(b) = baseline else { return (map.clone(), None) };
+    if map.is_empty() {
+        return (map.clone(), None);
+    }
+    if let (Some(req), Some(got)) = (requested, got) {
+        if req != got {
+            return (
+                map.clone(),
+                Some(format!(
+                    "Codex reported usage for session {got}, not the resumed {req}, so its earlier total wasn't subtracted"
+                )),
+            );
+        }
+    }
+    let t = sum_usage(map);
+    let Some(d) = session_usage_of(&t).since(&b) else {
+        return (
+            map.clone(),
+            Some(
+                "the resumed session's reported total is below what it had reported before, so the earlier total wasn't subtracted"
+                    .to_string(),
+            ),
+        );
+    };
+    (
+        std::collections::HashMap::from([(
+            "resumed".to_string(),
+            CliUsage {
+                input_tokens: d.input_tokens,
+                output_tokens: d.output_tokens,
+                cache_read_input_tokens: d.cache_read_tokens,
+                cache_creation_input_tokens: d.cache_creation_tokens,
+                ..t
+            },
+        )]),
+        None,
+    )
+}
+
+/// The journal line for a resumed Codex run whose usage couldn't be taken
+/// off its earlier total (see [`usage_since`]).
+pub(crate) fn usage_drift_notice(why: &str) -> String {
+    format!("Usage not reported exactly: {why}. This attempt counts the session's raw usage, which may include earlier runs.")
+}
+
+fn session_usage_of(u: &CliUsage) -> crate::orchestrator::types::SessionUsage {
+    crate::orchestrator::types::SessionUsage {
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        cache_read_tokens: u.cache_read_input_tokens,
+        cache_creation_tokens: u.cache_creation_input_tokens,
+    }
+}
+
+/// The running total a Codex session reported by the end of an attempt
+/// (`total` = the raw stream sum, before any baseline is taken off), kept as
+/// the next resume's baseline. `None` when it's unknown: no session id, no
+/// usage, or a last turn that never completed. Pure.
+pub(crate) fn codex_session_usage(accum: &CodexAccum, total: &CliUsage) -> Option<crate::orchestrator::types::SessionUsage> {
+    (accum.session_id.is_some() && !accum.turn_open && *total != CliUsage::default()).then(|| session_usage_of(total))
+}
+
+/// The outcome of a failed resume followed by its fresh run: the fresh run's
+/// result, with the failed attempt's spend added (it was really burned) and
+/// its unknown spend, if any, still flagged. Pure.
+/// Flag `outcome`'s spend as not exactly reported and journal why, when
+/// [`usage_since`] couldn't subtract the resume baseline.
+fn flag_usage_drift(
+    outcome: &mut StageOutcome,
+    drift: Option<&str>,
+    emitter: &crate::orchestrator::live::LiveEmitter<'_>,
+) {
+    if let Some(why) = drift {
+        outcome.cli.usage_unreported = true;
+        emitter.notice(&usage_drift_notice(why));
+    }
+}
+
+pub(crate) fn merge_resume_fallback(resumed: StageOutcome, mut fresh: StageOutcome) -> StageOutcome {
+    fresh.input_tokens += resumed.input_tokens;
+    fresh.output_tokens += resumed.output_tokens;
+    fresh.cache_read_tokens += resumed.cache_read_tokens;
+    fresh.cache_creation_tokens += resumed.cache_creation_tokens;
+    fresh.cost_usd += resumed.cost_usd;
+    fresh.cli.usage_unreported |= resumed.cli.usage_unreported
+        || resumed.error.as_deref().is_some_and(is_usage_unreported);
+    fresh
 }
 
 /// Preview (≤400 chars) of stderr if it has content, else of `fallback`
@@ -2638,6 +2956,7 @@ pub(crate) fn stopped_stage(
 
 fn failed_stage(msg: &str) -> StageOutcome {
     StageOutcome {
+        cli: Default::default(),
         artifact: StageArtifact {
             kind: ArtifactKind::Note,
             text: String::new(),

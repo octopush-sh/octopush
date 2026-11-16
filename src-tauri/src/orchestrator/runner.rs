@@ -391,6 +391,7 @@ impl AgentRunner for ApiRunner {
                 // decision; the spend it burned asking is preserved for the meter.
                 if let Some(ask) = r.blocked.clone() {
                     return Ok(StageOutcome {
+                        cli: Default::default(),
                         artifact: StageArtifact {
                             kind: ArtifactKind::Note,
                             text: String::new(),
@@ -422,6 +423,7 @@ impl AgentRunner for ApiRunner {
                 if !r.finished {
                     let cancelled = ctx.cancel.load(std::sync::atomic::Ordering::Relaxed);
                     return Ok(StageOutcome {
+                        cli: Default::default(),
                         artifact: StageArtifact {
                             kind: ArtifactKind::Note,
                             text: String::new(),
@@ -471,6 +473,7 @@ impl AgentRunner for ApiRunner {
                     r.text.clone()
                 };
                 Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact {
                         kind,
                         text,
@@ -492,6 +495,7 @@ impl AgentRunner for ApiRunner {
                 })
             }
             Err(e) => Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: String::new(),

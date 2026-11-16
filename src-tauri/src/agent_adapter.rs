@@ -486,6 +486,45 @@ fn probe_claude_version() -> Option<String> {
     parse_claude_version(&run_bounded(cmd, VERSION_TIMEOUT)?)
 }
 
+// ─── `codex exec resume` probe ─────────────────────────────────────
+
+/// True when the installed `codex` has `codex exec resume` in the shape
+/// Octopush calls it (`… resume <SESSION_ID> -`, the prompt on stdin, with
+/// `--json` in effect): read from `codex exec resume --help`, probed once per
+/// app session with the same login-shell PATH the stages use. A missing CLI,
+/// a non-zero exit or a timeout reads as unsupported, so the stage runs
+/// fresh. A stale answer is safe: an `exec resume` that is gone fails at
+/// once with an argument error, and the runner then runs the stage fresh.
+pub fn codex_exec_resume_supported() -> bool {
+    static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROBE.get_or_init(|| probe_codex_exec_resume_help().is_some_and(|h| codex_help_lists_exec_resume(&h)))
+}
+
+/// `codex exec resume --help` lists what the resumed argv relies on: the
+/// subcommand's usage line, the `SESSION_ID` and `PROMPT` positionals, `-`
+/// reading the prompt from stdin, and `--json`. Pinned by the recorded help
+/// in `tests/fixtures/codex/<version>/exec-resume-help.txt`. Pure.
+pub fn codex_help_lists_exec_resume(help: &str) -> bool {
+    help.contains("Usage: codex exec resume")
+        && help.contains("[SESSION_ID]")
+        && help.contains("[PROMPT]")
+        && help.contains("If `-` is used, read from stdin")
+        && help.contains("--json")
+}
+
+fn probe_codex_exec_resume_help() -> Option<String> {
+    use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
+    let path_env = resolved_cli_path();
+    let bin = resolve_executable("codex", &path_env)?;
+    let mut cmd = Command::new(bin);
+    cmd.args(["exec", "resume", "--help"]);
+    for (k, v) in login_shell_env() {
+        cmd.env(k, v);
+    }
+    cmd.env("PATH", &path_env);
+    run_bounded(cmd, VERSION_TIMEOUT)
+}
+
 // ─── `claude auth status` → claude.ai sign-in end (2.1.318+) ──────
 
 /// `--json` is asked for explicitly (it is the default today, see
