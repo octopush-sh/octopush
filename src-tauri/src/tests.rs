@@ -8296,6 +8296,85 @@ mod orchestrator_tests {
         assert!(seen[1].2.as_deref().unwrap_or_default().contains("fix the parser"));
     }
 
+    /// Review fix on #682: a 3-stage window run on [`CodexWindowRunner`]
+    /// records, per writer run, its role and the session it was asked to
+    /// resume. Every writer reports `thr-<role>` and its total.
+    struct CodexWindowRunner {
+        reviews: std::sync::atomic::AtomicUsize,
+        seen: Arc<Mutex<Vec<(String, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexWindowRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            let review = stage.role == "code_review";
+            let text = if review {
+                let n = self.reviews.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 { "fix the parser\nVERDICT: CHANGES_REQUESTED".to_string() } else { "ok\nVERDICT: PASS".to_string() }
+            } else {
+                self.seen.lock().push((stage.role.clone(), stage.resume_session.clone()));
+                "did it".to_string()
+            };
+            let mut cli: crate::orchestrator::types::CliOutcomeMeta = Default::default();
+            if !review {
+                cli.session_usage = Some(crate::orchestrator::types::SessionUsage { input_tokens: 900, output_tokens: 90, cache_read_tokens: 0, cache_creation_tokens: 0 });
+            }
+            Ok(StageOutcome {
+                cli,
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
+                input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: if review { None } else { Some(format!("thr-{}", stage.role)) },
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// Plan(`plan_model`/`plan_substrate`) → Implement(Codex CLI) → Review
+    /// (auto loop → Plan), run to completion; returns each writer run.
+    async fn codex_window_run(plan_model: &str, plan_substrate: &str) -> Vec<(String, Option<String>)> {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("CodexWindow", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", plan_model, plan_substrate, false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 2, "code_review", "m", "api", false, Some(0), 2, Some("auto"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CodexWindowRunner { reviews: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let out = seen.lock().clone();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_codex_writer_between_the_loop_target_and_the_review_reruns_fresh() {
+        // The target (Plan) is an API stage; Implement is a Codex writer with
+        // a resumable session in the window. Its input (the new plan)
+        // changed, so it must run fresh with the refreshed dossier.
+        let seen = codex_window_run("m", "api").await;
+        let implement: Vec<_> = seen.iter().filter(|(r, _)| r == "implement").collect();
+        assert_eq!(implement.len(), 2, "implement re-ran in the window: {seen:?}");
+        assert_eq!(implement[1].1, None, "not the loop target: no resume");
+    }
+
+    #[tokio::test]
+    async fn a_codex_writer_loop_target_resumes_and_the_rest_of_the_window_runs_fresh() {
+        let seen = codex_window_run("gpt-5.5", "cli").await;
+        let plan: Vec<_> = seen.iter().filter(|(r, _)| r == "plan").collect();
+        let implement: Vec<_> = seen.iter().filter(|(r, _)| r == "implement").collect();
+        assert_eq!(plan.len(), 2, "{seen:?}");
+        assert_eq!(plan[1].1.as_deref(), Some("thr-plan"), "the Codex loop target resumes its session");
+        assert_eq!(implement.len(), 2, "{seen:?}");
+        assert_eq!(implement[1].1, None, "a Codex writer after the target runs fresh");
+    }
+
     #[test]
     fn stage_session_usage_round_trips_per_session() {
         let (db, ws) = db_with_workspace();

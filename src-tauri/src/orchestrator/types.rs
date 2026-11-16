@@ -341,14 +341,18 @@ pub struct SessionUsage {
 }
 
 impl SessionUsage {
-    /// `self` minus `earlier`, field by field, never below zero.
-    pub fn since(&self, earlier: &SessionUsage) -> SessionUsage {
-        SessionUsage {
-            input_tokens: self.input_tokens.saturating_sub(earlier.input_tokens),
-            output_tokens: self.output_tokens.saturating_sub(earlier.output_tokens),
-            cache_read_tokens: self.cache_read_tokens.saturating_sub(earlier.cache_read_tokens),
-            cache_creation_tokens: self.cache_creation_tokens.saturating_sub(earlier.cache_creation_tokens),
-        }
+    /// `self` minus `earlier`, field by field — `None` when any field of
+    /// `self` is below `earlier`'s. A running total never shrinks, so a lower
+    /// field means `self` is not a continuation of `earlier` (another thread,
+    /// a reset or a changed report): subtracting would clamp to ~0 and
+    /// undercount, so the caller counts the raw usage instead.
+    pub fn since(&self, earlier: &SessionUsage) -> Option<SessionUsage> {
+        Some(SessionUsage {
+            input_tokens: self.input_tokens.checked_sub(earlier.input_tokens)?,
+            output_tokens: self.output_tokens.checked_sub(earlier.output_tokens)?,
+            cache_read_tokens: self.cache_read_tokens.checked_sub(earlier.cache_read_tokens)?,
+            cache_creation_tokens: self.cache_creation_tokens.checked_sub(earlier.cache_creation_tokens)?,
+        })
     }
 }
 

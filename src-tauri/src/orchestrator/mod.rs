@@ -133,6 +133,12 @@ pub(crate) fn downstream_of(
         .collect()
 }
 
+/// The first line of [`format_blocker_feedback`]: how a resumed session's
+/// prompt tells answered questions apart from review findings
+/// (`CliDialect::resume_prompt`).
+pub(crate) const BLOCKER_FEEDBACK_HEADER: &str =
+    "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n";
+
 /// Format the director's answers to a blocked stage's `ask_director` questions
 /// into the feedback block that `user_input_for` injects on the re-run. Answers
 /// are positional; a missing or empty answer falls back to that question's
@@ -143,9 +149,7 @@ pub(crate) fn format_blocker_feedback(
     ask: Option<&crate::orchestrator::types::BlockedAsk>,
     answers: &[String],
 ) -> String {
-    let mut s = String::from(
-        "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n",
-    );
+    let mut s = String::from(BLOCKER_FEEDBACK_HEADER);
     let questions = ask.map(|a| a.questions.as_slice()).unwrap_or(&[]);
     if questions.is_empty() {
         for (i, a) in answers.iter().enumerate() {
@@ -513,12 +517,18 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// The model the stage's next attempt runs on: the escalate model once the
+    /// stage is escalated (falling back to the base when only effort was
+    /// bumped), the base model otherwise.
+    fn effective_model(s: &crate::db::RunStageRow) -> &str {
+        if s.escalated { s.escalate_model.as_deref().unwrap_or(&s.agent_model) } else { &s.agent_model }
+    }
+
     /// A CLI stage row that runs on Codex (its effective model, escalation applied).
     fn is_codex_cli(s: &crate::db::RunStageRow) -> bool {
-        let model = if s.escalated { s.escalate_model.as_deref().unwrap_or(&s.agent_model) } else { &s.agent_model };
         s.substrate == "cli"
             && matches!(
-                crate::orchestrator::cli_runner::dialect_for_model(model),
+                crate::orchestrator::cli_runner::dialect_for_model(Self::effective_model(s)),
                 crate::orchestrator::cli_runner::CliDialect::Codex
             )
     }
@@ -548,7 +558,7 @@ impl Orchestrator {
     /// auto loop. Caller guarantees `review` has a valid `loop_target_position`
     /// strictly before `review.position` and iterations remaining.
     ///
-    /// `resume_codex`: a Codex writer in the window CONTINUES its session
+    /// `resume_codex`: the loop target, if it is a Codex writer, CONTINUES its session
     /// (`codex exec resume`, the findings as the prompt) instead of re-reading
     /// the repo and the whole dossier. False when the loop-back comes with an
     /// escalation, which is defined as a fresh attempt at the strong tier.
@@ -589,7 +599,13 @@ impl Orchestrator {
                 let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb, false)?;
                 let has_findings = fb.is_some_and(|f| !f.trim().is_empty());
+                // Only the loop TARGET continues its session. Every other
+                // Codex writer in the window (e.g. an implement stage between
+                // a plan target and the review) must re-run fresh: its inputs
+                // — the target's new artifact — changed, so the refreshed
+                // dossier is the point, not a delta on its old thread.
                 if resume_codex
+                    && s.position == target_pos
                     && has_findings
                     && Self::is_codex_cli(s)
                     && !self.stage_is_read_only(s)
@@ -1913,14 +1929,17 @@ impl Orchestrator {
         }
     }
 
-    /// [`stage_read_only`] for a run stage.
+    /// [`stage_read_only`] for a run stage, judged on its EFFECTIVE model
+    /// (escalation applied) — the same model [`Self::is_codex_cli`] uses, so
+    /// an escalated stage isn't classed on a dialect it no longer runs.
     fn stage_is_read_only(&self, s: &crate::db::RunStageRow) -> bool {
         use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+        let model = Self::effective_model(s);
         // The role matters only for a Codex CLI stage; skip the lookup otherwise.
         let needs_role = matches!(AgentSubstrate::from_db(&s.substrate), Some(AgentSubstrate::Cli))
-            && matches!(dialect_for_model(&s.agent_model), CliDialect::Codex);
+            && matches!(dialect_for_model(model), CliDialect::Codex);
         let role = if needs_role { self.db.lock().get_role(&s.role).ok().flatten() } else { None };
-        stage_read_only(&s.substrate, &s.agent_model, s.tools.as_deref(), role.as_ref())
+        stage_read_only(&s.substrate, model, s.tools.as_deref(), role.as_ref())
     }
 
     /// The freshly-persisted artifact text of `stage` (its review findings).

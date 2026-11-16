@@ -20,8 +20,8 @@ use std::path::{Path, PathBuf};
 use crate::agent_adapter::codex_help_lists_exec_resume;
 use crate::orchestrator::cli_runner::{
     build_codex_outcome, codex_fold_event, codex_resume_failure, codex_resume_skip_reason, codex_session_usage,
-    codex_usage_from_event, codex_writable_root_args, is_usage_unreported, merge_resume_fallback, sum_usage,
-    usage_since, CliDialect, CliUsage, CodexAccum, CodexWriteScope,
+    codex_usage_from_event, codex_resume_failure_notice, codex_writable_root_args, is_resume_problem, is_usage_unreported, merge_resume_fallback,
+    sum_usage, usage_drift_notice, usage_since, CliDialect, CliUsage, CodexAccum, CodexWriteScope,
 };
 use crate::orchestrator::types::{ArtifactKind, SessionUsage, StageStatus};
 
@@ -210,7 +210,9 @@ fn a_resumed_turn_counts_only_its_own_tokens() {
         let total = sum_usage(&map);
         assert_eq!(total.input_tokens, 184_000 - 150_000);
         assert_eq!(total.cache_read_input_tokens, 150_000);
-        let own = sum_usage(&usage_since(&map, Some(baseline)));
+        let (counted, drift) = usage_since(&map, Some(baseline), Some(SESSION), accum.session_id.as_deref());
+        assert_eq!(drift, None);
+        let own = sum_usage(&counted);
         assert_eq!(own.input_tokens, 34_000 - 20_000);
         assert_eq!(own.cache_read_input_tokens, 50_000);
         assert_eq!(own.output_tokens, 9_100 - 4_000);
@@ -225,7 +227,7 @@ fn a_resumed_turn_counts_only_its_own_tokens() {
             Some(SessionUsage { input_tokens: 34_000, output_tokens: 9_100, cache_read_tokens: 150_000, cache_creation_tokens: 0 })
         );
         // Without a baseline (a fresh run), the map is untouched.
-        assert_eq!(sum_usage(&usage_since(&map, None)), total);
+        assert_eq!(usage_since(&map, None, None, accum.session_id.as_deref()), (map.clone(), None));
     }
 }
 
@@ -234,7 +236,7 @@ fn a_resume_that_fails_before_any_message_falls_back_and_keeps_usage_unknown() {
     for r in recordings() {
         let (accum, map) = fold(&r.jsonl("stream-json/resume-turn-failed.jsonl"));
         let baseline = SessionUsage { input_tokens: 1, ..Default::default() };
-        let own = sum_usage(&usage_since(&map, Some(baseline)));
+        let own = sum_usage(&usage_since(&map, Some(baseline), Some(SESSION), accum.session_id.as_deref()).0);
         let resumed = build_codex_outcome(&accum, own, false, ArtifactKind::Diff, "gpt-5.5", "");
         assert!(matches!(resumed.status, StageStatus::Failed));
         // The turn started and never completed: its spend is unknown (#744).
@@ -260,4 +262,72 @@ fn resume_is_skipped_without_the_subcommand_or_a_baseline() {
     assert!(codex_resume_skip_reason(false, true).unwrap().contains("no `codex exec resume`"));
     assert!(codex_resume_skip_reason(true, false).unwrap().contains("never reported usage"));
     assert_eq!(codex_resume_skip_reason(true, true), None);
+}
+
+/// The resumed recording's total, minus a baseline above it in one field
+/// (usage drift): nothing is subtracted, the raw usage is counted and the
+/// reason says why — never a ~0 count.
+#[test]
+fn a_resumed_total_below_its_baseline_counts_the_raw_usage_and_says_why() {
+    for r in recordings() {
+        let (accum, map) = fold(&r.jsonl("stream-json/resume.jsonl"));
+        let total = sum_usage(&map);
+        // Output is above what the session now reports; the rest is below.
+        let baseline = SessionUsage { input_tokens: 1, output_tokens: total.output_tokens + 1, cache_read_tokens: 0, cache_creation_tokens: 0 };
+        let (counted, drift) = usage_since(&map, Some(baseline), Some(SESSION), accum.session_id.as_deref());
+        assert_eq!(sum_usage(&counted), total, "raw usage, nothing subtracted");
+        let why = drift.expect("drift is reported");
+        assert!(why.contains("below what it had reported"), "{why}");
+        assert!(usage_drift_notice(&why).starts_with("Usage not reported exactly"));
+        let out = build_codex_outcome(&accum, sum_usage(&counted), true, ArtifactKind::Diff, "gpt-5.5", "");
+        assert_eq!(out.input_tokens, total.input_tokens, "not ~0");
+    }
+}
+
+/// Codex streamed another session id than the one resumed: its total is not
+/// a continuation of the stored baseline, so nothing is subtracted.
+#[test]
+fn a_resumed_stream_for_another_session_counts_the_raw_usage_and_says_why() {
+    for r in recordings() {
+        let (accum, map) = fold(&r.jsonl("stream-json/resume.jsonl"));
+        let total = sum_usage(&map);
+        let baseline = SessionUsage { input_tokens: 20_000, output_tokens: 4_000, cache_read_tokens: 100_000, cache_creation_tokens: 0 };
+        let other = "00000000-0000-4000-8000-000000000000";
+        let (counted, drift) = usage_since(&map, Some(baseline), Some(other), accum.session_id.as_deref());
+        assert_eq!(sum_usage(&counted), total, "raw usage, nothing subtracted");
+        let why = drift.expect("a session mismatch is reported");
+        assert!(why.contains(other) && why.contains(SESSION), "{why}");
+    }
+}
+
+#[test]
+fn the_fallback_notice_says_could_not_resume_only_for_a_resume_problem() {
+    for why in [
+        "Codex answered with session b, not a",
+        "thread/resume: thread/resume failed: no rollout found for thread id x (code -32600)",
+        "unexpected argument '-s' found",
+        "Codex ran out of room in the model's context window. Start a new thread.",
+    ] {
+        assert!(is_resume_problem(why), "{why}");
+        assert!(codex_resume_failure_notice(why).starts_with("Codex could not resume"), "{why}");
+    }
+    for why in ["You've hit your usage limit.", "401 Unauthorized", "stream disconnected before completion: error sending request"] {
+        assert!(!is_resume_problem(why), "{why}");
+        let n = codex_resume_failure_notice(why);
+        assert!(n.starts_with("Codex failed before answering on the resumed session"), "{n}");
+        assert!(n.contains("running fresh once"), "{n}");
+    }
+}
+
+#[test]
+fn the_resume_prompt_words_answers_and_review_findings_apart() {
+    let answers = crate::orchestrator::format_blocker_feedback(None, &["use sqlite".to_string()]);
+    let p = CliDialect::Codex.resume_prompt(Some(&answers));
+    assert!(p.starts_with("Your director answered your questions:"), "{p}");
+    assert!(p.contains("use sqlite"), "{p}");
+    assert!(!p.contains("reviewer"), "{p}");
+    let p = CliDialect::Codex.resume_prompt(Some("fix the parser"));
+    assert!(p.starts_with("A reviewer sent your earlier work"), "{p}");
+    assert!(p.contains("fix the parser"), "{p}");
+    assert!(!p.contains("director"), "{p}");
 }
