@@ -42,6 +42,8 @@ tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-clipboard-manager = "2"
+# Used only in release builds (`#[cfg(not(debug_assertions))]` in lib.rs), so a
+# debug-profile clippy reports it as unused. It is needed: keep it.
 tauri-plugin-single-instance = "2"
 # Canonical paths without Windows' `\\?\` verbatim prefix (Open With).
 dunce = "1"
