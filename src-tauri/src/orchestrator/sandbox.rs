@@ -363,26 +363,192 @@ fn system_write_files(home: Option<&str>) -> Vec<String> {
     }
 }
 
+/// This process's user id, which owns the user-home write roots.
+#[cfg(unix)]
+fn current_uid() -> Option<u32> {
+    // SAFETY: `getuid` has no preconditions and can't fail.
+    Some(unsafe { libc::getuid() })
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn owner_of(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(meta.uid())
+}
+
+#[cfg(not(unix))]
+fn owner_of(_meta: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+/// Whether `meta` is owned by `owner` (always, when there is no owner to
+/// check against or the platform has no uids).
+fn owned_by(meta: &std::fs::Metadata, owner: Option<u32>) -> bool {
+    match (owner, owner_of(meta)) {
+        (Some(want), Some(got)) => want == got,
+        _ => true,
+    }
+}
+
+/// The dirs no system write root may resolve to: `/`, `/Users`, `$HOME` and
+/// every ancestor of `$HOME`, each as given and as its realpath.
+fn forbidden_root_targets(home: Option<&str>) -> Vec<PathBuf> {
+    let mut v = vec![PathBuf::from("/"), PathBuf::from("/Users"), canonical_lenient(Path::new("/Users"))];
+    if let Some(h) = home {
+        for base in [PathBuf::from(h), canonical_lenient(Path::new(h))] {
+            v.extend(base.ancestors().map(Path::to_path_buf));
+        }
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// The paths a profile may grant for the system write root dir `root`: the
+/// root as given and, when it differs, its realpath. A root that doesn't exist
+/// yet is granted as given (the root deny keeps a stage from creating it).
+/// Fails closed, with the reason, when the root resolves to `/`, `/Users`,
+/// `$HOME` or an ancestor of `$HOME`, doesn't resolve, isn't a directory, or
+/// (with `owner`, for the user-home roots) the entry or what it resolves to
+/// isn't owned by `owner`.
+fn resolve_system_root(root: &str, home: Option<&str>, owner: Option<u32>) -> Result<Vec<String>, String> {
+    let path = Path::new(root);
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return Ok(vec![root.to_string()]);
+    };
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{root} doesn't resolve ({e})"))?;
+    if forbidden_root_targets(home).contains(&real) {
+        return Err(format!("{root} resolves to {}", real.display()));
+    }
+    let target = std::fs::metadata(&real).map_err(|e| format!("{root} can't be read ({e})"))?;
+    if !target.is_dir() {
+        return Err(format!("{root} is not a directory"));
+    }
+    if !owned_by(&entry, owner) || !owned_by(&target, owner) {
+        return Err(format!("{root} is not owned by you"));
+    }
+    let real = real.to_string_lossy().into_owned();
+    Ok(if real == root { vec![real] } else { vec![root.to_string(), real] })
+}
+
+/// The paths a profile may grant for the CLI state file `file`
+/// (`~/.claude.json`): the file as given and, when it differs, its realpath.
+/// A file that doesn't exist yet is granted as given. Fails closed, with the
+/// reason, when it doesn't resolve, isn't a regular file, has another hard
+/// link, isn't owned by `owner`, or is a symlink to anything outside
+/// `~/.claude*`.
+fn resolve_state_file(file: &str, home: &str, owner: Option<u32>) -> Result<Vec<String>, String> {
+    let path = Path::new(file);
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
+        return Ok(vec![file.to_string()]);
+    };
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{file} doesn't resolve ({e})"))?;
+    let target = std::fs::metadata(&real).map_err(|e| format!("{file} can't be read ({e})"))?;
+    if !target.is_file() {
+        return Err(format!("{file} is not a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if target.nlink() != 1 {
+            return Err(format!("{file} has more than one hard link"));
+        }
+    }
+    if !owned_by(&entry, owner) || !owned_by(&target, owner) {
+        return Err(format!("{file} is not owned by you"));
+    }
+    let real = real.to_string_lossy().into_owned();
+    if entry.file_type().is_symlink() {
+        let prefix = format!("{}/.claude", canonical_string(Path::new(home)));
+        if !real.starts_with(&prefix) {
+            return Err(format!("{file} links outside {home}/.claude*"));
+        }
+    }
+    Ok(if real == file { vec![real] } else { vec![file.to_string(), real] })
+}
+
+/// The write roots a profile is built from (see [`assemble_write_roots`]).
+#[derive(Debug, Default, PartialEq)]
+struct WriteRoots {
+    /// Every writable subtree: the mission's roots and the system roots that
+    /// passed [`resolve_system_root`], with their realpaths.
+    subpaths: Vec<String>,
+    /// The system root dirs themselves (as given and as realpaths), denied as
+    /// paths so a stage can write inside them but never remove or replace one.
+    system_roots: Vec<String>,
+    /// Writable single files (`~/.claude.json` and its realpath).
+    files: Vec<String>,
+    /// Why a system root or file was left out, one line each.
+    refused: Vec<String>,
+}
+
 /// Merge the mission's write roots with the system defaults, add canonical forms
 /// (seatbelt matches realpaths, so a symlinked root must appear resolved too),
-/// and de-duplicate. Pure over its inputs.
-fn assemble_write_roots(mission_roots: &[String], home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
-    let mut roots: Vec<String> = mission_roots.to_vec();
-    roots.extend(system_write_roots(home, tmpdir));
-    // Add realpath forms where they differ (best-effort; skip non-existent).
-    let mut canonical: Vec<String> = Vec::new();
-    for r in &roots {
+/// and de-duplicate. The system roots and the state file go through
+/// [`resolve_system_root`] / [`resolve_state_file`] (user-home ones checked
+/// against `owner`); one that fails is left out (fail closed) and its reason
+/// recorded in `refused`. Reads the filesystem, writes nothing.
+fn assemble_write_roots(
+    mission_roots: &[String],
+    home: Option<&str>,
+    tmpdir: Option<&str>,
+    owner: Option<u32>,
+) -> WriteRoots {
+    let mut out = WriteRoots::default();
+    for r in mission_roots {
+        out.subpaths.push(r.clone());
+        // Add the realpath form where it differs (best-effort; skip non-existent).
         if let Ok(c) = std::fs::canonicalize(r) {
-            let cs = c.to_string_lossy().into_owned();
-            if &cs != r {
-                canonical.push(cs);
+            out.subpaths.push(c.to_string_lossy().into_owned());
+        }
+    }
+    let in_home = |r: &str| home.is_some_and(|h| Path::new(r).starts_with(h));
+    for r in system_write_roots(home, tmpdir) {
+        let check_owner = if in_home(&r) { owner } else { None };
+        match resolve_system_root(&r, home, check_owner) {
+            Ok(paths) => {
+                out.subpaths.extend(paths.iter().cloned());
+                out.system_roots.extend(paths);
+            }
+            Err(why) => out.refused.push(why),
+        }
+    }
+    if let Some(h) = home {
+        for f in system_write_files(home) {
+            match resolve_state_file(&f, h, owner) {
+                Ok(paths) => out.files.extend(paths),
+                Err(why) => out.refused.push(why),
             }
         }
     }
-    roots.extend(canonical);
-    roots.sort();
-    roots.dedup();
-    roots
+    for v in [&mut out.subpaths, &mut out.system_roots, &mut out.files] {
+        v.sort();
+        v.dedup();
+    }
+    out
+}
+
+/// Create the user-home write roots Octopush can make (`~/.claude`,
+/// `~/.cache`) when they don't exist yet, outside the sandbox and before the
+/// profile is built, so a stage never gets to create the root entry itself.
+/// `create_dir` never follows a link in the root's place, and the new dir must
+/// be a real directory of the user's. Best-effort: a root that can't be made
+/// is still resolved (and checked) as usual.
+fn ensure_home_roots(home: &str) {
+    for name in [".claude", ".cache"] {
+        let dir = Path::new(home).join(name);
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            continue;
+        }
+        if let Err(e) = create_dir_once(&dir).and_then(|()| check_own_dir(&dir)) {
+            tracing::warn!(dir = %dir.display(), error = %e, "sandbox: couldn't create a write root");
+        }
+    }
 }
 
 /// Escape `s` so an SBPL `(regex …)` matches it literally.
@@ -797,17 +963,30 @@ pub fn stage_isolation(git_isolation: &str, exec_choice: &str, workspace_path: &
 /// `prepare` checked) are writable too but never treated as workspaces. They go in as given, not
 /// re-resolved, and each root dir itself is denied: a `subpath` also matches
 /// its root, so without the deny a stage could swap the root for a symlink and
-/// widen the next stage's profile to wherever it points. Errors when a
-/// workspace's git layout can't be resolved (fail closed).
+/// widen the next stage's profile to wherever it points. The system write root
+/// dirs (`/dev`, `/private/tmp`, `$TMPDIR`, `~/.claude`, `~/.cache`) and their
+/// realpaths are denied as paths the same way, and a system root or the
+/// `~/.claude.json` state file that fails its check is left out with a
+/// warning (see [`assemble_write_roots`]). Errors when a workspace's git
+/// layout can't be resolved (fail closed).
 pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[String]) -> AppResult<String> {
     let home = std::env::var("HOME").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
-    let mut subpaths = assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref());
+    if let Some(h) = home.as_deref() {
+        ensure_home_roots(h);
+    }
+    let roots = assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref(), current_uid());
+    for why in &roots.refused {
+        tracing::warn!(reason = %why, "sandbox: a system write root was left out of the profile");
+    }
+    let mut subpaths = roots.subpaths;
     subpaths.extend(cache_roots.iter().cloned());
+    let mut deny_literals = roots.system_roots;
+    deny_literals.extend(cache_roots.iter().cloned());
     let mut rules = WriteRules {
         subpaths,
-        literals: system_write_files(home.as_deref()),
-        deny_literals: cache_roots.to_vec(),
+        literals: roots.files,
+        deny_literals,
         ..WriteRules::default()
     };
     let write_roots = rules.subpaths.clone();
@@ -1351,8 +1530,250 @@ mod tests {
         // A readonly mission has no mission roots: still temp-only, no git allows.
         let p = build_seatbelt_profile(&[], &[]).unwrap();
         assert!(!p.contains("/objects\""));
-        assert!(!p.contains("(deny file-write*\n"));
-        assert!(!p.contains("(deny file-link"));
+        // The only trailing denies are the system root dirs themselves.
+        if let Some(deny) = p.find("(deny file-write*\n") {
+            assert!(!p[deny..].contains("(subpath "));
+        }
+        assert!(!p.contains("/.git/"));
+        assert!(!p.contains("(regex "));
+    }
+
+    /// Profile-free check of `resolve_system_root` with `home` as `$HOME`.
+    fn root_ok(root: &Path, home: &Path, owner: Option<u32>) -> bool {
+        resolve_system_root(root.to_str().unwrap(), home.to_str(), owner).is_ok()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_system_root_resolving_to_home_or_an_ancestor_is_left_out() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join("home");
+        std::fs::create_dir_all(home.join("dotfiles/claude")).unwrap();
+        let uid = current_uid();
+        // A real dir, a missing one and a link to a dir of the user's are granted.
+        std::fs::create_dir(home.join(".cache")).unwrap();
+        assert!(root_ok(&home.join(".cache"), &home, uid));
+        assert_eq!(
+            resolve_system_root(home.join(".missing").to_str().unwrap(), home.to_str(), uid).unwrap(),
+            vec![home.join(".missing").to_string_lossy().into_owned()]
+        );
+        symlink(home.join("dotfiles/claude"), home.join(".claude")).unwrap();
+        let granted = resolve_system_root(home.join(".claude").to_str().unwrap(), home.to_str(), uid).unwrap();
+        assert!(granted.contains(&home.join(".claude").to_string_lossy().into_owned()));
+        assert!(granted.contains(&home.join("dotfiles/claude").to_string_lossy().into_owned()));
+        // Links to `$HOME`, each of its ancestors and `/` are not.
+        let mut targets: Vec<PathBuf> = home.ancestors().map(Path::to_path_buf).collect();
+        targets.push(PathBuf::from("/"));
+        for (i, t) in targets.iter().enumerate() {
+            let link = home.join(format!(".link-{i}"));
+            symlink(t, &link).unwrap();
+            assert!(!root_ok(&link, &home, uid), "a link to {} must be left out", t.display());
+            assert!(!root_ok(&link, &home, None), "a link to {} must be left out unchecked too", t.display());
+        }
+        // Through a chain of links as well.
+        symlink(home.join(".link-0"), home.join(".chain")).unwrap();
+        assert!(!root_ok(&home.join(".chain"), &home, uid));
+        // `/Users` (macOS's home parent) is never a root, even outside `$HOME`'s chain.
+        if Path::new("/Users").is_dir() {
+            symlink("/Users", home.join(".users")).unwrap();
+            assert!(!root_ok(&home.join(".users"), &home, None));
+        }
+        // A dangling link or a link to a file is left out.
+        symlink(home.join("gone"), home.join(".dangling")).unwrap();
+        assert!(!root_ok(&home.join(".dangling"), &home, uid));
+        std::fs::write(home.join("file"), "x").unwrap();
+        symlink(home.join("file"), home.join(".to-file")).unwrap();
+        assert!(!root_ok(&home.join(".to-file"), &home, uid));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_user_home_root_owned_by_someone_else_is_left_out() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(home.join(".cache")).unwrap();
+        std::fs::create_dir(home.join("elsewhere")).unwrap();
+        symlink(home.join("elsewhere"), home.join(".claude")).unwrap();
+        let mine = std::fs::metadata(&home).unwrap().uid();
+        // Stand in a different owner for "someone else": every entry here is ours.
+        let foreign = Some(mine.wrapping_add(1));
+        assert!(root_ok(&home.join(".cache"), &home, Some(mine)));
+        assert!(!root_ok(&home.join(".cache"), &home, foreign));
+        assert!(root_ok(&home.join(".claude"), &home, Some(mine)));
+        assert!(!root_ok(&home.join(".claude"), &home, foreign));
+        // A root-owned target the user's link points at (`/` aside) is foreign too.
+        if mine != 0 {
+            symlink("/usr", home.join(".foreign")).unwrap();
+            assert!(!root_ok(&home.join(".foreign"), &home, Some(mine)));
+        }
+        // `assemble_write_roots` drops a refused user-home root and says why,
+        // keeping the others.
+        let h = home.to_string_lossy().into_owned();
+        let roots = assemble_write_roots(&[], Some(&h), None, foreign);
+        assert!(!roots.subpaths.iter().any(|r| r.starts_with(&format!("{h}/.c"))));
+        assert!(!roots.subpaths.iter().any(|r| r.ends_with("/elsewhere")));
+        assert_eq!(roots.refused.len(), 2, "{:?}", roots.refused);
+        assert!(roots.subpaths.contains(&"/dev".to_string()));
+        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine));
+        assert!(roots.refused.is_empty(), "{:?}", roots.refused);
+        for r in [format!("{h}/.cache"), format!("{h}/.claude"), format!("{h}/elsewhere")] {
+            assert!(roots.subpaths.contains(&r), "{r} is writable");
+            assert!(roots.system_roots.contains(&r), "{r} is pinned");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_state_file_is_granted_only_as_a_plain_file_of_the_users_or_a_link_into_dot_claude() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let h = home.to_string_lossy().into_owned();
+        let file = format!("{h}/.claude.json");
+        let mine = std::fs::metadata(&home).unwrap().uid();
+        let ok = |owner: u32| resolve_state_file(&file, &h, Some(owner));
+        // Missing: granted as given, so the CLI can create it.
+        assert_eq!(ok(mine).unwrap(), vec![file.clone()]);
+        // A plain file of the user's.
+        std::fs::write(&file, "{}").unwrap();
+        assert_eq!(ok(mine).unwrap(), vec![file.clone()]);
+        assert!(ok(mine.wrapping_add(1)).is_err(), "someone else's file is left out");
+        // A second hard link to it is left out.
+        std::fs::hard_link(&file, home.join("other-name")).unwrap();
+        assert!(ok(mine).is_err());
+        std::fs::remove_file(home.join("other-name")).unwrap();
+        // A link into `~/.claude*` is granted, with its realpath.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(home.join(".claude")).unwrap();
+        std::fs::write(home.join(".claude/state.json"), "{}").unwrap();
+        symlink(home.join(".claude/state.json"), &file).unwrap();
+        assert_eq!(ok(mine).unwrap(), vec![file.clone(), format!("{h}/.claude/state.json")]);
+        // A link anywhere else, to a dir, or dangling is left out.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(home.join(".zshrc"), "x").unwrap();
+        for target in [home.join(".zshrc"), home.join(".claude"), home.join("gone"), PathBuf::from("/")] {
+            symlink(&target, &file).unwrap();
+            assert!(ok(mine).is_err(), "a link to {} must be left out", target.display());
+            std::fs::remove_file(&file).unwrap();
+        }
+        // `assemble_write_roots` records the refusal and grants no file.
+        symlink(home.join(".zshrc"), &file).unwrap();
+        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine));
+        assert!(roots.files.is_empty());
+        assert!(roots.refused.iter().any(|w| w.contains(".claude.json")), "{:?}", roots.refused);
+    }
+
+    #[test]
+    fn the_profile_denies_each_system_root_dir_itself_after_the_allows() {
+        let home = std::env::var("HOME").ok();
+        let tmpdir = std::env::var("TMPDIR").ok();
+        let p = build_seatbelt_profile(&[], &[]).unwrap();
+        let allow = p.find("(allow file-write*").unwrap();
+        let deny = p.find("(deny file-write*\n").expect("a deny block for the system roots");
+        let link = p.find("(deny file-link\n").expect("a file-link deny for the system roots");
+        assert!(allow < deny && deny < link);
+        let roots = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid());
+        assert!(roots.system_roots.contains(&"/dev".to_string()));
+        for r in &roots.system_roots {
+            let subpath = format!("(subpath {})", sbpl_string(r));
+            let pin = format!("(literal {})", sbpl_string(r));
+            assert!(p[allow..deny].contains(&subpath), "writes inside {r} are allowed");
+            assert!(p[deny..link].contains(&pin), "{r} itself can't be removed or replaced");
+            assert!(p[link..].contains(&pin), "{r} itself can't be hardlinked");
+            // Every root the profile grants is pinned, as given and as its realpath.
+            let real = canonical_string(Path::new(r));
+            if Path::new(r).exists() {
+                assert!(roots.system_roots.contains(&real), "{real} is pinned too");
+            }
+        }
+        // The state file stays writable: it is an allow literal, not a deny.
+        for f in &roots.files {
+            let lit = format!("(literal {})", sbpl_string(f));
+            assert!(p[allow..deny].contains(&lit));
+            assert!(!p[deny..].contains(&lit), "{f} stays writable");
+        }
+        // Pure rendering: the root deny comes after the allows.
+        let rules = WriteRules {
+            subpaths: vec!["/private/tmp".into()],
+            deny_literals: vec!["/private/tmp".into()],
+            ..WriteRules::default()
+        };
+        let r = render_profile(&rules);
+        assert!(r.find("(subpath \"/private/tmp\")").unwrap() < r.find("(literal \"/private/tmp\")").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ensure_home_roots_creates_missing_roots_as_real_dirs_and_leaves_links_alone() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(home.join("target")).unwrap();
+        symlink(home.join("target"), home.join(".cache")).unwrap();
+        ensure_home_roots(home.to_str().unwrap());
+        let claude = std::fs::symlink_metadata(home.join(".claude")).unwrap();
+        assert!(claude.is_dir() && !claude.file_type().is_symlink(), "~/.claude was created");
+        assert!(std::fs::symlink_metadata(home.join(".cache")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_dir(home.join("target")).unwrap().count(), 0, "nothing written through the link");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_keeps_a_system_root_writable_inside_but_not_replaceable() {
+        // `$TMPDIR` and `/private/tmp` are system roots on every Mac; `~/.cache`
+        // is created by the profile builder when missing.
+        let ws = tempfile::tempdir().unwrap();
+        let roots = vec![ws.path().to_string_lossy().into_owned()];
+        let run = |script: &str| -> bool {
+            let args = vec!["-c".to_string(), script.to_string()];
+            let prepared = prepare(&roots, None, OsStr::new("bash"), &args).unwrap();
+            std::process::Command::new(&prepared.program)
+                .args(&prepared.args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        let home = std::env::var("HOME").unwrap();
+        let cache = format!("{home}/.cache");
+        let tmpdir = canonical_string(Path::new(&std::env::var("TMPDIR").unwrap()));
+        let tag = format!("octopush-root-test-{}", std::process::id());
+        for root in ["/private/tmp".to_string(), tmpdir, cache] {
+            let inside = format!("{root}/{tag}");
+            assert!(run(&format!("mkdir -p '{inside}' && echo x > '{inside}/probe'")), "writes inside {root} work");
+            assert!(Path::new(&inside).join("probe").exists());
+            let moved = format!("{root}.moved-{tag}");
+            let renamed = run(&format!("mv '{root}' '{moved}'"));
+            if Path::new(&moved).exists() {
+                // Put it back before failing, so the test never leaves it moved.
+                let _ = std::fs::rename(&moved, &root);
+            }
+            assert!(!renamed, "{root} can't be renamed");
+            let meta = std::fs::symlink_metadata(&root).unwrap();
+            assert!(meta.is_dir() && !meta.file_type().is_symlink(), "{root} is intact");
+            let _ = std::fs::remove_dir_all(&inside);
+        }
+        // An empty root can't be removed either, and its parent can still hold
+        // other entries: the same rules, on a root under a temp dir.
+        let parent = tempfile::tempdir().unwrap();
+        let root = canonical_string(&parent.path().join("root"));
+        std::fs::create_dir(&root).unwrap();
+        let profile = render_profile(&WriteRules {
+            subpaths: vec![canonical_string(parent.path())],
+            deny_literals: vec![root.clone()],
+            ..WriteRules::default()
+        });
+        let sandboxed = |script: String| -> bool {
+            let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
+            std::process::Command::new(prog).args(args).output().map(|o| o.status.success()).unwrap_or(false)
+        };
+        assert!(sandboxed(format!("echo x > '{root}/probe' && rm '{root}/probe'")), "the root's contents stay writable");
+        assert!(!sandboxed(format!("rmdir '{root}'")), "the empty root can't be removed");
+        assert!(!sandboxed(format!("mv '{root}' '{root}.moved'")), "the root can't be renamed");
+        assert!(!sandboxed(format!("rmdir '{root}'; ln -s / '{root}'")), "the root can't be replaced by a link");
+        let meta = std::fs::symlink_metadata(&root).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
     }
 
     #[test]
@@ -1593,7 +2014,7 @@ mod tests {
 
     #[test]
     fn assemble_write_roots_is_narrow() {
-        let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"));
+        let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"), None).subpaths;
         assert!(roots.contains(&"/ws".to_string()));
         assert!(roots.contains(&"/home/u/.claude".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
@@ -1623,7 +2044,7 @@ mod tests {
         // NOT gain the workspace OR any package-manager dir. (The gap that let
         // the first cut of B3 accidentally grant readonly missions write access
         // to ~/.cargo etc.)
-        let roots = assemble_write_roots(&[], Some("/home/u"), Some("/tmp/session"));
+        let roots = assemble_write_roots(&[], Some("/home/u"), Some("/tmp/session"), None).subpaths;
         assert!(!roots.iter().any(|r| r.starts_with("/home/u/.cargo") || r == "/home/u/go"));
         assert!(!roots.contains(&"/ws".to_string()));
         // Temp + the CLI's own dirs are still there (a shell needs them).
@@ -1726,7 +2147,7 @@ mod tests {
         }
         let a_str = a.to_string_lossy().into_owned();
         let b_str = b.to_string_lossy().into_owned();
-        let roots = assemble_write_roots(&[ws_a[0].clone(), a_str.clone()], Some(home), Some(tmpdir));
+        let roots = assemble_write_roots(&[ws_a[0].clone(), a_str.clone()], Some(home), Some(tmpdir), None).subpaths;
         assert!(roots.contains(&a_str));
         assert!(!roots.iter().any(|r| Path::new(&b_str).starts_with(r)), "mission B's cache is writable to A");
     }
@@ -1872,7 +2293,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             let home = std::env::var("HOME").ok();
-            let shared = assemble_write_roots(&[], home.as_deref(), std::env::var("TMPDIR").ok().as_deref());
+            let shared = assemble_write_roots(&[], home.as_deref(), std::env::var("TMPDIR").ok().as_deref(), current_uid()).subpaths;
             for r in &shared {
                 assert!(!Path::new(&tmp).starts_with(r), "{tmp} is inside {r}");
             }
@@ -2148,7 +2569,7 @@ mod tests {
         let base = build_cache_base().expect("a user cache dir");
         let home = std::env::var("HOME").ok();
         let tmpdir = std::env::var("TMPDIR").ok();
-        let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref());
+        let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid()).subpaths;
         for base in [base, stage_tmp_base().expect("a user cache dir")] {
             let real = canonical_lenient(&base);
             for r in &shared {
