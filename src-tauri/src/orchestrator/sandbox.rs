@@ -1777,6 +1777,79 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_allows_hard_links_only_to_files_inside_the_write_roots() {
+        // A root and a file beside it, outside every root of the profile.
+        let parent = tempfile::tempdir().unwrap();
+        let root = canonical_string(&parent.path().join("root"));
+        std::fs::create_dir(&root).unwrap();
+        let outside = canonical_string(&parent.path().join("outside.txt"));
+        std::fs::write(&outside, "original\n").unwrap();
+        let profile = render_profile(&WriteRules { subpaths: vec![root.clone()], ..WriteRules::default() });
+        let sandboxed = |script: String| -> bool {
+            let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
+            std::process::Command::new(prog)
+                .args(args)
+                .current_dir(&root)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // A hard link to the outside file is refused, or at least can't be
+        // written through.
+        let linked = sandboxed(format!("ln '{outside}' '{root}/x'"));
+        let _ = sandboxed(format!("test -f '{root}/x' && echo changed >> '{root}/x'"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original\n", "the outside file is unchanged");
+        assert!(!linked, "no hard link to a file outside the roots");
+        assert!(!Path::new(&root).join("x").exists());
+        // Links whose source is inside the root work, and so do symlinks.
+        assert!(sandboxed(format!("echo a > '{root}/a' && ln '{root}/a' '{root}/b' && echo b >> '{root}/b'")));
+        assert_eq!(std::fs::read_to_string(Path::new(&root).join("a")).unwrap(), "a\nb\n");
+        assert!(sandboxed(format!("mkdir -p '{root}/d' && ln '{root}/a' '{root}/d/c'")), "into a subdir too");
+        assert!(sandboxed(format!("ln -s '{outside}' '{root}/s' && ln -s a '{root}/t'")), "symlinks are writes, not links");
+        // A link can't be placed outside the root either.
+        assert!(!sandboxed(format!("ln '{root}/a' '{}/escaped'", canonical_string(parent.path()))));
+
+        // The full profile, with git: commits and repacks (which hard-link
+        // objects) still work in a main checkout and a linked worktree.
+        let Some((dir, main, wt)) = repo_with_worktree() else {
+            eprintln!("git unavailable; skipping the git half");
+            return;
+        };
+        let run = |ws: &Path, script: &str| -> bool {
+            let roots = vec![ws.to_string_lossy().into_owned()];
+            let args = vec!["-c".to_string(), script.to_string()];
+            let prepared = prepare(&roots, None, OsStr::new("bash"), &args).unwrap();
+            std::process::Command::new(&prepared.program)
+                .args(&prepared.args)
+                .current_dir(ws)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        for ws in [&main, &wt] {
+            let commit = "echo x >> note.txt && git add note.txt && git -c user.name=t -c user.email=t@example.com commit -qm note";
+            assert!(run(ws, commit), "git commit works in {}", ws.display());
+            assert!(run(ws, "git repack -adq"), "git repack works in {}", ws.display());
+            assert!(run(ws, "ln note.txt note-link && rm note-link"), "a hard link inside the workspace works");
+        }
+        assert!(run(&main, "git gc -q"), "git gc works in a main checkout");
+        drop(dir);
+        // The temp dirs sit under $TMPDIR, a write root of the full profile, so
+        // the outside file for it goes under $HOME.
+        let Ok(home) = std::env::var("HOME") else { return };
+        let away = tempfile::tempdir_in(&home).unwrap();
+        let away_file = canonical_string(&away.path().join("outside.txt"));
+        std::fs::write(&away_file, "original\n").unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let ws = PathBuf::from(canonical_string(ws.path()));
+        let linked = run(&ws, &format!("ln '{away_file}' x"));
+        let _ = run(&ws, "test -f x && echo changed >> x");
+        assert_eq!(std::fs::read_to_string(&away_file).unwrap(), "original\n", "the outside file is unchanged");
+        assert!(!linked, "the full profile refuses a hard link to a file outside the roots");
+    }
+
+    #[test]
     fn implausible_git_layouts_are_rejected() {
         assert!(is_plausible_layout("/ws", &main_layout()));
         assert!(is_plausible_layout("/wt", &linked_layout()));
