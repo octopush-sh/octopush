@@ -60,6 +60,8 @@ mod tests;
 mod test_support;
 #[cfg(test)]
 mod claude_code_contract;
+#[cfg(test)]
+mod codex_contract;
 
 use state::AppState;
 use tauri::Manager;

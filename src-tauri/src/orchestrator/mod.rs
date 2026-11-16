@@ -513,12 +513,54 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// A CLI stage row that runs on Codex (its effective model, escalation applied).
+    fn is_codex_cli(s: &crate::db::RunStageRow) -> bool {
+        let model = if s.escalated { s.escalate_model.as_deref().unwrap_or(&s.agent_model) } else { &s.agent_model };
+        s.substrate == "cli"
+            && matches!(
+                crate::orchestrator::cli_runner::dialect_for_model(model),
+                crate::orchestrator::cli_runner::CliDialect::Codex
+            )
+    }
+
+    /// True when the stage's next run can continue its CLI session: a CLI
+    /// stage with a session id, on Claude Code (`--resume`), or on Codex
+    /// (`codex exec resume`) when the session's reported total is recorded —
+    /// without it the resumed run's thread-wide usage can't be counted, and a
+    /// fresh run is the honest choice. (Whether the installed Codex has
+    /// `exec resume` is the runner's call; it falls back to a fresh run.)
+    fn cli_session_resumable(&self, s: &crate::db::RunStageRow) -> AppResult<bool> {
+        let Some(sid) = s.session_id.as_deref().filter(|_| s.substrate == "cli") else {
+            return Ok(false);
+        };
+        if Self::is_codex_cli(s) {
+            return Ok(self.db.lock().get_stage_session_usage(&s.id, sid)?.is_some());
+        }
+        Ok(matches!(
+            crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
+            crate::orchestrator::cli_runner::CliDialect::Claude
+        ))
+    }
+
     /// Reset the contiguous [target..=review] range to pending (re-running the
     /// target + intervening stages with `feedback` on the target), retiring the
     /// erased cost and bumping the loop counter. Shared by gated SendBack and the
     /// auto loop. Caller guarantees `review` has a valid `loop_target_position`
     /// strictly before `review.position` and iterations remaining.
-    fn loop_back(&self, run_id: &str, review: &crate::db::RunStageRow, feedback: Option<&str>) -> AppResult<()> {
+    ///
+    /// `resume_codex`: a Codex writer in the window CONTINUES its session
+    /// (`codex exec resume`, the findings as the prompt) instead of re-reading
+    /// the repo and the whole dossier. False when the loop-back comes with an
+    /// escalation, which is defined as a fresh attempt at the strong tier.
+    /// Claude stages and reviews always re-run fresh here: a re-review must
+    /// not anchor on its own earlier verdict.
+    fn loop_back(
+        &self,
+        run_id: &str,
+        review: &crate::db::RunStageRow,
+        feedback: Option<&str>,
+        resume_codex: bool,
+    ) -> AppResult<()> {
         let target_pos = review.loop_target_position.expect("loop_back requires a target");
         let stages = self.db.lock().list_run_stages(run_id)?;
         // In an authored graph the [target..=review] position window can span a
@@ -546,6 +588,16 @@ impl Orchestrator {
                 let cf = if s.id == review.id { feedback } else { None };
                 let fb = if s.id == review.id { None } else { feedback };
                 self.archive_and_reset_stage(run_id, s, cf, fb, false)?;
+                let has_findings = fb.is_some_and(|f| !f.trim().is_empty());
+                if resume_codex
+                    && has_findings
+                    && Self::is_codex_cli(s)
+                    && !self.stage_is_read_only(s)
+                    && self.cli_session_resumable(s)?
+                {
+                    self.db.lock().set_stage_resume_pending(&s.id, true)?;
+                    self.db.lock().set_stage_resume_prior_cost(&s.id, s.cost_usd)?;
+                }
                 // An INNER review inside the window gets a fresh loop budget
                 // for each outer iteration — without this, its counter
                 // persisted across outer loops and the inner loop arrived
@@ -912,6 +964,12 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            // A resumed Codex session reports its running total; the runner
+            // subtracts what it had reported by the end of its last run.
+            resume_baseline: match (&stage.session_id, stage.resume_pending) {
+                (Some(sid), true) if Self::is_codex_cli(stage) => self.db.lock().get_stage_session_usage(&stage.id, sid)?,
+                _ => None,
+            },
             // Recorded from the stage row by whichever action set
             // resume_pending (Resume or an answered block) — not read from
             // the iteration history, whose latest entry need not be this
@@ -942,7 +1000,9 @@ impl Orchestrator {
         // Input dossier = the freshest artifact of each kind from earlier stages.
         // A resuming CLI stage discards the input for its resumed session, so
         // don't spend a worktree-diff capture on it.
-        let input = self.assemble_stage_input(run, stage.position, !resuming)?;
+        // A Codex resume still captures it: when `codex exec resume` fails the
+        // runner falls back to a fresh run, which needs the full dossier.
+        let input = self.assemble_stage_input(run, stage.position, !resuming || Self::is_codex_cli(stage))?;
 
         // Peers for the `ask_stage` consultation channel: completed upstream
         // stages (same ancestry rule as the dossier) with their archived
@@ -1104,6 +1164,21 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
+
+        // A CLI session's reported running total: the next `codex exec resume`
+        // of it subtracts this (Codex reports thread-wide usage on resume).
+        if let Some(sid) = outcome.session_id.as_deref() {
+            self.db.lock().set_stage_session_usage(&stage.id, sid, outcome.cli.session_usage.as_ref())?;
+        }
+        // Part of the spend is unknown even if the stage finished (a failed
+        // Codex resume before its fresh fallback) — flag it like an error
+        // that carries the marker (that path flags and journals it itself).
+        if outcome.cli.usage_unreported
+            && !outcome.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_usage_unreported)
+        {
+            self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
+            self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+        }
 
         // Escape valve: the stage called `ask_director`. Persist its questions
         // and the spend it burned asking, then park it as `awaiting_checkpoint`
@@ -1870,13 +1945,14 @@ impl Orchestrator {
         run_id: &str,
         review: &RunStageRow,
         looped: &mut std::collections::HashSet<i64>,
+        resume_codex: bool,
     ) -> AppResult<()> {
         let findings = self.fresh_artifact_text(run_id, &review.id)?;
         let target_pos = review
             .loop_target_position
             .expect("loop_back_or_merge requires a loop target");
         if looped.insert(target_pos) {
-            self.loop_back(run_id, review, findings.as_deref())?;
+            self.loop_back(run_id, review, findings.as_deref(), resume_codex)?;
             return Ok(());
         }
         // Merge path: the window is already reset this batch.
@@ -1945,7 +2021,7 @@ impl Orchestrator {
                             // Fall through to checkpoint/continue below.
                         }
                         Some(ReviewVerdict::ChangesRequested) if remaining => {
-                            self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                            self.loop_back_or_merge(run_id, stage, looped_targets, true)?;
                             self.emit_run_update(run_id);
                             return Ok(false);
                         }
@@ -1957,7 +2033,7 @@ impl Orchestrator {
                             // tier couldn't satisfy the reviewer), yet it
                             // historically only fired on hard failures.
                             if self.try_escalate_loop_target(run_id, stage)? {
-                                self.loop_back_or_merge(run_id, stage, looped_targets)?;
+                                self.loop_back_or_merge(run_id, stage, looped_targets, false)?;
                                 self.emit_run_update(run_id);
                                 return Ok(false);
                             }
@@ -2140,17 +2216,9 @@ impl Orchestrator {
                             // the answers reach the SAME conversation via the
                             // resume nudge (the CLI counterpart of the API's
                             // transcript continuation).
-                            // Resume only when the stage's CLI DIALECT can actually
-                            // continue a session — codex can't (no stable resume
-                            // contract), and setting resume_pending there would
-                            // skip the dossier's worktree-diff capture for a run
-                            // that then starts fresh and NEEDS the dossier.
-                            let can_resume = s.substrate == "cli"
-                                && s.session_id.is_some()
-                                && matches!(
-                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
-                                    crate::orchestrator::cli_runner::CliDialect::Claude
-                                );
+                            // Resume only when the stage's CLI session can be
+                            // continued (`cli_session_resumable`).
+                            let can_resume = self.cli_session_resumable(s)?;
                             if can_resume {
                                 self.db.lock().set_stage_resume_pending(&s.id, true)?;
                                 // A blocked stage is never archived (no artifact
@@ -2293,17 +2361,9 @@ impl Orchestrator {
                         if let Some(mt) = max_turns_override {
                             self.db.lock().set_stage_max_iterations(&s.id, mt)?;
                         }
-                        // Resume only when the stage's CLI DIALECT can actually
-                            // continue a session — codex can't (no stable resume
-                            // contract), and setting resume_pending there would
-                            // skip the dossier's worktree-diff capture for a run
-                            // that then starts fresh and NEEDS the dossier.
-                            let can_resume = s.substrate == "cli"
-                                && s.session_id.is_some()
-                                && matches!(
-                                    crate::orchestrator::cli_runner::dialect_for_model(&s.agent_model),
-                                    crate::orchestrator::cli_runner::CliDialect::Claude
-                                );
+                        // Resume only when the stage's CLI session can be
+                        // continued (`cli_session_resumable`).
+                        let can_resume = self.cli_session_resumable(s)?;
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
                         // The session's spend so far, taken from THIS row: the
                         // resumed run's budget cap sits on top of it.
@@ -2370,7 +2430,7 @@ impl Orchestrator {
                                 (None, Some(n)) => Some(n.to_string()),
                                 (None, None) => None,
                             };
-                            self.loop_back(run_id, review, composed.as_deref())?;
+                            self.loop_back(run_id, review, composed.as_deref(), true)?;
                         } else {
                             // No usable loop (no/invalid target or cap reached) → accept the review.
                             self.db.lock().set_run_stage_status(&review.id, "done")?;

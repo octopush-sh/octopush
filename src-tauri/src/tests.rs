@@ -4628,6 +4628,7 @@ mod orchestrator_tests {
             let first = !self.asked.swap(true, std::sync::atomic::Ordering::Relaxed);
             if first {
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -4645,6 +4646,7 @@ mod orchestrator_tests {
                 });
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Plan,
                     text: format!("resolved <<{}>>", stage.feedback.as_deref().unwrap_or("(no feedback)")),
@@ -4670,6 +4672,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -4707,6 +4710,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Diff,
                     text: format!("did {}", stage.role),
@@ -4744,6 +4748,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.agent_model.clone(), stage.effort));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Diff, text: "x".into(), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -4776,6 +4781,7 @@ mod orchestrator_tests {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: String::new(),
@@ -5657,6 +5663,7 @@ mod orchestrator_tests {
                     ask_tool_use_id: "ask-1".into(),
                 };
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5675,6 +5682,7 @@ mod orchestrator_tests {
             }
             *self.seen_transcript.lock() = stage.blocked_transcript.clone();
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "resolved".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5829,6 +5837,7 @@ mod orchestrator_tests {
                     ask_tool_use_id: String::new(),
                 };
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5842,6 +5851,7 @@ mod orchestrator_tests {
             *self.seen_transcript.lock() = Some(stage.blocked_transcript.clone());
             *self.seen_max_iterations.lock() = Some(stage.max_iterations);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5941,6 +5951,7 @@ mod orchestrator_tests {
             let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
             if first {
                 return Ok(StageOutcome {
+                    cli: Default::default(),
                     artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
                     input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                     cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -5954,6 +5965,7 @@ mod orchestrator_tests {
             }
             *self.seen_resume.lock() = Some((stage.resume_session.clone(), stage.max_iterations));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Plan, text: "finished".into(), payload: None, refs_worktree: false },
                 input_tokens: 5, output_tokens: 1, cost_usd: 0.02,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -6279,6 +6291,7 @@ mod orchestrator_tests {
             let kind = stage.artifact_kind.clone();
             let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind,
                     text: format!("{} output", stage.role),
@@ -7640,6 +7653,7 @@ mod orchestrator_tests {
             }
             self.in_flight.fetch_sub(1, Ordering::SeqCst);
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
                 input_tokens: 1, output_tokens: 1, cost_usd: 0.01,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -7831,6 +7845,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             self.seen.lock().push((stage.position, input.clone()));
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -8125,6 +8140,7 @@ mod orchestrator_tests {
             let is_review = matches!(stage.role.as_str(), "code_review" | "verify");
             let text = if is_review && !self.verdict.is_empty() { format!("findings\nVERDICT: {}", self.verdict) } else { "did it".into() };
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
                 input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
                 cache_read_tokens: 0, cache_creation_tokens: 0,
@@ -8202,6 +8218,98 @@ mod orchestrator_tests {
         // One normal loop + one escalated loop, then the gate.
         assert_eq!(stages[1].loop_iterations, 2);
         assert_eq!(stages[1].status, "awaiting_checkpoint");
+    }
+
+    /// #682: a Codex CLI writer looped back by a review sees, per run, the
+    /// session it is asked to resume, the baseline and the feedback. Its
+    /// first run reports a session and (when `report_total`) its total.
+    struct CodexLoopRunner {
+        report_total: bool,
+        reviews: std::sync::atomic::AtomicUsize,
+        seen: Arc<Mutex<Vec<(Option<String>, Option<crate::orchestrator::types::SessionUsage>, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for CodexLoopRunner {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext)
+            -> crate::error::AppResult<StageOutcome> {
+            let total = crate::orchestrator::types::SessionUsage { input_tokens: 900, output_tokens: 90, cache_read_tokens: 0, cache_creation_tokens: 0 };
+            let review = stage.role == "code_review";
+            let text = if review {
+                let n = self.reviews.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 { "fix the parser\nVERDICT: CHANGES_REQUESTED".to_string() } else { "ok\nVERDICT: PASS".to_string() }
+            } else {
+                self.seen.lock().push((stage.resume_session.clone(), stage.resume_baseline, stage.feedback.clone()));
+                "did it".to_string()
+            };
+            let mut cli: crate::orchestrator::types::CliOutcomeMeta = Default::default();
+            if !review && self.report_total {
+                cli.session_usage = Some(total);
+            }
+            Ok(StageOutcome {
+                cli,
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: text.clone(), payload: None, refs_worktree: false },
+                input_tokens: 10, output_tokens: 2, cost_usd: 0.01,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: StageStatus::Done, tool_calls: vec![], error: None,
+                verdict: crate::orchestrator::runner::parse_verdict(&text),
+                session_id: if review { None } else { Some("thr-1".into()) },
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    fn codex_loop_run(report_total: bool) -> (Orchestrator, String, Arc<Mutex<Db>>, Arc<Mutex<Vec<(Option<String>, Option<crate::orchestrator::types::SessionUsage>, Option<String>)>>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("CodexLoop", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "code_review", "m", "api", false, Some(0), 2, Some("auto"), 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(CodexLoopRunner { report_total, reviews: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        (orch, run_id, db, seen)
+    }
+
+    #[tokio::test]
+    async fn codex_writer_resumes_its_session_on_a_review_loop_back() {
+        let (orch, run_id, _db, seen) = codex_loop_run(true);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2, "implement ran twice");
+        assert_eq!(seen[0].0, None, "first run is fresh");
+        assert_eq!(seen[1].0.as_deref(), Some("thr-1"), "the loop-back resumes the session");
+        assert_eq!(seen[1].1.map(|u| u.input_tokens), Some(900), "with the session's reported total as baseline");
+        assert!(seen[1].2.as_deref().unwrap_or_default().contains("fix the parser"), "the findings ride along");
+    }
+
+    #[tokio::test]
+    async fn codex_writer_without_a_reported_total_reruns_fresh_on_a_loop_back() {
+        let (orch, run_id, _db, seen) = codex_loop_run(false);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+        let seen = seen.lock().clone();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].0, None, "no baseline: its cost couldn't be counted, so no resume");
+        assert!(seen[1].2.as_deref().unwrap_or_default().contains("fix the parser"));
+    }
+
+    #[test]
+    fn stage_session_usage_round_trips_per_session() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "gpt-5.5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sid = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let u = crate::orchestrator::types::SessionUsage { input_tokens: 5, output_tokens: 6, cache_read_tokens: 7, cache_creation_tokens: 8 };
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), None);
+        db.lock().set_stage_session_usage(&sid, "a", Some(&u)).unwrap();
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), Some(u));
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "b").unwrap(), None, "another session's total is no baseline");
+        db.lock().set_stage_session_usage(&sid, "a", None).unwrap();
+        assert_eq!(db.lock().get_stage_session_usage(&sid, "a").unwrap(), None);
     }
 
     #[tokio::test]
@@ -8289,6 +8397,7 @@ mod orchestrator_tests {
             _ctx: &StageContext,
         ) -> crate::error::AppResult<StageOutcome> {
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -8439,6 +8548,7 @@ mod orchestrator_tests {
                 }
             }
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -8919,6 +9029,7 @@ mod orchestrator_tests {
             let (status, error, blocked) =
                 if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
             Ok(StageOutcome {
+                cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
                     text: format!("did {}", stage.role),
@@ -10024,6 +10135,7 @@ mod cli_dialect_tests {
         use crate::orchestrator::cli_runner::fail_keeping_usage;
         use crate::orchestrator::types::StageArtifact;
         let done = crate::orchestrator::types::StageOutcome {
+            cli: Default::default(),
             artifact: StageArtifact { kind: ArtifactKind::Note, text: "done".into(), payload: None, refs_worktree: true },
             input_tokens: 10,
             output_tokens: 20,
@@ -10071,9 +10183,11 @@ mod cli_dialect_tests {
         assert!(mission.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{mission:?}");
         assert!(!mission.contains(&"--sandbox".to_string()), "{mission:?}");
 
-        // Codex has no confirmed resume contract → fresh-run fallback.
-        assert!(CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false).is_none());
-        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false).is_some());
+        // Codex resumes with `exec … resume <id> -` (#682; the argv shape is
+        // pinned against the recorded help in `codex_contract.rs`).
+        let resumed = CliDialect::Codex.resume_argv("gpt-5", "sess", 25, false, ws).unwrap();
+        assert_eq!(resumed[resumed.len() - 3..], ["resume", "sess", "-"]);
+        assert!(CliDialect::Claude.resume_argv("claude-sonnet-4-6", "sess", 25, false, ws).is_some());
 
         // Stdin payload: claude = user only; codex = system + user joined.
         assert_eq!(CliDialect::Claude.stdin_payload("SYS", "USER"), "USER");

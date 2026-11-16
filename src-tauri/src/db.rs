@@ -788,6 +788,11 @@ impl Db {
         // usage (Codex) — its cost is unknown, not $0. Sticky across re-runs:
         // the unknown spend was burned all the same.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN usage_unreported INTEGER NOT NULL DEFAULT 0")?;
+        // #682: the token totals the stage's CLI session had reported by the end
+        // of its last attempt (JSON `{"session": id, "usage": SessionUsage}`,
+        // Codex only) — the baseline a `codex exec resume` subtracts, since a
+        // resumed thread reports its running total. NULL when unknown.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN session_usage TEXT")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -6259,6 +6264,40 @@ impl Db {
             params![stage_id, cost_usd],
         )?;
         Ok(())
+    }
+
+    /// Record what `session_id` had reported by the end of the stage's last
+    /// attempt (`None` usage ⇒ unknown, stored as NULL).
+    pub fn set_stage_session_usage(
+        &self,
+        stage_id: &str,
+        session_id: &str,
+        usage: Option<&crate::orchestrator::types::SessionUsage>,
+    ) -> AppResult<()> {
+        let json = usage.map(|u| serde_json::json!({ "session": session_id, "usage": u }).to_string());
+        self.conn.execute(
+            "UPDATE run_stages SET session_usage = ?2 WHERE id = ?1",
+            params![stage_id, json],
+        )?;
+        Ok(())
+    }
+
+    /// The reported total recorded for `session_id` on this stage; `None` when
+    /// none is recorded or it belongs to another session.
+    pub fn get_stage_session_usage(
+        &self,
+        stage_id: &str,
+        session_id: &str,
+    ) -> AppResult<Option<crate::orchestrator::types::SessionUsage>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row("SELECT session_usage FROM run_stages WHERE id = ?1", params![stage_id], |r| r.get(0))
+            .optional()?
+            .flatten();
+        Ok(raw
+            .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+            .filter(|v| v.get("session").and_then(|s| s.as_str()) == Some(session_id))
+            .and_then(|v| serde_json::from_value(v.get("usage")?.clone()).ok()))
     }
 
     pub fn get_stage_resume_prior_cost(&self, stage_id: &str) -> AppResult<f64> {

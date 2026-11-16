@@ -301,6 +301,12 @@ pub struct StageSpec {
     /// reports the conversation's whole total, so its `--max-budget-usd` cap
     /// adds this on top of the remaining headroom.
     pub resume_prior_cost_usd: f64,
+    /// For a resumed Codex session: the token totals the session had reported
+    /// at the end of its last run. `codex exec resume` reports the THREAD's
+    /// running total on `turn.completed` (the earlier runs' tokens included),
+    /// so the runner subtracts this to count only the resumed run's own
+    /// tokens. `None` on a fresh run and on Claude.
+    pub resume_baseline: Option<SessionUsage>,
     /// Serialized [`BlockedTranscript`](crate::orchestrator::agentic::BlockedTranscript)
     /// of an answered `ask_director` block: the API runner continues that
     /// conversation (answer as tool_result) instead of re-running the stage
@@ -321,6 +327,44 @@ pub struct ToolCallLog {
     pub name: String,
     pub input: serde_json::Value,
     pub result: String,
+}
+
+/// Token totals a CLI session has reported, as stored on the stage row
+/// (`run_stages.session_usage`) and used as a resume baseline. The same split
+/// as [`StageOutcome`]: `input_tokens` excludes the cache reads and writes.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_tokens: u64,
+}
+
+impl SessionUsage {
+    /// `self` minus `earlier`, field by field, never below zero.
+    pub fn since(&self, earlier: &SessionUsage) -> SessionUsage {
+        SessionUsage {
+            input_tokens: self.input_tokens.saturating_sub(earlier.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(earlier.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_sub(earlier.cache_read_tokens),
+            cache_creation_tokens: self.cache_creation_tokens.saturating_sub(earlier.cache_creation_tokens),
+        }
+    }
+}
+
+/// CLI-only facts about a stage attempt that the drive persists.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CliOutcomeMeta {
+    /// Part of this stage's spend is unknown (a Codex turn ended without its
+    /// `turn.completed`), even when the outcome itself is `Done` — e.g. a
+    /// failed `codex exec resume` followed by a fresh run that finished. The
+    /// drive flags the row `usage_unreported` (as it does for an error that
+    /// carries `cli_runner::USAGE_UNREPORTED`).
+    pub usage_unreported: bool,
+    /// The session's reported running total at the end of this attempt
+    /// (Codex), kept as the next resume's baseline. `None` when the last turn
+    /// never completed, so the total is unknown and the session isn't resumed.
+    pub session_usage: Option<SessionUsage>,
 }
 
 /// What a runner returns for one stage.
@@ -354,6 +398,8 @@ pub struct StageOutcome {
     /// only): persisted on the stage row so the answered re-run continues the
     /// same conversation instead of starting over.
     pub blocked_transcript: Option<String>,
+    /// CLI-only bookkeeping (Codex resume baseline, unknown spend).
+    pub cli: CliOutcomeMeta,
 }
 
 /// What the user chose at a checkpoint.
