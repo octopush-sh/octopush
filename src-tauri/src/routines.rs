@@ -302,16 +302,46 @@ async fn read_to_string_lossy(mut pipe: impl tokio::io::AsyncRead + Unpin) -> St
 /// with the user's login-shell PATH (`condition_path`) so `gh`, `node`, `npx`
 /// and `claude` resolve — the SAME trust model as a run's `run_command` (their
 /// command, their machine). See `evaluate_condition_with_path`.
+///
+/// With "Quiet Claude Code in crews and Routines" on, the command also gets
+/// [`routine_quiet_env`], so a `claude` it starts is quiet too.
 pub async fn evaluate_condition(command: &str, cwd: &Path, timeout: Duration) -> ConditionEval {
     let path = condition_path().await;
-    evaluate_condition_with_path(command, cwd, timeout, &path).await
+    let env = routine_quiet_env(crate::settings::quiet_claude_code());
+    evaluate_condition_with_env(command, cwd, timeout, &path, &env).await
+}
+
+/// The variables a Routine's own shell commands (its fire condition, the
+/// fresh worktree's setup script) get from Settings › Privacy › "Quiet Claude
+/// Code in crews and Routines" (#703): `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`
+/// when on, so any `claude` they start skips its nonessential traffic as the
+/// Routine's crew stages do (those get it through the stage spawn,
+/// `cli_runner::apply_stage_env`). Off ⇒ nothing — the docs say even `0`
+/// disables the traffic, so no value is ever written. Pure.
+pub fn routine_quiet_env(quiet: bool) -> Vec<(&'static str, String)> {
+    if quiet {
+        vec![(crate::orchestrator::cli_runner::QUIET_TRAFFIC_ENV, "1".to_string())]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Run `command` under `bash -c` with `PATH = path`. exit 0 ⇒ `Met`; exit 1 ⇒
 /// `NotMet`; any other exit, spawn failure or timeout ⇒ `Error` (with the last
 /// stderr lines, so the Routines list shows *why*).
 pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Duration, path: &str) -> ConditionEval {
-    match run_bounded("condition", command, cwd, timeout, path, &[]).await {
+    evaluate_condition_with_env(command, cwd, timeout, path, &[]).await
+}
+
+/// See `evaluate_condition_with_path`; `env` adds variables for the command.
+pub async fn evaluate_condition_with_env(
+    command: &str,
+    cwd: &Path,
+    timeout: Duration,
+    path: &str,
+    env: &[(&str, String)],
+) -> ConditionEval {
+    match run_bounded("condition", command, cwd, timeout, path, env).await {
         Ok((code, stderr)) => classify_condition_exit(code, &stderr),
         Err(msg) => ConditionEval::Error(msg),
     }
@@ -320,11 +350,14 @@ pub async fn evaluate_condition_with_path(command: &str, cwd: &Path, timeout: Du
 /// Run a project's setup script headless in a Routine's fresh worktree, before
 /// its crew launches: the same `bash -c` + login-shell PATH as a fire
 /// condition. `env` adds variables for the script only (Conductor's, from
-/// `workspace_setup::conductor_env`). `Err` carries why it failed, for
+/// `workspace_setup::conductor_env`), plus [`routine_quiet_env`] when "Quiet
+/// Claude Code in crews and Routines" is on. `Err` carries why it failed, for
 /// `last_outcome`.
 pub async fn run_setup(script: &str, cwd: &Path, timeout: Duration, env: &[(&str, String)]) -> Result<(), String> {
     let path = condition_path().await;
-    run_setup_with_env(script, cwd, timeout, &path, env).await
+    let mut env = env.to_vec();
+    env.extend(routine_quiet_env(crate::settings::quiet_claude_code()));
+    run_setup_with_env(script, cwd, timeout, &path, &env).await
 }
 
 /// See `run_setup`; `path` is the PATH the script runs with.
