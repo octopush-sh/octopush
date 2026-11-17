@@ -2099,22 +2099,43 @@ fn minutes(d: std::time::Duration) -> u64 {
 }
 
 /// What an idle stall found: the tool call still open when it tripped (if
-/// any) and the silence it waited.
+/// any), the silence it waited, and — when the last line was a Claude
+/// `system/api_retry` — that retry's cause ("" when it named none).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IdleStall {
     pub tool: Option<OpenTool>,
     pub window: std::time::Duration,
+    pub after_retry: Option<String>,
+}
+
+/// The longest retry delay [`retry_idle_window`] waits out: 300s, the
+/// ceiling Claude Code 2.1.323 set for `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS`
+/// (529 overload backoff). A 429 `Retry-After` or a wait under
+/// `CLAUDE_CODE_RETRY_WATCHDOG` can be longer; it is capped here too, so the
+/// window after a retry stays about 10 minutes at most.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a Claude stage may stay silent after a `system/api_retry` that
+/// says it waits `retry_delay` before the next attempt: that delay (capped at
+/// [`MAX_RETRY_DELAY`]) plus the plain window for the attempt itself, never
+/// below `idle`.
+pub(crate) fn retry_idle_window(idle: std::time::Duration, retry_delay: std::time::Duration) -> std::time::Duration {
+    retry_delay.min(MAX_RETRY_DELAY).saturating_add(idle).max(idle)
 }
 
 /// The stage error for an idle stall, after the CLI's name: "timed out — no
-/// output for 5 minutes", or naming the open call ("timed out — Bash `npm
-/// test` gave no result for 11 minutes").
+/// output for 5 minutes", naming the open call ("timed out — Bash `npm
+/// test` gave no result for 11 minutes"), or the API retry it was waiting
+/// out ("timed out — no output for 10 minutes after an API retry
+/// (overloaded)").
 pub(crate) fn idle_timeout_message(stall: &IdleStall) -> String {
     let m = minutes(stall.window);
     let unit = if m == 1 { "minute" } else { "minutes" };
-    match &stall.tool {
-        Some(t) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
-        None => format!("timed out — no output for {m} {unit}"),
+    match (&stall.tool, stall.after_retry.as_deref()) {
+        (Some(t), _) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
+        (None, Some("")) => format!("timed out — no output for {m} {unit} after an API retry"),
+        (None, Some(cause)) => format!("timed out — no output for {m} {unit} after an API retry ({cause})"),
+        (None, None) => format!("timed out — no output for {m} {unit}"),
     }
 }
 
@@ -2175,7 +2196,11 @@ impl ReadLimits {
 /// window is [`ReadLimits::command_idle`] — Claude Code itself waits that
 /// long on a foreground command that prints nothing to the stream. The first
 /// time a stage stays silent past `idle` on that account, `on_long_wait` gets
-/// the window (the journal line). Codex keeps the plain idle window.
+/// the window (the journal line). After a `system/api_retry` with a numeric
+/// `retry_delay_ms` the next silence may last that delay plus `idle`
+/// ([`retry_idle_window`]) — the CLI is waiting out its own backoff; the
+/// next line of any other kind goes back to the plain window. Codex keeps
+/// the plain idle window.
 pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     dialect: CliDialect,
@@ -2195,6 +2220,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     let settled = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() >= limits.settle);
     let mut open = OpenTools::default();
     let mut long_wait_noted = false;
+    // The last line was a Claude `system/api_retry`: its cause and the
+    // silence it allows ([`retry_idle_window`]).
+    let mut retry_wait: Option<(String, std::time::Duration)> = None;
     loop {
         if settled(result_at) {
             if let Some(line) = result_line.take() {
@@ -2206,12 +2234,16 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             return ReadEnd::AbsCap(result_line, tail);
         }
         raw.clear();
-        let window = if open.command_open() { limits.command_idle.max(limits.idle) } else { limits.idle };
+        let command = open.command_open();
+        let mut window = if command { limits.command_idle.max(limits.idle) } else { limits.idle };
+        if let Some((_, w)) = &retry_wait {
+            window = window.max(*w);
+        }
         let mut wait = window.min(limits.cap - elapsed);
         if let Some(at) = result_at {
             wait = wait.min(limits.settle.saturating_sub(at.elapsed()));
         }
-        let read = if wait > limits.idle {
+        let read = if command && wait > limits.idle {
             // Only an open command waits past `idle`: say so once when it
             // does, then wait out the rest. `raw` keeps a partial line.
             let first = tokio::time::timeout(limits.idle, reader.read_until(b'\n', &mut raw)).await;
@@ -2238,7 +2270,8 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                 if started.elapsed() >= limits.cap {
                     return ReadEnd::AbsCap(result_line, tail);
                 }
-                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window });
+                let after_retry = retry_wait.map(|(cause, _)| cause);
+                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window, after_retry });
             }
             Ok(Ok(0)) => break,  // EOF
             Ok(Ok(_)) => {}
@@ -2257,6 +2290,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             continue;
         };
         if dialect == CliDialect::Claude {
+            retry_wait = crate::orchestrator::live::api_retry_cause(&value).zip(
+                crate::orchestrator::live::api_retry_delay(&value).map(|d| retry_idle_window(limits.idle, d)),
+            );
             open.observe(&value);
             if is_result_event(&value) {
                 result_line = Some(trimmed.to_string());

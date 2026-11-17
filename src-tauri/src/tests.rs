@@ -18378,8 +18378,8 @@ mod crew_tests {
 #[cfg(test)]
 mod cli_command_idle_tests {
     use crate::orchestrator::cli_runner::{
-        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
-        OpenTool, OpenTools, ReadEnd, ReadLimits,
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, retry_idle_window, CliDialect,
+        IdleStall, OpenTool, OpenTools, ReadEnd, ReadLimits,
     };
     use serde_json::{json, Value};
     use std::time::{Duration, Instant};
@@ -18476,7 +18476,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
     }
 
@@ -18503,8 +18503,93 @@ mod cli_command_idle_tests {
             read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
+    }
+
+    fn api_retry(delay_ms: u64, error: &str) -> Value {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": 529, "error": error})
+    }
+
+    #[tokio::test]
+    async fn a_stage_waiting_out_an_api_retry_outlives_the_idle_window() {
+        // The retry's delay (600ms) is three times `idle` (200ms): the answer
+        // arriving 700ms later is still inside delay + idle.
+        let (end, notes, took) = read(
+            vec![Some(api_retry(600, "overloaded")), None, Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert!(notes.is_empty(), "a retry wait is not a long command: {notes:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_past_the_retry_delay_plus_idle_still_stalls_and_names_the_retry() {
+        let (end, notes, took) = read(vec![Some(api_retry(600, "overloaded"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= Duration::from_millis(800), "{took:?}");
+        assert_eq!(stall.window, Duration::from_millis(800));
+        assert_eq!(stall.after_retry.as_deref(), Some("overloaded"));
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_non_retry_line_goes_back_to_the_plain_window() {
+        let (end, _, took) = read(
+            vec![Some(api_retry(5000, "overloaded")), Some(tool_result("toolu_ghost"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_numeric_delay_keeps_the_plain_window() {
+        let bare = json!({"type": "system", "subtype": "api_retry", "error": "overloaded", "retry_delay_ms": "soon"});
+        let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn codex_ignores_a_retry_delay() {
+        let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[test]
+    fn the_retry_window_is_the_delay_plus_the_plain_window() {
+        let idle = ReadLimits::STAGE.idle;
+        // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
+        assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_stall_after_a_retry_names_it() {
+        let stall = |c: &str| IdleStall { tool: None, window: Duration::from_secs(600), after_retry: Some(c.into()) };
+        assert_eq!(
+            idle_timeout_message(&stall("overloaded")),
+            "timed out — no output for 10 minutes after an API retry (overloaded)"
+        );
+        assert_eq!(idle_timeout_message(&stall("")), "timed out — no output for 10 minutes after an API retry");
     }
 
     #[test]
@@ -18555,11 +18640,11 @@ mod cli_command_idle_tests {
     fn idle_messages_name_the_open_call() {
         let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None }),
             "timed out — Bash `npm test` gave no result for 11 minutes"
         );
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None }),
             "timed out — no output for 5 minutes"
         );
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
