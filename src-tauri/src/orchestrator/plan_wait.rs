@@ -1,0 +1,320 @@
+//! Claude plan limit park (#731, part C of #299).
+//!
+//! A Claude Code stage on a Pro/Max plan that hits a plan window stops with
+//! a `rejected` `rate_limit_event` (`cli_runner::apply_plan_limit`). The
+//! drive does not treat that as a failure to decide on: the stage keeps its
+//! spend and session, the run pauses at the batch boundary (never mid-stage),
+//! and an automatic Resume is scheduled for the window's `resetsAt` plus a
+//! margin and a small jitter. The schedule is persisted on the `runs` row, so
+//! it survives an app restart: the app's scheduler tick (beside Routines)
+//! resumes it, and a detached worker that parked it waits and resumes it
+//! itself while the app is closed. Both claim it with one compare-and-set
+//! (`Db::claim_plan_resume`), so exactly one of them resumes.
+//!
+//! The resume goes through the ordinary Resume path (same stage, same
+//! dossier, `--resume` of the same session), so every checkpoint still holds.
+//! Automatic resumes are capped ([`AUTO_RESUME_CAP`]); a run whose budget is
+//! spent, or whose window resets too far off, waits for the director.
+
+use std::sync::Arc;
+
+use chrono::{Local, TimeZone, Utc};
+
+use crate::error::AppResult;
+use crate::orchestrator::cli_runner::{is_plan_limit, plan_window_name, PlanLimit};
+use crate::orchestrator::types::CheckpointAction;
+use crate::orchestrator::Orchestrator;
+
+/// Automatic resumes allowed before the run waits for the director. The
+/// count resets when the director acts or a stage finishes.
+pub const AUTO_RESUME_CAP: i64 = 3;
+/// Seconds after `resetsAt` before resuming: the window needs a moment to
+/// actually reopen.
+pub const RESUME_MARGIN_SECS: i64 = 90;
+/// Up to this many extra seconds, so several parked crews don't all resume
+/// in the same second.
+pub const RESUME_JITTER_SECS: i64 = 60;
+/// A window that resets further off than this is not waited for
+/// automatically (a weekly window is at most 7 days away).
+pub const MAX_WAIT_SECS: i64 = 8 * 86_400;
+
+/// Why a plan-parked run waits for the director instead of resuming itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DirectorReason {
+    /// [`AUTO_RESUME_CAP`] automatic resumes already ran into the wall.
+    CapReached,
+    /// The run's budget is spent: resuming would spend past it.
+    BudgetSpent,
+    /// The window resets more than [`MAX_WAIT_SECS`] away.
+    TooFar,
+}
+
+/// What to do with a run a plan limit just parked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ParkDecision {
+    /// Resume automatically at this epoch second.
+    Resume { at: i64 },
+    /// Wait for the director.
+    Director(DirectorReason),
+}
+
+/// Pure: the park decision. `jitter` is clamped to `0..=RESUME_JITTER_SECS`.
+/// A reset already in the past resumes from `now` (plus the margin).
+pub fn park_decision(resets_at: i64, now: i64, resume_count: i64, budget_spent: bool, jitter: i64) -> ParkDecision {
+    if budget_spent {
+        return ParkDecision::Director(DirectorReason::BudgetSpent);
+    }
+    if resume_count >= AUTO_RESUME_CAP {
+        return ParkDecision::Director(DirectorReason::CapReached);
+    }
+    if resets_at - now > MAX_WAIT_SECS {
+        return ParkDecision::Director(DirectorReason::TooFar);
+    }
+    ParkDecision::Resume { at: resets_at.max(now) + RESUME_MARGIN_SECS + jitter.clamp(0, RESUME_JITTER_SECS) }
+}
+
+/// A random jitter in `0..=RESUME_JITTER_SECS`.
+fn jitter() -> i64 {
+    (uuid::Uuid::new_v4().as_u128() % (RESUME_JITTER_SECS as u128 + 1)) as i64
+}
+
+/// `19:40` within a day of `now`, else `Tue 19:40`, in this Mac's clock.
+pub fn clock_label(epoch: i64, now: i64) -> String {
+    let Some(t) = Local.timestamp_opt(epoch, 0).single() else {
+        return String::new();
+    };
+    if epoch - now < 86_400 {
+        t.format("%H:%M").to_string()
+    } else {
+        t.format("%a %H:%M").to_string()
+    }
+}
+
+fn budget_spent(run: &crate::db::RunRow) -> bool {
+    run.budget_usd.is_some_and(|b| run.cost_usd >= b)
+}
+
+impl Orchestrator {
+    /// Park `run_id` after `stage_id` hit a Claude plan limit: persist the
+    /// wait and, unless the director must decide, schedule the automatic
+    /// resume. Journals what will happen. Returns whether a resume is
+    /// scheduled.
+    pub(crate) fn park_for_plan(&self, run_id: &str, stage_id: &str, limit: &PlanLimit) -> AppResult<bool> {
+        let now = Utc::now().timestamp();
+        let Some(run) = self.db.lock().get_run(run_id)? else {
+            return Ok(false);
+        };
+        let count = self.db.lock().plan_resume_count(run_id)?;
+        let decision = park_decision(limit.resets_at, now, count, budget_spent(&run), jitter());
+        let window = plan_window_name(&limit.window);
+        let resets = clock_label(limit.resets_at, now);
+        let (resume_at, notice) = match decision {
+            ParkDecision::Resume { at } => (
+                Some(at),
+                format!("Paused by your Claude plan · resumes at {}", clock_label(at, now)),
+            ),
+            ParkDecision::Director(DirectorReason::CapReached) => (
+                None,
+                format!(
+                    "Paused by your Claude plan again · {AUTO_RESUME_CAP} automatic resumes already ran, \
+                     so it waits for you (the {window} resets at {resets})"
+                ),
+            ),
+            ParkDecision::Director(DirectorReason::BudgetSpent) => (
+                None,
+                format!("Paused by your Claude plan · the run's budget is spent, so it waits for you (the {window} resets at {resets})"),
+            ),
+            ParkDecision::Director(DirectorReason::TooFar) => (
+                None,
+                format!("Paused by your Claude plan · the {window} resets at {resets}, too far off to wait for, so it waits for you"),
+            ),
+        };
+        self.db.lock().set_run_plan_wait(run_id, &limit.window, limit.resets_at, resume_at)?;
+        self.journal_notice(run_id, stage_id, &notice);
+        self.emit_run_update(run_id);
+        Ok(resume_at.is_some())
+    }
+
+    /// The `run://checkpoint` reason for a park: `plan_limit` while an
+    /// automatic resume is scheduled (nobody needs to decide), else `decision`.
+    pub(crate) fn park_reason(&self, run_id: &str) -> &'static str {
+        let waiting = self
+            .db
+            .lock()
+            .get_run(run_id)
+            .ok()
+            .flatten()
+            .and_then(|r| r.plan_wait)
+            .is_some_and(|w| w.resume_at.is_some());
+        if waiting {
+            "plan_limit"
+        } else {
+            "decision"
+        }
+    }
+
+    /// Claim and apply the automatic resume of a plan-parked run whose time
+    /// has come. `Ok(Some(budget_override))`: the Resume is applied and the
+    /// caller drives the next segment. `Ok(None)`: nothing to do (another
+    /// process claimed it, the director acted, or the budget is now spent and
+    /// the run waits for the director).
+    pub fn claim_plan_resume(&self, run_id: &str) -> AppResult<Option<bool>> {
+        let now = Utc::now().timestamp();
+        if !self.db.lock().claim_plan_resume(run_id, now)? {
+            return Ok(None);
+        }
+        let Some(run) = self.db.lock().get_run(run_id)? else {
+            return Ok(None);
+        };
+        let stages = self.db.lock().list_run_stages(run_id)?;
+        let Some(stage) = stages
+            .iter()
+            .find(|s| s.status == "failed" && s.error.as_deref().is_some_and(is_plan_limit))
+            .cloned()
+        else {
+            // The parked stage was resolved another way: nothing to resume.
+            self.db.lock().clear_run_plan_wait(run_id)?;
+            self.emit_run_update(run_id);
+            return Ok(None);
+        };
+        if budget_spent(&run) {
+            // Never resume a run whose budget is spent: it waits for you.
+            self.journal_notice(
+                run_id,
+                &stage.id,
+                "Claude plan window reset · the run's budget is spent, so it waits for you",
+            );
+            self.emit_run_update(run_id);
+            self.emit_checkpoint(run_id, &stage.id, "decision");
+            return Ok(None);
+        }
+        let count = self.db.lock().plan_resume_count(run_id)?;
+        self.journal_notice(
+            run_id,
+            &stage.id,
+            &format!("Claude plan window reset · resuming (automatic resume {count} of {AUTO_RESUME_CAP})"),
+        );
+        match self.resolve_checkpoint_apply_only(
+            run_id,
+            Some(&stage.id),
+            CheckpointAction::Resume { max_turns_override: None },
+        ) {
+            Ok(r) => Ok(r),
+            Err(e) => {
+                tracing::warn!(run_id = %run_id, error = %e, "plan resume: applying Resume failed");
+                Ok(None)
+            }
+        }
+    }
+
+    /// The director turned off this run's automatic resume: it stays parked
+    /// and waits for a manual Resume. Silent (`director`): it's their own hand.
+    pub fn cancel_plan_resume(&self, run_id: &str) -> AppResult<()> {
+        if !self.db.lock().cancel_plan_resume(run_id)? {
+            return Ok(());
+        }
+        let stage = self
+            .db
+            .lock()
+            .list_run_stages(run_id)?
+            .into_iter()
+            .find(|s| s.status == "failed" && s.error.as_deref().is_some_and(is_plan_limit));
+        if let Some(s) = stage {
+            self.journal_notice(run_id, &s.id, "Automatic resume turned off · resume when you're ready");
+            self.emit_run_update(run_id);
+            self.emit_checkpoint(run_id, &s.id, "director");
+        } else {
+            self.emit_run_update(run_id);
+        }
+        Ok(())
+    }
+
+    /// App side, on the scheduler tick: resume every plan-parked run whose
+    /// time has come — detached for Pro, in-process otherwise (the same
+    /// substrate a director's Resume would use). Never fails the tick.
+    pub(crate) fn plan_resume_tick(self: &Arc<Self>) {
+        let now = Utc::now().timestamp();
+        let due = match self.db.lock().list_due_plan_resumes(now) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(error = %e, "plan resume: listing due runs failed");
+                return;
+            }
+        };
+        for run_id in due {
+            match self.claim_plan_resume(&run_id) {
+                Ok(Some(budget_override)) => self.drive_resumed(run_id, budget_override),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(run_id = %run_id, error = %e, "plan resume failed"),
+            }
+        }
+    }
+
+    /// Drive a run whose Resume is applied: a detached worker for Pro, with
+    /// the in-process fallback (as `commands::dispatch_checkpoint` does).
+    fn drive_resumed(self: &Arc<Self>, run_id: String, budget_override: bool) {
+        if crate::entitlement::Entitlement::current().has_feature(crate::entitlement::feature::RUNS_DETACHED) {
+            match self.spawn_detached_segment(&run_id, budget_override) {
+                Ok(_) => return,
+                Err(e) => {
+                    tracing::warn!(run_id = %run_id, error = %e, "detached spawn failed — driving in-process");
+                }
+            }
+        }
+        Arc::clone(self).spawn_drive(run_id, budget_override);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_793_540_000;
+
+    #[test]
+    fn schedules_after_the_reset_with_margin_and_bounded_jitter() {
+        let resets = NOW + 3_600;
+        assert_eq!(park_decision(resets, NOW, 0, false, 0), ParkDecision::Resume { at: resets + 90 });
+        assert_eq!(park_decision(resets, NOW, 0, false, 42), ParkDecision::Resume { at: resets + 132 });
+        // Jitter is clamped either way.
+        assert_eq!(park_decision(resets, NOW, 0, false, 10_000), ParkDecision::Resume { at: resets + 150 });
+        assert_eq!(park_decision(resets, NOW, 0, false, -5), ParkDecision::Resume { at: resets + 90 });
+    }
+
+    #[test]
+    fn a_reset_already_past_resumes_from_now() {
+        assert_eq!(park_decision(NOW - 600, NOW, 1, false, 0), ParkDecision::Resume { at: NOW + 90 });
+    }
+
+    #[test]
+    fn the_cap_hands_the_run_to_the_director() {
+        let resets = NOW + 60;
+        assert!(matches!(park_decision(resets, NOW, AUTO_RESUME_CAP - 1, false, 0), ParkDecision::Resume { .. }));
+        assert_eq!(
+            park_decision(resets, NOW, AUTO_RESUME_CAP, false, 0),
+            ParkDecision::Director(DirectorReason::CapReached)
+        );
+    }
+
+    #[test]
+    fn a_spent_budget_never_resumes() {
+        assert_eq!(park_decision(NOW + 60, NOW, 0, true, 0), ParkDecision::Director(DirectorReason::BudgetSpent));
+    }
+
+    #[test]
+    fn a_window_too_far_off_waits_for_the_director() {
+        assert!(matches!(park_decision(NOW + 7 * 86_400, NOW, 0, false, 0), ParkDecision::Resume { .. }));
+        assert_eq!(
+            park_decision(NOW + MAX_WAIT_SECS + 1, NOW, 0, false, 0),
+            ParkDecision::Director(DirectorReason::TooFar)
+        );
+    }
+
+    #[test]
+    fn jitter_stays_in_range() {
+        for _ in 0..200 {
+            let j = jitter();
+            assert!((0..=RESUME_JITTER_SECS).contains(&j), "{j}");
+        }
+    }
+}

@@ -12,6 +12,10 @@
 // pulses in verdigris (#749). Under prefers-reduced-motion the pulse becomes
 // a static halo that follows `--pulse-halo` — brass-dim by default,
 // verdigris-strong on a running stage (styles.css, design-system §6).
+//
+// A run waiting for its Claude plan to reset, with an automatic resume
+// scheduled, has no decision pending: calm (#731) — ringing the beacon for
+// a wait trains users to ignore it.
 
 export type BeaconAnchor =
   | { kind: "decision" }
@@ -26,9 +30,12 @@ export function beaconAnchor(opts: {
   blockedStage: { id: string } | null;
   runningStage: { id: string } | null;
   launcherReady: boolean;
+  /** The run waits for its plan to reset with an automatic resume scheduled. */
+  planWaiting?: boolean;
 }): BeaconAnchor {
-  const { run, blockedStage, runningStage, launcherReady } = opts;
+  const { run, blockedStage, runningStage, launcherReady, planWaiting = false } = opts;
   const active = run !== null && !TERMINAL.has(run.status);
+  if (active && planWaiting) return null;
   if (active && (blockedStage || run.status === "draft")) {
     return { kind: "decision" };
   }

@@ -21,6 +21,8 @@ vi.mock("../lib/ipc", async (orig) => {
       ...actual.ipc,
       getRun: vi.fn().mockResolvedValue({ run: null, stages: [] }),
       abortRun: vi.fn().mockResolvedValue(undefined),
+      resolveCheckpoint: vi.fn().mockResolvedValue(undefined),
+      cancelPlanResume: vi.fn().mockResolvedValue(undefined),
       answerBlocker: vi.fn().mockResolvedValue(undefined),
     },
   };
@@ -333,6 +335,47 @@ describe("MissionControl", () => {
     });
     renderRoom();
     expect(screen.getByText(/holds the gate/)).toBeTruthy();
+  });
+
+  it("a run waiting for its Claude plan sits in flight with a sage line and no beacon", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0 },
+    });
+    const halted = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [halted] } } });
+    const { container } = renderRoom();
+    expect(screen.queryByText("Needs you")).toBeNull();
+    expect(screen.getByText("In flight")).toBeTruthy();
+    const line = container.querySelector('[data-tour="mission-control-plan-wait"]')!;
+    expect(line.textContent).toMatch(/^plan limit · resumes \d{2}:\d{2}$/);
+    expect(line.className).toContain("text-octo-sage");
+    expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+  });
+
+  it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0 },
+    });
+    const onJumpToRun = vi.fn();
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
+    renderRoom({ onJumpToRun });
+    fireEvent.click(screen.getByLabelText("Resume now"));
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "resume", undefined, undefined, undefined);
+    fireEvent.click(screen.getByLabelText("Don't resume automatically"));
+    expect(ipc.cancelPlanResume).toHaveBeenCalledWith("a");
+    expect(onJumpToRun).not.toHaveBeenCalled();
+  });
+
+  it("a plan park the director must resume is back in Needs you", () => {
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 60, resumeAt: null, resumeCount: 3 },
+    });
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
+    renderRoom();
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.queryByLabelText("Resume now")).toBeNull();
   });
 
   it("keeps brass dots to needs-you gates: in-flight running dots are verdigris", () => {

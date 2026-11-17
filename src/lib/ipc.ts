@@ -142,7 +142,8 @@ export interface FireOutcomeView {
     | "condition_error"
     | "workspace_unavailable"
     | "launch_refused"
-    | "setup_failed";
+    | "setup_failed"
+    | "plan_limit";
 }
 
 /** The phase a routine fire is in (`routine://phase`, `routines::PHASE_*`). */
@@ -266,6 +267,21 @@ export interface Run {
   /** True when the run executes in a detached segment worker (Pro) — the
    *  crew keeps working even if the app quits. */
   detached: boolean;
+  /** Set while a Claude plan limit parks the run (#731). Mirrors the Rust
+   *  `PlanWait`; times are epoch seconds. */
+  planWait?: PlanWait | null;
+}
+
+/** A run parked at a Claude plan limit. */
+export interface PlanWait {
+  /** The plan window that stopped the stage (`five_hour`, `seven_day`, …). */
+  window: string;
+  /** When that window resets (epoch seconds). */
+  resetsAt: number;
+  /** When the automatic resume is due (epoch seconds); null = the director resumes. */
+  resumeAt: number | null;
+  /** Automatic resumes since the director last acted or a stage finished. */
+  resumeCount: number;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.
@@ -1405,6 +1421,11 @@ export const ipc = {
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),
+
+  /** Turn off a plan-parked run's automatic resume: it waits for a manual
+   *  Resume. ("Resume now" is `resolveCheckpoint(runId, "resume")`.) */
+  cancelPlanResume: (runId: string) =>
+    invoke<void>("cancel_plan_resume", { runId }),
 
   /** Stop the run's in-flight stage (real cancellation). The stage lands in
    *  the normal failed/decision-strip recovery flow; the run itself survives. */

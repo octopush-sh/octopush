@@ -373,6 +373,9 @@ pub struct CliOutcomeMeta {
     /// (Codex), kept as the next resume's baseline. `None` when the last turn
     /// never completed, so the total is unknown and the session isn't resumed.
     pub session_usage: Option<SessionUsage>,
+    /// A Claude plan window stopped this attempt (`cli_runner::apply_plan_limit`):
+    /// the drive parks the run until the window resets.
+    pub plan_limit: Option<crate::orchestrator::cli_runner::PlanLimit>,
 }
 
 /// What a runner returns for one stage.

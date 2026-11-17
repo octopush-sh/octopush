@@ -10,6 +10,7 @@ import { PipelineBuilder } from "./PipelineBuilder";
 import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
 import { RunControlBar } from "./RunControlBar";
+import { isPlanWaiting } from "../lib/planWait";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -115,7 +116,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
     const runningStage = stages.find((s) => s.status === "running") ?? null;
     // Law 2 — one beacon per canvas: decision CTA → running card → calm.
-    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false });
+    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false, planWaiting: !!run && isPlanWaiting(run) });
 
     // Loop props (unchanged logic, but computed off blockedStage)
     let loopTargetRole: string | null = null;

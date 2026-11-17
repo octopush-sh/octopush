@@ -11,7 +11,7 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
+import { ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
@@ -19,6 +19,7 @@ import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
+import { isPlanWaiting, planWaitLine } from "../lib/planWait";
 import { lastActivity } from "../lib/liveLine";
 import { claudeWaitReason, claudeWaitingCopy, type ClaudeWaitReason } from "../lib/claudeWaiting";
 import { stageTitle } from "../lib/stageMeta";
@@ -78,8 +79,10 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // (undismissed). Attention items are always needs-you — a human is waiting.
   const board = useMemo(() => {
     const all = Object.values(runsByWs).flat();
-    const paused = all.filter((r) => r.status === "paused");
-    const running = all.filter((r) => r.status === "running");
+    // A run waiting for its Claude plan to reset, with an automatic resume
+    // scheduled, needs nobody: it stays in flight (#731).
+    const paused = all.filter((r) => r.status === "paused" && !isPlanWaiting(r));
+    const running = all.filter((r) => r.status === "running" || isPlanWaiting(r));
     const settled = all.filter((r) => r.id in settledAt);
     const runSince = (r: Run) => {
       if (statusSince[r.id] !== undefined) return statusSince[r.id];
@@ -408,9 +411,12 @@ function CrewCard({
   const failedStage = stages.find((s) => s.status === "failed");
   const stalled = !!failedStage && isTransientHalt(failedStage.error);
   const runningStage = stages.find((s) => s.status === "running");
+  const planWaiting = isPlanWaiting(run);
 
   const glyph =
-    band === "needs-you" && stalled
+    planWaiting
+      ? { label: "○", cls: "text-octo-sage", word: "waiting" }
+      : band === "needs-you" && stalled
       ? { label: "⟳", cls: "text-octo-warning", word: "stalled" }
       : band === "needs-you" && failedStage
         ? { label: "✕", cls: "text-octo-rouge", word: "halted" }
@@ -581,7 +587,12 @@ function LiveSlot({
 
   let text = "";
   let cls = "text-octo-mute";
-  if (band === "in-flight") {
+  const planLine = planWaitLine(run, Date.now());
+  if (band === "in-flight" && planLine && isPlanWaiting(run)) {
+    // Waiting for the plan's window, not for you: a calm sage line.
+    text = planLine;
+    cls = "text-octo-sage";
+  } else if (band === "in-flight") {
     text = (entries && lastActivity(entries)) || (running ? `${stageTitle(running)} at work` : "");
     cls = "text-octo-sage";
   } else if (band === "needs-you") {
@@ -616,8 +627,15 @@ function LiveSlot({
     }
   }
 
+  const planTitle = planLine && isPlanWaiting(run)
+    ? "Paused by your Claude plan — it continues the same session once the window resets"
+    : undefined;
   return (
-    <span className={`block h-4 truncate font-mono text-[10px] leading-4 ${cls}`} title={text || undefined}>
+    <span
+      className={`block h-4 truncate font-mono text-[10px] leading-4 ${cls}`}
+      title={planTitle ?? (text || undefined)}
+      data-tour={planTitle ? "mission-control-plan-wait" : undefined}
+    >
       {text}
     </span>
   );
@@ -741,7 +759,10 @@ function AskPanel({
 
 function CardFoot({ run, band }: { run: Run; band: Band }) {
   const abort = useRunsStore((s) => s.abort);
+  const resolve = useRunsStore((s) => s.resolve);
+  const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
   const dismissSettled = useRunsStore((s) => s.dismissSettled);
+  const planWaiting = isPlanWaiting(run);
   const [arming, setArming] = useState(false);
   const armTimer = useRef<number | null>(null);
   useEffect(
@@ -782,6 +803,35 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
         </span>
       )}
       <span className="relative z-10 ml-auto flex items-center gap-1 opacity-0 transition-opacity duration-[180ms] group-hover:opacity-100 group-focus-within:opacity-100">
+        {planWaiting && (
+          <>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation(); // don't trigger the card's jump
+                void resolve(run.id, "resume").catch(console.error);
+              }}
+              aria-label="Resume now"
+              title="Resume now — continue the same session before the plan's window resets"
+              data-tour="mission-control-plan-resume-now"
+              className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <Play size={11} />
+            </button>
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation(); // don't trigger the card's jump
+                void cancelPlanResume(run.id).catch(console.error);
+              }}
+              aria-label="Don't resume automatically"
+              title="Don't resume automatically — keep it parked until you resume it"
+              className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              <TimerOff size={11} />
+            </button>
+          </>
+        )}
         {band !== "settled" ? (
           <button
             type="button"

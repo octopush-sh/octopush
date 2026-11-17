@@ -10,6 +10,7 @@ pub mod launch;
 pub mod git_baseline;
 pub mod live;
 pub mod persist;
+pub mod plan_wait;
 pub mod roles;
 pub mod runner;
 pub mod sandbox;
@@ -827,6 +828,14 @@ impl Orchestrator {
         }) {
             return Ok(false);
         }
+        // A Claude plan limit: a stronger model meets the same wall.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -1264,6 +1273,8 @@ impl Orchestrator {
                     self.capture_stage_diff_snapshot(run, &stage.id);
                 }
                 self.recompute_run_cost(&run.id)?;
+                // Past the wall: a fresh allowance of automatic plan resumes.
+                self.db.lock().reset_plan_resume_count(&run.id)?;
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
@@ -1318,6 +1329,11 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A Claude plan limit parks the run until the window resets
+                // (the stage keeps its spend and session for the Resume).
+                if let Some(limit) = outcome.cli.plan_limit.as_ref() {
+                    self.park_for_plan(&run.id, &stage.id, limit)?;
+                }
                 // A Claude Code budget stop parks with the budget gate's own
                 // notice; its session (persisted above) lets Resume continue.
                 if crate::orchestrator::cli_runner::is_budget_stop(&err) {
@@ -2024,7 +2040,9 @@ impl Orchestrator {
                     self.emit_run_update(run_id);
                     return Ok(false);
                 }
-                self.emit_checkpoint(run_id, &stage.id, "decision");
+                // A plan-parked stage with a scheduled resume needs nobody.
+                let reason = self.park_reason(run_id);
+                self.emit_checkpoint(run_id, &stage.id, reason);
                 Ok(true)
             }
             StageStatus::AwaitingCheckpoint => {
@@ -2197,6 +2215,10 @@ impl Orchestrator {
                 "no stage is awaiting a director decision".into(),
             ));
         }
+
+        // Any resolution ends a Claude plan park (an automatic resume comes
+        // through here too, after claiming it).
+        self.db.lock().clear_run_plan_wait(run_id)?;
 
         // Approving a budget-parked stage (it never ran) is a conscious
         // override: the re-drive lets that stage start past the budget gate.
@@ -2658,6 +2680,7 @@ impl Orchestrator {
 
     pub async fn abort_run(&self, run_id: &str) -> AppResult<()> {
         self.db.lock().set_run_status(run_id, "aborted", true)?;
+        self.db.lock().clear_run_plan_wait(run_id)?;
         // Aborting must kill in-flight work, not just mark the DB: the drive
         // loop only checks the status BETWEEN stages.
         self.stop_current_stage(run_id)?;

@@ -3,6 +3,11 @@ import { fleetCounts, isTransientHalt, needsYou } from "./runStatus";
 import type { RunStatus } from "./ipc";
 import fixtures from "./needsYou.fixtures.json";
 
+/** A plan park with (`true`) or without (`false`) a scheduled resume. */
+function planWaitFor(scheduled: boolean) {
+  return { window: "five_hour", resetsAt: 1_793_551_200, resumeAt: scheduled ? 1_793_551_290 : null, resumeCount: 0 };
+}
+
 describe("needsYou parity with the Dock badge (Rust fleet_status)", () => {
   it("answers each status as the shared fixture says", () => {
     for (const c of fixtures.statuses) {
@@ -10,9 +15,19 @@ describe("needsYou parity with the Dock badge (Rust fleet_status)", () => {
     }
   });
 
+  it("answers each plan-waiting case as the shared fixture says", () => {
+    for (const c of fixtures.planWaiting) {
+      const run = { status: c.status as RunStatus, planWait: planWaitFor(c.planWaiting) };
+      expect(needsYou(run), `${c.status} ${c.planWaiting}`).toBe(c.needsYou);
+    }
+  });
+
   it("splits each fleet as the shared fixture says", () => {
     for (const f of fixtures.fleets) {
-      const counts = fleetCounts(f.statuses.map((status) => ({ status: status as RunStatus })));
+      const waiting = (f as { planWaiting?: boolean[] }).planWaiting;
+      const counts = fleetCounts(
+        f.statuses.map((status, i) => ({ status: status as RunStatus, planWait: planWaitFor(waiting?.[i] ?? false) })),
+      );
       expect(counts, f.statuses.join(",")).toEqual({ needsYou: f.needsYou, inFlight: f.inFlight });
     }
   });

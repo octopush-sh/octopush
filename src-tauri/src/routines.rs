@@ -66,6 +66,10 @@ pub enum SkipReason {
     /// A fresh worktree's setup script failed — the worktree is discarded and
     /// no run is created.
     SetupFailed(String),
+    /// The crew runs Claude Code and the last Claude plan snapshot says a
+    /// window is `rejected` until `resets_at` (epoch seconds): the fire would
+    /// halt within seconds, so no worktree, setup, run or tokens (#731).
+    PlanLimit { resets_at: i64 },
 }
 
 impl SkipReason {
@@ -78,6 +82,10 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace unavailable".to_string(),
             SkipReason::LaunchRefused(msg) => msg.clone(),
             SkipReason::SetupFailed(msg) => format!("setup failed: {msg}"),
+            SkipReason::PlanLimit { resets_at } => format!(
+                "plan limit · resets {}",
+                crate::orchestrator::plan_wait::clock_label(*resets_at, Utc::now().timestamp())
+            ),
         }
     }
 
@@ -91,6 +99,7 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace_unavailable",
             SkipReason::LaunchRefused(_) => "launch_refused",
             SkipReason::SetupFailed(_) => "setup_failed",
+            SkipReason::PlanLimit { .. } => "plan_limit",
         }
     }
 }
@@ -861,6 +870,9 @@ impl Orchestrator {
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+                // Claude plan parks resume for everyone (Free included), so
+                // before the Routines entitlement check.
+                self.plan_resume_tick();
                 self.routine_tick().await;
             }
         });
@@ -959,11 +971,38 @@ impl Orchestrator {
     /// touch the schedule). Returns whether a run was dispatched or the window
     /// skipped (with the reason).
     async fn fire_routine_inner(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
+        // A crew on Claude Code whose plan is at its wall would halt within
+        // seconds: skip before any workspace, setup or condition work.
+        if let Some(resets_at) = self.routine_plan_wall(r)? {
+            return Ok(FireOutcome::Skipped(SkipReason::PlanLimit { resets_at }));
+        }
         if r.workspace_mode == "fresh" {
             self.fire_fresh(r).await
         } else {
             self.fire_fixed(r).await
         }
+    }
+
+    /// When the routine's crew (its own model overrides applied) has a Claude
+    /// Code CLI stage and the stored Claude plan snapshot has a window
+    /// `rejected` (not covered by extra usage) with a future reset: that reset.
+    fn routine_plan_wall(&self, r: &RoutineRow) -> crate::error::AppResult<Option<i64>> {
+        let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
+        let stages = self.db().lock().get_pipeline_stages(&r.pipeline_id)?;
+        let crew: Vec<(String, String)> = stages
+            .iter()
+            .map(|s| {
+                let model = overrides
+                    .iter()
+                    .find(|(p, _)| *p == s.position)
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_else(|| s.agent_model.clone());
+                (s.substrate.clone(), model)
+            })
+            .collect();
+        let snapshots = crate::claude_plan::load(&self.db().lock())?;
+        let windows: Vec<_> = snapshots.into_iter().map(|s| s.window).collect();
+        Ok(plan_wall(&crew, &windows, Utc::now().timestamp()))
     }
 
     /// Fixed mode: resolve + guard the chosen workspace FIRST (so a deleted
@@ -1229,6 +1268,30 @@ impl Orchestrator {
 
 /// Parse the stored `[[position, model], …]` JSON overrides into the shape
 /// `create_run` wants. A malformed blob degrades to no overrides.
+/// Pure: the latest future reset among `rejected` plan windows (not covered
+/// by extra usage), when the crew — `(substrate, model)` per stage — has a
+/// Claude Code CLI stage. `None` otherwise (an API or Codex-only crew, or no
+/// wall), so API-key users and API crews never skip.
+pub(crate) fn plan_wall(
+    crew: &[(String, String)],
+    windows: &[crate::orchestrator::cli_runner::PlanWindow],
+    now: i64,
+) -> Option<i64> {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    let on_claude_code = crew
+        .iter()
+        .any(|(sub, model)| sub == "cli" && dialect_for_model(model) == CliDialect::Claude);
+    if !on_claude_code {
+        return None;
+    }
+    windows
+        .iter()
+        .filter(|w| w.status.as_deref() == Some("rejected") && !w.using_overage)
+        .filter_map(|w| w.resets_at)
+        .filter(|t| *t > now)
+        .max()
+}
+
 pub(crate) fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
     let Some(json) = json else { return Vec::new() };
     serde_json::from_str::<Vec<(i64, String)>>(json).unwrap_or_default()

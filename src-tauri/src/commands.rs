@@ -2659,6 +2659,8 @@ fn dispatch_checkpoint(
     stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
+    // The director acted: a fresh allowance of automatic plan resumes.
+    orch.db().lock().reset_plan_resume_count(&run_id)?;
     // Pro (`runs.detached`): apply the decision's mutations here — they're
     // synchronous and cheap — then hand the re-drive to a detached worker.
     // Guard rejections ("run is already executing") surface immediately
@@ -2713,6 +2715,14 @@ pub async fn answer_blocker(
     // Thread the validated `stage_id` through so the resolution acts on exactly
     // the stage we just checked, not merely "the parked stage".
     dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers, source })
+}
+
+/// Turn off the automatic resume of a run parked by a Claude plan limit: it
+/// stays parked and waits for a manual Resume (#731). "Resume now" is the
+/// ordinary `resolve_checkpoint("resume")`.
+#[tauri::command]
+pub async fn cancel_plan_resume(orch: State<'_, Arc<Orchestrator>>, run_id: String) -> AppResult<()> {
+    orch.cancel_plan_resume(&run_id)
 }
 
 #[tauri::command]

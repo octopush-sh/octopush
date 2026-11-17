@@ -2,6 +2,7 @@ import { listen } from "@tauri-apps/api/event";
 import { sendNotification } from "@tauri-apps/plugin-notification";
 import { RUN_EVENTS, type Run } from "./ipc";
 import { formatUsd } from "./cost";
+import { resetLabel } from "./claudePlan";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
 import { useNotifyPrefs } from "../stores/notifyPrefsStore";
@@ -14,6 +15,8 @@ import { useNotifyPrefs } from "../stores/notifyPrefsStore";
  *    stage-update is NOT the signal: gates/halts never emit one, and the
  *    director's own "pause at the next stage" does — the exact false
  *    negative/positive pair the naive design shipped with.
+ *    A `plan_limit` reason (a Claude plan park that resumes on its own) gets
+ *    a calm "Paused by your Claude plan · resumes at 19:40" instead.
  *  - **Finished** ← a stage-update transitioning an active run to
  *    `completed` (with the cost). `aborted` is the director's own hand.
  *
@@ -69,6 +72,15 @@ export function decideCheckpointNotification(
 ): CrewNotification | null {
   if (reason === "director") return null; // the user's own pause — not news
   if (!run) return null; // row not hydrated yet — better silent than wrong
+  if (reason === "plan_limit") {
+    // A Claude plan park with an automatic resume scheduled: informative,
+    // not a decision (#731) — the headline says when it continues.
+    const at = run.planWait?.resumeAt;
+    return {
+      title: "Paused by your Claude plan",
+      body: at != null ? `${describe(run, workspaceName)} · resumes at ${resetLabel(at, Date.now())}` : describe(run, workspaceName),
+    };
+  }
   return {
     title: "The crew needs you",
     body: describe(run, workspaceName),

@@ -987,6 +987,111 @@ fn rate_limit_event_without_unified_windows_uses_top_level_utilization() {
     assert!(w[0].using_overage);
 }
 
+// ─── A Claude plan wall (`rejected`) → plan-limit park (#731) ─────────────
+
+const REJECTED_REL: &str = "stream-json/subscriber-rate-limit-rejected.jsonl";
+
+/// Feed a fixture's events to the production plan-limit watch.
+fn plan_watch(events: &[Value]) -> crate::orchestrator::cli_runner::PlanLimitWatch {
+    let mut watch = crate::orchestrator::cli_runner::PlanLimitWatch::default();
+    for e in events {
+        watch.observe(e);
+    }
+    watch
+}
+
+#[test]
+fn a_rejected_plan_window_halts_the_stage_as_a_plan_limit() {
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit, PlanLimit};
+    let rec = recording("2.1.314");
+    let fx = rec.label(REJECTED_REL);
+    let events = rec.jsonl(REJECTED_REL);
+    let init = events.iter().find(|e| e["subtype"] == "init").unwrap();
+    assert_eq!(cli_auth_from_init(init), Some(CliAuth::Subscription), "[{fx}]");
+    let rl = of_type(&events, "rate_limit_event");
+    for f in ["status", "resetsAt", "rateLimitType", "isUsingOverage"] {
+        require(&fx, rl[1], &format!("rate_limit_info.{f}"));
+    }
+    let notice = events.iter().find(|e| e["error"] == "rate_limit").expect("the CLI's limit notice");
+    assert_eq!(notice["message"]["model"], "<synthetic>", "[{fx}]");
+
+    let watch = plan_watch(&events);
+    assert_eq!(
+        watch.limit(),
+        Some(&PlanLimit { window: "five_hour".into(), resets_at: 1793551200 }),
+        "[{fx}] the rejected window and its reset"
+    );
+
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let parsed = parse_cli_result(&result, true, ArtifactKind::Diff, "").unwrap();
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Failed), "[{fx}] {:?}", out.status);
+    let err = out.error.as_deref().unwrap();
+    assert!(is_plan_limit(err), "[{fx}] {err}");
+    assert!(err.starts_with("Paused by your Claude plan — the 5-hour window"), "[{fx}] {err}");
+    assert!(err.contains("You've hit your 5-hour limit"), "[{fx}] the CLI's own words follow: {err}");
+    assert_eq!(out.session_id.as_deref(), Some("aaaaaaaa-0000-4000-8000-000000000007"), "[{fx}] session kept for Resume");
+    assert_eq!(out.cost_usd, 0.0045, "[{fx}] spend kept");
+    assert_eq!(out.cli.plan_limit.as_ref().map(|l| l.resets_at), Some(1793551200));
+
+    // A success-shaped result (`is_error: false`) whose reply is the limit
+    // notice is the same stop, not finished work handed to the next stage.
+    let mut ok = events.iter().find(|e| is_result_event(e)).unwrap().clone();
+    ok["is_error"] = Value::Bool(false);
+    let parsed = parse_cli_result(&ok.to_string(), true, ArtifactKind::Diff, "").unwrap();
+    assert!(matches!(parsed.status, StageStatus::Done));
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Failed), "[{fx}] success-shaped stop");
+    assert!(out.artifact.text.is_empty(), "[{fx}] the notice is not an artifact");
+    assert!(out.cli.plan_limit.is_some());
+}
+
+#[test]
+fn a_rejected_window_covered_by_extra_usage_is_not_a_plan_limit() {
+    // `subscriber-rate-limit.jsonl`'s third event: rejected, but
+    // `isUsingOverage: true` — extra usage serves the request.
+    let rec = recording("2.1.314");
+    let fx = rec.label(SUBSCRIBER_REL);
+    let events = rec.jsonl(SUBSCRIBER_REL);
+    let watch = plan_watch(&events);
+    assert_eq!(watch.limit(), None, "[{fx}]");
+    let result = events.iter().find(|e| is_result_event(e)).unwrap().to_string();
+    let parsed = parse_cli_result(&result, true, ArtifactKind::Note, "").unwrap();
+    let out = crate::orchestrator::cli_runner::apply_plan_limit(parsed, &watch);
+    assert!(matches!(out.status, StageStatus::Done), "[{fx}] finished work is untouched");
+    assert!(out.cli.plan_limit.is_none());
+}
+
+#[test]
+fn a_window_allowed_again_clears_the_wall_and_other_failures_keep_their_cause() {
+    use crate::orchestrator::cli_runner::apply_plan_limit;
+    let rec = recording("2.1.314");
+    let mut events = rec.jsonl(REJECTED_REL);
+    let mut allowed = of_type(&events, "rate_limit_event")[1].clone();
+    allowed["rate_limit_info"]["status"] = Value::from("allowed");
+    let result = events.pop().unwrap();
+    events.push(allowed);
+    assert_eq!(plan_watch(&events).limit(), None, "the same window allowed again");
+
+    // A budget stop during a rejected window stays a budget stop.
+    let watch = plan_watch(&rec.jsonl(REJECTED_REL));
+    let mut budget = result.clone();
+    budget["subtype"] = Value::from(crate::orchestrator::cli_runner::BUDGET_STOP_SUBTYPE);
+    let parsed = parse_cli_result(&budget.to_string(), true, ArtifactKind::Note, "").unwrap();
+    let out = apply_plan_limit(parsed, &watch);
+    assert!(crate::orchestrator::cli_runner::is_budget_stop(out.error.as_deref().unwrap()));
+    assert!(out.cli.plan_limit.is_none());
+
+    // The real API-key recordings never show a plan wall.
+    for r in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/api-retry.jsonl"] {
+            if r.dir.join(rel).exists() {
+                assert_eq!(plan_watch(&r.jsonl(rel)).limit(), None, "[{}]", r.label(rel));
+            }
+        }
+    }
+}
+
 #[test]
 fn rate_limit_event_missing_fields_degrade_without_panicking() {
     let rec = recording("2.1.314");

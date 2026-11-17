@@ -44,4 +44,12 @@ describe("beaconAnchor — exactly one brass beacon", () => {
       beaconAnchor({ run: { status: "paused" } as any, blockedStage: null, runningStage: { id: "s3" } as any, launcherReady: false }),
     ).toEqual({ kind: "stage", stageId: "s3" });
   });
+
+  it("a run waiting for its Claude plan to reset never takes the beacon", () => {
+    const run = { status: "paused" } as any;
+    const blocked = { id: "halted" } as any;
+    expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: true })).toBeNull();
+    // Once the director must resume it (cap reached, budget spent, resume off), it is a decision again.
+    expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: false })).toEqual({ kind: "decision" });
+  });
 });

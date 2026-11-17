@@ -1,17 +1,111 @@
 {
-  "$comment": "Pins TS `needsYou`/`fleetCounts` (runStatus.ts) to Rust `fleet_status` (the Dock badge). Both test suites read this file.",
+  "$comment": "Pins TS `needsYou`/`fleetCounts` (runStatus.ts) to Rust `fleet_status` (the Dock badge). Both test suites read this file. A fleet's optional `planWaiting` marks, per run, a paused run waiting for its Claude plan to reset with an automatic resume scheduled: in flight, not needs-you.",
   "statuses": [
-    { "status": "draft", "needsYou": false },
-    { "status": "running", "needsYou": false },
-    { "status": "paused", "needsYou": true },
-    { "status": "completed", "needsYou": false },
-    { "status": "aborted", "needsYou": false },
-    { "status": "failed", "needsYou": false }
+    {
+      "status": "draft",
+      "needsYou": false
+    },
+    {
+      "status": "running",
+      "needsYou": false
+    },
+    {
+      "status": "paused",
+      "needsYou": true
+    },
+    {
+      "status": "completed",
+      "needsYou": false
+    },
+    {
+      "status": "aborted",
+      "needsYou": false
+    },
+    {
+      "status": "failed",
+      "needsYou": false
+    }
   ],
   "fleets": [
-    { "statuses": [], "needsYou": 0, "inFlight": 0, "badge": null },
-    { "statuses": ["paused", "paused", "running"], "needsYou": 2, "inFlight": 1, "badge": 2 },
-    { "statuses": ["running", "running", "completed"], "needsYou": 0, "inFlight": 2, "badge": null },
-    { "statuses": ["paused", "failed", "aborted", "draft"], "needsYou": 1, "inFlight": 0, "badge": 1 }
+    {
+      "statuses": [],
+      "needsYou": 0,
+      "inFlight": 0,
+      "badge": null
+    },
+    {
+      "statuses": [
+        "paused",
+        "paused",
+        "running"
+      ],
+      "needsYou": 2,
+      "inFlight": 1,
+      "badge": 2
+    },
+    {
+      "statuses": [
+        "running",
+        "running",
+        "completed"
+      ],
+      "needsYou": 0,
+      "inFlight": 2,
+      "badge": null
+    },
+    {
+      "statuses": [
+        "paused",
+        "failed",
+        "aborted",
+        "draft"
+      ],
+      "needsYou": 1,
+      "inFlight": 0,
+      "badge": 1
+    },
+    {
+      "statuses": [
+        "paused",
+        "paused",
+        "running"
+      ],
+      "planWaiting": [
+        true,
+        false,
+        false
+      ],
+      "needsYou": 1,
+      "inFlight": 2,
+      "badge": 1
+    },
+    {
+      "statuses": [
+        "paused"
+      ],
+      "planWaiting": [
+        true
+      ],
+      "needsYou": 0,
+      "inFlight": 1,
+      "badge": null
+    }
+  ],
+  "planWaiting": [
+    {
+      "status": "paused",
+      "planWaiting": true,
+      "needsYou": false
+    },
+    {
+      "status": "paused",
+      "planWaiting": false,
+      "needsYou": true
+    },
+    {
+      "status": "running",
+      "planWaiting": true,
+      "needsYou": false
+    }
   ]
 }

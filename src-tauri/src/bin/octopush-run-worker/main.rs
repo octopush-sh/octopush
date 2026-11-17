@@ -22,6 +22,7 @@ use std::time::Duration;
 use octopush_lib::db::Db;
 use octopush_lib::orchestrator::events::EventSink;
 use octopush_lib::orchestrator::types::RunStatus;
+use octopush_lib::orchestrator::plan_wait;
 use octopush_lib::orchestrator::Orchestrator;
 use parking_lot::Mutex;
 
@@ -111,92 +112,166 @@ async fn main() {
         Arc::new(NullSink),
     ));
 
-    // Heartbeat + control poll: beat the lease (~1s — well inside the 45s
-    // freshness window), and translate the cross-process request flags into
-    // the orchestrator's in-memory ones. Zero changes to the substrates —
-    // they already poll their cancel flag on a 500ms cadence.
-    {
-        let db = Arc::clone(&db);
-        let orch = Arc::clone(&orch);
-        let run_id = args.run_id.clone();
-        let nonce = args.nonce.clone();
-        tokio::spawn(async move {
-            let mut pause_seen = false;
-            loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-                let owned = db.lock().beat_worker_lease(&run_id, &nonce).unwrap_or(false);
-                if !owned {
-                    // Lost the lease (superseded, or repaired from outside):
-                    // stop driving as fast as the cancel check allows.
-                    let _ = orch.stop_current_stage(&run_id);
-                    return;
-                }
-                match db.lock().read_worker_controls(&run_id) {
-                    Ok(Some((status, stop, pause))) => {
-                        if status == "aborted" || stop {
-                            let _ = orch.stop_current_stage(&run_id);
-                            if stop {
-                                let _ = db.lock().set_stop_requested(&run_id, false);
-                            }
-                        }
-                        if pause && !pause_seen {
-                            pause_seen = true;
-                            orch.request_pause(&run_id);
-                            let _ = db.lock().set_pause_requested(&run_id, false);
-                        }
-                    }
-                    Ok(None) => {
-                        // Run vanished (workspace deleted under the worker).
-                        let _ = orch.stop_current_stage(&run_id);
-                        return;
-                    }
-                    Err(_) => {} // transient (busy DB) — next tick
-                }
-            }
-        });
-    }
+    // Drive segments. A segment that parks at a Claude plan limit with an
+    // automatic resume scheduled doesn't end the worker: it waits (holding no
+    // lease) for the window to reset, claims the resume — unless the app's
+    // scheduler or the director got there first — and drives again. So an
+    // overnight crew resumes itself even with Octopush closed (#731).
+    let mut budget_override = args.budget_override;
+    let result = loop {
+        let heartbeat = spawn_heartbeat(Arc::clone(&db), Arc::clone(&orch), args.run_id.clone(), args.nonce.clone());
+        let result = orch.drive_segment(&args.run_id, budget_override).await;
+        heartbeat.abort();
 
-    let result = orch.drive_segment(&args.run_id, args.budget_override).await;
+        // Release the claim (nonce-guarded: a successor's lease is never touched).
+        let _ = db.lock().clear_worker_lease(&args.run_id, &args.nonce);
 
-    // Release the claim (nonce-guarded: a successor's lease is never touched).
-    let _ = db.lock().clear_worker_lease(&args.run_id, &args.nonce);
-
-    // If the app is gone, the bridge can't announce the outcome — post a
-    // native notification so a park or finish is never silent.
-    let app_alive = args
-        .app_pid
-        .map(|p| p > 0 && unsafe { libc::kill(p, 0) } == 0)
-        .unwrap_or(false);
-    if !app_alive {
-        if let Ok(status) = &result {
-            let task = db
+        let plan_resume_at = match &result {
+            Ok(RunStatus::Paused) => db
                 .lock()
                 .get_run(&args.run_id)
                 .ok()
                 .flatten()
-                .map(|r| r.task)
-                .unwrap_or_default();
-            let headline = match status {
-                RunStatus::Completed => Some((
-                    "Crew finished",
-                    format!("{} — open Octopush for the story.", trim_task(&task)),
-                )),
-                RunStatus::Paused => Some((
-                    "The crew needs you",
-                    format!("{} — open Octopush to decide.", trim_task(&task)),
-                )),
-                // Aborted is the director's own hand — never news.
-                _ => None,
-            };
-            if let Some((title, body)) = headline {
-                notify_native(title, &body);
-            }
+                .and_then(|r| r.plan_wait)
+                .and_then(|w| w.resume_at),
+            _ => None,
+        };
+        let Some(resume_at) = plan_resume_at else {
+            announce(&db, &args, &result);
+            break result;
+        };
+        if !app_alive(args.app_pid) {
+            let now = chrono::Utc::now().timestamp();
+            let task = run_task(&db, &args.run_id);
+            notify_native(
+                "Paused by your Claude plan",
+                &format!("{} — resumes at {}.", trim_task(&task), plan_wait::clock_label(resume_at, now)),
+            );
         }
-    }
+        match wait_for_plan_reset(&db, &orch, &args.run_id).await {
+            Some(over) => {
+                // Drive the next segment under our own lease again.
+                if !db.lock().reserve_worker_lease(&args.run_id, &args.nonce).unwrap_or(false)
+                    || !db
+                        .lock()
+                        .confirm_worker_lease(&args.run_id, &args.nonce, std::process::id() as i64)
+                        .unwrap_or(false)
+                {
+                    // Someone else owns it now; the resume is already applied
+                    // and that driver will run it.
+                    break Ok(RunStatus::Paused);
+                }
+                if !app_alive(args.app_pid) {
+                    let task = run_task(&db, &args.run_id);
+                    notify_native("Crew resumed", &format!("{} — your Claude plan window reset.", trim_task(&task)));
+                }
+                budget_override = over;
+            }
+            // Resumed elsewhere, cancelled, aborted or resolved: nothing left here.
+            None => break Ok(RunStatus::Paused),
+        }
+    };
 
     if let Err(e) = result {
         eprintln!("octopush-run-worker: drive failed: {e}");
         std::process::exit(1);
+    }
+}
+
+/// How often a waiting worker re-reads the clock and the run. Wall-clock
+/// polling, not one long sleep: a Mac asleep through the reset must still
+/// resume soon after it wakes.
+const PLAN_WAIT_POLL: Duration = Duration::from_secs(15);
+
+/// Wait until the run's automatic plan resume is due, then claim and apply
+/// it. `Some(budget_override)` = drive the next segment; `None` = the wait
+/// ended without this worker resuming (the app or the director acted, the
+/// resume was turned off, or the run was aborted).
+async fn wait_for_plan_reset(db: &Arc<Mutex<Db>>, orch: &Arc<Orchestrator>, run_id: &str) -> Option<bool> {
+    loop {
+        let run = db.lock().get_run(run_id).ok().flatten()?;
+        if run.status != "paused" {
+            return None;
+        }
+        let resume_at = run.plan_wait.and_then(|w| w.resume_at)?;
+        if chrono::Utc::now().timestamp() >= resume_at {
+            return orch.claim_plan_resume(run_id).ok().flatten();
+        }
+        tokio::time::sleep(PLAN_WAIT_POLL).await;
+    }
+}
+
+/// Heartbeat + control poll for one segment: beat the lease (~1s — well
+/// inside the 45s freshness window), and translate the cross-process request
+/// flags into the orchestrator's in-memory ones. Zero changes to the
+/// substrates — they already poll their cancel flag on a 500ms cadence.
+fn spawn_heartbeat(
+    db: Arc<Mutex<Db>>,
+    orch: Arc<Orchestrator>,
+    run_id: String,
+    nonce: String,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut pause_seen = false;
+        loop {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let owned = db.lock().beat_worker_lease(&run_id, &nonce).unwrap_or(false);
+            if !owned {
+                // Lost the lease (superseded, or repaired from outside):
+                // stop driving as fast as the cancel check allows.
+                let _ = orch.stop_current_stage(&run_id);
+                return;
+            }
+            match db.lock().read_worker_controls(&run_id) {
+                Ok(Some((status, stop, pause))) => {
+                    if status == "aborted" || stop {
+                        let _ = orch.stop_current_stage(&run_id);
+                        if stop {
+                            let _ = db.lock().set_stop_requested(&run_id, false);
+                        }
+                    }
+                    if pause && !pause_seen {
+                        pause_seen = true;
+                        orch.request_pause(&run_id);
+                        let _ = db.lock().set_pause_requested(&run_id, false);
+                    }
+                }
+                Ok(None) => {
+                    // Run vanished (workspace deleted under the worker).
+                    let _ = orch.stop_current_stage(&run_id);
+                    return;
+                }
+                Err(_) => {} // transient (busy DB) — next tick
+            }
+        }
+    })
+}
+
+fn app_alive(app_pid: Option<i32>) -> bool {
+    app_pid.map(|p| p > 0 && unsafe { libc::kill(p, 0) } == 0).unwrap_or(false)
+}
+
+fn run_task(db: &Arc<Mutex<Db>>, run_id: &str) -> String {
+    db.lock().get_run(run_id).ok().flatten().map(|r| r.task).unwrap_or_default()
+}
+
+/// If the app is gone, the bridge can't announce the outcome — post a native
+/// notification so a park or finish is never silent.
+fn announce(db: &Arc<Mutex<Db>>, args: &Args, result: &Result<RunStatus, octopush_lib::error::AppError>) {
+    if app_alive(args.app_pid) {
+        return;
+    }
+    if let Ok(status) = result {
+        let task = run_task(db, &args.run_id);
+        let headline = match status {
+            RunStatus::Completed => Some(("Crew finished", format!("{} — open Octopush for the story.", trim_task(&task)))),
+            RunStatus::Paused => Some(("The crew needs you", format!("{} — open Octopush to decide.", trim_task(&task)))),
+            // Aborted is the director's own hand — never news.
+            _ => None,
+        };
+        if let Some((title, body)) = headline {
+            notify_native(title, &body);
+        }
     }
 }
 

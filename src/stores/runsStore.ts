@@ -135,6 +135,8 @@ interface RunsState {
    *  re-running stage. `source` names the answering surface for the journal. */
   answerBlocker: (runId: string, stageId: string, answers: string[], source?: AnswerSource) => Promise<void>;
   abort: (runId: string) => Promise<void>;
+  /** Turn off a plan-parked run's automatic resume (#731). */
+  cancelPlanResume: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
   /** Ask the run to pause at its next stage boundary (parks the next stage). */
@@ -453,6 +455,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   abort: async (runId) => {
     await ipc.abortRun(runId);
+    await get().refreshDetail(runId);
+  },
+
+  cancelPlanResume: async (runId) => {
+    await ipc.cancelPlanResume(runId);
     await get().refreshDetail(runId);
   },
 
