@@ -42,6 +42,9 @@
 
   --color-octo-brass:     #d4a574;
   --color-octo-brass-hi:  #e8c39a;
+  /* Class alias (`border-octo-brass-dim`, `decoration-octo-brass-dim`) for the
+     per-theme `--brass-dim` alpha below; themeStore repaints the source. */
+  --color-octo-brass-dim: var(--brass-dim);
 
   --color-octo-ivory:     #f4ecdb;
   --color-octo-sage:      #95897a;

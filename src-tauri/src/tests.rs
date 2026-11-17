@@ -18282,3 +18282,469 @@ mod cli_command_idle_tests {
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
     }
 }
+
+#[cfg(test)]
+mod collision_tests {
+    use crate::collisions::{
+        CollisionCache, ScanInput, Severity, MAX_CONFIRMED_PAIRS, MAX_PAIR_FILES, MAX_UNTRACKED_DIR_FILES,
+        REPORT_TTL,
+    };
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use tempfile::{tempdir, TempDir};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    const LIMITS: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+
+    /// A repo on `main` with a few files, plus `names` linked worktrees.
+    struct Fixture {
+        _dir: TempDir,
+        root: PathBuf,
+        wts: Vec<(String, PathBuf)>,
+    }
+
+    impl Fixture {
+        fn new(names: &[&str]) -> Self {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.email", "t@t.dev"]);
+            git(&root, &["config", "user.name", "T"]);
+            std::fs::write(root.join("src/limits.ts"), LIMITS).unwrap();
+            std::fs::write(root.join("src/plan.ts"), "plan\n").unwrap();
+            std::fs::write(root.join("README.md"), "readme\n").unwrap();
+            std::fs::write(root.join("package-lock.json"), "{\"v\":1}\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-qm", "base"]);
+            let mut wts = Vec::new();
+            for n in names {
+                let p = dir.path().join(format!("wt-{n}"));
+                git(&root, &["worktree", "add", "-q", "-b", n, p.to_str().unwrap(), "main"]);
+                git(&p, &["config", "user.email", "t@t.dev"]);
+                git(&p, &["config", "user.name", "T"]);
+                wts.push((n.to_string(), p));
+            }
+            Fixture { _dir: dir, root, wts }
+        }
+        fn wt(&self, name: &str) -> &Path {
+            &self.wts.iter().find(|(n, _)| n == name).unwrap().1
+        }
+        fn write_commit(&self, name: &str, file: &str, body: &str) {
+            let p = self.wt(name);
+            std::fs::write(p.join(file), body).unwrap();
+            git(p, &["add", "-A"]);
+            git(p, &["commit", "-qm", &format!("{name} edits {file}")]);
+        }
+        fn inputs(&self) -> Vec<ScanInput> {
+            self.wts
+                .iter()
+                .map(|(n, p)| ScanInput {
+                    id: format!("ws-{n}"),
+                    name: n.clone(),
+                    path: p.clone(),
+                    base: Some("main".into()),
+                })
+                .collect()
+        }
+        /// Everything a scan must leave untouched: the bytes and mtime of
+        /// every index (the main one and each `.git/worktrees/*/index`), each
+        /// worktree's status, every ref, and the object count. Hashed before
+        /// any git command runs, and the git commands use
+        /// `--no-optional-locks` so the snapshot itself never refreshes an
+        /// index.
+        fn snapshot(&self) -> String {
+            let gitdir = self.root.join(".git");
+            let mut indexes = vec![gitdir.join("index")];
+            let mut slots: Vec<PathBuf> = std::fs::read_dir(gitdir.join("worktrees"))
+                .unwrap()
+                .map(|e| e.unwrap().path().join("index"))
+                .collect();
+            slots.sort();
+            indexes.extend(slots);
+            let mut s = String::new();
+            for idx in &indexes {
+                let bytes = std::fs::read(idx).unwrap();
+                let mtime = std::fs::metadata(idx).unwrap().modified().unwrap();
+                let hash: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+                s += &format!("{} {hash} {mtime:?}\n", idx.display());
+            }
+            let quiet = |dir: &Path, args: &[&str]| {
+                let mut all = vec!["--no-optional-locks"];
+                all.extend_from_slice(args);
+                git(dir, &all)
+            };
+            s += &quiet(&self.root, &["for-each-ref"]);
+            s += &quiet(&self.root, &["count-objects", "-v"]);
+            s += &quiet(&self.root, &["status", "--porcelain"]);
+            for (_, p) in &self.wts {
+                s += &quiet(p, &["status", "--porcelain"]);
+                s += &quiet(p, &["rev-parse", "HEAD"]);
+            }
+            s
+        }
+    }
+
+    fn replace_line(body: &str, from: &str, to: &str) -> String {
+        body.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn no_overlap_reports_nothing() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        f.write_commit("gamma", "README.md", "readme c\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.scanned, 3);
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn same_file_that_merges_cleanly_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!((c.a.as_str(), c.b.as_str()), ("ws-alpha", "ws-beta"));
+        assert_eq!(c.files, vec!["src/limits.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.confirmed);
+        assert!(c.conflicting_files.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_conflict_is_reported_as_such() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        f.write_commit("gamma", "src/plan.ts", "gamma\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Conflict);
+        assert_eq!(c.conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_lockfile_only_overlap_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        std::fs::write(f.wt("beta").join("package-lock.json"), "{\"v\":1,\"b\":1}\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Lockfile);
+        assert!(crate::collisions::is_lockfile("web/pnpm-lock.yaml"));
+        assert!(!crate::collisions::is_lockfile("src/lock.ts"));
+    }
+
+    #[test]
+    fn uncommitted_changes_count_but_are_not_merge_confirmed() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Alpha: staged only. Beta: an untracked new file plus a worktree edit.
+        std::fs::write(f.wt("alpha").join("src/plan.ts"), "alpha plan\n").unwrap();
+        git(f.wt("alpha"), &["add", "src/plan.ts"]);
+        std::fs::write(f.wt("beta").join("src/plan.ts"), "beta plan\n").unwrap();
+        std::fs::write(f.wt("beta").join("notes.md"), "new\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files, vec!["src/plan.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(!c.confirmed);
+    }
+
+    #[test]
+    fn a_rename_counts_its_old_path() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["mv", "src/plan.ts", "src/strategy.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "rename"]);
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        assert_eq!(report.collisions[0].files, vec!["src/plan.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_delete_against_an_edit_is_a_conflict() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["rm", "-q", "src/limits.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "drop limits"]);
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Conflict);
+        assert_eq!(report.collisions[0].conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn the_same_file_in_three_workspaces_gives_every_pair() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        std::fs::write(f.wt("gamma").join("src/limits.ts"), replace_line(LIMITS, "ten", "TEN")).unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        let pairs: Vec<(&str, &str)> =
+            report.collisions.iter().map(|c| (c.a.as_str(), c.b.as_str())).collect();
+        assert_eq!(pairs, vec![("ws-alpha", "ws-beta"), ("ws-alpha", "ws-gamma"), ("ws-beta", "ws-gamma")]);
+        // Only the committed pair gets a merge-tree check.
+        let confirmed: Vec<bool> = report.collisions.iter().map(|c| c.confirmed).collect();
+        assert_eq!(confirmed, vec![true, false, false]);
+    }
+
+    #[test]
+    fn the_base_branch_moving_on_does_not_count() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        f.write_commit("beta", "README.md", "beta\n");
+        // main moves on and touches both files; neither workspace changed them.
+        std::fs::write(f.root.join("src/plan.ts"), "main\n").unwrap();
+        std::fs::write(f.root.join("README.md"), "main\n").unwrap();
+        git(&f.root, &["commit", "-qam", "main moves"]);
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_single_workspace_is_skipped() {
+        let f = Fixture::new(&["alpha"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert!(report.collisions.is_empty());
+        assert_eq!(cache.stats.committed_diffs, 0);
+    }
+
+    #[test]
+    fn a_scan_modifies_no_worktree_index_ref_or_object() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        // Gamma merges cleanly with alpha: libgit2 writes the merged blob
+        // during an automerge, which must land in memory, not on disk.
+        f.write_commit("gamma", "src/limits.ts", &replace_line(LIMITS, "ten", "gamma"));
+        std::fs::write(f.wt("gamma").join("scratch.txt"), "wip\n").unwrap();
+        let before = f.snapshot();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 3);
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn scans_are_throttled_and_cached() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        let first = cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(first.collisions.len(), 1);
+        assert_eq!((cache.stats.scans, cache.stats.committed_diffs, cache.stats.merges), (1, 2, 1));
+
+        // Within the TTL the report is reused, even though a file changed.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        let again = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(again, first);
+        assert_eq!(cache.stats.scans, 1);
+
+        // Past the TTL it rescans; HEADs are unchanged, so neither committed
+        // diff nor the merge confirmation runs again.
+        let later = cache.scan_throttled("p", &inputs, t0 + REPORT_TTL + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!((cache.stats.committed_diffs, cache.stats.merges), (2, 1));
+        assert_eq!(later.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A changed workspace list invalidates the report at once.
+        let fewer = cache.scan_throttled("p", &inputs[..1], t0 + REPORT_TTL + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert!(fewer.collisions.is_empty());
+    }
+
+    #[test]
+    fn force_and_a_new_commit_bypass_the_report_ttl() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+
+        // An uncommitted edit within the TTL: reused unless forced.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+        let forced = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, true);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!(forced.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A commit moves HEAD: the cached report is stale at once, no force needed.
+        f.write_commit("alpha", "src/plan.ts", "alpha plan\n");
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let after = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert_eq!(after.collisions[0].severity, Severity::Conflict);
+    }
+
+    #[test]
+    fn a_lockfile_conflict_alone_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert!(c.confirmed, "both sides committed the lockfile, so a merge check ran");
+        assert_eq!(c.severity, Severity::Lockfile);
+        assert!(c.conflicting_files.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn a_lockfile_conflict_plus_a_clean_overlap_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.conflicting_files.is_empty(), "the lockfile is not counted: {c:?}");
+        assert_eq!(c.files, vec!["package-lock.json".to_string(), "src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_large_untracked_dir_collapses_and_pair_files_are_capped() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // A big untracked dir on each side collapses to one `gen/` entry.
+        for wt in ["alpha", "beta"] {
+            let dir = f.wt(wt).join("gen");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..=MAX_UNTRACKED_DIR_FILES {
+                std::fs::write(dir.join(format!("f{i}.txt")), wt).unwrap();
+            }
+        }
+        // A small untracked dir keeps its files.
+        let small = f.wt("alpha").join("small");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("one.txt"), "1").unwrap();
+        let repo = git2::Repository::open(f.wt("alpha")).unwrap();
+        let set = crate::collisions::uncommitted_paths(&repo);
+        assert!(set.contains("gen/"), "{set:?}");
+        assert!(set.contains("small/one.txt"), "{set:?}");
+        assert!(!set.iter().any(|p| p.starts_with("gen/f")), "{set:?}");
+
+        // More shared files than the IPC cap: the list stops, the rest is counted.
+        let total = MAX_PAIR_FILES + 7;
+        for wt in ["alpha", "beta"] {
+            let src = f.wt(wt).join("src");
+            for i in 0..total {
+                std::fs::write(src.join(format!("m{i:03}.ts")), wt).unwrap();
+            }
+        }
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files.len(), MAX_PAIR_FILES);
+        // `gen/` + every src/mNNN.ts
+        assert_eq!(c.files.len() + c.truncated, total + 1);
+    }
+
+    #[test]
+    fn past_the_pair_cap_the_scan_is_marked_capped() {
+        // 9 workspaces all committing the same file = 36 pairs > the 32 cap.
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"];
+        assert!(names.len() * (names.len() - 1) / 2 > MAX_CONFIRMED_PAIRS);
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+        }
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 36);
+        assert!(report.capped);
+        assert_eq!(report.collisions.iter().filter(|c| c.confirmed).count(), MAX_CONFIRMED_PAIRS);
+        assert_eq!(cache.stats.merges, MAX_CONFIRMED_PAIRS);
+    }
+
+    /// Point `refs/remotes/origin/main` at `rev` in the shared repo.
+    fn set_origin_main(f: &Fixture, rev: &str) {
+        let oid = git(&f.root, &["rev-parse", rev]);
+        git(&f.root, &["update-ref", "refs/remotes/origin/main", oid.trim()]);
+    }
+
+    #[test]
+    fn a_newer_origin_base_is_used_over_a_stale_local_one() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main moves on (touching plan.ts); local main stays behind.
+        git(&f.root, &["switch", "-q", "-c", "upstream"]);
+        std::fs::write(f.root.join("src/plan.ts"), "upstream\n").unwrap();
+        git(&f.root, &["commit", "-qam", "upstream moves"]);
+        set_origin_main(&f, "HEAD");
+        git(&f.root, &["switch", "-q", "main"]);
+        // Alpha starts from origin/main; beta from the stale local main.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "origin/main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "upstream's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn a_newer_local_base_is_used_over_a_stale_origin() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main stays at the base; local main moves on (touching plan.ts).
+        set_origin_main(&f, "main");
+        std::fs::write(f.root.join("src/plan.ts"), "local\n").unwrap();
+        git(&f.root, &["commit", "-qam", "local main moves"]);
+        // Alpha starts from the newer local main; beta from the old base.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "local main's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn eight_live_workspaces_stay_cheap() {
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"];
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            // Every workspace edits its own line of the shared file and a file of its own.
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+            f.write_commit(n, &format!("{n}.txt"), "own\n");
+        }
+        let mut cache = CollisionCache::default();
+        let started = Instant::now();
+        let report = cache.scan(&f.inputs());
+        let cold = started.elapsed();
+        assert_eq!(report.collisions.len(), 28);
+        assert!(!report.capped);
+        let started = Instant::now();
+        cache.scan(&f.inputs());
+        let warm = started.elapsed();
+        assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
+        assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
+        assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
