@@ -83,12 +83,7 @@ pub async fn create_session(
         engine.scan_and_record(sid, seq, bytes);
     });
 
-    // Merge guard env into PTY env (isolated HISTFILE, project type, git branch).
-    let mut env = HashMap::new();
-    guard.apply_env(&mut env);
-
-    // Inject the selected model so CLI agents can read it.
-    env.insert("OCTOPUSH_MODEL".into(), session.agent.model.clone());
+    let env = run_terminal_env(&guard, &session.agent.model);
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -113,6 +108,18 @@ pub async fn create_session(
         .get_session(&id)?
         .ok_or_else(|| AppError::SessionNotFound(id.clone()))?;
     Ok(refreshed)
+}
+
+/// A Run terminal's PTY environment: the context guard's variables (isolated
+/// HISTFILE, project type, git branch) and the selected model, so CLI agents
+/// can read it. Nothing from the crew stage env — a Run terminal is the
+/// user's own session, so Settings › Privacy › "Quiet Claude Code in crews
+/// and Routines" (#703) never reaches it.
+pub(crate) fn run_terminal_env(guard: &ContextGuard, model: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    guard.apply_env(&mut env);
+    env.insert("OCTOPUSH_MODEL".into(), model.to_string());
+    env
 }
 
 #[tauri::command]

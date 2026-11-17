@@ -1306,6 +1306,27 @@ impl CliDialect {
         }
     }
 
+    /// Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703).
+    /// With it on, a Claude Code stage gets
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Claude Code's env-var
+    /// reference: "Set to any non-empty value, such as `1`, to disable
+    /// nonessential network traffic: auto-updates, telemetry, error
+    /// reporting, … release notes, … and availability checks such as the fast
+    /// mode check. … Also disables feature-flag fetching, which makes Remote
+    /// Control and the other features that need feature-flag fetching
+    /// unavailable." **Off ⇒ nothing is set or removed**: the docs say even
+    /// `0` still disables the traffic, so an off toggle never writes a value,
+    /// and a user's own export is left as they set it. Like [`Self::stage_env`]
+    /// it takes no resume flag — fresh and `--resume` runs, in-process or in
+    /// the detached worker, get the same. Codex has no equivalent; Run-mode
+    /// terminals and Talk never get it.
+    pub fn stage_quiet_env(&self, quiet: bool) -> Vec<(&'static str, String)> {
+        match self {
+            CliDialect::Claude if quiet => vec![(QUIET_TRAFFIC_ENV, "1".to_string())],
+            _ => Vec::new(),
+        }
+    }
+
     /// True when the stage's reasoning effort reaches this CLI. Claude Code
     /// takes `--effort <level>` (low/medium/high/xhigh/max, the same tokens as
     /// [`crate::providers::Effort`]); Codex takes the one-off config override
@@ -1840,6 +1861,38 @@ pub(crate) fn command_idle_window(bash_max_timeout_ms: Option<&str>) -> std::tim
         + std::time::Duration::from_secs(COMMAND_RESULT_SLACK_SECS)
 }
 
+/// The variable "Quiet Claude Code in crews and Routines" sets (#703). Shared
+/// with the Routines runner, which exports it to a Routine's own commands.
+pub const QUIET_TRAFFIC_ENV: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+/// The stage's own environment, applied to its CLI process after the
+/// login-shell and sandbox variables: the dialect's pins
+/// ([`CliDialect::stage_env`]), the inherited effort override dropped
+/// ([`CliDialect::stage_env_remove`]), the subagent effort
+/// ([`CliDialect::stage_effort_env`]) and the quiet-traffic opt-in
+/// ([`CliDialect::stage_quiet_env`]). The ONE place a stage's env is set —
+/// fresh and `--resume` runs, in-process and detached, all spawn through it.
+pub(crate) fn apply_stage_env(
+    command: &mut tokio::process::Command,
+    dialect: CliDialect,
+    effort: Option<crate::providers::Effort>,
+    quiet: bool,
+) {
+    for (k, v) in dialect.stage_env() {
+        command.env(k, v);
+    }
+    // After the login-shell env, which may carry the user's own export.
+    for k in dialect.stage_env_remove(effort) {
+        command.env_remove(k);
+    }
+    for (k, v) in dialect.stage_effort_env(effort) {
+        command.env(k, v);
+    }
+    for (k, v) in dialect.stage_quiet_env(quiet) {
+        command.env(k, v);
+    }
+}
+
 /// A variable as the stage's CLI process sees it: the login-shell env, which
 /// the spawn sets over the app's own, else the app's.
 fn stage_env_value(key: &str) -> Option<String> {
@@ -2330,16 +2383,7 @@ impl CliRunner {
         for (k, v) in sandbox_env {
             command.env(k, v);
         }
-        for (k, v) in dialect.stage_env() {
-            command.env(k, v);
-        }
-        // After the login-shell env, which may carry the user's own export.
-        for k in dialect.stage_env_remove(effort) {
-            command.env_remove(k);
-        }
-        for (k, v) in dialect.stage_effort_env(effort) {
-            command.env(k, v);
-        }
+        apply_stage_env(&mut command, dialect, effort, ctx.quiet_claude_code);
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())

@@ -556,6 +556,10 @@ export interface AppSettings {
   /** Run-mode attention from Claude Code's lifecycle hooks instead of the
    *  terminal bell (#287). Unset/null → **on**; only `false` turns it off. */
   claudeHooksEnabled?: boolean | null;
+  /** Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703):
+   *  crew stages and Routines start Claude Code with
+   *  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Unset → **off**. */
+  quietClaudeCode?: boolean;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */

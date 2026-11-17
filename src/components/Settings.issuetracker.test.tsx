@@ -230,7 +230,9 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     expect(mobile.querySelector(".octo-midtrunc-tail")?.textContent).toBe("prise-mobile");
     expect(billing.querySelector(".octo-midtrunc-tail")?.textContent).toBe("rise-billing");
     // The label is the elastic column (a definite width), not a fixed 160px one.
-    expect(mobile).toHaveClass("min-w-0", "flex-1");
+    // …and a FLEX box: as a block, the inline-flex MidTruncate inside it was
+    // sized from its own text and ran under the key input, hard-cut (#757).
+    expect(mobile).toHaveClass("flex", "min-w-0", "flex-1");
     expect(mobile.textContent).toBe("octopush-enterprise-mobile");
   });
 
