@@ -487,6 +487,61 @@ fn stream_json_resume_with_its_deferred_tool_gone_names_the_tool() {
     assert!(is_deferred_tool_unavailable(exit_0.error.as_deref().unwrap_or_default()), "[{fx}]");
 }
 
+const SETTINGS_REFUSED_VERSION: &str = "2.1.326";
+const SETTINGS_REFUSED_REL: &str = "stream-json/settings-refused.jsonl";
+const SETTINGS_REFUSED_STDERR_REL: &str = "stream-json/settings-refused.stderr.txt";
+
+#[test]
+fn stream_json_refused_settings_name_the_setting() {
+    use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved, is_settings_refused, SETTINGS_REFUSED};
+    // Claude Code 2.1.323: `--settings` that turn the sandbox on and fail
+    // validation stop `claude -p` at start-up, naming the invalid setting.
+    let rec = synthesized(SETTINGS_REFUSED_VERSION);
+    let fx = rec.label(SETTINGS_REFUSED_REL);
+    let events = rec.jsonl(SETTINGS_REFUSED_REL);
+    let r = result_event(&fx, &events).clone();
+    for f in ["subtype", "is_error", "errors.0", "session_id"] {
+        require(&fx, &r, f);
+    }
+    assert_eq!(require_str(&fx, &r, "subtype"), "error_during_execution", "[{fx}]");
+    let stderr = rec.text(SETTINGS_REFUSED_STDERR_REL);
+    let line = serde_json::to_string(&r).unwrap();
+    let named = "(permissions.blockWritesOutsideWorkingDirectories: Expected boolean, but received string)";
+    for err_text in [stderr.as_str(), ""] {
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, err_text)
+            .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+        assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: ")), "[{fx}] {err}");
+        assert!(err.lines().next().unwrap().contains(named), "[{fx}] the first line names the setting: {err}");
+        assert!(!err.contains("error_during_execution"), "[{fx}] not the generic stop: {err}");
+        assert!(is_settings_refused(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+        assert_eq!(outcome.session_id, None, "[{fx}] the session never ran: nothing to resume");
+        assert!(outcome.artifact.text.is_empty(), "[{fx}]");
+    }
+    // stderr alone (no `errors` field) still names it.
+    let mut bare = r.clone();
+    bare.as_object_mut().unwrap().remove("errors");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, &stderr).unwrap();
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: sandbox required but unavailable: ")), "[{fx}] {err}");
+    assert!(err.lines().next().unwrap().contains(named), "[{fx}] {err}");
+}
+
+#[test]
+fn recorded_failures_are_never_read_as_refused_settings() {
+    use crate::orchestrator::cli_runner::is_settings_refused;
+    for rec in recordings() {
+        let rel = "stream-json/error-unknown-model.jsonl";
+        let fx = rec.label(rel);
+        let events = rec.jsonl(rel);
+        let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(!is_settings_refused(err), "[{fx}] {err}");
+    }
+}
+
 #[test]
 fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
     use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};

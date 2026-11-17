@@ -190,6 +190,8 @@ pub const TESTED_CLAUDE_FLOOR: &str = "2.1.314";
 pub const CLAUDE_SECURITY_FIXES: &[(&str, &str)] = &[
     ("2.1.319", "fixes a sandbox escape when creating a worktree"),
     ("2.1.321", "fixes a read-only Bash command running outside the sandbox without a prompt"),
+    ("2.1.323", "fixes the Bash sandbox switching off mid-session"),
+    ("2.1.325", "fixes the Bash sandbox not fully protecting a worktree's settings, hooks and shared git folder"),
 ];
 
 /// Models a Claude Code CLI stage can only launch on a new enough CLI:
@@ -924,9 +926,9 @@ mod tests {
         let old = ClaudeCliVersion::new(Some("2.1.307".into()), "2.1.314");
         assert!(old.below_floor);
         let note = old.update_notice().expect("old CLI warns");
-        // The floor still trips the 2.1.321 security fix: recommend that.
+        // The floor still trips the 2.1.325 security fix: recommend that.
         assert!(note.contains("2.1.307") && note.contains("older than 2.1.314"), "{note}");
-        assert!(note.contains("2.1.321 or newer recommended"), "{note}");
+        assert!(note.contains("2.1.325 or newer recommended"), "{note}");
 
         let current = ClaudeCliVersion::new(Some("2.1.316".into()), "2.1.314");
         assert!(!current.below_floor);
@@ -1239,24 +1241,36 @@ mod tests {
         assert!(!below.below_floor, "independent of the tested floor");
         assert_eq!(
             below.security_notice().as_deref(),
-            Some("Update Claude Code: 2.1.321 fixes a read-only Bash command running outside the sandbox without a prompt")
+            Some("Update Claude Code: 2.1.325 fixes the Bash sandbox not fully protecting a worktree's settings, hooks and shared git folder")
         );
-        assert_eq!(below.security_fix.as_ref().map(|f| f.version.as_str()), Some("2.1.321"));
-        // 2.1.319 has the worktree fix but not the Bash one.
-        assert_eq!(at(Some("2.1.319")).security_fix.map(|f| f.version).as_deref(), Some("2.1.321"));
-        assert_eq!(at(Some("2.1.321")).security_notice(), None);
+        assert_eq!(below.security_fix.as_ref().map(|f| f.version.as_str()), Some("2.1.325"));
+        // Each older fix release still lacks the newest fix: the notice names 2.1.325.
+        for v in ["2.1.319", "2.1.321", "2.1.322", "2.1.323", "2.1.324"] {
+            assert_eq!(at(Some(v)).security_fix.map(|f| f.version).as_deref(), Some("2.1.325"), "{v}");
+        }
+        assert_eq!(at(Some("2.1.325")).security_notice(), None);
+        assert_eq!(at(Some("2.1.326")).security_notice(), None);
         assert_eq!(at(Some("2.2.0")).security_notice(), None);
         assert_eq!(at(None).security_notice(), None, "an unknown version never warns");
         // Below the floor too: both notes exist; surfaces pick which to show.
         assert!(at(Some("2.1.307")).below_floor && at(Some("2.1.307")).security_notice().is_some());
+        assert_eq!(at(Some("2.1.307")).recommended, "2.1.325");
 
         // A stage journals each notice once.
         let notes = below.stage_notices();
         assert_eq!(notes.len(), 1);
-        assert!(notes[0].contains("2.1.321 fixes a read-only Bash command") && notes[0].contains("installed: 2.1.316"), "{notes:?}");
+        assert!(notes[0].contains("2.1.325 fixes the Bash sandbox not fully protecting") && notes[0].contains("installed: 2.1.316"), "{notes:?}");
         assert_eq!(at(Some("2.1.307")).stage_notices().len(), 2);
-        assert!(at(Some("2.1.321")).stage_notices().is_empty());
+        assert!(at(Some("2.1.325")).stage_notices().is_empty());
         assert!(at(None).stage_notices().is_empty());
+    }
+
+    #[test]
+    fn security_fix_rows_are_in_version_order() {
+        let keys: Vec<_> = CLAUDE_SECURITY_FIXES.iter().map(|(v, _)| version_key(v)).collect();
+        assert!(keys.windows(2).all(|w| w[0] < w[1]), "oldest first, no duplicates: {CLAUDE_SECURITY_FIXES:?}");
+        let versions: Vec<_> = CLAUDE_SECURITY_FIXES.iter().map(|(v, _)| *v).collect();
+        assert_eq!(versions, ["2.1.319", "2.1.321", "2.1.323", "2.1.325"]);
     }
 
     #[test]

@@ -9473,6 +9473,41 @@ mod cli_runner_tests {
     }"#;
 
     #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::refused_setting;
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&errors), stderr).as_deref(), Some("Settings failed validation (a.b: bad)"));
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded"), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), ""), None, "not an array");
+        assert_eq!(refused_setting(None, ""), None);
+        assert!(refused_setting(None, &format!("failed validation {}", "x".repeat(900))).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
         use crate::orchestrator::cli_runner::is_budget_stop;
         let outcome = parse_cli_result(BUDGET_STOPPED, true, ArtifactKind::Diff, "").unwrap();

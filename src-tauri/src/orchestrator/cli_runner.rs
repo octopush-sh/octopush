@@ -61,6 +61,10 @@ struct CliResult {
     /// The tool call a PreToolUse hook deferred (`permissionDecision: "defer"`).
     #[serde(default)]
     deferred_tool_use: Option<CliDeferredToolUse>,
+    /// Start-up errors (Claude Code ≥ 2.1.323), e.g. the settings that failed
+    /// validation ([`refused_setting`]). Kept untyped: only strings are read.
+    #[serde(default)]
+    errors: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -460,6 +464,48 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
+/// The start of the error of a Claude stage that Claude Code refused to start
+/// because the stage's settings failed validation. Since 2.1.323 `claude -p`
+/// "stops at start-up and names the invalid setting" when `--settings` that
+/// turn the sandbox on fail validation, instead of running Bash unsandboxed.
+pub const SETTINGS_REFUSED: &str = "Claude Code refused the stage's settings";
+
+/// True when a stage error is a refused-settings start-up stop (see
+/// [`parse_cli_result`]): the drive must not escalate it — a stronger model
+/// starts with the same settings.
+pub fn is_settings_refused(error: &str) -> bool {
+    error.starts_with(SETTINGS_REFUSED)
+}
+
+/// The line naming the setting Claude Code refused, from the result's
+/// `errors` (first) or stderr: the first line that says the settings
+/// "failed validation", without a leading `Error: `, at most 400 chars.
+/// `None` for any other failure. Pure.
+pub(crate) fn refused_setting(errors: Option<&serde_json::Value>, stderr: &str) -> Option<String> {
+    let from_errors = errors
+        .and_then(|e| e.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.as_str())
+        .flat_map(str::lines);
+    from_errors
+        .chain(stderr.lines())
+        .map(str::trim)
+        .find(|l| l.to_ascii_lowercase().contains("failed validation"))
+        .map(|l| {
+            let l = l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l);
+            l.chars().take(400).collect()
+        })
+}
+
+/// The error for a refused-settings stop ([`SETTINGS_REFUSED`]), with the
+/// stderr tail when there is one.
+fn settings_refused_error(line: &str, stderr: &str) -> String {
+    let error = format!("{SETTINGS_REFUSED}: {line}");
+    let tail = stderr_tail(stderr, 10);
+    if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") }
+}
+
 /// The marker line in the error of a Codex stage that ended (director stop,
 /// stall, 60-minute cap, `turn.failed`, a crash) with its last turn missing
 /// its `turn.completed` / `token_count` event: Codex reports usage only there,
@@ -698,6 +744,36 @@ pub fn parse_cli_result(
             blocked: None,
             blocked_transcript: None,
         });
+    }
+
+    // Claude Code refused to start because the stage's settings failed
+    // validation (≥ 2.1.323): name the refused setting, not "stopped early
+    // (error_during_execution)". The session never ran, so there is nothing
+    // to resume.
+    if parsed.is_error || !exit_success {
+        if let Some(line) = refused_setting(parsed.errors.as_ref(), stderr_text) {
+            return Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: String::new(),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                cache_read_tokens: parsed.usage.cache_read_input_tokens,
+                cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+                cost_usd: parsed.total_cost_usd,
+                status: StageStatus::Failed,
+                tool_calls: vec![],
+                error: Some(settings_refused_error(&line, stderr_text)),
+                verdict: None,
+                session_id: None,
+                blocked: None,
+                blocked_transcript: None,
+            });
+        }
     }
 
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
@@ -2694,6 +2770,11 @@ impl CliRunner {
                         failure_detail(&stderr_out, &line)
                     ))),
                 },
+                // No result event, but stderr names refused settings.
+                None if !exit_success && refused_setting(None, &stderr_out).is_some() => {
+                    let line = refused_setting(None, &stderr_out).unwrap_or_default();
+                    Ok(failed_stage(&settings_refused_error(&line, &stderr_out)))
+                }
                 None => {
                     let recent = tail.into_iter().collect::<Vec<_>>().join("\n");
                     let fallback = if recent.trim().is_empty() {
