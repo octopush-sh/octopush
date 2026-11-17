@@ -2425,7 +2425,7 @@ impl CliRunner {
         }
         if dialect == CliDialect::Codex {
             if let Some(note) = crate::codex_trust::untrusted_note(&ctx.workspace_path) {
-                emitter.notice(&format!("{note} {}", crate::codex_trust::CODEX_TRUST_HOW));
+                emitter.notice(&format!("{} {}", note.line, note.how));
             }
         }
         let mut child = match command.spawn() {

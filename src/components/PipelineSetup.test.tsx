@@ -603,6 +603,19 @@ describe("PipelineSetup Claude Code version preflight", () => {
     expect(screen.queryByTestId("launcher-codex-trust")).not.toBeInTheDocument();
   });
 
+  it("tells a project marked untrusted in Codex to change its trust_level, not to run --trust", async () => {
+    codexTrustMock.mockResolvedValue({
+      line: "Codex will ignore this repo's .codex/ settings and MCP servers: the project is marked untrusted in Codex.",
+      how: "To trust it, change its trust_level from \"untrusted\" to \"trusted\" in ~/.codex/config.toml yourself. Octopush never changes your Codex config.",
+    });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-codex-trust");
+    expect(note).toHaveTextContent("marked untrusted in Codex");
+    expect(note).toHaveTextContent("~/.codex/config.toml");
+    expect(note).not.toHaveTextContent("--trust");
+  });
+
   it("does not probe for crews without a Claude Code CLI stage", async () => {
     storeState.pipelines = [cliPipe("gpt-5-codex")];
     cliVersionMock.mockResolvedValue({ version: "2.1.307", floor: "2.1.314", belowFloor: true });

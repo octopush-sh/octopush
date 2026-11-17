@@ -6826,9 +6826,9 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
 #[tauri::command]
 pub async fn codex_trust_note(workspace_path: String) -> AppResult<Option<CodexTrustNote>> {
     tokio::task::spawn_blocking(move || {
-        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|line| CodexTrustNote {
-            line: line.to_string(),
-            how: crate::codex_trust::CODEX_TRUST_HOW.to_string(),
+        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|note| CodexTrustNote {
+            line: note.line.to_string(),
+            how: note.how.to_string(),
         })
     })
     .await

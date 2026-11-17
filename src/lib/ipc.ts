@@ -1639,16 +1639,17 @@ export interface ClaudeCliVersion {
   recommended?: string;
 }
 
-/** A crew model the installed Claude Code is too old for (mirrors Rust
- *  `agent_adapter::ClaudeModelFloorNote`). */
-/** Codex will skip the repo's `.codex/` config: the project isn't trusted
- *  in Codex (`commands::codex_trust_note`). */
+/** Codex will skip the repo's `.codex/` config: the project is marked
+ *  untrusted in Codex, or has no trust decision saved
+ *  (`commands::codex_trust_note`). */
 export interface CodexTrustNote {
   line: string;
-  /** How the user can trust it themselves. */
+  /** How the user can trust it themselves; differs between the two states. */
   how: string;
 }
 
+/** A crew model the installed Claude Code is too old for (mirrors Rust
+ *  `agent_adapter::ClaudeModelFloorNote`). */
 export interface ClaudeModelFloorNote {
   /** Display name, e.g. "Fable 5.2". */
   label: string;
