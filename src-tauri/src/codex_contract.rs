@@ -254,6 +254,16 @@ fn a_resume_that_fails_before_any_message_falls_back_and_keeps_usage_unknown() {
         assert!(matches!(merged.status, StageStatus::Done));
         assert_eq!(merged.input_tokens, fresh_input);
         assert!(merged.cli.usage_unreported);
+        assert!(!merged.cli.usage_unreported_journaled, "the resumed stop was never journaled");
+
+        // A drift-only unknown on the fresh run was journaled by its notice.
+        let mut drifted = build_codex_outcome(&fresh_accum, sum_usage(&fresh_map), true, ArtifactKind::Diff, "gpt-5.5", "");
+        drifted.cli.usage_unreported = true;
+        drifted.cli.usage_unreported_journaled = true;
+        let clean_resumed = build_codex_outcome(&fresh_accum, sum_usage(&fresh_map), true, ArtifactKind::Diff, "gpt-5.5", "");
+        assert!(clean_resumed.error.is_none() && !clean_resumed.cli.usage_unreported);
+        let merged = merge_resume_fallback(clean_resumed, drifted);
+        assert!(merged.cli.usage_unreported && merged.cli.usage_unreported_journaled);
     }
 }
 

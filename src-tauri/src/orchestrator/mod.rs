@@ -1189,11 +1189,14 @@ impl Orchestrator {
         // Part of the spend is unknown even if the stage finished (a failed
         // Codex resume before its fresh fallback) — flag it like an error
         // that carries the marker (that path flags and journals it itself).
+        // A usage drift already journaled its own reason: flag, don't repeat.
         if outcome.cli.usage_unreported
             && !outcome.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_usage_unreported)
         {
             self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
-            self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+            if !outcome.cli.usage_unreported_journaled {
+                self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+            }
         }
 
         // Escape valve: the stage called `ask_director`. Persist its questions
