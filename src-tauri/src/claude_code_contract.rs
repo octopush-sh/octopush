@@ -739,6 +739,29 @@ fn claude_stage_env_keeps_the_skills_the_stage_started_with() {
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH"));
 }
 
+#[test]
+fn claude_stage_env_turns_off_subagent_progress_summaries() {
+    // 2.1.323: "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available
+    // since 2.1.318): set it to `1` to turn off subagent progress summaries and
+    // the requests that write them". No stage reads them (#722).
+    const KEY: &str = "CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES";
+    let env = CliDialect::Claude.stage_env();
+    assert_eq!(env.iter().find(|(k, _)| *k == KEY).map(|(_, v)| v.as_str()), Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == KEY));
+    // Set on the spawn whatever the quiet opt-in or effort, so a fresh and a
+    // `--resume` run (one `apply_stage_env`, no resume flag) both get it, over
+    // any inherited value; it's never removed.
+    for (effort, quiet) in [(None, false), (Some(crate::providers::Effort::High), true)] {
+        let spawn = stage_spawn_env(CliDialect::Claude, effort, quiet);
+        assert_eq!(spawn.get(KEY), Some(&Some("1".to_string())), "{spawn:?}");
+    }
+    assert!(!stage_spawn_env(CliDialect::Codex, None, true).contains_key(KEY));
+    // No stream event is read as a progress summary: a `task_summary`-style
+    // system event journals nothing.
+    let summary = serde_json::json!({"type": "system", "subtype": "task_summary", "summary": "Reading files"});
+    assert!(entries_from_stream_event(&summary).is_empty());
+}
+
 // ─── Quiet Claude Code (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, #703) ──
 
 /// The stage process's explicit env after [`apply_stage_env`]: `Some(v)` for a
