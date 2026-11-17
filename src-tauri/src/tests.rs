@@ -19825,6 +19825,27 @@ mod secret_guard_tests {
         std::fs::remove_file(dir.path().join("huge.bin")).unwrap();
     }
 
+    /// A worktree file git hasn't hashed (untracked, too large to read) is
+    /// bound by size, mtime and inode, not a zero blob id: confirming it
+    /// can't cover a different file at the same path later.
+    #[test]
+    fn an_unhashed_worktree_file_is_bound_to_its_content() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let c1 = worktree_files(dir.path(), Some("main")).unwrap();
+        assert!(c1.partial);
+        let entry = c1.unscanned.iter().find(|u| u.starts_with("huge.bin@")).expect("listed").clone();
+        assert!(!entry.contains(&"0".repeat(40)), "a zero blob id: {entry}");
+        assert!(entry.starts_with("huge.bin@stat:"), "{entry}");
+        let fp1 = scan_collected(&c1, &[]).fingerprint;
+        assert_eq!(scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint, fp1, "stable");
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 20)).unwrap();
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "a different file at the same path asks again");
+        std::fs::remove_file(&big).unwrap();
+    }
+
     /// Every rule but the generic one reads the whole line: a secret past
     /// column 16K (a minified bundle) is still found.
     #[test]
@@ -19862,6 +19883,69 @@ mod secret_guard_tests {
         // The same key twice on a line is one finding.
         let same = scan_report(&[file("k.ts", &[&format!("{a} {a}")])], &[], false);
         assert_eq!(same.total, 1);
+    }
+
+    /// A provider hit on a line no longer hides the other rules: a generic
+    /// assignment, a `.env` credential or an AWS key on the same line is
+    /// hashed too, so editing it asks again.
+    #[test]
+    fn a_provider_hit_does_not_hide_the_other_rules_on_its_line() {
+        let ghp = ["gh", "p_"].concat() + &rnd(320, 36, B62);
+        let line = |v: &str| format!("const t = \"{ghp}\"; const apiKey = \"{v}\";");
+        let r1 = scan_report(&[file("src/a.ts", &[&line(&rnd(321, 32, B62))])], &[], false);
+        let r2 = scan_report(&[file("src/a.ts", &[&line(&rnd(322, 32, B62))])], &[], false);
+        let rules: Vec<_> = r1.findings.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["github-token", "generic-secret"]);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the generic value asks again");
+
+        // Your own key on a line with a generic secret: both bound.
+        let mine = rnd(323, 40, B62);
+        let known = [KnownSecret::new("your Anthropic key", mine.clone())];
+        let mline = |v: &str| format!("x = \"{mine}\"; secret = \"{v}\"");
+        let k1 = scan_report(&[file("src/b.ts", &[&mline(&rnd(324, 32, B62))])], &known, false);
+        let k2 = scan_report(&[file("src/b.ts", &[&mline(&rnd(325, 32, B62))])], &known, false);
+        assert_eq!(k1.total, 2);
+        assert_ne!(k1.fingerprint, k2.fingerprint);
+
+        // An `.env` value that IS a provider key is listed once, but the
+        // `.env` rule's value is hashed as well.
+        let env = scan_report(&[file(".env", &[&format!("GITHUB_TOKEN={ghp}")])], &[], false);
+        assert_eq!(env.total, 1, "{:?}", env.findings);
+        assert_eq!(env.findings[0].rule, "github-token");
+    }
+
+    /// The per-line dedupe is linear: a multi-MB minified line holding 100k
+    /// distinct provider tokens scans in well under a few seconds.
+    #[test]
+    fn a_line_with_100k_distinct_tokens_scans_fast() {
+        let prefix = ["gh", "p_"].concat();
+        let line_of = |count: u64| {
+            let mut line = String::with_capacity(count as usize * 42);
+            for i in 0..count {
+                line.push_str(&prefix);
+                line.push_str(&rnd(1_000_000 + i, 36, B62));
+                line.push(' ');
+            }
+            line
+        };
+        let timed = |line: &str| {
+            let started = std::time::Instant::now();
+            let r = scan_report(&[file("dist/bundle.min.js", &[line])], &[], false);
+            (r, started.elapsed())
+        };
+        let big = line_of(100_000);
+        assert!(big.len() > 4_000_000, "a multi-MB line");
+        let (r, took) = timed(&big);
+        // A handful of random bodies read as placeholders or low-entropy.
+        assert!(r.total > 99_900, "{}", r.total);
+        assert_eq!(r.findings.len(), MAX_FINDINGS);
+        let (_, took_10k) = timed(&line_of(10_000));
+        eprintln!("100k-token line: {took:?}; 10k: {took_10k:?}");
+        // Linear: ten times the tokens costs about ten times the time (the
+        // quadratic dedupe cost a hundred times, minutes in all). Debug
+        // builds on a slow runner stay well inside the absolute bound.
+        assert!(took < took_10k * 30, "not linear: 100k {took:?} vs 10k {took_10k:?}");
+        assert!(took < std::time::Duration::from_secs(20), "took {took:?}");
     }
 
     #[test]

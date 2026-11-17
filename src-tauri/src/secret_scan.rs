@@ -35,7 +35,7 @@ use crate::error::{AppError, AppResult};
 use git2::{Delta, Diff, DiffOptions, Oid, Repository};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -245,14 +245,19 @@ fn value_tag(value: &str) -> [u8; 32] {
 }
 
 /// One detection: the value-free finding plus the keyed hash of its value.
+/// A hit whose value lies inside one already reported on the line (an `.env`
+/// value that is a provider key, a generic assignment of your own key) is
+/// hashed into the fingerprint but not `shown` as a second finding.
 struct Hit {
     finding: SecretFinding,
     tag: [u8; 32],
+    shown: bool,
 }
 
 /// Fingerprint over the scope (`commit`, `push`, `pr`, `worktree`), every hit
 /// (file, line, rule, keyed value hash), the total, the partial flag and,
-/// for a partial scan, what wasn't scanned (paths with blob ids, commits),
+/// for a partial scan, what wasn't scanned (paths with blob ids or, for a
+/// worktree file git hasn't hashed, its size, mtime and inode; commits),
 /// so a confirmed partial scan can't cover a different unread blob later.
 /// Order-independent.
 fn fingerprint_hits(hits: &[Hit], scope: &str, partial: bool, unscanned: &[String]) -> String {
@@ -260,14 +265,14 @@ fn fingerprint_hits(hits: &[Hit], scope: &str, partial: bool, unscanned: &[Strin
     let mut keys: Vec<String> = hits
         .iter()
         .map(|h| {
-            let tag: String = h.tag.iter().map(|b| format!("{b:02x}")).collect();
+            let tag = hex(&h.tag);
             format!("{}\u{0}{}\u{0}{}\u{0}{tag}", h.finding.file, h.finding.line.unwrap_or(0), h.finding.rule)
         })
         .collect();
     keys.sort();
     keys.dedup();
     let mut h = Sha256::new();
-    h.update(format!("v2\u{0}{scope}\u{0}{}\u{0}{}", keys.len(), partial).as_bytes());
+    h.update(format!("v3\u{0}{scope}\u{0}{}\u{0}{}", keys.len(), partial).as_bytes());
     for k in keys {
         h.update(k.as_bytes());
         h.update([0xff]);
@@ -282,7 +287,19 @@ fn fingerprint_hits(hits: &[Hit], scope: &str, partial: bool, unscanned: &[Strin
             h.update([0xff]);
         }
     }
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hex(&h.finalize())
+}
+
+/// Lower-case hex of `bytes`, without a `format!` per byte (a fingerprint
+/// can cover a hundred thousand hits).
+fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize] as char);
+        out.push(DIGITS[(b & 0xf) as usize] as char);
+    }
+    out
 }
 
 /// What one scan found: the first [`MAX_FINDINGS`] findings to show, the
@@ -465,15 +482,37 @@ pub fn shannon_entropy(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
+    let n = s.chars().count() as f64;
+    let term = |c: usize| {
+        let p = c as f64 / n;
+        -p * p.log2()
+    };
+    // Tokens are ASCII: count into an array (a scan can judge a hundred
+    // thousand of them; a hash map per token dominated that).
+    if s.is_ascii() {
+        let mut counts = [0usize; 128];
+        for b in s.bytes() {
+            counts[b as usize] += 1;
+        }
+        return counts.iter().filter(|&&c| c > 0).map(|&c| term(c)).sum();
+    }
     let mut counts = std::collections::HashMap::new();
     for c in s.chars() {
         *counts.entry(c).or_insert(0usize) += 1;
     }
-    let n = s.chars().count() as f64;
-    counts.values().map(|&c| {
-        let p = c as f64 / n;
-        -p * p.log2()
-    }).sum()
+    counts.values().map(|&c| term(c)).sum()
+}
+
+/// How many distinct characters `s` holds.
+fn distinct_chars(s: &str) -> usize {
+    if s.is_ascii() {
+        let mut seen = [false; 128];
+        for b in s.bytes() {
+            seen[b as usize] = true;
+        }
+        return seen.iter().filter(|&&x| x).count();
+    }
+    s.chars().collect::<HashSet<char>>().len()
 }
 
 /// An obvious stand-in rather than a real credential: docs and examples say
@@ -503,8 +542,7 @@ pub fn is_placeholder(token: &str) -> bool {
         }
     }
     // Too few distinct characters to be random.
-    let distinct: HashSet<char> = token.chars().collect();
-    distinct.len() < 10
+    distinct_chars(token) < 10
 }
 
 fn is_token_char(c: char) -> bool {
@@ -590,20 +628,49 @@ pub struct AddedFile {
     pub lines: Vec<(u32, String)>,
 }
 
-type SeenKey = (String, Option<u32>, [u8; 32]);
+type SeenKey = (String, Option<u32>, String, [u8; 32]);
 
-/// Record a hit unless this file, line and value were already recorded (two
-/// different values on one line are two findings).
-fn push_hit(out: &mut Vec<Hit>, seen: &mut HashSet<SeenKey>, finding: SecretFinding, value: &str) {
+/// Record a hit unless this file, line, rule and value were already recorded
+/// (two different values on one line are two findings). `shown: false`
+/// hashes the value into the fingerprint without listing it again.
+fn push_hit(out: &mut Vec<Hit>, seen: &mut HashSet<SeenKey>, finding: SecretFinding, value: &str, shown: bool) {
     let tag = value_tag(value);
-    if seen.insert((finding.file.clone(), finding.line, tag)) {
-        out.push(Hit { finding, tag });
+    if seen.insert((finding.file.clone(), finding.line, finding.rule.clone(), tag)) {
+        out.push(Hit { finding, tag, shown });
     }
 }
 
-/// Every prefixed-token hit on `line` with its matched text. `skip_google`
+/// The byte spans of one line already reported, kept non-overlapping and
+/// keyed by start, so "is this match inside one we have?" is a log-time
+/// lookup instead of a scan of every earlier value (a minified line can
+/// carry a hundred thousand tokens).
+#[derive(Default)]
+struct Spans(BTreeMap<usize, usize>);
+
+impl Spans {
+    /// Whether `[start, end)` overlaps a claimed span. The spans never
+    /// overlap one another, so the one starting last before `end` also ends
+    /// last: checking it alone is enough.
+    fn overlaps(&self, start: usize, end: usize) -> bool {
+        self.0.range(..end).next_back().is_some_and(|(_, &e)| e > start)
+    }
+
+    /// Claim `[start, end)` unless it overlaps a claimed span; whether it did.
+    fn claim(&mut self, start: usize, end: usize) -> bool {
+        if self.overlaps(start, end) {
+            return false;
+        }
+        self.0.insert(start, end);
+        true
+    }
+}
+
+/// Every prefixed-token hit on `line` with its matched span. `skip_google`
 /// drops the Google rule (a Firebase web config or a `NEXT_PUBLIC_*` value).
-fn token_hits(line: &str, skip_google: bool) -> Vec<(&'static TokenRule, &str)> {
+/// Spans already in `claimed` (your own credentials) are skipped, and each
+/// returned token is claimed, so two rules matching one token keep the
+/// first. Linear in the number of matches.
+fn token_hits(line: &str, skip_google: bool, claimed: &mut Spans) -> Vec<(&'static TokenRule, usize, usize)> {
     let mut out = Vec::new();
     for r in TOKEN_RULES.iter() {
         if skip_google && r.id == "google-api-key" {
@@ -619,11 +686,12 @@ fn token_hits(line: &str, skip_google: bool) -> Vec<(&'static TokenRule, &str)> 
             if is_placeholder(body) || shannon_entropy(body) < 3.0 {
                 continue;
             }
-            // Two rules can match one token (`sk-…` shapes): keep the first.
-            if out.iter().any(|(_, t): &(&TokenRule, &str)| t.contains(token) || token.contains(t)) {
+            // Your own key (reported as yours), or a token an earlier rule
+            // matched (`sk-…` shapes): keep the first.
+            if !claimed.claim(m.start(), m.end()) {
                 continue;
             }
-            out.push((r, token));
+            out.push((r, m.start(), m.end()));
         }
     }
     out
@@ -657,7 +725,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
             push_hit(&mut out, &mut seen, SecretFinding {
                 file: path.into(), line: None, rule: "ssh-private-key-file".into(),
                 kind: "SSH private key file".into(), yours: false,
-            }, &body);
+            }, &body, true);
         }
         let env_file = is_env_file(path);
         let doc_file = is_doc_file(path);
@@ -688,24 +756,23 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
             let firebase_key = line.to_ascii_lowercase().contains("apikey")
                 && firebase_lines.iter().any(|f| f.abs_diff(*n) <= 8);
             let public_web_value = next_public || firebase_key;
-            // Every value this line was flagged for: each is hashed into the
-            // fingerprint, so editing any of them asks again.
-            let mut values: Vec<String> = Vec::new();
-            let covered = |values: &[String], v: &str| values.iter().any(|w| w.contains(v) || v.contains(w.as_str()));
+            // Every rule runs on every line and every value it flags is hashed
+            // into the fingerprint, so editing any of them asks again. A value
+            // inside a span already reported here is hashed but not listed twice.
+            let mut claimed = Spans::default();
 
-            for k in known.iter().filter(|k| line.contains(k.value.as_str())) {
-                push_hit(&mut out, &mut seen, at("your-credential", k.label.clone(), true), &k.value);
-                values.push(k.value.clone());
-            }
-            for (r, token) in token_hits(line, public_web_value) {
-                if covered(&values, token) {
-                    continue; // your own key, already reported as yours
+            for k in known.iter() {
+                let mut found = false;
+                for (at_byte, v) in line.match_indices(k.value.as_str()) {
+                    found = true;
+                    claimed.claim(at_byte, at_byte + v.len());
                 }
-                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), token);
-                values.push(token.to_string());
+                if found {
+                    push_hit(&mut out, &mut seen, at("your-credential", k.label.clone(), true), &k.value, true);
+                }
             }
-            if !values.is_empty() {
-                continue;
+            for (r, start, end) in token_hits(line, public_web_value, &mut claimed) {
+                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), &line[start..end], true);
             }
             if let Some(m) = AWS_KEY_ID.find(line) {
                 let near = aws_secret_lines.iter().any(|s| s.abs_diff(*n) <= 5) || aws_bare_secret_on(line);
@@ -720,8 +787,8 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     }
                     v.push('\u{0}');
                     v.push_str(line);
-                    push_hit(&mut out, &mut seen, at("aws-access-key", "AWS access key".into(), false), &v);
-                    continue;
+                    claimed.claim(m.start(), m.end());
+                    push_hit(&mut out, &mut seen, at("aws-access-key", "AWS access key".into(), false), &v, true);
                 }
             }
             if PEM_HEADER.is_match(line) {
@@ -733,23 +800,28 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     .filter(|(_, l)| PEM_BODY_LINE.is_match(l));
                 if inline || next.is_some() {
                     let v = format!("{line}\u{0}{}", next.map(|(_, l)| l.as_str()).unwrap_or(""));
-                    push_hit(&mut out, &mut seen, at("private-key", "private key".into(), false), &v);
-                    continue;
+                    if let Some(h) = PEM_HEADER.find(line) {
+                        claimed.claim(h.start(), h.end());
+                    }
+                    push_hit(&mut out, &mut seen, at("private-key", "private key".into(), false), &v, true);
                 }
             }
             if env_file && !next_public {
                 if let Some(c) = ENV_ASSIGN.captures(line) {
                     let name = c.get(1).map(|m| m.as_str()).unwrap_or("");
-                    let value = env_value(c.get(2).map(|m| m.as_str()).unwrap_or(""));
+                    let raw = c.get(2);
+                    let value = env_value(raw.map(|m| m.as_str()).unwrap_or(""));
                     if !name.starts_with("NEXT_PUBLIC_") && ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(value) {
-                        push_hit(&mut out, &mut seen, at("env-credential", format!("credential in a .env file ({name})"), false), value);
-                        continue;
+                        let (s0, e0) = raw.map(|m| (m.start(), m.end())).unwrap_or((0, line.len()));
+                        let shown = claimed.claim(s0, e0);
+                        push_hit(&mut out, &mut seen, at("env-credential", format!("credential in a .env file ({name})"), false), value, shown);
                     }
                 }
             }
             if generic_ok && !public_web_value {
                 for c in GENERIC_ASSIGN.captures_iter(head) {
-                    let v = c.get(1).map(|m| m.as_str()).unwrap_or("");
+                    let Some(m) = c.get(1) else { continue };
+                    let v = m.as_str();
                     let plausible = !is_placeholder(v)
                         && shannon_entropy(v) > 4.0
                         && v.chars().any(|c| c.is_ascii_digit())
@@ -757,9 +829,9 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                         && !v.contains("://")
                         // An example JWT in prose docs is an illustration.
                         && !(doc_file && JWT.is_match(v));
-                    if plausible && !covered(&values, v) {
-                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false), v);
-                        values.push(v.to_string());
+                    if plausible {
+                        let shown = claimed.claim(m.start(), m.end());
+                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false), v, shown);
                     }
                 }
             }
@@ -790,8 +862,9 @@ pub fn scan_collected(c: &Collected, known: &[KnownSecret]) -> ScanReport {
 fn report_of(files: &[AddedFile], known: &[KnownSecret], scope: &str, partial: bool, unscanned: &[String]) -> ScanReport {
     let hits = scan_hits(files, known);
     let fingerprint = fingerprint_hits(&hits, scope, partial, unscanned);
-    let total = hits.len();
-    let findings = hits.into_iter().take(MAX_FINDINGS).map(|h| h.finding).collect();
+    let shown: Vec<SecretFinding> = hits.into_iter().filter(|h| h.shown).map(|h| h.finding).collect();
+    let total = shown.len();
+    let findings = shown.into_iter().take(MAX_FINDINGS).collect();
     ScanReport { findings, total, partial, fingerprint }
 }
 
@@ -806,7 +879,8 @@ pub struct Collected {
     /// Which action this is for: `commit`, `push`, `pr` or `worktree`.
     pub scope: &'static str,
     /// What a partial scan didn't read: `path@blob` for a file it couldn't
-    /// (or only partly) read, `commit <oid>` for a commit it never reached.
+    /// (or only partly) read (`path@stat:size:mtime_ns:inode` when git has no
+    /// blob id for it yet), `commit <oid>` for a commit it never reached.
     pub unscanned: Vec<String>,
 }
 
@@ -834,9 +908,35 @@ impl Budget {
     }
 }
 
-/// `path@blob` for the unscanned list.
-fn unscanned_entry(path: &str, id: Oid) -> String {
-    format!("{path}@{id}")
+/// `path@blob` for the unscanned list. A worktree file git hasn't hashed
+/// (untracked or modified, its blob id still zero) is bound to its content by
+/// `path@stat:size:mtime_ns:inode` instead, so confirming a partial scan
+/// can't later cover a different unread file at the same path. Hashing the
+/// file would be stronger but means reading a file the scan skipped for being
+/// too large, so the metadata stands in for it.
+fn unscanned_entry(repo: &Repository, path: &str, id: Oid) -> String {
+    if !id.is_zero() {
+        return format!("{path}@{id}");
+    }
+    let Some(meta) = repo.workdir().and_then(|w| std::fs::symlink_metadata(w.join(path)).ok()) else {
+        return format!("{path}@missing");
+    };
+    format!("{path}@stat:{}", content_stamp(&meta))
+}
+
+/// `size:mtime_ns:inode` of a file (inode 0 where the platform has none).
+fn content_stamp(meta: &std::fs::Metadata) -> String {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(meta);
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    format!("{}:{mtime}:{ino}", meta.len())
 }
 
 fn opts() -> DiffOptions {
@@ -913,7 +1013,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
                 if size > MAX_SCAN_BYTES as u64 {
                     // Too large to read as text: the scan didn't see it.
                     let p = path_of(&delta).unwrap_or_default();
-                    oversized.push(unscanned_entry(&p, new.id()));
+                    oversized.push(unscanned_entry(repo, &p, new.id()));
                 }
                 true
             },
@@ -947,7 +1047,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
     if stopped {
         // The file being read when the budget ran out, and every one after it.
         for (p, id) in order.into_iter().skip(pos.saturating_sub(1)).flatten() {
-            budget.unscanned.push(unscanned_entry(&p, id));
+            budget.unscanned.push(unscanned_entry(repo, &p, id));
         }
     }
     match result {
