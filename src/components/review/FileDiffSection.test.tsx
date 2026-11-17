@@ -30,7 +30,8 @@ describe("FileDiffSection", () => {
     const long = { ...file, filePath: "src-tauri/src/very/deep/module/sync.rs" };
     const { container, getByTitle } = render(<FileDiffSection file={long} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
-    expect(getByTitle(long.filePath)).toHaveTextContent(long.filePath);
+    // Full path in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(getByTitle(long.filePath).textContent?.replace("…", "")).toBe(long.filePath);
     expect(container.querySelector(".octo-midtrunc-tail")?.textContent).toContain("/sync.rs");
   });
   it("renders a short path as one nowrap line, not a bare string in the flex row", () => {

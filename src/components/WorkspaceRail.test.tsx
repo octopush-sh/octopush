@@ -243,7 +243,8 @@ describe("WorkspaceRail", () => {
     expect(header).toHaveClass("flex", "min-w-0", "flex-1");
     expect(header).not.toHaveClass("truncate");
     expect(header.querySelector(".octo-midtrunc-tail")).toHaveTextContent("prise-monorepo");
-    expect(header).toHaveTextContent(name);
+    // Full name in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(header.textContent?.replace("…", "")).toBe(name);
     // The fold control carries the full name as its tooltip.
     expect(screen.getByRole("button", { name, expanded: true })).toHaveAttribute(
       "title",

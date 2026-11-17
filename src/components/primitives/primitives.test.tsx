@@ -3,7 +3,22 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { Reveal } from "./Reveal";
 import { FadeSwap } from "./FadeSwap";
-import { MidTruncate, graphemeBoundaries, lastFitting, trimTrailingSpace } from "./MidTruncate";
+import {
+  MidTruncate,
+  flatten,
+  graphemeBoundaries,
+  lastFitting,
+  trimTrailingSpace,
+  widthAnchor,
+} from "./MidTruncate";
+
+/** What a reader (and a copy) gets: the text minus the `aria-hidden` ellipsis
+ *  span, with the seam's no-break spaces read back as spaces. */
+function readable(el: Element): string {
+  const clone = el.cloneNode(true) as Element;
+  clone.querySelectorAll("[aria-hidden='true']").forEach((n) => n.remove());
+  return (clone.textContent ?? "").replace(/\u00a0/g, " ");
+}
 
 describe("Reveal", () => {
   it("renders children and reflects open state via grid-template-rows + aria-hidden", () => {
@@ -95,7 +110,7 @@ describe("MidTruncate", () => {
     expect(container.querySelector(".octo-midtrunc-tail")).toHaveTextContent("-tail-marker");
     // Nothing is dropped from the DOM — the elision is CSS, so the full string
     // is still selectable and still what a copy would yield.
-    expect(container.textContent).toBe(text);
+    expect(readable(container)).toBe(text);
   });
 
   it("draws an optional lead glyph inside the box, on both paths", () => {
@@ -110,7 +125,7 @@ describe("MidTruncate", () => {
       expect(lead).toHaveAttribute("aria-hidden");
       expect(box.firstElementChild).toBe(lead);
       expect(lead!.querySelector("[data-testid='lead']")).toBeTruthy();
-      expect(box.textContent).toBe(text);
+      expect(readable(box)).toBe(text);
       unmount();
     }
   });
@@ -153,6 +168,182 @@ describe("MidTruncate — the ellipsis butts against the tail (#750)", () => {
     const { container } = render(<MidTruncate text={"Production deploy (octopush-web)-1"} tail={14} />);
     const box = container.querySelector(".octo-midtrunc")!;
     expect(box).not.toHaveAttribute("data-elided");
-    expect(box.textContent).toBe("Production deploy (octopush-web)-1");
+    expect(readable(box)).toBe("Production deploy (octopush-web)-1");
+  });
+});
+
+describe("MidTruncate — review fixes (#807)", () => {
+  // A hand-cranked frame and observer, so each layout pass is explicit.
+  let frames: FrameRequestCallback[] = [];
+  let observed: Element[] = [];
+  let resize: ResizeObserverCallback | null = null;
+  const flushFrames = () => {
+    const run = frames;
+    frames = [];
+    run.forEach((cb) => cb(0));
+  };
+  // Fake layout: the head's natural width vs the room it has, 7px a glyph.
+  let natural = 0;
+  let room = 0;
+
+  beforeEach(() => {
+    frames = [];
+    observed = [];
+    resize = null;
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: ResizeObserverCallback) {
+          resize = cb;
+        }
+        observe(el: Element) {
+          observed.push(el);
+        }
+        unobserve() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("octo-midtrunc-head") ? natural : 0;
+    });
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockImplementation(function (this: HTMLElement) {
+      return this.classList.contains("octo-midtrunc-head") ? room : 0;
+    });
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      return { left: 0, right: this.endOffset * 7, top: 0, bottom: 0, width: this.endOffset * 7, height: 0 } as DOMRect;
+    };
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  const text = "Production deploy (octopush-web)-12345";
+  const ROW = { display: "flex" } as const;
+  const SHRINK = { display: "flex", minWidth: 0 } as const; // FileDiffSection's path cell
+  const fire = (target: Element, width: number) =>
+    act(() => resize!([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
+
+  it("observes the row, not a parent that sizes to its content, and re-cuts when it widens", () => {
+    natural = text.length * 7;
+    room = 70;
+    const { getByTestId, container } = render(
+      <div data-testid="row" style={ROW}>
+        <span data-testid="cell" style={SHRINK}>
+          <MidTruncate text={text} tail={14} />
+        </span>
+      </div>,
+    );
+    expect(observed).toEqual([getByTestId("row")]);
+    expect(widthAnchor(container.querySelector(".octo-midtrunc") as HTMLElement)).toBe(getByTestId("row"));
+    act(flushFrames);
+    const box = container.querySelector(".octo-midtrunc")!;
+    const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
+    expect(box).toHaveAttribute("data-elided");
+    expect(head.style.maxWidth).toBe("70px");
+
+    // The row widens until the whole head fits: the stale cut must go.
+    room = natural;
+    fire(getByTestId("row"), 900);
+    act(flushFrames);
+    expect(box).not.toHaveAttribute("data-elided");
+    expect(head.style.maxWidth).toBe("");
+  });
+
+  it("observes a parent that grows into the row (flex-1), as before", () => {
+    const { getByTestId } = render(
+      <div style={ROW}>
+        <span data-testid="grown" style={{ display: "flex", flexGrow: 1, minWidth: 0 }}>
+          <MidTruncate text={text} tail={14} />
+        </span>
+      </div>,
+    );
+    expect(observed).toEqual([getByTestId("grown")]);
+  });
+
+  it("skips the re-cut when the row moves by less than a pixel", () => {
+    natural = text.length * 7;
+    room = 70;
+    const { getByTestId } = render(
+      <div data-testid="row" style={ROW}>
+        <MidTruncate text={text} tail={14} />
+      </div>,
+    );
+    act(flushFrames);
+    fire(getByTestId("row"), 400);
+    act(flushFrames);
+    fire(getByTestId("row"), 400.6);
+    expect(frames).toHaveLength(0);
+    fire(getByTestId("row"), 402);
+    expect(frames).toHaveLength(1);
+  });
+
+  it("shares one frame across every instance", () => {
+    natural = text.length * 7;
+    room = 70;
+    const { container } = render(
+      <div style={ROW}>
+        {[1, 2, 3].map((n) => (
+          <div key={n} style={{ display: "flex", flexGrow: 1 }}>
+            <MidTruncate text={`${text}-${n}`} tail={14} />
+          </div>
+        ))}
+      </div>,
+    );
+    expect(frames).toHaveLength(1);
+    act(flushFrames);
+    expect(container.querySelectorAll(".octo-midtrunc[data-elided]")).toHaveLength(3);
+  });
+
+  it("keeps the accessible name the clean full string, elided or not", () => {
+    natural = text.length * 7;
+    room = 70;
+    const { container } = render(
+      <button type="button">
+        <MidTruncate text={text} tail={14} />
+      </button>,
+    );
+    expect(screen.getByRole("button", { name: text })).toBeInTheDocument();
+    act(flushFrames);
+    expect(container.querySelector(".octo-midtrunc")).toHaveAttribute("data-elided");
+    // The ellipsis is a real glyph, hidden from assistive tech — not CSS content.
+    const ell = container.querySelector(".octo-midtrunc-ell")!;
+    expect(ell).toHaveAttribute("aria-hidden", "true");
+    expect(ell.textContent).toBe("…");
+    expect(screen.getByRole("button", { name: text })).toBeInTheDocument();
+  });
+
+  it("keeps the CSS ellipsis for right-to-left text", () => {
+    natural = text.length * 7;
+    room = 70;
+    const real = window.getComputedStyle;
+    vi.spyOn(window, "getComputedStyle").mockImplementation((el, pseudo) => {
+      const cs = real(el, pseudo);
+      return (el as Element).classList?.contains("octo-midtrunc")
+        ? ({ ...cs, display: cs.display, direction: "rtl" } as CSSStyleDeclaration)
+        : cs;
+    });
+    const { container } = render(<MidTruncate text={text} tail={14} />);
+    act(flushFrames);
+    expect(container.querySelector(".octo-midtrunc")).not.toHaveAttribute("data-elided");
+    expect(container.querySelector<HTMLElement>(".octo-midtrunc-head")!.style.maxWidth).toBe("");
+  });
+
+  it("renders line breaks and tabs as a space and keeps the seam's spaces", () => {
+    expect(flatten("a\nb\tc\r\nd")).toBe("a b c d");
+    const raw = "fix: the\tseam\nhandling (octopush-web)";
+    const { container } = render(<MidTruncate text={raw} tail={15} />);
+    expect(readable(container)).toBe(flatten(raw));
+    expect(container.textContent).not.toMatch(/[\n\t]/);
+    // A space at the seam would collapse under `nowrap`; it is a no-break space.
+    expect(container.querySelector(".octo-midtrunc-tail")!.textContent).toBe("\u00a0(octopush-web)");
+  });
+
+  it("re-seats when the lead or className changes", () => {
+    const { rerender } = render(<MidTruncate text={text} tail={14} className="a" />);
+    act(flushFrames);
+    rerender(<MidTruncate text={text} tail={14} className="b" />);
+    expect(frames).toHaveLength(1);
   });
 });

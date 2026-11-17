@@ -3,7 +3,9 @@
 import { useLayoutEffect, useRef, type ReactNode } from "react";
 
 interface Props {
-  /** The full string. The caller is responsible for the `title` that carries it. */
+  /** The full string. The caller is responsible for the `title` that carries
+   *  it — verbatim: the rendered text folds line breaks and tabs to a space,
+   *  the title should not. */
   text: string;
   /** How many trailing characters stay pinned. Below `tail + 4` the string
    *  renders whole — eliding two characters out of the middle of a short name
@@ -23,33 +25,24 @@ interface Props {
  *
  *  CSS does the layout (design-system §6, `.octo-midtrunc`): the head
  *  ellipsizes into whatever space is left over and the tail is pinned, so the
- *  elision point tracks the container's width. One layout pass then seats
- *  the `…` flush against the tail (`seatEllipsis`, #750).
- *  The parent must give it a DEFINITE width — a `flex-1 min-w-0` item, as in
- *  the rail and the ContextHeader. Inside a shrink-to-fit parent the box is
- *  sized from its own text and WebKit hard-cuts it instead of eliding. */
+ *  elision point tracks the container's width. A layout pass then seats the
+ *  `…` flush against the tail (`seatEllipsis`, #750), re-run whenever the
+ *  nearest ancestor with a definite width resizes (`widthAnchor`).
+ *  The parent should still give it a DEFINITE width — a `flex-1 min-w-0`
+ *  item, as in the rail and the ContextHeader. Inside a shrink-to-fit parent
+ *  the box is sized from its own text and WebKit hard-cuts it instead of
+ *  eliding. */
 export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
   const boxRef = useRef<HTMLSpanElement>(null);
   const headRef = useRef<HTMLSpanElement>(null);
-  const split = text.length > tail + 4;
+  const shown = flatten(text);
+  const split = shown.length > tail + 4;
   useLayoutEffect(() => {
     const box = boxRef.current;
     const head = headRef.current;
     if (!split || !box || !head) return;
-    let alive = true;
-    const fit = () => alive && seatEllipsis(box, head);
-    fit();
-    // The parent, not the box: the box shrinks when the head is cut, and
-    // observing it would feed the cut back into the measurement.
-    const ro = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
-    ro?.observe(box.parentElement ?? box);
-    // Widths change once the web fonts land.
-    document.fonts?.ready.then(fit).catch(() => {});
-    return () => {
-      alive = false;
-      ro?.disconnect();
-    };
-  }, [split, text, tail]);
+    return track(box, head);
+  }, [split, shown, tail, lead, className]);
 
   const leadEl =
     lead != null ? (
@@ -64,19 +57,159 @@ export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
     return (
       <span className={`octo-midtrunc-whole ${className}`.trim()}>
         {leadEl}
-        {text}
+        {shown}
       </span>
     );
   }
+  const [headText, tailText] = splitAt(shown, shown.length - tail);
   return (
     <span ref={boxRef} className={`octo-midtrunc ${className}`.trim()}>
       {leadEl}
       <span ref={headRef} className="octo-midtrunc-head">
-        {text.slice(0, text.length - tail)}
+        {headText}
       </span>
-      <span className="octo-midtrunc-tail">{text.slice(text.length - tail)}</span>
+      {/* A real glyph, not CSS `content`: hidden from the accessibility tree
+          (the accessible name stays the clean full string) and from a copy,
+          and shown only once `seatEllipsis` has cut the head (`data-elided`). */}
+      <span className="octo-midtrunc-ell" aria-hidden="true">
+        …
+      </span>
+      <span className="octo-midtrunc-tail">{tailText}</span>
     </span>
   );
+}
+
+/** One line, always: a line break or a tab in an identifier renders as a
+ *  space (the box is `white-space: nowrap`, which would otherwise collapse a
+ *  break into nothing visible at all, or wrap it under `pre`). */
+export function flatten(text: string): string {
+  return text.replace(/\r\n|[\r\n\t]/g, " ");
+}
+
+/** Splits at `at`. Under `nowrap` a space at the very end of the head, or the
+ *  very start of the tail, is a line-edge space and collapses away — the two
+ *  halves are separate flex items — so `deploy (api)` would read `deploy(api)`.
+ *  The one space on each side of the seam becomes a no-break space, which
+ *  keeps its width. */
+export function splitAt(text: string, at: number): [string, string] {
+  const head = text.slice(0, at).replace(/ $/, " ");
+  const tail = text.slice(at).replace(/^ /, " ");
+  return [head, tail];
+}
+
+// ── One observer, batched layout ────────────────────────────────────────
+//
+// Every MidTruncate on screen (a rail can hold hundreds) shares ONE
+// ResizeObserver and ONE animation frame. A frame resets every dirty box,
+// then reads them all, then writes them all — one forced layout per frame,
+// however many rows changed, instead of one per row.
+
+interface Tracked {
+  box: HTMLElement;
+  head: HTMLElement;
+  anchor: Element;
+}
+
+const tracked = new Set<Tracked>();
+const byAnchor = new Map<Element, Set<Tracked>>();
+const lastWidth = new Map<Element, number>();
+const dirty = new Set<Tracked>();
+let observer: ResizeObserver | null = null;
+let frame: (() => void) | null = null; // cancels the pending frame
+
+function track(box: HTMLElement, head: HTMLElement): () => void {
+  const anchor = widthAnchor(box);
+  const t: Tracked = { box, head, anchor };
+  tracked.add(t);
+  let peers = byAnchor.get(anchor);
+  if (!peers) {
+    byAnchor.set(anchor, (peers = new Set()));
+    if (!observer && typeof ResizeObserver !== "undefined") observer = new ResizeObserver(onResize);
+    observer?.observe(anchor);
+  }
+  peers.add(t);
+  schedule(t);
+  // Widths change once the web fonts land.
+  document.fonts?.ready.then(() => tracked.has(t) && schedule(t)).catch(() => {});
+  return () => {
+    tracked.delete(t);
+    dirty.delete(t);
+    peers.delete(t);
+    if (peers.size === 0) {
+      byAnchor.delete(anchor);
+      lastWidth.delete(anchor);
+      observer?.unobserve(anchor);
+    }
+    if (tracked.size === 0) {
+      observer?.disconnect();
+      observer = null;
+      frame?.();
+      frame = null;
+    }
+  };
+}
+
+function onResize(records: ResizeObserverEntry[]) {
+  for (const r of records) {
+    const width = r.contentRect.width;
+    const before = lastWidth.get(r.target);
+    lastWidth.set(r.target, width);
+    // Under a pixel of slack can't move the cut by a glyph: skip the re-cut.
+    if (before !== undefined && Math.abs(width - before) < 1) continue;
+    for (const t of byAnchor.get(r.target) ?? []) schedule(t);
+  }
+}
+
+function schedule(t: Tracked) {
+  dirty.add(t);
+  if (frame !== null) return;
+  if (typeof requestAnimationFrame === "function") {
+    const id = requestAnimationFrame(flush);
+    frame = () => typeof cancelAnimationFrame === "function" && cancelAnimationFrame(id);
+  } else {
+    const id = setTimeout(flush, 16);
+    frame = () => clearTimeout(id);
+  }
+}
+
+function flush() {
+  frame = null;
+  const batch = [...dirty].filter((t) => t.box.isConnected);
+  dirty.clear();
+  for (const t of batch) reset(t.box, t.head); // writes
+  const cuts = batch.map((t) => measureCut(t.box, t.head)); // reads
+  batch.forEach((t, i) => applyCut(t.box, t.head, cuts[i])); // writes
+}
+
+/** The element whose width actually bounds the box: the nearest ancestor
+ *  whose width does NOT come from its own content. A shrink-to-fit parent
+ *  (`FileDiffSection`'s `flex min-w-0` path cell, an inline wrapper) shrinks
+ *  when the head is cut and never grows back when the row widens, so
+ *  observing it leaves a stale cut; the row it sits in does resize. */
+export function widthAnchor(box: HTMLElement): Element {
+  let el = box.parentElement;
+  while (el && el !== document.body && el !== document.documentElement) {
+    if (!sizedByContent(el)) return el;
+    el = el.parentElement;
+  }
+  return el ?? box;
+}
+
+function sizedByContent(el: HTMLElement): boolean {
+  const cs = getComputedStyle(el);
+  if (cs.display === "contents" || cs.display.startsWith("inline") || cs.display.startsWith("table-cell")) return true;
+  if (cs.position === "absolute" || cs.position === "fixed") return true;
+  if (cs.float && cs.float !== "none") return true;
+  const parent = el.parentElement;
+  if (!parent) return false;
+  const p = getComputedStyle(parent);
+  if (!p.display.endsWith("flex")) return false;
+  if (p.flexDirection.startsWith("column")) {
+    const align = cs.alignSelf && cs.alignSelf !== "auto" ? cs.alignSelf : p.alignItems;
+    return !(align === "" || align === "normal" || align === "stretch");
+  }
+  // A row flex item takes the room its content asks for unless it grows.
+  return !(parseFloat(cs.flexGrow) > 0);
 }
 
 /** Seats the ellipsis flush against the pinned tail (#750).
@@ -87,18 +220,30 @@ export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
  *  from row to row, and a visible space when the cut lands after a word. CSS
  *  can't shrink a box to its ellipsized text, so once the head overflows we
  *  cut it ourselves: `data-elided` swaps the head to `text-overflow: clip` and
- *  draws the `…` as the tail's `::before`, and the head's `max-width` is set to
- *  the last grapheme boundary that fits (trailing whitespace dropped). Any
- *  slack then falls after the tail, where it is just row space. The full
- *  string stays in the DOM, so it is still selectable and copyable; without
- *  layout (tests, SSR) the plain CSS ellipsis remains the fallback. */
+ *  shows the real, `aria-hidden` `…` span before the tail, and the head's
+ *  `max-width` is set to the last grapheme boundary that fits (trailing
+ *  whitespace dropped). Any slack then falls after the tail, where it is just
+ *  row space. The full string stays in the DOM, so it is still selectable and
+ *  copyable. Right-to-left text keeps the plain CSS ellipsis: the range maths
+ *  below measures from the left edge. Without layout (tests, SSR) the CSS
+ *  ellipsis is also the fallback. Synchronous; the component batches the
+ *  same three steps across every instance (`flush`). */
 export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
+  reset(box, head);
+  applyCut(box, head, measureCut(box, head));
+}
+
+function reset(box: HTMLElement, head: HTMLElement) {
   box.removeAttribute("data-elided");
   head.style.maxWidth = "";
-  if (head.scrollWidth <= head.clientWidth) return;
+}
+
+/** The head's new `max-width` in px, or `null` to keep the CSS ellipsis. Reads only. */
+function measureCut(box: HTMLElement, head: HTMLElement): number | null {
+  if (getComputedStyle(box).direction === "rtl") return null;
+  if (head.scrollWidth <= head.clientWidth) return null;
   const node = head.firstChild;
-  if (!(node instanceof Text)) return;
-  box.setAttribute("data-elided", "");
+  if (!(node instanceof Text)) return null;
   const left = head.getBoundingClientRect().left;
   const room = head.clientWidth;
   const range = document.createRange();
@@ -109,7 +254,13 @@ export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
     return range.getBoundingClientRect().right - left;
   };
   const cut = trimTrailingSpace(node.data, lastFitting(graphemeBoundaries(node.data), widthTo, room));
-  head.style.maxWidth = `${widthTo(cut)}px`;
+  return widthTo(cut);
+}
+
+function applyCut(box: HTMLElement, head: HTMLElement, px: number | null) {
+  if (px === null) return;
+  box.setAttribute("data-elided", "");
+  head.style.maxWidth = `${px}px`;
 }
 
 /** Offsets (UTF-16) at which `text` may be cut without splitting a grapheme:
