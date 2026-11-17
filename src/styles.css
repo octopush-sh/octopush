@@ -42,6 +42,9 @@
 
   --color-octo-brass:     #d4a574;
   --color-octo-brass-hi:  #e8c39a;
+  /* Class alias (`border-octo-brass-dim`, `decoration-octo-brass-dim`) for the
+     per-theme `--brass-dim` alpha below; themeStore repaints the source. */
+  --color-octo-brass-dim: var(--brass-dim);
 
   --color-octo-ivory:     #f4ecdb;
   --color-octo-sage:      #95897a;
@@ -429,6 +432,23 @@
   .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
 
+/* ── Row actions over a fade (Talk chat rows, #756) ────────────────
+   Hover/focus actions that sit ON the row's right end instead of beside the
+   title, so revealing them never moves or rewraps anything. The fade repaints
+   exactly what the row shows beneath it: the panel the list sits on (panel-2
+   on the open, boxed row) plus, on a hovered unboxed row, the brass-ghost wash
+   — two layers, so the composite matches the row rather than approximating it.
+   The first 20px (the element's left padding) fade to transparent. */
+.octo-row-actions-fade {
+  --row-fill: var(--color-octo-panel);
+  --row-wash: transparent;
+  background:
+    linear-gradient(to left, var(--row-wash) calc(100% - 20px), transparent),
+    linear-gradient(to left, var(--row-fill) calc(100% - 20px), transparent);
+}
+[data-active] > .octo-row-actions-fade { --row-fill: var(--color-octo-panel-2); }
+.group:not([data-active]):hover > .octo-row-actions-fade { --row-wash: var(--brass-ghost); }
+
 /* ── Elision primitives · middle truncation ──────────────────────
    For any identifier whose HEAD and TAIL both disambiguate — branch names,
    file paths, run ids. A plain `truncate` keeps the head and throws away the
@@ -455,7 +475,20 @@
 .octo-midtrunc-whole { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .octo-midtrunc       { display: inline-flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
 .octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.octo-midtrunc-tail  { flex: none; white-space: nowrap; }
+/* `pre`, not `nowrap`: the seam's space starts the tail (`splitAt`) and would
+   collapse at the flex item's edge otherwise. A plain space, so a copy and
+   the accessible name stay the string itself. */
+.octo-midtrunc-tail  { flex: none; white-space: pre; }
+/* Once the head overflows, MidTruncate cuts it at a grapheme boundary itself
+   and shows its own `…` span between head and tail, so the ellipsis butts
+   against the tail in every row. The engine's own ellipsis leaves up to a
+   glyph of empty room after it (#750). The span is `aria-hidden` and
+   unselectable: the accessible name and a copy stay the full string. Until
+   the cut it is laid out but zero-width and invisible, so its glyph can be
+   measured in the same layout pass and reserved beside the head. */
+.octo-midtrunc-ell   { flex: none; width: 0; visibility: hidden; user-select: none; -webkit-user-select: none; }
+.octo-midtrunc[data-elided] .octo-midtrunc-head { text-overflow: clip; }
+.octo-midtrunc[data-elided] .octo-midtrunc-ell  { width: auto; visibility: visible; }
 /* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
    it as a flex item in the split box, `vertical-align` as inline content in
    the whole one — each property is ignored by the box it doesn't apply to. */

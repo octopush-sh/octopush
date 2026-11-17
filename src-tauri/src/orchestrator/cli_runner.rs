@@ -1291,9 +1291,17 @@ impl CliDialect {
     /// so a stage that writes (or is tricked into planting) a skill in the
     /// worktree it edits would change its own instructions mid-stage, and a
     /// reviewer would certify work done under other rules than it started
-    /// with; an older CLI ignores this one too. All are set on fresh and
-    /// `--resume` runs alike; Run-mode terminals never get them — backgrounding
-    /// and skill reloads are theirs to keep, since a human is directing there.
+    /// with; an older CLI ignores this one too. Subagent progress summaries
+    /// are off (`CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`): 2.1.323
+    /// "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available since
+    /// 2.1.318): set it to `1` to turn off subagent progress summaries and the
+    /// requests that write them". Those requests are billed, and a stage reads
+    /// none of them: the journal leaves `task_summary`-style system events
+    /// out, and the pane shows tool calls and the result. An older CLI ignores
+    /// the unknown variable. All are set on fresh and `--resume` runs alike,
+    /// over any inherited value; Run-mode terminals never get them —
+    /// backgrounding, skill reloads and progress summaries are theirs to keep,
+    /// since a human is directing there.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
@@ -1301,6 +1309,7 @@ impl CliDialect {
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
                 ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
                 ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0".to_string()),
+                ("CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES", "1".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
         }
