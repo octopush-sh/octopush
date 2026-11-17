@@ -61,6 +61,17 @@ struct CliResult {
     /// The tool call a PreToolUse hook deferred (`permissionDecision: "defer"`).
     #[serde(default)]
     deferred_tool_use: Option<CliDeferredToolUse>,
+    /// Start-up errors (Claude Code ≥ 2.1.323), e.g. the settings that failed
+    /// validation ([`refused_setting`]). Kept untyped: only strings are read.
+    #[serde(default)]
+    errors: Option<serde_json::Value>,
+    /// Why the CLI never started the session (Claude Code ≥ 2.1.323), e.g.
+    /// [`SANDBOX_REQUIRED_UNAVAILABLE`]. Older CLIs leave it unset.
+    #[serde(default)]
+    startup_failure_reason: Option<String>,
+    /// Turns the session ran; a start-up stop reports 0.
+    #[serde(default)]
+    num_turns: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -237,6 +248,71 @@ pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
         "none" => Some(CliAuth::Subscription),
         _ => Some(CliAuth::ApiKey),
     }
+}
+
+/// The model a Claude session runs on, from its `system/init` event's
+/// `model`; `None` for any other event or an init without one.
+pub(crate) fn init_model(v: &Value) -> Option<&str> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    v.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty())
+}
+
+/// Claude Code's own aliases cover any id of their family: `sonnet` (or
+/// `sonnet[1m]`, already stripped) runs as some `claude-sonnet-*`;
+/// `opusplan` as Opus or Sonnet; `default`/`best` as whatever the account
+/// resolves them to.
+fn alias_covers(alias: &str, id: &str) -> bool {
+    match alias {
+        "default" | "best" => true,
+        "opusplan" => id.starts_with("claude-opus") || id.starts_with("claude-sonnet"),
+        "sonnet" | "opus" | "haiku" | "fable" | "mythos" => id.starts_with(&format!("claude-{alias}")),
+        _ => false,
+    }
+}
+
+/// True when a stage that asked for `requested` and ran on `ran` ran on the
+/// model it asked for: equal after `token_engine::normalize_model_id`
+/// (gateway prefixes, Bedrock/Vertex suffixes, dated snapshots, dotted
+/// gateway versions, `[1m]`), or one is a Claude Code alias covering the
+/// other (`sonnet` vs `claude-sonnet-5-5`). Pure.
+pub fn same_model(requested: &str, ran: &str) -> bool {
+    let norm = |m: &str| crate::token_engine::normalize_model_id(&m.trim().to_ascii_lowercase());
+    let (a, b) = (norm(requested), norm(ran));
+    a == b || alias_covers(&a, &b) || alias_covers(&b, &a)
+}
+
+/// The model a Claude stage ran on when it isn't the one it asked for: the
+/// `system/init` event's `model` that [`same_model`] says differs. A missing
+/// or empty `model` changes nothing. Pure.
+pub fn substituted_model(requested: &str, init: &Value) -> Option<String> {
+    init_model(init).filter(|ran| !same_model(requested, ran)).map(str::to_string)
+}
+
+/// A model's short display name for the journal: the catalog's name
+/// without "Claude " ("Sonnet 5.5"), else the id as given.
+fn model_display(model: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    router
+        .and_then(|r| r.find_model(model))
+        .map(|(_, m)| m.display_name.trim_start_matches("Claude ").to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// The journal line when a Claude stage runs on another model than it
+/// asked for: "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model
+/// settings picked another model". Since 2.1.323 `claude -p` "now warns on
+/// stderr" when settings block the requested model in text output only;
+/// a stream-json stage says nothing, so this is the only notice.
+pub fn ran_on_notice(requested: &str, ran: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    format!(
+        "ran on {}, not {} — Claude Code's model settings picked another model",
+        model_display(ran, router),
+        model_display(requested, router)
+    )
 }
 
 /// Hand a Claude stream event's plan windows and sign-in end to
@@ -458,6 +534,76 @@ pub const SESSION_NOT_SAVED: &str = "could not save its session";
 /// will not free a full disk — and its session must not be `--resume`d.
 pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
+}
+
+/// The start of the error of a Claude stage that Claude Code refused to start
+/// because the stage's settings failed validation. Since 2.1.323 `claude -p`
+/// "stops at start-up and names the invalid setting" when `--settings` that
+/// turn the sandbox on fail validation, instead of running Bash unsandboxed.
+pub const SETTINGS_REFUSED: &str = "Claude Code refused the stage's settings";
+
+/// True when a stage error is a refused-settings start-up stop (see
+/// [`parse_cli_result`]): the drive must not escalate it — a stronger model
+/// starts with the same settings.
+pub fn is_settings_refused(error: &str) -> bool {
+    error.starts_with(SETTINGS_REFUSED)
+}
+
+/// The `startup_failure_reason` of a result whose `--settings` turn the
+/// sandbox on but failed validation (Claude Code ≥ 2.1.323).
+pub const SANDBOX_REQUIRED_UNAVAILABLE: &str = "sandbox_required_unavailable";
+
+/// The prefix of the line Claude Code prints for that start-up stop.
+const SANDBOX_REQUIRED_PREFIX: &str = "sandbox required but unavailable";
+
+/// A line, without a leading `Error: `, that is Claude Code's own
+/// refused-settings message: the "Sandbox required but unavailable" prefix
+/// together with "failed validation". Any other "failed validation" line
+/// (a gateway probe, a hook) is not one.
+fn refused_settings_line(line: &str) -> Option<&str> {
+    let l = line.trim();
+    let l = l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l);
+    let lower = l.to_ascii_lowercase();
+    (lower.starts_with(SANDBOX_REQUIRED_PREFIX) && lower.contains("failed validation")).then_some(l)
+}
+
+/// The line naming the setting Claude Code refused, from the result's
+/// `errors` (first) or stderr, at most 400 chars. Anchored on the real
+/// signal: `startup_failure_reason` is [`SANDBOX_REQUIRED_UNAVAILABLE`], or
+/// a line is the "Sandbox required but unavailable … failed validation"
+/// message ([`refused_settings_line`]). With the reason but no such line, the
+/// first `errors` string stands in. `None` for any other failure. Pure.
+pub(crate) fn refused_setting(
+    errors: Option<&serde_json::Value>,
+    stderr: &str,
+    startup_failure_reason: Option<&str>,
+) -> Option<String> {
+    let error_lines = || {
+        errors
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str())
+            .flat_map(str::lines)
+    };
+    let clip = |l: &str| -> String { l.chars().take(400).collect() };
+    if let Some(l) = error_lines().chain(stderr.lines()).find_map(refused_settings_line) {
+        return Some(clip(l));
+    }
+    if startup_failure_reason != Some(SANDBOX_REQUIRED_UNAVAILABLE) {
+        return None;
+    }
+    let first = error_lines().map(str::trim).find(|l| !l.is_empty());
+    let first = first.map(|l| l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l));
+    Some(clip(first.unwrap_or("Sandbox required but unavailable: the settings failed validation")))
+}
+
+/// The error for a refused-settings stop ([`SETTINGS_REFUSED`]), with the
+/// stderr tail when there is one.
+fn settings_refused_error(line: &str, stderr: &str) -> String {
+    let error = format!("{SETTINGS_REFUSED}: {line}");
+    let tail = stderr_tail(stderr, 10);
+    if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") }
 }
 
 /// The marker line in the error of a Codex stage that ended (director stop,
@@ -698,6 +844,41 @@ pub fn parse_cli_result(
             blocked: None,
             blocked_transcript: None,
         });
+    }
+
+    // Claude Code refused to start because the stage's settings failed
+    // validation (≥ 2.1.323): name the refused setting, not "stopped early
+    // (error_during_execution)". The session never ran, so there is nothing
+    // to resume. Never a budget stop or a max-turns stop, nor a session that
+    // ran turns: those keep their own handling below.
+    let ran_turns = parsed.num_turns.is_some_and(|n| n > 0);
+    let own_stop = matches!(bad_subtype, Some(BUDGET_STOP_SUBTYPE) | Some("error_max_turns"));
+    if (parsed.is_error || !exit_success) && !ran_turns && !own_stop {
+        if let Some(line) =
+            refused_setting(parsed.errors.as_ref(), stderr_text, parsed.startup_failure_reason.as_deref())
+        {
+            return Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: String::new(),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                cache_read_tokens: parsed.usage.cache_read_input_tokens,
+                cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+                cost_usd: parsed.total_cost_usd,
+                status: StageStatus::Failed,
+                tool_calls: vec![],
+                error: Some(settings_refused_error(&line, stderr_text)),
+                verdict: None,
+                session_id: None,
+                blocked: None,
+                blocked_transcript: None,
+            });
+        }
     }
 
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
@@ -1918,22 +2099,43 @@ fn minutes(d: std::time::Duration) -> u64 {
 }
 
 /// What an idle stall found: the tool call still open when it tripped (if
-/// any) and the silence it waited.
+/// any), the silence it waited, and — when the last line was a Claude
+/// `system/api_retry` — that retry's cause ("" when it named none).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IdleStall {
     pub tool: Option<OpenTool>,
     pub window: std::time::Duration,
+    pub after_retry: Option<String>,
+}
+
+/// The longest retry delay [`retry_idle_window`] waits out: 300s, the
+/// ceiling Claude Code 2.1.323 set for `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS`
+/// (529 overload backoff). A 429 `Retry-After` or a wait under
+/// `CLAUDE_CODE_RETRY_WATCHDOG` can be longer; it is capped here too, so the
+/// window after a retry stays about 10 minutes at most.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a Claude stage may stay silent after a `system/api_retry` that
+/// says it waits `retry_delay` before the next attempt: that delay (capped at
+/// [`MAX_RETRY_DELAY`]) plus the plain window for the attempt itself, never
+/// below `idle`.
+pub(crate) fn retry_idle_window(idle: std::time::Duration, retry_delay: std::time::Duration) -> std::time::Duration {
+    retry_delay.min(MAX_RETRY_DELAY).saturating_add(idle).max(idle)
 }
 
 /// The stage error for an idle stall, after the CLI's name: "timed out — no
-/// output for 5 minutes", or naming the open call ("timed out — Bash `npm
-/// test` gave no result for 11 minutes").
+/// output for 5 minutes", naming the open call ("timed out — Bash `npm
+/// test` gave no result for 11 minutes"), or the API retry it was waiting
+/// out ("timed out — no output for 10 minutes after an API retry
+/// (overloaded)").
 pub(crate) fn idle_timeout_message(stall: &IdleStall) -> String {
     let m = minutes(stall.window);
     let unit = if m == 1 { "minute" } else { "minutes" };
-    match &stall.tool {
-        Some(t) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
-        None => format!("timed out — no output for {m} {unit}"),
+    match (&stall.tool, stall.after_retry.as_deref()) {
+        (Some(t), _) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
+        (None, Some("")) => format!("timed out — no output for {m} {unit} after an API retry"),
+        (None, Some(cause)) => format!("timed out — no output for {m} {unit} after an API retry ({cause})"),
+        (None, None) => format!("timed out — no output for {m} {unit}"),
     }
 }
 
@@ -1994,7 +2196,11 @@ impl ReadLimits {
 /// window is [`ReadLimits::command_idle`] — Claude Code itself waits that
 /// long on a foreground command that prints nothing to the stream. The first
 /// time a stage stays silent past `idle` on that account, `on_long_wait` gets
-/// the window (the journal line). Codex keeps the plain idle window.
+/// the window (the journal line). After a `system/api_retry` with a numeric
+/// `retry_delay_ms` the next silence may last that delay plus `idle`
+/// ([`retry_idle_window`]) — the CLI is waiting out its own backoff; the
+/// next line of any other kind goes back to the plain window. Codex keeps
+/// the plain idle window.
 pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     dialect: CliDialect,
@@ -2014,6 +2220,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     let settled = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() >= limits.settle);
     let mut open = OpenTools::default();
     let mut long_wait_noted = false;
+    // The last line was a Claude `system/api_retry`: its cause and the
+    // silence it allows ([`retry_idle_window`]).
+    let mut retry_wait: Option<(String, std::time::Duration)> = None;
     loop {
         if settled(result_at) {
             if let Some(line) = result_line.take() {
@@ -2025,12 +2234,16 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             return ReadEnd::AbsCap(result_line, tail);
         }
         raw.clear();
-        let window = if open.command_open() { limits.command_idle.max(limits.idle) } else { limits.idle };
+        let command = open.command_open();
+        let mut window = if command { limits.command_idle.max(limits.idle) } else { limits.idle };
+        if let Some((_, w)) = &retry_wait {
+            window = window.max(*w);
+        }
         let mut wait = window.min(limits.cap - elapsed);
         if let Some(at) = result_at {
             wait = wait.min(limits.settle.saturating_sub(at.elapsed()));
         }
-        let read = if wait > limits.idle {
+        let read = if command && wait > limits.idle {
             // Only an open command waits past `idle`: say so once when it
             // does, then wait out the rest. `raw` keeps a partial line.
             let first = tokio::time::timeout(limits.idle, reader.read_until(b'\n', &mut raw)).await;
@@ -2057,7 +2270,8 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                 if started.elapsed() >= limits.cap {
                     return ReadEnd::AbsCap(result_line, tail);
                 }
-                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window });
+                let after_retry = retry_wait.map(|(cause, _)| cause);
+                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window, after_retry });
             }
             Ok(Ok(0)) => break,  // EOF
             Ok(Ok(_)) => {}
@@ -2076,6 +2290,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             continue;
         };
         if dialect == CliDialect::Claude {
+            retry_wait = crate::orchestrator::live::api_retry_cause(&value).zip(
+                crate::orchestrator::live::api_retry_delay(&value).map(|d| retry_idle_window(limits.idle, d)),
+            );
             open.observe(&value);
             if is_result_event(&value) {
                 result_line = Some(trimmed.to_string());
@@ -2432,6 +2649,11 @@ impl CliRunner {
         if let Some(note) = codex_git_notice(dialect, read_only, write_scope, stage.role_environment) {
             emitter.notice(note);
         }
+        if dialect == CliDialect::Codex {
+            if let Some(note) = crate::codex_trust::untrusted_note(&ctx.workspace_path) {
+                emitter.notice(&format!("{} {}", note.line, note.how));
+            }
+        }
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2505,8 +2727,20 @@ impl CliRunner {
         let mut auth: Option<CliAuth> = None;
         // A retry storm journals one line per cause per 10 s, not one per attempt.
         let mut retry_throttle = crate::orchestrator::live::RetryThrottle::default();
+        // From `system/init`: the model the session runs on, when it isn't
+        // the one the stage asked for (settings such as `availableModels`
+        // can make Claude Code pick another). Prices a stop's estimate and
+        // goes on the outcome (`CliOutcomeMeta::ran_model`).
+        let ran_model: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let ran_in_loop = std::sync::Arc::clone(&ran_model);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
+                if let Some(ran) = substituted_model(&stage.agent_model, value) {
+                    let catalog = crate::token_engine::catalog();
+                    emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
+                    *ran_in_loop.lock() = Some(ran);
+                }
                 if let Some((id, u)) = usage_from_stream_event(value) {
                     let mut map = usage_in_loop.lock();
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
@@ -2577,14 +2811,16 @@ impl CliRunner {
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
                 let (counted, drift) = counted_usage();
+                let ran = ran_model.lock().clone();
                 let mut out = stopped_stage(
                     dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
-                    &stage.agent_model,
+                    ran.as_deref().unwrap_or(&stage.agent_model),
                     &counted,
                     codex_accum.lock().turn_open,
                 );
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                out.cli.ran_model = ran;
                 return Ok(out);
             }
         };
@@ -2610,14 +2846,16 @@ impl CliRunner {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
             let (counted, drift) = counted_usage();
+            let ran = ran_model.lock().clone();
             let mut out = stopped_stage(
                 dialect,
                 &format!("{bin} {kind}"),
-                &stage.agent_model,
+                ran.as_deref().unwrap_or(&stage.agent_model),
                 &counted,
                 codex_accum.lock().turn_open,
             );
             flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+            out.cli.ran_model = ran;
             return Ok(out);
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -2694,15 +2932,21 @@ impl CliRunner {
             }
             CliDialect::Claude => match result_line {
                 Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                    Ok(outcome) => Ok(apply_question_guard(with_free_space(
-                        outcome,
-                        || free_bytes(&ctx.workspace_path),
-                    ))),
+                    Ok(mut outcome) => {
+                        outcome.cli.ran_model = ran_model.lock().clone();
+                        Ok(apply_question_guard(with_free_space(outcome, || free_bytes(&ctx.workspace_path))))
+                    }
                     Err(_) => Ok(failed_stage(&format!(
                         "claude produced no parseable result: {}",
                         failure_detail(&stderr_out, &line)
                     ))),
                 },
+                // No result event, but stderr carries Claude Code's own
+                // "Sandbox required but unavailable … failed validation" line.
+                None if !exit_success && refused_setting(None, &stderr_out, None).is_some() => {
+                    let line = refused_setting(None, &stderr_out, None).unwrap_or_default();
+                    Ok(failed_stage(&settings_refused_error(&line, &stderr_out)))
+                }
                 None => {
                     let recent = tail.into_iter().collect::<Vec<_>>().join("\n");
                     let fallback = if recent.trim().is_empty() {

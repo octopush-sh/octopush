@@ -318,6 +318,10 @@ export interface RunStage {
    *  its cost reads "usage not reported", never $0.00, and like an unpriced
    *  stage it is invisible to the run budget. */
   usageUnreported?: boolean;
+  /** The model the stage's last attempt actually ran on, when Claude Code's
+   *  `system/init` named another than `agentModel` (set by `get_run`; #791).
+   *  null/absent = it ran on the model it asked for. */
+  ranModel?: string | null;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -1560,6 +1564,9 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
+  codexTrustNote: (workspacePath: string) =>
+    invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -1649,6 +1656,15 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+}
+
+/** Codex will skip the repo's `.codex/` config: the project is marked
+ *  untrusted in Codex, or has no trust decision saved
+ *  (`commands::codex_trust_note`). */
+export interface CodexTrustNote {
+  line: string;
+  /** How the user can trust it themselves; differs between the two states. */
+  how: string;
 }
 
 /** A crew model the installed Claude Code is too old for (mirrors Rust
