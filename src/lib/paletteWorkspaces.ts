@@ -1,6 +1,7 @@
 import type { Run } from "./ipc";
 import type { Workspace } from "./types";
 import { needsYou } from "./runStatus";
+import { resolveMonogram } from "./monogram";
 
 /** One row of the ⌘K Workspaces group. */
 export interface PaletteWorkspace {
@@ -53,7 +54,8 @@ export function paletteWorkspaces(
         name,
         branch: ws.branch ?? "",
         project: project.name ?? "",
-        glyph: ws.glyph || name.charAt(0).toUpperCase() || "?",
+        // The rail's monogram, so the row reads like the rail.
+        glyph: resolveMonogram(ws).glyph,
         needsYou: waiting.length > 0,
         running: Boolean(runningByWs?.[ws.id]),
         keywords: [name, ws.branch ?? "", project.name ?? ""].filter(Boolean),

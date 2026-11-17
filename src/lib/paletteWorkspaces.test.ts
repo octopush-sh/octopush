@@ -51,6 +51,13 @@ describe("paletteWorkspaces", () => {
     expect(rows.every((r) => !r.needsYou)).toBe(true);
   });
 
+  it("uses the rail's monogram: a custom glyph wins over the first letter", () => {
+    const custom = [{ name: "p", workspaces: [ws("g", "lower-case name", "b", "2026-11-01T00:00:00Z", { glyph: "★" })] }];
+    expect(paletteWorkspaces(custom, {}, {}, {})[0].glyph).toBe("★");
+    const plain = [{ name: "p", workspaces: [ws("h", "lower-case name", "b", "2026-11-01T00:00:00Z")] }];
+    expect(paletteWorkspaces(plain, {}, {}, {})[0].glyph).toBe("L");
+  });
+
   it("keys each row by name, branch and project so a branch fragment matches", () => {
     const row = paletteWorkspaces(projects, {}, {}, {}).find((r) => r.id === "d")!;
     expect(row.keywords).toEqual(["Waiting long", "pm/issue-772", "octopush-api"]);

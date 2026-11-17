@@ -41,7 +41,7 @@ const projects: ProjectGroup[] = [
   { id: "p2", name: "octopush-api", workspaces: [ws("w2", "p2", "Sync since", "pm/issue-772", "2026-11-01T10:00:00Z")] },
 ];
 
-async function renderPalette(onSelectWorkspace = vi.fn(), onClose = vi.fn()) {
+async function renderPalette(onSelectWorkspace = vi.fn(), onClose = vi.fn(), groups: ProjectGroup[] = projects) {
   await act(async () => {
     render(
       <CommandPalette
@@ -49,7 +49,7 @@ async function renderPalette(onSelectWorkspace = vi.fn(), onClose = vi.fn()) {
         onClose={onClose}
         onNewSession={vi.fn()}
         onToggleTokens={vi.fn()}
-        projects={projects}
+        projects={groups}
         runningByWs={{}}
         onSelectWorkspace={onSelectWorkspace}
       />,
@@ -99,6 +99,36 @@ describe("CommandPalette · Workspaces group", () => {
     });
     expect(onSelectWorkspace).toHaveBeenCalledWith("w2");
     expect(onClose).toHaveBeenCalled();
+  });
+
+  it("keeps two same-named `main` workspaces in same-named projects apart for the keyboard", async () => {
+    // Two checkouts of one repo: both projects are "octopush", both have a
+    // `main` workspace on branch `main`. cmdk selects by `value`, so the rows
+    // must not share one.
+    const twins: ProjectGroup[] = [
+      { id: "p1", name: "octopush", workspaces: [ws("m1", "p1", "main", "main", "2026-11-16T10:00:00Z")] },
+      { id: "p2", name: "octopush", workspaces: [ws("m2", "p2", "main", "main", "2026-11-15T10:00:00Z")] },
+    ];
+    const { onSelectWorkspace } = await renderPalette(vi.fn(), vi.fn(), twins);
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    const rows = () => screen.getAllByTestId("palette-workspace");
+    const selected = () => rows().map((r) => r.getAttribute("aria-selected") === "true");
+    expect(rows()).toHaveLength(2);
+    // Walk down to the first workspace row, then one more.
+    for (let i = 0; i < 100 && !selected()[0]; i++) {
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    expect(selected()).toEqual([true, false]);
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+    });
+    expect(selected()).toEqual([false, true]);
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(onSelectWorkspace).toHaveBeenCalledWith("m2");
   });
 
   it("shows no group without a workspace switcher", async () => {

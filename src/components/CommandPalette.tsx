@@ -445,7 +445,10 @@ function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () 
   const state = row.needsYou ? "Needs you" : row.running ? "Working" : null;
   return (
     <Command.Item
-      value={`${row.name} · ${row.project} · ${row.branch}`}
+      // cmdk keys selection on `value`: the id keeps two same-named rows
+      // (one `main` per project) distinct; name, branch and project match
+      // through `keywords`.
+      value={row.id}
       keywords={row.keywords}
       onSelect={onSelect}
       data-testid="palette-workspace"
@@ -453,8 +456,7 @@ function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () 
     >
       <span
         aria-hidden
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded font-serif text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
-        style={{ border: "1px solid var(--color-octo-hairline)" }}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline font-serif text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
       >
         {row.glyph}
       </span>
