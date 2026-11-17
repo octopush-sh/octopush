@@ -9274,6 +9274,28 @@ mod cli_runner_tests {
     use crate::orchestrator::cli_runner::parse_cli_result;
     use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
+    #[test]
+    fn auto_memory_is_turned_off_only_for_sandboxed_claude_stages() {
+        use crate::orchestrator::cli_runner::{sandboxed_stage_env, CliDialect};
+        use crate::orchestrator::sandbox::claude_stage_env;
+        let prepared = vec![("TMPDIR".to_string(), "/stage/tmp".to_string())];
+        let claude = sandboxed_stage_env(CliDialect::Claude, prepared.clone());
+        assert_eq!(claude[0], prepared[0], "the prepared env comes first");
+        for var in claude_stage_env() {
+            assert!(claude.contains(&var), "{var:?} is set for a sandboxed Claude stage");
+        }
+        let codex = sandboxed_stage_env(CliDialect::Codex, prepared.clone());
+        assert_eq!(codex, prepared, "a Codex stage gets the prepared env only");
+        assert!(!codex.iter().any(|(k, _)| k == "CLAUDE_CODE_DISABLE_AUTO_MEMORY"));
+        // An unsandboxed stage gets no env from the sandbox at all: only the
+        // sandbox arm of the spawn calls `sandboxed_stage_env`.
+        let src = include_str!("orchestrator/cli_runner.rs");
+        let calls: Vec<_> = src.match_indices("sandboxed_stage_env(dialect, ").collect();
+        assert_eq!(calls.len(), 1, "one call site");
+        let arm = src[..calls[0].0].rfind("\"sandbox\" => {").expect("inside the sandbox arm");
+        assert!(!src[arm..calls[0].0].contains("\"none\" =>"), "not in the unsandboxed arm");
+    }
+
     const SUCCESS: &str = r#"{
         "type":"result","subtype":"success","is_error":false,
         "result":"Implemented the feature.","total_cost_usd":0.0123,

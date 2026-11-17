@@ -4,4 +4,4 @@ kind: improvement
 area: app
 highlight: false
 ---
-A sandboxed stage now writes only the parts of `~/.claude` Claude Code keeps its session state in (transcripts, task lists, snapshots), not its skills, agents, commands, plugins, hooks or settings. It no longer writes the shared `~/.cache` either: tools that cache there use the stage's own build cache.
+A sandboxed stage now writes only the parts of `~/.claude` (or your `CLAUDE_CONFIG_DIR`) that hold Claude Code's session state, not its skills, agents, plugins, hooks or settings. Auto memory is off in sandboxed Claude stages. The shared `~/.cache` isn't writable either: pre-commit, uv and similar caches use the stage's own build cache, so they start cold once per workspace.
