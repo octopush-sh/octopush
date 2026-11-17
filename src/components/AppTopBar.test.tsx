@@ -10,6 +10,7 @@ vi.mock("../hooks/useMascotState", () => ({
 }));
 
 import { AppTopBar, projectNameFits } from "./AppTopBar";
+import { readable } from "../test-utils/readable";
 
 function renderBar(projectName: string | null) {
   return render(
@@ -46,6 +47,6 @@ describe("AppTopBar project name", () => {
     expect(name.querySelector(".octo-midtrunc-tail")).toHaveTextContent("ise-monorepo");
     // The full string stays in the DOM; the only extra glyph is MidTruncate's
     // aria-hidden `…`, shown only once the head is cut.
-    expect(name.textContent?.replace("…", "")).toBe(long);
+    expect(readable(name)).toBe(long);
   });
 });

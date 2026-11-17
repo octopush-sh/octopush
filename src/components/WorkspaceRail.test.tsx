@@ -4,6 +4,7 @@ import { WorkspaceRail, resolveAttention, type ProjectGroup } from "./WorkspaceR
 import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import type { Workspace, Mission } from "../lib/types";
+import { readable } from "../test-utils/readable";
 
 function makeMission(overrides: Partial<Mission> = {}): Mission {
   return {
@@ -244,7 +245,7 @@ describe("WorkspaceRail", () => {
     expect(header).not.toHaveClass("truncate");
     expect(header.querySelector(".octo-midtrunc-tail")).toHaveTextContent("prise-monorepo");
     // Full name in the DOM; the only extra glyph is the aria-hidden `…`.
-    expect(header.textContent?.replace("…", "")).toBe(name);
+    expect(readable(header)).toBe(name);
     // The fold control carries the full name as its tooltip.
     expect(screen.getByRole("button", { name, expanded: true })).toHaveAttribute(
       "title",
@@ -413,7 +414,8 @@ describe("WorkspaceRail", () => {
       />,
     );
     const tails = [...container.querySelectorAll(".octo-midtrunc-tail")].map((t) => t.textContent);
-    expect(tails).toEqual(["(octopush-api)", "(octopush-web)"]);
+    // The seam's space starts the tail (kept by its `white-space: pre`).
+    expect(tails).toEqual([" (octopush-api)", " (octopush-web)"]);
     // The full name stays the tooltip.
     expect(screen.getByTitle("Production deploy (octopush-api)")).toBeInTheDocument();
     // Short names take the plain path — no split.

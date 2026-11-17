@@ -86,15 +86,16 @@ export function flatten(text: string): string {
   return text.replace(/\r\n|[\r\n\t]/g, " ");
 }
 
-/** Splits at `at`. Under `nowrap` a space at the very end of the head, or the
- *  very start of the tail, is a line-edge space and collapses away — the two
- *  halves are separate flex items — so `deploy (api)` would read `deploy(api)`.
- *  The one space on each side of the seam becomes a no-break space, which
- *  keeps its width. */
+/** Splits at `at`. Under `nowrap` a space at the very end of the head is a
+ *  line-edge space and collapses away — the two halves are separate flex
+ *  items — so `deploy (api)` would read `deploy(api)`. Whitespace at the end
+ *  of the head moves to the start of the tail instead, and the tail alone is
+ *  `white-space: pre` (`.octo-midtrunc-tail`), which keeps it. The text stays
+ *  plain spaces, so a copy and the accessible name are the string itself. */
 export function splitAt(text: string, at: number): [string, string] {
-  const head = text.slice(0, at).replace(/ $/, " ");
-  const tail = text.slice(at).replace(/^ /, " ");
-  return [head, tail];
+  let cut = at;
+  while (cut > 0 && text[cut - 1] === " ") cut--;
+  return [text.slice(0, cut), text.slice(cut)];
 }
 
 // ── One observer, batched layout ────────────────────────────────────────
@@ -107,6 +108,7 @@ export function splitAt(text: string, at: number): [string, string] {
 interface Tracked {
   box: HTMLElement;
   head: HTMLElement;
+  ell: HTMLElement | null;
   anchor: Element;
 }
 
@@ -119,7 +121,7 @@ let frame: (() => void) | null = null; // cancels the pending frame
 
 function track(box: HTMLElement, head: HTMLElement): () => void {
   const anchor = widthAnchor(box);
-  const t: Tracked = { box, head, anchor };
+  const t: Tracked = { box, head, ell: ellOf(box), anchor };
   tracked.add(t);
   let peers = byAnchor.get(anchor);
   if (!peers) {
@@ -153,9 +155,11 @@ function onResize(records: ResizeObserverEntry[]) {
   for (const r of records) {
     const width = r.contentRect.width;
     const before = lastWidth.get(r.target);
-    lastWidth.set(r.target, width);
     // Under a pixel of slack can't move the cut by a glyph: skip the re-cut.
+    // The recorded width only moves when a re-cut is scheduled, so many small
+    // steps still add up to one.
     if (before !== undefined && Math.abs(width - before) < 1) continue;
+    lastWidth.set(r.target, width);
     for (const t of byAnchor.get(r.target) ?? []) schedule(t);
   }
 }
@@ -177,7 +181,7 @@ function flush() {
   const batch = [...dirty].filter((t) => t.box.isConnected);
   dirty.clear();
   for (const t of batch) reset(t.box, t.head); // writes
-  const cuts = batch.map((t) => measureCut(t.box, t.head)); // reads
+  const cuts = batch.map((t) => measureCut(t.box, t.head, t.ell)); // reads
   batch.forEach((t, i) => applyCut(t.box, t.head, cuts[i])); // writes
 }
 
@@ -221,8 +225,8 @@ function sizedByContent(el: HTMLElement): boolean {
  *  can't shrink a box to its ellipsized text, so once the head overflows we
  *  cut it ourselves: `data-elided` swaps the head to `text-overflow: clip` and
  *  shows the real, `aria-hidden` `…` span before the tail, and the head's
- *  `max-width` is set to the last grapheme boundary that fits (trailing
- *  whitespace dropped). Any slack then falls after the tail, where it is just
+ *  `max-width` is set to the last grapheme boundary that fits beside the
+ *  `…` (its width is reserved; trailing whitespace dropped). Any slack then falls after the tail, where it is just
  *  row space. The full string stays in the DOM, so it is still selectable and
  *  copyable. Right-to-left text keeps the plain CSS ellipsis: the range maths
  *  below measures from the left edge. Without layout (tests, SSR) the CSS
@@ -230,31 +234,57 @@ function sizedByContent(el: HTMLElement): boolean {
  *  same three steps across every instance (`flush`). */
 export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
   reset(box, head);
-  applyCut(box, head, measureCut(box, head));
+  applyCut(box, head, measureCut(box, head, ellOf(box)));
 }
+
+function ellOf(box: HTMLElement): HTMLElement | null {
+  return box.querySelector<HTMLElement>(":scope > .octo-midtrunc-ell");
+}
+
+/** Float noise in range maths, not a rounding allowance: the cut must fit. */
+const EPS = 0.01;
 
 function reset(box: HTMLElement, head: HTMLElement) {
   box.removeAttribute("data-elided");
   head.style.maxWidth = "";
 }
 
-/** The head's new `max-width` in px, or `null` to keep the CSS ellipsis. Reads only. */
-function measureCut(box: HTMLElement, head: HTMLElement): number | null {
+/** The head's new `max-width` in px, or `null` to keep the CSS ellipsis
+ *  (nothing to cut, RTL, or no layout). Reads only.
+ *
+ *  `room` is the head's own width, read while the `…` span takes no room
+ *  (`.octo-midtrunc-ell` is zero-width until `data-elided`); the span's
+ *  glyph is laid out all the same, so its width is measured in the same
+ *  layout and subtracted — head + `…` + tail never exceed the box. */
+function measureCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null): number | null {
   if (getComputedStyle(box).direction === "rtl") return null;
-  if (head.scrollWidth <= head.clientWidth) return null;
   const node = head.firstChild;
-  if (!(node instanceof Text)) return null;
-  const left = head.getBoundingClientRect().left;
-  const room = head.clientWidth;
+  if (!(node instanceof Text) || node.length === 0) return null;
   const range = document.createRange();
+  if (typeof range.getBoundingClientRect !== "function") return null;
+  const rect = head.getBoundingClientRect();
+  const left = rect.left;
+  const full = rect.width;
   const widthTo = (i: number) => {
     if (i === 0) return 0;
     range.setStart(node, 0);
     range.setEnd(node, i);
     return range.getBoundingClientRect().right - left;
   };
-  const cut = trimTrailingSpace(node.data, lastFitting(graphemeBoundaries(node.data), widthTo, room));
-  return widthTo(cut);
+  // The whole head fits: nothing is cut, so no `…` either.
+  if (widthTo(node.length) <= full + EPS) return null;
+  const room = full - ellipsisWidth(ell, range);
+  const fit = lastFitting(graphemeBoundaries(node.data), widthTo, room);
+  if (fit >= node.length) return null;
+  return widthTo(trimTrailingSpace(node.data, fit));
+}
+
+function ellipsisWidth(ell: HTMLElement | null, range: Range): number {
+  const glyph = ell?.firstChild;
+  if (!(glyph instanceof Text)) return 0;
+  range.setStart(glyph, 0);
+  range.setEnd(glyph, glyph.length);
+  return range.getBoundingClientRect().width;
 }
 
 function applyCut(box: HTMLElement, head: HTMLElement, px: number | null) {
@@ -279,14 +309,13 @@ export function graphemeBoundaries(text: string): number[] {
   return out;
 }
 
-/** The largest boundary whose prefix fits in `room` px (half a pixel of
- *  rounding forgiven). `widthTo` must be monotonic, so this is a binary search. */
+/** The largest boundary whose prefix fits in `room` px. `widthTo` must be monotonic, so this is a binary search. */
 export function lastFitting(bounds: number[], widthTo: (i: number) => number, room: number): number {
   let lo = 0;
   let hi = bounds.length - 1;
   while (lo < hi) {
     const mid = (lo + hi + 1) >> 1;
-    if (widthTo(bounds[mid]) <= room + 0.5) lo = mid;
+    if (widthTo(bounds[mid]) <= room + EPS) lo = mid;
     else hi = mid - 1;
   }
   return bounds[lo];
