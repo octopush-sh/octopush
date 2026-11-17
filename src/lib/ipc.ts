@@ -317,6 +317,10 @@ export interface RunStage {
    *  its cost reads "usage not reported", never $0.00, and like an unpriced
    *  stage it is invisible to the run budget. */
   usageUnreported?: boolean;
+  /** The model the stage's last attempt actually ran on, when Claude Code's
+   *  `system/init` named another than `agentModel` (set by `get_run`; #791).
+   *  null/absent = it ran on the model it asked for. */
+  ranModel?: string | null;
   artifact: string | null;
   feedback: string | null;
   error: string | null;

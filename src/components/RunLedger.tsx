@@ -3,6 +3,7 @@ import type { Run, RunStage } from "../lib/ipc";
 import { savingsVsBaseline } from "../lib/runStatus";
 import { labelForRole, fmtTokens } from "../lib/stageMeta";
 import { Reveal } from "./primitives/Reveal";
+import { ranOnNote, ranOnTitle } from "../lib/modelLabel";
 import { OctoMark } from "./icons/OctoMark";
 import {
   budgetUnenforceableNote,
@@ -50,7 +51,7 @@ export function RunLedger({ run, stages }: Props) {
   // Spend the budget cannot see: an unpriced model, or a stage whose CLI
   // stopped before it reported usage.
   const unpriced = stages.filter((s) => s.unpricedModel || s.usageUnreported);
-  const unpricedModels = [...new Set(stages.filter((s) => s.unpricedModel).map((s) => s.agentModel))];
+  const unpricedModels = [...new Set(stages.filter((s) => s.unpricedModel).map((s) => s.ranModel ?? s.agentModel))];
   const unreported = stages.filter((s) => s.usageUnreported).length;
   const unenforceableTitle = [
     "The budget pauses the run on billed cost; unpriced stages bill $0, so it cannot stop their spend.",
@@ -129,13 +130,18 @@ export function RunLedger({ run, stages }: Props) {
                   usage not reported
                 </span>
               ) : s.unpricedModel && s.costUsd === 0 ? (
-                <span className="text-octo-mute" title={unpricedTitle([s.agentModel])}>unpriced</span>
+                <span className="text-octo-mute" title={unpricedTitle([s.ranModel ?? s.agentModel])}>unpriced</span>
               ) : (
                 <span className="octo-tabular text-octo-sage">{formatUsd(s.costUsd)}</span>
               )}
               {s.usageUnreported && s.costUsd > 0 && (
                 <span className="text-octo-mute" title={USAGE_UNREPORTED_TITLE} data-tour="direct-ledger-usage-unreported-stage">
                   {" "}+ usage not reported
+                </span>
+              )}
+              {s.ranModel && (
+                <span className="text-octo-warning" title={ranOnTitle(s.agentModel, s.ranModel)}>
+                  {" "}· {ranOnNote(s.ranModel)}
                 </span>
               )}
               {(s.inputTokens > 0 || s.outputTokens > 0) && (

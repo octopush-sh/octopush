@@ -4222,6 +4222,35 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_stage_that_ran_on_another_model_is_attributed_to_it() {
+        // #791: Claude Code's settings ran the stage on Sonnet, not the Opus
+        // it asked for — the ledger row (Usage, savings) names what ran.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+
+        db.set_run_stage_ran_model(&stage, Some("claude-sonnet-5-5")).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        let rep = db.token_report(None).unwrap();
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-sonnet-5-5"), "{:?}", rep.cost_by_model);
+        assert!(!rep.cost_by_model.iter().any(|m| m.label == "claude-opus-5-5"));
+        assert_eq!(db.ran_models(&run).unwrap().get(&stage).map(String::as_str), Some("claude-sonnet-5-5"));
+        // The stage still asked for Opus.
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].agent_model, "claude-opus-5-5");
+
+        // A re-run clears it; an attempt on the model it asked for records none.
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+        db.set_run_stage_ran_model(&stage, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+    }
+
+    #[test]
     fn check_budget_blocks_only_when_over_a_configured_limit() {
         // Phase 3 backend gate: blocks only when a *configured* budget is at/over
         // its limit; no budget → always allow.
@@ -18746,5 +18775,76 @@ mod collision_tests {
         assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
         assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
         assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+#[cfg(test)]
+mod ran_model_tests {
+    use crate::orchestrator::cli_runner::{ran_on_notice, same_model, substituted_model};
+    use serde_json::json;
+
+    #[test]
+    fn aliases_snapshots_and_gateway_spellings_are_the_same_model() {
+        for (asked, ran) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
+            ("opus", "claude-opus-5-5-20261001"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
+            ("opusplan", "claude-sonnet-5-5"),
+            ("default", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-5-5"),
+            ("claude-opus-4-6[1m]", "claude-opus-4-6"),
+            ("claude-sonnet-latest", "claude-sonnet-latest"),
+            ("Claude-Sonnet-5-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(same_model(asked, ran), "{asked} vs {ran}");
+            assert!(same_model(ran, asked), "{ran} vs {asked}");
+        }
+    }
+
+    #[test]
+    fn another_model_is_not_the_same() {
+        for (asked, ran) in [
+            ("claude-opus-5-5", "claude-sonnet-5-5"),
+            ("opus", "claude-sonnet-5-5"),
+            ("sonnet", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-fable-5-2", "claude-fable-5-1"),
+            ("opusplan", "claude-haiku-5-5"),
+        ] {
+            assert!(!same_model(asked, ran), "{asked} vs {ran}");
+        }
+    }
+
+    #[test]
+    fn only_an_init_naming_another_model_is_a_substitution() {
+        let init = |m: serde_json::Value| json!({"type": "system", "subtype": "init", "model": m});
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!("claude-sonnet-5-5"))).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(substituted_model("sonnet", &init(json!("claude-sonnet-5-5"))), None, "no false alarm on an alias");
+        // A missing, empty or non-string model changes nothing.
+        assert_eq!(substituted_model("claude-opus-5-5", &json!({"type": "system", "subtype": "init"})), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(""))), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(42))), None);
+        // Only `system/init` counts.
+        let assistant = json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}});
+        assert_eq!(substituted_model("claude-opus-5-5", &assistant), None);
+    }
+
+    #[test]
+    fn the_notice_names_both_models_by_their_catalog_names() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "claude-sonnet-5-5", Some(&router)),
+            "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model settings picked another model"
+        );
+        // An id the catalog doesn't know prints as given.
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "team-model", None),
+            "ran on team-model, not claude-opus-5-5 — Claude Code's model settings picked another model"
+        );
     }
 }
