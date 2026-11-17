@@ -145,6 +145,7 @@ Current anchors:
 | `rail-collision` | Rail row meta: the `GitCompareArrows` collision mark, amber for a file overlap, rouge for a confirmed conflict (only while another live workspace of the project changes the same files) | `CollisionMark.tsx` via `WorkspaceRail.tsx` |
 | `mission-control-card-collision` | Mission Control, a non-settled crew card: the "overlaps auth-flow · 2 files" meta segment (only while its workspace overlaps another) | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` · `mission-control-card-spent` | Mission Control crew card: its task title · the workspace name in its meta row · the spent figure in its ledger foot | `MissionControl.tsx` |
+| `mission-control-card-size` · `mission-control-settled-order` | Mission Control crew card (settled and needs-you): the `+N −M · K files` diff size in its ledger foot (only once measured) · the Settled band's Oldest first / Smallest first toggle | `MissionControl.tsx` |
 | `mission-control-ask-toggle` · `mission-control-ask-accept` | Mission Control `?` card (an `ask_director` block): the questions disclosure · "Accept recommended" | `MissionControl.tsx` |
 
 A target only counts as found when it is visible; the tour waits up to 2s for it after

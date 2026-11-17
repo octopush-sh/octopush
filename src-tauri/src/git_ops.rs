@@ -847,6 +847,133 @@ pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<Stri
     Ok((text, subjects))
 }
 
+/// How much code a workspace holds for review: files changed and lines
+/// added/removed from the merge base with `base` to the working tree —
+/// committed work, staged and unstaged edits and untracked files together
+/// (what a reviewer of the crew's branch reads). Renames are detected, so a
+/// moved file counts its edits, not a whole delete plus add. `base` is `None`
+/// when the workspace has no base branch or it no longer resolves: the size
+/// is then the uncommitted changes against HEAD, and says so.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSize {
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub base: Option<String>,
+    /// Untracked entries counted as files but not line-counted: a directory
+    /// past [`crate::collisions::MAX_UNTRACKED_DIR_FILES`] files (one entry),
+    /// a file past the [`MAX_UNTRACKED_LINE_FILES`] / [`MAX_UNTRACKED_LINE_BYTES`]
+    /// budget, or one too large to read whole. `0` when every line counted.
+    pub untracked_skipped: usize,
+}
+
+/// At most this many untracked files are read to count their lines.
+pub const MAX_UNTRACKED_LINE_FILES: usize = 200;
+/// At most this many bytes of untracked files are read in total.
+pub const MAX_UNTRACKED_LINE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Lines in an untracked file as `git diff --stat` counts them: a last line
+/// without a newline still counts, a binary file (a NUL byte) counts none.
+fn text_lines(bytes: &[u8]) -> usize {
+    if bytes.is_empty() || bytes[..bytes.len().min(8000)].contains(&0) {
+        return 0;
+    }
+    let nl = bytes.iter().filter(|&&b| b == b'\n').count();
+    nl + usize::from(bytes.last() != Some(&b'\n'))
+}
+
+/// [`DiffSize`] for the worktree at `path`. The merge base resolves like the
+/// collision radar's ([`crate::collisions::resolve_merge_base`]: the newest of
+/// the merge bases with `origin/<base>` and `<base>`). Tracked changes are one
+/// tree → index + working tree diff with rename detection; untracked files are
+/// listed (an untracked directory with more than
+/// [`crate::collisions::MAX_UNTRACKED_DIR_FILES`] files is one entry) and
+/// their lines counted within a file-count and byte budget, so a stray
+/// `node_modules/` never makes the measure read gigabytes.
+pub fn diff_size(path: &Path, base: Option<&str>) -> AppResult<DiffSize> {
+    use crate::collisions::{find_renames, resolve_merge_base, MAX_UNTRACKED_DIR_FILES};
+    let repo = open_repo(path)?;
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let merge_base = match (head.as_ref(), base.map(str::trim).filter(|b| !b.is_empty())) {
+        (Some(h), Some(b)) => resolve_merge_base(&repo, h.id(), b)
+            .and_then(|mb| repo.find_commit(mb).ok()?.tree().ok())
+            .map(|t| (b.to_string(), t)),
+        _ => None,
+    };
+    let (resolved, tree) = match merge_base {
+        Some((b, t)) => (Some(b), Some(t)),
+        None => (None, head.as_ref().and_then(|c| c.tree().ok())),
+    };
+    let err = |what: &str, e: git2::Error| AppError::Other(format!("{what}: {e}"));
+
+    // Tracked: merge base → index + working tree, renames paired.
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(false);
+    let mut diff = repo
+        .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+        .map_err(|e| err("diff", e))?;
+    find_renames(&mut diff, false);
+    let stats = diff.stats().map_err(|e| err("diff stats", e))?;
+    let mut size = DiffSize {
+        files: stats.files_changed(),
+        added: stats.insertions(),
+        removed: stats.deletions(),
+        base: resolved,
+        untracked_skipped: 0,
+    };
+
+    // Untracked: the directories as `git status` shows them (`dir/`), then
+    // every file, each large directory folded into one entry.
+    let untracked = |recurse: bool| -> Vec<String> {
+        let mut o = git2::DiffOptions::new();
+        o.include_untracked(true).recurse_untracked_dirs(recurse);
+        let Ok(d) = repo.diff_index_to_workdir(None, Some(&mut o)) else { return Vec::new() };
+        d.deltas()
+            .filter(|x| x.status() == git2::Delta::Untracked)
+            .filter_map(|x| x.new_file().path().and_then(|p| p.to_str()).map(str::to_string))
+            .collect()
+    };
+    let dirs: Vec<String> = untracked(false).into_iter().filter(|p| p.ends_with('/')).collect();
+    let files = untracked(true);
+    let mut per_dir: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for f in &files {
+        if let Some(d) = dirs.iter().find(|d| f.starts_with(d.as_str())) {
+            *per_dir.entry(d.as_str()).or_default() += 1;
+        }
+    }
+    let workdir = repo.workdir().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf());
+    let (mut read_files, mut read_bytes) = (0usize, 0u64);
+    let big_dirs = per_dir.values().filter(|&&n| n > MAX_UNTRACKED_DIR_FILES).count();
+    size.files += big_dirs;
+    size.untracked_skipped += big_dirs;
+    for f in &files {
+        let big_dir = dirs
+            .iter()
+            .find(|d| f.starts_with(d.as_str()))
+            .is_some_and(|d| per_dir.get(d.as_str()).copied().unwrap_or(0) > MAX_UNTRACKED_DIR_FILES);
+        if big_dir {
+            continue;
+        }
+        size.files += 1;
+        let full = workdir.join(f);
+        let len = std::fs::symlink_metadata(&full).map(|m| if m.is_file() { m.len() } else { 0 }).unwrap_or(0);
+        if read_files >= MAX_UNTRACKED_LINE_FILES || read_bytes + len > MAX_UNTRACKED_LINE_BYTES {
+            size.untracked_skipped += 1;
+            continue;
+        }
+        read_files += 1;
+        read_bytes += len;
+        if len > 0 {
+            match std::fs::read(&full) {
+                Ok(bytes) => size.added += text_lines(&bytes),
+                Err(_) => size.untracked_skipped += 1,
+            }
+        }
+    }
+    Ok(size)
+}
+
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
 pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     let repo = open_repo(path)?;

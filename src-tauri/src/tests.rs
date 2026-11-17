@@ -17560,6 +17560,127 @@ mod open_pull_request_tests {
     }
 
     #[test]
+    fn diff_size_counts_the_branch_against_its_base_plus_uncommitted_and_untracked() {
+        use crate::git_ops::{diff_size, DiffSize};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        // Nothing changed yet: a real zero, against the named base.
+        assert_eq!(diff_size(d, Some("main")).unwrap(), DiffSize { files: 0, added: 0, removed: 0, base: Some("main".into()), untracked_skipped: 0 });
+        // A commit (2 lines changed), an unstaged edit and an untracked file.
+        std::fs::write(d.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(d, &["commit", "-qam", "crew work"]);
+        std::fs::write(d.join("b.txt"), "x\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n1\nn2\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size, DiffSize { files: 3, added: 5, removed: 1, base: Some("main".into()), untracked_skipped: 0 });
+        // main moving on adds nothing to the crew's diff (merge base, not tip).
+        git(d, &["stash", "-u", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+        assert_eq!(diff_size(d, Some("main")).unwrap(), size);
+        // No base, or one that no longer resolves: the uncommitted changes vs HEAD.
+        let uncommitted = DiffSize { files: 2, added: 3, removed: 0, base: None, untracked_skipped: 0 };
+        assert_eq!(diff_size(d, None).unwrap(), uncommitted);
+        assert_eq!(diff_size(d, Some("gone/branch")).unwrap(), uncommitted);
+    }
+
+    /// A repo on `main` with one committed `a.txt`, checked out on `crew`.
+    fn diff_size_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        dir
+    }
+
+    #[test]
+    fn diff_size_uses_the_collision_radars_merge_base_so_a_stale_local_base_adds_nothing() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Upstream moved on (origin/main = C1) while the local `main` stayed
+        // at C0; the crew branched from origin/main.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "u\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["checkout", "-q", "-B", "crew"]);
+        git(d, &["branch", "-f", "main", "HEAD~1"]);
+        std::fs::write(d.join("crew.txt"), "c\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "crew work"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        // Only the crew's file — not upstream's, as `merge_base(HEAD, main)` would add.
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 0), "{size:?}");
+        assert_eq!(size.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn workspace_base_falls_back_to_the_projects_default_branch() {
+        use crate::collisions::workspace_base;
+        assert_eq!(workspace_base(Some("dev".into()), Some("main")).as_deref(), Some("dev"));
+        assert_eq!(workspace_base(None, Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(Some("  ".into()), Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(None, None), None);
+    }
+
+    #[test]
+    fn diff_size_pairs_a_rename_so_a_moved_file_counts_only_its_edit() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        std::fs::write(d.join("moved.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["add", "moved.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 1), "a rename, not a delete plus add: {size:?}");
+    }
+
+    #[test]
+    fn diff_size_bounds_untracked_content() {
+        use crate::collisions::MAX_UNTRACKED_DIR_FILES;
+        use crate::git_ops::{diff_size, MAX_UNTRACKED_LINE_BYTES};
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // A small untracked file, last line without a newline: 2 lines.
+        std::fs::write(d.join("note.txt"), "one\ntwo").unwrap();
+        // An untracked directory past the cap: one entry, never read.
+        std::fs::create_dir(d.join("vendor")).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(d.join("vendor").join(format!("f{i}.js")), "x\n".repeat(100)).unwrap();
+        }
+        // A small untracked directory: each file counted.
+        std::fs::create_dir(d.join("small")).unwrap();
+        std::fs::write(d.join("small").join("s.txt"), "s\n").unwrap();
+        // A file past the byte budget: a file, its lines not read.
+        std::fs::write(d.join("huge.log"), vec![b'l'; MAX_UNTRACKED_LINE_BYTES as usize + 1]).unwrap();
+        // A binary file: a file with no lines, like git.
+        std::fs::write(d.join("blob.bin"), [0u8, 1, 2, b'\n']).unwrap();
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size.files, 5, "note, vendor/, small/s.txt, huge.log, blob.bin: {size:?}");
+        assert_eq!(size.added, 3, "note's 2 + s.txt's 1: {size:?}");
+        assert_eq!(size.untracked_skipped, 2, "vendor/ and huge.log: {size:?}");
+    }
+
+    #[test]
     fn branch_pr_context_diffs_against_the_base_remote() {
         let dir = tempdir().unwrap();
         let d = dir.path();

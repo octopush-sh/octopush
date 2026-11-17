@@ -461,6 +461,20 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
+/** `git_ops::DiffSize`: files and lines from the merge base with `base` to
+ *  the working tree (commits, edits and untracked files). `base` is null when
+ *  the workspace has none that resolves: the size is then the uncommitted
+ *  changes against HEAD. */
+export interface DiffSize {
+  files: number;
+  added: number;
+  removed: number;
+  base: string | null;
+  /** Untracked entries counted as files but not line-counted (a large
+   *  untracked directory, or past the read budget). */
+  untrackedSkipped: number;
+}
+
 /** One line of per-line blame (G7 slice III). Lines are 1-based and refer
  *  to the committed (HEAD) version of the file. */
 export interface BlameLine {
@@ -918,6 +932,10 @@ export const ipc = {
   listBranches: (path: string) => invoke<BranchList>("list_branches", { path }),
   getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
     invoke<string>("get_git_diff", { path, ignoreWhitespace }),
+  /** The workspace's diff size against its base (Mission Control cards);
+   *  null when the workspace or its worktree is gone. */
+  workspaceDiffSize: (workspaceId: string) =>
+    invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
 
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
