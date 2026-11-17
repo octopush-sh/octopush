@@ -4222,6 +4222,35 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_stage_that_ran_on_another_model_is_attributed_to_it() {
+        // #791: Claude Code's settings ran the stage on Sonnet, not the Opus
+        // it asked for — the ledger row (Usage, savings) names what ran.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+
+        db.set_run_stage_ran_model(&stage, Some("claude-sonnet-5-5")).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        let rep = db.token_report(None).unwrap();
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-sonnet-5-5"), "{:?}", rep.cost_by_model);
+        assert!(!rep.cost_by_model.iter().any(|m| m.label == "claude-opus-5-5"));
+        assert_eq!(db.ran_models(&run).unwrap().get(&stage).map(String::as_str), Some("claude-sonnet-5-5"));
+        // The stage still asked for Opus.
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].agent_model, "claude-opus-5-5");
+
+        // A re-run clears it; an attempt on the model it asked for records none.
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+        db.set_run_stage_ran_model(&stage, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+    }
+
+    #[test]
     fn check_budget_blocks_only_when_over_a_configured_limit() {
         // Phase 3 backend gate: blocks only when a *configured* budget is at/over
         // its limit; no budget → always allow.
@@ -6065,7 +6094,7 @@ mod orchestrator_tests {
         ) -> crate::error::AppResult<StageOutcome> {
             use crate::orchestrator::cli_runner::{apply_stage_env, dialect_for_model, QUIET_TRAFFIC_ENV};
             let mut command = tokio::process::Command::new("claude");
-            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code);
+            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code, None);
             let var = command
                 .as_std()
                 .get_envs()
@@ -9471,6 +9500,91 @@ mod cli_runner_tests {
         "usage":{"input_tokens":10,"output_tokens":4,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
     }"#;
+
+    #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::{refused_setting, SANDBOX_REQUIRED_UNAVAILABLE};
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr, None).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Sandbox required but unavailable: settings failed validation (a.b: bad)"]);
+        assert_eq!(
+            refused_setting(Some(&errors), stderr, None).as_deref(),
+            Some("Sandbox required but unavailable: settings failed validation (a.b: bad)")
+        );
+        // "failed validation" alone is not the signal.
+        let unrelated = "[Bootstrap] Gateway /v1/models failed validation: unexpected shape";
+        assert_eq!(refused_setting(None, unrelated, None), None);
+        let other = serde_json::json!(["Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&other), unrelated, None), None);
+        // The machine-readable reason is: the first `errors` string stands in.
+        assert_eq!(
+            refused_setting(Some(&other), unrelated, Some(SANDBOX_REQUIRED_UNAVAILABLE)).as_deref(),
+            Some("Settings failed validation (a.b: bad)")
+        );
+        assert!(refused_setting(None, "", Some(SANDBOX_REQUIRED_UNAVAILABLE)).is_some());
+        assert_eq!(refused_setting(None, "", Some("something_else")), None);
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded", None), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), "", None), None, "not an array");
+        assert_eq!(refused_setting(None, "", None), None);
+        let long = format!("Sandbox required but unavailable: failed validation {}", "x".repeat(900));
+        assert!(refused_setting(None, &long, None).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn budget_and_max_turns_stops_with_an_unrelated_validation_line_keep_their_own_handling() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_settings_refused, BUDGET_STOP_SUBTYPE};
+        let stderr = "[Bootstrap] Gateway /v1/models failed validation: expected a list\n";
+        let budget = format!(
+            r#"{{"type":"result","subtype":"{BUDGET_STOP_SUBTYPE}","is_error":true,"num_turns":7,
+            "session_id":"s","total_cost_usd":1.5}}"#
+        );
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(is_budget_stop(err) && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,
+            "session_id":"s","total_cost_usd":0.4}"#;
+        let outcome = parse_cli_result(turns, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.contains("error_max_turns") && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        // Even the real refused-settings line does not take over a budget stop
+        // or a session that ran turns.
+        let real = "Error: Sandbox required but unavailable: settings failed validation (x: y)";
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, real).unwrap();
+        assert!(is_budget_stop(outcome.error.as_deref().unwrap()));
+        let ran = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,
+            "session_id":"s","total_cost_usd":0.1}"#;
+        let outcome = parse_cli_result(ran, false, ArtifactKind::Diff, real).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+        // A generic execution error with only the unrelated line stays generic.
+        let plain = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0}"#;
+        let outcome = parse_cli_result(plain, false, ArtifactKind::Diff, stderr).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
 
     #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
@@ -18264,8 +18378,8 @@ mod crew_tests {
 #[cfg(test)]
 mod cli_command_idle_tests {
     use crate::orchestrator::cli_runner::{
-        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
-        OpenTool, OpenTools, ReadEnd, ReadLimits,
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, retry_idle_window, CliDialect,
+        IdleStall, OpenTool, OpenTools, ReadEnd, ReadLimits,
     };
     use serde_json::{json, Value};
     use std::time::{Duration, Instant};
@@ -18362,7 +18476,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
     }
 
@@ -18389,8 +18503,93 @@ mod cli_command_idle_tests {
             read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
+    }
+
+    fn api_retry(delay_ms: u64, error: &str) -> Value {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": 529, "error": error})
+    }
+
+    #[tokio::test]
+    async fn a_stage_waiting_out_an_api_retry_outlives_the_idle_window() {
+        // The retry's delay (600ms) is three times `idle` (200ms): the answer
+        // arriving 700ms later is still inside delay + idle.
+        let (end, notes, took) = read(
+            vec![Some(api_retry(600, "overloaded")), None, Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert!(notes.is_empty(), "a retry wait is not a long command: {notes:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_past_the_retry_delay_plus_idle_still_stalls_and_names_the_retry() {
+        let (end, notes, took) = read(vec![Some(api_retry(600, "overloaded"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= Duration::from_millis(800), "{took:?}");
+        assert_eq!(stall.window, Duration::from_millis(800));
+        assert_eq!(stall.after_retry.as_deref(), Some("overloaded"));
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_non_retry_line_goes_back_to_the_plain_window() {
+        let (end, _, took) = read(
+            vec![Some(api_retry(5000, "overloaded")), Some(tool_result("toolu_ghost"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_numeric_delay_keeps_the_plain_window() {
+        let bare = json!({"type": "system", "subtype": "api_retry", "error": "overloaded", "retry_delay_ms": "soon"});
+        let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn codex_ignores_a_retry_delay() {
+        let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[test]
+    fn the_retry_window_is_the_delay_plus_the_plain_window() {
+        let idle = ReadLimits::STAGE.idle;
+        // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
+        assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_stall_after_a_retry_names_it() {
+        let stall = |c: &str| IdleStall { tool: None, window: Duration::from_secs(600), after_retry: Some(c.into()) };
+        assert_eq!(
+            idle_timeout_message(&stall("overloaded")),
+            "timed out — no output for 10 minutes after an API retry (overloaded)"
+        );
+        assert_eq!(idle_timeout_message(&stall("")), "timed out — no output for 10 minutes after an API retry");
     }
 
     #[test]
@@ -18441,11 +18640,11 @@ mod cli_command_idle_tests {
     fn idle_messages_name_the_open_call() {
         let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None }),
             "timed out — Bash `npm test` gave no result for 11 minutes"
         );
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None }),
             "timed out — no output for 5 minutes"
         );
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
@@ -18915,5 +19114,76 @@ mod collision_tests {
         assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
         assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
         assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+#[cfg(test)]
+mod ran_model_tests {
+    use crate::orchestrator::cli_runner::{ran_on_notice, same_model, substituted_model};
+    use serde_json::json;
+
+    #[test]
+    fn aliases_snapshots_and_gateway_spellings_are_the_same_model() {
+        for (asked, ran) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
+            ("opus", "claude-opus-5-5-20261001"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
+            ("opusplan", "claude-sonnet-5-5"),
+            ("default", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-5-5"),
+            ("claude-opus-4-6[1m]", "claude-opus-4-6"),
+            ("claude-sonnet-latest", "claude-sonnet-latest"),
+            ("Claude-Sonnet-5-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(same_model(asked, ran), "{asked} vs {ran}");
+            assert!(same_model(ran, asked), "{ran} vs {asked}");
+        }
+    }
+
+    #[test]
+    fn another_model_is_not_the_same() {
+        for (asked, ran) in [
+            ("claude-opus-5-5", "claude-sonnet-5-5"),
+            ("opus", "claude-sonnet-5-5"),
+            ("sonnet", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-fable-5-2", "claude-fable-5-1"),
+            ("opusplan", "claude-haiku-5-5"),
+        ] {
+            assert!(!same_model(asked, ran), "{asked} vs {ran}");
+        }
+    }
+
+    #[test]
+    fn only_an_init_naming_another_model_is_a_substitution() {
+        let init = |m: serde_json::Value| json!({"type": "system", "subtype": "init", "model": m});
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!("claude-sonnet-5-5"))).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(substituted_model("sonnet", &init(json!("claude-sonnet-5-5"))), None, "no false alarm on an alias");
+        // A missing, empty or non-string model changes nothing.
+        assert_eq!(substituted_model("claude-opus-5-5", &json!({"type": "system", "subtype": "init"})), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(""))), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(42))), None);
+        // Only `system/init` counts.
+        let assistant = json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}});
+        assert_eq!(substituted_model("claude-opus-5-5", &assistant), None);
+    }
+
+    #[test]
+    fn the_notice_names_both_models_by_their_catalog_names() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "claude-sonnet-5-5", Some(&router)),
+            "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model settings picked another model"
+        );
+        // An id the catalog doesn't know prints as given.
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "team-model", None),
+            "ran on team-model, not claude-opus-5-5 — Claude Code's model settings picked another model"
+        );
     }
 }
