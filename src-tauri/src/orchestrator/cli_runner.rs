@@ -2830,9 +2830,6 @@ pub(crate) fn codex_session_usage(accum: &CodexAccum, total: &CliUsage) -> Optio
     (accum.session_id.is_some() && !accum.turn_open && *total != CliUsage::default()).then(|| session_usage_of(total))
 }
 
-/// The outcome of a failed resume followed by its fresh run: the fresh run's
-/// result, with the failed attempt's spend added (it was really burned) and
-/// its unknown spend, if any, still flagged. Pure.
 /// Flag `outcome`'s spend as not exactly reported and journal why, when
 /// [`usage_since`] couldn't subtract the resume baseline.
 fn flag_usage_drift(
@@ -2842,18 +2839,27 @@ fn flag_usage_drift(
 ) {
     if let Some(why) = drift {
         outcome.cli.usage_unreported = true;
+        outcome.cli.usage_unreported_journaled = true;
         emitter.notice(&usage_drift_notice(why));
     }
 }
 
+/// The outcome of a failed resume followed by its fresh run: the fresh run's
+/// result, with the failed attempt's spend added (it was really burned) and
+/// its unknown spend, if any, still flagged. Pure.
 pub(crate) fn merge_resume_fallback(resumed: StageOutcome, mut fresh: StageOutcome) -> StageOutcome {
     fresh.input_tokens += resumed.input_tokens;
     fresh.output_tokens += resumed.output_tokens;
     fresh.cache_read_tokens += resumed.cache_read_tokens;
     fresh.cache_creation_tokens += resumed.cache_creation_tokens;
     fresh.cost_usd += resumed.cost_usd;
-    fresh.cli.usage_unreported |= resumed.cli.usage_unreported
-        || resumed.error.as_deref().is_some_and(is_usage_unreported);
+    // A stop marker in the resumed error was never journaled (its error is
+    // dropped), so only drift-only unknowns on both sides skip the generic line.
+    let resumed_stopped = resumed.error.as_deref().is_some_and(is_usage_unreported);
+    let unjournaled = |cli: &crate::orchestrator::types::CliOutcomeMeta|cli.usage_unreported && !cli.usage_unreported_journaled;
+    let journaled = !resumed_stopped && !unjournaled(&resumed.cli) && !unjournaled(&fresh.cli);
+    fresh.cli.usage_unreported |= resumed.cli.usage_unreported || resumed_stopped;
+    fresh.cli.usage_unreported_journaled = fresh.cli.usage_unreported && journaled;
     fresh
 }
 

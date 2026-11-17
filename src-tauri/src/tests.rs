@@ -5380,6 +5380,48 @@ mod orchestrator_tests {
         assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().is_empty());
     }
 
+    /// A stage that finished with part of its spend unknown: `journaled` says
+    /// whether the runner already wrote why (a usage drift notice).
+    struct UnreportedDoneRunner {
+        journaled: bool,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for UnreportedDoneRunner {
+        async fn run(
+            &self,
+            _stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let mut out = crate::orchestrator::cli_runner::parse_cli_result(
+                r#"{"type":"result","subtype":"success","is_error":false,"result":"Implemented the feature.",
+                    "session_id":"sess-ok","total_cost_usd":0.2,"usage":{"input_tokens":30,"output_tokens":9}}"#,
+                true,
+                ArtifactKind::Diff,
+                "",
+            )?;
+            out.cli.usage_unreported = true;
+            out.cli.usage_unreported_journaled = self.journaled;
+            Ok(out)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_finished_stage_with_unknown_spend_is_journaled_once_and_a_drift_not_twice() {
+        use crate::orchestrator::cli_runner::USAGE_UNREPORTED;
+        for (journaled, generic_lines) in [(false, 1), (true, 0)] {
+            let (db, run) = esc_run(None, None, None);
+            let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(UnreportedDoneRunner { journaled }));
+            orch.run_to_pause(&run).await.unwrap();
+            let stage = db.lock().list_run_stages(&run).unwrap().remove(0);
+            assert_eq!(stage.status, "done");
+            assert!(db.lock().usage_unreported_stage_ids(&run).unwrap().contains(&stage.id), "flagged either way");
+            let log = db.lock().list_stage_log(&stage.id).unwrap();
+            assert_eq!(log.iter().filter(|e| e.contains(USAGE_UNREPORTED)).count(), generic_lines, "{log:?}");
+        }
+    }
+
     /// A Claude stage that ended on a hook-deferred tool call (Claude Code ≥
     /// 2.1.319), parsed by the real parser: `line` at exit `exit_success`.
     struct DeferredRunner {

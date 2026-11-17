@@ -365,6 +365,10 @@ pub struct CliOutcomeMeta {
     /// drive flags the row `usage_unreported` (as it does for an error that
     /// carries `cli_runner::USAGE_UNREPORTED`).
     pub usage_unreported: bool,
+    /// Every cause of `usage_unreported` is already in the journal (a
+    /// `cli_runner::usage_drift_notice`), so the drive flags the row without
+    /// adding the generic `cli_runner::USAGE_UNREPORTED` line.
+    pub usage_unreported_journaled: bool,
     /// The session's reported running total at the end of this attempt
     /// (Codex), kept as the next resume's baseline. `None` when the last turn
     /// never completed, so the total is unknown and the session isn't resumed.
