@@ -19596,6 +19596,114 @@ mod secret_guard_tests {
         assert_eq!(f[0].file, "new.ts");
     }
 
+    /// A committed blob larger than the scan budget: in a tree-to-tree diff
+    /// its size isn't known until the patch is generated, so it must still
+    /// make push and PR scans partial (never silently clean).
+    #[test]
+    fn a_committed_blob_past_the_limit_makes_push_and_pr_scans_partial() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("huge.bin"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::write(dir.path().join("small.ts"), "ok\n").unwrap();
+        commit_all(&repo, "add a large blob");
+        let blob = repo.head().unwrap().peel_to_tree().unwrap().get_name("huge.bin").unwrap().id();
+        for (scope, c) in [("push", push_files(dir.path()).unwrap()), ("pr", pr_files(dir.path(), "main").unwrap())] {
+            assert!(c.partial, "{scope}: a blob past the limit was treated as clean");
+            assert_eq!(c.scope, scope);
+            assert!(c.unscanned.contains(&format!("huge.bin@{blob}")), "{scope}: {:?}", c.unscanned);
+            let r = scan_collected(&c, &[]);
+            assert_eq!(r.total, 0);
+            assert!(r.needs_confirmation(), "{scope}: the action must ask first");
+            assert!(enforce(r.clone(), None).is_err());
+            assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        }
+        // Push and PR fingerprints differ for the same change.
+        let push = scan_collected(&push_files(dir.path()).unwrap(), &[]);
+        let pr = scan_collected(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_ne!(push.fingerprint, pr.fingerprint);
+        std::fs::remove_file(dir.path().join("huge.bin")).unwrap();
+    }
+
+    /// Every rule but the generic one reads the whole line: a secret past
+    /// column 16K (a minified bundle) is still found.
+    #[test]
+    fn a_secret_past_column_16k_is_found() {
+        let filler = "a=b(c,d);".repeat(20 * 1024 / 9);
+        assert!(filler.len() > 16 * 1024);
+        for (rule, _secret, line) in true_positives() {
+            let long = format!("{filler} {line}");
+            let f = scan_one("dist/bundle.min.js", &[&long]);
+            assert_eq!(f.len(), 1, "{rule} past 16K: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+        // Your own credential too.
+        let mine = rnd(300, 40, B62);
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let f = scan_added(&[file("dist/app.js", &[&format!("{filler}x({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+        // The generic assignment rule stays on the first 16 KB of a line.
+        let generic = format!("api_key = \"{}9z\"", rnd(301, 30, B62));
+        assert_eq!(scan_one("src/a.ts", &[&generic]).len(), 1);
+        assert!(scan_one("src/a.ts", &[&format!("{filler} {generic}")]).is_empty());
+    }
+
+    #[test]
+    fn every_value_on_a_line_is_bound_into_the_fingerprint() {
+        let a = ["sk-", "ant-", "api03-"].concat() + &rnd(310, 93, B62) + "AA";
+        let b1 = ["sk-", "ant-", "api03-"].concat() + &rnd(311, 93, B62) + "AA";
+        let b2 = ["sk-", "ant-", "api03-"].concat() + &rnd(312, 93, B62) + "AA";
+        let line = |b: &str| format!("const A = \"{a}\", B = \"{b}\";");
+        let r1 = scan_report(&[file("k.ts", &[&line(&b1)])], &[], false);
+        let r2 = scan_report(&[file("k.ts", &[&line(&b2)])], &[], false);
+        assert_eq!(r1.total, 2, "two keys on one line are two findings");
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the second key asks again");
+        // The same key twice on a line is one finding.
+        let same = scan_report(&[file("k.ts", &[&format!("{a} {a}")])], &[], false);
+        assert_eq!(same.total, 1);
+    }
+
+    #[test]
+    fn a_partial_fingerprint_is_bound_to_what_was_not_scanned() {
+        let c = |scope: &'static str, unscanned: &[&str]| Collected {
+            files: vec![],
+            partial: true,
+            scope,
+            unscanned: unscanned.iter().map(|s| s.to_string()).collect(),
+        };
+        let fp = |c: Collected| scan_collected(&c, &[]).fingerprint;
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("push", &["big.bin@bbbb"])));
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("pr", &["big.bin@aaaa"])));
+        assert_eq!(fp(c("push", &["a@1", "b@2"])), fp(c("push", &["b@2", "a@1"])));
+    }
+
+    #[test]
+    fn the_key_file_is_created_once_and_a_corrupt_one_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = load_or_create_key_in(&dir.path().join(".octopush")).expect("created");
+        let path = dir.path().join(".octopush").join(KEY_FILE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k1), "the same key on every load");
+        // An empty (half-written) key file is replaced, not trusted.
+        std::fs::write(&path, "").unwrap();
+        let k2 = load_or_create_key_in(&dir.path().join(".octopush")).expect("replaced");
+        assert_ne!(k2, k1);
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k2));
+        // No temp files are left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path().join(".octopush")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE)]);
+        // An unreadable key (a directory in its place) falls back to None.
+        let odd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(odd.path().join(KEY_FILE)).unwrap();
+        assert_eq!(load_or_create_key_in(odd.path()), None);
+    }
+
     #[test]
     fn the_setting_defaults_on() {
         let s = crate::settings::AppSettings::default();

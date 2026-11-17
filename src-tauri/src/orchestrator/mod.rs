@@ -1713,7 +1713,7 @@ impl Orchestrator {
         let scanned = match self.workspace_path(run) {
             Ok(path) => tokio::task::spawn_blocking(move || {
                 crate::secret_scan::worktree_files(&path, base.as_deref())
-                    .map(|c| crate::secret_scan::scan_report(&c.files, &known, c.partial))
+                    .map(|c| crate::secret_scan::scan_collected(&c, &known))
             })
             .await
             .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}")))),

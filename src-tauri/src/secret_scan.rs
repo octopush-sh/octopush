@@ -44,8 +44,10 @@ pub const MAX_FINDINGS: usize = 50;
 /// A push/PR range longer than this is scanned as one net diff instead of
 /// commit by commit (keeps a long-lived branch fast).
 const MAX_RANGE_COMMITS: usize = 200;
-/// Lines longer than this are scanned on their first N bytes only (a minified
-/// bundle line must never stall the commit button).
+/// The generic assignment rule looks at the first N bytes of a line only (a
+/// minified bundle line must never stall the commit button). Every other rule
+/// — the prefixed provider keys, your own credentials, AWS, private keys and
+/// `.env` credentials — reads the whole line: their regexes are linear.
 const MAX_LINE_BYTES: usize = 16 * 1024;
 /// Total added bytes looked at per scan.
 const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
@@ -108,8 +110,18 @@ pub const PARTIAL_NOTE: &str = "scanned the first 16 MB; the rest wasn't checked
 /// process; the app keeps one per install (see the module docs for why).
 static VALUE_KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
     #[cfg(not(test))]
-    if let Some(k) = load_or_create_key() {
-        return k;
+    {
+        match dirs::home_dir() {
+            Some(home) => {
+                if let Some(k) = load_or_create_key_in(&home.join(".octopush")) {
+                    return k;
+                }
+            }
+            None => tracing::warn!("secret guard: no home folder for its key"),
+        }
+        tracing::warn!(
+            "secret guard: using a key for this process only; a held stage the director approved will ask again after a restart or in a detached worker"
+        );
     }
     random_key()
 });
@@ -122,30 +134,56 @@ fn random_key() -> [u8; 32] {
     k
 }
 
-#[cfg(not(test))]
-fn load_or_create_key() -> Option<[u8; 32]> {
+/// The file the per-install key lives in, inside `dir`.
+pub(crate) const KEY_FILE: &str = "secret-guard.key";
+
+fn parse_key(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 {
+        return None;
+    }
+    let mut k = [0u8; 32];
+    for (i, b) in k.iter_mut().enumerate() {
+        *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(k)
+}
+
+/// Load the key from `dir/secret-guard.key`, or create it there. The new key
+/// is written to a temp file (0600, synced) and only then linked into place,
+/// so a crash mid-write never leaves an empty or half-written key: an
+/// existing file is never overwritten unless it is corrupt. When two
+/// processes race, the one that links second uses the first one's key.
+/// `None` (with a warning) when the key can't be read or written; the
+/// caller then falls back to a per-process key.
+pub(crate) fn load_or_create_key_in(dir: &Path) -> Option<[u8; 32]> {
     use std::io::Write;
-    let dir = dirs::home_dir()?.join(".octopush");
-    let path = dir.join("secret-guard.key");
-    let parse = |s: &str| -> Option<[u8; 32]> {
-        let s = s.trim();
-        if s.len() != 64 {
+    let path = dir.join(KEY_FILE);
+    let mut corrupt = false;
+    match std::fs::read_to_string(&path) {
+        Ok(s) => match parse_key(&s) {
+            Some(k) => return Some(k),
+            None => {
+                tracing::warn!("secret guard: {} is corrupt; writing a new key", path.display());
+                corrupt = true;
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!("secret guard: can't read {}: {e}", path.display());
             return None;
         }
-        let mut k = [0u8; 32];
-        for (i, b) in k.iter_mut().enumerate() {
-            *b = u8::from_str_radix(s.get(i * 2..i * 2 + 2)?, 16).ok()?;
-        }
-        Some(k)
-    };
-    if let Ok(s) = std::fs::read_to_string(&path) {
-        if let Some(k) = parse(&s) {
-            return Some(k);
-        }
     }
-    std::fs::create_dir_all(&dir).ok()?;
+    let warn = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::warn!("secret guard: can't {what} {}: {e}", path.display());
+    };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        warn("create the folder for", &e);
+        return None;
+    }
     let k = random_key();
     let hex: String = k.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = dir.join(format!("{KEY_FILE}.tmp-{}", uuid::Uuid::new_v4().simple()));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
@@ -153,13 +191,31 @@ fn load_or_create_key() -> Option<[u8; 32]> {
         use std::os::unix::fs::OpenOptionsExt;
         o.mode(0o600);
     }
-    match o.open(&path) {
-        Ok(mut f) => {
-            f.write_all(hex.as_bytes()).ok()?;
-            Some(k)
+    let written = o.open(&tmp).and_then(|mut f| {
+        f.write_all(hex.as_bytes())?;
+        f.sync_all()
+    });
+    if let Err(e) = written {
+        let _ = std::fs::remove_file(&tmp);
+        warn("write", &e);
+        return None;
+    }
+    // A corrupt key is replaced; otherwise link, which fails if another
+    // process got there first (then theirs is read back below).
+    let placed = if corrupt { std::fs::rename(&tmp, &path) } else { std::fs::hard_link(&tmp, &path) };
+    let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = &placed {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            warn("write", e);
+            return None;
         }
-        // Another process (the detached worker) created it first: use theirs.
-        Err(_) => std::fs::read_to_string(&path).ok().and_then(|s| parse(&s)),
+    }
+    match std::fs::read_to_string(&path).ok().and_then(|s| parse_key(&s)) {
+        Some(theirs) => Some(theirs),
+        None => {
+            warn("read back", &"the key file is unreadable or corrupt");
+            None
+        }
     }
 }
 
@@ -194,9 +250,12 @@ struct Hit {
     tag: [u8; 32],
 }
 
-/// Fingerprint over every hit (file, line, rule, keyed value hash), the total
-/// and the partial flag. Order-independent.
-fn fingerprint_hits(hits: &[Hit], partial: bool) -> String {
+/// Fingerprint over the scope (`commit`, `push`, `pr`, `worktree`), every hit
+/// (file, line, rule, keyed value hash), the total, the partial flag and,
+/// for a partial scan, what wasn't scanned (paths with blob ids, commits),
+/// so a confirmed partial scan can't cover a different unread blob later.
+/// Order-independent.
+fn fingerprint_hits(hits: &[Hit], scope: &str, partial: bool, unscanned: &[String]) -> String {
     use sha2::{Digest, Sha256};
     let mut keys: Vec<String> = hits
         .iter()
@@ -208,10 +267,20 @@ fn fingerprint_hits(hits: &[Hit], partial: bool) -> String {
     keys.sort();
     keys.dedup();
     let mut h = Sha256::new();
-    h.update(format!("v2\u{0}{}\u{0}{}", keys.len(), partial).as_bytes());
+    h.update(format!("v2\u{0}{scope}\u{0}{}\u{0}{}", keys.len(), partial).as_bytes());
     for k in keys {
         h.update(k.as_bytes());
         h.update([0xff]);
+    }
+    if partial {
+        let mut skipped: Vec<&String> = unscanned.iter().collect();
+        skipped.sort();
+        skipped.dedup();
+        h.update([0xfe]);
+        for u in skipped {
+            h.update(u.as_bytes());
+            h.update([0xff]);
+        }
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -521,15 +590,21 @@ pub struct AddedFile {
     pub lines: Vec<(u32, String)>,
 }
 
-fn push_hit(out: &mut Vec<Hit>, seen: &mut HashSet<(String, Option<u32>)>, finding: SecretFinding, value: &str) {
-    if seen.insert((finding.file.clone(), finding.line)) {
-        out.push(Hit { finding, tag: value_tag(value) });
+type SeenKey = (String, Option<u32>, [u8; 32]);
+
+/// Record a hit unless this file, line and value were already recorded (two
+/// different values on one line are two findings).
+fn push_hit(out: &mut Vec<Hit>, seen: &mut HashSet<SeenKey>, finding: SecretFinding, value: &str) {
+    let tag = value_tag(value);
+    if seen.insert((finding.file.clone(), finding.line, tag)) {
+        out.push(Hit { finding, tag });
     }
 }
 
-/// The first prefixed-token hit on `line` and its matched text. `skip_google`
+/// Every prefixed-token hit on `line` with its matched text. `skip_google`
 /// drops the Google rule (a Firebase web config or a `NEXT_PUBLIC_*` value).
-fn token_hit(line: &str, skip_google: bool) -> Option<(&'static TokenRule, &str)> {
+fn token_hits(line: &str, skip_google: bool) -> Vec<(&'static TokenRule, &str)> {
+    let mut out = Vec::new();
     for r in TOKEN_RULES.iter() {
         if skip_google && r.id == "google-api-key" {
             continue;
@@ -544,10 +619,14 @@ fn token_hit(line: &str, skip_google: bool) -> Option<(&'static TokenRule, &str)
             if is_placeholder(body) || shannon_entropy(body) < 3.0 {
                 continue;
             }
-            return Some((r, token));
+            // Two rules can match one token (`sk-…` shapes): keep the first.
+            if out.iter().any(|(_, t): &(&TokenRule, &str)| t.contains(token) || token.contains(t)) {
+                continue;
+            }
+            out.push((r, token));
         }
     }
-    None
+    out
 }
 
 fn aws_secret_on(line: &str) -> bool {
@@ -590,15 +669,17 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
         let firebase_lines: Vec<u32> =
             file.lines.iter().filter(|(_, l)| FIREBASE_CONTEXT.is_match(l)).map(|(n, _)| *n).collect();
 
-        for (idx, (n, raw)) in file.lines.iter().enumerate() {
-            let line: &str = if raw.len() > MAX_LINE_BYTES {
+        for (idx, (n, line)) in file.lines.iter().enumerate() {
+            let line = line.as_str();
+            // Only the generic rule is held to the first MAX_LINE_BYTES.
+            let head: &str = if line.len() > MAX_LINE_BYTES {
                 let mut end = MAX_LINE_BYTES;
-                while !raw.is_char_boundary(end) {
+                while !line.is_char_boundary(end) {
                     end -= 1;
                 }
-                &raw[..end]
+                &line[..end]
             } else {
-                raw
+                line
             };
             let at = |rule: &str, kind: String, yours: bool| SecretFinding {
                 file: path.into(), line: Some(*n), rule: rule.into(), kind, yours,
@@ -607,13 +688,23 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
             let firebase_key = line.to_ascii_lowercase().contains("apikey")
                 && firebase_lines.iter().any(|f| f.abs_diff(*n) <= 8);
             let public_web_value = next_public || firebase_key;
+            // Every value this line was flagged for: each is hashed into the
+            // fingerprint, so editing any of them asks again.
+            let mut values: Vec<String> = Vec::new();
+            let covered = |values: &[String], v: &str| values.iter().any(|w| w.contains(v) || v.contains(w.as_str()));
 
-            if let Some(k) = known.iter().find(|k| line.contains(k.value.as_str())) {
+            for k in known.iter().filter(|k| line.contains(k.value.as_str())) {
                 push_hit(&mut out, &mut seen, at("your-credential", k.label.clone(), true), &k.value);
-                continue;
+                values.push(k.value.clone());
             }
-            if let Some((r, token)) = token_hit(line, public_web_value) {
+            for (r, token) in token_hits(line, public_web_value) {
+                if covered(&values, token) {
+                    continue; // your own key, already reported as yours
+                }
                 push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), token);
+                values.push(token.to_string());
+            }
+            if !values.is_empty() {
                 continue;
             }
             if let Some(m) = AWS_KEY_ID.find(line) {
@@ -657,7 +748,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                 }
             }
             if generic_ok && !public_web_value {
-                let hit = GENERIC_ASSIGN.captures_iter(line).find_map(|c| {
+                for c in GENERIC_ASSIGN.captures_iter(head) {
                     let v = c.get(1).map(|m| m.as_str()).unwrap_or("");
                     let plausible = !is_placeholder(v)
                         && shannon_entropy(v) > 4.0
@@ -666,10 +757,10 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                         && !v.contains("://")
                         // An example JWT in prose docs is an illustration.
                         && !(doc_file && JWT.is_match(v));
-                    plausible.then_some(v)
-                });
-                if let Some(v) = hit {
-                    push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false), v);
+                    if plausible && !covered(&values, v) {
+                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false), v);
+                        values.push(v.to_string());
+                    }
                 }
             }
         }
@@ -687,8 +778,18 @@ pub fn scan_added(files: &[AddedFile], known: &[KnownSecret]) -> Vec<SecretFindi
 /// Scan `files` into a [`ScanReport`]: the capped findings for people, the
 /// total, `partial`, and the fingerprint over all of it.
 pub fn scan_report(files: &[AddedFile], known: &[KnownSecret], partial: bool) -> ScanReport {
+    report_of(files, known, "", partial, &[])
+}
+
+/// Scan what a collector gathered, binding the fingerprint to its scope and,
+/// when partial, to what it left unscanned. What the guard and Direct use.
+pub fn scan_collected(c: &Collected, known: &[KnownSecret]) -> ScanReport {
+    report_of(&c.files, known, c.scope, c.partial, &c.unscanned)
+}
+
+fn report_of(files: &[AddedFile], known: &[KnownSecret], scope: &str, partial: bool, unscanned: &[String]) -> ScanReport {
     let hits = scan_hits(files, known);
-    let fingerprint = fingerprint_hits(&hits, partial);
+    let fingerprint = fingerprint_hits(&hits, scope, partial, unscanned);
     let total = hits.len();
     let findings = hits.into_iter().take(MAX_FINDINGS).map(|h| h.finding).collect();
     ScanReport { findings, total, partial, fingerprint }
@@ -702,6 +803,11 @@ pub fn scan_report(files: &[AddedFile], known: &[KnownSecret], partial: bool) ->
 pub struct Collected {
     pub files: Vec<AddedFile>,
     pub partial: bool,
+    /// Which action this is for: `commit`, `push`, `pr` or `worktree`.
+    pub scope: &'static str,
+    /// What a partial scan didn't read: `path@blob` for a file it couldn't
+    /// (or only partly) read, `commit <oid>` for a commit it never reached.
+    pub unscanned: Vec<String>,
 }
 
 impl std::ops::Deref for Collected {
@@ -715,12 +821,22 @@ impl std::ops::Deref for Collected {
 struct Budget {
     left: usize,
     exhausted: bool,
+    unscanned: Vec<String>,
 }
 
 impl Budget {
     fn new() -> Self {
-        Budget { left: MAX_SCAN_BYTES, exhausted: false }
+        Budget { left: MAX_SCAN_BYTES, exhausted: false, unscanned: Vec::new() }
     }
+
+    fn into_collected(self, files: Vec<AddedFile>, scope: &'static str) -> Collected {
+        Collected { files, partial: self.exhausted, scope, unscanned: self.unscanned }
+    }
+}
+
+/// `path@blob` for the unscanned list.
+fn unscanned_entry(path: &str, id: Oid) -> String {
+    format!("{path}@{id}")
 }
 
 fn opts() -> DiffOptions {
@@ -734,20 +850,31 @@ fn opts() -> DiffOptions {
 
 /// Collect the added lines of `diff`, appending to `files` (keyed by path).
 /// `budget` counts down the scanned bytes across one scan.
-fn collect_added(diff: &Diff, files: &mut Vec<AddedFile>, budget: &mut Budget) -> AppResult<()> {
+///
+/// A blob past `max_size` is never loaded: git flags it binary and no line
+/// callback runs. In a tree-to-tree diff `new_file().size()` is still 0 when
+/// the deltas are listed (libgit2 reads it only while generating the patch),
+/// so the size is checked in the per-file callback, where it is known, and a
+/// binary-flagged blob whose size is still unknown has it read from the
+/// object database's header. Either way such a file marks the scan partial.
+fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, budget: &mut Budget) -> AppResult<()> {
     let mut index: std::collections::HashMap<String, usize> =
         files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
+    let path_of = |d: &git2::DiffDelta| d.new_file().path().map(|p| p.to_string_lossy().replace('\\', "/"));
+    // Every delta in foreach order: (path, new blob id), None for a deletion.
+    let mut order: Vec<Option<(String, Oid)>> = Vec::new();
     // Register every delta first so a newly added empty or binary file is
     // still seen (its name alone can be the finding).
     for delta in diff.deltas() {
         if matches!(delta.status(), Delta::Deleted) {
+            order.push(None);
             continue;
         }
-        let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy().replace('\\', "/")) else { continue };
-        if delta.new_file().size() > MAX_SCAN_BYTES as u64 {
-            // Past `max_size`: git treats it as binary and we can't read it.
-            budget.exhausted = true;
-        }
+        let Some(path) = path_of(&delta) else {
+            order.push(None);
+            continue;
+        };
+        order.push(Some((path.clone(), delta.new_file().id())));
         let is_new = matches!(delta.status(), Delta::Added | Delta::Untracked);
         match index.get(&path) {
             Some(&i) => files[i].is_new |= is_new,
@@ -757,29 +884,72 @@ fn collect_added(diff: &Diff, files: &mut Vec<AddedFile>, budget: &mut Budget) -
             }
         }
     }
-    let result = diff.foreach(
-        &mut |_, _| true,
-        None,
-        None,
-        Some(&mut |delta, _hunk, line| {
-            if line.origin() != '+' {
-                return true;
-            }
-            if budget.left == 0 {
-                budget.exhausted = true;
-                return false;
-            }
-            let Some(n) = line.new_lineno() else { return true };
-            let Some(path) = delta.new_file().path().map(|p| p.to_string_lossy().replace('\\', "/")) else { return true };
-            let content = line.content();
-            budget.left = budget.left.saturating_sub(content.len());
-            let text = String::from_utf8_lossy(content).trim_end_matches(['\n', '\r']).to_string();
-            if let Some(&i) = index.get(&path) {
-                files[i].lines.push((n, text));
-            }
-            true
-        }),
-    );
+    let odb = repo.odb().ok();
+    // How many file callbacks have run: the delta being read is `pos - 1`.
+    let mut pos = 0usize;
+    let mut stopped = false;
+    let mut oversized: Vec<String> = Vec::new();
+    let result = {
+        let stopped = &mut stopped;
+        let pos = &mut pos;
+        let oversized = &mut oversized;
+        let budget = &mut *budget;
+        let files = &mut *files;
+        diff.foreach(
+            &mut |delta, _| {
+                *pos += 1;
+                if matches!(delta.status(), Delta::Deleted) {
+                    return true;
+                }
+                let new = delta.new_file();
+                let mut size = new.size();
+                if size == 0 && new.is_binary() && !new.id().is_zero() {
+                    size = odb
+                        .as_ref()
+                        .and_then(|o| o.read_header(new.id()).ok())
+                        .map(|(len, _)| len as u64)
+                        .unwrap_or(0);
+                }
+                if size > MAX_SCAN_BYTES as u64 {
+                    // Too large to read as text: the scan didn't see it.
+                    let p = path_of(&delta).unwrap_or_default();
+                    oversized.push(unscanned_entry(&p, new.id()));
+                }
+                true
+            },
+            None,
+            None,
+            Some(&mut |delta, _hunk, line| {
+                if line.origin() != '+' {
+                    return true;
+                }
+                if budget.left == 0 {
+                    budget.exhausted = true;
+                    *stopped = true;
+                    return false;
+                }
+                let Some(n) = line.new_lineno() else { return true };
+                let Some(path) = path_of(&delta) else { return true };
+                let content = line.content();
+                budget.left = budget.left.saturating_sub(content.len());
+                let text = String::from_utf8_lossy(content).trim_end_matches(['\n', '\r']).to_string();
+                if let Some(&i) = index.get(&path) {
+                    files[i].lines.push((n, text));
+                }
+                true
+            }),
+        )
+    };
+    if !oversized.is_empty() {
+        budget.exhausted = true;
+        budget.unscanned.extend(oversized);
+    }
+    if stopped {
+        // The file being read when the budget ran out, and every one after it.
+        for (p, id) in order.into_iter().skip(pos.saturating_sub(1)).flatten() {
+            budget.unscanned.push(unscanned_entry(&p, id));
+        }
+    }
     match result {
         Ok(()) => Ok(()),
         // Our own callback stopped it: the byte budget ran out.
@@ -804,8 +974,8 @@ pub fn staged_files(path: &Path) -> AppResult<Collected> {
         .map_err(|e| AppError::Other(format!("secret scan: staged diff: {e}")))?;
     let mut files = Vec::new();
     let mut budget = Budget::new();
-    collect_added(&diff, &mut files, &mut budget)?;
-    Ok(Collected { files, partial: budget.exhausted })
+    collect_added(&repo, &diff, &mut files, &mut budget)?;
+    Ok(budget.into_collected(files, "commit"))
 }
 
 /// Where a range starts: after one commit already on the remote, or — when
@@ -841,19 +1011,20 @@ fn range_files(repo: &Repository, base: RangeBase, head: Oid, budget: &mut Budge
         };
         let to = tree_of(repo, head)?;
         let diff = repo.diff_tree_to_tree(from.as_ref(), Some(&to), Some(&mut opts())).map_err(err)?;
-        collect_added(&diff, &mut files, budget)?;
+        collect_added(repo, &diff, &mut files, budget)?;
         return Ok(files);
     }
-    for oid in commits {
+    for (i, &oid) in commits.iter().enumerate() {
         if budget.left == 0 {
             budget.exhausted = true;
+            budget.unscanned.extend(commits[i..].iter().map(|c| format!("commit {c}")));
             break;
         }
         let commit = repo.find_commit(oid).map_err(err)?;
         let to = commit.tree().map_err(err)?;
         let from = commit.parent(0).ok().and_then(|p| p.tree().ok());
         let diff = repo.diff_tree_to_tree(from.as_ref(), Some(&to), Some(&mut opts())).map_err(err)?;
-        collect_added(&diff, &mut files, budget)?;
+        collect_added(repo, &diff, &mut files, budget)?;
     }
     Ok(files)
 }
@@ -889,11 +1060,13 @@ fn base_or_unpushed(base: Option<Oid>) -> RangeBase {
 /// The commits a push of the current branch would send.
 pub fn push_files(path: &Path) -> AppResult<Collected> {
     let repo = crate::git_ops::open_repo(path)?;
-    let Some(head) = repo.head().ok().and_then(|h| h.target()) else { return Ok(Collected::default()) };
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Budget::new().into_collected(Vec::new(), "push"));
+    };
     let base = base_or_unpushed(push_base(&repo, head));
     let mut budget = Budget::new();
     let files = range_files(&repo, base, head, &mut budget)?;
-    Ok(Collected { files, partial: budget.exhausted })
+    Ok(budget.into_collected(files, "push"))
 }
 
 /// The merge base of HEAD with `base` (resolved like the PR it opens:
@@ -913,11 +1086,13 @@ fn pr_merge_base(repo: &Repository, base: &str, head: Oid) -> Option<Oid> {
 /// The commits a pull request from HEAD onto `base` contains.
 pub fn pr_files(path: &Path, base: &str) -> AppResult<Collected> {
     let repo = crate::git_ops::open_repo(path)?;
-    let Some(head) = repo.head().ok().and_then(|h| h.target()) else { return Ok(Collected::default()) };
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Budget::new().into_collected(Vec::new(), "pr"));
+    };
     let mb = pr_merge_base(&repo, base, head).or_else(|| push_base(&repo, head));
     let mut budget = Budget::new();
     let files = range_files(&repo, base_or_unpushed(mb), head, &mut budget)?;
-    Ok(Collected { files, partial: budget.exhausted })
+    Ok(budget.into_collected(files, "pr"))
 }
 
 /// Everything a crew's Action stage could commit and push: the branch's
@@ -942,8 +1117,8 @@ pub fn worktree_files(path: &Path, base: Option<&str>) -> AppResult<Collected> {
     let diff = repo
         .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut o))
         .map_err(|e| AppError::Other(format!("secret scan: worktree diff: {e}")))?;
-    collect_added(&diff, &mut files, &mut budget)?;
-    Ok(Collected { files, partial: budget.exhausted })
+    collect_added(&repo, &diff, &mut files, &mut budget)?;
+    Ok(budget.into_collected(files, "worktree"))
 }
 
 // ─── Enforcement ───────────────────────────────────────────────────────
@@ -978,7 +1153,7 @@ where
     }
     let known = known_secrets_from(&settings);
     let scanned = tokio::task::spawn_blocking(move || {
-        collect().map(|c| scan_report(&c.files, &known, c.partial))
+        collect().map(|c| scan_collected(&c, &known))
     })
     .await
     .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}"))));
