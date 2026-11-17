@@ -417,11 +417,16 @@
 /* Calm pulse for the active pipeline stage in the Direct run track. */
 @keyframes octo-stage-pulse {
   0%, 100% { box-shadow: 0 0 0 0 rgba(0,0,0,0); }
-  50%      { box-shadow: 0 0 0 3px var(--brass-ghost); }
+  50%      { box-shadow: 0 0 0 3px var(--pulse-ink, var(--brass-ghost)); }
 }
 .octo-stage-pulse { animation: octo-stage-pulse 2.4s var(--ease-octo, cubic-bezier(0.2,0.8,0.3,1)) infinite; }
+/* A RUNNING stage holding the beacon pulses in its own status ink, never
+   brass (§5 StageDots: "a running stage is never brass"). Without this the
+   reduced-motion halo drew a 1px brass ring hugging the verdigris border, and
+   a working card read exactly like an awaiting-gate one (#749). */
+.octo-stage-pulse-running { --pulse-ink: var(--verdigris-ghost); --pulse-halo: var(--verdigris-strong); }
 @media (prefers-reduced-motion: reduce) {
-  .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--brass-dim); }
+  .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
 
 /* ── Elision primitives · middle truncation ──────────────────────
