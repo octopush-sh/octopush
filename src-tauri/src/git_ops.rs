@@ -847,6 +847,54 @@ pub fn branch_pr_context(path: &Path, base: &str) -> AppResult<(String, Vec<Stri
     Ok((text, subjects))
 }
 
+/// How much code a workspace holds for review: files changed and lines
+/// added/removed from the merge base with `base` to the working tree —
+/// committed work, staged and unstaged edits and untracked files together
+/// (what a reviewer of the crew's branch reads). `base` is `None` when the
+/// workspace has no base branch or it no longer resolves: the size is then
+/// the uncommitted changes against HEAD, and says so.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffSize {
+    pub files: usize,
+    pub added: usize,
+    pub removed: usize,
+    pub base: Option<String>,
+}
+
+/// [`DiffSize`] for the worktree at `path`. `base` resolves as given, then as
+/// `origin/<base>`.
+pub fn diff_size(path: &Path, base: Option<&str>) -> AppResult<DiffSize> {
+    let repo = open_repo(path)?;
+    let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+    let base_tree = base
+        .filter(|b| !b.trim().is_empty())
+        .and_then(|b| {
+            let commit = [b.to_string(), format!("origin/{b}")]
+                .iter()
+                .find_map(|r| repo.revparse_single(r).ok().and_then(|o| o.peel_to_commit().ok()))?;
+            let head = head.as_ref()?;
+            let mb = repo.merge_base(commit.id(), head.id()).ok()?;
+            Some((b.to_string(), repo.find_commit(mb).ok()?.tree().ok()?))
+        });
+    let (resolved, tree) = match base_tree {
+        Some((b, t)) => (Some(b), Some(t)),
+        None => (None, head.as_ref().and_then(|c| c.tree().ok())),
+    };
+    let mut opts = git2::DiffOptions::new();
+    opts.include_untracked(true).recurse_untracked_dirs(true).show_untracked_content(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("diff: {e}")))?;
+    let stats = diff.stats().map_err(|e| AppError::Other(format!("diff stats: {e}")))?;
+    Ok(DiffSize {
+        files: stats.files_changed(),
+        added: stats.insertions(),
+        removed: stats.deletions(),
+        base: resolved,
+    })
+}
+
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
 pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     let repo = open_repo(path)?;

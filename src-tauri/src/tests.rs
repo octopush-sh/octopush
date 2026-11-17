@@ -17277,6 +17277,43 @@ mod open_pull_request_tests {
     }
 
     #[test]
+    fn diff_size_counts_the_branch_against_its_base_plus_uncommitted_and_untracked() {
+        use crate::git_ops::{diff_size, DiffSize};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        // Nothing changed yet: a real zero, against the named base.
+        assert_eq!(diff_size(d, Some("main")).unwrap(), DiffSize { files: 0, added: 0, removed: 0, base: Some("main".into()) });
+        // A commit (2 lines changed), an unstaged edit and an untracked file.
+        std::fs::write(d.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(d, &["commit", "-qam", "crew work"]);
+        std::fs::write(d.join("b.txt"), "x\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n1\nn2\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size, DiffSize { files: 3, added: 5, removed: 1, base: Some("main".into()) });
+        // main moving on adds nothing to the crew's diff (merge base, not tip).
+        git(d, &["stash", "-u", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+        assert_eq!(diff_size(d, Some("main")).unwrap(), size);
+        // No base, or one that no longer resolves: the uncommitted changes vs HEAD.
+        let uncommitted = DiffSize { files: 2, added: 3, removed: 0, base: None };
+        assert_eq!(diff_size(d, None).unwrap(), uncommitted);
+        assert_eq!(diff_size(d, Some("gone/branch")).unwrap(), uncommitted);
+    }
+
+    #[test]
     fn branch_pr_context_diffs_against_the_base_remote() {
         let dir = tempdir().unwrap();
         let d = dir.path();

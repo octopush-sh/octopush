@@ -6,7 +6,7 @@
 //
 // When a layout bug escapes to users, add the data that would have caught it.
 import type { Scenario } from "./types";
-import type { PipelineWithStages, Run } from "../../../src/lib/ipc";
+import type { DiffSize, PipelineWithStages, Run } from "../../../src/lib/ipc";
 import type { ChatThread, ModelWithProvider, ProjectInfo, TokenReport, Workspace, WorkspaceGitSummary } from "../../../src/lib/types";
 import { defaultScenario, DEFAULT_FIXTURES as F } from "./default";
 import { logbookSummary, missionFor } from "./logbook";
@@ -58,6 +58,19 @@ const RUNS: Run[] = Array.from({ length: 18 }, (_, i) => ({
   baselineUsd: i === 3 ? 98_211.9 : F.RUN.baselineUsd,
 }));
 
+// Mission Control's settled cards with the diff sizes real crews leave: one
+// that changed nothing (reads "no changes", never a fake 0) and a 2,000-line
+// refactor, each in its own workspace, plus the active workspace's size.
+const SETTLED_AWAY: Run[] = [
+  { ...F.RUN, id: "run-away-empty", workspaceId: WORKSPACES[2].id, task: `${pick(3)}: investigate only, no code changes`, status: "completed", finishedAt: "2026-07-09T03:00:00Z" },
+  { ...F.RUN, id: "run-away-huge", workspaceId: WORKSPACES[3].id, task: `${pick(4)}: ${"rewrite the session layer and every caller ".repeat(2).trim()}`, status: "completed", finishedAt: "2026-07-09T04:00:00Z" },
+];
+const DIFF_SIZES: Record<string, DiffSize> = {
+  [WORKSPACES[2].id]: { files: 0, added: 0, removed: 0, base: "main" },
+  [WORKSPACES[3].id]: { files: 214, added: 1_612, removed: 388, base: "origin/release/2026-11-enterprise-long-base-branch" },
+  [ACTIVE.id]: { files: 6, added: 120, removed: 40, base: "main" },
+};
+
 const THREADS: ChatThread[] = Array.from({ length: 15 }, (_, i) => ({
   ...F.THREAD,
   id: i === 0 ? F.THREAD.id : `th-${i + 1}`, // unique: F.THREAD.id is th-1
@@ -96,12 +109,14 @@ export const stress: Scenario = {
     workspaces_git_summary: SUMMARIES,
     list_pipelines: PIPELINES,
     get_pipeline: (a) => PIPELINES.find((p) => p.pipeline.id === a.pipelineId || p.pipeline.id === a.id) ?? PIPELINES[0],
-    list_runs: (a) => (a.workspaceId === ACTIVE.id ? RUNS : []),
+    list_runs: (a) => (a.workspaceId === ACTIVE.id ? RUNS : SETTLED_AWAY.filter((r) => r.workspaceId === a.workspaceId)),
+    list_runs_settled_since: SETTLED_AWAY,
+    workspace_diff_size: (a) => DIFF_SIZES[a.workspaceId as string] ?? null,
     // Consistent everywhere: every run has its stages, and the live ones are
     // what Mission Control and the top bar see (a mismatch here reads as an
     // app bug to the design review).
     get_run: (a) => {
-      const run = RUNS.find((r) => r.id === a.runId) ?? null;
+      const run = [...RUNS, ...SETTLED_AWAY].find((r) => r.id === a.runId) ?? null;
       if (!run) return { run: null, stages: [] };
       const live = run.status === "running" || run.status === "paused";
       return {

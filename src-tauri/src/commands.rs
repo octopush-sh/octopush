@@ -1288,6 +1288,29 @@ pub async fn project_collisions(
     .map_err(|e| AppError::Other(format!("collision scan: {e}")))
 }
 
+/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
+/// for Mission Control's settled and needs-you cards. `None` when the
+/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
+/// out — the card then shows nothing rather than a made-up zero.
+#[tauri::command]
+pub async fn workspace_diff_size(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::git_ops::DiffSize>> {
+    let Some(row) = state.db.lock().get_workspace(&workspace_id)? else { return Ok(None) };
+    let Some(wt) = row.worktree_path else { return Ok(None) };
+    let path = expand_tilde(&wt);
+    if !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
+        return Ok(None);
+    }
+    let base = row.from_branch;
+    Ok(run_with_timeout(std::time::Duration::from_secs(5), move || {
+        crate::git_ops::diff_size(std::path::Path::new(&path), base.as_deref()).ok()
+    })
+    .await
+    .flatten())
+}
+
 #[tauri::command]
 pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);

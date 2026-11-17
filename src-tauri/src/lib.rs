@@ -240,6 +240,7 @@ pub fn run() {
             commands::list_branches,
             commands::workspaces_git_summary,
             commands::project_collisions,
+            commands::workspace_diff_size,
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,

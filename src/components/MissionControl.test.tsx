@@ -22,6 +22,7 @@ vi.mock("../lib/ipc", async (orig) => {
       getRun: vi.fn().mockResolvedValue({ run: null, stages: [] }),
       abortRun: vi.fn().mockResolvedValue(undefined),
       answerBlocker: vi.fn().mockResolvedValue(undefined),
+      workspaceDiffSize: vi.fn().mockResolvedValue(null),
     },
   };
 });
@@ -32,6 +33,7 @@ const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useAttentionStore } = await import("../stores/attentionStore");
 const { useMissionsStore } = await import("../stores/missionsStore");
 const { ipc } = await import("../lib/ipc");
+const { useDiffSizeStore } = await import("../stores/diffSizeStore");
 
 const mkRun = (id: string, status: RunStatus, over: Partial<Run> = {}): Run => ({
   id,
@@ -110,6 +112,7 @@ beforeEach(() => {
   useWorkspaceStore.setState({ workspacesByProjectId: {} } as any);
   useAttentionStore.setState({ flagsByWs: {} });
   useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
+  useDiffSizeStore.setState({ byKey: {} });
   vi.clearAllMocks();
 });
 
@@ -212,6 +215,85 @@ describe("MissionControl", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
     expect(ipc.abortRun).toHaveBeenCalledWith("a");
     expect(onJumpToRun).not.toHaveBeenCalled(); // the action never triggers the jump
+  });
+
+  describe("diff size", () => {
+    const size = (files: number, added: number, removed: number, base: string | null = "main") => ({ files, added, removed, base });
+    const loaded = (...ids: string[]) =>
+      useWorkspaceStore.setState({
+        workspacesByProjectId: { p1: ids.map((id) => ({ id: `ws-${id}`, name: id.toUpperCase() })) },
+      } as any);
+
+    it("shows a settled card's size, measured once, with what it was measured against", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(size(6, 120, 40));
+      useRunsStore.setState({ runsByWs: { "ws-c": [mkRun("c", "completed")] }, settledAt: { c: Date.now() - 60_000 } });
+      loaded("c");
+      const { rerender } = renderRoom();
+      const slot = await screen.findByText("· +120 −40 · 6 files");
+      expect(slot.getAttribute("data-tour")).toBe("mission-control-card-size");
+      expect(slot.className).toContain("text-octo-mute");
+      expect(slot.className).not.toContain("brass");
+      expect(slot).toHaveAttribute("title", "Against main: 6 files changed, +120 −40 lines");
+      rerender(<MissionControl open onClose={noop} onJumpToRun={noop} onJumpToAttention={noop} onDispatch={noop} />);
+      await act(async () => {});
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1);
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-c");
+    });
+
+    it("sizes needs-you cards but not in-flight ones", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(size(1, 12, 0));
+      useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "paused")], "ws-b": [mkRun("b", "running")] } });
+      loaded("a", "b");
+      renderRoom();
+      expect(await screen.findByText("· +12 −0 · 1 file")).toBeTruthy();
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1);
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-a");
+    });
+
+    it("shows nothing for an unloaded or vanished workspace — never a made-up zero", async () => {
+      useRunsStore.setState({
+        runsByWs: { "ws-gone": [mkRun("gone", "completed")], "ws-c": [mkRun("c", "completed")] },
+        settledAt: { gone: Date.now() - 60_000, c: Date.now() - 50_000 },
+      });
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(null);
+      loaded("c"); // ws-c is loaded but its worktree is gone: the command says null
+      renderRoom();
+      await act(async () => {});
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1); // never for the unloaded one
+      expect(document.querySelector('[data-tour="mission-control-card-size"]')).toBeNull();
+    });
+
+    it("says 'no changes' for a crew that changed nothing, and orders the band smallest first on request", async () => {
+      const sizes: Record<string, ReturnType<typeof size>> = {
+        "ws-big": size(40, 1800, 200),
+        "ws-none": size(0, 0, 0),
+        "ws-mid": size(3, 30, 10),
+      };
+      vi.mocked(ipc.workspaceDiffSize).mockImplementation(async (id: string) => sizes[id] ?? null);
+      const now = Date.now();
+      useRunsStore.setState({
+        runsByWs: {
+          "ws-big": [mkRun("big", "completed")],
+          "ws-none": [mkRun("none", "completed")],
+          "ws-mid": [mkRun("mid", "completed")],
+          "ws-unk": [mkRun("unk", "completed")],
+        },
+        settledAt: { big: now - 4000, none: now - 3000, mid: now - 2000, unk: now - 1000 },
+        statusSince: { big: 1, none: 2, mid: 3, unk: 4 },
+      });
+      loaded("big", "none", "mid", "unk");
+      renderRoom();
+      expect(await screen.findByText("· no changes")).toBeTruthy();
+      await screen.findByText("· +1800 −200 · 40 files");
+      const tasks = () => screen.getAllByText(/^task /).map((el) => el.textContent);
+      expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]); // oldest first by default
+      const toggle = screen.getByRole("button", { name: "Order settled crews by smallest diff first" });
+      expect(toggle).toHaveTextContent("Oldest first");
+      fireEvent.click(toggle);
+      expect(tasks()).toEqual(["task none", "task mid", "task big", "task unk"]); // unmeasured last
+      fireEvent.click(screen.getByRole("button", { name: "Order settled crews oldest first" }));
+      expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]);
+    });
   });
 
   it("dismiss removes a settled card from the board", () => {
