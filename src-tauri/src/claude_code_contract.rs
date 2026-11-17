@@ -487,6 +487,71 @@ fn stream_json_resume_with_its_deferred_tool_gone_names_the_tool() {
     assert!(is_deferred_tool_unavailable(exit_0.error.as_deref().unwrap_or_default()), "[{fx}]");
 }
 
+const SETTINGS_REFUSED_VERSION: &str = "2.1.326";
+const SETTINGS_REFUSED_REL: &str = "stream-json/settings-refused.jsonl";
+const SETTINGS_REFUSED_STDERR_REL: &str = "stream-json/settings-refused.stderr.txt";
+
+#[test]
+fn stream_json_refused_settings_name_the_setting() {
+    use crate::orchestrator::cli_runner::{is_budget_stop, is_session_not_saved, is_settings_refused, SETTINGS_REFUSED};
+    // Claude Code 2.1.323: `--settings` that turn the sandbox on and fail
+    // validation stop `claude -p` at start-up, naming the invalid setting.
+    let rec = synthesized(SETTINGS_REFUSED_VERSION);
+    let fx = rec.label(SETTINGS_REFUSED_REL);
+    let events = rec.jsonl(SETTINGS_REFUSED_REL);
+    let r = result_event(&fx, &events).clone();
+    for f in ["subtype", "is_error", "errors.0", "session_id"] {
+        require(&fx, &r, f);
+    }
+    assert_eq!(require_str(&fx, &r, "subtype"), "error_during_execution", "[{fx}]");
+    let stderr = rec.text(SETTINGS_REFUSED_STDERR_REL);
+    let line = serde_json::to_string(&r).unwrap();
+    let named = "(permissions.blockWritesOutsideWorkingDirectories: Expected boolean, but received string)";
+    for err_text in [stderr.as_str(), ""] {
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, err_text)
+            .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+        assert_eq!(outcome.status, StageStatus::Failed, "[{fx}]");
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: ")), "[{fx}] {err}");
+        assert!(err.lines().next().unwrap().contains(named), "[{fx}] the first line names the setting: {err}");
+        assert!(!err.contains("error_during_execution"), "[{fx}] not the generic stop: {err}");
+        assert!(is_settings_refused(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
+        assert_eq!(outcome.session_id, None, "[{fx}] the session never ran: nothing to resume");
+        assert!(outcome.artifact.text.is_empty(), "[{fx}]");
+    }
+    // stderr alone (no `errors` field) still names it.
+    let mut bare = r.clone();
+    bare.as_object_mut().unwrap().remove("errors");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, &stderr).unwrap();
+    let err = outcome.error.as_deref().unwrap_or_default();
+    assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: sandbox required but unavailable: ")), "[{fx}] {err}");
+    assert!(err.lines().next().unwrap().contains(named), "[{fx}] {err}");
+    // The machine-readable reason alone (no `errors`, no stderr) still reads
+    // as refused settings; with the reason gone and only an unrelated
+    // "failed validation" line, it does not.
+    require(&fx, &r, "startup_failure_reason");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, "").unwrap();
+    assert!(is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+    bare.as_object_mut().unwrap().remove("startup_failure_reason");
+    let unrelated = "[Bootstrap] Gateway /v1/models failed validation: expected a list";
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, unrelated).unwrap();
+    assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+}
+
+#[test]
+fn recorded_failures_are_never_read_as_refused_settings() {
+    use crate::orchestrator::cli_runner::is_settings_refused;
+    for rec in recordings() {
+        let rel = "stream-json/error-unknown-model.jsonl";
+        let fx = rec.label(rel);
+        let events = rec.jsonl(rel);
+        let line = serde_json::to_string(result_event(&fx, &events)).unwrap();
+        let outcome = parse_cli_result(&line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap_or_default();
+        assert!(!is_settings_refused(err), "[{fx}] {err}");
+    }
+}
+
 #[test]
 fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
     use crate::orchestrator::cli_runner::{is_deferred_tool_unavailable, is_tool_deferred};
@@ -1156,6 +1221,32 @@ fn auth_status_signed_out_is_told_apart_from_unknown() {
     for text in ["", "Logged in using claude.ai", "Not logged in", "error: unknown command 'auth'", "} {", "{not json}"] {
         assert_eq!(parse(text), Unknown, "{text:?}");
     }
+}
+
+// ─── `system/init` `model` → the model a stage ran on (#791) ──
+
+#[test]
+fn init_events_name_the_model_the_session_runs_on() {
+    // Every recorded init carries `model`, and a stage that asked for that
+    // model (or its family alias) reads as not substituted.
+    use crate::orchestrator::cli_runner::{init_model, substituted_model};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let init = events.iter().find(|e| e["subtype"] == "init").unwrap_or_else(|| panic!("[{fx}] no init"));
+            let model = init_model(init).unwrap_or_else(|| panic!("[{fx}] init without a model: {init}"));
+            assert_eq!(substituted_model(model, init), None, "[{fx}]");
+        }
+    }
+    // The 2.1.314 retry fixture's init: `claude-sonnet-4-5`.
+    let rec = recording("2.1.314");
+    let events = rec.jsonl(API_RETRY_REL);
+    let init = &events[0];
+    assert_eq!(init_model(init), Some("claude-sonnet-4-5"), "[{}]", rec.label(API_RETRY_REL));
+    assert_eq!(substituted_model("sonnet", init), None);
+    assert_eq!(substituted_model("claude-sonnet-4-5-20250929", init), None);
+    assert_eq!(substituted_model("claude-opus-5-5", init).as_deref(), Some("claude-sonnet-4-5"));
 }
 
 // ─── `system/api_retry`, `system/notification` and `system/init` load errors → journal notices ──

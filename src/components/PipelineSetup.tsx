@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustNote, type PipelineWithStages, type RepoCrew, type RunEstimate } from "../lib/ipc";
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import {
-  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, crewClaudeModels, crewUsesClaudeCode, loadClaudeCliVersion, modelFloorLabel,
+  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, crewClaudeModels, crewUsesClaudeCode, crewUsesCodex, loadClaudeCliVersion, modelFloorLabel,
 } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -245,6 +245,19 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     return () => { alive = false; };
   }, [cli?.version, claudeModelsKey]);
   const modelFloorLine = cli?.version ? modelFloorLabel(floorNote) : null;
+  // A Codex stage in a repo whose .codex/ config Codex will skip, because the
+  // project isn't trusted in Codex. Octopush never trusts it for the user.
+  const usesCodex = !!selected && crewUsesCodex(selected.stages, overrides);
+  const [codexTrust, setCodexTrust] = useState<CodexTrustNote | null>(null);
+  useEffect(() => {
+    setCodexTrust(null);
+    if (!usesCodex || !workspacePath) return;
+    let alive = true;
+    ipc.codexTrustNote(workspacePath)
+      .then((n) => { if (alive) setCodexTrust(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [usesCodex, workspacePath]);
   // An Action stage on Codex outside a sandboxed mission can't commit.
   const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
 
@@ -636,6 +649,12 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 setOverrides((prev) => Object.fromEntries(Object.entries(prev).filter(([, m]) => !fromIds.includes(m))));
               }}
             />
+            {codexTrust && (
+              <div data-tour="direct-launcher-codex-trust" data-testid="launcher-codex-trust" className="octo-rise-in mt-3">
+                <p className="m-0 font-mono text-[11px] text-octo-warning">{codexTrust.line}</p>
+                <p className="m-0 mt-0.5 text-[11px] leading-[1.55] text-octo-sage">{codexTrust.how} The run can still begin.</p>
+              </div>
+            )}
             {codexCommitLine && (
               <p
                 data-tour="direct-launcher-codex-commit"

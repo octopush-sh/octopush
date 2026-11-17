@@ -373,6 +373,11 @@ pub struct CliOutcomeMeta {
     /// (Codex), kept as the next resume's baseline. `None` when the last turn
     /// never completed, so the total is unknown and the session isn't resumed.
     pub session_usage: Option<SessionUsage>,
+    /// The model a Claude stage ran on when its `system/init` named another
+    /// than the one it asked for (`cli_runner::substituted_model`); `None`
+    /// when they match or the init didn't say. The drive records it on the
+    /// stage, so its spend is attributed and priced to what ran.
+    pub ran_model: Option<String>,
 }
 
 /// What a runner returns for one stage.
