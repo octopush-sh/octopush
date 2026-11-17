@@ -819,6 +819,15 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Claude Code refused the stage's settings at start-up: a stronger
+        // model starts with the same settings.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_settings_refused)
+        {
+            return Ok(false);
+        }
         // A hook deferred a tool call, or a resumed session's deferred tool is
         // gone: a stronger model meets the same hook and won't bring the tool back.
         if fresh.error.as_deref().is_some_and(|e| {

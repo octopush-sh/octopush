@@ -1,0 +1,4 @@
+
+Error: sandbox required but unavailable: the settings passed with --settings or the SDK's settings option configure the sandbox but failed validation, so none of them apply (permissions.blockWritesOutsideWorkingDirectories: Expected boolean, but received string). Fix them and start again
+  Refusing to start without a working sandbox (see sandbox.failIfUnavailable).
+

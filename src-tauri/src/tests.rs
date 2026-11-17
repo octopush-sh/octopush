@@ -9502,6 +9502,91 @@ mod cli_runner_tests {
     }"#;
 
     #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::{refused_setting, SANDBOX_REQUIRED_UNAVAILABLE};
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr, None).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Sandbox required but unavailable: settings failed validation (a.b: bad)"]);
+        assert_eq!(
+            refused_setting(Some(&errors), stderr, None).as_deref(),
+            Some("Sandbox required but unavailable: settings failed validation (a.b: bad)")
+        );
+        // "failed validation" alone is not the signal.
+        let unrelated = "[Bootstrap] Gateway /v1/models failed validation: unexpected shape";
+        assert_eq!(refused_setting(None, unrelated, None), None);
+        let other = serde_json::json!(["Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&other), unrelated, None), None);
+        // The machine-readable reason is: the first `errors` string stands in.
+        assert_eq!(
+            refused_setting(Some(&other), unrelated, Some(SANDBOX_REQUIRED_UNAVAILABLE)).as_deref(),
+            Some("Settings failed validation (a.b: bad)")
+        );
+        assert!(refused_setting(None, "", Some(SANDBOX_REQUIRED_UNAVAILABLE)).is_some());
+        assert_eq!(refused_setting(None, "", Some("something_else")), None);
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded", None), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), "", None), None, "not an array");
+        assert_eq!(refused_setting(None, "", None), None);
+        let long = format!("Sandbox required but unavailable: failed validation {}", "x".repeat(900));
+        assert!(refused_setting(None, &long, None).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn budget_and_max_turns_stops_with_an_unrelated_validation_line_keep_their_own_handling() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_settings_refused, BUDGET_STOP_SUBTYPE};
+        let stderr = "[Bootstrap] Gateway /v1/models failed validation: expected a list\n";
+        let budget = format!(
+            r#"{{"type":"result","subtype":"{BUDGET_STOP_SUBTYPE}","is_error":true,"num_turns":7,
+            "session_id":"s","total_cost_usd":1.5}}"#
+        );
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(is_budget_stop(err) && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,
+            "session_id":"s","total_cost_usd":0.4}"#;
+        let outcome = parse_cli_result(turns, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.contains("error_max_turns") && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        // Even the real refused-settings line does not take over a budget stop
+        // or a session that ran turns.
+        let real = "Error: Sandbox required but unavailable: settings failed validation (x: y)";
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, real).unwrap();
+        assert!(is_budget_stop(outcome.error.as_deref().unwrap()));
+        let ran = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,
+            "session_id":"s","total_cost_usd":0.1}"#;
+        let outcome = parse_cli_result(ran, false, ArtifactKind::Diff, real).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+        // A generic execution error with only the unrelated line stays generic.
+        let plain = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0}"#;
+        let outcome = parse_cli_result(plain, false, ArtifactKind::Diff, stderr).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
         use crate::orchestrator::cli_runner::is_budget_stop;
         let outcome = parse_cli_result(BUDGET_STOPPED, true, ArtifactKind::Diff, "").unwrap();
