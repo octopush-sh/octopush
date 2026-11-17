@@ -1,5 +1,5 @@
 import { Command } from "cmdk";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
@@ -12,6 +12,10 @@ import { ModalShell } from "./ModalShell";
 import { openWhatsNewForCurrentVersion, previewUnreleasedTips } from "../lib/whatsNewLaunch";
 import { tourId } from "../lib/tour/ids";
 import { useCrewImportStore } from "../stores/crewImportStore";
+import { useRunsStore } from "../stores/runsStore";
+import { MidTruncate } from "./primitives/MidTruncate";
+import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
+import type { ProjectGroup } from "./WorkspaceRail";
 
 interface Props {
   open: boolean;
@@ -20,6 +24,12 @@ interface Props {
   onToggleTokens: () => void;
   /** Opens the PR composer for the active workspace; absent without one. */
   onOpenPullRequest?: () => void;
+  /** The rail's projects and their workspaces — the Workspaces group. */
+  projects?: ProjectGroup[];
+  /** Workspaces something is working in (the rail's marching edge). */
+  runningByWs?: Record<string, boolean>;
+  /** Switches project and workspace like a rail click. */
+  onSelectWorkspace?: (id: string) => void;
 }
 
 export function CommandPalette({
@@ -28,6 +38,9 @@ export function CommandPalette({
   onNewSession,
   onToggleTokens,
   onOpenPullRequest,
+  projects,
+  runningByWs,
+  onSelectWorkspace,
 }: Props) {
   const { sessions, activeId, select, kill } = useSessionStore();
   const refresh = useSessionStore((s) => s.refresh);
@@ -39,6 +52,12 @@ export function CommandPalette({
   const editorTabWidth = useEditorPrefs((s) => s.tabWidth);
   const editorLineNumbers = useEditorPrefs((s) => s.lineNumbers);
   const blameOn = useBlameStore((s) => s.enabled);
+  const runsByWs = useRunsStore((s) => s.runsByWs);
+  const statusSince = useRunsStore((s) => s.statusSince);
+  const workspaceRows = useMemo(
+    () => (open && onSelectWorkspace ? paletteWorkspaces(projects, runsByWs, statusSince, runningByWs) : []),
+    [open, onSelectWorkspace, projects, runsByWs, statusSince, runningByWs],
+  );
 
   useEffect(() => {
     if (open) {
@@ -69,7 +88,7 @@ export function CommandPalette({
             "0 30px 60px -10px rgba(0,0,0,0.6), 0 0 0 6px rgba(212, 165, 116, 0.04)",
         }}
       >
-        <Command loop className="overflow-hidden rounded-xl">
+        <Command loop filter={paletteFilter} className="overflow-hidden rounded-xl">
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
@@ -117,6 +136,17 @@ export function CommandPalette({
                 />
               )}
             </Group>
+
+            {/* Workspaces — every open project's, needs-you first, then
+                running, then most recently active. Typing part of a branch
+                or a project name finds the row. */}
+            {workspaceRows.length > 0 && onSelectWorkspace && (
+              <Group heading="Workspaces" tour={tourId("palette-workspaces")}>
+                {workspaceRows.map((w) => (
+                  <WorkspaceItem key={w.id} row={w} onSelect={() => run(() => onSelectWorkspace(w.id))} />
+                ))}
+              </Group>
+            )}
 
             {/* Models */}
             {/* The heading already says "Models", so rows carry the bare name. */}
@@ -402,6 +432,55 @@ function Item({
           {shortcut}
         </kbd>
       )}
+    </Command.Item>
+  );
+}
+
+/** A Workspaces row: the name over a mono meta line, "<project> · <branch>",
+ *  both middle-truncated like the rail with the full text in a title. A
+ *  static dot says the crew needs you (brass, the rail's non-beacon dot) or
+ *  that it is working (sage); the palette never pulses. */
+function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () => void }) {
+  const meta = row.branch ? `${row.project} · ${row.branch}` : row.project;
+  const state = row.needsYou ? "Needs you" : row.running ? "Working" : null;
+  return (
+    <Command.Item
+      // cmdk keys selection on `value`: the id keeps two same-named rows
+      // (one `main` per project) distinct; name, branch and project match
+      // through `keywords`. The prefix tells `paletteFilter` to score the
+      // keywords alone, so the UUID never matches a search.
+      value={`${WORKSPACE_VALUE_PREFIX}${row.id}`}
+      keywords={row.keywords}
+      onSelect={onSelect}
+      data-testid="palette-workspace"
+      className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
+    >
+      <span
+        aria-hidden
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline font-serif text-[12px] text-octo-mute group-aria-selected:text-octo-brass"
+      >
+        {row.glyph}
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex min-w-0" title={row.name}>
+          <MidTruncate text={row.name} className="min-w-0 flex-1" />
+        </span>
+        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={meta}>
+          <MidTruncate text={meta} tail={16} className="min-w-0 flex-1" />
+        </span>
+      </span>
+      {/* Reserved slot, so a state change never shifts the row. */}
+      <span className="flex w-2 shrink-0 justify-center">
+        {state && (
+          <span
+            role="img"
+            aria-label={state}
+            title={state}
+            data-testid="palette-workspace-state"
+            className={`octo-pop-in h-[5px] w-[5px] rounded-full ${row.needsYou ? "bg-octo-brass" : "bg-octo-sage"}`}
+          />
+        )}
+      </span>
     </Command.Item>
   );
 }

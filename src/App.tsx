@@ -2613,6 +2613,9 @@ function App() {
         onOpenPullRequest={
           activeWorkspaceId ? () => usePrStore.getState().openComposer(activeWorkspaceId) : undefined
         }
+        projects={projectGroups}
+        runningByWs={runningByWs}
+        onSelectWorkspace={handleSelectWorkspace}
       />
       </ErrorBoundary>
 
