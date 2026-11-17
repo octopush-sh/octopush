@@ -2294,6 +2294,9 @@ impl CliRunner {
                     ) {
                         Ok(prepared) => {
                             sandbox_env = prepared.env;
+                            if dialect == CliDialect::Claude {
+                                sandbox_env.extend(crate::orchestrator::sandbox::claude_stage_env());
+                            }
                             left_out = prepared.left_out;
                             (prepared.program, prepared.args)
                         }
