@@ -1545,6 +1545,9 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
+  codexTrustNote: (workspacePath: string) =>
+    invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -1638,6 +1641,14 @@ export interface ClaudeCliVersion {
 
 /** A crew model the installed Claude Code is too old for (mirrors Rust
  *  `agent_adapter::ClaudeModelFloorNote`). */
+/** Codex will skip the repo's `.codex/` config: the project isn't trusted
+ *  in Codex (`commands::codex_trust_note`). */
+export interface CodexTrustNote {
+  line: string;
+  /** How the user can trust it themselves. */
+  how: string;
+}
+
 export interface ClaudeModelFloorNote {
   /** Display name, e.g. "Fable 5.2". */
   label: string;

@@ -6819,6 +6819,29 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
 }
 
+/// Direct launcher: the line saying Codex will skip this repo's `.codex/`
+/// settings and MCP servers because the project isn't trusted in Codex, and
+/// how to trust it. Reads Codex's config only; `None` when the repo has no
+/// `.codex/` dir, the project is trusted, or the config is missing or unreadable.
+#[tauri::command]
+pub async fn codex_trust_note(workspace_path: String) -> AppResult<Option<CodexTrustNote>> {
+    tokio::task::spawn_blocking(move || {
+        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|line| CodexTrustNote {
+            line: line.to_string(),
+            how: crate::codex_trust::CODEX_TRUST_HOW.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("codex trust task failed: {e}")))
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrustNote {
+    pub line: String,
+    pub how: String,
+}
+
 /// Direct launcher, Readiness and Routines: the models among `models` with a
 /// published retirement date (`token_engine::MODEL_RETIREMENTS`), each once.
 /// The caller decides from the date whether to say anything.

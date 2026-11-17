@@ -2423,6 +2423,11 @@ impl CliRunner {
         if let Some(note) = codex_git_notice(dialect, read_only, write_scope, stage.role_environment) {
             emitter.notice(note);
         }
+        if dialect == CliDialect::Codex {
+            if let Some(note) = crate::codex_trust::untrusted_note(&ctx.workspace_path) {
+                emitter.notice(&format!("{note} {}", crate::codex_trust::CODEX_TRUST_HOW));
+            }
+        }
         let mut child = match command.spawn() {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

@@ -30,6 +30,7 @@ vi.mock("../hooks/useEntitlement", () => ({
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
 const floorNoteMock = vi.hoisted(() => vi.fn());
+const codexTrustMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
 const readRepoCrewMock = vi.hoisted(() => vi.fn());
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -37,7 +38,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
   return {
     ...actual,
     ipc: {
-      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock,
+      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, codexTrustNote: codexTrustMock,
       listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
     },
   };
@@ -73,6 +74,8 @@ beforeEach(() => {
   repoCrewsMock.mockResolvedValue([]);
   floorNoteMock.mockReset();
   floorNoteMock.mockResolvedValue(null);
+  codexTrustMock.mockReset();
+  codexTrustMock.mockResolvedValue(null);
 });
 
 describe("PipelineSetup crews from the repo", () => {
@@ -574,6 +577,30 @@ describe("PipelineSetup Claude Code version preflight", () => {
     // A sandboxed mission confines it with Octopush's own profile instead.
     act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox" } as any } }));
     expect(screen.queryByTestId("launcher-codex-commit")).not.toBeInTheDocument();
+  });
+
+  it("says when Codex will skip the repo's .codex/ config, and still lets the run begin", async () => {
+    codexTrustMock.mockResolvedValue({
+      line: "Codex will ignore this repo's .codex/ settings and MCP servers: the project isn't trusted in Codex.",
+      how: "To trust it, open Codex in the repo once and accept, or run `codex exec --trust` there yourself. Octopush never changes your Codex config.",
+    });
+    storeState.pipelines = [cliPipe("gpt-5-codex")];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const note = await screen.findByTestId("launcher-codex-trust");
+    expect(codexTrustMock).toHaveBeenCalledWith("/tmp/w1");
+    expect(note).toHaveTextContent("Codex will ignore this repo's .codex/ settings and MCP servers");
+    expect(note).toHaveTextContent("codex exec --trust");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("does not read Codex trust for a crew without a Codex stage", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await act(async () => {});
+    expect(codexTrustMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-codex-trust")).not.toBeInTheDocument();
   });
 
   it("does not probe for crews without a Claude Code CLI stage", async () => {

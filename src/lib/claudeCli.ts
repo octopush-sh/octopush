@@ -106,6 +106,14 @@ export function crewUsesClaudeCode(
   return stages.some((s) => s.substrate === "cli" && runsOnClaudeCode(overrides[s.position] || s.agentModel));
 }
 
+/** Whether any CLI stage of the crew (with the launcher's overrides) runs on Codex. */
+export function crewUsesCodex(
+  stages: { position: number; substrate: string; agentModel: string }[],
+  overrides: Record<number, string>,
+): boolean {
+  return stages.some((s) => s.substrate === "cli" && !runsOnClaudeCode(overrides[s.position] || s.agentModel));
+}
+
 /** Every model a Claude Code CLI stage of the crew may launch — its model
  *  (with the launcher's overrides) and its escalation model — deduplicated. */
 export function crewClaudeModels(
