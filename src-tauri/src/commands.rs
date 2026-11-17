@@ -1270,7 +1270,7 @@ pub async fn project_collisions(
                 id: row.id,
                 name: row.name,
                 path,
-                base: row.from_branch.or_else(|| default_base.clone()),
+                base: crate::collisions::workspace_base(row.from_branch, default_base.as_deref()),
             })
         })
         .collect();
@@ -1286,6 +1286,40 @@ pub async fn project_collisions(
     })
     .await
     .map_err(|e| AppError::Other(format!("collision scan: {e}")))
+}
+
+/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
+/// for Mission Control's settled and needs-you cards. `None` when the
+/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
+/// out — the card then shows nothing rather than a made-up zero.
+#[tauri::command]
+pub async fn workspace_diff_size(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::git_ops::DiffSize>> {
+    let (row, project_path) = {
+        let db = state.db.lock();
+        let Some(row) = db.get_workspace(&workspace_id)? else { return Ok(None) };
+        let project_path = db.get_project(&row.project_id)?.map(|p| p.path);
+        (row, project_path)
+    };
+    let Some(wt) = row.worktree_path else { return Ok(None) };
+    let path = expand_tilde(&wt);
+    if !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
+        return Ok(None);
+    }
+    let from_branch = row.from_branch;
+    Ok(run_with_timeout(std::time::Duration::from_secs(5), move || {
+        // The same base the collision radar uses: the workspace's own base
+        // branch, else the project's default branch.
+        let default_base = project_path
+            .as_deref()
+            .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+        let base = crate::collisions::workspace_base(from_branch, default_base.as_deref());
+        crate::git_ops::diff_size(std::path::Path::new(&path), base.as_deref()).ok()
+    })
+    .await
+    .flatten())
 }
 
 #[tauri::command]
@@ -2025,9 +2059,14 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages, unreported) = {
+    let (run, stages, unreported, ran) = {
         let db = state.db.lock();
-        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?, db.usage_unreported_stage_ids(&run_id)?)
+        (
+            db.get_run(&run_id)?,
+            db.list_run_stages(&run_id)?,
+            db.usage_unreported_stage_ids(&run_id)?,
+            db.ran_models(&run_id)?,
+        )
     };
     // Flag stages whose model has no price (resolved after the DB lock), and
     // stages whose CLI stopped before reporting usage: the ledger shows them
@@ -2037,12 +2076,18 @@ pub async fn get_run(
     let mut stages_json = serde_json::to_value(&stages)?;
     if let Some(arr) = stages_json.as_array_mut() {
         for (v, s) in arr.iter_mut().zip(stages.iter()) {
+            // A stage that ran on another model is priced as what ran.
+            let model = ran.get(&s.id).unwrap_or(&s.agent_model);
             let ok = *priced
-                .entry(s.agent_model.clone())
-                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
+                .entry(model.clone())
+                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), model).is_some());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
                 obj.insert("usageUnreported".into(), serde_json::Value::Bool(unreported.contains(&s.id)));
+                obj.insert(
+                    "ranModel".into(),
+                    ran.get(&s.id).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.clone())),
+                );
             }
         }
     }
@@ -6827,6 +6872,29 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
     Ok(crate::agent_adapter::claude_cli_version_cached()
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher: the line saying Codex will skip this repo's `.codex/`
+/// settings and MCP servers because the project isn't trusted in Codex, and
+/// how to trust it. Reads Codex's config only; `None` when the repo has no
+/// `.codex/` dir, the project is trusted, or the config is missing or unreadable.
+#[tauri::command]
+pub async fn codex_trust_note(workspace_path: String) -> AppResult<Option<CodexTrustNote>> {
+    tokio::task::spawn_blocking(move || {
+        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|note| CodexTrustNote {
+            line: note.line.to_string(),
+            how: note.how.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("codex trust task failed: {e}")))
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrustNote {
+    pub line: String,
+    pub how: String,
 }
 
 /// Direct launcher, Readiness and Routines: the models among `models` with a

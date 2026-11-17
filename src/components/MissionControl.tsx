@@ -11,8 +11,8 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, X } from "lucide-react";
-import type { Run, RunStage } from "../lib/ipc";
+import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, X } from "lucide-react";
+import type { DiffSize, Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
 import { useAttentionStore } from "../stores/attentionStore";
@@ -32,6 +32,7 @@ import { tourId } from "../lib/tour/ids";
 import { useCollisionStore } from "../stores/collisionStore";
 import { collisionSegment, collisionTooltip, worstSeverity } from "../lib/collisions";
 import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
+import { diffSizeKey, diffSizeLabel, diffSizeTitle, orderSettled, useDiffSizeStore } from "../stores/diffSizeStore";
 
 interface Props {
   open: boolean;
@@ -73,6 +74,11 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   const awayRunIds = useRunsStore((s) => s.awayRunIds);
   const flagsByWs = useAttentionStore((s) => s.flagsByWs);
   const missionByWorkspaceId = useMissionsStore((s) => s.missionByWorkspaceId);
+  // The Settled band only: oldest first (the default, today's order) or the
+  // smallest diff first, so the director can clear the quick reviews.
+  const [settledOrder, setSettledOrder] = useState<"oldest" | "smallest">("oldest");
+  const sizeByKey = useDiffSizeStore((s) => s.byKey);
+  const workspacesByProjectId = useWorkspaceStore((s) => s.workspacesByProjectId);
 
   // The board: paused runs + attention (chats/terminals waiting on you) in
   // "needs you", running runs in flight, and this session's settled
@@ -122,6 +128,25 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // detailByRun imperatively — subscribing to the whole map here would churn
   // this component on every stage event even while the room is closed.
   const boardIds = boardRuns.map((r) => r.id).join(",");
+
+  // Diff sizes of runs that left the board are dropped, never kept for good.
+  useEffect(() => {
+    useDiffSizeStore.getState().prune(boardIds ? boardIds.split(",") : []);
+  }, [boardIds]);
+
+  // Settled, in the chosen order. A card is measured only while its workspace
+  // is loaded (see CrewCard); one that can't be has nothing to show (`null`),
+  // one still measuring is `undefined`, which holds "Smallest first" at the
+  // oldest-first order until every visible size is in.
+  const settledItems = useMemo(
+    () =>
+      orderSettled(board.settled, settledOrder, (r) => {
+        if (findWorkspaceName(workspacesByProjectId, r.workspaceId) === null) return null;
+        const key = diffSizeKey(r.id, r.status, statusSince[r.id]);
+        return key in sizeByKey ? sizeByKey[key] : undefined;
+      }).map((r) => ({ kind: "run" as const, run: r })),
+    [board.settled, settledOrder, sizeByKey, statusSince, workspacesByProjectId],
+  );
 
   // Collision radar (#732): opening the room rescans the projects its crews
   // work in (throttled in the store, cached in the backend).
@@ -246,7 +271,28 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
         <div className="flex-1 overflow-y-auto px-8 pb-8">
           <BandSection title="Needs you" items={board.needsYou} band="needs-you" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
           <BandSection title="In flight" items={board.inFlight.map((r) => ({ kind: "run" as const, run: r }))} band="in-flight" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
-          <BandSection title="Settled" items={board.settled.map((r) => ({ kind: "run" as const, run: r }))} band="settled" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
+          <BandSection
+            title="Settled"
+            items={settledItems}
+            band="settled"
+            onJumpToRun={onJumpToRun}
+            onJumpToAttention={onJumpToAttention}
+            control={
+              <button
+                type="button"
+                data-tour="mission-control-settled-order"
+                onClick={() => setSettledOrder((o) => (o === "oldest" ? "smallest" : "oldest"))}
+                aria-label={settledOrder === "oldest" ? "Order settled crews by smallest diff first" : "Order settled crews oldest first"}
+                title={settledOrder === "oldest" ? "Oldest first — click for smallest diff first" : "Smallest diff first — click for oldest first"}
+                className="flex items-center gap-1.5 rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-ivory focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              >
+                <ArrowDownUp size={11} aria-hidden />
+                <span key={settledOrder} className="octo-fade-in">
+                  {settledOrder === "oldest" ? "Oldest first" : "Smallest first"}
+                </span>
+              </button>
+            }
+          />
         </div>
       )}
     </OverlayRoom>
@@ -259,18 +305,22 @@ function BandSection({
   band,
   onJumpToRun,
   onJumpToAttention,
+  control,
 }: {
   title: string;
   items: BoardItem[];
   band: Band;
   onJumpToRun: (workspaceId: string) => void;
   onJumpToAttention: (workspaceId: string, kind: "chat" | "terminal") => void;
+  /** A quiet band-level control at the header's right end (Settled's order). */
+  control?: React.ReactNode;
 }) {
   if (items.length === 0) return null;
   return (
     <section>
-      <div className="flex h-11 items-center font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
+      <div className="flex h-11 items-center justify-between font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">
         {title}
+        {control}
       </div>
       <div className="grid grid-cols-[repeat(auto-fill,minmax(380px,1fr))] items-start gap-4">
         {items.map((item, i) =>
@@ -312,6 +362,7 @@ function AttentionCard({
   // Mirror CrewCard's guard: a workspace whose project is closed still shows,
   // but jump-to is disabled — we can't navigate to an unloaded workspace.
   const canJump = wsName !== null;
+
   const jump = () => onJump(item.workspaceId, item.flag);
   const jumpProps = canJump
     ? {
@@ -390,6 +441,18 @@ function CrewCard({
   // and can be aborted — but jump-to is disabled: we can't navigate to an
   // unloaded workspace. (Same guard the old tray popover carried.)
   const canJump = wsName !== null;
+
+  // How much code waits for review — settled and needs-you cards only,
+  // measured once per run state (never on every render) and only while the
+  // workspace is loaded; nothing shows until (or unless) it is known.
+  const sized = canJump && (band === "settled" || band === "needs-you");
+  const ensureSize = useDiffSizeStore((s) => s.ensure);
+  const size = useDiffSizeStore((s) =>
+    sized ? s.byKey[diffSizeKey(run.id, run.status, statusSinceMs)] ?? null : null,
+  );
+  useEffect(() => {
+    if (sized) ensureSize(run.id, run.status, statusSinceMs, run.workspaceId);
+  }, [sized, ensureSize, run.id, run.status, statusSinceMs, run.workspaceId]);
 
   // Time-in-state — session-observed transition time, falling back to the
   // run's start for launch-hydrated rows. Fixed-width tabular slot (S2);
@@ -543,7 +606,7 @@ function CrewCard({
       )}
 
       {/* Row 5 — ledger foot + actions. */}
-      <CardFoot run={run} band={band} />
+      <CardFoot run={run} band={band} size={size} />
     </div>
   );
 }
@@ -757,7 +820,7 @@ function AskPanel({
   );
 }
 
-function CardFoot({ run, band }: { run: Run; band: Band }) {
+function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | null }) {
   const abort = useRunsStore((s) => s.abort);
   const resolve = useRunsStore((s) => s.resolve);
   const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
@@ -797,6 +860,15 @@ function CardFoot({ run, band }: { run: Run; band: Band }) {
       <span data-tour="mission-control-card-spent" className="octo-tabular text-octo-mute">
         {formatUsd(run.costUsd)}
       </span>
+      {size && (
+        <span
+          data-tour="mission-control-card-size"
+          className="octo-pop-in octo-tabular min-w-0 truncate text-octo-mute"
+          title={diffSizeTitle(size)}
+        >
+          · {diffSizeLabel(size)}
+        </span>
+      )}
       {run.baselineUsd > run.costUsd && band !== "settled" && (
         <span className="octo-tabular text-octo-verdigris">
           saved {formatUsd(run.baselineUsd - run.costUsd)}

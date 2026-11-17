@@ -820,6 +820,15 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Claude Code refused the stage's settings at start-up: a stronger
+        // model starts with the same settings.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_settings_refused)
+        {
+            return Ok(false);
+        }
         // A hook deferred a tool call, or a resumed session's deferred tool is
         // gone: a stronger model meets the same hook and won't bring the tool back.
         if fresh.error.as_deref().is_some_and(|e| {
@@ -1196,6 +1205,11 @@ impl Orchestrator {
         if let Some(sid) = outcome.session_id.as_deref() {
             self.db.lock().set_stage_session_usage(&stage.id, sid, outcome.cli.session_usage.as_ref())?;
         }
+        // The model this attempt actually ran on (Claude Code's settings can
+        // pick another than `--model`), recorded before any completion below
+        // so the spend ledger attributes and prices it to what ran. `None`
+        // clears an earlier attempt's.
+        self.db.lock().set_run_stage_ran_model(&stage.id, outcome.cli.ran_model.as_deref())?;
         // Part of the spend is unknown even if the stage finished (a failed
         // Codex resume before its fresh fallback) — flag it like an error
         // that carries the marker (that path flags and journals it itself).

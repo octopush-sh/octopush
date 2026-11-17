@@ -182,6 +182,14 @@ pub fn api_retry_cause(v: &Value) -> Option<String> {
     Some(first_str(v, &["error"]).unwrap_or("").to_string())
 }
 
+/// How long the CLI says it will wait before the retry a `system/api_retry`
+/// event announces (its numeric `retry_delay_ms`); `None` for any other
+/// event or a missing/non-numeric delay.
+pub fn api_retry_delay(v: &Value) -> Option<std::time::Duration> {
+    api_retry_cause(v)?;
+    v.get("retry_delay_ms").and_then(Value::as_u64).map(std::time::Duration::from_millis)
+}
+
 /// How long consecutive retries for one cause share a single notice.
 pub const RETRY_NOTICE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 

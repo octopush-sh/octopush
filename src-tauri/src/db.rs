@@ -793,6 +793,10 @@ impl Db {
         // Codex only) — the baseline a `codex exec resume` subtracts, since a
         // resumed thread reports its running total. NULL when unknown.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN session_usage TEXT")?;
+        // #791: the model the stage's last attempt actually ran on, when Claude
+        // Code's `system/init` named another than `agent_model` (its settings
+        // blocked the requested one). NULL when they matched or nobody said.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN ran_model TEXT")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -5831,6 +5835,27 @@ impl Db {
         Ok(())
     }
 
+    /// Record the model a stage's attempt actually ran on (`None` = the one
+    /// it asked for). Set before the attempt's completion is recorded, so its
+    /// spend event is attributed to that model (`record_direct_spend`).
+    pub fn set_run_stage_ran_model(&self, stage_id: &str, ran_model: Option<&str>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET ran_model = ?2 WHERE id = ?1",
+            params![stage_id, ran_model],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages that ran on another model than they asked for:
+    /// stage id → the model that ran.
+    pub fn ran_models(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, ran_model FROM run_stages WHERE run_id = ?1 AND ran_model IS NOT NULL")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
     /// Ids of the run's stages flagged `usage_unreported`.
     pub fn usage_unreported_stage_ids(&self, run_id: &str) -> AppResult<std::collections::HashSet<String>> {
         let mut stmt = self
@@ -5963,7 +5988,7 @@ impl Db {
         let attr: Option<(String, Option<String>, String, Option<String>)> = self
             .conn
             .query_row(
-                "SELECT r.workspace_id, w.project_id, s.agent_model, r.mission_id
+                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id
                  FROM run_stages s
                  JOIN runs r ON r.id = s.run_id
                  LEFT JOIN workspaces w ON w.id = r.workspace_id
@@ -6057,7 +6082,7 @@ impl Db {
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
-                 blocked_questions = NULL,
+                 blocked_questions = NULL, ran_model = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],

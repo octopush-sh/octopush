@@ -60,6 +60,16 @@ describe("RunLedger", () => {
     expect(screen.getByText(/budget \$0\.05/).className).toContain("text-octo-rouge");
   });
 
+  it("notes a stage that ran on another model in its breakdown row (#791)", () => {
+    const ran = [
+      { id: "s1", role: "implement", agentModel: "claude-opus-5-5", ranModel: "claude-sonnet-5-5", costUsd: 0.12, inputTokens: 0, outputTokens: 0 },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={baseRun} stages={ran} />);
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    const note = screen.getByText(/ran on sonnet-5-5/);
+    expect(note.getAttribute("title")).toContain("cost is for claude-sonnet-5-5");
+  });
+
   it("shows unpriced stages as unpriced and says the budget cannot see them", () => {
     const withUnpriced = [
       ...stages,

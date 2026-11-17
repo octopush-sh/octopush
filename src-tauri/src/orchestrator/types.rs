@@ -376,6 +376,11 @@ pub struct CliOutcomeMeta {
     /// A Claude plan window stopped this attempt (`cli_runner::apply_plan_limit`):
     /// the drive parks the run until the window resets.
     pub plan_limit: Option<crate::orchestrator::cli_runner::PlanLimit>,
+    /// The model a Claude stage ran on when its `system/init` named another
+    /// than the one it asked for (`cli_runner::substituted_model`); `None`
+    /// when they match or the init didn't say. The drive records it on the
+    /// stage, so its spend is attributed and priced to what ran.
+    pub ran_model: Option<String>,
 }
 
 /// What a runner returns for one stage.
