@@ -36,6 +36,7 @@ import { GitOpsMenu } from "./GitOpsMenu";
 import { HistoryModal } from "./HistoryModal";
 import { COMMIT_SYSTEM, buildCommitPrompt } from "../lib/commitMessage";
 import { resolveHelperModel } from "../lib/helperModels";
+import { useCollisionStore } from "../stores/collisionStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { useProjectStore } from "../stores/projectStore";
 import { useAiReview } from "../stores/aiReviewStore";
@@ -259,7 +260,10 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       const sha = amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
       // A commit changes the worktree's dirty state — refresh the rail signal.
       const pid = useProjectStore.getState().current?.id;
-      if (pid) void useWorkspaceStore.getState().loadGitSummaries(pid);
+      if (pid) {
+        void useWorkspaceStore.getState().loadGitSummaries(pid);
+        void useCollisionStore.getState().refresh(pid, { force: true });
+      }
       pushToast({ level: "success", title: amend ? "Amended" : "Committed", body: sha });
       setCommitMessage(""); setAmend(false); setLastCommit(null);
       await refresh();

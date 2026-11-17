@@ -105,6 +105,7 @@ Current anchors:
 | `logbook-upsell-cta` | Logbook room, Free only: "Open the full logbook with Pro" | `LogbookRoom.tsx` |
 | `review-mode-tail` | Review: the mode band's status tail ("2 files changed · +2 −1"; only with changes) | `ReviewTail.tsx` |
 | `review-companion-verdict` | Review Companion: the serif readiness verdict ("2 files to review.") | `CompanionReview.tsx` |
+| `review-companion-collision` | Review Companion, under the verdict: "Will conflict with refund-webhooks in 1 file." + "Open refund-webhooks" (only while the workspace overlaps another) | `CompanionReview.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
@@ -139,6 +140,8 @@ Current anchors:
 | `usage-claude-plan` | Settings › Usage: the Claude plan card (only once a Claude-plan stage reported) | `settings/ClaudePlanCard.tsx` |
 | `fleet-chip` | Top bar: the fleet chip (`2 needs you` · `1 in flight` · `✓ 3 done`; only while the board has something) | `RunsTray.tsx` |
 | `mission-control-away` | Mission Control header: "While you were away" line | `MissionControl.tsx` |
+| `rail-collision` | Rail row meta: the `GitCompareArrows` collision mark, amber for a file overlap, rouge for a confirmed conflict (only while another live workspace of the project changes the same files) | `CollisionMark.tsx` via `WorkspaceRail.tsx` |
+| `mission-control-card-collision` | Mission Control, a non-settled crew card: the "overlaps auth-flow · 2 files" meta segment (only while its workspace overlaps another) | `MissionControl.tsx` |
 | `mission-control-card-task` · `mission-control-card-workspace` · `mission-control-card-spent` | Mission Control crew card: its task title · the workspace name in its meta row · the spent figure in its ledger foot | `MissionControl.tsx` |
 | `mission-control-ask-toggle` · `mission-control-ask-accept` | Mission Control `?` card (an `ask_director` block): the questions disclosure · "Accept recommended" | `MissionControl.tsx` |
 
