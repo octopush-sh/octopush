@@ -57,6 +57,14 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
       remedy: "Claude Code was still waiting on it. Check why it hangs, then resume or re-run.",
     };
   }
+  // "claude timed out — no output for 10 minutes after an API retry (overloaded)".
+  const retried = /no output for (\d+ minutes?) after an API retry(?: \(([^)]+)\))?/.exec(raw.split("\n")[0]);
+  if (retried) {
+    return {
+      title: `No answer for ${retried[1]} after an API retry${retried[2] ? ` (${retried[2]})` : ""}`,
+      remedy: "Claude Code waited out its retry delay and the API still didn't answer. Check the provider, then resume or re-run.",
+    };
+  }
   if (/no output for/i.test(raw)) {
     return { title: "Claude produced no output and timed out", remedy: "The CLI stalled — resume or re-run." };
   }

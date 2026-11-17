@@ -30,7 +30,7 @@ use crate::orchestrator::cli_runner::{
     parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
     CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
-use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
+use crate::orchestrator::live::{api_retry_delay, entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
 
 // ─── Fixture helpers ──────────────────────────────────────────────────────
@@ -1172,6 +1172,10 @@ fn api_retry_events_journal_a_throttled_retry_notice() {
         }
         require_str(&fx, r, "error");
     }
+    // The delay each retry waits out stretches the runner's idle window.
+    let delays: Vec<Option<u64>> = retries.iter().map(|r| api_retry_delay(r).map(|d| d.as_millis() as u64)).collect();
+    assert_eq!(delays, [Some(520), Some(1130), Some(30_000), Some(2000)], "[{fx}]");
+    assert!(events.iter().filter(|e| e["subtype"] != "api_retry").all(|e| api_retry_delay(e).is_none()), "[{fx}]");
     let (entries, _, outcome) = replay(&fx, &events);
     assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
     assert_eq!(notice_texts(&entries), [
