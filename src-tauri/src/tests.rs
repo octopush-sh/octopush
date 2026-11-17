@@ -6048,6 +6048,127 @@ mod orchestrator_tests {
         assert_eq!(max_iterations, 100, "+turns override reached the re-run");
     }
 
+    /// Records `(resume session, quiet setting, the quiet variable as the CLI
+    /// spawn would set it)` per attempt; fails the first attempt with a
+    /// session so the director can `--resume` it.
+    struct QuietRecordingRunner {
+        failed: std::sync::atomic::AtomicBool,
+        seen: Arc<Mutex<Vec<(Option<String>, bool, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for QuietRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{apply_stage_env, dialect_for_model, QUIET_TRAFFIC_ENV};
+            let mut command = tokio::process::Command::new("claude");
+            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), stage.effort, ctx.quiet_claude_code);
+            let var = command
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == QUIET_TRAFFIC_ENV)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            self.seen.lock().push((stage.resume_session.clone(), ctx.quiet_claude_code, var));
+            let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "done".into(), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: if first { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: first.then(|| crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                verdict: None,
+                session_id: Some("sess-quiet".into()),
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// #703: the quiet setting is read from `settings.json` when each stage
+    /// starts — a fresh attempt and its `--resume` both get what the file says
+    /// at that moment, and the detached worker, a separate process driving the
+    /// same `Orchestrator` over the same file, gets it the same way.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_fresh_and_resumed_stages_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":false}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        // The user turns the toggle on before resuming: the resumed stage sees it.
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        test_settings_path::set(None);
+        assert_eq!(status, RunStatus::Completed);
+
+        let seen = seen.lock().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (None, false, None),
+                (Some("sess-quiet".into()), true, Some("1".into())),
+            ],
+            "fresh (off) then --resume (on)",
+        );
+    }
+
+    /// #703: a detached segment — `drive_segment`, the entry point
+    /// `octopush-run-worker` calls in its own process — reads the quiet
+    /// setting from `settings.json` per stage, like the in-process drive.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_a_detached_segment_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.drive_segment(&run_id, false).await.unwrap();
+        // The user turns it off; the next detached segment (the resume) is loud again.
+        std::fs::write(&settings, "{}").unwrap();
+        let resumed = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await;
+        test_settings_path::set(None);
+        resumed.unwrap();
+
+        let seen = seen.lock().clone();
+        assert_eq!(seen.first(), Some(&(None, true, Some("1".into()))), "detached segment, on: {seen:?}");
+        assert_eq!(seen.get(1), Some(&(Some("sess-quiet".into()), false, None)), "resumed segment, off: {seen:?}");
+    }
+
     #[test]
     fn blocked_ask_serde_round_trips_camel_case() {
         let ask = BlockedAsk {
@@ -7083,6 +7204,62 @@ mod orchestrator_tests {
         let env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
         let script = r#"test "$CONDUCTOR_ROOT_PATH:$CONDUCTOR_WORKSPACE_PATH:$CONDUCTOR_WORKSPACE_NAME" = "/repo:/wt/a:a""#;
         assert_eq!(run_setup_with_env(script, dir.path(), Duration::from_secs(5), "/usr/bin:/bin", &env).await, Ok(()));
+    }
+
+    /// #703: with "Quiet Claude Code in crews and Routines" on, a Routine's own
+    /// commands — its fire condition and the fresh worktree's setup script —
+    /// run with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so a `claude`
+    /// they start is quiet like the Routine's crew stages. Off sets nothing.
+    #[tokio::test]
+    async fn routine_commands_get_the_quiet_variable_only_when_on() {
+        use crate::routines::{evaluate_condition_with_env, routine_quiet_env, run_setup_with_env, ConditionEval};
+        use std::time::Duration;
+        assert_eq!(
+            routine_quiet_env(true),
+            vec![("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string())],
+        );
+        assert!(routine_quiet_env(false).is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/usr/bin:/bin";
+        let t = Duration::from_secs(5);
+        let is_quiet = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = 1"#;
+        let not_set = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = unset"#;
+        // Fire condition.
+        assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(true)).await, ConditionEval::Met);
+        // Off adds nothing (checked only when the test runner doesn't export it).
+        let inherited = std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_some();
+        if !inherited {
+            assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(false)).await, ConditionEval::NotMet);
+        }
+        // Setup script, beside Conductor's variables.
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(true));
+        let both = format!(r#"{is_quiet} && test "$CONDUCTOR_WORKSPACE_NAME" = a"#);
+        assert_eq!(run_setup_with_env(&both, dir.path(), t, path, &env).await, Ok(()));
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(false));
+        if !inherited {
+            assert_eq!(run_setup_with_env(not_set, dir.path(), t, path, &env).await, Ok(()));
+        }
+    }
+
+    /// #703: Run terminals are the user's own sessions — the quiet setting
+    /// never reaches their PTY env, even with it on.
+    #[test]
+    fn run_terminal_env_is_untouched_by_quiet_claude_code() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        test_settings_path::set(Some(settings));
+        assert!(crate::settings::quiet_claude_code(), "the toggle is on");
+        let guard = crate::context_guard::ContextGuard::auto_configure("s1", dir.path());
+        let env = crate::commands::run_terminal_env(&guard, "claude-sonnet-5");
+        test_settings_path::set(None);
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), "{env:?}");
+        assert!(!env.keys().any(|k| k.starts_with("CLAUDE_CODE_")), "no stage pins in a Run terminal: {env:?}");
+        assert_eq!(env.get("OCTOPUSH_MODEL").map(String::as_str), Some("claude-sonnet-5"));
     }
 
     /// A failed setup only discards a worktree the fire just created — never an
