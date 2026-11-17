@@ -41,6 +41,25 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
   });
 
+  it("a running beacon pulses in verdigris, never brass (#749)", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />,
+    );
+    const card = container.querySelector(".octo-stage-pulse")!;
+    expect(card).toHaveClass("octo-stage-pulse-running", "border-octo-verdigris");
+    expect(card.className).not.toMatch(/border-octo-brass|brass-dim/);
+  });
+
+  it("an awaiting-gate beacon keeps the brass pulse", () => {
+    const gate = [mk({ id: "g", status: "awaiting_checkpoint", checkpoint: true })];
+    const { container } = render(
+      <RunFlow stages={gate} selectedStageId="g" beaconStageId="g" onSelectStage={() => {}} />,
+    );
+    const card = container.querySelector(".octo-stage-pulse")!;
+    expect(card).toHaveClass("border-octo-brass");
+    expect(card).not.toHaveClass("octo-stage-pulse-running");
+  });
+
   it("never pulses without a beacon, even while running", () => {
     const { container } = render(
       <RunFlow stages={stages} selectedStageId="b" beaconStageId={null} onSelectStage={() => {}} />,
