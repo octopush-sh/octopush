@@ -523,6 +523,39 @@ const SUBAGENT_MODEL_VERSION: &str = "2.1.325";
 
 #[test]
 #[serial_test::serial(pricing_catalog)]
+fn stream_json_synthetic_error_message_is_never_unpriced() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_estimate, CliUsage};
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Recorded: Claude Code's own model_not_found error message, stamped
+    // `message.model: "<synthetic>"` with zero usage.
+    let rec = recording("2.1.314");
+    let rel = "stream-json/error-unknown-model.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let synthetic = of_type(&events, "assistant")
+        .into_iter()
+        .find(|e| e.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>"))
+        .unwrap_or_else(|| panic!("[{fx}] no <synthetic> assistant message"));
+    let (id, u) = usage_from_stream_event(synthetic).unwrap();
+    assert_eq!(u.model.as_deref(), Some("<synthetic>"), "[{fx}]");
+    // Alone, and beside a priced message of the stage's model.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    map.insert(id.unwrap(), u);
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+    let priced = CliUsage { input_tokens: 1_000, output_tokens: 100, model: Some("claude-opus-5".into()), ..Default::default() };
+    map.insert("msg_priced".into(), priced);
+    let est = streamed_estimate("claude-opus-5", &map);
+    assert!(est.unpriced.is_empty(), "[{fx}] {:?}", est.unpriced);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}]");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    // A token-less message on an unknown model is not unpriced either.
+    map.insert("msg_empty".into(), CliUsage { model: Some("claude-mystery-9".into()), ..Default::default() });
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+}
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
 fn stream_json_stopped_stage_prices_a_subagent_at_its_own_model() {
     use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost, CliUsage};
     // Isolated catalog: never the owner's ~/.octopush/providers.json.

@@ -108,6 +108,11 @@ impl CliUsage {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
     }
+
+    /// Every token the usage counts (input, output, cache reads and writes).
+    fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
 }
 
 /// Per-message usage from an `assistant` NDJSON stream event: the message id
@@ -2964,9 +2969,12 @@ pub(crate) struct StreamedEstimate {
     /// tokens whose cost is unknown and reports them as saved).
     pub(crate) usage: CliUsage,
     pub(crate) cost_usd: f64,
-    /// The messages with no price that the stage's own `unpricedModel` flag
-    /// does not already cover, as `model` or `model (fast)`, sorted. Empty
-    /// when the estimate is complete.
+    /// The (model, speed) groups that have tokens but no price, as `model`
+    /// or `model (fast)`, sorted and deduplicated. Empty when the estimate is
+    /// complete, and also when every token is the stage's own unpriced model
+    /// at standard speed (the ledger already reads that stage "unpriced" from
+    /// its model). Token-less groups and CLI placeholder models such as
+    /// `<synthetic>` are never listed.
     pub(crate) unpriced: Vec<String>,
 }
 
@@ -2979,7 +2987,9 @@ pub(crate) struct StreamedEstimate {
 /// model, or fast mode on a model with no fast rate) is never billed at
 /// another rate and never read as free: it lands in `unpriced`, except a
 /// stage whose usage is all its own unpriced model at standard speed — the
-/// ledger already reads that stage "unpriced" from its model.
+/// ledger already reads that stage "unpriced" from its model. A group with
+/// no tokens, or on a CLI placeholder model (`<synthetic>`, which Claude Code
+/// stamps on its own error messages), billed nothing and is never unpriced.
 pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StreamedEstimate {
     use crate::token_engine::{normalize_model_id, prices_at_speed, prices_for, SPEED_FAST};
     let stage = normalize_model_id(model);
@@ -3012,6 +3022,7 @@ pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<Str
                     u.cache_creation_1h_input_tokens,
                 );
             }
+            None if u.total() == 0 || m.starts_with('<') => {}
             None => {
                 only_stage_model_unpriced &= !*fast && *key == stage;
                 unpriced.push(if *fast { format!("{m} (fast)") } else { m.clone() });

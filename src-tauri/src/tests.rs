@@ -4172,6 +4172,31 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_zero_dollar_stage_flagged_usage_unreported_is_unpriced_in_the_ledger() {
+        // A stopped stage on a priced model whose streamed tokens were all on
+        // an unpriced subagent model records those tokens at $0: the ledger
+        // row reads "unpriced", never a free "computed" row.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let st = db.list_run_stages(&run).unwrap();
+        let basis = |stage: &str| -> String {
+            db.conn_ref()
+                .query_row("SELECT cost_basis FROM spend_events WHERE source_id = ?1", [stage], |r| r.get(0))
+                .unwrap()
+        };
+        db.set_run_stage_usage_unreported(&st[0].id).unwrap();
+        db.complete_run_stage(&st[0].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[0].id), "unpriced");
+        // Unflagged, the same $0 on a priced model stays "computed".
+        db.complete_run_stage(&st[1].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[1].id), "computed");
+    }
+
+    #[test]
     fn retire_stage_cost_accumulates_on_the_run() {
         let db = test_db();
         let ws = seed_workspace(&db);
