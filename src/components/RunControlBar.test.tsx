@@ -230,4 +230,19 @@ describe("RunControlBar", () => {
     expect(screen.getByRole("button", { name: /Approve & continue/i })).toBeInTheDocument();
     expect(screen.queryByText(/the crew asked you/i)).not.toBeInTheDocument();
   });
+  it("secret hold: names what was found and makes approving an explicit override", () => {
+    const h = handlers();
+    const held = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "f", findings: [
+        { file: "tests/fixtures.ts", line: 12, rule: "github-token", kind: "GitHub token", yours: false },
+      ] },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={held} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText("possible secret")).toBeInTheDocument();
+    expect(screen.getByText(/possible secret · GitHub token in tests\/fixtures\.ts:12/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Proceed regardless" }));
+    expect(h.onApprove).toHaveBeenCalled();
+  });
 });

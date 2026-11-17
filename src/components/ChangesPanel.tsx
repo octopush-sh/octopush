@@ -30,6 +30,8 @@ import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
+import { SecretGuardDialog } from "./SecretGuardDialog";
+import { secretFindings, type SecretFinding } from "../lib/secretGuard";
 import { ModalShell } from "./ModalShell";
 import { ConflictAiModal } from "./ConflictAiModal";
 import { GitOpsMenu } from "./GitOpsMenu";
@@ -93,6 +95,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
   const [drafting, setDrafting] = useState(false);
   const [discardTarget, setDiscardTarget] = useState<string | null>(null);
+  const [secretHold, setSecretHold] = useState<{ action: "commit" | "push"; findings: SecretFinding[] } | null>(null);
   const [reconcile, setReconcile] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [resolvingPath, setResolvingPath] = useState<string | null>(null);
@@ -252,12 +255,14 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handleCommitOrAmend() {
+  async function handleCommitOrAmend(allowSecrets?: boolean) {
     const msg = commitMessage.trim();
     if (!msg || (!amend && staged.length === 0)) return;
     setCommitting(true);
     try {
-      const sha = amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
+      const sha = allowSecrets
+        ? amend ? await ipc.amendCommit(projectPath, msg, true) : await ipc.commitChanges(projectPath, msg, true)
+        : amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
       // A commit changes the worktree's dirty state — refresh the rail signal.
       const pid = useProjectStore.getState().current?.id;
       if (pid) {
@@ -269,7 +274,11 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       await refresh();
       onChange?.();
     } catch (e) {
-      pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
+      // Secret guard (#730): a possible credential in the staged diff asks
+      // first instead of failing.
+      const findings = secretFindings(e);
+      if (findings) setSecretHold({ action: "commit", findings });
+      else pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
     } finally {
       setCommitting(false);
     }
@@ -289,10 +298,10 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handlePush() {
+  async function handlePush(allowSecrets?: boolean) {
     setPushing(true);
     try {
-      const result = await ipc.pushBranch(projectPath);
+      const result = allowSecrets ? await ipc.pushBranch(projectPath, true) : await ipc.pushBranch(projectPath);
       pushToast({
         level: "success",
         title: "Branch published",
@@ -309,7 +318,9 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           .catch(() => {});
       }
     } catch (e) {
-      pushToast({ level: "error", title: "Push failed", body: String(e) });
+      const findings = secretFindings(e);
+      if (findings) setSecretHold({ action: "push", findings });
+      else pushToast({ level: "error", title: "Push failed", body: String(e) });
     } finally {
       setPushing(false);
     }
@@ -663,7 +674,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
 
         <button
           type="button"
-          onClick={handleCommitOrAmend}
+          onClick={() => void handleCommitOrAmend()}
           disabled={!canCommit}
           className="flex w-full items-center justify-center gap-1.5 rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] transition-colors disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           style={{
@@ -683,7 +694,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
         </button>
 
         <button
-          onClick={handlePush}
+          onClick={() => void handlePush()}
           disabled={!canPush}
           title={
             !hasUpstream
@@ -723,6 +734,25 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           </p>
         )}
       </div>
+
+      {secretHold && (
+        <SecretGuardDialog
+          action={secretHold.action}
+          findings={secretHold.findings}
+          onLeaveOut={() => {
+            // Take the user to the first finding's diff so they can drop it.
+            const first = secretHold.findings[0];
+            setSecretHold(null);
+            if (first) onFileClick?.(first.file);
+          }}
+          onOverride={() => {
+            const action = secretHold.action;
+            setSecretHold(null);
+            if (action === "commit") void handleCommitOrAmend(true);
+            else void handlePush(true);
+          }}
+        />
+      )}
 
       {discardTarget && (
         <ConfirmDialog

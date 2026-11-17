@@ -32,6 +32,7 @@ pub mod pty_daemon;
 mod pty_manager;
 mod session;
 pub mod session_recap;
+pub mod secret_scan;
 pub mod settings;
 pub mod skills;
 mod state;

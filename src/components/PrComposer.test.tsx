@@ -178,6 +178,32 @@ describe("PrComposer", () => {
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Pull request #7 opened" }));
   });
 
+  it("secret guard: a held branch asks first; the override pushes and opens this one PR", async () => {
+    ready();
+    ipcMock.getGitStatus.mockResolvedValue(status({ ahead: 1 }));
+    const refusal = { kind: "SecretsFound", message: "m", findings: [
+      { file: "seed.js", line: 9, rule: "your-credential", kind: "your Anthropic API key", yours: true },
+    ] };
+    ipcMock.pushBranch.mockRejectedValueOnce(refusal).mockRejectedValueOnce(refusal).mockResolvedValueOnce("ok");
+    const pr = { number: 8, title: "Add CSV export", url: "https://github.com/o/r/pull/8", isDraft: false, state: "open" };
+    ipcMock.createPullRequest.mockResolvedValue(pr);
+    const onClose = vi.fn();
+    renderComposer(onClose);
+    await screen.findByDisplayValue("Add CSV export");
+    fireEvent.click(screen.getByRole("button", { name: "Open the pull request" }));
+    expect(await screen.findByText("This pull request adds what looks like your Anthropic API key in seed.js:9.")).toBeTruthy();
+    expect(ipcMock.createPullRequest).not.toHaveBeenCalled();
+    // Escape closes only the guard, never the composer underneath.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByText(/your Anthropic API key/)).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open the pull request" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Open it regardless" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(ipcMock.pushBranch).toHaveBeenLastCalledWith("/w", true);
+    expect(ipcMock.createPullRequest).toHaveBeenCalledWith("/w", "main", "Add CSV export", "Closes #42\n\n## Summary\nExports.", false, true);
+  });
+
   it("shows a create failure inline and stays open", async () => {
     ready();
     ipcMock.createPullRequest.mockRejectedValue("gh pr create failed: a pull request already exists");

@@ -719,7 +719,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
@@ -750,7 +750,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
@@ -13065,7 +13065,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
-            blocked_questions: None, blocked_transcript: None,
+            blocked_questions: None, blocked_transcript: None, secret_hold: None,
         }
     }
 
@@ -18746,5 +18746,650 @@ mod collision_tests {
         assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
         assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
         assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+// ─── Secret guard (#730) ────────────────────────────────────────────────
+//
+// Every credential-shaped string here is ASSEMBLED AT RUNTIME from fragments
+// and a seeded generator, so this source file never holds anything a scanner
+// (ours, GitHub push protection) would flag.
+#[cfg(test)]
+mod secret_guard_tests {
+    use crate::secret_scan::*;
+    use std::path::Path;
+
+    /// Deterministic pseudo-random string over `alphabet`.
+    fn rnd(seed: u64, len: usize, alphabet: &str) -> String {
+        let a: Vec<char> = alphabet.chars().collect();
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                a[((x >> 33) as usize) % a.len()]
+            })
+            .collect()
+    }
+    const B62: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const B64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const DIGITS: &str = "123456789";
+
+    fn file(path: &str, lines: &[&str]) -> AddedFile {
+        AddedFile {
+            path: path.into(),
+            is_new: true,
+            lines: lines.iter().enumerate().map(|(i, l)| (i as u32 + 1, l.to_string())).collect(),
+        }
+    }
+
+    fn scan_one(path: &str, lines: &[&str]) -> Vec<SecretFinding> {
+        scan_added(&[file(path, lines)], &[])
+    }
+
+    /// (rule id, the secret itself, the line holding it)
+    fn true_positives() -> Vec<(&'static str, String, String)> {
+        let mut v = Vec::new();
+        let ant = ["sk-", "ant-", "api03-"].concat() + &rnd(1, 93, B62) + "AA";
+        v.push(("anthropic-key", ant.clone(), format!("const KEY = \"{ant}\";")));
+        let proj = ["sk-", "proj-"].concat() + &rnd(2, 64, B62);
+        v.push(("openai-key", proj.clone(), format!("OPENAI={proj}")));
+        let legacy = format!("sk-{}{}{}", rnd(3, 20, B62), ["T3Blbk", "FJ"].concat(), rnd(4, 20, B62));
+        v.push(("openai-key", legacy.clone(), format!("key: '{legacy}'")));
+        let plain48 = format!("sk-{}", rnd(5, 48, B62));
+        v.push(("openai-key", plain48.clone(), format!("let k = \"{plain48}\"")));
+        let ghp = ["gh", "p_"].concat() + &rnd(6, 36, B62);
+        v.push(("github-token", ghp.clone(), format!("token = \"{ghp}\"")));
+        let gho = ["gh", "o_"].concat() + &rnd(7, 36, B62);
+        v.push(("github-token", gho.clone(), format!("{gho}")));
+        let pat = ["github", "_pat_", "11"].concat() + &rnd(8, 20, B62) + "_" + &rnd(9, 59, B62);
+        v.push(("github-token", pat.clone(), format!("GH_TOKEN: {pat}")));
+        let stripe = ["sk", "_live_"].concat() + &rnd(10, 24, B62);
+        v.push(("stripe-key", stripe.clone(), format!("stripe.key = \"{stripe}\"")));
+        let slack = format!("{}{}-{}-{}", "xox", "b", rnd(11, 12, DIGITS), rnd(12, 24, B62));
+        v.push(("slack-token", slack.clone(), format!("SLACK={slack}")));
+        let google = ["AI", "za"].concat() + &rnd(13, 35, B62);
+        v.push(("google-api-key", google.clone(), format!("apiKey: \"{google}\",")));
+        v
+    }
+
+    #[test]
+    fn every_prefixed_rule_finds_its_true_positive() {
+        for (rule, secret, line) in true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: expected one finding");
+            assert_eq!(f[0].rule, rule);
+            assert_eq!(f[0].line, Some(1));
+            assert_eq!(f[0].file, "src/config.ts");
+            assert!(!f[0].yours);
+            // A prefixed key is a leak in a fixture too.
+            assert_eq!(scan_one("tests/fixtures/a.ts", &[&line]).len(), 1, "{rule} in a test path");
+            let _ = secret;
+        }
+    }
+
+    #[test]
+    fn prefixed_lookalikes_do_not_match() {
+        let x40 = "x".repeat(44);
+        let near = vec![
+            format!("sk-ant-{x40}"),                                   // placeholder
+            format!("{}{}", ["sk-", "ant-", "api03-"].concat(), "short"), // too short
+            format!("sk-proj-your-key-here-{}", "0".repeat(30)),       // placeholder
+            format!("{}{}", ["gh", "p_"].concat(), rnd(20, 35, B62)), // 35 chars: too short
+            format!("{}{}", ["gh", "p_"].concat(), rnd(21, 37, B62)), // 37 chars: runs on
+            format!("{}{}", ["sk", "_test_"].concat(), rnd(22, 24, B62)), // a test-mode key
+            "xoxb-your-token-goes-here".to_string(),
+            format!("task-{}", rnd(23, 48, B62)),                      // no word boundary
+            format!("{}{}", ["AI", "za"].concat(), rnd(24, 30, B62)), // too short
+            format!("sk-{}", "abcdefghij".repeat(5)),                  // low randomness
+            "Bearer <your-token>".to_string(),
+        ];
+        for line in near {
+            assert!(scan_one("src/a.ts", &[&line]).is_empty(), "false positive on {line:?}");
+        }
+    }
+
+    #[test]
+    fn aws_needs_the_key_id_and_a_secret_nearby() {
+        let id = ["AK", "IA"].concat() + &rnd(30, 16, UPPER);
+        let secret = rnd(31, 40, B64);
+        let both = scan_one("deploy/creds.ini", &[
+            "[default]",
+            &format!("aws_access_key_id = {id}"),
+            &format!("aws_secret_access_key = {secret}"),
+        ]);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].rule, "aws-access-key");
+        assert_eq!(both[0].line, Some(2));
+        // Same-line CSV form.
+        let csv = scan_one("creds.csv", &[&format!("{id},{secret}")]);
+        assert_eq!(csv.len(), 1);
+        // The key id alone is not enough.
+        assert!(scan_one("a.txt", &[&format!("user = {id}")]).is_empty());
+        // AWS's own documentation example is a placeholder.
+        let doc_id = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+        let doc_secret = ["wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "EXAMPLE", "KEY"].concat();
+        assert!(scan_one("README.md", &[
+            &format!("aws_access_key_id = {doc_id}"),
+            &format!("aws_secret_access_key = {doc_secret}"),
+        ]).is_empty());
+    }
+
+    #[test]
+    fn private_keys_need_key_material_under_the_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let body = rnd(40, 64, B64);
+        let f = scan_one("deploy/key.pem", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "private-key");
+        // Inline in JSON, with an escaped newline.
+        let inline = format!("\"private_key\": \"{}\\n{}\\n\"", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat(), body);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+        // Code that only mentions the header is not a key.
+        let code = format!("if pem.starts_with(\"{}\") {{", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat());
+        assert!(scan_one("src/pem.rs", &[&code, "    return true;", "}"]).is_empty());
+    }
+
+    #[test]
+    fn env_files_flag_credential_named_variables_only() {
+        let pw = rnd(41, 18, B62);
+        let f = scan_one(".env", &[
+            "LOG_LEVEL=debug",
+            "API_URL=https://api.example.org",
+            "AUTH_ENABLED=true",
+            "TOKEN=${OTHER_TOKEN}",
+            "PORT=8080",
+            &format!("DATABASE_PASSWORD=\"{pw}\""),
+        ]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "env-credential");
+        assert_eq!(f[0].line, Some(6));
+        assert!(f[0].kind.contains("DATABASE_PASSWORD"));
+        assert_eq!(scan_one("apps/web/.env.local", &[&format!("SECRET_KEY={pw}")]).len(), 1);
+        // Templates are committed on purpose.
+        assert!(scan_one(".env.example", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        assert!(scan_one(".env.sample", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        // A URL with credentials in it is one.
+        let url = format!("DATABASE_URL_AUTH=postgres://app:{pw}@db/app");
+        assert!(scan_one(".env", &[&url]).len() == 1 || !url.starts_with("http"));
+        let http = format!("AUTH_URL=https://user:{pw}@host/x");
+        assert_eq!(scan_one(".env", &[&http]).len(), 1);
+    }
+
+    #[test]
+    fn generic_assignment_is_entropy_gated_and_quiet_in_tests() {
+        let v = rnd(50, 32, B62);
+        let line = format!("const apiKey = \"{v}\";");
+        let f = scan_one("src/config.ts", &[&line]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "generic-secret");
+        assert!(scan_one("tests/config.test.ts", &[&line]).is_empty(), "test paths are quiet");
+        assert!(scan_one("src/__mocks__/api.ts", &[&line]).is_empty());
+        let near = [
+            "password = \"correcthorsebatterystaple\"".to_string(),   // no digits, low entropy
+            format!("secret = \"{}\"", rnd(51, 40, "0123456789abcdef")), // hex: ≤ 4 bits/char
+            "api_key = \"your-api-key-goes-here-123\"".to_string(),
+            "auth_token = \"{{ secrets.AUTH_TOKEN_VALUE_2 }}\"".to_string(),
+            "client_secret = \"https://vault.local/secret/path/1\"".to_string(),
+        ];
+        for l in near {
+            assert!(scan_one("src/a.py", &[&l]).is_empty(), "false positive on {l:?}");
+        }
+    }
+
+    #[test]
+    fn placeholders_are_suppressed() {
+        for p in ["xxxxxxxxxxxxxxxxxxxx", "your-key-here", "<token>", "AKIAIOSFODNN7EXAMPLE", "REDACTED", "aaaaaaaaaaaaaaaaaa", "changeme"] {
+            assert!(is_placeholder(p), "{p}");
+        }
+        assert!(!is_placeholder(&rnd(60, 40, B62)));
+    }
+
+    #[test]
+    fn the_canary_names_your_own_configured_key() {
+        let mine = format!("zq{}", rnd(70, 30, B62)); // matches no pattern
+        let mut settings = crate::settings::AppSettings::default();
+        settings.provider_keys.insert("anthropic".into(), mine.clone());
+        settings.provider_keys.insert("short".into(), "tooshort".into());
+        let known = known_secrets_from(&settings);
+        assert_eq!(known.len(), 1, "a too-short credential is never matched");
+        assert!(!format!("{known:?}").contains(&mine), "Debug redacts the value");
+        let f = scan_added(&[file("scripts/seed.js", &["// setup", &format!("client({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "your-credential");
+        assert_eq!(f[0].kind, "your Anthropic API key");
+        assert!(f[0].yours);
+        assert_eq!(f[0].line, Some(2));
+        // The canary wins over a pattern on the same line.
+        let (_, ant, line) = true_positives().remove(0);
+        let known = vec![KnownSecret::new("your Anthropic API key", ant)];
+        let f = scan_added(&[file("a.ts", &[&line])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+    }
+
+    #[test]
+    fn a_newly_added_ssh_key_file_is_flagged_by_name() {
+        let f = scan_added(&[AddedFile { path: "deploy/id_rsa".into(), is_new: true, lines: vec![] }], &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "ssh-private-key-file");
+        assert_eq!(f[0].line, None);
+        assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, lines: vec![] }], &[]).is_empty());
+    }
+
+    /// The secret never reaches a finding's Debug/Serialize output, the
+    /// error's Display or its IPC form, the summary, the journal notice, the
+    /// persisted hold or its fingerprint.
+    #[test]
+    fn no_secret_value_appears_in_any_output() {
+        let mut lines = Vec::new();
+        let mut secrets = Vec::new();
+        for (_, secret, line) in true_positives() {
+            secrets.push(secret);
+            lines.push(line);
+        }
+        let mine = format!("zq{}", rnd(80, 30, B62));
+        lines.push(format!("x = {mine}"));
+        secrets.push(mine.clone());
+        let known = vec![KnownSecret::new("your OpenAI API key", mine)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let findings = scan_added(&[file("src/leak.ts", &refs)], &known);
+        assert_eq!(findings.len(), secrets.len());
+
+        let err = crate::error::AppError::SecretsFound { findings: findings.clone() };
+        let hold = SecretHold { acknowledged: false, fingerprint: fingerprint(&findings), findings: findings.clone() };
+        let outputs = [
+            format!("{findings:?}"),
+            serde_json::to_string(&findings).unwrap(),
+            err.to_string(),
+            format!("{err:?}"),
+            serde_json::to_string(&err).unwrap(),
+            summarize(&findings),
+            hold_notice("the pull request", &findings),
+            serde_json::to_string(&hold).unwrap(),
+            format!("{known:?}"),
+        ];
+        for out in &outputs {
+            for s in &secrets {
+                assert!(!out.contains(s.as_str()), "a secret leaked into {out}");
+                // Not even a recognisable tail of it.
+                assert!(!out.contains(&s[s.len() - 8..]), "a secret's tail leaked into {out}");
+            }
+        }
+        let ipc: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(ipc["kind"], "SecretsFound");
+        assert_eq!(ipc["findings"][0]["file"], "src/leak.ts");
+        assert_eq!(ipc["findings"][0]["line"], 1);
+    }
+
+    #[test]
+    fn summary_and_notice_read_kind_file_and_line() {
+        let f = scan_one("tests/fixtures.ts", &["", "", "", "", "", "", "", "", "", "", "", &true_positives()[0].2]);
+        assert_eq!(summarize(&f), "Anthropic API key in tests/fixtures.ts:12");
+        assert_eq!(
+            hold_notice("the pull request", &f),
+            "Held before the pull request: possible secret · Anthropic API key in tests/fixtures.ts:12"
+        );
+    }
+
+    #[test]
+    fn fingerprint_changes_with_the_findings_not_their_order() {
+        let a = SecretFinding { file: "a".into(), line: Some(1), rule: "r".into(), kind: "k".into(), yours: false };
+        let b = SecretFinding { file: "b".into(), line: Some(2), rule: "r".into(), kind: "k".into(), yours: false };
+        assert_eq!(fingerprint(&[a.clone(), b.clone()]), fingerprint(&[b.clone(), a.clone()]));
+        assert_ne!(fingerprint(&[a.clone()]), fingerprint(&[a, b]));
+    }
+
+    // ── git-level collection ────────────────────────────────────────────
+
+    fn sig() -> git2::Signature<'static> {
+        git2::Signature::now("Test", "test@example.invalid").unwrap()
+    }
+
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig(), &sig(), msg, &tree, &parents).unwrap()
+    }
+
+    fn stage(repo: &git2::Repository, rel: &str) {
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new(rel)).unwrap();
+        idx.write().unwrap();
+    }
+
+    /// A repo with one clean commit on `main`.
+    fn repo() -> (tempfile::TempDir, git2::Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        commit_all(&repo, "init");
+        {
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("main", &head, true).unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        (dir, repo)
+    }
+
+    /// Point `settings.json` at a temp file for this thread.
+    struct SettingsGuard(tempfile::TempDir);
+    impl SettingsGuard {
+        fn new(json: serde_json::Value) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("settings.json");
+            std::fs::write(&p, json.to_string()).unwrap();
+            crate::settings::test_settings_path::set(Some(p));
+            SettingsGuard(dir)
+        }
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::settings::test_settings_path::set(None);
+        }
+    }
+
+    #[test]
+    fn staged_scan_sees_only_what_is_staged() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("staged.ts"), format!("a\n{line}\n")).unwrap();
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "staged.ts");
+        let f = scan_added(&staged_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].location(), "staged.ts:2");
+    }
+
+    #[test]
+    fn push_and_pr_scans_cover_every_commit_on_the_branch() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("leak.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add");
+        // Removed in the next commit: still in the history being pushed.
+        std::fs::write(dir.path().join("leak.ts"), "clean\n").unwrap();
+        commit_all(&repo, "remove");
+        let pr = scan_added(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_eq!(pr.len(), 1, "{pr:?}");
+        assert_eq!(pr[0].rule, "openai-key");
+        // No remote: a first push sends the whole history.
+        let push = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(push.len(), 1);
+        // Main itself is clean against main.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+        assert!(scan_added(&pr_files(dir.path(), "main").unwrap(), &[]).is_empty());
+    }
+
+    #[test]
+    fn worktree_scan_includes_untracked_files_and_skips_ignored_ones() {
+        let (dir, _repo) = repo();
+        let line = true_positives().remove(4).2;
+        std::fs::write(dir.path().join(".gitignore"), "ignored.ts\n").unwrap();
+        std::fs::write(dir.path().join("ignored.ts"), format!("{line}\n")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests/fixtures")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures/data.ts"), format!("x\n{line}\n")).unwrap();
+        let f = scan_added(&worktree_files(dir.path(), Some("main")).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "tests/fixtures/data.ts:2");
+    }
+
+    /// Scanning a 5,000-line staged diff stays far below a click's latency.
+    #[test]
+    fn a_5k_line_diff_scans_fast() {
+        let (dir, repo) = repo();
+        let mut body = String::new();
+        for i in 0..5000 {
+            body.push_str(&format!(
+                "export const value{i} = computeToken(\"key-{i}\", {{ secret: process.env.SECRET_{i}, password: input }});\n"
+            ));
+        }
+        std::fs::write(dir.path().join("big.ts"), &body).unwrap();
+        stage(&repo, "big.ts");
+        let start = std::time::Instant::now();
+        let files = staged_files(dir.path()).unwrap();
+        let f = scan_added(&files, &[]);
+        let took = start.elapsed();
+        assert_eq!(files[0].lines.len(), 5000);
+        assert!(f.is_empty(), "{f:?}");
+        assert!(took < std::time::Duration::from_millis(1500), "took {took:?}");
+    }
+
+    // ── block points: commit, amend, push, pull request ────────────────
+
+    #[tokio::test]
+    async fn commit_amend_push_and_pr_refuse_a_change_with_a_secret() {
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "cfg.ts");
+        let path = dir.path().to_string_lossy().to_string();
+
+        let commit = crate::commands::commit_changes(path.clone(), "msg".into(), None).await;
+        let amend = crate::commands::amend_commit(path.clone(), "msg".into(), Some(false)).await;
+        for r in [commit, amend] {
+            match r {
+                Err(crate::error::AppError::SecretsFound { findings }) => {
+                    assert_eq!(findings[0].location(), "cfg.ts:1");
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
+        }
+        // Nothing was committed.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap(), Some("init"));
+
+        commit_all(&repo, "leak");
+        let push = crate::commands::push_branch(path.clone(), None).await;
+        let e = push.expect_err("push refused");
+        assert!(matches!(e, crate::error::AppError::SecretsFound { .. }));
+        assert!(!e.to_string().contains(&secret));
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        // `main` must not contain the leak for a PR from feature: rewind it.
+        let init = head.parent(0).unwrap();
+        repo.branch("main", &init, true).unwrap();
+        let pr = crate::commands::create_pull_request(path, "main".into(), "t".into(), "b".into(), false, None).await;
+        assert!(matches!(pr, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn confirming_or_turning_the_guard_off_restores_todays_path() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(5).2;
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "leak");
+        let path = dir.path().to_string_lossy().to_string();
+        // Explicit confirm for this one push: the guard steps aside and git
+        // runs (and fails here only because there is no remote).
+        {
+            let _s = SettingsGuard::new(serde_json::json!({}));
+            let r = crate::commands::push_branch(path.clone(), Some(true)).await;
+            assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // The next push asks again.
+            let r = crate::commands::push_branch(path.clone(), None).await;
+            assert!(matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+        }
+        // Setting off: no scan at all.
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let r = crate::commands::push_branch(path, None).await;
+        assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    #[test]
+    fn the_setting_defaults_on() {
+        let s = crate::settings::AppSettings::default();
+        assert!(guard_enabled(&s));
+        let s: crate::settings::AppSettings = serde_json::from_str(r#"{"secretGuardEnabled":false}"#).unwrap();
+        assert!(!guard_enabled(&s));
+    }
+}
+
+/// Secret guard at the crew boundary: an Action stage parks needs-you.
+#[cfg(test)]
+mod secret_guard_orchestrator_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Sink(Mutex<Vec<(String, Value)>>);
+    impl EventSink for Sink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.0.lock().push((event.to_string(), payload));
+        }
+    }
+
+    struct Ok1;
+    #[async_trait::async_trait]
+    impl AgentRunner for Ok1 {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+                status: StageStatus::Done, tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// The leaked value — assembled at runtime.
+    fn secret() -> String {
+        ["gh", "p_"].concat() + "Qm7Rt2Vx9Lk4Pz8Wn3Hy6Bc1Df5Gj0Ks7Eab"
+    }
+
+    fn setup(settings: Value) -> (Arc<Mutex<Db>>, String, tempfile::TempDir, tempfile::TempDir) {
+        let sdir = tempfile::tempdir().unwrap();
+        let sp = sdir.path().join("settings.json");
+        std::fs::write(&sp, settings.to_string()).unwrap();
+        crate::settings::test_settings_path::set(Some(sp));
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README.md")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        // The crew wrote a key into a tracked-to-be fixture.
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures.ts"), format!("// seed\nexport const t = \"{}\";\n", secret())).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main',?1,?2,?2)",
+            rusqlite::params![dir.path().to_string_lossy(), now]).unwrap();
+        let pid = db.insert_pipeline("Ship", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "pull_request", "m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run, dir, sdir)
+    }
+
+    #[tokio::test]
+    async fn a_pr_stage_with_a_secret_in_the_worktree_parks_needs_you() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({}));
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink.clone(), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[0].status, "done", "the non-Action stage ran");
+        let pr = &stages[1];
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        assert!(pr.started_at.is_none(), "the PR stage never started");
+        let hold = pr.secret_hold.as_ref().expect("held");
+        assert!(!hold.acknowledged);
+        assert_eq!(hold.findings[0].location(), "tests/fixtures.ts:2");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "paused");
+
+        // A "decision" checkpoint: needs-you, the native notification, the beacon.
+        let events = sink.0.lock().clone();
+        assert!(events.iter().any(|(e, p)| e == "run://checkpoint" && p["stageId"] == pr.id.as_str() && p["reason"] == "decision"));
+
+        // The journal says why, without the value.
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("Held before the pull request: possible secret · GitHub token in tests/fixtures.ts:2"), "{log}");
+        let s = secret();
+        for (_, p) in &events {
+            assert!(!p.to_string().contains(&s), "a secret leaked into an event");
+        }
+        assert!(!log.contains(&s));
+        assert!(!serde_json::to_string(&stages).unwrap().contains(&s), "nor into the stage rows sent to the UI");
+        let raw: String = db.lock().conn_ref()
+            .query_row("SELECT secret_hold FROM run_stages WHERE id = ?1", [&pr.id], |r| r.get(0)).unwrap();
+        assert!(!raw.contains(&s), "nor into the database");
+
+        // Re-driving without a decision holds again.
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "awaiting_checkpoint");
+
+        // The director's explicit approval lets exactly these findings through.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "completed");
+        let log = db.lock().list_stage_log(&stages[1].id).unwrap().join("\n");
+        assert!(log.contains("the director approved proceeding"), "{log}");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_new_secret_after_approval_holds_again() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        orch.run_to_pause(&run).await.unwrap();
+        // Approve, but add another key before the re-drive scans.
+        let pr_id = db.lock().list_run_stages(&run).unwrap()[1].id.clone();
+        std::fs::write(dir.path().join("seed.js"), format!("{}\n", ["gh", "o_"].concat() + "Zx8Wq2Lm5Np7Rt3Vy6Bk9Cd1Fh4Gj0Ks2Eab")).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap().into_iter().find(|s| s.id == pr_id).unwrap();
+        assert_eq!(pr.status, "awaiting_checkpoint", "a different set of findings needs a new decision");
+        assert_eq!(pr.secret_hold.unwrap().findings.len(), 2);
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_or_the_guard_off_runs_straight_through() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({ "secretGuardEnabled": false }));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_none());
+        crate::settings::test_settings_path::set(None);
+
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        std::fs::remove_file(dir.path().join("tests/fixtures.ts")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
+    fn hold_labels_read_naturally() {
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("pull_request", "Pull request"), "the pull request");
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("deploy", "Deploy"), "the deploy stage");
     }
 }

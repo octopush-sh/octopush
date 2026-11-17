@@ -33,6 +33,8 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { TogglePill } from "./controls/TogglePill";
 import { pushToast } from "./Toasts";
+import { SecretGuardDialog } from "./SecretGuardDialog";
+import { secretFindings, type SecretFinding } from "../lib/secretGuard";
 import { resolveHelperModel } from "../lib/helperModels";
 
 type Phase =
@@ -57,6 +59,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
   const [body, setBody] = useState("");
   const [draft, setDraft] = useState(false);
   const [drafting, setDrafting] = useState(false);
+  const [secretHold, setSecretHold] = useState<SecretFinding[] | null>(null);
   const [draftNote, setDraftNote] = useState<{ tone: "mute" | "rouge"; text: string } | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -183,7 +186,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath]);
 
-  async function handleCreate() {
+  async function handleCreate(allowSecrets?: boolean) {
     if (!base || !title.trim()) return;
     setCreating(true);
     setCreateError(null);
@@ -193,8 +196,15 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
       if (!status.branch || status.branch === "HEAD" || status.branch === bareBase(base, branches)) {
         throw new Error(`Pick a base other than ${status.branch ?? "this branch"}.`);
       }
-      if (!status.hasUpstream || status.ahead > 0) await ipc.pushBranch(workspacePath);
-      const pr = await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft);
+      // Secret guard (#730): the push and the PR both refuse a branch with a
+      // possible credential until the user confirms this one pull request.
+      if (!status.hasUpstream || status.ahead > 0) {
+        if (allowSecrets) await ipc.pushBranch(workspacePath, true);
+        else await ipc.pushBranch(workspacePath);
+      }
+      const pr = allowSecrets
+        ? await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft, true)
+        : await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft);
       usePrStore.getState().setPr(workspace.id, pr);
       pushToast({
         level: "success",
@@ -204,7 +214,9 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
       });
       onClose();
     } catch (e) {
-      setCreateError(String(e));
+      const findings = secretFindings(e);
+      if (findings) setSecretHold(findings);
+      else setCreateError(String(e));
     } finally {
       setCreating(false);
     }
@@ -349,7 +361,7 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
             <button
               type="button"
               data-tour="pr-composer-create"
-              onClick={handleCreate}
+              onClick={() => void handleCreate()}
               disabled={!canCreate}
               className="flex items-center gap-1.5 rounded-md px-3 py-1 font-serif text-[13px] text-octo-brass transition-colors disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
               style={{ border: "1px solid var(--brass-dim)", background: "var(--brass-ghost)" }}
@@ -360,6 +372,20 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
           )}
         </footer>
       </div>
+      {secretHold && (
+        <SecretGuardDialog
+          action="pr"
+          findings={secretHold}
+          onLeaveOut={() => {
+            setSecretHold(null);
+            setCreateError("Held: take the possible secret out of the branch, then open the pull request.");
+          }}
+          onOverride={() => {
+            setSecretHold(null);
+            void handleCreate(true);
+          }}
+        />
+      )}
     </ModalShell>
   );
 }

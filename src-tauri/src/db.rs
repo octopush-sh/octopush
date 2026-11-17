@@ -779,6 +779,10 @@ impl Db {
         // D18: the ask_director conversation transcript, so an answered block
         // CONTINUES its conversation instead of re-running from scratch.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN blocked_transcript TEXT")?;
+        // #730: the secret guard's hold on an Action stage (JSON `SecretHold`:
+        // findings without values, a fingerprint, and whether the director
+        // approved proceeding past exactly those findings). NULL otherwise.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN secret_hold TEXT")?;
         // #362: the spend the session had already reported when a Resume (or
         // an answered block) set resume_pending — the resumed Claude run
         // reports the conversation's whole total, so its budget cap sits on
@@ -5106,7 +5110,7 @@ impl Db {
                     loop_target_position, loop_max_iterations, loop_mode, loop_iterations, diff_snapshot,
                     max_iterations, parents, tools, custom_name, instructions,
                     session_id, resume_pending, baseline_commit, effort, blocked_questions,
-                    escalate_model, escalate_effort, escalated, blocked_transcript
+                    escalate_model, escalate_effort, escalated, blocked_transcript, secret_hold
              FROM run_stages WHERE run_id = ?1 ORDER BY position",
         )?;
         let rows = stmt.query_map(params![run_id], |r| {
@@ -5146,6 +5150,9 @@ impl Db {
                 baseline_commit: r.get(28)?,
                 blocked_questions: r.get(30)?,
                 blocked_transcript: r.get(34)?,
+                secret_hold: r
+                    .get::<_, Option<String>>(35)?
+                    .and_then(|j| serde_json::from_str(&j).ok()),
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -5698,6 +5705,16 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// Persist (or clear, with `None`) the secret guard's hold on a stage (#730).
+    pub fn set_stage_secret_hold(&self, stage_id: &str, hold: Option<&crate::secret_scan::SecretHold>) -> AppResult<()> {
+        let json = hold.map(serde_json::to_string).transpose()?;
+        self.conn.execute(
+            "UPDATE run_stages SET secret_hold = ?2 WHERE id = ?1",
+            params![stage_id, json],
+        )?;
+        Ok(())
+    }
+
     /// Persist (or clear, with `None`) a parked stage's `ask_director`
     /// questions — the JSON `BlockedAsk` the answer form reads. Set when a stage
     /// blocks; cleared when the director answers (or, defensively, on any reset).
@@ -5965,7 +5982,7 @@ impl Db {
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
-                 blocked_questions = NULL,
+                 blocked_questions = NULL, secret_hold = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],
@@ -7468,6 +7485,10 @@ pub struct RunStageRow {
     /// Never serialized to the frontend (internal continuation state).
     #[serde(skip_serializing)]
     pub blocked_transcript: Option<String>,
+    /// The secret guard's hold on this (Action) stage, if any (#730): what it
+    /// found (file, line, kind — never a value) and whether the director
+    /// approved proceeding. Unparseable ⇒ `None`.
+    pub secret_hold: Option<crate::secret_scan::SecretHold>,
 }
 
 /// Serialize a stored JSON string as its parsed value (or `null`) so a

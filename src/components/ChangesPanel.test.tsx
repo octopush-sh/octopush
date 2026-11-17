@@ -429,4 +429,48 @@ describe("ChangesPanel — Open a pull request", () => {
     expect(await screen.findByRole("button", { name: "Open a pull request" })).toBeInTheDocument();
     expect(usePrStore.getState().byWorkspace["ws-1"]).toBeNull();
   });
+  it("secret guard: a refused commit asks first, and the override commits this once", async () => {
+    const refusal = { kind: "SecretsFound", message: "possible secret", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+    ] };
+    ipcMock.commitChanges.mockRejectedValueOnce(refusal).mockResolvedValueOnce("c0ffee1");
+    const onFileClick = vi.fn();
+    render(<ChangesPanel projectPath="/repo" onFileClick={onFileClick} />);
+    await screen.findByText("a.ts");
+    await userEvent.type(screen.getByPlaceholderText(/describe the change/i), "feat: x");
+    await userEvent.click(screen.getByRole("button", { name: /^commit$/i }));
+    expect(await screen.findByText("This change adds what looks like a GitHub token in a.ts:4.")).toBeInTheDocument();
+    expect(ipcMock.commitChanges).toHaveBeenCalledWith("/repo", "feat: x");
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "Commit failed" }));
+    await userEvent.click(screen.getByRole("button", { name: "Commit regardless" }));
+    await waitFor(() => expect(ipcMock.commitChanges).toHaveBeenLastCalledWith("/repo", "feat: x", true));
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Committed" }));
+  });
+
+  it("secret guard: Leave it out takes you to the file and commits nothing", async () => {
+    ipcMock.commitChanges.mockRejectedValueOnce({ kind: "SecretsFound", message: "m", findings: [
+      { file: "a.ts", line: 4, rule: "github-token", kind: "GitHub token", yours: false },
+    ] });
+    const onFileClick = vi.fn();
+    render(<ChangesPanel projectPath="/repo" onFileClick={onFileClick} />);
+    await screen.findByText("a.ts");
+    await userEvent.type(screen.getByPlaceholderText(/describe the change/i), "feat: x");
+    await userEvent.click(screen.getByRole("button", { name: /^commit$/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Leave it out" }));
+    expect(onFileClick).toHaveBeenCalledWith("a.ts");
+    expect(ipcMock.commitChanges).toHaveBeenCalledTimes(1);
+  });
+
+  it("secret guard: a refused push asks first", async () => {
+    ipcMock.getGitStatus.mockResolvedValue({ ...STATUS, branch: "feat/x", ahead: 1 });
+    ipcMock.pushBranch.mockRejectedValueOnce({ kind: "SecretsFound", message: "m", findings: [
+      { file: ".env", line: 2, rule: "env-credential", kind: "credential in a .env file (DB_PASSWORD)", yours: false },
+    ] }).mockResolvedValueOnce("done");
+    ipcMock.findPrForBranch.mockResolvedValue(null);
+    render(<ChangesPanel projectPath="/repo" />);
+    await userEvent.click(await screen.findByRole("button", { name: /push to origin/i }));
+    await userEvent.click(await screen.findByRole("button", { name: "Push regardless" }));
+    await waitFor(() => expect(ipcMock.pushBranch).toHaveBeenLastCalledWith("/repo", true));
+    expect(pushToast).not.toHaveBeenCalledWith(expect.objectContaining({ title: "Push failed" }));
+  });
 });

@@ -9,6 +9,7 @@ import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
 import { haltCause } from "../lib/stageHalt";
 import { formatUsd } from "../lib/cost";
+import { findingLocation, secretSummary } from "../lib/secretGuard";
 
 interface LoopState {
   iteration: number;
@@ -257,6 +258,11 @@ function DecisionBar({
   const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
+  // Secret guard (#730): an Action stage held before it started because the
+  // worktree holds a possible secret. Approving is the explicit override.
+  const secret = !failed && blockedStage.secretHold && !blockedStage.secretHold.acknowledged
+    ? blockedStage.secretHold.findings
+    : null;
   const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
   // A cause that prefers a re-run (a deferred tool) is never a transient wait.
   const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
@@ -402,8 +408,8 @@ function DecisionBar({
           ) : (
             /* ── Transient or checkpoint decide row ── */
             <div className="flex items-center gap-3">
-              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
-                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
+              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed || secret ? "text-octo-rouge" : "text-octo-brass"}`}>
+                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : secret ? "possible secret" : "⟜ checkpoint"}
               </span>
               <span
                 className="min-w-0 flex-1 truncate text-sm text-octo-sage"
@@ -413,6 +419,10 @@ function DecisionBar({
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
                 ) : failed ? (
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
+                ) : secret ? (
+                  <span data-tour="direct-secret-hold" title={secret.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n")}>
+                    Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {secretSummary(secret)}
+                  </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
                 )}
@@ -426,6 +436,12 @@ function DecisionBar({
                 <button type="button" onClick={onApprove}
                   className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                   Accept &amp; continue
+                </button>
+              ) : secret ? (
+                <button type="button" onClick={onApprove}
+                  title="Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]`}>
+                  {secret.length === 1 ? "Proceed regardless" : "Proceed past them"}
                 </button>
               ) : (
                 <button type="button" onClick={onApprove}
