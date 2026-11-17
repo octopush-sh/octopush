@@ -176,7 +176,7 @@ fn delta_paths(diff: &git2::Diff<'_>, out: &mut BTreeSet<String>) {
     }
 }
 
-fn find_renames(diff: &mut git2::Diff<'_>, untracked: bool) {
+pub(crate) fn find_renames(diff: &mut git2::Diff<'_>, untracked: bool) {
     let mut find = DiffFindOptions::new();
     find.renames(true).for_untracked(untracked);
     // Rename detection is a nicety: both paths land in the set either way.
@@ -185,8 +185,9 @@ fn find_renames(diff: &mut git2::Diff<'_>, untracked: bool) {
 
 /// The merge base to diff from: the newest of `merge_base(HEAD, origin/base)`
 /// and `merge_base(HEAD, base)`, so a stale local base (or a stale remote)
-/// never pulls the base's own commits into the changed set.
-fn resolve_merge_base(repo: &Repository, head: Oid, base: &str) -> Option<Oid> {
+/// never pulls the base's own commits into the changed set. Shared with
+/// Mission Control's diff size (`git_ops::diff_size`).
+pub(crate) fn resolve_merge_base(repo: &Repository, head: Oid, base: &str) -> Option<Oid> {
     let mut bases: Vec<Oid> = Vec::new();
     for name in [format!("origin/{base}"), base.to_string()] {
         let Ok(obj) = repo.revparse_single(&name) else { continue };
@@ -203,6 +204,14 @@ fn resolve_merge_base(repo: &Repository, head: Oid, base: &str) -> Option<Oid> {
             .all(|&other| other == mb || repo.graph_descendant_of(mb, other).unwrap_or(false))
     })
     .or_else(|| bases.first().copied())
+}
+
+/// The base a workspace diffs against: the branch it was created from, else
+/// the project's default branch (`default_base`, from
+/// `git_ops::repo_default_branch` on the project's repo). Shared by the
+/// collision scan and Mission Control's diff size.
+pub(crate) fn workspace_base(from_branch: Option<String>, default_base: Option<&str>) -> Option<String> {
+    from_branch.filter(|b| !b.trim().is_empty()).or_else(|| default_base.map(str::to_string))
 }
 
 /// Paths changed between HEAD and the index + working tree (untracked

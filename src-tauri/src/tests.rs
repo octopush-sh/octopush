@@ -4247,6 +4247,35 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_stage_that_ran_on_another_model_is_attributed_to_it() {
+        // #791: Claude Code's settings ran the stage on Sonnet, not the Opus
+        // it asked for — the ledger row (Usage, savings) names what ran.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+
+        db.set_run_stage_ran_model(&stage, Some("claude-sonnet-5-5")).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        let rep = db.token_report(None).unwrap();
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-sonnet-5-5"), "{:?}", rep.cost_by_model);
+        assert!(!rep.cost_by_model.iter().any(|m| m.label == "claude-opus-5-5"));
+        assert_eq!(db.ran_models(&run).unwrap().get(&stage).map(String::as_str), Some("claude-sonnet-5-5"));
+        // The stage still asked for Opus.
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].agent_model, "claude-opus-5-5");
+
+        // A re-run clears it; an attempt on the model it asked for records none.
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+        db.set_run_stage_ran_model(&stage, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+    }
+
+    #[test]
     fn check_budget_blocks_only_when_over_a_configured_limit() {
         // Phase 3 backend gate: blocks only when a *configured* budget is at/over
         // its limit; no budget → always allow.
@@ -9496,6 +9525,91 @@ mod cli_runner_tests {
         "usage":{"input_tokens":10,"output_tokens":4,
                  "cache_read_input_tokens":0,"cache_creation_input_tokens":0}
     }"#;
+
+    #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::{refused_setting, SANDBOX_REQUIRED_UNAVAILABLE};
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr, None).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Sandbox required but unavailable: settings failed validation (a.b: bad)"]);
+        assert_eq!(
+            refused_setting(Some(&errors), stderr, None).as_deref(),
+            Some("Sandbox required but unavailable: settings failed validation (a.b: bad)")
+        );
+        // "failed validation" alone is not the signal.
+        let unrelated = "[Bootstrap] Gateway /v1/models failed validation: unexpected shape";
+        assert_eq!(refused_setting(None, unrelated, None), None);
+        let other = serde_json::json!(["Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&other), unrelated, None), None);
+        // The machine-readable reason is: the first `errors` string stands in.
+        assert_eq!(
+            refused_setting(Some(&other), unrelated, Some(SANDBOX_REQUIRED_UNAVAILABLE)).as_deref(),
+            Some("Settings failed validation (a.b: bad)")
+        );
+        assert!(refused_setting(None, "", Some(SANDBOX_REQUIRED_UNAVAILABLE)).is_some());
+        assert_eq!(refused_setting(None, "", Some("something_else")), None);
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded", None), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), "", None), None, "not an array");
+        assert_eq!(refused_setting(None, "", None), None);
+        let long = format!("Sandbox required but unavailable: failed validation {}", "x".repeat(900));
+        assert!(refused_setting(None, &long, None).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn budget_and_max_turns_stops_with_an_unrelated_validation_line_keep_their_own_handling() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_settings_refused, BUDGET_STOP_SUBTYPE};
+        let stderr = "[Bootstrap] Gateway /v1/models failed validation: expected a list\n";
+        let budget = format!(
+            r#"{{"type":"result","subtype":"{BUDGET_STOP_SUBTYPE}","is_error":true,"num_turns":7,
+            "session_id":"s","total_cost_usd":1.5}}"#
+        );
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(is_budget_stop(err) && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,
+            "session_id":"s","total_cost_usd":0.4}"#;
+        let outcome = parse_cli_result(turns, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.contains("error_max_turns") && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        // Even the real refused-settings line does not take over a budget stop
+        // or a session that ran turns.
+        let real = "Error: Sandbox required but unavailable: settings failed validation (x: y)";
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, real).unwrap();
+        assert!(is_budget_stop(outcome.error.as_deref().unwrap()));
+        let ran = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,
+            "session_id":"s","total_cost_usd":0.1}"#;
+        let outcome = parse_cli_result(ran, false, ArtifactKind::Diff, real).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+        // A generic execution error with only the unrelated line stays generic.
+        let plain = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0}"#;
+        let outcome = parse_cli_result(plain, false, ArtifactKind::Diff, stderr).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
 
     #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
@@ -16813,6 +16927,175 @@ mod sync_opt_in_tests {
     }
 }
 
+// ── Sync pulls through the api_base()/access_token() seams (#753) ─────
+#[cfg(test)]
+mod sync_pull_tests {
+    use crate::settings::test_sync_override;
+    use crate::sync::{test_net, SyncKind};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    /// An HTTP server answering every request with `code` and `body` (JSON).
+    /// Returns its base URL and the request heads it received.
+    async fn serve(code: u16, body: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (log, body) = (seen.clone(), body.to_string());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, body) = (log.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = String::from_utf8_lossy(&buf).find("\r\n\r\n") {
+                            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..end]).to_string());
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The one request the server saw: its request line, and whether it
+    /// carried the test token.
+    fn only_request(seen: &Arc<Mutex<Vec<String>>>) -> (String, bool) {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let head = &seen[0];
+        let line = head.lines().next().unwrap_or_default().to_string();
+        let authed = head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-token"));
+        (line, authed)
+    }
+
+    const RUNS: &str = r#"{"runs":[
+        {"run_id":"r1","task":"t","status":"completed","cost_usd":0.5,"stages":[{"role":"implement","status":"done"}]},
+        {"task":"no run id: unreadable"},
+        "not even an object"
+    ]}"#;
+
+    #[tokio::test]
+    async fn pull_runs_keeps_the_readable_rows() {
+        reset(true, false);
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1, "the malformed rows are skipped");
+        assert_eq!((runs[0].run_id.as_str(), runs[0].stages.len()), ("r1", 1));
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-runs "), "{line}");
+        assert!(authed, "the session token is sent");
+    }
+
+    #[tokio::test]
+    async fn pull_runs_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_reads_404_as_no_detail_and_an_unreadable_blob_as_none() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        let (base, seen) = serve(200, r#"{"detail":{"run_id":"r1","stages":[]}}"#).await;
+        test_net::set(Some(base), token());
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("a detail");
+        assert_eq!(detail.run_id, "r1");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-run-detail?run_id=r1 "), "{line}");
+        assert!(authed);
+
+        test_net::set(Some(serve(404, "{}").await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404: no detail");
+        test_net::set(Some(serve(200, r#"{"detail":{"stages":"not a list"}}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "unreadable: no detail");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history detail fetch failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_library_keeps_the_readable_items() {
+        reset(false, true);
+        let body = r#"{"items":[
+            {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+            {"kind":"role","item_id":"r1","deleted":true},
+            {"item_id":"no kind: unreadable"}
+        ]}"#;
+        let (base, seen) = serve(200, body).await;
+        test_net::set(Some(base), token());
+        let items = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let got: Vec<(&str, bool)> = items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(got, [("p1", false), ("r1", true)], "the malformed item is skipped; tombstones stay");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-library "), "{line}");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn pull_library_http_errors_and_signed_out() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("library sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+}
+
 // ── Last sync attempt under each Sync toggle (#518) ───────────────────
 #[cfg(test)]
 mod sync_status_tests {
@@ -17411,6 +17694,127 @@ mod open_pull_request_tests {
         assert_eq!(pr_target(&repo, "main", "feature").head_remote.as_deref(), Some("upstream"));
         let url = crate::git_ops::remote_slug(&repo, "origin").unwrap();
         assert_eq!((url.owner.as_str(), url.repo.as_str()), ("me", "app"));
+    }
+
+    #[test]
+    fn diff_size_counts_the_branch_against_its_base_plus_uncommitted_and_untracked() {
+        use crate::git_ops::{diff_size, DiffSize};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        // Nothing changed yet: a real zero, against the named base.
+        assert_eq!(diff_size(d, Some("main")).unwrap(), DiffSize { files: 0, added: 0, removed: 0, base: Some("main".into()), untracked_skipped: 0 });
+        // A commit (2 lines changed), an unstaged edit and an untracked file.
+        std::fs::write(d.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(d, &["commit", "-qam", "crew work"]);
+        std::fs::write(d.join("b.txt"), "x\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n1\nn2\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size, DiffSize { files: 3, added: 5, removed: 1, base: Some("main".into()), untracked_skipped: 0 });
+        // main moving on adds nothing to the crew's diff (merge base, not tip).
+        git(d, &["stash", "-u", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+        assert_eq!(diff_size(d, Some("main")).unwrap(), size);
+        // No base, or one that no longer resolves: the uncommitted changes vs HEAD.
+        let uncommitted = DiffSize { files: 2, added: 3, removed: 0, base: None, untracked_skipped: 0 };
+        assert_eq!(diff_size(d, None).unwrap(), uncommitted);
+        assert_eq!(diff_size(d, Some("gone/branch")).unwrap(), uncommitted);
+    }
+
+    /// A repo on `main` with one committed `a.txt`, checked out on `crew`.
+    fn diff_size_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        dir
+    }
+
+    #[test]
+    fn diff_size_uses_the_collision_radars_merge_base_so_a_stale_local_base_adds_nothing() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Upstream moved on (origin/main = C1) while the local `main` stayed
+        // at C0; the crew branched from origin/main.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "u\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["checkout", "-q", "-B", "crew"]);
+        git(d, &["branch", "-f", "main", "HEAD~1"]);
+        std::fs::write(d.join("crew.txt"), "c\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "crew work"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        // Only the crew's file — not upstream's, as `merge_base(HEAD, main)` would add.
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 0), "{size:?}");
+        assert_eq!(size.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn workspace_base_falls_back_to_the_projects_default_branch() {
+        use crate::collisions::workspace_base;
+        assert_eq!(workspace_base(Some("dev".into()), Some("main")).as_deref(), Some("dev"));
+        assert_eq!(workspace_base(None, Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(Some("  ".into()), Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(None, None), None);
+    }
+
+    #[test]
+    fn diff_size_pairs_a_rename_so_a_moved_file_counts_only_its_edit() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        std::fs::write(d.join("moved.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["add", "moved.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 1), "a rename, not a delete plus add: {size:?}");
+    }
+
+    #[test]
+    fn diff_size_bounds_untracked_content() {
+        use crate::collisions::MAX_UNTRACKED_DIR_FILES;
+        use crate::git_ops::{diff_size, MAX_UNTRACKED_LINE_BYTES};
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // A small untracked file, last line without a newline: 2 lines.
+        std::fs::write(d.join("note.txt"), "one\ntwo").unwrap();
+        // An untracked directory past the cap: one entry, never read.
+        std::fs::create_dir(d.join("vendor")).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(d.join("vendor").join(format!("f{i}.js")), "x\n".repeat(100)).unwrap();
+        }
+        // A small untracked directory: each file counted.
+        std::fs::create_dir(d.join("small")).unwrap();
+        std::fs::write(d.join("small").join("s.txt"), "s\n").unwrap();
+        // A file past the byte budget: a file, its lines not read.
+        std::fs::write(d.join("huge.log"), vec![b'l'; MAX_UNTRACKED_LINE_BYTES as usize + 1]).unwrap();
+        // A binary file: a file with no lines, like git.
+        std::fs::write(d.join("blob.bin"), [0u8, 1, 2, b'\n']).unwrap();
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size.files, 5, "note, vendor/, small/s.txt, huge.log, blob.bin: {size:?}");
+        assert_eq!(size.added, 3, "note's 2 + s.txt's 1: {size:?}");
+        assert_eq!(size.untracked_skipped, 2, "vendor/ and huge.log: {size:?}");
     }
 
     #[test]
@@ -18232,8 +18636,8 @@ mod crew_tests {
 #[cfg(test)]
 mod cli_command_idle_tests {
     use crate::orchestrator::cli_runner::{
-        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
-        OpenTool, OpenTools, ReadEnd, ReadLimits,
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, retry_idle_window, CliDialect,
+        IdleStall, OpenTool, OpenTools, ReadEnd, ReadLimits,
     };
     use serde_json::{json, Value};
     use std::time::{Duration, Instant};
@@ -18330,7 +18734,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
     }
 
@@ -18357,8 +18761,93 @@ mod cli_command_idle_tests {
             read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
+    }
+
+    fn api_retry(delay_ms: u64, error: &str) -> Value {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": 529, "error": error})
+    }
+
+    #[tokio::test]
+    async fn a_stage_waiting_out_an_api_retry_outlives_the_idle_window() {
+        // The retry's delay (600ms) is three times `idle` (200ms): the answer
+        // arriving 700ms later is still inside delay + idle.
+        let (end, notes, took) = read(
+            vec![Some(api_retry(600, "overloaded")), None, Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert!(notes.is_empty(), "a retry wait is not a long command: {notes:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_past_the_retry_delay_plus_idle_still_stalls_and_names_the_retry() {
+        let (end, notes, took) = read(vec![Some(api_retry(600, "overloaded"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= Duration::from_millis(800), "{took:?}");
+        assert_eq!(stall.window, Duration::from_millis(800));
+        assert_eq!(stall.after_retry.as_deref(), Some("overloaded"));
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_non_retry_line_goes_back_to_the_plain_window() {
+        let (end, _, took) = read(
+            vec![Some(api_retry(5000, "overloaded")), Some(tool_result("toolu_ghost"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_numeric_delay_keeps_the_plain_window() {
+        let bare = json!({"type": "system", "subtype": "api_retry", "error": "overloaded", "retry_delay_ms": "soon"});
+        let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn codex_ignores_a_retry_delay() {
+        let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[test]
+    fn the_retry_window_is_the_delay_plus_the_plain_window() {
+        let idle = ReadLimits::STAGE.idle;
+        // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
+        assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_stall_after_a_retry_names_it() {
+        let stall = |c: &str| IdleStall { tool: None, window: Duration::from_secs(600), after_retry: Some(c.into()) };
+        assert_eq!(
+            idle_timeout_message(&stall("overloaded")),
+            "timed out — no output for 10 minutes after an API retry (overloaded)"
+        );
+        assert_eq!(idle_timeout_message(&stall("")), "timed out — no output for 10 minutes after an API retry");
     }
 
     #[test]
@@ -18409,11 +18898,11 @@ mod cli_command_idle_tests {
     fn idle_messages_name_the_open_call() {
         let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None }),
             "timed out — Bash `npm test` gave no result for 11 minutes"
         );
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None }),
             "timed out — no output for 5 minutes"
         );
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
@@ -18883,5 +19372,76 @@ mod collision_tests {
         assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
         assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
         assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+#[cfg(test)]
+mod ran_model_tests {
+    use crate::orchestrator::cli_runner::{ran_on_notice, same_model, substituted_model};
+    use serde_json::json;
+
+    #[test]
+    fn aliases_snapshots_and_gateway_spellings_are_the_same_model() {
+        for (asked, ran) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
+            ("opus", "claude-opus-5-5-20261001"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
+            ("opusplan", "claude-sonnet-5-5"),
+            ("default", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-5-5"),
+            ("claude-opus-4-6[1m]", "claude-opus-4-6"),
+            ("claude-sonnet-latest", "claude-sonnet-latest"),
+            ("Claude-Sonnet-5-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(same_model(asked, ran), "{asked} vs {ran}");
+            assert!(same_model(ran, asked), "{ran} vs {asked}");
+        }
+    }
+
+    #[test]
+    fn another_model_is_not_the_same() {
+        for (asked, ran) in [
+            ("claude-opus-5-5", "claude-sonnet-5-5"),
+            ("opus", "claude-sonnet-5-5"),
+            ("sonnet", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-fable-5-2", "claude-fable-5-1"),
+            ("opusplan", "claude-haiku-5-5"),
+        ] {
+            assert!(!same_model(asked, ran), "{asked} vs {ran}");
+        }
+    }
+
+    #[test]
+    fn only_an_init_naming_another_model_is_a_substitution() {
+        let init = |m: serde_json::Value| json!({"type": "system", "subtype": "init", "model": m});
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!("claude-sonnet-5-5"))).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(substituted_model("sonnet", &init(json!("claude-sonnet-5-5"))), None, "no false alarm on an alias");
+        // A missing, empty or non-string model changes nothing.
+        assert_eq!(substituted_model("claude-opus-5-5", &json!({"type": "system", "subtype": "init"})), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(""))), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(42))), None);
+        // Only `system/init` counts.
+        let assistant = json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}});
+        assert_eq!(substituted_model("claude-opus-5-5", &assistant), None);
+    }
+
+    #[test]
+    fn the_notice_names_both_models_by_their_catalog_names() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "claude-sonnet-5-5", Some(&router)),
+            "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model settings picked another model"
+        );
+        // An id the catalog doesn't know prints as given.
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "team-model", None),
+            "ran on team-model, not claude-opus-5-5 — Claude Code's model settings picked another model"
+        );
     }
 }

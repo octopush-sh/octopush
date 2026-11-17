@@ -15,6 +15,7 @@ const {
   codexEffortLevels,
   crewClaudeModels,
   crewUsesClaudeCode,
+  crewUsesCodex,
   effortApplies,
   loadClaudeCliVersion,
   modelFloorLabel,
@@ -138,6 +139,9 @@ describe("crewUsesClaudeCode", () => {
     expect(crewUsesClaudeCode([stage("cli", "gpt-5")], {})).toBe(false);
     expect(crewUsesClaudeCode([stage("cli", "gpt-5")], { 0: "claude-opus-4-8" })).toBe(true);
     expect(crewUsesClaudeCode([stage("cli", "claude-sonnet-4-6")], { 0: "gpt-5" })).toBe(false);
+    expect(crewUsesCodex([stage("cli", "claude-sonnet-4-6")], { 0: "gpt-5" })).toBe(true);
+    expect(crewUsesCodex([stage("cli", "gpt-5")], { 0: "claude-opus-4-8" })).toBe(false);
+    expect(crewUsesCodex([stage("api", "gpt-5")], {})).toBe(false);
   });
 });
 

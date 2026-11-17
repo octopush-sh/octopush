@@ -624,10 +624,10 @@ pub async fn pull_run_detail(
     if !opted_in(SyncKind::History) {
         return Err(sync_off_error(SyncKind::History));
     }
-    let token = crate::auth::current_access_token()
+    let token = access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
-    let url = format!("{SYNC_API_BASE}/api/sync-run-detail");
+    let url = format!("{}/api/sync-run-detail", api_base());
     let resp = client
         .get(&url)
         .query(&[("run_id", run_id)])
@@ -733,10 +733,10 @@ pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
     if !opted_in(SyncKind::History) {
         return Err(sync_off_error(SyncKind::History));
     }
-    let token = crate::auth::current_access_token()
+    let token = access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
-    let url = format!("{SYNC_API_BASE}/api/sync-runs");
+    let url = format!("{}/api/sync-runs", api_base());
     let resp = client
         .get(&url)
         .bearer_auth(token)
@@ -888,10 +888,10 @@ pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibrary
     if !opted_in(SyncKind::Library) {
         return Err(sync_off_error(SyncKind::Library));
     }
-    let token = crate::auth::current_access_token()
+    let token = access_token()
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
-    let url = format!("{SYNC_API_BASE}/api/sync-library");
+    let url = format!("{}/api/sync-library", api_base());
     let resp = client
         .get(&url)
         .bearer_auth(token)
