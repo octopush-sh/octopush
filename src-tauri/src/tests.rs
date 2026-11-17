@@ -4172,6 +4172,31 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_zero_dollar_stage_flagged_usage_unreported_is_unpriced_in_the_ledger() {
+        // A stopped stage on a priced model whose streamed tokens were all on
+        // an unpriced subagent model records those tokens at $0: the ledger
+        // row reads "unpriced", never a free "computed" row.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let st = db.list_run_stages(&run).unwrap();
+        let basis = |stage: &str| -> String {
+            db.conn_ref()
+                .query_row("SELECT cost_basis FROM spend_events WHERE source_id = ?1", [stage], |r| r.get(0))
+                .unwrap()
+        };
+        db.set_run_stage_usage_unreported(&st[0].id).unwrap();
+        db.complete_run_stage(&st[0].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[0].id), "unpriced");
+        // Unflagged, the same $0 on a priced model stays "computed".
+        db.complete_run_stage(&st[1].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[1].id), "computed");
+    }
+
+    #[test]
     fn retire_stage_cost_accumulates_on_the_run() {
         let db = test_db();
         let ws = seed_workspace(&db);
@@ -10816,7 +10841,7 @@ mod cli_dialect_tests {
             json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
         ]);
         let usage = crate::orchestrator::cli_runner::sum_usage(&map);
-        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        let out = build_codex_outcome(&accum, usage.clone(), true, ArtifactKind::Note, "gpt-5", "");
         let err = out.error.as_deref().unwrap();
         assert!(err.contains("no final message"), "{err}");
         assert!(!is_usage_unreported(err), "{err}");
@@ -10829,11 +10854,11 @@ mod cli_dialect_tests {
 
     #[test]
     fn codex_outcome_is_the_last_message_or_an_honest_failure() {
-        let usage = Default::default();
+        let usage = crate::orchestrator::cli_runner::CliUsage::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
             &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
-            usage, true, ArtifactKind::Review, "gpt-5", "",
+            usage.clone(), true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
         assert_eq!(ok.artifact.text, "findings\nVERDICT: PASS");
@@ -10843,7 +10868,7 @@ mod cli_dialect_tests {
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
             &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
-            usage, true, ArtifactKind::Diff, "gpt-5", "",
+            usage.clone(), true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
         let msg = failed.error.as_deref().unwrap();
@@ -11773,6 +11798,118 @@ mod live_tests {
         // others still bill at $4/$20.
         let c = streamed_cost("claude-opus-5-5", &map);
         assert!((c - 2.0 * (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
+    /// One streamed assistant message: 1,000 in / 100 out, on `model` (none
+    /// when `None`), fast when `fast`.
+    fn streamed_msg(id: &str, model: Option<&str>, fast: bool) -> serde_json::Value {
+        let mut usage = serde_json::json!({ "input_tokens": 1_000, "output_tokens": 100,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 });
+        if fast {
+            usage["speed"] = serde_json::Value::from("fast");
+        }
+        let mut message = serde_json::json!({ "id": id, "usage": usage });
+        if let Some(m) = model {
+            message["model"] = serde_json::Value::from(m);
+        }
+        serde_json::json!({ "type": "assistant", "message": message })
+    }
+
+    fn streamed_map(events: &[serde_json::Value]) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        events
+            .iter()
+            .map(|e| {
+                let (id, u) = crate::orchestrator::cli_runner::usage_from_stream_event(e).unwrap();
+                (id.unwrap(), u)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_prices_each_streamed_message_at_its_own_model() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // An Opus 5 stage whose Haiku subagent answered one message; a message
+        // naming no model is the stage's.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-haiku-4-5-20251001"), false),
+            streamed_msg("msg_3", None, false),
+        ]);
+        assert_eq!(map["msg_2"].model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(map["msg_3"].model, None);
+        let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let haiku = (1_000.0 * 1.0 + 100.0 * 5.0) / 1e6;
+        let c = streamed_cost("claude-opus-5", &map);
+        assert!((c - (2.0 * opus + haiku)).abs() < 1e-12, "{c}, not the two priced separately");
+        // Before: every message at the stage's model — the subagent over-billed.
+        assert!((c - 3.0 * opus).abs() > 1e-6);
+        // The reverse case: a Haiku stage with an Opus subagent is not under-billed.
+        let rev = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-haiku-4-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5"), false),
+        ]);
+        assert!((streamed_cost("claude-haiku-4-5", &rev) - (opus + haiku)).abs() < 1e-12);
+        // Everything priced: the stopped stage keeps all its tokens, no marker.
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.output_tokens), (3_000, 300));
+        assert!((out.cost_usd - (2.0 * opus + haiku)).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_with_a_fast_message_and_no_fast_rate_reads_usage_not_reported() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // Opus 5.5 has no fast rate: its fast message is unpriced, not $0.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5-5"), true),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-opus-5-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("claude timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-opus-5-5 (fast))").as_str()));
+        // Only the priced message is spend — and only its tokens are recorded,
+        // so the baseline never re-prices the unknown part as saved.
+        assert!((out.cost_usd - (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{}", out.cost_usd);
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn an_unknown_subagent_model_is_unpriced_and_kept_out_of_savings() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-mystery-9"), false),
+            streamed_msg("msg_3", Some("claude-mystery-9"), false),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-mystery-9)").as_str()));
+        // The unknown model's tokens are neither spend nor baseline.
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+        assert!((out.cost_usd - (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6).abs() < 1e-12);
+
+        // A stage that is all its own unpriced model is unchanged: no marker —
+        // its model already reads "unpriced" — and every token kept at $0
+        // (a $0 stage with tokens stays out of the baseline).
+        let own = streamed_map(&[streamed_msg("msg_1", Some("claude-mystery-9"), false), streamed_msg("msg_2", None, false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &own, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0));
+        // …but an unpriced stage model with an unknown subagent model is marked.
+        let both = streamed_map(&[streamed_msg("msg_1", None, false), streamed_msg("msg_2", Some("claude-enigma-1"), false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &both, false);
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0), "nothing priced: every token kept, $0");
     }
 
     #[tokio::test]

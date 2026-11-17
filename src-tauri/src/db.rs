@@ -5893,28 +5893,33 @@ impl Db {
         cache_creation_tokens: i64,
         cost_usd: f64,
     ) -> AppResult<()> {
-        let attr: Option<(String, Option<String>, String, Option<String>)> = self
+        let attr: Option<(String, Option<String>, String, Option<String>, bool)> = self
             .conn
             .query_row(
-                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id
+                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id, s.usage_unreported != 0
                  FROM run_stages s
                  JOIN runs r ON r.id = s.run_id
                  LEFT JOIN workspaces w ON w.id = r.workspace_id
                  WHERE s.id = ?1",
                 params![stage_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .optional()?;
-        let Some((workspace_id, project_id, model, mission_id)) = attr else {
+        let Some((workspace_id, project_id, model, mission_id, usage_unreported)) = attr else {
             return Ok(()); // stage vanished — nothing to attribute
         };
         // Logbook: a stage that burned spend is active DIRECT work on the mission.
         let _ = self.record_activity(&workspace_id, "direct", "stage");
-        let cost_basis = crate::token_engine::ledger_cost_basis(
-            &model,
-            cost_usd,
-            input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens,
-        );
+        let tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens;
+        // $0 with tokens on a stage flagged `usage_unreported` (its streamed
+        // tokens were all on message models with no price, e.g. an unknown
+        // subagent model under a priced stage model): unknown, never free —
+        // even though the stage's own model has a price.
+        let cost_basis = if usage_unreported && cost_usd == 0.0 && tokens > 0 {
+            "unpriced"
+        } else {
+            crate::token_engine::ledger_cost_basis(&model, cost_usd, tokens)
+        };
         self.insert_spend_event(&SpendEvent {
             ts_utc: ts_utc.to_string(),
             surface: "direct".into(),
