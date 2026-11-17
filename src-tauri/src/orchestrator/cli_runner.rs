@@ -239,6 +239,71 @@ pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
     }
 }
 
+/// The model a Claude session runs on, from its `system/init` event's
+/// `model`; `None` for any other event or an init without one.
+pub(crate) fn init_model(v: &Value) -> Option<&str> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    v.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty())
+}
+
+/// Claude Code's own aliases cover any id of their family: `sonnet` (or
+/// `sonnet[1m]`, already stripped) runs as some `claude-sonnet-*`;
+/// `opusplan` as Opus or Sonnet; `default`/`best` as whatever the account
+/// resolves them to.
+fn alias_covers(alias: &str, id: &str) -> bool {
+    match alias {
+        "default" | "best" => true,
+        "opusplan" => id.starts_with("claude-opus") || id.starts_with("claude-sonnet"),
+        "sonnet" | "opus" | "haiku" | "fable" | "mythos" => id.starts_with(&format!("claude-{alias}")),
+        _ => false,
+    }
+}
+
+/// True when a stage that asked for `requested` and ran on `ran` ran on the
+/// model it asked for: equal after `token_engine::normalize_model_id`
+/// (gateway prefixes, Bedrock/Vertex suffixes, dated snapshots, dotted
+/// gateway versions, `[1m]`), or one is a Claude Code alias covering the
+/// other (`sonnet` vs `claude-sonnet-5-5`). Pure.
+pub fn same_model(requested: &str, ran: &str) -> bool {
+    let norm = |m: &str| crate::token_engine::normalize_model_id(&m.trim().to_ascii_lowercase());
+    let (a, b) = (norm(requested), norm(ran));
+    a == b || alias_covers(&a, &b) || alias_covers(&b, &a)
+}
+
+/// The model a Claude stage ran on when it isn't the one it asked for: the
+/// `system/init` event's `model` that [`same_model`] says differs. A missing
+/// or empty `model` changes nothing. Pure.
+pub fn substituted_model(requested: &str, init: &Value) -> Option<String> {
+    init_model(init).filter(|ran| !same_model(requested, ran)).map(str::to_string)
+}
+
+/// A model's short display name for the journal: the catalog's name
+/// without "Claude " ("Sonnet 5.5"), else the id as given.
+fn model_display(model: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    router
+        .and_then(|r| r.find_model(model))
+        .map(|(_, m)| m.display_name.trim_start_matches("Claude ").to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// The journal line when a Claude stage runs on another model than it
+/// asked for: "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model
+/// settings picked another model". Since 2.1.323 `claude -p` "now warns on
+/// stderr" when settings block the requested model in text output only;
+/// a stream-json stage says nothing, so this is the only notice.
+pub fn ran_on_notice(requested: &str, ran: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    format!(
+        "ran on {}, not {} — Claude Code's model settings picked another model",
+        model_display(ran, router),
+        model_display(requested, router)
+    )
+}
+
 /// Hand a Claude stream event's plan windows and sign-in end to
 /// `PersistingSink`, which keeps them for Readiness, Usage and the notes.
 /// `auth` is the session's, from its `system/init`. An API-key session's
@@ -2505,8 +2570,20 @@ impl CliRunner {
         let mut auth: Option<CliAuth> = None;
         // A retry storm journals one line per cause per 10 s, not one per attempt.
         let mut retry_throttle = crate::orchestrator::live::RetryThrottle::default();
+        // From `system/init`: the model the session runs on, when it isn't
+        // the one the stage asked for (settings such as `availableModels`
+        // can make Claude Code pick another). Prices a stop's estimate and
+        // goes on the outcome (`CliOutcomeMeta::ran_model`).
+        let ran_model: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let ran_in_loop = std::sync::Arc::clone(&ran_model);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
+                if let Some(ran) = substituted_model(&stage.agent_model, value) {
+                    let catalog = crate::token_engine::catalog();
+                    emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
+                    *ran_in_loop.lock() = Some(ran);
+                }
                 if let Some((id, u)) = usage_from_stream_event(value) {
                     let mut map = usage_in_loop.lock();
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
@@ -2577,14 +2654,16 @@ impl CliRunner {
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
                 let (counted, drift) = counted_usage();
+                let ran = ran_model.lock().clone();
                 let mut out = stopped_stage(
                     dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
-                    &stage.agent_model,
+                    ran.as_deref().unwrap_or(&stage.agent_model),
                     &counted,
                     codex_accum.lock().turn_open,
                 );
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                out.cli.ran_model = ran;
                 return Ok(out);
             }
         };
@@ -2610,14 +2689,16 @@ impl CliRunner {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
             let (counted, drift) = counted_usage();
+            let ran = ran_model.lock().clone();
             let mut out = stopped_stage(
                 dialect,
                 &format!("{bin} {kind}"),
-                &stage.agent_model,
+                ran.as_deref().unwrap_or(&stage.agent_model),
                 &counted,
                 codex_accum.lock().turn_open,
             );
             flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+            out.cli.ran_model = ran;
             return Ok(out);
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -2694,10 +2775,10 @@ impl CliRunner {
             }
             CliDialect::Claude => match result_line {
                 Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                    Ok(outcome) => Ok(apply_question_guard(with_free_space(
-                        outcome,
-                        || free_bytes(&ctx.workspace_path),
-                    ))),
+                    Ok(mut outcome) => {
+                        outcome.cli.ran_model = ran_model.lock().clone();
+                        Ok(apply_question_guard(with_free_space(outcome, || free_bytes(&ctx.workspace_path))))
+                    }
                     Err(_) => Ok(failed_stage(&format!(
                         "claude produced no parseable result: {}",
                         failure_detail(&stderr_out, &line)

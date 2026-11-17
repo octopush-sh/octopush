@@ -1158,6 +1158,32 @@ fn auth_status_signed_out_is_told_apart_from_unknown() {
     }
 }
 
+// ─── `system/init` `model` → the model a stage ran on (#791) ──
+
+#[test]
+fn init_events_name_the_model_the_session_runs_on() {
+    // Every recorded init carries `model`, and a stage that asked for that
+    // model (or its family alias) reads as not substituted.
+    use crate::orchestrator::cli_runner::{init_model, substituted_model};
+    for rec in recordings() {
+        for rel in ["stream-json/simple.jsonl", "stream-json/tool-use.jsonl"] {
+            let fx = rec.label(rel);
+            let events = rec.jsonl(rel);
+            let init = events.iter().find(|e| e["subtype"] == "init").unwrap_or_else(|| panic!("[{fx}] no init"));
+            let model = init_model(init).unwrap_or_else(|| panic!("[{fx}] init without a model: {init}"));
+            assert_eq!(substituted_model(model, init), None, "[{fx}]");
+        }
+    }
+    // The 2.1.314 retry fixture's init: `claude-sonnet-4-5`.
+    let rec = recording("2.1.314");
+    let events = rec.jsonl(API_RETRY_REL);
+    let init = &events[0];
+    assert_eq!(init_model(init), Some("claude-sonnet-4-5"), "[{}]", rec.label(API_RETRY_REL));
+    assert_eq!(substituted_model("sonnet", init), None);
+    assert_eq!(substituted_model("claude-sonnet-4-5-20250929", init), None);
+    assert_eq!(substituted_model("claude-opus-5-5", init).as_deref(), Some("claude-sonnet-4-5"));
+}
+
 // ─── `system/api_retry`, `system/notification` and `system/init` load errors → journal notices ──
 
 const API_RETRY_REL: &str = "stream-json/api-retry.jsonl";
