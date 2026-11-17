@@ -466,7 +466,7 @@ describe("MissionControl", () => {
   it("a run waiting for its Claude plan sits in flight with a sage line and no beacon", () => {
     const resumeAt = Math.floor(Date.now() / 1000) + 3600;
     const run = mkRun("a", "paused", {
-      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0 },
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
     });
     const halted = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
     useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [halted] } } });
@@ -482,7 +482,7 @@ describe("MissionControl", () => {
   it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", () => {
     const resumeAt = Math.floor(Date.now() / 1000) + 3600;
     const run = mkRun("a", "paused", {
-      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0 },
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
     });
     const onJumpToRun = vi.fn();
     useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
@@ -494,9 +494,22 @@ describe("MissionControl", () => {
     expect(onJumpToRun).not.toHaveBeenCalled();
   });
 
+  it("a plan park beside a sibling's real halt is in Needs you", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: true },
+    });
+    const plan = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    const halt = { ...mkStage("s2", "a", 1, "failed"), error: "the build broke" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [plan, halt] } } });
+    renderRoom();
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.queryByText("In flight")).toBeNull();
+  });
+
   it("a plan park the director must resume is back in Needs you", () => {
     const run = mkRun("a", "paused", {
-      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 60, resumeAt: null, resumeCount: 3 },
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 60, resumeAt: null, resumeCount: 3, otherHold: false },
     });
     useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
     renderRoom();

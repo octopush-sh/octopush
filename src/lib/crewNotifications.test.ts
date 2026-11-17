@@ -32,7 +32,7 @@ describe("decideCheckpointNotification (needs you)", () => {
     const at = Math.floor(Date.now() / 1000) + 3600;
     const n = decideCheckpointNotification(
       "plan_limit",
-      run("paused", { planWait: { window: "five_hour", resetsAt: at - 90, resumeAt: at, resumeCount: 0 } }),
+      run("paused", { planWait: { window: "five_hour", resetsAt: at - 90, resumeAt: at, resumeCount: 0, otherHold: false } }),
       "ws",
     );
     expect(n?.title).toBe("Paused by your Claude plan");

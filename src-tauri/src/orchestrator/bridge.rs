@@ -224,7 +224,7 @@ impl Orchestrator {
                         "director"
                     } else if !repaired_error {
                         // A Claude plan park with a scheduled resume needs nobody.
-                        self.park_reason(run_id)
+                        self.park_reason(run_id, s)
                     } else {
                         "decision"
                     };

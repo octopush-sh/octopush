@@ -239,7 +239,7 @@ describe("RunControlBar", () => {
     });
     const parked = (resumeAt: number | null): Run => ({
       ...run("paused"),
-      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 600, resumeAt, resumeCount: resumeAt ? 0 : 3 },
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 600, resumeAt, resumeCount: resumeAt ? 0 : 3, otherHold: false },
     });
 
     it("scheduled: says when it resumes, offers Resume now and the opt-out, never the beacon", () => {

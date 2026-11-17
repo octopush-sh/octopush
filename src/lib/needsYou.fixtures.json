@@ -1,5 +1,5 @@
 {
-  "$comment": "Pins TS `needsYou`/`fleetCounts` (runStatus.ts) to Rust `fleet_status` (the Dock badge). Both test suites read this file. A fleet's optional `planWaiting` marks, per run, a paused run waiting for its Claude plan to reset with an automatic resume scheduled: in flight, not needs-you.",
+  "$comment": "Pins TS `needsYou`/`fleetCounts` (runStatus.ts) to Rust `fleet_status` (the Dock badge). Both test suites read this file. A fleet's optional `planWaiting` marks, per run, a paused run waiting for its Claude plan to reset with an automatic resume scheduled: in flight, not needs-you. `planWait` cases carry the run's park itself: it is calm (in flight) only with a resume scheduled (`resumeAt`) and no other stage waiting for the director (`otherHold`: a sibling's real halt, gate or question).",
   "statuses": [
     {
       "status": "draft",
@@ -105,6 +105,43 @@
     {
       "status": "running",
       "planWaiting": true,
+      "needsYou": false
+    }
+  ],
+  "planWait": [
+    {
+      "status": "paused",
+      "resumeAt": 1793551290,
+      "otherHold": false,
+      "planWaiting": true,
+      "needsYou": false
+    },
+    {
+      "status": "paused",
+      "resumeAt": 1793551290,
+      "otherHold": true,
+      "planWaiting": false,
+      "needsYou": true
+    },
+    {
+      "status": "paused",
+      "resumeAt": null,
+      "otherHold": false,
+      "planWaiting": false,
+      "needsYou": true
+    },
+    {
+      "status": "paused",
+      "resumeAt": null,
+      "otherHold": true,
+      "planWaiting": false,
+      "needsYou": true
+    },
+    {
+      "status": "running",
+      "resumeAt": 1793551290,
+      "otherHold": false,
+      "planWaiting": false,
       "needsYou": false
     }
   ]

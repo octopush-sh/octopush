@@ -90,6 +90,39 @@ pub fn clock_label(epoch: i64, now: i64) -> String {
     }
 }
 
+/// What claiming a due automatic plan resume came to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanClaim {
+    /// The Resume is applied: drive the next segment.
+    Resumed { budget_override: bool },
+    /// Nothing to do here: another process claimed it, the director acted or
+    /// turned it off, or the parked stages were resolved another way.
+    NotClaimed,
+    /// The run now waits for the director (its budget is spent): say so.
+    NeedsYou,
+    /// Applying the Resume failed; the automatic resume is scheduled again
+    /// shortly ([`RETRY_SECS`]), so keep waiting.
+    Retry,
+}
+
+/// After a Resume that couldn't be applied, try again this many seconds later.
+pub const RETRY_SECS: i64 = 60;
+
+/// Whether every stage waiting for a decision is a Claude plan limit: only
+/// then is a run with a scheduled resume calm. A sibling's real halt, a gate
+/// or a question still needs the director (and the beacon).
+pub fn only_plan_holds(stages: &[crate::db::RunStageRow]) -> bool {
+    let mut any = false;
+    for s in stages {
+        match s.status.as_str() {
+            "failed" if s.error.as_deref().is_some_and(is_plan_limit) => any = true,
+            "failed" | "awaiting_checkpoint" => return false,
+            _ => {}
+        }
+    }
+    any
+}
+
 fn budget_spent(run: &crate::db::RunRow) -> bool {
     run.budget_usd.is_some_and(|b| run.cost_usd >= b)
 }
@@ -135,10 +168,15 @@ impl Orchestrator {
         Ok(resume_at.is_some())
     }
 
-    /// The `run://checkpoint` reason for a park: `plan_limit` while an
-    /// automatic resume is scheduled (nobody needs to decide), else `decision`.
-    pub(crate) fn park_reason(&self, run_id: &str) -> &'static str {
-        let waiting = self
+    /// The `run://checkpoint` reason for a failed `stage`: `plan_limit` when
+    /// that stage hit a plan limit, an automatic resume is scheduled and no
+    /// other stage of the run waits for a decision (nobody needs to decide),
+    /// else `decision`.
+    pub(crate) fn park_reason(&self, run_id: &str, stage: &crate::db::RunStageRow) -> &'static str {
+        let stages = self.db.lock().list_run_stages(run_id).unwrap_or_default();
+        let error = stages.iter().find(|s| s.id == stage.id).and_then(|s| s.error.clone()).or_else(|| stage.error.clone());
+        let plan_stage = error.as_deref().is_some_and(is_plan_limit);
+        let scheduled = self
             .db
             .lock()
             .get_run(run_id)
@@ -146,7 +184,8 @@ impl Orchestrator {
             .flatten()
             .and_then(|r| r.plan_wait)
             .is_some_and(|w| w.resume_at.is_some());
-        if waiting {
+        let only_plan = only_plan_holds(&stages);
+        if plan_stage && scheduled && only_plan {
             "plan_limit"
         } else {
             "decision"
@@ -154,17 +193,36 @@ impl Orchestrator {
     }
 
     /// Claim and apply the automatic resume of a plan-parked run whose time
-    /// has come. `Ok(Some(budget_override))`: the Resume is applied and the
-    /// caller drives the next segment. `Ok(None)`: nothing to do (another
-    /// process claimed it, the director acted, or the budget is now spent and
-    /// the run waits for the director).
-    pub fn claim_plan_resume(&self, run_id: &str) -> AppResult<Option<bool>> {
+    /// has come: every plan-limited stage of the run resumes (see
+    /// [`PlanClaim`] for the outcomes).
+    pub fn claim_plan_resume(&self, run_id: &str) -> AppResult<PlanClaim> {
         let now = Utc::now().timestamp();
+        // Read the park before the claim clears its resume time, so a Resume
+        // that fails to apply can be scheduled again.
+        let Some(before) = self.db.lock().get_run(run_id)?.and_then(|r| r.plan_wait) else {
+            return Ok(PlanClaim::NotClaimed);
+        };
         if !self.db.lock().claim_plan_resume(run_id, now)? {
-            return Ok(None);
+            return Ok(PlanClaim::NotClaimed);
         }
+        match self.apply_claimed_plan_resume(run_id) {
+            Ok(PlanClaim::Retry) | Err(_) => {
+                // Put the park back, due again shortly, the claim uncounted:
+                // a claim that couldn't be applied must not end the wait.
+                self.db.lock().restore_plan_resume(run_id, &before.window, before.resets_at, now + RETRY_SECS)?;
+                self.emit_run_update(run_id);
+                Ok(PlanClaim::Retry)
+            }
+            Ok(claim) => Ok(claim),
+        }
+    }
+
+    /// The part of [`Self::claim_plan_resume`] after the claim: resume, or
+    /// hand the run to the director. `Retry` (or an error) means the caller
+    /// schedules the resume again.
+    fn apply_claimed_plan_resume(&self, run_id: &str) -> AppResult<PlanClaim> {
         let Some(run) = self.db.lock().get_run(run_id)? else {
-            return Ok(None);
+            return Ok(PlanClaim::NotClaimed);
         };
         let stages = self.db.lock().list_run_stages(run_id)?;
         let Some(stage) = stages
@@ -175,7 +233,7 @@ impl Orchestrator {
             // The parked stage was resolved another way: nothing to resume.
             self.db.lock().clear_run_plan_wait(run_id)?;
             self.emit_run_update(run_id);
-            return Ok(None);
+            return Ok(PlanClaim::NotClaimed);
         };
         if budget_spent(&run) {
             // Never resume a run whose budget is spent: it waits for you.
@@ -186,23 +244,28 @@ impl Orchestrator {
             );
             self.emit_run_update(run_id);
             self.emit_checkpoint(run_id, &stage.id, "decision");
-            return Ok(None);
+            return Ok(PlanClaim::NeedsYou);
         }
         let count = self.db.lock().plan_resume_count(run_id)?;
-        self.journal_notice(
-            run_id,
-            &stage.id,
-            &format!("Claude plan window reset · resuming (automatic resume {count} of {AUTO_RESUME_CAP})"),
-        );
+        // Resume on the plan-limited stage resumes every plan-limited stage
+        // of the run (`apply_checkpoint_action`).
         match self.resolve_checkpoint_apply_only(
             run_id,
             Some(&stage.id),
             CheckpointAction::Resume { max_turns_override: None },
         ) {
-            Ok(r) => Ok(r),
+            Ok(Some(budget_override)) => {
+                self.journal_notice(
+                    run_id,
+                    &stage.id,
+                    &format!("Claude plan window reset · resuming (automatic resume {count} of {AUTO_RESUME_CAP})"),
+                );
+                Ok(PlanClaim::Resumed { budget_override })
+            }
+            Ok(None) => Ok(PlanClaim::NotClaimed),
             Err(e) => {
-                tracing::warn!(run_id = %run_id, error = %e, "plan resume: applying Resume failed");
-                Ok(None)
+                tracing::warn!(run_id = %run_id, error = %e, "plan resume: applying Resume failed; scheduled again");
+                Ok(PlanClaim::Retry)
             }
         }
     }
@@ -243,17 +306,22 @@ impl Orchestrator {
         };
         for run_id in due {
             match self.claim_plan_resume(&run_id) {
-                Ok(Some(budget_override)) => self.drive_resumed(run_id, budget_override),
-                Ok(None) => {}
+                Ok(PlanClaim::Resumed { budget_override }) => self.drive_resumed(run_id, budget_override),
+                // The app is up: the checkpoint and run events already tell the
+                // director; a retry is picked up by a later tick.
+                Ok(PlanClaim::NotClaimed | PlanClaim::NeedsYou | PlanClaim::Retry) => {}
                 Err(e) => tracing::warn!(run_id = %run_id, error = %e, "plan resume failed"),
             }
         }
     }
 
-    /// Drive a run whose Resume is applied: a detached worker for Pro, with
-    /// the in-process fallback (as `commands::dispatch_checkpoint` does).
+    /// Drive a run whose Resume is applied on the run's own substrate: a
+    /// detached worker for a detached run (`runs.detached`), with the
+    /// in-process fallback `commands::dispatch_checkpoint` uses, else
+    /// in-process.
     fn drive_resumed(self: &Arc<Self>, run_id: String, budget_override: bool) {
-        if crate::entitlement::Entitlement::current().has_feature(crate::entitlement::feature::RUNS_DETACHED) {
+        let detached = self.db.lock().get_run(&run_id).ok().flatten().is_some_and(|r| r.detached);
+        if detached {
             match self.spawn_detached_segment(&run_id, budget_override) {
                 Ok(_) => return,
                 Err(e) => {

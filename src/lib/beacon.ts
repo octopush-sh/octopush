@@ -15,7 +15,10 @@
 //
 // A run waiting for its Claude plan to reset, with an automatic resume
 // scheduled, has no decision pending: calm (#731) — ringing the beacon for
-// a wait trains users to ignore it.
+// a wait trains users to ignore it. Only the plan-limited stage is calm: a
+// blocked stage that is a real halt, a gate or a question still takes it.
+
+import { isPlanLimitHalt } from "./planWait";
 
 export type BeaconAnchor =
   | { kind: "decision" }
@@ -27,15 +30,17 @@ const TERMINAL: ReadonlySet<string> = new Set(["completed", "aborted", "failed"]
 
 export function beaconAnchor(opts: {
   run: { status: string } | null;
-  blockedStage: { id: string } | null;
+  blockedStage: { id: string; error?: string | null } | null;
   runningStage: { id: string } | null;
   launcherReady: boolean;
-  /** The run waits for its plan to reset with an automatic resume scheduled. */
+  /** The run waits for its plan to reset with an automatic resume scheduled
+   *  and nothing else waits for the director (`isPlanWaiting`). */
   planWaiting?: boolean;
 }): BeaconAnchor {
   const { run, blockedStage, runningStage, launcherReady, planWaiting = false } = opts;
   const active = run !== null && !TERMINAL.has(run.status);
-  if (active && planWaiting) return null;
+  const calmWait = planWaiting && (!blockedStage || isPlanLimitHalt(blockedStage.error));
+  if (active && calmWait) return null;
   if (active && (blockedStage || run.status === "draft")) {
     return { kind: "decision" };
   }

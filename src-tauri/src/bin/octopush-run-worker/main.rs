@@ -22,7 +22,7 @@ use std::time::Duration;
 use octopush_lib::db::Db;
 use octopush_lib::orchestrator::events::EventSink;
 use octopush_lib::orchestrator::types::RunStatus;
-use octopush_lib::orchestrator::plan_wait;
+use octopush_lib::orchestrator::plan_wait::{self, PlanClaim};
 use octopush_lib::orchestrator::Orchestrator;
 use parking_lot::Mutex;
 
@@ -149,7 +149,7 @@ async fn main() {
             );
         }
         match wait_for_plan_reset(&db, &orch, &args.run_id).await {
-            Some(over) => {
+            WaitEnd::Drive(over) => {
                 // Drive the next segment under our own lease again.
                 if !db.lock().reserve_worker_lease(&args.run_id, &args.nonce).unwrap_or(false)
                     || !db
@@ -167,8 +167,15 @@ async fn main() {
                 }
                 budget_override = over;
             }
+            // The run now waits for the director (its budget is spent, or the
+            // database stayed unreadable): never exit silently.
+            WaitEnd::NeedsYou => {
+                let result = Ok(RunStatus::Paused);
+                announce(&db, &args, &result);
+                break result;
+            }
             // Resumed elsewhere, cancelled, aborted or resolved: nothing left here.
-            None => break Ok(RunStatus::Paused),
+            WaitEnd::Gone => break Ok(RunStatus::Paused),
         }
     };
 
@@ -183,21 +190,73 @@ async fn main() {
 /// resume soon after it wakes.
 const PLAN_WAIT_POLL: Duration = Duration::from_secs(15);
 
+/// How a worker's wait for a plan reset ended.
+#[derive(Debug, PartialEq, Eq)]
+enum WaitEnd {
+    /// The Resume is applied: drive the next segment with this budget override.
+    Drive(bool),
+    /// The run waits for the director now: announce it.
+    NeedsYou,
+    /// Nothing left for this worker: the app or the director acted, the
+    /// resume was turned off, or the run was aborted or deleted.
+    Gone,
+}
+
+/// Consecutive database errors a waiting worker rides out (with backoff up
+/// to [`PLAN_WAIT_POLL`], about 15 minutes in all) before it hands the run to
+/// the director instead of waiting blind.
+const MAX_DB_RETRIES: u32 = 60;
+
+/// The pause after the `n`th consecutive database error: 1 s, doubling, at
+/// most [`PLAN_WAIT_POLL`].
+fn db_backoff(n: u32) -> Duration {
+    Duration::from_secs(1u64 << n.min(4)).min(PLAN_WAIT_POLL)
+}
+
 /// Wait until the run's automatic plan resume is due, then claim and apply
-/// it. `Some(budget_override)` = drive the next segment; `None` = the wait
-/// ended without this worker resuming (the app or the director acted, the
-/// resume was turned off, or the run was aborted).
-async fn wait_for_plan_reset(db: &Arc<Mutex<Db>>, orch: &Arc<Orchestrator>, run_id: &str) -> Option<bool> {
+/// it. A transient database error (a busy database) is retried with backoff,
+/// never read as a lost claim; a Resume that failed to apply is scheduled
+/// again by the claim and waited for.
+async fn wait_for_plan_reset(db: &Arc<Mutex<Db>>, orch: &Arc<Orchestrator>, run_id: &str) -> WaitEnd {
+    let mut errors = 0u32;
+    fn on_error(errors: &mut u32, e: &dyn std::fmt::Display) -> Option<Duration> {
+        *errors += 1;
+        eprintln!("octopush-run-worker: plan wait: database error ({errors}): {e}");
+        (*errors <= MAX_DB_RETRIES).then(|| db_backoff(*errors))
+    }
     loop {
-        let run = db.lock().get_run(run_id).ok().flatten()?;
+        let run = match db.lock().get_run(run_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return WaitEnd::Gone,
+            Err(e) => match on_error(&mut errors, &e) {
+                Some(pause) => {
+                    tokio::time::sleep(pause).await;
+                    continue;
+                }
+                None => return WaitEnd::NeedsYou,
+            },
+        };
         if run.status != "paused" {
-            return None;
+            return WaitEnd::Gone;
         }
-        let resume_at = run.plan_wait.and_then(|w| w.resume_at)?;
-        if chrono::Utc::now().timestamp() >= resume_at {
-            return orch.claim_plan_resume(run_id).ok().flatten();
+        let Some(resume_at) = run.plan_wait.and_then(|w| w.resume_at) else {
+            return WaitEnd::Gone;
+        };
+        if chrono::Utc::now().timestamp() < resume_at {
+            errors = 0;
+            tokio::time::sleep(PLAN_WAIT_POLL).await;
+            continue;
         }
-        tokio::time::sleep(PLAN_WAIT_POLL).await;
+        match orch.claim_plan_resume(run_id) {
+            Ok(PlanClaim::Resumed { budget_override }) => return WaitEnd::Drive(budget_override),
+            Ok(PlanClaim::NeedsYou) => return WaitEnd::NeedsYou,
+            Ok(PlanClaim::NotClaimed) => return WaitEnd::Gone,
+            Ok(PlanClaim::Retry) => tokio::time::sleep(PLAN_WAIT_POLL).await,
+            Err(e) => match on_error(&mut errors, &e) {
+                Some(pause) => tokio::time::sleep(pause).await,
+                None => return WaitEnd::NeedsYou,
+            },
+        }
     }
 }
 
@@ -310,3 +369,18 @@ fn notify_native(title: &str, body: &str) {
 
 #[cfg(not(target_os = "macos"))]
 fn notify_native(_title: &str, _body: &str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn db_errors_back_off_up_to_the_poll() {
+        assert_eq!(db_backoff(1), Duration::from_secs(2));
+        assert!(db_backoff(2) > db_backoff(1));
+        assert_eq!(db_backoff(30), PLAN_WAIT_POLL, "capped at the poll");
+        // The retries span minutes, not one blip.
+        let total: Duration = (1..=MAX_DB_RETRIES).map(db_backoff).sum();
+        assert!(total >= Duration::from_secs(10 * 60), "{total:?}");
+    }
+}

@@ -377,15 +377,31 @@ pub(crate) struct PlanLimitWatch {
     rejected: Option<PlanLimit>,
     /// The CLI wrote its own limit notice (`error: "rate_limit"`).
     limit_notice: bool,
+    /// The last rate-limit event seen was that rejection: nothing allowed a
+    /// request after it, so it is what ended the turn.
+    rejection_last: bool,
 }
 
 impl PlanLimitWatch {
+    /// Feed one stream message. Only the stage's own top-level messages
+    /// count: a sub-agent's (`parent_tool_use_id` set) is not the stage's
+    /// stop.
     pub(crate) fn observe(&mut self, v: &Value) {
-        for w in plan_windows_from_stream_event(v) {
+        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return;
+        }
+        let windows = plan_windows_from_stream_event(v);
+        if !windows.is_empty() {
+            // A rate-limit event: the rejection is the last one only if this
+            // event rejects too (other windows it lists may be allowed).
+            self.rejection_last = false;
+        }
+        for w in windows {
             match w.status.as_deref() {
                 Some("rejected") if !w.using_overage => {
                     if let Some(resets_at) = w.resets_at {
                         self.rejected = Some(PlanLimit { window: w.kind, resets_at });
+                        self.rejection_last = true;
                     }
                 }
                 // The same window allowed again: the wall is gone.
@@ -445,7 +461,10 @@ pub(crate) fn apply_plan_limit(mut outcome: StageOutcome, watch: &PlanLimitWatch
         return outcome;
     }
     let stopped = match outcome.status {
-        StageStatus::Failed => true,
+        // A failure is the plan's only with the CLI's own limit notice, or
+        // when the rejection was the last rate-limit event before the result
+        // (a failure after a later allowed request has another cause).
+        StageStatus::Failed => watch.limit_notice || watch.rejection_last,
         // The reply is the CLI's own limit notice, not the agent's work.
         StageStatus::Done | StageStatus::AwaitingCheckpoint => watch.limit_notice,
         _ => false,

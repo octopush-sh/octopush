@@ -47,9 +47,17 @@ describe("beaconAnchor — exactly one brass beacon", () => {
 
   it("a run waiting for its Claude plan to reset never takes the beacon", () => {
     const run = { status: "paused" } as any;
-    const blocked = { id: "halted" } as any;
+    const blocked = { id: "halted", error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
     expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: true })).toBeNull();
     // Once the director must resume it (cap reached, budget spent, resume off), it is a decision again.
     expect(beaconAnchor({ run, blockedStage: blocked, runningStage: null, launcherReady: false, planWaiting: false })).toEqual({ kind: "decision" });
+  });
+
+  it("a sibling's real halt or gate beside a plan wait still takes the beacon", () => {
+    const run = { status: "paused" } as any;
+    const halt = { id: "halted", error: "the build broke" };
+    const gate = { id: "gate", error: null };
+    expect(beaconAnchor({ run, blockedStage: halt, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
+    expect(beaconAnchor({ run, blockedStage: gate, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
   });
 });

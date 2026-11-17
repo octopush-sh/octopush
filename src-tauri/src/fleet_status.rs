@@ -13,8 +13,9 @@ const COALESCE_MS: u64 = 250;
 
 /// Whether a run needs the director: `paused` covers every human-must-act
 /// reason (gate, halted stage, budget park, director pause) — except a run
-/// waiting for its Claude plan to reset with an automatic resume scheduled
-/// (`plan_waiting`): nobody has to decide, so it is in flight (#731).
+/// whose only waiting stages are Claude plan limits with an automatic resume
+/// scheduled (`plan_waiting`, see [`plan_waiting`]): nobody has to decide,
+/// so it is in flight (#731). A sibling's real halt or gate keeps it needs-you.
 pub fn needs_you(status: &str, plan_waiting: bool) -> bool {
     status == "paused" && !plan_waiting
 }
@@ -46,9 +47,17 @@ pub fn derive<'a>(runs: impl IntoIterator<Item = (&'a str, bool)>) -> FleetStatu
     fleet
 }
 
-/// A run waits for its Claude plan with an automatic resume scheduled.
+/// A run waits for its Claude plan with an automatic resume scheduled, and
+/// nothing else in it waits for the director (`PlanWait::other_hold`: no
+/// other failed stage, gate or question).
 pub fn plan_waiting(run: &crate::db::RunRow) -> bool {
-    run.plan_wait.as_ref().is_some_and(|w| w.resume_at.is_some())
+    run.plan_wait.as_ref().is_some_and(|w| calm_plan_wait(w.resume_at, w.other_hold))
+}
+
+/// Pure: a plan park is calm with a resume scheduled and no other hold.
+/// Mirrors TS `isPlanWaiting` (pinned by `needsYou.fixtures.json`).
+pub fn calm_plan_wait(resume_at: Option<i64>, other_hold: bool) -> bool {
+    resume_at.is_some() && !other_hold
 }
 
 /// Run events after which a run's status may have changed.
@@ -128,6 +137,20 @@ mod tests {
             let status = c["status"].as_str().unwrap();
             let waiting = c["planWaiting"].as_bool().unwrap();
             assert_eq!(needs_you(status, waiting), c["needsYou"].as_bool().unwrap(), "{status} {waiting}");
+        }
+    }
+
+    #[test]
+    fn a_plan_park_is_calm_only_when_nothing_else_waits() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/needsYou.fixtures.json")).expect("fixtures");
+        let cases = fixtures["planWait"].as_array().expect("planWait");
+        assert!(cases.iter().any(|c| c["otherHold"].as_bool() == Some(true)), "a sibling-hold case is pinned");
+        for c in cases {
+            let status = c["status"].as_str().unwrap();
+            let calm = status == "paused" && calm_plan_wait(c["resumeAt"].as_i64(), c["otherHold"].as_bool().unwrap());
+            assert_eq!(calm, c["planWaiting"].as_bool().unwrap(), "{c}");
+            assert_eq!(needs_you(status, calm), c["needsYou"].as_bool().unwrap(), "{c}");
         }
     }
 

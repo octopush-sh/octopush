@@ -273,7 +273,7 @@ function PlanWaitBar({
   const scheduled = run.planWait?.resumeAt != null;
   const why = planWaitWhy(run);
   return (
-    <div className="border-t border-[var(--warning-border)] bg-[var(--warning-ghost)] px-4 py-3" data-tour="direct-plan-wait">
+    <div className="octo-fade-in border-t border-[var(--warning-border)] bg-[var(--warning-ghost)] px-4 py-3" data-tour="direct-plan-wait">
       <div className="flex items-center gap-3">
         <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-warning">
           <Hourglass size={11} aria-hidden />

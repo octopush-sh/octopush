@@ -15,9 +15,16 @@ export function isPlanLimitHalt(error: string | null | undefined): boolean {
   return !!error && error.includes(PLAN_LIMIT_MARKER);
 }
 
-/** A paused run waiting for its plan to reset, with an automatic resume scheduled. */
+/** Automatic resumes before a plan-parked run waits for the director. Mirrors
+ *  `plan_wait::AUTO_RESUME_CAP` in Rust; `planWait.test.ts` pins the two. */
+export const AUTO_RESUME_CAP = 3;
+
+/** A paused run waiting for its plan to reset, with an automatic resume
+ *  scheduled, and nothing else in it waiting for the director: only then is
+ *  it calm. A sibling's real halt, gate or question keeps it needs-you. */
 export function isPlanWaiting(run: Pick<Run, "status" | "planWait">): boolean {
-  return run.status === "paused" && run.planWait?.resumeAt != null;
+  const w = run.planWait;
+  return run.status === "paused" && w?.resumeAt != null && !w.otherHold;
 }
 
 /** Mission Control's live line: `plan limit · resumes 19:40`, or, when the
@@ -46,8 +53,8 @@ export function planWaitWhy(run: Pick<Run, "planWait" | "budgetUsd" | "costUsd">
   if (run.budgetUsd != null && run.costUsd >= run.budgetUsd) {
     return "The run's budget is spent, so it doesn't resume on its own. Resume it when you're ready.";
   }
-  if (w.resumeCount >= 3) {
-    return "It hit the limit again after 3 automatic resumes, so it waits for you.";
+  if (w.resumeCount >= AUTO_RESUME_CAP) {
+    return `It hit the limit again after ${AUTO_RESUME_CAP} automatic resumes, so it waits for you.`;
   }
   return "It doesn't resume on its own. Resume it when you're ready.";
 }

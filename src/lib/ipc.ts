@@ -282,6 +282,9 @@ export interface PlanWait {
   resumeAt: number | null;
   /** Automatic resumes since the director last acted or a stage finished. */
   resumeCount: number;
+  /** Another stage also waits for the director (a real halt, a gate, a
+   *  question): the run needs you even with a resume scheduled. */
+  otherHold: boolean;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.

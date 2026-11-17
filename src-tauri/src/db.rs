@@ -4630,7 +4630,9 @@ impl Db {
             .query_row(
                 "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
                         reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
-                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -4643,7 +4645,9 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
-                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -4657,7 +4661,9 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
-                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -4725,7 +4731,9 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
-                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -4746,7 +4754,9 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
                     reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
-                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs
              WHERE status IN ('completed', 'aborted') AND finished_at IS NOT NULL AND finished_at > ?1
              ORDER BY finished_at DESC LIMIT 50",
@@ -5232,6 +5242,25 @@ impl Db {
             params![run_id, now],
         )?;
         Ok(n > 0)
+    }
+
+    /// Undo a claim whose Resume couldn't be applied: the run is parked by its
+    /// plan again, its automatic resume due at `resume_at`, and the claim no
+    /// longer counts against the cap.
+    pub fn restore_plan_resume(
+        &self,
+        run_id: &str,
+        window: &str,
+        resets_at: i64,
+        resume_at: i64,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,
+                 plan_resume_count = MAX(plan_resume_count - 1, 0)
+             WHERE id = ?1 AND status = 'paused'",
+            params![run_id, window, resets_at, resume_at],
+        )?;
+        Ok(())
     }
 
     /// A fresh allowance of automatic resumes (the director acted, or a stage
@@ -7432,6 +7461,10 @@ pub struct PlanWait {
     pub resume_at: Option<i64>,
     /// Automatic resumes since the director last acted or a stage finished.
     pub resume_count: i64,
+    /// Another stage of the run also waits for the director: a real halt, a
+    /// gate or a question (anything resolvable that isn't a plan limit). The
+    /// run then needs you, even with an automatic resume scheduled.
+    pub other_hold: bool,
 }
 
 /// The routines column list, in the order `row_to_routine` reads them.
@@ -7538,11 +7571,13 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
             let resets_at: Option<i64> = r.get(14)?;
             let resume_at: Option<i64> = r.get(15)?;
             let resume_count: i64 = r.get(16)?;
+            let other_hold = r.get::<_, i64>(17)? != 0;
             resets_at.map(|resets_at| PlanWait {
                 window: window.unwrap_or_default(),
                 resets_at,
                 resume_at,
                 resume_count,
+                other_hold,
             })
         },
     })

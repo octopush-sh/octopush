@@ -1001,8 +1001,8 @@ impl Orchestrator {
             })
             .collect();
         let snapshots = crate::claude_plan::load(&self.db().lock())?;
-        let windows: Vec<_> = snapshots.into_iter().map(|s| s.window).collect();
-        Ok(plan_wall(&crew, &windows, Utc::now().timestamp()))
+        let now = Utc::now().timestamp();
+        Ok(plan_wall(&crew, &fresh_plan_windows(&snapshots, now), now))
     }
 
     /// Fixed mode: resolve + guard the chosen workspace FIRST (so a deleted
@@ -1266,32 +1266,64 @@ impl Orchestrator {
     }
 }
 
-/// Parse the stored `[[position, model], …]` JSON overrides into the shape
-/// `create_run` wants. A malformed blob degrades to no overrides.
+/// A Claude plan snapshot older than this no longer skips a Routine: the
+/// wall may have lifted another way (extra usage turned on, a plan upgrade,
+/// an API-key sign-in), and a fire that does meet it parks cheaply and
+/// refreshes the snapshot.
+pub(crate) const PLAN_WALL_MAX_AGE_SECS: i64 = 6 * 3_600;
+
+/// Pure: the stored plan windows seen within [`PLAN_WALL_MAX_AGE_SECS`] of
+/// `now` (a snapshot whose time can't be read is dropped).
+pub(crate) fn fresh_plan_windows(
+    snapshots: &[crate::claude_plan::PlanSnapshot],
+    now: i64,
+) -> Vec<crate::orchestrator::cli_runner::PlanWindow> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.seen_at)
+                .is_ok_and(|t| now - t.timestamp() <= PLAN_WALL_MAX_AGE_SECS)
+        })
+        .map(|s| s.window.clone())
+        .collect()
+}
+
 /// Pure: the latest future reset among `rejected` plan windows (not covered
-/// by extra usage), when the crew — `(substrate, model)` per stage — has a
-/// Claude Code CLI stage. `None` otherwise (an API or Codex-only crew, or no
-/// wall), so API-key users and API crews never skip.
+/// by extra usage) that apply to the crew — `(substrate, model)` per stage —
+/// through one of its Claude Code CLI stages. A window for every model
+/// (`five_hour`, `seven_day`) applies to any such stage; a model's own
+/// window (`seven_day_opus`) only to a stage on that model, so a rejected
+/// Opus week doesn't skip a Sonnet crew. `None` otherwise (an API or
+/// Codex-only crew, or no wall), so API-key users and API crews never skip.
 pub(crate) fn plan_wall(
     crew: &[(String, String)],
     windows: &[crate::orchestrator::cli_runner::PlanWindow],
     now: i64,
 ) -> Option<i64> {
     use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
-    let on_claude_code = crew
+    let claude_models: Vec<String> = crew
         .iter()
-        .any(|(sub, model)| sub == "cli" && dialect_for_model(model) == CliDialect::Claude);
-    if !on_claude_code {
+        .filter(|(sub, model)| sub == "cli" && dialect_for_model(model) == CliDialect::Claude)
+        .map(|(_, model)| model.to_ascii_lowercase())
+        .collect();
+    if claude_models.is_empty() {
         return None;
     }
+    let applies = |kind: &str| match kind.strip_prefix("seven_day_") {
+        // `opusplan` plans on Opus: it meets an Opus wall too.
+        Some(family) => claude_models.iter().any(|m| m.contains(family)),
+        None => true,
+    };
     windows
         .iter()
-        .filter(|w| w.status.as_deref() == Some("rejected") && !w.using_overage)
+        .filter(|w| w.status.as_deref() == Some("rejected") && !w.using_overage && applies(&w.kind))
         .filter_map(|w| w.resets_at)
         .filter(|t| *t > now)
         .max()
 }
 
+/// Parse the stored `[[position, model], …]` JSON overrides into the shape
+/// `create_run` wants. A malformed blob degrades to no overrides.
 pub(crate) fn parse_stage_overrides(json: Option<&str>) -> Vec<(i64, String)> {
     let Some(json) = json else { return Vec::new() };
     serde_json::from_str::<Vec<(i64, String)>>(json).unwrap_or_default()
