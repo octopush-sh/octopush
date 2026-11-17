@@ -3,7 +3,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from "vitest";
 import { act, render, screen } from "@testing-library/react";
 import { Reveal } from "./Reveal";
 import { FadeSwap } from "./FadeSwap";
-import { MidTruncate } from "./MidTruncate";
+import { MidTruncate, graphemeBoundaries, lastFitting, trimTrailingSpace } from "./MidTruncate";
 
 describe("Reveal", () => {
   it("renders children and reflects open state via grid-template-rows + aria-hidden", () => {
@@ -126,5 +126,33 @@ describe("MidTruncate", () => {
   it("honours a custom tail length", () => {
     const { container } = render(<MidTruncate text="0123456789abcdef" tail={4} />);
     expect(container.querySelector(".octo-midtrunc-tail")).toHaveTextContent("cdef");
+  });
+});
+
+describe("MidTruncate — the ellipsis butts against the tail (#750)", () => {
+  it("never cuts inside a grapheme", () => {
+    expect(graphemeBoundaries("a🐙é")).toEqual([0, 1, 3, 4]);
+    expect(graphemeBoundaries("")).toEqual([0]);
+  });
+
+  it("finds the last boundary whose prefix fits", () => {
+    const widthTo = (i: number) => i * 7; // 7px a character
+    expect(lastFitting([0, 1, 2, 3, 4, 5], widthTo, 22)).toBe(3);
+    expect(lastFitting([0, 1, 2, 3, 4, 5], widthTo, 21.4)).toBe(3); // rounding forgiven
+    expect(lastFitting([0, 1, 2, 3, 4, 5], widthTo, 100)).toBe(5);
+    expect(lastFitting([0, 1, 2], widthTo, 3)).toBe(0);
+  });
+
+  it("drops whitespace before the cut, so no stray space precedes the ellipsis", () => {
+    expect(trimTrailingSpace("Production deploy (o", 11)).toBe(10);
+    expect(trimTrailingSpace("a  b", 3)).toBe(1);
+    expect(trimTrailingSpace("abc", 2)).toBe(2);
+  });
+
+  it("leaves the CSS ellipsis in place where nothing overflows", () => {
+    const { container } = render(<MidTruncate text={"Production deploy (octopush-web)-1"} tail={14} />);
+    const box = container.querySelector(".octo-midtrunc")!;
+    expect(box).not.toHaveAttribute("data-elided");
+    expect(box.textContent).toBe("Production deploy (octopush-web)-1");
   });
 });

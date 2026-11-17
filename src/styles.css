@@ -449,8 +449,13 @@
    container; the percentage only added a second, wrong opinion. */
 .octo-midtrunc-whole { display: block; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .octo-midtrunc       { display: inline-flex; align-items: baseline; min-width: 0; overflow: hidden; white-space: nowrap; }
-.octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.octo-midtrunc-tail  { flex: none; white-space: nowrap; }
+.octo-midtrunc-head  { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: pre; }
+.octo-midtrunc-tail  { flex: none; white-space: pre; }
+/* Once the head overflows, MidTruncate cuts it at a grapheme boundary itself
+   and the `…` moves onto the tail, so it butts against the tail in every row.
+   The engine's own ellipsis leaves up to a glyph of empty room after it (#750). */
+.octo-midtrunc[data-elided] .octo-midtrunc-head { text-overflow: clip; }
+.octo-midtrunc[data-elided] .octo-midtrunc-tail::before { content: "\2026"; }
 /* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
    it as a flex item in the split box, `vertical-align` as inline content in
    the whole one — each property is ignored by the box it doesn't apply to. */
