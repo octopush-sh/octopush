@@ -2353,10 +2353,14 @@ mod tests {
     fn seatbelt_keeps_a_system_root_writable_inside_but_not_replaceable() {
         // `$TMPDIR` and `/private/tmp` are system roots on every Mac; the
         // `~/.claude` state dirs are those of a stand-in `$HOME`, so the test
-        // never writes the developer's real `~/.claude/projects`.
+        // never writes the developer's real `~/.claude/projects`. The stand-in
+        // sits in the user cache dir, not in `$TMPDIR`: a root that holds
+        // `$HOME` is left out, so a `$HOME` inside `$TMPDIR` would drop it.
         let ws = tempfile::tempdir().unwrap();
         let roots = vec![ws.path().to_string_lossy().into_owned()];
-        let fake_home = tempfile::tempdir().unwrap();
+        let caches = dirs::cache_dir().unwrap();
+        std::fs::create_dir_all(&caches).unwrap();
+        let fake_home = tempfile::Builder::new().prefix("octopush-home-test-").tempdir_in(&caches).unwrap();
         let home = canonical_string(fake_home.path());
         ensure_home_roots(&home, None);
         let tmpdir = canonical_string(Path::new(&std::env::var("TMPDIR").unwrap()));
