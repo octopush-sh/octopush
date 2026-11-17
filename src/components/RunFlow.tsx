@@ -4,7 +4,7 @@ import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runSt
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
-import { shortModel } from "../lib/modelLabel";
+import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
 import { effortApplies } from "../lib/claudeCli";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
@@ -213,6 +213,15 @@ function StageCard({
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
             <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
+            {s.ranModel && (
+              <span
+                className="octo-pop-in shrink-0 text-octo-warning"
+                title={ranOnTitle(s.agentModel, s.ranModel)}
+                data-tour="direct-stage-ran-on"
+              >
+                {ranOnNote(s.ranModel)}
+              </span>
+            )}
             {s.effort && effortApplies(s.substrate, s.escalated && s.escalateModel ? s.escalateModel : s.agentModel) && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}

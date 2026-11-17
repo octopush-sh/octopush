@@ -10,6 +10,7 @@ pub mod collisions;
 pub mod claude_hooks;
 pub mod claude_login;
 pub mod claude_plan;
+pub mod codex_trust;
 mod commands;
 pub mod context_guard;
 pub mod crew;
@@ -240,6 +241,7 @@ pub fn run() {
             commands::list_branches,
             commands::workspaces_git_summary,
             commands::project_collisions,
+            commands::workspace_diff_size,
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,
@@ -419,6 +421,7 @@ pub fn run() {
             commands::connect_claude_code,
             commands::claude_cli_version,
             commands::claude_model_floor_note,
+            commands::codex_trust_note,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands

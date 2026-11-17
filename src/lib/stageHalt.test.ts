@@ -61,6 +61,14 @@ describe("haltCause", () => {
     expect(c.title).toBe("Bash `npm test` gave no result for 11 minutes");
     expect(c.remedy).toMatch(/still waiting on it/);
   });
+  it("names the API retry an idle timeout followed", () => {
+    const c = haltCause("claude timed out — no output for 10 minutes after an API retry (overloaded)", 25);
+    expect(c.title).toBe("No answer for 10 minutes after an API retry (overloaded)");
+    expect(c.remedy).toMatch(/retry delay/);
+    expect(haltCause("claude timed out — no output for 6 minutes after an API retry", 25).title).toBe(
+      "No answer for 6 minutes after an API retry",
+    );
+  });
   it("falls back to the first line", () => {
     expect(haltCause("something weird\nsecond line", 25).title).toBe("something weird");
   });
