@@ -11,7 +11,7 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ChevronRight, Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
+import { ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Plus, Square, Terminal, X } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
@@ -28,6 +28,9 @@ import { StageDots } from "./direct/StageDots";
 import { Reveal } from "./primitives/Reveal";
 import { ClaudeLoginNote } from "./ClaudeLoginNote";
 import { tourId } from "../lib/tour/ids";
+import { useCollisionStore } from "../stores/collisionStore";
+import { collisionSegment, collisionTooltip, worstSeverity } from "../lib/collisions";
+import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
 
 interface Props {
   open: boolean;
@@ -116,6 +119,18 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // detailByRun imperatively — subscribing to the whole map here would churn
   // this component on every stage event even while the room is closed.
   const boardIds = boardRuns.map((r) => r.id).join(",");
+
+  // Collision radar (#732): opening the room rescans the projects its crews
+  // work in (throttled in the store, cached in the backend).
+  const boardWs = boardRuns.map((r) => r.workspaceId).join(",");
+  useEffect(() => {
+    if (!open || !boardWs) return;
+    const wanted = new Set(boardWs.split(","));
+    const byProject = useWorkspaceStore.getState().workspacesByProjectId;
+    for (const [projectId, list] of Object.entries(byProject)) {
+      if (list.some((w) => wanted.has(w.id))) void useCollisionStore.getState().refresh(projectId);
+    }
+  }, [open, boardWs]);
   useEffect(() => {
     if (!open) return;
     const detailByRun = useRunsStore.getState().detailByRun;
@@ -470,6 +485,7 @@ function CrewCard({
             </span>
           </>
         )}
+        {band !== "settled" && <CollisionSegment workspaceId={run.workspaceId} />}
         {run.detached && run.status === "running" && (
           <span
             title="Working detached — this crew keeps going even if you quit Octopush"
@@ -845,6 +861,34 @@ function useTimeInState(sinceIso: string | null): string {
   const h = Math.floor(secs / 3600);
   const mm = Math.floor((secs % 3600) / 60).toString().padStart(2, "0");
   return `${h}h ${mm}m`;
+}
+
+/** Collision radar (#732): one meta segment — "overlaps auth-flow · 2 files"
+ *  — when another live workspace of the project changes the same files. Mute
+ *  text behind an amber/rouge glyph; never a needs-you item, never the beacon.
+ *  It gives way (truncates) before the status word and the time slot. */
+function CollisionSegment({ workspaceId }: { workspaceId: string }) {
+  const list = useWorkspaceCollisions(workspaceId);
+  const view = useMemo(() => {
+    const severity = worstSeverity(list);
+    const text = collisionSegment(list);
+    const tip = collisionTooltip(list);
+    return severity && text && tip ? { severity, text, tip } : null;
+  }, [list]);
+  if (!view) return null;
+  return (
+    <>
+      <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+      <span
+        data-tour="mission-control-card-collision"
+        title={view.tip}
+        className="octo-pop-in flex min-w-0 items-center gap-1 text-octo-mute"
+      >
+        <GitCompareArrows size={11} aria-hidden className={`shrink-0 ${collisionTone(view.severity)}`} />
+        <span className="min-w-0 truncate">{view.text}</span>
+      </span>
+    </>
+  );
 }
 
 /** The workspace's display name — thin hook over the shared selector. */

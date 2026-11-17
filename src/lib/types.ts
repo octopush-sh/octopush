@@ -556,6 +556,10 @@ export interface AppSettings {
   /** Run-mode attention from Claude Code's lifecycle hooks instead of the
    *  terminal bell (#287). Unset/null → **on**; only `false` turns it off. */
   claudeHooksEnabled?: boolean | null;
+  /** Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703):
+   *  crew stages and Routines start Claude Code with
+   *  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Unset → **off**. */
+  quietClaudeCode?: boolean;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */
@@ -593,6 +597,36 @@ export interface WorkspaceGitSummary {
   dirty: boolean;
   ahead: number;
   behind: number;
+}
+
+// ─── Collision radar (#732) ────────────────────────────────────────
+
+/** `lockfile`: only lockfiles overlap · `overlap`: the same file changes on
+ *  both sides · `conflict`: an in-memory merge confirmed a conflict. */
+export type CollisionSeverity = "lockfile" | "overlap" | "conflict";
+
+/** Two live workspaces of one project changing the same files. */
+export interface Collision {
+  a: string;
+  aName: string;
+  b: string;
+  bName: string;
+  /** The overlapping paths, sorted; at most 50 cross IPC. */
+  files: string[];
+  /** Overlapping paths left out of `files`. */
+  truncated: number;
+  /** The conflicting non-lockfile paths, sorted; at most 50. */
+  conflictingFiles: string[];
+  /** Conflicting paths left out of `conflictingFiles`. */
+  conflictingTruncated: number;
+  severity: CollisionSeverity;
+  confirmed: boolean;
+}
+
+export interface ProjectCollisions {
+  collisions: Collision[];
+  scanned: number;
+  capped: boolean;
 }
 
 // ─── Usage report (Settings → Usage) ───────────────────────────────

@@ -26,9 +26,9 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
-    build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event, parse_cli_result,
-    plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth, CliDialect,
-    CodexWriteScope, OpenTools, ReadEnd, ReadLimits,
+    apply_stage_env, build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event,
+    parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
+    CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
 use crate::orchestrator::live::{entries_from_stream_event, RetryThrottle};
 use crate::orchestrator::types::{ArtifactKind, StageStatus};
@@ -777,6 +777,84 @@ fn claude_stage_env_keeps_the_skills_the_stage_started_with() {
     let pin = env.iter().find(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH").map(|(_, v)| v.as_str());
     assert_eq!(pin, Some("0"), "{env:?}");
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH"));
+}
+
+// ─── Quiet Claude Code (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, #703) ──
+
+/// The stage process's explicit env after [`apply_stage_env`]: `Some(v)` for a
+/// set variable, `None` for a removed one; absent keys are inherited.
+fn stage_spawn_env(
+    dialect: CliDialect,
+    effort: Option<crate::providers::Effort>,
+    quiet: bool,
+) -> HashMap<String, Option<String>> {
+    let mut command = tokio::process::Command::new("claude");
+    apply_stage_env(&mut command, dialect, effort, quiet);
+    command
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| {
+            (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))
+        })
+        .collect()
+}
+
+#[test]
+fn quiet_claude_code_sets_the_documented_variable_on_claude_stages_only() {
+    assert_eq!(QUIET_TRAFFIC_ENV, "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
+    assert_eq!(CliDialect::Claude.stage_quiet_env(true), vec![(QUIET_TRAFFIC_ENV, "1".to_string())]);
+    // Off writes nothing: the docs say even `0`/`false` still disables the
+    // traffic, so the only off state is the variable left alone.
+    assert!(CliDialect::Claude.stage_quiet_env(false).is_empty());
+    assert!(CliDialect::Codex.stage_quiet_env(true).is_empty());
+    assert!(CliDialect::Codex.stage_quiet_env(false).is_empty());
+    // The quiet pin is its own opt-in, never part of the always-on pins.
+    assert!(!CliDialect::Claude.stage_env().iter().any(|(k, _)| *k == QUIET_TRAFFIC_ENV));
+}
+
+#[test]
+fn quiet_claude_code_reaches_a_fresh_stage_spawn() {
+    // A fresh stage: no session, usually no effort override.
+    for effort in [None, Some(crate::providers::Effort::Medium)] {
+        let on = stage_spawn_env(CliDialect::Claude, effort, true);
+        assert_eq!(on.get(QUIET_TRAFFIC_ENV), Some(&Some("1".to_string())), "fresh, effort {effort:?}: {on:?}");
+        let off = stage_spawn_env(CliDialect::Claude, effort, false);
+        assert!(!off.contains_key(QUIET_TRAFFIC_ENV), "fresh off must neither set nor remove it: {off:?}");
+        // The always-on pins ride along either way.
+        assert_eq!(on.get("CLAUDE_CODE_DISABLE_FAST_MODE"), Some(&Some("1".to_string())));
+        assert_eq!(off.get("CLAUDE_CODE_DISABLE_FAST_MODE"), Some(&Some("1".to_string())));
+    }
+}
+
+#[test]
+fn quiet_claude_code_reaches_a_resumed_stage_spawn() {
+    // A `--resume` run builds a different argv but spawns through the same
+    // `apply_stage_env`, which takes no resume flag: the env must match the
+    // fresh run's exactly, quiet pin included.
+    use crate::providers::Effort;
+    let fresh_args = build_cli_args("claude-sonnet-5", "sys", 25, false);
+    let resume_args = build_cli_args_resume("claude-sonnet-5", "sess-1", 25, false);
+    assert!(resume_args.iter().any(|a| a == "--resume"), "{resume_args:?}");
+    assert!(!fresh_args.iter().chain(&resume_args).any(|a| a.contains(QUIET_TRAFFIC_ENV)), "never an argv flag");
+    for effort in [None, Some(Effort::High)] {
+        let resumed = stage_spawn_env(CliDialect::Claude, effort, true);
+        assert_eq!(resumed.get(QUIET_TRAFFIC_ENV), Some(&Some("1".to_string())), "resumed, effort {effort:?}");
+        assert_eq!(resumed, stage_spawn_env(CliDialect::Claude, effort, true), "deterministic");
+        assert!(!stage_spawn_env(CliDialect::Claude, effort, false).contains_key(QUIET_TRAFFIC_ENV));
+    }
+    // The effort override still drops the user's inherited export beside it.
+    let resumed = stage_spawn_env(CliDialect::Claude, Some(Effort::High), true);
+    assert_eq!(resumed.get("CLAUDE_CODE_EFFORT_LEVEL"), Some(&None));
+}
+
+#[test]
+fn quiet_claude_code_never_reaches_a_codex_stage_spawn() {
+    for effort in [None, Some(crate::providers::Effort::High)] {
+        for quiet in [true, false] {
+            let env = stage_spawn_env(CliDialect::Codex, effort, quiet);
+            assert!(!env.contains_key(QUIET_TRAFFIC_ENV), "codex, quiet {quiet}: {env:?}");
+        }
+    }
 }
 
 // ─── Codex CLI effort (`-c model_reasoning_effort`) ──────────────────────

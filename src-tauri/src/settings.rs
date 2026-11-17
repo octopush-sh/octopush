@@ -62,6 +62,16 @@ pub struct AppSettings {
     #[serde(default)]
     pub claude_hooks_enabled: Option<bool>,
 
+    /// Opt-in (Settings › Privacy › "Quiet Claude Code in crews and
+    /// Routines", #703): Claude Code launched for crew stages — fresh,
+    /// `--resume`d and detached — and the shell commands a Routine runs get
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. **Off by default**,
+    /// including for every settings file written before this field existed
+    /// (`serde(default)` ⇒ `false`). Run terminals and Talk never get it.
+    /// Read fresh per stage by [`quiet_claude_code`].
+    #[serde(default)]
+    pub quiet_claude_code: bool,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,
@@ -337,6 +347,14 @@ impl AppSettings {
     }
 }
 
+/// Is "Quiet Claude Code in crews and Routines" on? Reads `settings.json`
+/// fresh each call, so a toggle reaches the next stage (in-process or in the
+/// detached worker, which reads the same file) without a restart. Any read
+/// or parse failure answers **no** — the default.
+pub fn quiet_claude_code() -> bool {
+    load_settings().map(|s| s.quiet_claude_code).unwrap_or(false)
+}
+
 /// The persisted update channel (any read failure ⇒ stable).
 pub fn update_channel() -> crate::updater::UpdateChannel {
     load_settings().map(|s| s.update_channel).unwrap_or_default()
@@ -609,6 +627,33 @@ mod tests {
         assert_eq!(settings.claude_hooks_enabled, Some(true));
         let json = serde_json::to_string(&settings).unwrap();
         assert!(json.contains(r#""claudeHooksEnabled":true"#), "{json}");
+    }
+
+    #[test]
+    fn quiet_claude_code_round_trips_and_defaults_to_off() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.quiet_claude_code);
+        let settings: AppSettings = serde_json::from_str(r#"{"quietClaudeCode":true}"#).unwrap();
+        assert!(settings.quiet_claude_code);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""quietClaudeCode":true"#), "{json}");
+    }
+
+    #[test]
+    fn quiet_claude_code_reads_the_file_fresh_and_fails_to_off() {
+        // The detached worker reads the same file per stage, so this is what
+        // a toggle flipped mid-crew reaches.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+        assert!(!quiet_claude_code(), "missing file ⇒ off");
+        std::fs::write(&path, r#"{"quietClaudeCode":true}"#).unwrap();
+        assert!(quiet_claude_code());
+        std::fs::write(&path, r#"{"quietClaudeCode":false}"#).unwrap();
+        assert!(!quiet_claude_code());
+        std::fs::write(&path, "{ not json").unwrap();
+        assert!(!quiet_claude_code(), "unparseable ⇒ off");
+        test_settings_path::set(None);
     }
 
     #[test]

@@ -1141,6 +1141,7 @@ impl Orchestrator {
                 skills,
                 spend_limit,
                 peers,
+                quiet_claude_code: crate::settings::quiet_claude_code(),
             };
             match &self.test_runner {
                 Some(r) => r.run(&spec, &input, &ctx).await,

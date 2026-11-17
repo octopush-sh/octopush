@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
-import { GenesisPrompt } from "./GenesisPrompt";
+import { GENESIS_LINK_CLASS, GenesisPrompt } from "./GenesisPrompt";
 
 vi.mock("../lib/ipc", () => ({
   ipc: {
@@ -98,7 +98,7 @@ describe("GenesisPrompt pre-flight", () => {
     expect(m.saveProviders).not.toHaveBeenCalled(); // nothing to save
   });
 
-  it("a cold user gets ONE primary CTA: outlined until it has a key and a brief, then brass-ghost", async () => {
+  it("a cold user gets ONE primary CTA, in the ceremonial recipe in every state (#758)", async () => {
     m.listProviders.mockResolvedValue([anthropic(false)] as never);
     m.getSettings.mockResolvedValue(settings());
     render(<GenesisPrompt onSubmit={vi.fn()} onSketch={vi.fn()} />);
@@ -109,23 +109,67 @@ describe("GenesisPrompt pre-flight", () => {
     expect(buttons()).toHaveLength(1);
     const cta = buttons()[0];
     expect(cta).toHaveTextContent("Set a crew on it");
-    expect(cta).toHaveClass("font-serif");
-    expect(cta.className).not.toMatch(/uppercase|font-mono|opacity/);
+    // The frame is the same in every state; only the ink moves.
+    const frame = ["font-serif", "border-[var(--brass-dim)]", "bg-[var(--brass-ghost)]"];
+    const receded = () => {
+      expect(cta).toHaveClass(...frame, "text-octo-brass/50");
+      expect(cta).not.toHaveClass("text-octo-brass");
+      expect(cta).not.toHaveAttribute("data-primed");
+    };
+    const primed = () => {
+      expect(cta).toHaveClass(...frame, "text-octo-brass");
+      expect(cta).not.toHaveClass("text-octo-brass/50");
+      expect(cta).toHaveAttribute("data-primed", "true");
+    };
+    // Disabled with nothing to do: the frame, receded ink. No opacity on the
+    // whole button (#585).
     expect(cta).toBeDisabled();
-    expect(cta.style.background).not.toContain("--brass-ghost");
+    receded();
+    expect(cta.className).not.toMatch(/uppercase|font-mono|(^|\s)(disabled:)?opacity/);
 
-    // A brief without a key: the honest fallback stays available, but not primed.
+    // A brief without a key: the honest fallback stays clickable, but receded.
     fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
       target: { value: "a todo cli" },
     });
     expect(cta).toBeEnabled();
-    expect(cta.style.background).not.toContain("--brass-ghost");
+    receded();
 
-    // Brief + key: the brass-ghost primary.
+    // Brief + a typed key: full brass ink.
     fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
     expect(buttons()).toHaveLength(1);
     expect(cta).toHaveTextContent("Set a crew on it");
-    expect(cta.style.background).toContain("--brass-ghost");
+    primed();
+  });
+
+  it("with a stored key, a brief alone gives the CTA full brass ink", async () => {
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
+    render(<GenesisPrompt onSubmit={vi.fn()} />);
+    await screen.findByLabelText("Crew model");
+    const cta = screen.getByRole("button", { name: "Set a crew on it" });
+    expect(cta).toHaveClass("text-octo-brass/50"); // no brief yet
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
+      target: { value: "a todo cli" },
+    });
+    expect(cta).toHaveClass("border-[var(--brass-dim)]", "bg-[var(--brass-ghost)]", "text-octo-brass");
+    expect(cta).not.toHaveClass("text-octo-brass/50");
+  });
+
+  it("a disabled genesis link drops to mute ink", async () => {
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
+    render(<GenesisPrompt onSubmit={vi.fn()} onSketch={vi.fn()} />);
+    await screen.findByLabelText("Crew model");
+    const link = screen.getByRole("button", { name: /think it through first/i });
+    expect(link).toBeDisabled(); // no brief yet
+    expect(link).toHaveClass("text-octo-sage", "disabled:text-octo-mute", "disabled:hover:text-octo-mute");
+    expect(GENESIS_LINK_CLASS).not.toMatch(/disabled:hover:text-octo-sage/);
+  });
+
+  it("every secondary route shares one ink and one underline (#758)", () => {
+    expect(GENESIS_LINK_CLASS).toMatch(/(^|\s)text-octo-sage(\s|$)/);
+    expect(GENESIS_LINK_CLASS).toMatch(/hover:text-octo-ivory/);
+    expect(GENESIS_LINK_CLASS).not.toMatch(/(^|\s)text-octo-ivory(\s|$)|opacity/);
   });
 
   it("with a key but no brief, the same CTA reads 'Wake the crew' and only saves the key", async () => {
@@ -136,7 +180,8 @@ describe("GenesisPrompt pre-flight", () => {
     await screen.findByLabelText("Anthropic API key");
     fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
     const cta = screen.getByRole("button", { name: "Wake the crew" });
-    expect(cta.style.background).toContain("--brass-ghost");
+    expect(cta).toHaveClass("bg-[var(--brass-ghost)]", "text-octo-brass");
+    expect(cta).toHaveAttribute("data-primed", "true");
     m.listProviders.mockResolvedValue([anthropic(true)] as never);
     m.getSettings.mockResolvedValue(settings("sk-ant-zzz"));
     fireEvent.click(cta);
@@ -166,8 +211,8 @@ describe("GenesisPrompt pre-flight", () => {
     m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
     render(<GenesisPrompt onSubmit={vi.fn()} onSketch={vi.fn()} />);
     const link = screen.getByRole("button", { name: /think it through first/i });
-    expect(link).toHaveClass("underline", "text-octo-ivory");
-    expect(link).not.toHaveClass("text-octo-mute");
+    expect(link).toHaveClass("underline", "text-octo-sage");
+    expect(link).not.toHaveClass("text-octo-mute", "text-octo-ivory");
     await screen.findByLabelText("Crew model");
   });
 

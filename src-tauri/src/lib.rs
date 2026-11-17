@@ -6,6 +6,7 @@ pub mod billing;
 pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
+pub mod collisions;
 pub mod claude_hooks;
 pub mod claude_login;
 pub mod claude_plan;
@@ -238,6 +239,7 @@ pub fn run() {
             commands::get_git_status,
             commands::list_branches,
             commands::workspaces_git_summary,
+            commands::project_collisions,
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,

@@ -13,11 +13,16 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { Sparkles, GitBranch, Loader2, ChevronDown, GitCommit } from "lucide-react";
+import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
 import { formatRelTime } from "../lib/relTime";
+import { collisionTooltip, notable, shownCount } from "../lib/collisions";
+import { useCollisionStore } from "../stores/collisionStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { Reveal } from "./primitives/Reveal";
+import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
 
 interface Props {
   workspaceId: string;
@@ -51,6 +56,7 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
       <div className="border-b border-octo-hairline px-4 py-3">
         <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Review</div>
         <div data-tour="review-companion-verdict" className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
+        <CollisionVerdict workspaceId={workspaceId} />
       </div>
 
       {/* ── Provenance ──────────────────────────────────────────── */}
@@ -59,6 +65,71 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
       {/* ── Branch & publish ────────────────────────────────────── */}
       <BranchPublish workspacePath={workspacePath} gitStatus={gitStatus} />
     </div>
+  );
+}
+
+// ─── Collision radar (#732) ───────────────────────────────────────
+
+/** One line under the verdict when another live workspace of the project
+ *  changes the same files — the moment the director decides what to land
+ *  first — with a jump to that workspace. Warn only: nothing is blocked.
+ *  Unfolds on the grid-rows Reveal; the last line stays mounted while it
+ *  folds away so the text doesn't vanish mid-motion. */
+export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
+  const list = useWorkspaceCollisions(workspaceId);
+  const projectId = useWorkspaceStore(
+    (s) => s.workspaces.find((w) => w.id === workspaceId)?.projectId ?? null,
+  );
+  useEffect(() => {
+    if (projectId) void useCollisionStore.getState().refresh(projectId);
+  }, [projectId, workspaceId]);
+
+  const current = useMemo(() => {
+    const top = notable(list)[0];
+    if (!top) return null;
+    const n = shownCount(top);
+    const files = `${n} file${n === 1 ? "" : "s"}`;
+    return {
+      top,
+      text:
+        top.severity === "conflict"
+          ? `Will conflict with ${top.otherName} in ${files}.`
+          : `Overlaps ${top.otherName} in ${files}.`,
+      tip: collisionTooltip(list) ?? "",
+    };
+  }, [list]);
+  const [shown, setShown] = useState(current);
+  useEffect(() => {
+    if (current) setShown(current);
+  }, [current]);
+  const view = current ?? shown;
+
+  return (
+    <Reveal open={!!current}>
+      {view && (
+        <div
+          data-tour="review-companion-collision"
+          className="mt-1.5 flex items-start gap-1.5 text-[12px] leading-snug text-octo-sage"
+        >
+          <GitCompareArrows
+            size={12}
+            aria-hidden
+            className={`mt-[2px] shrink-0 ${collisionTone(view.top.severity)}`}
+          />
+          <span className="min-w-0" title={view.tip}>
+            {view.text}{" "}
+            <button
+              type="button"
+              onClick={() => useWorkspaceStore.getState().select(view.top.otherId)}
+              title={`Open ${view.top.otherName}`}
+              className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            >
+              Open {view.top.otherName}
+            </button>
+          </span>
+        </div>
+      )}
+    </Reveal>
   );
 }
 

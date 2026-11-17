@@ -83,12 +83,7 @@ pub async fn create_session(
         engine.scan_and_record(sid, seq, bytes);
     });
 
-    // Merge guard env into PTY env (isolated HISTFILE, project type, git branch).
-    let mut env = HashMap::new();
-    guard.apply_env(&mut env);
-
-    // Inject the selected model so CLI agents can read it.
-    env.insert("OCTOPUSH_MODEL".into(), session.agent.model.clone());
+    let env = run_terminal_env(&guard, &session.agent.model);
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -113,6 +108,18 @@ pub async fn create_session(
         .get_session(&id)?
         .ok_or_else(|| AppError::SessionNotFound(id.clone()))?;
     Ok(refreshed)
+}
+
+/// A Run terminal's PTY environment: the context guard's variables (isolated
+/// HISTFILE, project type, git branch) and the selected model, so CLI agents
+/// can read it. Nothing from the crew stage env — a Run terminal is the
+/// user's own session, so Settings › Privacy › "Quiet Claude Code in crews
+/// and Routines" (#703) never reaches it.
+pub(crate) fn run_terminal_env(guard: &ContextGuard, model: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    guard.apply_env(&mut env);
+    env.insert("OCTOPUSH_MODEL".into(), model.to_string());
+    env
 }
 
 #[tauri::command]
@@ -1232,6 +1239,53 @@ pub async fn workspaces_git_summary(
         });
     }
     Ok(out)
+}
+
+/// Collision radar (#732): which live workspaces of a project change the same
+/// files, and whether an in-memory merge confirms a conflict. Read-only: it
+/// never writes objects, refs, the index or locks. Throttled: a report younger
+/// than `collisions::REPORT_TTL` is reused (unless `force`, or a HEAD moved),
+/// and committed diffs and merge confirmations are cached by commit id.
+#[tauri::command]
+pub async fn project_collisions(
+    state: State<'_, AppState>,
+    project_id: String,
+    force: Option<bool>,
+) -> AppResult<crate::collisions::ProjectCollisions> {
+    let (rows, project_path) = {
+        let db = state.db.lock();
+        let rows = db.list_workspaces(&project_id)?;
+        let path = db.get_project(&project_id)?.map(|p| p.path);
+        (rows, path)
+    };
+    let default_base = project_path
+        .as_deref()
+        .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+    let inputs: Vec<crate::collisions::ScanInput> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let wt = expand_tilde(row.worktree_path.as_deref()?);
+            let path = std::path::PathBuf::from(wt);
+            path.is_dir().then(|| crate::collisions::ScanInput {
+                id: row.id,
+                name: row.name,
+                path,
+                base: row.from_branch.or_else(|| default_base.clone()),
+            })
+        })
+        .collect();
+    let cache = std::sync::Arc::clone(&state.collisions);
+    tauri::async_runtime::spawn_blocking(move || {
+        cache.lock().scan_throttled(
+            &project_id,
+            &inputs,
+            std::time::Instant::now(),
+            crate::collisions::REPORT_TTL,
+            force.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("collision scan: {e}")))
 }
 
 #[tauri::command]

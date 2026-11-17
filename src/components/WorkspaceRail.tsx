@@ -36,6 +36,8 @@ import { ProjectMark } from "./icons/ProjectMark";
 import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { RecentlyClosedDrawer } from "./RecentlyClosedDrawer";
+import { CollisionMark, useWorkspaceCollisions } from "./CollisionMark";
+import { collisionSegment, worstSeverity } from "../lib/collisions";
 
 /**
  * The workspace rail — "the index".
@@ -663,6 +665,8 @@ export interface RowMeta {
   hasOpenPr?: boolean;
   /** The dirty glyph is shown (not on the active row). */
   dirty?: boolean;
+  /** The collision-radar glyph is shown (#732). */
+  collision?: boolean;
   dot?: boolean;
 }
 
@@ -677,6 +681,7 @@ export function shedsGitMeta(name: string, meta: RowMeta): boolean {
   if (meta.ticketKey) atoms.push(meta.ticketKey.length * META_PX_PER_CHAR);
   if (meta.hasOpenPr) atoms.push(META_ICON_PX);
   if (meta.dirty) atoms.push(META_ICON_PX);
+  if (meta.collision) atoms.push(META_ICON_PX);
   if (meta.dot) atoms.push(5);
   const floor = atoms.reduce((sum, w) => sum + w + META_GAP_PX, 0);
   // Each count: a 10px arrow, a 2px gap and its digits.
@@ -744,6 +749,7 @@ function WorkspaceRow({
   const missionGit = useMissionsStore(
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
+  const collisions = useWorkspaceCollisions(workspace?.id);
 
   if (!workspace) return null;
 
@@ -785,6 +791,7 @@ function WorkspaceRow({
     behind,
     hasOpenPr,
     dirty: dirty && !active,
+    collision: worstSeverity(collisions) !== null,
     dot: attention === "dot",
   });
   const shedSuffix = shedGit ? ` · ${gitCountsLabel(ahead, behind)}` : "";
@@ -847,7 +854,7 @@ function WorkspaceRow({
       </button>
 
       {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·
-          dirty · attention. Brass appears here only as the attention dot. The
+          dirty · collision (#732) · attention. Brass appears here only as the attention dot. The
           ahead/behind pair is the row's one demotion rung (`shedsGitMeta`). */}
       <div className="octo-tabular flex shrink-0 items-center gap-2 font-mono text-[10px] leading-none text-octo-mute">
         {ticketKey && (
@@ -900,6 +907,7 @@ function WorkspaceRow({
             <GitCommitHorizontal size={11} aria-hidden />
           </span>
         )}
+        <CollisionMark workspaceId={workspace.id} />
         {attention === "dot" && (
           <span
             role="img"
@@ -1103,6 +1111,7 @@ function CollapsedCell({
   onCustomize,
   onContextMenu,
 }: CollapsedCellProps) {
+  const collisions = useWorkspaceCollisions(workspace?.id);
   let mono: ReturnType<typeof resolveMonogram>;
   let tint: { accent: string; bg: string } | undefined;
   try {
@@ -1121,6 +1130,7 @@ function CollapsedCell({
     git?.behind ? `↓${git.behind}` : null,
     hasOpenPr ? "PR open" : null,
     git?.dirty ? "uncommitted changes" : null,
+    collisionSegment(collisions),
     running ? "working…" : null,
     attention ? `needs your attention${attentionKind ? ` (${attentionKind})` : ""}` : null,
   ].filter(Boolean);
