@@ -18461,7 +18461,11 @@ mod cli_command_idle_tests {
         // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
         assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
         assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
-        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::MAX);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
     }
 
     #[test]

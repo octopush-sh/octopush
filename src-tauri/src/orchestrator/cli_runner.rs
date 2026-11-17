@@ -1927,11 +1927,19 @@ pub(crate) struct IdleStall {
     pub after_retry: Option<String>,
 }
 
+/// The longest retry delay [`retry_idle_window`] waits out: 300s, the
+/// ceiling Claude Code 2.1.323 set for `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS`
+/// (529 overload backoff). A 429 `Retry-After` or a wait under
+/// `CLAUDE_CODE_RETRY_WATCHDOG` can be longer; it is capped here too, so the
+/// window after a retry stays about 10 minutes at most.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// How long a Claude stage may stay silent after a `system/api_retry` that
-/// says it waits `retry_delay` before the next attempt: that delay plus the
-/// plain window for the attempt itself, never below `idle`.
+/// says it waits `retry_delay` before the next attempt: that delay (capped at
+/// [`MAX_RETRY_DELAY`]) plus the plain window for the attempt itself, never
+/// below `idle`.
 pub(crate) fn retry_idle_window(idle: std::time::Duration, retry_delay: std::time::Duration) -> std::time::Duration {
-    retry_delay.saturating_add(idle).max(idle)
+    retry_delay.min(MAX_RETRY_DELAY).saturating_add(idle).max(idle)
 }
 
 /// The stage error for an idle stall, after the CLI's name: "timed out — no
