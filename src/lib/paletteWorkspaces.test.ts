@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { paletteWorkspaces } from "./paletteWorkspaces";
+import { defaultFilter } from "cmdk";
+import { paletteFilter, paletteWorkspaces } from "./paletteWorkspaces";
 import type { Workspace } from "./types";
 
 const ws = (id: string, name: string, branch: string, lastActive: string, extra: Partial<Workspace> = {}): Workspace => ({
@@ -62,5 +63,21 @@ describe("paletteWorkspaces", () => {
     const row = paletteWorkspaces(projects, {}, {}, {}).find((r) => r.id === "d")!;
     expect(row.keywords).toEqual(["Waiting long", "pm/issue-772", "octopush-api"]);
     expect(row.glyph).toBe("W");
+  });
+});
+
+describe("paletteFilter", () => {
+  const id = "ws:7a72c0de-0772-4dec-a772-dec772dec772";
+
+  it("scores a workspace row on its keywords, not its id", () => {
+    expect(paletteFilter(id, "772", ["Palette jump", "pm/issue-770", "octopush"])).toBe(0);
+    expect(paletteFilter(id, "770", ["Palette jump", "pm/issue-770", "octopush"])).toBeGreaterThan(0);
+    expect(paletteFilter(id, "dec", [])).toBe(0);
+  });
+
+  it("leaves every other row on cmdk's default scoring", () => {
+    expect(paletteFilter("Toggle word wrap", "wrap", undefined)).toBe(defaultFilter("Toggle word wrap", "wrap", undefined));
+    expect(paletteFilter("Sonnet", "anth", ["anthropic"])).toBe(defaultFilter("Sonnet", "anth", ["anthropic"]));
+    expect(paletteFilter("Sonnet", "anth", ["anthropic"])).toBeGreaterThan(0);
   });
 });

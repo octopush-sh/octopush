@@ -2,6 +2,24 @@ import type { Run } from "./ipc";
 import type { Workspace } from "./types";
 import { needsYou } from "./runStatus";
 import { resolveMonogram } from "./monogram";
+import { defaultFilter } from "cmdk";
+
+/** Prefix on a workspace row's cmdk `value`. The value is the workspace id
+ *  (unique, so two same-named rows stay apart for the keyboard), and the
+ *  prefix lets {@link paletteFilter} keep that id out of the score. */
+export const WORKSPACE_VALUE_PREFIX = "ws:";
+
+/** The palette's cmdk filter. A workspace row is scored on its keywords
+ *  only (name, branch, project): its value is a UUID, and fuzzy-matching
+ *  that would let any query of hex letters and digits ("772", "dec") hit
+ *  most workspaces. Every other row keeps cmdk's default scoring. */
+export function paletteFilter(value: string, search: string, keywords?: string[]): number {
+  if (value.startsWith(WORKSPACE_VALUE_PREFIX)) {
+    const text = (keywords ?? []).join(" ");
+    return text ? defaultFilter(text, search) : 0;
+  }
+  return defaultFilter(value, search, keywords);
+}
 
 /** One row of the ⌘K Workspaces group. */
 export interface PaletteWorkspace {

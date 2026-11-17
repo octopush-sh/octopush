@@ -92,6 +92,32 @@ describe("CommandPalette · Workspaces group", () => {
     expect(rowNames()).toEqual(["Sync since"]);
   });
 
+  it("scores workspaces on name, branch and project only, never on their UUID ids", async () => {
+    // Real ids are UUIDs: a query made only of hex letters and digits used to
+    // fuzzy-match nearly every workspace through its `value`.
+    const uuids: ProjectGroup[] = [
+      {
+        id: "p1",
+        name: "octopush",
+        workspaces: [
+          ws("7a72c0de-0772-4dec-a772-dec772dec772", "p1", "Palette jump", "pm/issue-770", "2026-11-16T10:00:00Z"),
+          ws("d772ec00-7720-4772-8dec-0dec772a7720", "p1", "Ledger", "pm/issue-769", "2026-11-15T10:00:00Z"),
+        ],
+      },
+      {
+        id: "p2",
+        name: "octopush-api",
+        workspaces: [ws("c7720dec-dec7-4720-9772-772dec0dec77", "p2", "Sync since", "pm/issue-772", "2026-11-01T10:00:00Z")],
+      },
+    ];
+    await renderPalette(vi.fn(), vi.fn(), uuids);
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "772" } });
+    });
+    expect(rowNames()).toEqual(["Sync since"]);
+  });
+
   it("switches like a rail click and closes", async () => {
     const { onSelectWorkspace, onClose } = await renderPalette();
     await act(async () => {

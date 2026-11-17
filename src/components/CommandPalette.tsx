@@ -14,7 +14,7 @@ import { tourId } from "../lib/tour/ids";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import { useRunsStore } from "../stores/runsStore";
 import { MidTruncate } from "./primitives/MidTruncate";
-import { paletteWorkspaces, type PaletteWorkspace } from "../lib/paletteWorkspaces";
+import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
 
 interface Props {
@@ -88,7 +88,7 @@ export function CommandPalette({
             "0 30px 60px -10px rgba(0,0,0,0.6), 0 0 0 6px rgba(212, 165, 116, 0.04)",
         }}
       >
-        <Command loop className="overflow-hidden rounded-xl">
+        <Command loop filter={paletteFilter} className="overflow-hidden rounded-xl">
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
@@ -447,8 +447,9 @@ function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () 
     <Command.Item
       // cmdk keys selection on `value`: the id keeps two same-named rows
       // (one `main` per project) distinct; name, branch and project match
-      // through `keywords`.
-      value={row.id}
+      // through `keywords`. The prefix tells `paletteFilter` to score the
+      // keywords alone, so the UUID never matches a search.
+      value={`${WORKSPACE_VALUE_PREFIX}${row.id}`}
       keywords={row.keywords}
       onSelect={onSelect}
       data-testid="palette-workspace"
