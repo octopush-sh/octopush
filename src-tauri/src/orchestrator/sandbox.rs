@@ -409,14 +409,51 @@ fn forbidden_root_targets(home: Option<&str>) -> Vec<PathBuf> {
     v
 }
 
+/// The dirs only Octopush may hand out, which no system write root may hold:
+/// the build-cache base and the stage temp base, each as given and as its
+/// realpath. A stage must never write another stage's cache root or temp dir.
+fn private_bases() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    for base in [build_cache_base(), stage_tmp_base()].into_iter().flatten() {
+        v.push(canonical_lenient(&base));
+        v.push(base);
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Why `real` (a system root's realpath) sits in a user dir no stage may
+/// write: `~/.config`, `~/.ssh`, or `~/Library` outside `~/Library/Caches`
+/// (`$HOME` as given and as its realpath). Credentials and launch agents
+/// live there. Pure over its inputs (`home_real` is `$HOME`'s realpath).
+fn guarded_home_dir(real: &Path, home: &str, home_real: &Path) -> Option<String> {
+    for base in [Path::new(home), home_real] {
+        for name in [".config", ".ssh", "Library"] {
+            let guarded = base.join(name);
+            if real.starts_with(&guarded) && !(name == "Library" && real.starts_with(base.join("Library/Caches"))) {
+                return Some(format!("{home}/{name}"));
+            }
+        }
+    }
+    None
+}
+
 /// The paths a profile may grant for the system write root dir `root`: the
 /// root as given and, when it differs, its realpath. A root that doesn't exist
 /// yet is granted as given (the root deny keeps a stage from creating it).
 /// Fails closed, with the reason, when the root resolves to `/`, `/Users`,
-/// `$HOME` or an ancestor of `$HOME`, doesn't resolve, isn't a directory, or
-/// (with `owner`, for the user-home roots) the entry or what it resolves to
-/// isn't owned by `owner`.
-fn resolve_system_root(root: &str, home: Option<&str>, owner: Option<u32>) -> Result<Vec<String>, String> {
+/// `$HOME` or an ancestor of `$HOME`, holds one of `private` (the build-cache
+/// and stage temp bases, `private_bases`), resolves under `~/.config`,
+/// `~/.ssh` or `~/Library` outside its `Caches`, doesn't resolve, isn't a
+/// directory, or (with `owner`, for the user-home roots) the entry or what it
+/// resolves to isn't owned by `owner`.
+fn resolve_system_root(
+    root: &str,
+    home: Option<&str>,
+    owner: Option<u32>,
+    private: &[PathBuf],
+) -> Result<Vec<String>, String> {
     let path = Path::new(root);
     let Ok(entry) = std::fs::symlink_metadata(path) else {
         return Ok(vec![root.to_string()]);
@@ -424,6 +461,12 @@ fn resolve_system_root(root: &str, home: Option<&str>, owner: Option<u32>) -> Re
     let real = std::fs::canonicalize(path).map_err(|e| format!("{root} doesn't resolve ({e})"))?;
     if forbidden_root_targets(home).contains(&real) {
         return Err(format!("{root} resolves to {}", real.display()));
+    }
+    if let Some(base) = private.iter().find(|b| b.starts_with(&real)) {
+        return Err(format!("{root} holds Octopush's own stage dirs ({})", base.display()));
+    }
+    if let Some(dir) = home.and_then(|h| guarded_home_dir(&real, h, &canonical_lenient(Path::new(h)))) {
+        return Err(format!("{root} resolves under {dir}"));
     }
     let target = std::fs::metadata(&real).map_err(|e| format!("{root} can't be read ({e})"))?;
     if !target.is_dir() {
@@ -441,7 +484,7 @@ fn resolve_system_root(root: &str, home: Option<&str>, owner: Option<u32>) -> Re
 /// A file that doesn't exist yet is granted as given. Fails closed, with the
 /// reason, when it doesn't resolve, isn't a regular file, has another hard
 /// link, isn't owned by `owner`, or is a symlink to anything outside
-/// `~/.claude*`.
+/// `~/.claude/` (a path-component prefix: `~/.claude-old` is outside).
 fn resolve_state_file(file: &str, home: &str, owner: Option<u32>) -> Result<Vec<String>, String> {
     let path = Path::new(file);
     let Ok(entry) = std::fs::symlink_metadata(path) else {
@@ -464,9 +507,9 @@ fn resolve_state_file(file: &str, home: &str, owner: Option<u32>) -> Result<Vec<
     }
     let real = real.to_string_lossy().into_owned();
     if entry.file_type().is_symlink() {
-        let prefix = format!("{}/.claude", canonical_string(Path::new(home)));
-        if !real.starts_with(&prefix) {
-            return Err(format!("{file} links outside {home}/.claude*"));
+        let dot_claude = canonical_lenient(Path::new(home)).join(".claude");
+        if !Path::new(&real).starts_with(&dot_claude) {
+            return Err(format!("{file} links outside {home}/.claude"));
         }
     }
     Ok(if real == file { vec![real] } else { vec![file.to_string(), real] })
@@ -491,13 +534,15 @@ struct WriteRoots {
 /// (seatbelt matches realpaths, so a symlinked root must appear resolved too),
 /// and de-duplicate. The system roots and the state file go through
 /// [`resolve_system_root`] / [`resolve_state_file`] (user-home ones checked
-/// against `owner`); one that fails is left out (fail closed) and its reason
-/// recorded in `refused`. Reads the filesystem, writes nothing.
+/// against `owner`, none allowed to hold one of `private`); one that fails is
+/// left out (fail closed) and its reason recorded in `refused`. Reads the
+/// filesystem, writes nothing.
 fn assemble_write_roots(
     mission_roots: &[String],
     home: Option<&str>,
     tmpdir: Option<&str>,
     owner: Option<u32>,
+    private: &[PathBuf],
 ) -> WriteRoots {
     let mut out = WriteRoots::default();
     for r in mission_roots {
@@ -510,7 +555,7 @@ fn assemble_write_roots(
     let in_home = |r: &str| home.is_some_and(|h| Path::new(r).starts_with(h));
     for r in system_write_roots(home, tmpdir) {
         let check_owner = if in_home(&r) { owner } else { None };
-        match resolve_system_root(&r, home, check_owner) {
+        match resolve_system_root(&r, home, check_owner, private) {
             Ok(paths) => {
                 out.subpaths.extend(paths.iter().cloned());
                 out.system_roots.extend(paths);
@@ -536,16 +581,17 @@ fn assemble_write_roots(
 /// Create the user-home write roots Octopush can make (`~/.claude`,
 /// `~/.cache`) when they don't exist yet, outside the sandbox and before the
 /// profile is built, so a stage never gets to create the root entry itself.
-/// `create_dir` never follows a link in the root's place, and the new dir must
-/// be a real directory of the user's. Best-effort: a root that can't be made
-/// is still resolved (and checked) as usual.
+/// `create_dir` never follows a link in the root's place, the new dir is made
+/// owner-only (0700, as the CLI makes `~/.claude`), and it must be a real
+/// directory of the user's. An existing root is left as it is. Best-effort: a
+/// root that can't be made is still resolved (and checked) as usual.
 fn ensure_home_roots(home: &str) {
     for name in [".claude", ".cache"] {
         let dir = Path::new(home).join(name);
         if std::fs::symlink_metadata(&dir).is_ok() {
             continue;
         }
-        if let Err(e) = create_dir_once(&dir).and_then(|()| check_own_dir(&dir)) {
+        if let Err(e) = create_dir_0700(&dir).and_then(|()| check_own_dir(&dir)) {
             tracing::warn!(dir = %dir.display(), error = %e, "sandbox: couldn't create a write root");
         }
     }
@@ -986,15 +1032,33 @@ pub fn stage_isolation(git_isolation: &str, exec_choice: &str, workspace_path: &
 /// warning (see [`assemble_write_roots`]). Errors when a workspace's git
 /// layout can't be resolved (fail closed).
 pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[String]) -> AppResult<String> {
+    seatbelt_profile_and_refusals(mission_write_roots, cache_roots).map(|(profile, _)| profile)
+}
+
+/// [`build_seatbelt_profile`], plus why each system root or state file left
+/// out of the profile was refused (one line each), for the stage launch line.
+/// The missing user-home roots are created only on macOS, the one platform
+/// that runs the sandbox, so a test elsewhere never writes the real `$HOME`.
+fn seatbelt_profile_and_refusals(
+    mission_write_roots: &[String],
+    cache_roots: &[String],
+) -> AppResult<(String, Vec<String>)> {
     let home = std::env::var("HOME").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
-    if let Some(h) = home.as_deref() {
+    if let (true, Some(h)) = (cfg!(target_os = "macos"), home.as_deref()) {
         ensure_home_roots(h);
     }
-    let roots = assemble_write_roots(mission_write_roots, home.as_deref(), tmpdir.as_deref(), current_uid());
+    let roots = assemble_write_roots(
+        mission_write_roots,
+        home.as_deref(),
+        tmpdir.as_deref(),
+        current_uid(),
+        &private_bases(),
+    );
     for why in &roots.refused {
         tracing::warn!(reason = %why, "sandbox: a system write root was left out of the profile");
     }
+    let refused = roots.refused;
     let mut subpaths = roots.subpaths;
     subpaths.extend(cache_roots.iter().cloned());
     let mut deny_literals = roots.system_roots;
@@ -1012,7 +1076,14 @@ pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[Str
         }
     }
     rules.dedup();
-    Ok(render_profile(&rules))
+    Ok((render_profile(&rules), refused))
+}
+
+/// The launch-line note for the system roots left out of a stage's profile
+/// (`Prepared::left_out`), so a dropped root never breaks a stage quietly:
+/// `left out of the sandbox: <why>; <why>`. `None` when nothing was. Pure.
+pub fn left_out_label(left_out: &[String]) -> Option<String> {
+    (!left_out.is_empty()).then(|| format!("left out of the sandbox: {}", left_out.join("; ")))
 }
 
 /// Wrap a program + args as a `sandbox-exec -p <profile> <program> <args…>` argv.
@@ -1037,6 +1108,9 @@ pub struct Prepared {
     pub program: OsString,
     pub args: Vec<OsString>,
     pub env: Vec<(String, String)>,
+    /// Why each system root or state file was left out of the profile (see
+    /// [`left_out_label`]).
+    pub left_out: Vec<String>,
 }
 
 /// Make `dir` owner-only (0700), refusing unless it is a real directory (not a
@@ -1096,6 +1170,22 @@ fn create_dir_once(dir: &Path) -> std::io::Result<()> {
         Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
         _ => Ok(()),
     }
+}
+
+/// [`create_dir_once`], but a dir it creates starts out owner-only (0700), so
+/// there is no moment it is open to others.
+#[cfg(unix)]
+fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e),
+        _ => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+fn create_dir_0700(dir: &Path) -> std::io::Result<()> {
+    create_dir_once(dir)
 }
 
 /// Mark `dir` as just used (its mtime), so `prune_build_caches` keeps it.
@@ -1267,11 +1357,11 @@ pub fn prepare_with(
     }
     let stage_dirs = StageDirs::make(write_roots, cache_scope, tenant, private_tmp)?;
     let own_dirs = stage_dirs.dirs();
-    let profile = build_seatbelt_profile(write_roots, &own_dirs)?;
+    let (profile, left_out) = seatbelt_profile_and_refusals(write_roots, &own_dirs)?;
     let mut args = args.to_vec();
     args.extend(extra_args(&own_dirs));
     let (prog, wrapped) = sandbox_argv(program, &args, &profile);
-    Ok(Prepared { program: prog, args: wrapped, env: stage_dirs.env() })
+    Ok(Prepared { program: prog, args: wrapped, env: stage_dirs.env(), left_out })
 }
 
 /// Collapse `.`/`..` components lexically (no filesystem access, so it works for
@@ -1592,7 +1682,7 @@ mod tests {
 
     /// Profile-free check of `resolve_system_root` with `home` as `$HOME`.
     fn root_ok(root: &Path, home: &Path, owner: Option<u32>) -> bool {
-        resolve_system_root(root.to_str().unwrap(), home.to_str(), owner).is_ok()
+        resolve_system_root(root.to_str().unwrap(), home.to_str(), owner, &[]).is_ok()
     }
 
     #[test]
@@ -1607,11 +1697,11 @@ mod tests {
         std::fs::create_dir(home.join(".cache")).unwrap();
         assert!(root_ok(&home.join(".cache"), &home, uid));
         assert_eq!(
-            resolve_system_root(home.join(".missing").to_str().unwrap(), home.to_str(), uid).unwrap(),
+            resolve_system_root(home.join(".missing").to_str().unwrap(), home.to_str(), uid, &[]).unwrap(),
             vec![home.join(".missing").to_string_lossy().into_owned()]
         );
         symlink(home.join("dotfiles/claude"), home.join(".claude")).unwrap();
-        let granted = resolve_system_root(home.join(".claude").to_str().unwrap(), home.to_str(), uid).unwrap();
+        let granted = resolve_system_root(home.join(".claude").to_str().unwrap(), home.to_str(), uid, &[]).unwrap();
         assert!(granted.contains(&home.join(".claude").to_string_lossy().into_owned()));
         assert!(granted.contains(&home.join("dotfiles/claude").to_string_lossy().into_owned()));
         // Links to `$HOME`, each of its ancestors and `/` are not.
@@ -1641,6 +1731,50 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn a_system_root_holding_the_stage_dirs_or_in_a_guarded_home_dir_is_left_out() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap().join("home");
+        let caches = home.join("Library/Caches");
+        let private = vec![caches.join("octopush/build-cache"), caches.join("octopush/tmp")];
+        for d in [".config/gh", ".ssh", "Library/LaunchAgents", "Library/Caches/octopush/tmp", "Library/Caches/other"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        let uid = current_uid();
+        let h = home.to_str();
+        let ok = |name: &str, target: PathBuf| {
+            symlink(&target, home.join(name)).unwrap();
+            resolve_system_root(home.join(name).to_str().unwrap(), h, uid, &private)
+        };
+        // A root that is, or holds, the cache or temp base (even one not made yet).
+        let holders = [home.join("Library"), caches.clone(), caches.join("octopush"), caches.join("octopush/tmp")];
+        for (i, t) in holders.into_iter().enumerate() {
+            let why = ok(&format!(".holds-{i}"), t.clone()).unwrap_err();
+            assert!(why.contains("stage dirs"), "{}: {why}", t.display());
+        }
+        // A root under `~/.config`, `~/.ssh` or `~/Library` outside its Caches.
+        let guarded = [home.join(".config"), home.join(".config/gh"), home.join(".ssh"), home.join("Library/LaunchAgents")];
+        for (i, t) in guarded.into_iter().enumerate() {
+            let why = ok(&format!(".guarded-{i}"), t.clone()).unwrap_err();
+            assert!(why.contains("resolves under"), "{}: {why}", t.display());
+        }
+        // Another dir in `~/Library/Caches` is fine, and so is a root as given
+        // without a private base to protect.
+        assert!(ok(".other-cache", caches.join("other")).is_ok());
+        assert!(resolve_system_root(caches.to_str().unwrap(), h, uid, &[]).is_ok());
+        assert!(resolve_system_root(home.join(".ssh").to_str().unwrap(), h, uid, &[]).is_err());
+        assert!(resolve_system_root(home.join("Library").to_str().unwrap(), h, uid, &[]).is_err());
+        // Pure: the guarded dirs by name, with `$HOME` as given or resolved.
+        let g = |p: &str| guarded_home_dir(Path::new(p), "/home/u", Path::new("/real/u"));
+        assert_eq!(g("/home/u/.ssh/keys").as_deref(), Some("/home/u/.ssh"));
+        assert_eq!(g("/real/u/Library/Preferences").as_deref(), Some("/home/u/Library"));
+        assert_eq!(g("/real/u/Library/Caches/x"), None);
+        assert_eq!(g("/home/u/.configs"), None, "a path-component prefix, not a string one");
+        assert_eq!(g("/home/u/.cache"), None);
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_user_home_root_owned_by_someone_else_is_left_out() {
         use std::os::unix::fs::{symlink, MetadataExt};
         let dir = tempfile::tempdir().unwrap();
@@ -1663,12 +1797,12 @@ mod tests {
         // `assemble_write_roots` drops a refused user-home root and says why,
         // keeping the others.
         let h = home.to_string_lossy().into_owned();
-        let roots = assemble_write_roots(&[], Some(&h), None, foreign);
+        let roots = assemble_write_roots(&[], Some(&h), None, foreign, &[]);
         assert!(!roots.subpaths.iter().any(|r| r.starts_with(&format!("{h}/.c"))));
         assert!(!roots.subpaths.iter().any(|r| r.ends_with("/elsewhere")));
         assert_eq!(roots.refused.len(), 2, "{:?}", roots.refused);
         assert!(roots.subpaths.contains(&"/dev".to_string()));
-        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine));
+        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine), &[]);
         assert!(roots.refused.is_empty(), "{:?}", roots.refused);
         for r in [format!("{h}/.cache"), format!("{h}/.claude"), format!("{h}/elsewhere")] {
             assert!(roots.subpaths.contains(&r), "{r} is writable");
@@ -1702,17 +1836,21 @@ mod tests {
         std::fs::write(home.join(".claude/state.json"), "{}").unwrap();
         symlink(home.join(".claude/state.json"), &file).unwrap();
         assert_eq!(ok(mine).unwrap(), vec![file.clone(), format!("{h}/.claude/state.json")]);
-        // A link anywhere else, to a dir, or dangling is left out.
+        // A link anywhere else (a sibling that only shares the `.claude`
+        // prefix included), to a dir, or dangling is left out.
         std::fs::remove_file(&file).unwrap();
         std::fs::write(home.join(".zshrc"), "x").unwrap();
-        for target in [home.join(".zshrc"), home.join(".claude"), home.join("gone"), PathBuf::from("/")] {
+        std::fs::create_dir(home.join(".claude-old")).unwrap();
+        std::fs::write(home.join(".claude-old/state.json"), "{}").unwrap();
+        let near = home.join(".claude-old/state.json");
+        for target in [home.join(".zshrc"), near, home.join(".claude"), home.join("gone"), PathBuf::from("/")] {
             symlink(&target, &file).unwrap();
             assert!(ok(mine).is_err(), "a link to {} must be left out", target.display());
             std::fs::remove_file(&file).unwrap();
         }
         // `assemble_write_roots` records the refusal and grants no file.
         symlink(home.join(".zshrc"), &file).unwrap();
-        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine));
+        let roots = assemble_write_roots(&[], Some(&h), None, Some(mine), &[]);
         assert!(roots.files.is_empty());
         assert!(roots.refused.iter().any(|w| w.contains(".claude.json")), "{:?}", roots.refused);
     }
@@ -1726,7 +1864,7 @@ mod tests {
         let deny = p.find("(deny file-write*\n").expect("a deny block for the system roots");
         let link = p.find("(deny file-link\n").expect("a file-link deny for the system roots");
         assert!(allow < deny && deny < link);
-        let roots = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid());
+        let roots = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid(), &private_bases());
         assert!(roots.system_roots.contains(&"/dev".to_string()));
         for r in &roots.system_roots {
             let subpath = format!("(subpath {})", sbpl_string(r));
@@ -1758,8 +1896,8 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn ensure_home_roots_creates_missing_roots_as_real_dirs_and_leaves_links_alone() {
-        use std::os::unix::fs::symlink;
+    fn ensure_home_roots_creates_missing_roots_as_owner_only_real_dirs_and_leaves_links_alone() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
         let dir = tempfile::tempdir().unwrap();
         let home = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir(home.join("target")).unwrap();
@@ -1767,6 +1905,7 @@ mod tests {
         ensure_home_roots(home.to_str().unwrap());
         let claude = std::fs::symlink_metadata(home.join(".claude")).unwrap();
         assert!(claude.is_dir() && !claude.file_type().is_symlink(), "~/.claude was created");
+        assert_eq!(claude.permissions().mode() & 0o777, 0o700, "~/.claude is owner-only");
         assert!(std::fs::symlink_metadata(home.join(".cache")).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_dir(home.join("target")).unwrap().count(), 0, "nothing written through the link");
     }
@@ -1791,23 +1930,20 @@ mod tests {
         let cache = format!("{home}/.cache");
         let tmpdir = canonical_string(Path::new(&std::env::var("TMPDIR").unwrap()));
         let tag = format!("octopush-root-test-{}", std::process::id());
+        // Writes and the atomic write-then-rename editors and the CLI use work
+        // inside each real root. (Renaming a real root itself is left to the
+        // root below: their parents aren't writable anyway, so it would prove
+        // nothing about the pin.)
         for root in ["/private/tmp".to_string(), tmpdir, cache] {
             let inside = format!("{root}/{tag}");
-            assert!(run(&format!("mkdir -p '{inside}' && echo x > '{inside}/probe'")), "writes inside {root} work");
-            assert!(Path::new(&inside).join("probe").exists());
-            let moved = format!("{root}.moved-{tag}");
-            let renamed = run(&format!("mv '{root}' '{moved}'"));
-            if Path::new(&moved).exists() {
-                // Put it back before failing, so the test never leaves it moved.
-                let _ = std::fs::rename(&moved, &root);
-            }
-            assert!(!renamed, "{root} can't be renamed");
-            let meta = std::fs::symlink_metadata(&root).unwrap();
-            assert!(meta.is_dir() && !meta.file_type().is_symlink(), "{root} is intact");
+            let script = format!("mkdir -p '{inside}' && echo x > '{inside}/probe.tmp' && mv '{inside}/probe.tmp' '{inside}/probe'");
+            assert!(run(&script), "writes and renames inside {root} work");
+            assert!(Path::new(&inside).join("probe").exists() && !Path::new(&inside).join("probe.tmp").exists());
             let _ = std::fs::remove_dir_all(&inside);
         }
-        // An empty root can't be removed either, and its parent can still hold
-        // other entries: the same rules, on a root under a temp dir.
+        assert!(run("echo x > /dev/null"), "/dev/null stays writable");
+        // An empty root can't be removed or renamed, and its parent can still
+        // hold other entries: the same rules, on a root whose parent is writable.
         let parent = tempfile::tempdir().unwrap();
         let root = canonical_string(&parent.path().join("root"));
         std::fs::create_dir(&root).unwrap();
@@ -2139,7 +2275,7 @@ mod tests {
 
     #[test]
     fn assemble_write_roots_is_narrow() {
-        let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"), None).subpaths;
+        let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"), None, &[]).subpaths;
         assert!(roots.contains(&"/ws".to_string()));
         assert!(roots.contains(&"/home/u/.claude".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
@@ -2169,7 +2305,7 @@ mod tests {
         // NOT gain the workspace OR any package-manager dir. (The gap that let
         // the first cut of B3 accidentally grant readonly missions write access
         // to ~/.cargo etc.)
-        let roots = assemble_write_roots(&[], Some("/home/u"), Some("/tmp/session"), None).subpaths;
+        let roots = assemble_write_roots(&[], Some("/home/u"), Some("/tmp/session"), None, &[]).subpaths;
         assert!(!roots.iter().any(|r| r.starts_with("/home/u/.cargo") || r == "/home/u/go"));
         assert!(!roots.contains(&"/ws".to_string()));
         // Temp + the CLI's own dirs are still there (a shell needs them).
@@ -2272,7 +2408,7 @@ mod tests {
         }
         let a_str = a.to_string_lossy().into_owned();
         let b_str = b.to_string_lossy().into_owned();
-        let roots = assemble_write_roots(&[ws_a[0].clone(), a_str.clone()], Some(home), Some(tmpdir), None).subpaths;
+        let roots = assemble_write_roots(&[ws_a[0].clone(), a_str.clone()], Some(home), Some(tmpdir), None, &[]).subpaths;
         assert!(roots.contains(&a_str));
         assert!(!roots.iter().any(|r| Path::new(&b_str).starts_with(r)), "mission B's cache is writable to A");
     }
@@ -2418,7 +2554,14 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             let home = std::env::var("HOME").ok();
-            let shared = assemble_write_roots(&[], home.as_deref(), std::env::var("TMPDIR").ok().as_deref(), current_uid()).subpaths;
+            let shared = assemble_write_roots(
+                &[],
+                home.as_deref(),
+                std::env::var("TMPDIR").ok().as_deref(),
+                current_uid(),
+                &private_bases(),
+            )
+            .subpaths;
             for r in &shared {
                 assert!(!Path::new(&tmp).starts_with(r), "{tmp} is inside {r}");
             }
@@ -2694,7 +2837,7 @@ mod tests {
         let base = build_cache_base().expect("a user cache dir");
         let home = std::env::var("HOME").ok();
         let tmpdir = std::env::var("TMPDIR").ok();
-        let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid()).subpaths;
+        let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), current_uid(), &private_bases()).subpaths;
         for base in [base, stage_tmp_base().expect("a user cache dir")] {
             let real = canonical_lenient(&base);
             for r in &shared {
@@ -2799,6 +2942,16 @@ mod tests {
         assert!(!is_write_allowed(Path::new("/ws/../etc/passwd"), &roots));
         // A sibling dir that merely shares a prefix is NOT under the root.
         assert!(!is_write_allowed(Path::new("/ws-other/x"), &roots));
+    }
+
+    #[test]
+    fn the_launch_line_names_each_root_left_out_of_the_sandbox() {
+        assert_eq!(left_out_label(&[]), None);
+        let why = vec!["/u/.cache resolves to /u".to_string(), "/u/.claude.json has more than one hard link".to_string()];
+        assert_eq!(
+            left_out_label(&why).as_deref(),
+            Some("left out of the sandbox: /u/.cache resolves to /u; /u/.claude.json has more than one hard link")
+        );
     }
 
     #[test]
