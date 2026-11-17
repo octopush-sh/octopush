@@ -429,6 +429,23 @@
   .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
 
+/* ── Row actions over a fade (Talk chat rows, #756) ────────────────
+   Hover/focus actions that sit ON the row's right end instead of beside the
+   title, so revealing them never moves or rewraps anything. The fade repaints
+   exactly what the row shows beneath it: the panel the list sits on (panel-2
+   on the open, boxed row) plus, on a hovered unboxed row, the brass-ghost wash
+   — two layers, so the composite matches the row rather than approximating it.
+   The first 20px (the element's left padding) fade to transparent. */
+.octo-row-actions-fade {
+  --row-fill: var(--color-octo-panel);
+  --row-wash: transparent;
+  background:
+    linear-gradient(to left, var(--row-wash) calc(100% - 20px), transparent),
+    linear-gradient(to left, var(--row-fill) calc(100% - 20px), transparent);
+}
+[data-active] > .octo-row-actions-fade { --row-fill: var(--color-octo-panel-2); }
+.group:not([data-active]):hover > .octo-row-actions-fade { --row-wash: var(--brass-ghost); }
+
 /* ── Elision primitives · middle truncation ──────────────────────
    For any identifier whose HEAD and TAIL both disambiguate — branch names,
    file paths, run ids. A plain `truncate` keeps the head and throws away the

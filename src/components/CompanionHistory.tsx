@@ -225,11 +225,16 @@ export function CompanionHistory({
                     </button>
                   </span>
                 ) : !editing ? (
-                  // The actions take no width until hover/focus (the rail's
-                  // max-width + opacity idiom): hidden by opacity alone they
-                  // kept ~95px of every row empty and the title wrapped early
-                  // (#756). Focus rings are inset so the clip can't cut them.
-                  <span className="flex max-w-0 shrink-0 items-center overflow-hidden opacity-0 transition-[max-width,opacity] duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] group-hover:max-w-[112px] group-hover:opacity-100 focus-within:max-w-[112px] focus-within:opacity-100">
+                  // The actions OVERLAY the row's right end on a panel fade
+                  // (`.octo-row-actions-fade`) instead of taking width, so
+                  // revealing them never rewraps the title (#756). Opacity
+                  // only: the buttons stay in the tab order, focus-within
+                  // reveals them, and their rings are inset so the row's
+                  // rounded edge can't clip them.
+                  <span
+                    data-testid="chat-row-actions"
+                    className="octo-row-actions-fade absolute inset-y-0 right-0 flex items-center rounded-r-md pl-5 pr-0.5 opacity-0 transition-opacity duration-[220ms] ease-[var(--ease-octo)] group-hover:opacity-100 focus-within:opacity-100"
+                  >
                     {onPinChat && (
                       <button
                         type="button"

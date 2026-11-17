@@ -176,13 +176,53 @@ describe("CompanionHistory — keyboard reachability", () => {
 });
 
 describe("CompanionHistory — the title owns the row (#756)", () => {
-  it("hidden row actions take no width, so the title can use the full row", () => {
-    renderHistory({ onRenameChat: vi.fn(), onExportChat: vi.fn(), onPinChat: vi.fn() });
-    const actions = screen.getAllByRole("button", { name: "Delete conversation" })[0].parentElement!;
-    // Opacity alone kept ~95px of every row empty; the width collapses too.
-    expect(actions).toHaveClass("max-w-0", "overflow-hidden", "opacity-0");
-    expect(actions).toHaveClass("group-hover:max-w-[112px]", "focus-within:max-w-[112px]");
-    // Symmetric inset: the row adds no right padding of its own.
-    expect(actions.parentElement).not.toHaveClass("pr-1");
+  const withActions = { onRenameChat: vi.fn(), onExportChat: vi.fn(), onPinChat: vi.fn() };
+  const titleBox = () => screen.getByText("First conversation").closest("button")!;
+  const widthClasses = () => {
+    const btn = titleBox();
+    const title = screen.getByText("First conversation");
+    return [btn.className, title.className, btn.parentElement!.className];
+  };
+
+  it("overlays the row actions instead of giving them width", () => {
+    renderHistory(withActions);
+    const actions = screen.getAllByTestId("chat-row-actions")[0];
+    // Out of flow, at the right end, over the panel fade: revealing them can't
+    // narrow the title, so the title never rewraps on hover.
+    expect(actions).toHaveClass("absolute", "inset-y-0", "right-0", "octo-row-actions-fade");
+    expect(actions).not.toHaveClass("max-w-0");
+    expect(actions.className).not.toMatch(/max-w-\[/);
+    // Hidden by opacity only, revealed on hover AND on keyboard focus.
+    expect(actions).toHaveClass("opacity-0", "group-hover:opacity-100", "focus-within:opacity-100");
+    // The shared motion token, never a hand-copied curve.
+    expect(actions).toHaveClass("ease-[var(--ease-octo)]");
+    expect(actions.className).not.toMatch(/cubic-bezier/);
+    // The title button is the only in-flow child: it takes the whole row.
+    expect(titleBox()).toHaveClass("min-w-0", "flex-1");
+    expect(titleBox().parentElement).not.toHaveClass("pr-1");
+  });
+
+  it("toggling hover or focus doesn't change the title's width classes", async () => {
+    const user = userEvent.setup();
+    renderHistory({ ...withActions, chats: [chats[0]] });
+    const before = widthClasses();
+    // No hover- or focus-dependent width utility anywhere on the title's chain.
+    for (const cls of before) expect(cls).not.toMatch(/(group-hover|focus-within|hover):(max-)?w-/);
+    await user.hover(titleBox());
+    expect(widthClasses()).toEqual(before);
+    await user.unhover(titleBox());
+    const pin = screen.getByRole("button", { name: "Pin conversation" });
+    pin.focus();
+    expect(pin).toHaveFocus();
+    expect(widthClasses()).toEqual(before);
+  });
+
+  it("keeps every action focusable with an inset ring", () => {
+    renderHistory(withActions);
+    for (const name of ["Pin conversation", "Rename conversation", "Export conversation", "Delete conversation"]) {
+      const btn = screen.getAllByRole("button", { name })[0];
+      expect(btn).not.toHaveAttribute("tabindex", "-1");
+      expect(btn).toHaveClass("focus-visible:ring-1", "focus-visible:ring-inset");
+    }
   });
 });
