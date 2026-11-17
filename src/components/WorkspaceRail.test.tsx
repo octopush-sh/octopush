@@ -1,9 +1,12 @@
 import { describe, it, expect, vi, afterEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
-import { WorkspaceRail, resolveAttention, type ProjectGroup } from "./WorkspaceRail";
+import { WorkspaceRail, resolveAttention, shedsGitMeta, type ProjectGroup } from "./WorkspaceRail";
+import { useCollisionStore } from "../stores/collisionStore";
+import { collisionsByWorkspace } from "../lib/collisions";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import type { Workspace, Mission } from "../lib/types";
+import { readable } from "../test-utils/readable";
 
 function makeMission(overrides: Partial<Mission> = {}): Mission {
   return {
@@ -243,7 +246,8 @@ describe("WorkspaceRail", () => {
     expect(header).toHaveClass("flex", "min-w-0", "flex-1");
     expect(header).not.toHaveClass("truncate");
     expect(header.querySelector(".octo-midtrunc-tail")).toHaveTextContent("prise-monorepo");
-    expect(header).toHaveTextContent(name);
+    // Full name in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(readable(header)).toBe(name);
     // The fold control carries the full name as its tooltip.
     expect(screen.getByRole("button", { name, expanded: true })).toHaveAttribute(
       "title",
@@ -412,7 +416,8 @@ describe("WorkspaceRail", () => {
       />,
     );
     const tails = [...container.querySelectorAll(".octo-midtrunc-tail")].map((t) => t.textContent);
-    expect(tails).toEqual(["(octopush-api)", "(octopush-web)"]);
+    // The seam's space starts the tail (kept by its `white-space: pre`).
+    expect(tails).toEqual([" (octopush-api)", " (octopush-web)"]);
     // The full name stays the tooltip.
     expect(screen.getByTitle("Production deploy (octopush-api)")).toBeInTheDocument();
     // Short names take the plain path — no split.
@@ -1063,5 +1068,86 @@ describe("resolveAttention — the rail's single beacon", () => {
 
   it("ignores flags for workspaces that are not in the rail", () => {
     expect(resolveAttention(projects, { ghost: { kind: "chat", at: 1 } }, null, {})).toEqual({});
+  });
+});
+
+describe("WorkspaceRail — collision radar (#732)", () => {
+  afterEach(() => {
+    useCollisionStore.getState().reset();
+  });
+
+  const projects = (): ProjectGroup[] => [
+    {
+      id: "proj-1",
+      name: "Project",
+      workspaces: [
+        makeWorkspace({ id: "a", name: "auth-flow" }),
+        makeWorkspace({ id: "b", name: "refund-webhooks" }),
+        makeWorkspace({ id: "c", name: "docs" }),
+      ],
+    },
+  ];
+  const seed = (severity: "overlap" | "conflict" | "lockfile") =>
+    useCollisionStore.setState({
+      byWorkspace: collisionsByWorkspace([
+        {
+          a: "a",
+          aName: "auth-flow",
+          b: "b",
+          bName: "refund-webhooks",
+          files: severity === "lockfile" ? ["yarn.lock"] : ["src/billing/limits.ts", "src/billing/plan.ts"],
+          truncated: 0,
+          conflictingTruncated: 0,
+          conflictingFiles: severity === "conflict" ? ["src/billing/limits.ts"] : [],
+          severity,
+          confirmed: severity !== "lockfile",
+        },
+      ]),
+    });
+
+  it("shows nothing when no workspaces overlap", () => {
+    render(<WorkspaceRail projects={projects()} activeWorkspaceId="c" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />);
+    expect(document.querySelectorAll('[data-tour="rail-collision"]')).toHaveLength(0);
+  });
+
+  it("marks both overlapping workspaces in amber, naming the other and the files", () => {
+    seed("overlap");
+    render(<WorkspaceRail projects={projects()} activeWorkspaceId="c" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />);
+    const marks = document.querySelectorAll('[data-tour="rail-collision"]');
+    expect(marks).toHaveLength(2);
+    const onA = screen.getByTitle(
+      "Overlaps refund-webhooks · 2 files: src/billing/limits.ts, src/billing/plan.ts",
+    );
+    expect(onA).toHaveAttribute("role", "img");
+    expect(onA.className).toContain("text-octo-warning");
+    expect(onA.className).not.toContain("brass");
+    expect(screen.getByTitle(/^Overlaps auth-flow · 2 files/)).toBeInTheDocument();
+  });
+
+  it("a confirmed conflict turns the mark rouge", () => {
+    seed("conflict");
+    render(<WorkspaceRail projects={projects()} activeWorkspaceId="c" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />);
+    const mark = screen.getByTitle("Will conflict with refund-webhooks in 1 file: src/billing/limits.ts");
+    expect(mark.className).toContain("text-octo-rouge");
+  });
+
+  it("a lockfile-only overlap stays quiet", () => {
+    seed("lockfile");
+    render(<WorkspaceRail projects={projects()} activeWorkspaceId="c" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />);
+    expect(document.querySelectorAll('[data-tour="rail-collision"]')).toHaveLength(0);
+  });
+
+  it("never takes the beacon", () => {
+    seed("conflict");
+    render(<WorkspaceRail projects={projects()} activeWorkspaceId="c" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />);
+    expect(document.querySelectorAll(".animate-attention-pulse")).toHaveLength(0);
+  });
+
+  it("counts the mark in the row's demotion ladder", () => {
+    const meta = { ahead: 3, behind: 1, ticketKey: "OCT-123" };
+    // 15 characters: fits beside the counts alone, not beside the mark too.
+    const name = "refund-webhooks";
+    expect(shedsGitMeta(name, meta)).toBe(false);
+    expect(shedsGitMeta(name, { ...meta, collision: true })).toBe(true);
   });
 });

@@ -277,9 +277,12 @@ function JiraDetail({ onConfigSaved, onConnectedChange }: {
                 {/* The name takes the width the key input leaves (a definite
                     `flex-1 min-w-0` box) and is MIDDLE-truncated: sibling projects
                     share their head (`octopush-enterprise-…`), so the tail is what
-                    tells the rows apart (design-system E1). */}
+                    tells the rows apart (design-system E1). The wrapper must be a
+                    FLEX box: as a block, the inline-flex MidTruncate box is sized
+                    from its own unbreakable text, spills under the key input and
+                    is hard-cut with no ellipsis (#757). */}
                 <div
-                  className="min-w-0 flex-1 text-[13px] text-octo-ivory"
+                  className="flex min-w-0 flex-1 text-[13px] text-octo-ivory"
                   title={p.name}
                   data-tour={i === 0 ? tourId("settings-integrations-project-link") : undefined}
                 >

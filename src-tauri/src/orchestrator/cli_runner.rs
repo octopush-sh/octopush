@@ -1291,9 +1291,17 @@ impl CliDialect {
     /// so a stage that writes (or is tricked into planting) a skill in the
     /// worktree it edits would change its own instructions mid-stage, and a
     /// reviewer would certify work done under other rules than it started
-    /// with; an older CLI ignores this one too. All are set on fresh and
-    /// `--resume` runs alike; Run-mode terminals never get them — backgrounding
-    /// and skill reloads are theirs to keep, since a human is directing there.
+    /// with; an older CLI ignores this one too. Subagent progress summaries
+    /// are off (`CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`): 2.1.323
+    /// "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available since
+    /// 2.1.318): set it to `1` to turn off subagent progress summaries and the
+    /// requests that write them". Those requests are billed, and a stage reads
+    /// none of them: the journal leaves `task_summary`-style system events
+    /// out, and the pane shows tool calls and the result. An older CLI ignores
+    /// the unknown variable. All are set on fresh and `--resume` runs alike,
+    /// over any inherited value; Run-mode terminals never get them —
+    /// backgrounding, skill reloads and progress summaries are theirs to keep,
+    /// since a human is directing there.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
@@ -1301,6 +1309,7 @@ impl CliDialect {
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
                 ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
                 ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0".to_string()),
+                ("CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES", "1".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
         }
@@ -1879,6 +1888,10 @@ pub const DISABLE_1M_CONTEXT_ENV: &str = "CLAUDE_CODE_DISABLE_1M_CONTEXT";
 const UNRECOGNIZED_MODEL_CONTEXT: u64 = 1_000_000;
 /// The window [`DISABLE_1M_CONTEXT_ENV`] keeps.
 const KEPT_CONTEXT_WITHOUT_1M: u64 = 200_000;
+/// The first Claude Code that applies [`MAX_CONTEXT_TOKENS_ENV`] to an
+/// unrecognized id starting with `claude-` (2.1.325). Ids that don't start
+/// with `claude-` have honoured it since 2.1.193.
+pub const CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR: &str = "2.1.325";
 
 /// The context-window variables a Claude stage on `model` gets, so Claude
 /// Code compacts before a smaller gateway window fills instead of assuming
@@ -1886,18 +1899,25 @@ const KEPT_CONTEXT_WITHOUT_1M: u64 = 200_000;
 /// once full, they can fail every turn until `/clear`, so set
 /// `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` before they fill" — and a headless
 /// stage can't `/clear`. Pure:
-/// - a built-in Anthropic catalog id (`builtin`), or a model whose window is
-///   unknown (`max_context` `None`/0) or at least 1M, gets nothing;
-/// - an id starting with `claude-` gets [`MAX_CONTEXT_TOKENS_ENV`] set to its
-///   window;
-/// - any other id at ≤ 200K gets [`DISABLE_1M_CONTEXT_ENV`]`=1` (the
-///   variable keeps 200K, so a window between 200K and 1M gets nothing);
+/// - a built-in Anthropic catalog id (`builtin`, decided on the normalized
+///   id, [`is_builtin_claude_model`]), or a model whose window is unknown
+///   (`max_context` `None`/0) or at least 1M, gets nothing;
+/// - any other model gets [`MAX_CONTEXT_TOKENS_ENV`] set to its window.
+///   [`DISABLE_1M_CONTEXT_ENV`] is never used for an id that doesn't start
+///   with `claude-`: it is process-wide, so it would also cap a subagent on
+///   a builtin 1M model, and such ids honour the max-tokens variable anyway;
+/// - an id starting with `claude-` on a Claude Code below
+///   [`CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR`] (or an unknown version,
+///   `cli_version` `None`) ignores that variable, so at a window ≤ 200K it
+///   also gets [`DISABLE_1M_CONTEXT_ENV`]`=1`, which keeps 200K. A window
+///   below 200K can't be expressed there (2.1.323–324);
 /// - a variable `user_set` reports (the user's own export) is never
 ///   overridden.
 pub(crate) fn context_window_env(
     model: &str,
     builtin: bool,
     max_context: Option<u64>,
+    cli_version: Option<&str>,
     user_set: impl Fn(&str) -> bool,
 ) -> Vec<(&'static str, String)> {
     let Some(window) = max_context.filter(|w| *w > 0 && *w < UNRECOGNIZED_MODEL_CONTEXT) else {
@@ -1906,35 +1926,42 @@ pub(crate) fn context_window_env(
     if builtin {
         return Vec::new();
     }
-    let pick = if model.trim().to_ascii_lowercase().starts_with("claude-") {
-        Some((MAX_CONTEXT_TOKENS_ENV, window.to_string()))
-    } else if window <= KEPT_CONTEXT_WITHOUT_1M {
-        Some((DISABLE_1M_CONTEXT_ENV, "1".to_string()))
-    } else {
-        None
-    };
-    pick.into_iter().filter(|(k, _)| !user_set(k)).collect()
+    let mut picks = vec![(MAX_CONTEXT_TOKENS_ENV, window.to_string())];
+    let claude_prefixed = model.trim().to_ascii_lowercase().starts_with("claude-");
+    let old_cli = cli_version.is_none_or(|v| crate::agent_adapter::version_below(v, CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR));
+    if claude_prefixed && old_cli && window <= KEPT_CONTEXT_WITHOUT_1M {
+        picks.push((DISABLE_1M_CONTEXT_ENV, "1".to_string()));
+    }
+    picks.into_iter().filter(|(k, _)| !user_set(k)).collect()
 }
 
-/// [`context_window_env`] for a stage's model: built-in means an exact id of
-/// the builtin Anthropic catalog (Claude Code knows those and their windows);
-/// the window comes from the provider catalog, the user's custom model
-/// entries included (`ProviderRouter::find_model`); a user's export is read
-/// the way the CLI process will see it ([`stage_env_value`]). Codex: nothing.
-fn stage_context_env(dialect: CliDialect, model: &str) -> Vec<(&'static str, String)> {
-    if dialect != CliDialect::Claude {
-        return Vec::new();
-    }
-    let builtin = crate::provider_router::builtin_providers()
+/// Whether Claude Code knows `model` and its window: its normalized id
+/// ([`crate::token_engine::normalize_model_id`], so `bedrock/claude-haiku-4-5`
+/// and `us.anthropic.claude-sonnet-5-v1:0` count) is a builtin Anthropic
+/// catalog id.
+pub(crate) fn is_builtin_claude_model(model: &str) -> bool {
+    let id = crate::token_engine::normalize_model_id(model);
+    crate::provider_router::builtin_providers()
         .get("anthropic")
-        .is_some_and(|p| p.models.iter().any(|m| m.id == model));
-    if builtin {
+        .is_some_and(|p| p.models.iter().any(|m| m.id == id))
+}
+
+/// [`context_window_env`] for a stage's model: built-in per
+/// [`is_builtin_claude_model`]; the window comes from the provider catalog,
+/// the user's custom model entries included (`ProviderRouter::find_model`);
+/// the CLI version is the one the stage probed before spawning
+/// (`agent_adapter::claude_cli_version_cached`, unknown when it isn't
+/// there); a user's export is read the way the CLI process will see it
+/// ([`stage_env_value`]). Codex: nothing.
+fn stage_context_env(dialect: CliDialect, model: &str) -> Vec<(&'static str, String)> {
+    if dialect != CliDialect::Claude || is_builtin_claude_model(model) {
         return Vec::new();
     }
     let max_context = crate::provider_router::ProviderRouter::load()
         .ok()
         .and_then(|r| r.find_model(model).map(|(_, m)| m.max_context));
-    context_window_env(model, false, max_context, |k| stage_env_value(k).is_some())
+    let version = crate::agent_adapter::claude_cli_version_cached().and_then(|v| v.version);
+    context_window_env(model, false, max_context, version.as_deref(), |k| stage_env_value(k).is_some())
 }
 
 /// The stage's own environment, applied to its CLI process after the

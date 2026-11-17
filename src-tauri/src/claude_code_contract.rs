@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
-    apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, DISABLE_1M_CONTEXT_ENV,
+    apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, is_builtin_claude_model, DISABLE_1M_CONTEXT_ENV,
     MAX_CONTEXT_TOKENS_ENV, cli_auth_from_init, is_result_event,
     parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
     CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
@@ -759,48 +759,77 @@ fn context_window_variables_are_the_documented_names() {
 
 #[test]
 fn a_builtin_claude_model_gets_no_context_window_variable() {
-    // Claude Code knows the builtin catalog's ids and their windows.
-    for model in ["claude-sonnet-5", "claude-opus-5-5", "claude-haiku-4-5"] {
+    // Claude Code knows the builtin catalog's ids and their windows, also
+    // behind a gateway or Bedrock prefix (the builtin check normalizes).
+    for model in [
+        "claude-sonnet-5",
+        "claude-opus-5-5",
+        "claude-haiku-4-5",
+        "bedrock/claude-haiku-4-5",
+        "us.anthropic.claude-haiku-4-5-v1:0",
+    ] {
+        assert!(is_builtin_claude_model(model), "{model}");
         let env = stage_spawn_env_for(model);
         assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{model}: {env:?}");
     }
-    assert!(context_window_env("claude-haiku-4-5", true, Some(200_000), |_| false).is_empty());
+    assert!(!is_builtin_claude_model("claude-sonnet-latest"));
+    assert!(!is_builtin_claude_model("gpt-4o"));
+    assert!(context_window_env("claude-haiku-4-5", true, Some(200_000), None, |_| false).is_empty());
 }
 
 #[test]
 fn a_gateway_model_gets_the_variable_for_its_window() {
     let none = |_: &str| false;
-    assert_eq!(
-        context_window_env("claude-sonnet-latest", false, Some(200_000), none),
-        vec![(MAX_CONTEXT_TOKENS_ENV, "200000".to_string())]
-    );
-    assert_eq!(
-        context_window_env("claude-internal-128k", false, Some(128_000), none),
-        vec![(MAX_CONTEXT_TOKENS_ENV, "128000".to_string())]
-    );
-    assert_eq!(context_window_env("gpt-4o", false, Some(128_000), none), vec![(DISABLE_1M_CONTEXT_ENV, "1".to_string())]);
-    assert_eq!(
-        context_window_env("bedrock/claude-haiku-4-5", false, Some(200_000), none),
-        vec![(DISABLE_1M_CONTEXT_ENV, "1".to_string())],
-        "a prefixed id doesn't start with `claude-`"
-    );
-    // A window `CLAUDE_CODE_DISABLE_1M_CONTEXT` can't express, a 1M window,
-    // and an unknown one: nothing.
-    assert!(context_window_env("kimi-k3", false, Some(512_000), none).is_empty());
-    assert!(context_window_env("claude-sonnet-latest", false, Some(1_000_000), none).is_empty());
-    assert!(context_window_env("claude-sonnet-latest", false, None, none).is_empty());
-    assert!(context_window_env("claude-sonnet-latest", false, Some(0), none).is_empty());
+    let max = |w: &str| (MAX_CONTEXT_TOKENS_ENV, w.to_string());
+    let disable = (DISABLE_1M_CONTEXT_ENV, "1".to_string());
+    // Ids that don't start with `claude-` have honoured the max-tokens
+    // variable since 2.1.193: never the process-wide DISABLE_1M switch,
+    // whatever the CLI version.
+    for v in [None, Some("2.1.323"), Some("2.1.325")] {
+        assert_eq!(context_window_env("gpt-4o", false, Some(128_000), v, none), vec![max("128000")], "{v:?}");
+        assert_eq!(context_window_env("kimi-k3", false, Some(512_000), v, none), vec![max("512000")], "{v:?}");
+    }
+    // A `claude-` gateway id on 2.1.325+: the variable alone.
+    let new = Some("2.1.325");
+    assert_eq!(context_window_env("claude-sonnet-latest", false, Some(200_000), new, none), vec![max("200000")]);
+    assert_eq!(context_window_env("claude-internal-128k", false, Some(128_000), Some("2.2.0"), none), vec![max("128000")]);
+    assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), new, none), vec![max("512000")]);
+    // Below 2.1.325 (or an unknown version) Claude Code ignores it for a
+    // `claude-` id, so a window up to 200K also keeps 200K; below 200K
+    // can't be expressed there, and 200K–1M gets only the ignored variable.
+    for old in [Some("2.1.323"), Some("2.1.324"), None] {
+        assert_eq!(
+            context_window_env("claude-sonnet-latest", false, Some(200_000), old, none),
+            vec![max("200000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(
+            context_window_env("claude-internal-128k", false, Some(128_000), old, none),
+            vec![max("128000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), old, none), vec![max("512000")], "{old:?}");
+    }
+    // A 1M window and an unknown one: nothing.
+    assert!(context_window_env("claude-sonnet-latest", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, None, None, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, Some(0), None, none).is_empty());
 }
 
 #[test]
 fn a_users_own_context_window_export_is_never_overridden() {
     let set = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
-    assert!(context_window_env("claude-sonnet-latest", false, Some(200_000), set).is_empty());
-    let set = |k: &str| k == DISABLE_1M_CONTEXT_ENV;
-    assert!(context_window_env("gpt-4o", false, Some(128_000), set).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.325"), set).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(128_000), None, set).is_empty());
     // Only the variable the user set is left alone.
     assert_eq!(
-        context_window_env("claude-sonnet-latest", false, Some(200_000), set),
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
+        vec![(DISABLE_1M_CONTEXT_ENV, "1".to_string())]
+    );
+    let set = |k: &str| k == DISABLE_1M_CONTEXT_ENV;
+    assert_eq!(
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
         vec![(MAX_CONTEXT_TOKENS_ENV, "200000".to_string())]
     );
 }
@@ -825,12 +854,13 @@ fn a_custom_gateway_model_reaches_the_spawn_with_its_catalog_window() {
         "models": [model("claude-sonnet-latest", 200_000), model("team-llama", 128_000), model("claude-sonnet-5", 100_000)],
     }]);
     std::fs::write(cfg.path().join("providers.json"), providers.to_string()).unwrap();
+    // (Whether DISABLE_1M joins it depends on the probed CLI version; the
+    // pure `context_window_env` tests pin that.)
     let env = stage_spawn_env_for("claude-sonnet-latest");
     assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("200000".to_string())), "{env:?}");
-    assert!(!env.contains_key(DISABLE_1M_CONTEXT_ENV));
     let env = stage_spawn_env_for("team-llama");
-    assert_eq!(env.get(DISABLE_1M_CONTEXT_ENV), Some(&Some("1".to_string())), "{env:?}");
-    assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV));
+    assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("128000".to_string())), "{env:?}");
+    assert!(!env.contains_key(DISABLE_1M_CONTEXT_ENV), "a non-`claude-` id never gets the process-wide switch");
     // A builtin id stays untouched even when a custom entry repeats it.
     let env = stage_spawn_env_for("claude-sonnet-5");
     assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
@@ -848,6 +878,29 @@ fn stage_spawn_env_for(model: &str) -> HashMap<String, Option<String>> {
         .get_envs()
         .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
         .collect()
+}
+
+#[test]
+fn claude_stage_env_turns_off_subagent_progress_summaries() {
+    // 2.1.323: "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available
+    // since 2.1.318): set it to `1` to turn off subagent progress summaries and
+    // the requests that write them". No stage reads them (#722).
+    const KEY: &str = "CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES";
+    let env = CliDialect::Claude.stage_env();
+    assert_eq!(env.iter().find(|(k, _)| *k == KEY).map(|(_, v)| v.as_str()), Some("1"), "{env:?}");
+    assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == KEY));
+    // Set on the spawn whatever the quiet opt-in or effort, so a fresh and a
+    // `--resume` run (one `apply_stage_env`, no resume flag) both get it, over
+    // any inherited value; it's never removed.
+    for (effort, quiet) in [(None, false), (Some(crate::providers::Effort::High), true)] {
+        let spawn = stage_spawn_env(CliDialect::Claude, effort, quiet);
+        assert_eq!(spawn.get(KEY), Some(&Some("1".to_string())), "{spawn:?}");
+    }
+    assert!(!stage_spawn_env(CliDialect::Codex, None, true).contains_key(KEY));
+    // No stream event is read as a progress summary: a `task_summary`-style
+    // system event journals nothing.
+    let summary = serde_json::json!({"type": "system", "subtype": "task_summary", "summary": "Reading files"});
+    assert!(entries_from_stream_event(&summary).is_empty());
 }
 
 // ─── Quiet Claude Code (`CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, #703) ──

@@ -23,6 +23,9 @@ pub struct AppState {
     pub gateways: crate::gateway::GatewayCache,
     /// The shared daemon client — kept alive for the app lifetime.
     pub daemon_client: Option<Arc<DaemonClient>>,
+    /// Collision radar caches (#732): per-worktree changed sets, merge-tree
+    /// confirmations and each project's last report.
+    pub collisions: Arc<Mutex<crate::collisions::CollisionCache>>,
 }
 
 impl AppState {
@@ -56,6 +59,7 @@ impl AppState {
             chat,
             gateways: crate::gateway::GatewayCache::default(),
             daemon_client,
+            collisions: Arc::new(Mutex::new(crate::collisions::CollisionCache::default())),
         })
     }
 }
