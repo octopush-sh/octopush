@@ -584,3 +584,52 @@ describe("MissionControl", () => {
     expect(screen.getByText("waiting in Talk")).toBeInTheDocument();
   });
 });
+
+const { useCollisionStore } = await import("../stores/collisionStore");
+const { collisionsByWorkspace } = await import("../lib/collisions");
+
+describe("MissionControl — collision radar (#732)", () => {
+  it("adds one meta segment to an in-flight card, never a needs-you item", () => {
+    useWorkspaceStore.setState({
+      workspacesByProjectId: {
+        p: [
+          { id: "ws-a", projectId: "p", name: "auth-flow" },
+          { id: "ws-b", projectId: "p", name: "refund-webhooks" },
+        ],
+      },
+    } as any);
+    useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    useCollisionStore.setState({
+      byWorkspace: collisionsByWorkspace([
+        {
+          a: "ws-a",
+          aName: "auth-flow",
+          b: "ws-b",
+          bName: "refund-webhooks",
+          files: ["src/billing/limits.ts", "src/billing/plan.ts"],
+          conflictingFiles: [],
+          severity: "overlap",
+          confirmed: true,
+        },
+      ]),
+    });
+    renderRoom();
+    const seg = document.querySelector('[data-tour="mission-control-card-collision"]');
+    expect(seg).not.toBeNull();
+    expect(seg).toHaveTextContent("overlaps refund-webhooks · 2 files");
+    expect(seg).toHaveAttribute(
+      "title",
+      "Overlaps refund-webhooks · 2 files: src/billing/limits.ts, src/billing/plan.ts",
+    );
+    // Still in flight: the overlap adds no needs-you card and no beacon.
+    expect(document.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
+    expect(seg?.closest(".border-octo-brass")).toBeNull();
+    useCollisionStore.getState().reset();
+  });
+
+  it("shows nothing when the workspace overlaps no one", () => {
+    useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    renderRoom();
+    expect(document.querySelector('[data-tour="mission-control-card-collision"]')).toBeNull();
+  });
+});

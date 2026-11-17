@@ -595,6 +595,30 @@ export interface WorkspaceGitSummary {
   behind: number;
 }
 
+// ─── Collision radar (#732) ────────────────────────────────────────
+
+/** `lockfile`: only lockfiles overlap · `overlap`: the same file changes on
+ *  both sides · `conflict`: an in-memory merge confirmed a conflict. */
+export type CollisionSeverity = "lockfile" | "overlap" | "conflict";
+
+/** Two live workspaces of one project changing the same files. */
+export interface Collision {
+  a: string;
+  aName: string;
+  b: string;
+  bName: string;
+  files: string[];
+  conflictingFiles: string[];
+  severity: CollisionSeverity;
+  confirmed: boolean;
+}
+
+export interface ProjectCollisions {
+  collisions: Collision[];
+  scanned: number;
+  capped: boolean;
+}
+
 // ─── Usage report (Settings → Usage) ───────────────────────────────
 
 export type UsageSurface = "talk" | "run" | "review" | "direct" | "adhoc";

@@ -547,6 +547,7 @@ import type {
   CreatedWorkspace,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
+  ProjectCollisions,
 } from "./types";
 
 // ─── Entitlement (premium scaffolding — P0) ───────────────────────
@@ -779,6 +780,10 @@ export const ipc = {
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),
+  /** Collision radar (#732): live workspaces of a project changing the same
+   *  files. Read-only; the backend reuses a report for a few seconds. */
+  projectCollisions: (projectId: string) =>
+    invoke<ProjectCollisions>("project_collisions", { projectId }),
   deleteWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
     invoke<void>("delete_workspace", { workspaceId, projectPath, branch, worktreePath }),
   archiveWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>

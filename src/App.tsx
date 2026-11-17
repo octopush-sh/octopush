@@ -76,6 +76,7 @@ import { CrewImportHost } from "./components/CrewImportSheet";
 import { useCrewImportStore } from "./stores/crewImportStore";
 import { Settings } from "./components/Settings";
 import { useProjectStore } from "./stores/projectStore";
+import { useCollisionStore } from "./stores/collisionStore";
 import { useWorkspaceStore } from "./stores/workspaceStore";
 import { useMissionsStore } from "./stores/missionsStore";
 import { useThemeStore } from "./stores/themeStore";
@@ -644,6 +645,18 @@ function App() {
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
+  // Collision radar (#732): poll every open project at a modest interval while
+  // the window is visible; the store throttles and the backend caches.
+  useEffect(() => {
+    if (!project && recentProjects.length === 0) return;
+    const ids = () => {
+      const set = new Set<string>(recentProjects.map((p) => p.id));
+      if (project) set.add(project.id);
+      return [...set];
+    };
+    return useCollisionStore.getState().startPolling(ids);
+  }, [project, recentProjects]);
+
   // Refresh externally-authored data when the window regains focus — calm,
   // event-driven (no polling). octopush-mcp is a separate process writing to
   // the same SQLite store; it cannot emit Tauri events, so anything it authors
@@ -662,6 +675,7 @@ function App() {
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
         void loadProjectPrs(id, path);
+        void useCollisionStore.getState().refresh(id);
       });
       // Pipelines (the ensemble picker) + the active workspace's runs list —
       // both read via getState at fire time, so the listener neither

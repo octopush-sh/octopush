@@ -1,0 +1,80 @@
+/**
+ * Collision radar (#732) — which live workspaces of a project change the same
+ * files. Warn only: nothing here ever blocks an action.
+ *
+ * Cost is bounded twice. Here, `refresh` is throttled per project
+ * (`MIN_REFRESH_MS`) and deduped while a scan is in flight, and the poll runs
+ * at a modest `POLL_MS` only while the window is visible. In the backend, a
+ * project's report is reused for a few seconds and committed diffs and merge
+ * confirmations are cached by commit id (`src-tauri/src/collisions.rs`).
+ */
+import { create } from "zustand";
+import { ipc } from "../lib/ipc";
+import { collisionsByWorkspace, type WorkspaceCollision } from "../lib/collisions";
+
+/** A project is rescanned at most this often, unless forced. */
+export const MIN_REFRESH_MS = 10_000;
+/** The background poll. Workspace changes (commits, agent edits) have no
+ *  watcher event, so this is what notices them between explicit refreshes. */
+export const POLL_MS = 60_000;
+
+interface CollisionState {
+  /** workspace id → its collisions, worst first. Absent = nothing to say. */
+  byWorkspace: Record<string, WorkspaceCollision[]>;
+  /** project id → the workspace ids its last report covered. */
+  idsByProject: Record<string, string[]>;
+  /** Rescan one project. Throttled to `MIN_REFRESH_MS` unless `force`
+   *  (a commit, an explicit user action) and deduped while in flight. */
+  refresh: (projectId: string, opts?: { force?: boolean }) => Promise<void>;
+  /** Poll `projectIds()` every `POLL_MS` while the window is visible.
+   *  Returns the stop function. */
+  startPolling: (projectIds: () => string[]) => () => void;
+  /** Test seam. */
+  reset: () => void;
+}
+
+const inFlight = new Set<string>();
+const lastAt = new Map<string, number>();
+
+export const useCollisionStore = create<CollisionState>((set, get) => ({
+  byWorkspace: {},
+  idsByProject: {},
+
+  refresh: async (projectId, opts) => {
+    if (!projectId || inFlight.has(projectId)) return;
+    const now = Date.now();
+    if (!opts?.force && now - (lastAt.get(projectId) ?? -Infinity) < MIN_REFRESH_MS) return;
+    lastAt.set(projectId, now);
+    inFlight.add(projectId);
+    try {
+      const report = await ipc.projectCollisions(projectId);
+      const mine = collisionsByWorkspace(report.collisions);
+      set((s) => {
+        const next = { ...s.byWorkspace };
+        for (const id of s.idsByProject[projectId] ?? []) delete next[id];
+        Object.assign(next, mine);
+        return { byWorkspace: next, idsByProject: { ...s.idsByProject, [projectId]: Object.keys(mine) } };
+      });
+    } catch {
+      // Non-critical: keep the last report rather than flicker the glyphs away.
+    } finally {
+      inFlight.delete(projectId);
+    }
+  },
+
+  startPolling: (projectIds) => {
+    const tick = () => {
+      if (typeof document !== "undefined" && document.hidden) return;
+      for (const id of projectIds()) void get().refresh(id);
+    };
+    tick();
+    const timer = setInterval(tick, POLL_MS);
+    return () => clearInterval(timer);
+  },
+
+  reset: () => {
+    inFlight.clear();
+    lastAt.clear();
+    set({ byWorkspace: {}, idsByProject: {} });
+  },
+}));

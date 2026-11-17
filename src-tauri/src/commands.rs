@@ -1234,6 +1234,51 @@ pub async fn workspaces_git_summary(
     Ok(out)
 }
 
+/// Collision radar (#732): which live workspaces of a project change the same
+/// files, and whether an in-memory merge confirms a conflict. Read-only — no
+/// worktree, index or ref is touched. Throttled: a report younger than
+/// `collisions::REPORT_TTL` is reused, and committed diffs and merge
+/// confirmations are cached by commit id.
+#[tauri::command]
+pub async fn project_collisions(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<crate::collisions::ProjectCollisions> {
+    let (rows, project_path) = {
+        let db = state.db.lock();
+        let rows = db.list_workspaces(&project_id)?;
+        let path = db.get_project(&project_id)?.map(|p| p.path);
+        (rows, path)
+    };
+    let default_base = project_path
+        .as_deref()
+        .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+    let inputs: Vec<crate::collisions::ScanInput> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let wt = expand_tilde(row.worktree_path.as_deref()?);
+            let path = std::path::PathBuf::from(wt);
+            path.is_dir().then(|| crate::collisions::ScanInput {
+                id: row.id,
+                name: row.name,
+                path,
+                base: row.from_branch.or_else(|| default_base.clone()),
+            })
+        })
+        .collect();
+    let cache = std::sync::Arc::clone(&state.collisions);
+    tauri::async_runtime::spawn_blocking(move || {
+        cache.lock().scan_throttled(
+            &project_id,
+            &inputs,
+            std::time::Instant::now(),
+            crate::collisions::REPORT_TTL,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("collision scan: {e}")))
+}
+
 #[tauri::command]
 pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);

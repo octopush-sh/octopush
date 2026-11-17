@@ -118,3 +118,40 @@ describe("CompanionReview", () => {
     expect(screen.getByText(/not published yet/i)).toBeInTheDocument();
   });
 });
+
+describe("CompanionReview — collision verdict (#732)", () => {
+  it("adds one line naming the other workspace, with a jump to it", async () => {
+    const { useCollisionStore } = await import("../stores/collisionStore");
+    const { useWorkspaceStore } = await import("../stores/workspaceStore");
+    const { collisionsByWorkspace } = await import("../lib/collisions");
+    const select = vi.fn();
+    useWorkspaceStore.setState({ select } as any);
+    const { container, rerender } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />,
+    );
+    expect(container.querySelector('[data-tour="review-companion-collision"]')).toBeNull();
+
+    useCollisionStore.setState({
+      byWorkspace: collisionsByWorkspace([
+        {
+          a: "w1",
+          aName: "auth-flow",
+          b: "w2",
+          bName: "refund-webhooks",
+          files: ["src/billing/limits.ts"],
+          conflictingFiles: ["src/billing/limits.ts"],
+          severity: "conflict",
+          confirmed: true,
+        },
+      ]),
+    });
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    const line = container.querySelector('[data-tour="review-companion-collision"]');
+    expect(line).toHaveTextContent("Will conflict with refund-webhooks in 1 file.");
+    // Warn only: the commit verdict above is unchanged.
+    expect(screen.getByText("1 file to review.")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Open refund-webhooks" }));
+    expect(select).toHaveBeenCalledWith("w2");
+    useCollisionStore.getState().reset();
+  });
+});
