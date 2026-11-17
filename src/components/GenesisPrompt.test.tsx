@@ -109,23 +109,61 @@ describe("GenesisPrompt pre-flight", () => {
     expect(buttons()).toHaveLength(1);
     const cta = buttons()[0];
     expect(cta).toHaveTextContent("Set a crew on it");
-    // Disabled with nothing to do, it is still the brass-ghost primary — only
-    // its ink recedes. No opacity on the whole button (#585).
+    // The frame is the same in every state; only the ink moves.
+    const frame = ["font-serif", "border-[var(--brass-dim)]", "bg-[var(--brass-ghost)]"];
+    const receded = () => {
+      expect(cta).toHaveClass(...frame, "text-octo-brass/50");
+      expect(cta).not.toHaveClass("text-octo-brass");
+      expect(cta).not.toHaveAttribute("data-primed");
+    };
+    const primed = () => {
+      expect(cta).toHaveClass(...frame, "text-octo-brass");
+      expect(cta).not.toHaveClass("text-octo-brass/50");
+      expect(cta).toHaveAttribute("data-primed", "true");
+    };
+    // Disabled with nothing to do: the frame, receded ink. No opacity on the
+    // whole button (#585).
     expect(cta).toBeDisabled();
-    expect(cta).toHaveClass("font-serif", "border-[var(--brass-dim)]", "bg-[var(--brass-ghost)]", "text-octo-brass");
+    receded();
     expect(cta.className).not.toMatch(/uppercase|font-mono|(^|\s)(disabled:)?opacity/);
 
-    // A brief without a key: the honest fallback stays available.
+    // A brief without a key: the honest fallback stays clickable, but receded.
     fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
       target: { value: "a todo cli" },
     });
     expect(cta).toBeEnabled();
+    receded();
 
-    // Brief + key: still the one primary.
+    // Brief + a typed key: full brass ink.
     fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
     expect(buttons()).toHaveLength(1);
     expect(cta).toHaveTextContent("Set a crew on it");
-    expect(cta).toHaveClass("bg-[var(--brass-ghost)]");
+    primed();
+  });
+
+  it("with a stored key, a brief alone gives the CTA full brass ink", async () => {
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
+    render(<GenesisPrompt onSubmit={vi.fn()} />);
+    await screen.findByLabelText("Crew model");
+    const cta = screen.getByRole("button", { name: "Set a crew on it" });
+    expect(cta).toHaveClass("text-octo-brass/50"); // no brief yet
+    fireEvent.change(screen.getByPlaceholderText(/Describe what you want to build/i), {
+      target: { value: "a todo cli" },
+    });
+    expect(cta).toHaveClass("border-[var(--brass-dim)]", "bg-[var(--brass-ghost)]", "text-octo-brass");
+    expect(cta).not.toHaveClass("text-octo-brass/50");
+  });
+
+  it("a disabled genesis link drops to mute ink", async () => {
+    m.listProviders.mockResolvedValue([anthropic(true)] as never);
+    m.getSettings.mockResolvedValue(settings("sk-ant-xxx"));
+    render(<GenesisPrompt onSubmit={vi.fn()} onSketch={vi.fn()} />);
+    await screen.findByLabelText("Crew model");
+    const link = screen.getByRole("button", { name: /think it through first/i });
+    expect(link).toBeDisabled(); // no brief yet
+    expect(link).toHaveClass("text-octo-sage", "disabled:text-octo-mute", "disabled:hover:text-octo-mute");
+    expect(GENESIS_LINK_CLASS).not.toMatch(/disabled:hover:text-octo-sage/);
   });
 
   it("every secondary route shares one ink and one underline (#758)", () => {
@@ -142,7 +180,8 @@ describe("GenesisPrompt pre-flight", () => {
     await screen.findByLabelText("Anthropic API key");
     fireEvent.change(screen.getByLabelText("Anthropic API key"), { target: { value: "sk-ant-zzz" } });
     const cta = screen.getByRole("button", { name: "Wake the crew" });
-    expect(cta).toHaveClass("bg-[var(--brass-ghost)]");
+    expect(cta).toHaveClass("bg-[var(--brass-ghost)]", "text-octo-brass");
+    expect(cta).toHaveAttribute("data-primed", "true");
     m.listProviders.mockResolvedValue([anthropic(true)] as never);
     m.getSettings.mockResolvedValue(settings("sk-ant-zzz"));
     fireEvent.click(cta);

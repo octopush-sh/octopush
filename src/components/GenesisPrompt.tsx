@@ -85,6 +85,10 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
   // saves the key ("Wake the crew"); otherwise it sets the crew on the brief.
   const hasTypedKey = keyValue.trim().length > 0;
   const wakeOnly = ready === false && hasTypedKey && !canGenesis;
+  // Full brass ink only when the CTA can act with confidence: a brief plus a
+  // stored or typed key, or a key alone to save ("Wake the crew"). A brief
+  // with no key stays clickable (the honest Settings fallback) but receded.
+  const primed = wakeOnly || (canGenesis && (ready !== false || hasTypedKey));
 
   const secondary: ReactNode[] = [];
   if (onSketch) {
@@ -193,17 +197,19 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
             />
           </div>
         )}
-        {/* The block's one primary CTA, always in the ceremonial recipe
-            (brass-dim border, brass-ghost fill, brass serif) so it leads the
-            footer in every state. Until there is something to do it keeps
-            the recipe's frame and only its ink recedes: a ghost outline in
-            sage made it the faintest thing on the screen (#758). */}
+        {/* The block's one primary CTA, always in the ceremonial frame
+            (brass-dim border, brass-ghost fill, serif) so it leads the footer
+            in every state — a ghost outline in sage made it the faintest
+            thing on the screen (#758). Only the ink changes: full brass once
+            it can act with confidence, receded brass/50 otherwise (disabled
+            with nothing to do, or a brief with no key — still clickable). */}
         <button
           type="button"
           data-tour="genesis-begin"
           onClick={() => void (wakeOnly ? saveKey() : submit())}
           disabled={!(canGenesis || wakeOnly) || loading || savingKey}
-          className={GENESIS_CTA_CLASS}
+          data-primed={primed ? "true" : undefined}
+          className={`${GENESIS_CTA_CLASS} ${primed ? GENESIS_CTA_INK_PRIMED : GENESIS_CTA_INK_RECEDED}`}
         >
           {savingKey ? "Waking the crew…" : wakeOnly ? "Wake the crew" : "Set a crew on it"}
         </button>
@@ -225,15 +231,21 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
   );
 }
 
-/** The genesis block's one primary CTA: the ceremonial recipe (design-system
- *  §4). Disabled, the frame stays and only the ink recedes — no opacity on the
+/** The genesis block's one primary CTA: the ceremonial frame (design-system
+ *  §4) in every state. The ink is one of the two below. No opacity on the
  *  whole button, which read as the screen being off (#585). */
 export const GENESIS_CTA_CLASS =
-  "shrink-0 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[14px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:cursor-default disabled:text-octo-brass/50 disabled:hover:text-octo-brass/50";
+  "shrink-0 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[14px] transition-colors duration-[180ms] disabled:cursor-default";
+/** Brief plus a stored or typed key, or "Wake the crew": full brass. */
+export const GENESIS_CTA_INK_PRIMED = "text-octo-brass hover:text-octo-brass-hi";
+/** Nothing to do yet (disabled), or a brief with no key (clickable, the honest
+ *  Settings fallback): the frame stays, the ink recedes. */
+export const GENESIS_CTA_INK_RECEDED =
+  "text-octo-brass/50 hover:text-octo-brass disabled:hover:text-octo-brass/50";
 
 /** The quiet link style shared by every secondary route under the genesis CTA:
  *  one ink (sage, ivory on hover) and one underline for all of them, so none
- *  outshouts the primary (#758). A disabled route keeps the ink; its `title`
- *  says why, and the primary beside it shows the same disabled state. */
+ *  outshouts the primary (#758). A disabled route drops to mute ink, so it
+ *  reads as unavailable; its `title` says why. */
 export const GENESIS_LINK_CLASS =
-  "font-serif text-[12px] text-octo-sage underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:text-octo-ivory hover:decoration-octo-brass disabled:cursor-default disabled:hover:text-octo-sage disabled:hover:decoration-octo-brass/40";
+  "font-serif text-[12px] text-octo-sage underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:text-octo-ivory hover:decoration-octo-brass disabled:cursor-default disabled:text-octo-mute disabled:hover:text-octo-mute disabled:hover:decoration-octo-brass/40";
