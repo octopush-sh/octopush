@@ -2271,6 +2271,7 @@ impl CliRunner {
         // in `sandbox-exec -p <profile> claude …`. NO silent fallback — if the
         // sandbox can't be set up the stage fails rather than running unconfined.
         let mut sandbox_env: Vec<(String, String)> = cache_env;
+        let mut left_out: Vec<String> = Vec::new();
         let (program, exec_args): (std::ffi::OsString, Vec<std::ffi::OsString>) =
             match ctx.exec_isolation.as_str() {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
@@ -2293,6 +2294,7 @@ impl CliRunner {
                     ) {
                         Ok(prepared) => {
                             sandbox_env = prepared.env;
+                            left_out = prepared.left_out;
                             (prepared.program, prepared.args)
                         }
                         Err(e) => {
@@ -2385,7 +2387,7 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
@@ -2394,6 +2396,7 @@ impl CliRunner {
                 .map(|s| format!(" · {s}"))
                 .unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
+            crate::orchestrator::sandbox::left_out_label(&left_out).map(|s| format!(" · {s}")).unwrap_or_default(),
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {
             emitter.notice(&format!(
