@@ -1,5 +1,5 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
-import type { SecretFinding } from "./secretGuard";
+import type { SecretHold } from "./secretGuard";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -352,7 +352,7 @@ export interface RunStage {
    *  merge / release) was held because the worktree holds a possible secret.
    *  `acknowledged` once the director approved proceeding past exactly these
    *  findings. Findings carry file, line and kind only — never the value. */
-  secretHold?: { acknowledged: boolean; fingerprint: string; findings: SecretFinding[] } | null;
+  secretHold?: SecretHold | null;
 }
 export interface RunDetail {
   run: Run | null;
@@ -1089,14 +1089,15 @@ export const ipc = {
 
   /** Returns the new short SHA on success. */
   /** Secret guard (#730): rejects with `SecretsFound` (see `lib/secretGuard`)
-   *  on a possible credential in the staged diff, unless `allowSecrets`
-   *  carries the user's explicit confirm for this one commit. */
-  commitChanges: (workspacePath: string, message: string, allowSecrets?: boolean) =>
-    invoke<string>("commit_changes", { workspacePath, message, allowSecrets: allowSecrets ?? null }),
+   *  on a possible credential in the staged diff (or a partial scan), unless
+   *  `allowFindings` is the refusal's `fingerprint` — the user's confirm of
+   *  exactly what the dialog showed. The core rescans every time. */
+  commitChanges: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("commit_changes", { workspacePath, message, allowFindings: allowFindings ?? null }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
-  amendCommit: (workspacePath: string, message: string, allowSecrets?: boolean) =>
-    invoke<string>("amend_commit", { workspacePath, message, allowSecrets: allowSecrets ?? null }),
+  amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("amend_commit", { workspacePath, message, allowFindings: allowFindings ?? null }),
   getLastCommit: (workspacePath: string) =>
     invoke<LastCommit | null>("get_last_commit", { workspacePath }),
   /** Newest-first commit page from HEAD; `skip` offsets for pagination. */
@@ -1195,9 +1196,10 @@ export const ipc = {
 
   /** Returns the trimmed git-push output (combined stdout+stderr). Secret
    *  guard (#730): rejects with `SecretsFound` on a possible credential in the
-   *  commits being pushed, unless `allowSecrets` is the user's confirm. */
-  pushBranch: (workspacePath: string, allowSecrets?: boolean) =>
-    invoke<string>("push_branch", { workspacePath, allowSecrets: allowSecrets ?? null }),
+   *  commits being pushed, unless `allowFindings` is the fingerprint the
+   *  dialog showed and the fresh scan still matches it. */
+  pushBranch: (workspacePath: string, allowFindings?: string) =>
+    invoke<string>("push_branch", { workspacePath, allowFindings: allowFindings ?? null }),
 
   /** Workspace-wide file listing (respects .gitignore). Returns paths
    *  relative to the workspace root. Capped at 20k entries. */
@@ -1253,9 +1255,11 @@ export const ipc = {
   prDraftContext: (workspacePath: string, base: string) =>
     invoke<PrDraftContext>("pr_draft_context", { workspacePath, base }),
   /** `gh pr create` from the current branch (body passed via a file). The
-   *  branch must already be published. Resolves to the new PR. */
-  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean, allowSecrets?: boolean) =>
-    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft, allowSecrets: allowSecrets ?? null }),
+   *  branch must already be published. Resolves to the new PR. Secret guard
+   *  (#730): the PR's own scan, separate from the push's; `allowFindings`
+   *  confirms only the fingerprint the PR dialog showed. */
+  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean, allowFindings?: string) =>
+    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft, allowFindings: allowFindings ?? null }),
 
   /** Fetch a PR's head ref as a local branch (no-op if it already exists),
    *  so it can serve as the base of a new workspace. */

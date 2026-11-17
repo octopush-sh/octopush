@@ -118,18 +118,23 @@ pub enum AppError {
         limit: u32,
     },
 
+    /// The secret guard (#730) found possible credentials in what a commit,
+    /// push or pull request would send, or couldn't scan all of it
+    /// (`partial`). The frontend detects `kind == "SecretsFound"` to show the
+    /// confirm dialog, and echoes `fingerprint` back to override exactly what
+    /// it showed. Findings carry the file, line and kind only — never any
+    /// part of the value; `findings` is capped, `total` is not.
+    #[error("possible secret: {}", crate::secret_scan::refusal_summary(.findings, *.total, *.partial))]
+    SecretsFound {
+        findings: Vec<crate::secret_scan::SecretFinding>,
+        total: usize,
+        partial: bool,
+        fingerprint: String,
+    },
+
     /// Returned when a backend budget gate blocks a spend (Phase 3 enforcement).
     /// The frontend detects `kind == "BudgetExceeded"` to surface the budget UI /
     /// override affordance. `scope` is a human string like "workspace daily".
-    /// The secret guard (#730) found possible credentials in what a commit,
-    /// push or pull request would send. The frontend detects
-    /// `kind == "SecretsFound"` to show the confirm dialog. Findings carry the
-    /// file, line and kind only — never any part of the value.
-    #[error("possible secret: {}", crate::secret_scan::summarize(.findings))]
-    SecretsFound {
-        findings: Vec<crate::secret_scan::SecretFinding>,
-    },
-
     #[error("budget exceeded: {scope} — spent {} of {}", usd(.spent), usd(.limit))]
     BudgetExceeded {
         scope: String,
@@ -201,11 +206,14 @@ impl Serialize for AppError {
                 map.serialize_entry("limit", limit)?;
                 map.end()
             }
-            AppError::SecretsFound { findings } => {
-                let mut map = ser.serialize_map(Some(3))?;
+            AppError::SecretsFound { findings, total, partial, fingerprint } => {
+                let mut map = ser.serialize_map(Some(6))?;
                 map.serialize_entry("kind", "SecretsFound")?;
                 map.serialize_entry("message", &self.to_string())?;
                 map.serialize_entry("findings", findings)?;
+                map.serialize_entry("total", total)?;
+                map.serialize_entry("partial", partial)?;
+                map.serialize_entry("fingerprint", fingerprint)?;
                 map.end()
             }
             other => ser.serialize_str(&other.to_string()),

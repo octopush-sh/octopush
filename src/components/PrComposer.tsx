@@ -34,7 +34,7 @@ import { FadeSwap } from "./primitives/FadeSwap";
 import { TogglePill } from "./controls/TogglePill";
 import { pushToast } from "./Toasts";
 import { SecretGuardDialog } from "./SecretGuardDialog";
-import { secretFindings, type SecretFinding } from "../lib/secretGuard";
+import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 import { resolveHelperModel } from "../lib/helperModels";
 
 type Phase =
@@ -59,7 +59,14 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
   const [body, setBody] = useState("");
   const [draft, setDraft] = useState(false);
   const [drafting, setDrafting] = useState(false);
-  const [secretHold, setSecretHold] = useState<SecretFinding[] | null>(null);
+  // Secret guard (#730): the push and the PR are scanned separately, and
+  // each refusal is confirmed on its own — one override never covers both.
+  const [secretHold, setSecretHold] = useState<{
+    action: "push" | "pr";
+    refusal: SecretRefusal;
+    /** Fingerprints already confirmed in this attempt. */
+    allow: { push?: string; pr?: string };
+  } | null>(null);
   const [draftNote, setDraftNote] = useState<{ tone: "mute" | "rouge"; text: string } | null>(null);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -186,24 +193,27 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspacePath]);
 
-  async function handleCreate(allowSecrets?: boolean) {
+  /** `allow`: the fingerprints the user confirmed, one per scan. */
+  async function handleCreate(allow: { push?: string; pr?: string } = {}) {
     if (!base || !title.trim()) return;
     setCreating(true);
     setCreateError(null);
+    let step: "push" | "pr" = "push";
     try {
       const status = await ipc.getGitStatus(workspacePath);
       // Never push the base branch itself: a PR needs a branch other than its base.
       if (!status.branch || status.branch === "HEAD" || status.branch === bareBase(base, branches)) {
         throw new Error(`Pick a base other than ${status.branch ?? "this branch"}.`);
       }
-      // Secret guard (#730): the push and the PR both refuse a branch with a
-      // possible credential until the user confirms this one pull request.
+      // Secret guard (#730): the push and the PR each refuse a branch with a
+      // possible credential until the user confirms that scan's findings.
       if (!status.hasUpstream || status.ahead > 0) {
-        if (allowSecrets) await ipc.pushBranch(workspacePath, true);
+        if (allow.push) await ipc.pushBranch(workspacePath, allow.push);
         else await ipc.pushBranch(workspacePath);
       }
-      const pr = allowSecrets
-        ? await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft, true)
+      step = "pr";
+      const pr = allow.pr
+        ? await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft, allow.pr)
         : await ipc.createPullRequest(workspacePath, base, title.trim(), body, draft);
       usePrStore.getState().setPr(workspace.id, pr);
       pushToast({
@@ -214,8 +224,8 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
       });
       onClose();
     } catch (e) {
-      const findings = secretFindings(e);
-      if (findings) setSecretHold(findings);
+      const refusal = secretRefusal(e);
+      if (refusal) setSecretHold({ action: step, refusal, allow });
       else setCreateError(String(e));
     } finally {
       setCreating(false);
@@ -374,15 +384,16 @@ export function PrComposer({ workspace, workspacePath, onClose }: Props) {
       </div>
       {secretHold && (
         <SecretGuardDialog
-          action="pr"
-          findings={secretHold}
+          action={secretHold.action}
+          refusal={secretHold.refusal}
           onLeaveOut={() => {
             setSecretHold(null);
             setCreateError("Held: take the possible secret out of the branch, then open the pull request.");
           }}
           onOverride={() => {
+            const { action, refusal, allow } = secretHold;
             setSecretHold(null);
-            void handleCreate(true);
+            void handleCreate({ ...allow, [action]: refusal.fingerprint });
           }}
         />
       )}

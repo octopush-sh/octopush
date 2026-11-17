@@ -1680,12 +1680,16 @@ impl Orchestrator {
     /// The secret guard's boundary check for one about-to-start stage (#730).
     /// Only Action-environment roles are checked. Scans the worktree's
     /// changes against the workspace's base (commits + staged + unstaged +
-    /// untracked); on a finding the director hasn't approved, parks the stage
+    /// untracked) on a blocking thread; on a finding, a partial scan (the
+    /// 16 MB budget ran out) or a worktree it couldn't read — fail closed, so
+    /// a detached run or a Routine never ships unchecked — parks the stage
     /// `awaiting_checkpoint` (never started, like a budget park) with its
-    /// `secret_hold`, journals the reason and fires the "decision" checkpoint.
-    /// Returns `true` when it parked. Never journals or stores a value: the
-    /// hold and the notice carry the file, the line and the kind only.
-    fn secret_gate(&self, run: &crate::db::RunRow, stage: &RunStageRow) -> AppResult<bool> {
+    /// `secret_hold`, journals the reason and fires the "decision" checkpoint
+    /// unless the director already approved exactly this hold (same
+    /// fingerprint). Returns `true` when it parked. With the guard off, a stale
+    /// hold is cleared. Never journals or stores a value: the hold and the
+    /// notice carry the file, the line and the kind only.
+    async fn secret_gate(&self, run: &crate::db::RunRow, stage: &RunStageRow) -> AppResult<bool> {
         let role = self.db.lock().get_role(&stage.role).ok().flatten();
         let Some(role) = role else { return Ok(false) };
         if role.environment != crate::orchestrator::types::RoleEnvironment::Action {
@@ -1693,9 +1697,11 @@ impl Orchestrator {
         }
         let settings = crate::settings::load_settings().unwrap_or_default();
         if !crate::secret_scan::guard_enabled(&settings) {
+            if stage.secret_hold.is_some() {
+                self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+            }
             return Ok(false);
         }
-        let Ok(path) = self.workspace_path(run) else { return Ok(false) };
         let base = self
             .db
             .lock()
@@ -1703,38 +1709,42 @@ impl Orchestrator {
             .ok()
             .flatten()
             .and_then(|w| w.from_branch);
-        let files = match crate::secret_scan::worktree_files(&path, base.as_deref()) {
-            Ok(f) => f,
-            Err(e) => {
-                tracing::warn!(run_id = %run.id, "secret guard skipped: {e}");
-                self.journal_notice(&run.id, &stage.id,
-                    "secret guard: couldn't read the worktree's changes, so this stage wasn't checked");
+        let known = crate::secret_scan::known_secrets_from(&settings);
+        let scanned = match self.workspace_path(run) {
+            Ok(path) => tokio::task::spawn_blocking(move || {
+                crate::secret_scan::worktree_files(&path, base.as_deref())
+                    .map(|c| crate::secret_scan::scan_report(&c.files, &known, c.partial))
+            })
+            .await
+            .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}")))),
+            Err(e) => Err(e),
+        };
+        let hold = match scanned {
+            Ok(report) if !report.needs_confirmation() => {
+                if stage.secret_hold.is_some() {
+                    self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+                }
                 return Ok(false);
             }
-        };
-        let known = crate::secret_scan::known_secrets_from(&settings);
-        let findings = crate::secret_scan::scan_added(&files, &known);
-        if findings.is_empty() {
-            if stage.secret_hold.is_some() {
-                self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+            Ok(report) => crate::secret_scan::SecretHold::from_report(report),
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "secret guard couldn't scan the worktree: {e}");
+                crate::secret_scan::SecretHold::unreadable()
             }
-            return Ok(false);
-        }
-        let fp = crate::secret_scan::fingerprint(&findings);
+        };
         if let Some(h) = &stage.secret_hold {
-            if h.acknowledged && h.fingerprint == fp {
+            if h.acknowledged && h.fingerprint == hold.fingerprint {
                 self.journal_notice(&run.id, &stage.id, &format!(
                     "secret guard: the director approved proceeding · {}",
-                    crate::secret_scan::summarize(&findings)
+                    hold.summary()
                 ));
                 return Ok(false);
             }
         }
-        let hold = crate::secret_scan::SecretHold { acknowledged: false, fingerprint: fp, findings };
         self.db.lock().set_stage_secret_hold(&stage.id, Some(&hold))?;
         self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
         let label = secret_hold_stage_label(&stage.role, &role.label);
-        self.journal_notice(&run.id, &stage.id, &crate::secret_scan::hold_notice(&label, &hold.findings));
+        self.journal_notice(&run.id, &stage.id, &crate::secret_scan::hold_notice(&label, &hold));
         self.emit_run_update(&run.id);
         self.emit_checkpoint(&run.id, &stage.id, "decision");
         Ok(true)
@@ -1918,7 +1928,7 @@ impl Orchestrator {
             // approves a secret. Detached runs and Routines park the same way.
             let mut held = false;
             for s in &batch {
-                held |= self.secret_gate(&run, s)?;
+                held |= self.secret_gate(&run, s).await?;
             }
             if held {
                 self.db.lock().set_run_status(run_id, "paused", false)?;

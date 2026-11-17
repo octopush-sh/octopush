@@ -18996,16 +18996,19 @@ mod secret_guard_tests {
         let findings = scan_added(&[file("src/leak.ts", &refs)], &known);
         assert_eq!(findings.len(), secrets.len());
 
-        let err = crate::error::AppError::SecretsFound { findings: findings.clone() };
-        let hold = SecretHold { acknowledged: false, fingerprint: fingerprint(&findings), findings: findings.clone() };
+        let report = scan_report(&[file("src/leak.ts", &refs)], &known, false);
+        let err = crate::error::AppError::SecretsFound {
+            findings: findings.clone(), total: report.total, partial: false, fingerprint: report.fingerprint.clone(),
+        };
+        let hold = SecretHold::from_report(report);
         let outputs = [
             format!("{findings:?}"),
             serde_json::to_string(&findings).unwrap(),
             err.to_string(),
             format!("{err:?}"),
             serde_json::to_string(&err).unwrap(),
-            summarize(&findings),
-            hold_notice("the pull request", &findings),
+            refusal_summary(&findings, findings.len(), true),
+            hold_notice("the pull request", &hold),
             serde_json::to_string(&hold).unwrap(),
             format!("{known:?}"),
         ];
@@ -19020,24 +19023,62 @@ mod secret_guard_tests {
         assert_eq!(ipc["kind"], "SecretsFound");
         assert_eq!(ipc["findings"][0]["file"], "src/leak.ts");
         assert_eq!(ipc["findings"][0]["line"], 1);
+        assert_eq!(ipc["total"], secrets.len());
+        assert_eq!(ipc["partial"], false);
+        assert_eq!(ipc["fingerprint"].as_str().unwrap().len(), 64);
     }
 
     #[test]
     fn summary_and_notice_read_kind_file_and_line() {
         let f = scan_one("tests/fixtures.ts", &["", "", "", "", "", "", "", "", "", "", "", &true_positives()[0].2]);
-        assert_eq!(summarize(&f), "Anthropic API key in tests/fixtures.ts:12");
+        assert_eq!(refusal_summary(&f, 1, false), "Anthropic API key in tests/fixtures.ts:12");
+        let tp = true_positives().remove(0).2;
+        let lines = ["", "", "", "", "", "", "", "", "", "", "", tp.as_str()];
+        let hold = SecretHold::from_report(scan_report(&[file("tests/fixtures.ts", &lines)], &[], false));
         assert_eq!(
-            hold_notice("the pull request", &f),
+            hold_notice("the pull request", &hold),
             "Held before the pull request: possible secret · Anthropic API key in tests/fixtures.ts:12"
+        );
+        let partial = SecretHold::from_report(scan_report(&[], &[], true));
+        assert_eq!(
+            hold_notice("the push", &partial),
+            "Held before the push: secret scan incomplete · scanned the first 16 MB; the rest wasn't checked"
+        );
+        assert_eq!(
+            hold_notice("the push", &SecretHold::unreadable()),
+            "Held before the push: the secret guard couldn't read the worktree's changes, so nothing was checked"
         );
     }
 
     #[test]
-    fn fingerprint_changes_with_the_findings_not_their_order() {
-        let a = SecretFinding { file: "a".into(), line: Some(1), rule: "r".into(), kind: "k".into(), yours: false };
-        let b = SecretFinding { file: "b".into(), line: Some(2), rule: "r".into(), kind: "k".into(), yours: false };
-        assert_eq!(fingerprint(&[a.clone(), b.clone()]), fingerprint(&[b.clone(), a.clone()]));
-        assert_ne!(fingerprint(&[a.clone()]), fingerprint(&[a, b]));
+    fn fingerprint_covers_every_finding_the_value_and_partial_not_order() {
+        let tps = true_positives();
+        let a = file("a.ts", &[tps[0].2.as_str()]);
+        let b = file("b.ts", &[tps[1].2.as_str()]);
+        let fp = |files: &[AddedFile], partial: bool| scan_report(files, &[], partial).fingerprint;
+        assert_eq!(fp(&[a.clone(), b.clone()], false), fp(&[b.clone(), a.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone(), b.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone()], true), "a partial scan is a different question");
+        // Same file, line and rule, a different value: a different fingerprint.
+        let other = ["sk-", "ant-", "api03-"].concat() + &rnd(99, 93, B62) + "AA";
+        let a2 = file("a.ts", &[&format!("const KEY = \"{other}\";")]);
+        assert_eq!(scan_added(&[a2.clone()], &[])[0].rule, "anthropic-key");
+        assert_ne!(fp(&[a.clone()], false), fp(&[a2], false));
+        // Past the display cap: the 51st finding still changes it.
+        let many: Vec<String> = (0..MAX_FINDINGS + 1)
+            .map(|i| format!("k = \"{}\"", ["gh", "p_"].concat() + &rnd(1000 + i as u64, 36, B62)))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let full = scan_report(&[file("m.ts", &refs)], &[], false);
+        assert_eq!(full.findings.len(), MAX_FINDINGS);
+        assert_eq!(full.total, MAX_FINDINGS + 1);
+        let capped = scan_report(&[file("m.ts", &refs[..MAX_FINDINGS])], &[], false);
+        assert_eq!(capped.findings, full.findings, "the shown list is identical");
+        assert_ne!(capped.fingerprint, full.fingerprint, "but the fingerprint is not");
+        // The fingerprint holds no part of any value.
+        for (_, secret, _) in tps {
+            assert!(!full.fingerprint.contains(&secret[secret.len() - 8..]));
+        }
     }
 
     // ── git-level collection ────────────────────────────────────────────
@@ -19175,10 +19216,10 @@ mod secret_guard_tests {
         let path = dir.path().to_string_lossy().to_string();
 
         let commit = crate::commands::commit_changes(path.clone(), "msg".into(), None).await;
-        let amend = crate::commands::amend_commit(path.clone(), "msg".into(), Some(false)).await;
+        let amend = crate::commands::amend_commit(path.clone(), "msg".into(), Some("stale".into())).await;
         for r in [commit, amend] {
             match r {
-                Err(crate::error::AppError::SecretsFound { findings }) => {
+                Err(crate::error::AppError::SecretsFound { findings, .. }) => {
                     assert_eq!(findings[0].location(), "cfg.ts:1");
                 }
                 other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
@@ -19210,20 +19251,180 @@ mod secret_guard_tests {
         std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
         commit_all(&repo, "leak");
         let path = dir.path().to_string_lossy().to_string();
-        // Explicit confirm for this one push: the guard steps aside and git
-        // runs (and fails here only because there is no remote).
+        // Explicit confirm for this one push, bound to what the dialog showed:
+        // the guard steps aside and git runs (and fails here only because
+        // there is no remote).
         {
             let _s = SettingsGuard::new(serde_json::json!({}));
-            let r = crate::commands::push_branch(path.clone(), Some(true)).await;
+            let shown = match crate::commands::push_branch(path.clone(), None).await {
+                Err(crate::error::AppError::SecretsFound { fingerprint, .. }) => fingerprint,
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            };
+            let r = crate::commands::push_branch(path.clone(), Some(shown.clone())).await;
             assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
-            // The next push asks again.
-            let r = crate::commands::push_branch(path.clone(), None).await;
+            // A fingerprint that doesn't match the fresh scan is refused.
+            let r = crate::commands::push_branch(path.clone(), Some("0".repeat(64))).await;
             assert!(matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // A new secret after the dialog: the old fingerprint no longer
+            // covers it, and the refusal carries the new findings.
+            let more = true_positives().remove(4).2;
+            std::fs::write(dir.path().join("more.ts"), format!("{more}\n")).unwrap();
+            commit_all(&repo, "more");
+            match crate::commands::push_branch(path.clone(), Some(shown)).await {
+                Err(crate::error::AppError::SecretsFound { findings, total, .. }) => {
+                    assert_eq!(total, 2);
+                    assert!(findings.iter().any(|f| f.file == "more.ts"));
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
         }
         // Setting off: no scan at all.
         let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
         let r = crate::commands::push_branch(path, None).await;
         assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    const HEX: &str = "0123456789abcdef";
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    /// (rule id, line) for the provider formats added after review. Formats:
+    /// TruffleHog's openrouter/xai/groq detectors; gitleaks' huggingface,
+    /// gitlab-pat, npm-access-token and slack-app-token rules.
+    fn more_true_positives() -> Vec<(&'static str, String)> {
+        vec![
+            ("openrouter-key", format!("OPENROUTER_API_KEY={}", ["sk-", "or-", "v1-"].concat() + &rnd(200, 64, HEX))),
+            ("xai-key", format!("const k = \"{}\";", ["xa", "i-"].concat() + &rnd(201, 80, B62))),
+            ("groq-key", format!("groq = '{}'", ["gs", "k_"].concat() + &rnd(202, 52, B62))),
+            ("huggingface-token", format!("HF_TOKEN: {}", ["h", "f_"].concat() + &rnd(203, 34, LETTERS))),
+            ("gitlab-token", format!("token = \"{}\"", ["gl", "pat-"].concat() + &rnd(204, 20, B62))),
+            ("npm-token", format!("//registry.npmjs.org/:_authToken={}", ["np", "m_"].concat() + &rnd(205, 36, B62))),
+            ("slack-token", format!(
+                "SLACK_APP={}-1-A{}-{}-{}",
+                ["xa", "pp"].concat(), rnd(206, 10, UPPER), rnd(207, 13, DIGITS), rnd(208, 64, HEX)
+            )),
+        ]
+    }
+
+    #[test]
+    fn the_added_provider_rules_find_their_true_positives() {
+        for (rule, line) in more_true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+    }
+
+    #[test]
+    fn the_added_provider_rules_skip_near_misses() {
+        let near = vec![
+            ["sk-", "or-", "v1-"].concat() + &rnd(210, 63, HEX),           // 63 hex
+            ["sk-", "or-", "v1-"].concat() + &rnd(211, 64, B62),           // not hex
+            ["xa", "i-"].concat() + &rnd(212, 79, B62),                    // 79
+            ["xa", "i-"].concat() + &rnd(213, 81, B62),                    // runs on
+            ["gs", "k_"].concat() + &rnd(214, 51, B62),                    // 51
+            ["h", "f_"].concat() + &rnd(215, 33, LETTERS),                 // 33
+            ["h", "f_"].concat() + &rnd(216, 34, LETTERS) + "7",           // runs on
+            ["gl", "pat-"].concat() + &rnd(217, 19, B62),                  // 19
+            ["gl", "pat-"].concat() + &"x".repeat(20),                     // placeholder
+            ["np", "m_"].concat() + &rnd(218, 35, B62),                    // 35
+            ["xa", "pp"].concat() + "-your-app-token-here",
+        ];
+        for t in near {
+            assert!(scan_one("src/a.ts", &[&format!("k = \"{t}\"")]).is_empty(), "false positive on {t:?}");
+        }
+    }
+
+    #[test]
+    fn an_encrypted_pem_key_is_still_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let f = scan_one("deploy/key.pem", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "private-key");
+        let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+    }
+
+    #[test]
+    fn public_by_design_values_are_not_flagged() {
+        let google = ["AI", "za"].concat() + &rnd(220, 35, B62);
+        // A Firebase web config's apiKey is a public identifier.
+        let fb = scan_one("src/firebase.ts", &[
+            "const firebaseConfig = {",
+            &format!("  apiKey: \"{google}\","),
+            "  authDomain: \"demo-app.firebaseapp.com\",",
+            "  projectId: \"demo-app\",",
+            "};",
+        ]);
+        assert!(fb.is_empty(), "{fb:?}");
+        // The same key outside a Firebase config still is one.
+        assert_eq!(scan_one("src/maps.ts", &[&format!("const apiKey = \"{google}\";")]).len(), 1);
+        // NEXT_PUBLIC_* values ship to the browser on purpose…
+        let v = rnd(221, 32, B62);
+        assert!(scan_one(".env.local", &[&format!("NEXT_PUBLIC_API_KEY={v}")]).is_empty());
+        assert!(scan_one(".env", &[&format!("NEXT_PUBLIC_FIREBASE_API_KEY={google}")]).is_empty());
+        assert!(scan_one("src/env.ts", &[&format!("  NEXT_PUBLIC_API_KEY: \"{v}\",")]).is_empty());
+        // …but a provider secret there is still a leak.
+        let stripe = ["sk", "_live_"].concat() + &rnd(222, 24, B62);
+        assert_eq!(scan_one(".env", &[&format!("NEXT_PUBLIC_STRIPE_KEY={stripe}")])[0].rule, "stripe-key");
+        // An example JWT in prose docs is an illustration; in code it isn't.
+        let jwt = format!("eyJ{}.eyJ{}.{}", rnd(223, 30, B62), rnd(224, 60, B62), rnd(225, 43, B62));
+        let line = format!("\"access_token\": \"{jwt}\"");
+        assert!(scan_one("README.md", &[&line]).is_empty());
+        assert!(scan_one("docs/auth.mdx", &[&line]).is_empty());
+        assert_eq!(scan_one("src/client.ts", &[&line]).len(), 1);
+    }
+
+    #[test]
+    fn a_scan_past_the_byte_budget_is_partial_and_needs_confirmation() {
+        let fresh = repo;
+        let (dir, git) = repo();
+        // Three 6 MB files: the 16 MB budget runs out inside the third.
+        let chunk = "const ok = computeValue(input, other) + 1; // filler line\n".repeat(6 * 1024 * 1024 / 58);
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(dir.path().join(name), &chunk).unwrap();
+            stage(&git, name);
+        }
+        let c = staged_files(dir.path()).unwrap();
+        assert!(c.partial);
+        let r = scan_report(&c.files, &[], c.partial);
+        assert_eq!(r.total, 0);
+        assert!(r.needs_confirmation(), "partial is never clean");
+        let err = enforce(r.clone(), None).unwrap_err();
+        assert!(err.to_string().contains("scanned the first 16 MB; the rest wasn't checked"), "{err}");
+        assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        // One file larger than the whole budget is never read as text.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("huge.txt"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        stage(&git, "huge.txt");
+        assert!(staged_files(dir.path()).unwrap().partial);
+        // A small change is complete.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("x.ts"), "ok\n").unwrap();
+        stage(&git, "x.ts");
+        assert!(!staged_files(dir.path()).unwrap().partial);
+    }
+
+    #[test]
+    fn with_no_upstream_or_default_branch_push_scans_only_unpushed_commits() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let pushed = commit_all(&repo, "already on a fork");
+        // On a remote, but not origin's default branch nor an upstream.
+        repo.reference("refs/remotes/fork/topic", pushed, true, "test").unwrap();
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "history already on a remote isn't rescanned: {f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].file, "new.ts");
     }
 
     #[test]
@@ -19384,6 +19585,39 @@ mod secret_guard_orchestrator_tests {
         std::fs::remove_file(dir.path().join("tests/fixtures.ts")).unwrap();
         let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
         assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_worktree_parks_instead_of_shipping_unchecked() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        // The worktree vanished (or isn't a repo any more): nothing can be checked.
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        let hold = pr.secret_hold.clone().expect("held");
+        assert!(hold.unreadable);
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("couldn't read the worktree's changes, so nothing was checked"), "{log}");
+        // The director may still choose to proceed.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "done");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn turning_the_guard_off_clears_a_stale_hold() {
+        let (db, run, _dir, sdir) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_some());
+        std::fs::write(sdir.path().join("settings.json"), r#"{"secretGuardEnabled":false}"#).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "done");
+        assert!(pr.secret_hold.is_none(), "no stale hold left behind");
         crate::settings::test_settings_path::set(None);
     }
 

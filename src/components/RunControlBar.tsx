@@ -9,7 +9,7 @@ import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
 import { haltCause } from "../lib/stageHalt";
 import { formatUsd } from "../lib/cost";
-import { findingLocation, secretSummary } from "../lib/secretGuard";
+import { findingLocation, holdSummary } from "../lib/secretGuard";
 
 interface LoopState {
   iteration: number;
@@ -259,10 +259,13 @@ function DecisionBar({
 
   const failed = blockedStage.status === "failed";
   // Secret guard (#730): an Action stage held before it started because the
-  // worktree holds a possible secret. Approving is the explicit override.
+  // worktree holds a possible secret, the scan stopped at its 16 MB budget,
+  // or the worktree couldn't be read (fail closed). Approving is the
+  // explicit override.
   const secret = !failed && blockedStage.secretHold && !blockedStage.secretHold.acknowledged
-    ? blockedStage.secretHold.findings
+    ? blockedStage.secretHold
     : null;
+  const secretCount = secret ? Math.max(secret.total ?? 0, secret.findings.length) : 0;
   const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
   // A cause that prefers a re-run (a deferred tool) is never a transient wait.
   const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
@@ -420,8 +423,8 @@ function DecisionBar({
                 ) : failed ? (
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
                 ) : secret ? (
-                  <span data-tour="direct-secret-hold" title={secret.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n")}>
-                    Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {secretSummary(secret)}
+                  <span data-tour="direct-secret-hold" title={secret.findings.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n") || undefined}>
+                    Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {holdSummary(secret)}
                   </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
@@ -439,9 +442,11 @@ function DecisionBar({
                 </button>
               ) : secret ? (
                 <button type="button" onClick={onApprove}
-                  title="Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
+                  title={secretCount > 0
+                    ? "Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
+                    : "Start this stage anyway, without a complete check."}
                   className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]`}>
-                  {secret.length === 1 ? "Proceed regardless" : "Proceed past them"}
+                  {secretCount > 1 ? "Proceed past them" : "Proceed regardless"}
                 </button>
               ) : (
                 <button type="button" onClick={onApprove}

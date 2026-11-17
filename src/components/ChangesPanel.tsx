@@ -31,7 +31,7 @@ import type { FileChange, GitStatus } from "../lib/types";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { SecretGuardDialog } from "./SecretGuardDialog";
-import { secretFindings, type SecretFinding } from "../lib/secretGuard";
+import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 import { ModalShell } from "./ModalShell";
 import { ConflictAiModal } from "./ConflictAiModal";
 import { GitOpsMenu } from "./GitOpsMenu";
@@ -95,7 +95,7 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
   const [drafting, setDrafting] = useState(false);
   const [discardTarget, setDiscardTarget] = useState<string | null>(null);
-  const [secretHold, setSecretHold] = useState<{ action: "commit" | "push"; findings: SecretFinding[] } | null>(null);
+  const [secretHold, setSecretHold] = useState<{ action: "commit" | "push"; refusal: SecretRefusal } | null>(null);
   const [reconcile, setReconcile] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [resolvingPath, setResolvingPath] = useState<string | null>(null);
@@ -255,13 +255,14 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handleCommitOrAmend(allowSecrets?: boolean) {
+  /** `allowFindings`: the fingerprint of the refusal the user confirmed. */
+  async function handleCommitOrAmend(allowFindings?: string) {
     const msg = commitMessage.trim();
     if (!msg || (!amend && staged.length === 0)) return;
     setCommitting(true);
     try {
-      const sha = allowSecrets
-        ? amend ? await ipc.amendCommit(projectPath, msg, true) : await ipc.commitChanges(projectPath, msg, true)
+      const sha = allowFindings
+        ? amend ? await ipc.amendCommit(projectPath, msg, allowFindings) : await ipc.commitChanges(projectPath, msg, allowFindings)
         : amend ? await ipc.amendCommit(projectPath, msg) : await ipc.commitChanges(projectPath, msg);
       // A commit changes the worktree's dirty state — refresh the rail signal.
       const pid = useProjectStore.getState().current?.id;
@@ -275,9 +276,10 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       onChange?.();
     } catch (e) {
       // Secret guard (#730): a possible credential in the staged diff asks
-      // first instead of failing.
-      const findings = secretFindings(e);
-      if (findings) setSecretHold({ action: "commit", findings });
+      // first instead of failing. A confirmed fingerprint that no longer
+      // matches comes back as a new refusal with the new findings.
+      const refusal = secretRefusal(e);
+      if (refusal) setSecretHold({ action: "commit", refusal });
       else pushToast({ level: "error", title: amend ? "Amend failed" : "Commit failed", body: String(e) });
     } finally {
       setCommitting(false);
@@ -298,10 +300,10 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
     }
   }
 
-  async function handlePush(allowSecrets?: boolean) {
+  async function handlePush(allowFindings?: string) {
     setPushing(true);
     try {
-      const result = allowSecrets ? await ipc.pushBranch(projectPath, true) : await ipc.pushBranch(projectPath);
+      const result = allowFindings ? await ipc.pushBranch(projectPath, allowFindings) : await ipc.pushBranch(projectPath);
       pushToast({
         level: "success",
         title: "Branch published",
@@ -318,8 +320,8 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
           .catch(() => {});
       }
     } catch (e) {
-      const findings = secretFindings(e);
-      if (findings) setSecretHold({ action: "push", findings });
+      const refusal = secretRefusal(e);
+      if (refusal) setSecretHold({ action: "push", refusal });
       else pushToast({ level: "error", title: "Push failed", body: String(e) });
     } finally {
       setPushing(false);
@@ -738,18 +740,18 @@ export function ChangesPanel({ projectPath, workspaceId, diff = "", onFileClick,
       {secretHold && (
         <SecretGuardDialog
           action={secretHold.action}
-          findings={secretHold.findings}
+          refusal={secretHold.refusal}
           onLeaveOut={() => {
             // Take the user to the first finding's diff so they can drop it.
-            const first = secretHold.findings[0];
+            const first = secretHold.refusal.findings[0];
             setSecretHold(null);
             if (first) onFileClick?.(first.file);
           }}
           onOverride={() => {
-            const action = secretHold.action;
+            const { action, refusal } = secretHold;
             setSecretHold(null);
-            if (action === "commit") void handleCommitOrAmend(true);
-            else void handlePush(true);
+            if (action === "commit") void handleCommitOrAmend(refusal.fingerprint);
+            else void handlePush(refusal.fingerprint);
           }}
         />
       )}
