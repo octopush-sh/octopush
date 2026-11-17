@@ -52,6 +52,12 @@ pub struct StageContext {
     /// tool (API substrate): archived artifact + journal digest + the model
     /// that produced them.
     pub peers: Vec<crate::orchestrator::agentic::PeerStage>,
+    /// Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703),
+    /// read from `settings.json` when the stage starts — so the detached
+    /// worker sees it too. A Claude CLI stage then gets
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` (see
+    /// `CliDialect::stage_quiet_env`); Codex and `ApiRunner` ignore it.
+    pub quiet_claude_code: bool,
 }
 
 /// The error message for a stage whose agentic work ended without a final
