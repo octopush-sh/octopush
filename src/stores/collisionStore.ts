@@ -24,7 +24,9 @@ interface CollisionState {
   /** project id → the workspace ids its last report covered. */
   idsByProject: Record<string, string[]>;
   /** Rescan one project. Throttled to `MIN_REFRESH_MS` unless `force`
-   *  (a commit, an explicit user action) and deduped while in flight. */
+   *  (a commit, an explicit user action) and deduped while in flight; a
+   *  force that arrives mid-scan queues one forced follow-up, since the scan
+   *  in flight may predate what prompted it. */
   refresh: (projectId: string, opts?: { force?: boolean }) => Promise<void>;
   /** Poll `projectIds()` every `POLL_MS` while the window is visible.
    *  Returns the stop function. */
@@ -34,6 +36,8 @@ interface CollisionState {
 }
 
 const inFlight = new Set<string>();
+/** Projects owed one forced rescan once their in-flight scan settles. */
+const queuedForce = new Set<string>();
 const lastAt = new Map<string, number>();
 
 export const useCollisionStore = create<CollisionState>((set, get) => ({
@@ -41,13 +45,17 @@ export const useCollisionStore = create<CollisionState>((set, get) => ({
   idsByProject: {},
 
   refresh: async (projectId, opts) => {
-    if (!projectId || inFlight.has(projectId)) return;
+    if (!projectId) return;
+    if (inFlight.has(projectId)) {
+      if (opts?.force) queuedForce.add(projectId);
+      return;
+    }
     const now = Date.now();
     if (!opts?.force && now - (lastAt.get(projectId) ?? -Infinity) < MIN_REFRESH_MS) return;
     lastAt.set(projectId, now);
     inFlight.add(projectId);
     try {
-      const report = await ipc.projectCollisions(projectId);
+      const report = await ipc.projectCollisions(projectId, !!opts?.force);
       const mine = collisionsByWorkspace(report.collisions);
       set((s) => {
         const next = { ...s.byWorkspace };
@@ -60,6 +68,7 @@ export const useCollisionStore = create<CollisionState>((set, get) => ({
     } finally {
       inFlight.delete(projectId);
     }
+    if (queuedForce.delete(projectId)) await get().refresh(projectId, { force: true });
   },
 
   startPolling: (projectIds) => {
@@ -74,6 +83,7 @@ export const useCollisionStore = create<CollisionState>((set, get) => ({
 
   reset: () => {
     inFlight.clear();
+    queuedForce.clear();
     lastAt.clear();
     set({ byWorkspace: {}, idsByProject: {} });
   },

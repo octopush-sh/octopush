@@ -13,6 +13,8 @@ const report = (pairs: Array<[string, string]>): ProjectCollisions => ({
     b,
     bName: b,
     files: ["src/x.ts"],
+    truncated: 0,
+    conflictingTruncated: 0,
     conflictingFiles: [],
     severity: "overlap",
     confirmed: false,
@@ -54,17 +56,41 @@ describe("collisionStore", () => {
     expect(mockIpc.projectCollisions).toHaveBeenCalledTimes(3);
   });
 
-  it("force bypasses the throttle but never stacks on an in-flight scan", async () => {
+  it("force bypasses the throttle and the backend's report cache", async () => {
+    const s = useCollisionStore.getState();
+    await s.refresh("p1");
+    await s.refresh("p1", { force: true });
+    expect(mockIpc.projectCollisions.mock.calls).toEqual([["p1", false], ["p1", true]]);
+  });
+
+  it("a force mid-scan queues exactly one forced follow-up", async () => {
+    let release!: (r: ProjectCollisions) => void;
+    mockIpc.projectCollisions.mockReturnValueOnce(new Promise((r) => (release = r)));
+    mockIpc.projectCollisions.mockResolvedValue(report([["b", "c"]]));
+    const s = useCollisionStore.getState();
+    const first = s.refresh("p1");
+    // Several forces while in flight collapse into one queued rescan.
+    await s.refresh("p1", { force: true });
+    await s.refresh("p1", { force: true });
+    await s.refresh("p1"); // an unforced one queues nothing
+    expect(mockIpc.projectCollisions).toHaveBeenCalledTimes(1);
+    release(report([["a", "b"]]));
+    await first;
+    expect(mockIpc.projectCollisions.mock.calls).toEqual([["p1", false], ["p1", true]]);
+    // The follow-up's report wins.
+    expect(useCollisionStore.getState().byWorkspace.c[0].otherId).toBe("b");
+    expect(useCollisionStore.getState().byWorkspace.a).toBeUndefined();
+  });
+
+  it("an unforced call mid-scan queues no follow-up", async () => {
     let release!: (r: ProjectCollisions) => void;
     mockIpc.projectCollisions.mockReturnValueOnce(new Promise((r) => (release = r)));
     const s = useCollisionStore.getState();
     const first = s.refresh("p1");
-    await s.refresh("p1", { force: true }); // in flight: dropped
-    expect(mockIpc.projectCollisions).toHaveBeenCalledTimes(1);
+    await s.refresh("p1");
     release(report([]));
     await first;
-    await s.refresh("p1", { force: true });
-    expect(mockIpc.projectCollisions).toHaveBeenCalledTimes(2);
+    expect(mockIpc.projectCollisions).toHaveBeenCalledTimes(1);
   });
 
   it("a new report replaces the project's previous entries", async () => {

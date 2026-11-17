@@ -18,7 +18,7 @@ import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
 import { formatRelTime } from "../lib/relTime";
-import { collisionTooltip, notable } from "../lib/collisions";
+import { collisionTooltip, notable, shownCount } from "../lib/collisions";
 import { useCollisionStore } from "../stores/collisionStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { Reveal } from "./primitives/Reveal";
@@ -87,7 +87,7 @@ export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
   const current = useMemo(() => {
     const top = notable(list)[0];
     if (!top) return null;
-    const n = top.severity === "conflict" ? top.conflictingFiles.length : top.files.length;
+    const n = shownCount(top);
     const files = `${n} file${n === 1 ? "" : "s"}`;
     return {
       top,
@@ -122,7 +122,7 @@ export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
               type="button"
               onClick={() => useWorkspaceStore.getState().select(view.top.otherId)}
               title={`Open ${view.top.otherName}`}
-              className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[180ms] hover:text-octo-brass hover:decoration-[var(--brass-dim)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+              className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
             >
               Open {view.top.otherName}
             </button>

@@ -607,6 +607,8 @@ describe("MissionControl — collision radar (#732)", () => {
           b: "ws-b",
           bName: "refund-webhooks",
           files: ["src/billing/limits.ts", "src/billing/plan.ts"],
+          truncated: 0,
+          conflictingTruncated: 0,
           conflictingFiles: [],
           severity: "overlap",
           confirmed: true,

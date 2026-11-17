@@ -645,14 +645,19 @@ function App() {
     });
   }, [project, recentProjects, loadAllWorkspaces, loadGitSummaries, loadProjectPrs]);
 
-  // Collision radar (#732): poll every open project at a modest interval while
-  // the window is visible; the store throttles and the backend caches.
+  // Collision radar (#732): poll the open projects at a modest interval while
+  // the window is visible; the store throttles and the backend caches. Read at
+  // tick time, only projects with two or more loaded workspaces on a worktree
+  // are polled: a lone workspace can't collide with anything.
   useEffect(() => {
     if (!project && recentProjects.length === 0) return;
     const ids = () => {
       const set = new Set<string>(recentProjects.map((p) => p.id));
       if (project) set.add(project.id);
-      return [...set];
+      const byProject = useWorkspaceStore.getState().workspacesByProjectId;
+      return [...set].filter(
+        (id) => (byProject[id] ?? []).filter((w) => w.worktreePath).length >= 2,
+      );
     };
     return useCollisionStore.getState().startPolling(ids);
   }, [project, recentProjects]);

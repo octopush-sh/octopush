@@ -611,8 +611,14 @@ export interface Collision {
   aName: string;
   b: string;
   bName: string;
+  /** The overlapping paths, sorted; at most 50 cross IPC. */
   files: string[];
+  /** Overlapping paths left out of `files`. */
+  truncated: number;
+  /** The conflicting non-lockfile paths, sorted; at most 50. */
   conflictingFiles: string[];
+  /** Conflicting paths left out of `conflictingFiles`. */
+  conflictingTruncated: number;
   severity: CollisionSeverity;
   confirmed: boolean;
 }

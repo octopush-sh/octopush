@@ -1242,14 +1242,15 @@ pub async fn workspaces_git_summary(
 }
 
 /// Collision radar (#732): which live workspaces of a project change the same
-/// files, and whether an in-memory merge confirms a conflict. Read-only — no
-/// worktree, index or ref is touched. Throttled: a report younger than
-/// `collisions::REPORT_TTL` is reused, and committed diffs and merge
-/// confirmations are cached by commit id.
+/// files, and whether an in-memory merge confirms a conflict. Read-only: it
+/// never writes objects, refs, the index or locks. Throttled: a report younger
+/// than `collisions::REPORT_TTL` is reused (unless `force`, or a HEAD moved),
+/// and committed diffs and merge confirmations are cached by commit id.
 #[tauri::command]
 pub async fn project_collisions(
     state: State<'_, AppState>,
     project_id: String,
+    force: Option<bool>,
 ) -> AppResult<crate::collisions::ProjectCollisions> {
     let (rows, project_path) = {
         let db = state.db.lock();
@@ -1280,6 +1281,7 @@ pub async fn project_collisions(
             &inputs,
             std::time::Instant::now(),
             crate::collisions::REPORT_TTL,
+            force.unwrap_or(false),
         )
     })
     .await

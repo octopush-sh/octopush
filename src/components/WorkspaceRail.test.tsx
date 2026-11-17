@@ -1093,6 +1093,8 @@ describe("WorkspaceRail — collision radar (#732)", () => {
           b: "b",
           bName: "refund-webhooks",
           files: severity === "lockfile" ? ["yarn.lock"] : ["src/billing/limits.ts", "src/billing/plan.ts"],
+          truncated: 0,
+          conflictingTruncated: 0,
           conflictingFiles: severity === "conflict" ? ["src/billing/limits.ts"] : [],
           severity,
           confirmed: severity !== "lockfile",

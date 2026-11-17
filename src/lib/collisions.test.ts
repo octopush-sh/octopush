@@ -16,6 +16,8 @@ const mk = (over: Partial<Collision>): Collision => ({
   b: "ws-b",
   bName: "refund-webhooks",
   files: ["src/billing/limits.ts", "src/billing/plan.ts"],
+  truncated: 0,
+  conflictingTruncated: 0,
   conflictingFiles: [],
   severity: "overlap",
   confirmed: true,
@@ -90,5 +92,25 @@ describe("collision radar — copy", () => {
   it("long file lists are capped", () => {
     expect(fileList(["a", "b", "c", "d", "e", "f"])).toBe("a, b, c, d +2 more");
     expect(fileList(["a"])).toBe("a");
+  });
+
+  it("files the backend left out still count and show as +N more", () => {
+    expect(fileList(["a", "b"], 4, 3)).toBe("a, b +3 more");
+    const files = Array.from({ length: 50 }, (_, i) => `f${i}`);
+    const [c] = collisionsByWorkspace([mk({ files, truncated: 12 })])["ws-a"];
+    expect(collisionLine(c)).toBe("Overlaps refund-webhooks · 62 files: f0, f1, f2, f3 +58 more");
+    expect(collisionSegment([c])).toBe("overlaps refund-webhooks · 62 files");
+    const [k] = collisionsByWorkspace([
+      mk({ severity: "conflict", conflictingFiles: ["x"], conflictingTruncated: 2 }),
+    ])["ws-a"];
+    expect(collisionLine(k)).toBe("Will conflict with refund-webhooks in 3 files: x +2 more");
+  });
+
+  it("ranks by the full file count, truncated paths included", () => {
+    const by = collisionsByWorkspace([
+      mk({ b: "ws-b", bName: "beta", files: ["a", "b"] }),
+      mk({ b: "ws-c", bName: "gamma", files: ["a"], truncated: 5 }),
+    ]);
+    expect(by["ws-a"].map((c) => c.otherName)).toEqual(["gamma", "beta"]);
   });
 });

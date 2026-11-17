@@ -139,6 +139,8 @@ describe("CompanionReview — collision verdict (#732)", () => {
           b: "w2",
           bName: "refund-webhooks",
           files: ["src/billing/limits.ts"],
+          truncated: 0,
+          conflictingTruncated: 0,
           conflictingFiles: ["src/billing/limits.ts"],
           severity: "conflict",
           confirmed: true,
