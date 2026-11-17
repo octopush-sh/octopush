@@ -65,6 +65,13 @@ struct CliResult {
     /// validation ([`refused_setting`]). Kept untyped: only strings are read.
     #[serde(default)]
     errors: Option<serde_json::Value>,
+    /// Why the CLI never started the session (Claude Code ≥ 2.1.323), e.g.
+    /// [`SANDBOX_REQUIRED_UNAVAILABLE`]. Older CLIs leave it unset.
+    #[serde(default)]
+    startup_failure_reason: Option<String>,
+    /// Turns the session ran; a start-up stop reports 0.
+    #[serde(default)]
+    num_turns: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -477,25 +484,53 @@ pub fn is_settings_refused(error: &str) -> bool {
     error.starts_with(SETTINGS_REFUSED)
 }
 
+/// The `startup_failure_reason` of a result whose `--settings` turn the
+/// sandbox on but failed validation (Claude Code ≥ 2.1.323).
+pub const SANDBOX_REQUIRED_UNAVAILABLE: &str = "sandbox_required_unavailable";
+
+/// The prefix of the line Claude Code prints for that start-up stop.
+const SANDBOX_REQUIRED_PREFIX: &str = "sandbox required but unavailable";
+
+/// A line, without a leading `Error: `, that is Claude Code's own
+/// refused-settings message: the "Sandbox required but unavailable" prefix
+/// together with "failed validation". Any other "failed validation" line
+/// (a gateway probe, a hook) is not one.
+fn refused_settings_line(line: &str) -> Option<&str> {
+    let l = line.trim();
+    let l = l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l);
+    let lower = l.to_ascii_lowercase();
+    (lower.starts_with(SANDBOX_REQUIRED_PREFIX) && lower.contains("failed validation")).then_some(l)
+}
+
 /// The line naming the setting Claude Code refused, from the result's
-/// `errors` (first) or stderr: the first line that says the settings
-/// "failed validation", without a leading `Error: `, at most 400 chars.
-/// `None` for any other failure. Pure.
-pub(crate) fn refused_setting(errors: Option<&serde_json::Value>, stderr: &str) -> Option<String> {
-    let from_errors = errors
-        .and_then(|e| e.as_array())
-        .into_iter()
-        .flatten()
-        .filter_map(|e| e.as_str())
-        .flat_map(str::lines);
-    from_errors
-        .chain(stderr.lines())
-        .map(str::trim)
-        .find(|l| l.to_ascii_lowercase().contains("failed validation"))
-        .map(|l| {
-            let l = l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l);
-            l.chars().take(400).collect()
-        })
+/// `errors` (first) or stderr, at most 400 chars. Anchored on the real
+/// signal: `startup_failure_reason` is [`SANDBOX_REQUIRED_UNAVAILABLE`], or
+/// a line is the "Sandbox required but unavailable … failed validation"
+/// message ([`refused_settings_line`]). With the reason but no such line, the
+/// first `errors` string stands in. `None` for any other failure. Pure.
+pub(crate) fn refused_setting(
+    errors: Option<&serde_json::Value>,
+    stderr: &str,
+    startup_failure_reason: Option<&str>,
+) -> Option<String> {
+    let error_lines = || {
+        errors
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str())
+            .flat_map(str::lines)
+    };
+    let clip = |l: &str| -> String { l.chars().take(400).collect() };
+    if let Some(l) = error_lines().chain(stderr.lines()).find_map(refused_settings_line) {
+        return Some(clip(l));
+    }
+    if startup_failure_reason != Some(SANDBOX_REQUIRED_UNAVAILABLE) {
+        return None;
+    }
+    let first = error_lines().map(str::trim).find(|l| !l.is_empty());
+    let first = first.map(|l| l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l));
+    Some(clip(first.unwrap_or("Sandbox required but unavailable: the settings failed validation")))
 }
 
 /// The error for a refused-settings stop ([`SETTINGS_REFUSED`]), with the
@@ -749,9 +784,14 @@ pub fn parse_cli_result(
     // Claude Code refused to start because the stage's settings failed
     // validation (≥ 2.1.323): name the refused setting, not "stopped early
     // (error_during_execution)". The session never ran, so there is nothing
-    // to resume.
-    if parsed.is_error || !exit_success {
-        if let Some(line) = refused_setting(parsed.errors.as_ref(), stderr_text) {
+    // to resume. Never a budget stop or a max-turns stop, nor a session that
+    // ran turns: those keep their own handling below.
+    let ran_turns = parsed.num_turns.is_some_and(|n| n > 0);
+    let own_stop = matches!(bad_subtype, Some(BUDGET_STOP_SUBTYPE) | Some("error_max_turns"));
+    if (parsed.is_error || !exit_success) && !ran_turns && !own_stop {
+        if let Some(line) =
+            refused_setting(parsed.errors.as_ref(), stderr_text, parsed.startup_failure_reason.as_deref())
+        {
             return Ok(StageOutcome {
                 cli: Default::default(),
                 artifact: StageArtifact {
@@ -2770,9 +2810,10 @@ impl CliRunner {
                         failure_detail(&stderr_out, &line)
                     ))),
                 },
-                // No result event, but stderr names refused settings.
-                None if !exit_success && refused_setting(None, &stderr_out).is_some() => {
-                    let line = refused_setting(None, &stderr_out).unwrap_or_default();
+                // No result event, but stderr carries Claude Code's own
+                // "Sandbox required but unavailable … failed validation" line.
+                None if !exit_success && refused_setting(None, &stderr_out, None).is_some() => {
+                    let line = refused_setting(None, &stderr_out, None).unwrap_or_default();
                     Ok(failed_stage(&settings_refused_error(&line, &stderr_out)))
                 }
                 None => {

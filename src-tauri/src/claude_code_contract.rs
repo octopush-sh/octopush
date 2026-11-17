@@ -526,6 +526,16 @@ fn stream_json_refused_settings_name_the_setting() {
     let err = outcome.error.as_deref().unwrap_or_default();
     assert!(err.starts_with(&format!("{SETTINGS_REFUSED}: sandbox required but unavailable: ")), "[{fx}] {err}");
     assert!(err.lines().next().unwrap().contains(named), "[{fx}] {err}");
+    // The machine-readable reason alone (no `errors`, no stderr) still reads
+    // as refused settings; with the reason gone and only an unrelated
+    // "failed validation" line, it does not.
+    require(&fx, &r, "startup_failure_reason");
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, "").unwrap();
+    assert!(is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
+    bare.as_object_mut().unwrap().remove("startup_failure_reason");
+    let unrelated = "[Bootstrap] Gateway /v1/models failed validation: expected a list";
+    let outcome = parse_cli_result(&serde_json::to_string(&bare).unwrap(), false, ArtifactKind::Diff, unrelated).unwrap();
+    assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
 }
 
 #[test]
