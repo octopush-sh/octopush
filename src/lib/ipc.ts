@@ -457,8 +457,6 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
-/** One line of per-line blame (G7 slice III). Lines are 1-based and refer
- *  to the committed (HEAD) version of the file. */
 /** `git_ops::DiffSize`: files and lines from the merge base with `base` to
  *  the working tree (commits, edits and untracked files). `base` is null when
  *  the workspace has none that resolves: the size is then the uncommitted
@@ -468,8 +466,13 @@ export interface DiffSize {
   added: number;
   removed: number;
   base: string | null;
+  /** Untracked entries counted as files but not line-counted (a large
+   *  untracked directory, or past the read budget). */
+  untrackedSkipped: number;
 }
 
+/** One line of per-line blame (G7 slice III). Lines are 1-based and refer
+ *  to the committed (HEAD) version of the file. */
 export interface BlameLine {
   line: number;
   shaShort: string;

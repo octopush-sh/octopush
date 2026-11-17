@@ -66,9 +66,9 @@ const SETTLED_AWAY: Run[] = [
   { ...F.RUN, id: "run-away-huge", workspaceId: WORKSPACES[3].id, task: `${pick(4)}: ${"rewrite the session layer and every caller ".repeat(2).trim()}`, status: "completed", finishedAt: "2026-07-09T04:00:00Z" },
 ];
 const DIFF_SIZES: Record<string, DiffSize> = {
-  [WORKSPACES[2].id]: { files: 0, added: 0, removed: 0, base: "main" },
-  [WORKSPACES[3].id]: { files: 214, added: 1_612, removed: 388, base: "origin/release/2026-11-enterprise-long-base-branch" },
-  [ACTIVE.id]: { files: 6, added: 120, removed: 40, base: "main" },
+  [WORKSPACES[2].id]: { files: 0, added: 0, removed: 0, base: "main", untrackedSkipped: 0 },
+  [WORKSPACES[3].id]: { files: 214, added: 1_612, removed: 388, base: "origin/release/2026-11-enterprise-long-base-branch", untrackedSkipped: 0 },
+  [ACTIVE.id]: { files: 6, added: 120, removed: 40, base: "main", untrackedSkipped: 0 },
 };
 
 const THREADS: ChatThread[] = Array.from({ length: 15 }, (_, i) => ({

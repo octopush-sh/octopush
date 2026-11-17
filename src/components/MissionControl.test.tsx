@@ -33,7 +33,7 @@ const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useAttentionStore } = await import("../stores/attentionStore");
 const { useMissionsStore } = await import("../stores/missionsStore");
 const { ipc } = await import("../lib/ipc");
-const { useDiffSizeStore } = await import("../stores/diffSizeStore");
+const { useDiffSizeStore, resetDiffSizeQueueForTests } = await import("../stores/diffSizeStore");
 
 const mkRun = (id: string, status: RunStatus, over: Partial<Run> = {}): Run => ({
   id,
@@ -113,6 +113,7 @@ beforeEach(() => {
   useAttentionStore.setState({ flagsByWs: {} });
   useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
   useDiffSizeStore.setState({ byKey: {} });
+  resetDiffSizeQueueForTests();
   vi.clearAllMocks();
 });
 
@@ -218,7 +219,7 @@ describe("MissionControl", () => {
   });
 
   describe("diff size", () => {
-    const size = (files: number, added: number, removed: number, base: string | null = "main") => ({ files, added, removed, base });
+    const size = (files: number, added: number, removed: number, base: string | null = "main") => ({ files, added, removed, base, untrackedSkipped: 0 });
     const loaded = (...ids: string[]) =>
       useWorkspaceStore.setState({
         workspacesByProjectId: { p1: ids.map((id) => ({ id: `ws-${id}`, name: id.toUpperCase() })) },
@@ -285,6 +286,9 @@ describe("MissionControl", () => {
       renderRoom();
       expect(await screen.findByText("· no changes")).toBeTruthy();
       await screen.findByText("· +1800 −200 · 40 files");
+      await screen.findByText("· +30 −10 · 3 files");
+      await vi.waitFor(() => expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-unk"));
+      await act(async () => {});
       const tasks = () => screen.getAllByText(/^task /).map((el) => el.textContent);
       expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]); // oldest first by default
       const toggle = screen.getByRole("button", { name: "Order settled crews by smallest diff first" });
@@ -293,6 +297,46 @@ describe("MissionControl", () => {
       expect(tasks()).toEqual(["task none", "task mid", "task big", "task unk"]); // unmeasured last
       fireEvent.click(screen.getByRole("button", { name: "Order settled crews oldest first" }));
       expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]);
+    });
+  });
+
+  describe("diff size while loading", () => {
+    it("holds Smallest first at the oldest-first order until every visible size is in", async () => {
+      const pending: Record<string, (v: unknown) => void> = {};
+      vi.mocked(ipc.workspaceDiffSize).mockImplementation(
+        (id: string) => new Promise((resolve) => { pending[id] = resolve as (v: unknown) => void; }) as never,
+      );
+      const now = Date.now();
+      useRunsStore.setState({
+        runsByWs: { "ws-big": [mkRun("big", "completed")], "ws-mid": [mkRun("mid", "completed")] },
+        settledAt: { big: now - 4000, mid: now - 2000 },
+        statusSince: { big: 1, mid: 2 },
+      });
+      useWorkspaceStore.setState({
+        workspacesByProjectId: { p1: [{ id: "ws-big", name: "BIG" }, { id: "ws-mid", name: "MID" }] },
+      } as any);
+      renderRoom();
+      const tasks = () => screen.getAllByText(/^task /).map((el) => el.textContent);
+      fireEvent.click(screen.getByRole("button", { name: "Order settled crews by smallest diff first" }));
+      await vi.waitFor(() => expect(Object.keys(pending)).toHaveLength(2));
+      // Only the big one is in: no jump yet.
+      await act(async () => pending["ws-big"]({ files: 40, added: 1800, removed: 200, base: "main", untrackedSkipped: 0 }));
+      await screen.findByText("· +1800 −200 · 40 files");
+      expect(tasks()).toEqual(["task big", "task mid"]);
+      // Every size in: one reorder.
+      await act(async () => pending["ws-mid"]({ files: 3, added: 30, removed: 10, base: "main", untrackedSkipped: 0 }));
+      await screen.findByText("· +30 −10 · 3 files");
+      expect(tasks()).toEqual(["task mid", "task big"]);
+    });
+
+    it("drops the sizes of runs that left the board", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue({ files: 1, added: 1, removed: 0, base: "main", untrackedSkipped: 0 });
+      useRunsStore.setState({ runsByWs: { "ws-c": [mkRun("c", "completed")] }, settledAt: { c: Date.now() } });
+      useWorkspaceStore.setState({ workspacesByProjectId: { p1: [{ id: "ws-c", name: "C" }] } } as any);
+      useDiffSizeStore.setState({ byKey: { "old:completed:1": { files: 9, added: 9, removed: 9, base: "main", untrackedSkipped: 0 } } });
+      renderRoom();
+      await screen.findByText("· +1 −0 · 1 file");
+      expect(Object.keys(useDiffSizeStore.getState().byKey).some((k) => k.startsWith("old:"))).toBe(false);
     });
   });
 

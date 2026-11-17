@@ -77,6 +77,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // smallest diff first, so the director can clear the quick reviews.
   const [settledOrder, setSettledOrder] = useState<"oldest" | "smallest">("oldest");
   const sizeByKey = useDiffSizeStore((s) => s.byKey);
+  const workspacesByProjectId = useWorkspaceStore((s) => s.workspacesByProjectId);
 
   // The board: paused runs + attention (chats/terminals waiting on you) in
   // "needs you", running runs in flight, and this session's settled
@@ -124,6 +125,25 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
   // detailByRun imperatively — subscribing to the whole map here would churn
   // this component on every stage event even while the room is closed.
   const boardIds = boardRuns.map((r) => r.id).join(",");
+
+  // Diff sizes of runs that left the board are dropped, never kept for good.
+  useEffect(() => {
+    useDiffSizeStore.getState().prune(boardIds ? boardIds.split(",") : []);
+  }, [boardIds]);
+
+  // Settled, in the chosen order. A card is measured only while its workspace
+  // is loaded (see CrewCard); one that can't be has nothing to show (`null`),
+  // one still measuring is `undefined`, which holds "Smallest first" at the
+  // oldest-first order until every visible size is in.
+  const settledItems = useMemo(
+    () =>
+      orderSettled(board.settled, settledOrder, (r) => {
+        if (findWorkspaceName(workspacesByProjectId, r.workspaceId) === null) return null;
+        const key = diffSizeKey(r.id, r.status, statusSince[r.id]);
+        return key in sizeByKey ? sizeByKey[key] : undefined;
+      }).map((r) => ({ kind: "run" as const, run: r })),
+    [board.settled, settledOrder, sizeByKey, statusSince, workspacesByProjectId],
+  );
 
   // Collision radar (#732): opening the room rescans the projects its crews
   // work in (throttled in the store, cached in the backend).
@@ -250,7 +270,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
           <BandSection title="In flight" items={board.inFlight.map((r) => ({ kind: "run" as const, run: r }))} band="in-flight" onJumpToRun={onJumpToRun} onJumpToAttention={onJumpToAttention} />
           <BandSection
             title="Settled"
-            items={orderSettled(board.settled, settledOrder, sizeByKey).map((r) => ({ kind: "run" as const, run: r }))}
+            items={settledItems}
             band="settled"
             onJumpToRun={onJumpToRun}
             onJumpToAttention={onJumpToAttention}
@@ -424,10 +444,12 @@ function CrewCard({
   // workspace is loaded; nothing shows until (or unless) it is known.
   const sized = canJump && (band === "settled" || band === "needs-you");
   const ensureSize = useDiffSizeStore((s) => s.ensure);
-  const size = useDiffSizeStore((s) => (sized ? s.byKey[diffSizeKey(run.id, run.status)] ?? null : null));
+  const size = useDiffSizeStore((s) =>
+    sized ? s.byKey[diffSizeKey(run.id, run.status, statusSinceMs)] ?? null : null,
+  );
   useEffect(() => {
-    if (sized) ensureSize(run.id, run.status, run.workspaceId);
-  }, [sized, ensureSize, run.id, run.status, run.workspaceId]);
+    if (sized) ensureSize(run.id, run.status, statusSinceMs, run.workspaceId);
+  }, [sized, ensureSize, run.id, run.status, statusSinceMs, run.workspaceId]);
 
   // Time-in-state — session-observed transition time, falling back to the
   // run's start for launch-hydrated rows. Fixed-width tabular slot (S2);
