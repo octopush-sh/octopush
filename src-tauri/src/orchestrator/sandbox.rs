@@ -32,23 +32,20 @@ fn sbpl_string(s: &str) -> String {
 }
 
 /// The writable directory *subtrees* a real CLI process needs regardless of the
-/// mission — the temp dir, `/dev`, and the Claude CLI's own session/cache dirs.
-/// Kept deliberately narrow: `~/.ssh`, `~/.aws`, `~/.config` (credentials),
-/// documents, and every other project stay read-only. Pure over its inputs.
+/// mission — the temp dir and `/dev`. The Claude CLI's own state dirs under
+/// `~/.claude` come from [`CLAUDE_STATE_DIRS`]. Kept deliberately narrow:
+/// `~/.ssh`, `~/.aws`, `~/.config` (credentials), `~/.cache` (shared by every
+/// tool and mission, so builds get `XDG_CACHE_HOME` in their own cache root
+/// instead), documents, and every other project stay read-only. Pure.
 ///
 /// Seatbelt matches the kernel-resolved (realpath) path, so only the `/private`
 /// forms are live rules — `/tmp`→`/private/tmp`, `$TMPDIR`→`/private/var/…`. We
 /// list the real form here; the exact `$TMPDIR` subtree's canonical form is added
 /// by `assemble_write_roots`, so we don't blanket-allow all of `/var/folders`.
-fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
+fn system_write_roots(tmpdir: Option<&str>) -> Vec<String> {
     let mut v = vec!["/dev".to_string(), "/private/tmp".to_string()];
     if let Some(t) = tmpdir {
         v.push(t.to_string());
-    }
-    if let Some(h) = home {
-        // The CLI's own session + generic tool caches — needed for it to run.
-        v.push(format!("{h}/.claude"));
-        v.push(format!("{h}/.cache"));
     }
     // NB: we do NOT add the global package-manager dirs (~/.cargo, ~/.gradle, …)
     // to the write roots — several are config/executable dirs, and a sandboxed
@@ -58,6 +55,78 @@ fn system_write_roots(home: Option<&str>, tmpdir: Option<&str>) -> Vec<String> {
     // to write its caches into its own cache root via env
     // redirection — see `sandbox_cache_env` and `mission_cache_root`.
     v
+}
+
+/// The `~/.claude` subdirs a Claude Code `-p` stage writes, each its own
+/// write root: session transcripts (`projects`), todo and task lists, the
+/// feature-flag cache (`statsig`), the shell snapshot and session env its Bash
+/// tool sources, `~/.claude.json` backups, debug logs, file checkpoints, plans
+/// and queued telemetry. `~/.claude` itself is not writable, so a stage can't
+/// plant the skills, agents, commands, plugins, hooks, settings or `CLAUDE.md`
+/// that every later Claude Code session loads, the user's own `claude` in a
+/// terminal included (#774).
+const CLAUDE_STATE_DIRS: &[&str] = &[
+    "backups",
+    "debug",
+    "file-history",
+    "plans",
+    "projects",
+    "session-env",
+    "shell-snapshots",
+    "statsig",
+    "tasks",
+    "telemetry",
+    "todos",
+];
+
+/// The `~/.claude` dirs Claude Code loads code or instructions from (`local`
+/// holds a local install's `claude` binary). Denied again after every allow.
+const CLAUDE_DENIED_DIRS: &[&str] = &["agents", "commands", "hooks", "local", "output-styles", "plugins", "rules", "skills"];
+
+/// The `~/.claude` files Claude Code loads settings, hooks or instructions
+/// from. Denied again after every allow, with every other `settings*.json`.
+const CLAUDE_DENIED_FILES: &[&str] = &["CLAUDE.md", "settings.json", "settings.local.json"];
+
+/// `~/.claude` as given and as its realpath (given first). Never empty.
+fn claude_forms(home: &str) -> Vec<String> {
+    let given = format!("{}/.claude", home.trim_end_matches('/'));
+    let real = canonical_string(Path::new(&given));
+    if real == given { vec![given] } else { vec![given, real] }
+}
+
+/// Whether `path` is, or is inside, something Claude Code loads from one of
+/// the `~/.claude` forms `claude`: a [`CLAUDE_DENIED_DIRS`] dir, a
+/// [`CLAUDE_DENIED_FILES`] file or other `settings*.json`, or a project's
+/// auto memory (`projects/<project>/memory`, loaded into every later session
+/// of that project). Pure.
+fn in_claude_denied(path: &Path, claude: &[String]) -> bool {
+    claude.iter().any(|c| {
+        let Ok(rel) = path.strip_prefix(c) else { return false };
+        let parts: Vec<&str> = rel.iter().filter_map(|p| p.to_str()).collect();
+        match parts.as_slice() {
+            [first, ..] if CLAUDE_DENIED_DIRS.contains(first) => true,
+            [name] => CLAUDE_DENIED_FILES.contains(name) || (name.starts_with("settings") && name.ends_with(".json")),
+            ["projects", _, "memory", ..] => true,
+            _ => false,
+        }
+    })
+}
+
+/// The deny rules for what Claude Code loads from each `~/.claude` form in
+/// `claude` (see [`in_claude_denied`]). Rendered after the allows, so they win
+/// even over a state dir or `~/.claude.json` link that resolves there. Pure.
+fn claude_deny_rules(claude: &[String]) -> WriteRules {
+    let mut rules = WriteRules::default();
+    for c in claude {
+        let c = c.trim_end_matches('/');
+        rules.deny_subpaths.extend(CLAUDE_DENIED_DIRS.iter().map(|d| format!("{c}/{d}")));
+        rules.deny_literals.extend(CLAUDE_DENIED_FILES.iter().map(|f| format!("{c}/{f}")));
+        let e = regex_escape(c);
+        rules.deny_regexes.push(format!("^{e}/settings[^/]*\\.json$"));
+        rules.deny_regexes.push(format!("^{e}/projects/[^/]+/memory(/|$)"));
+    }
+    rules.dedup();
+    rules
 }
 
 /// A short, stable hex scope key for a string (e.g. a workspace path) — used to
@@ -330,6 +399,8 @@ fn sandbox_cache_env(cache_root: &str) -> Vec<(String, String)> {
         ("GRADLE_USER_HOME".into(), format!("{base}/gradle")),
         ("DENO_DIR".into(), format!("{base}/deno")),
         ("PIP_CACHE_DIR".into(), format!("{base}/pip")),
+        // Every XDG tool (pre-commit, uv, ruff, …) instead of the shared ~/.cache.
+        ("XDG_CACHE_HOME".into(), format!("{base}/xdg")),
     ]
 }
 
@@ -484,7 +555,8 @@ fn resolve_system_root(
 /// A file that doesn't exist yet is granted as given. Fails closed, with the
 /// reason, when it doesn't resolve, isn't a regular file, has another hard
 /// link, isn't owned by `owner`, or is a symlink to anything outside
-/// `~/.claude/` (a path-component prefix: `~/.claude-old` is outside).
+/// `~/.claude/` (a path-component prefix: `~/.claude-old` is outside) or to
+/// something Claude Code loads from there (`in_claude_denied`).
 fn resolve_state_file(file: &str, home: &str, owner: Option<u32>) -> Result<Vec<String>, String> {
     let path = Path::new(file);
     let Ok(entry) = std::fs::symlink_metadata(path) else {
@@ -511,8 +583,34 @@ fn resolve_state_file(file: &str, home: &str, owner: Option<u32>) -> Result<Vec<
         if !Path::new(&real).starts_with(&dot_claude) {
             return Err(format!("{file} links outside {home}/.claude"));
         }
+        if in_claude_denied(Path::new(&real), &claude_forms(home)) {
+            return Err(format!("{file} links to {real}, which Claude Code loads"));
+        }
     }
     Ok(if real == file { vec![real] } else { vec![file.to_string(), real] })
+}
+
+/// [`resolve_system_root`] for the Claude Code state dir `root`
+/// (`~/.claude/<dir>`, [`CLAUDE_STATE_DIRS`]), which must also not resolve
+/// to `~/.claude` itself or a dir holding it (that would make the whole config
+/// writable again), nor into something Claude Code loads
+/// (`in_claude_denied`). `claude` is `~/.claude` as given and as its realpath.
+fn resolve_claude_state_dir(
+    root: &str,
+    home: Option<&str>,
+    owner: Option<u32>,
+    private: &[PathBuf],
+    claude: &[String],
+) -> Result<Vec<String>, String> {
+    let paths = resolve_system_root(root, home, owner, private)?;
+    let real = canonical_lenient(Path::new(root));
+    if claude.iter().any(|c| Path::new(c).starts_with(&real)) {
+        return Err(format!("{root} resolves to {}, which holds {}", real.display(), claude[0]));
+    }
+    if in_claude_denied(&real, claude) {
+        return Err(format!("{root} resolves to {}, which Claude Code loads", real.display()));
+    }
+    Ok(paths)
 }
 
 /// The write roots a profile is built from (see [`assemble_write_roots`]).
@@ -526,17 +624,22 @@ struct WriteRoots {
     system_roots: Vec<String>,
     /// Writable single files (`~/.claude.json` and its realpath).
     files: Vec<String>,
+    /// `~/.claude` as given and as its realpath, whose loaded files and dirs
+    /// the profile denies (`claude_deny_rules`). Empty without a `$HOME`.
+    claude: Vec<String>,
     /// Why a system root or file was left out, one line each.
     refused: Vec<String>,
 }
 
 /// Merge the mission's write roots with the system defaults, add canonical forms
 /// (seatbelt matches realpaths, so a symlinked root must appear resolved too),
-/// and de-duplicate. The system roots and the state file go through
-/// [`resolve_system_root`] / [`resolve_state_file`] (user-home ones checked
-/// against `owner`, none allowed to hold one of `private`); one that fails is
-/// left out (fail closed) and its reason recorded in `refused`. Reads the
-/// filesystem, writes nothing.
+/// and de-duplicate. The system roots, the Claude Code state dirs and the
+/// state file go through [`resolve_system_root`] /
+/// [`resolve_claude_state_dir`] / [`resolve_state_file`] (user-home ones
+/// checked against `owner`, none allowed to hold one of `private`); one that
+/// fails is left out (fail closed) and its reason recorded in `refused`. The
+/// state dirs are only granted when `~/.claude` itself passes
+/// [`resolve_system_root`]. Reads the filesystem, writes nothing.
 fn assemble_write_roots(
     mission_roots: &[String],
     home: Option<&str>,
@@ -553,7 +656,7 @@ fn assemble_write_roots(
         }
     }
     let in_home = |r: &str| home.is_some_and(|h| Path::new(r).starts_with(h));
-    for r in system_write_roots(home, tmpdir) {
+    for r in system_write_roots(tmpdir) {
         let check_owner = if in_home(&r) { owner } else { None };
         match resolve_system_root(&r, home, check_owner, private) {
             Ok(paths) => {
@@ -564,6 +667,23 @@ fn assemble_write_roots(
         }
     }
     if let Some(h) = home {
+        let claude = claude_forms(h);
+        match resolve_system_root(&claude[0], home, owner, private) {
+            Ok(_) => {
+                for name in CLAUDE_STATE_DIRS {
+                    let dir = format!("{}/{name}", claude[0]);
+                    match resolve_claude_state_dir(&dir, home, owner, private, &claude) {
+                        Ok(paths) => {
+                            out.subpaths.extend(paths.iter().cloned());
+                            out.system_roots.extend(paths);
+                        }
+                        Err(why) => out.refused.push(why),
+                    }
+                }
+            }
+            Err(why) => out.refused.push(why),
+        }
+        out.claude = claude;
         for f in system_write_files(home) {
             match resolve_state_file(&f, h, owner) {
                 Ok(paths) => out.files.extend(paths),
@@ -578,22 +698,31 @@ fn assemble_write_roots(
     out
 }
 
-/// Create the user-home write roots Octopush can make (`~/.claude`,
-/// `~/.cache`) when they don't exist yet, outside the sandbox and before the
-/// profile is built, so a stage never gets to create the root entry itself.
-/// `create_dir` never follows a link in the root's place, the new dir is made
+/// Create `~/.claude` and its state dirs ([`CLAUDE_STATE_DIRS`], the
+/// user-home write roots) when they don't exist yet, outside the sandbox and
+/// before the profile is built, so a stage never gets to create a root entry
+/// itself (each root is pinned, so it couldn't). The state dirs are only made
+/// inside a `~/.claude` that passes [`resolve_system_root`]. `create_dir`
+/// never follows a link in the new dir's place, each new dir is made
 /// owner-only (0700, as the CLI makes `~/.claude`), and it must be a real
-/// directory of the user's. An existing root is left as it is. Best-effort: a
-/// root that can't be made is still resolved (and checked) as usual.
+/// directory of the user's. An existing entry is left as it is. Best-effort:
+/// a root that can't be made is still resolved (and checked) as usual.
 fn ensure_home_roots(home: &str) {
-    for name in [".claude", ".cache"] {
-        let dir = Path::new(home).join(name);
-        if std::fs::symlink_metadata(&dir).is_ok() {
-            continue;
+    let make = |dir: &Path| {
+        if std::fs::symlink_metadata(dir).is_ok() {
+            return;
         }
-        if let Err(e) = create_dir_0700(&dir).and_then(|()| check_own_dir(&dir)) {
+        if let Err(e) = create_dir_0700(dir).and_then(|()| check_own_dir(dir)) {
             tracing::warn!(dir = %dir.display(), error = %e, "sandbox: couldn't create a write root");
         }
+    };
+    let claude = claude_forms(home).swap_remove(0);
+    make(Path::new(&claude));
+    if resolve_system_root(&claude, Some(home), current_uid(), &private_bases()).is_err() {
+        return;
+    }
+    for name in CLAUDE_STATE_DIRS {
+        make(&Path::new(&claude).join(name));
     }
 }
 
@@ -681,7 +810,7 @@ fn shared_git_write_subpaths(common_dir: &str) -> [String; 4] {
 /// subtree. Then denies everything that runs code or changes git's behaviour
 /// on the host: the effective hooks dir (and `<common>/hooks`) plus its parent
 /// dirs inside the workspace or any other of `write_roots` (a `core.hooksPath`
-/// may point into `$TMPDIR` or `~/.cache`), `info/`, the legacy `remotes/` and
+/// may point into `$TMPDIR` or a `~/.claude` state dir), `info/`, the legacy `remotes/` and
 /// `branches/` (a planted file there redirects a later `git fetch`), the
 /// shared and per-worktree config, every worktree's `commondir`/`gitdir`/
 /// `config.worktree` (a main checkout could otherwise repoint a sibling
@@ -1026,10 +1155,11 @@ pub fn stage_isolation(git_isolation: &str, exec_choice: &str, workspace_path: &
 /// re-resolved, and each root dir itself is denied: a `subpath` also matches
 /// its root, so without the deny a stage could swap the root for a symlink and
 /// widen the next stage's profile to wherever it points. The system write root
-/// dirs (`/dev`, `/private/tmp`, `$TMPDIR`, `~/.claude`, `~/.cache`) and their
-/// realpaths are denied as paths the same way, and a system root or the
+/// dirs (`/dev`, `/private/tmp`, `$TMPDIR` and the `~/.claude` state dirs) and
+/// their realpaths are denied as paths the same way, and a system root or the
 /// `~/.claude.json` state file that fails its check is left out with a
-/// warning (see [`assemble_write_roots`]). Errors when a workspace's git
+/// warning (see [`assemble_write_roots`]). What Claude Code loads from
+/// `~/.claude` is denied after every allow (`claude_deny_rules`). Errors when a workspace's git
 /// layout can't be resolved (fail closed).
 pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[String]) -> AppResult<String> {
     seatbelt_profile_and_refusals(mission_write_roots, cache_roots).map(|(profile, _)| profile)
@@ -1055,6 +1185,18 @@ fn seatbelt_profile_and_refusals(
         current_uid(),
         &private_bases(),
     );
+    profile_from_roots(roots, mission_write_roots, cache_roots)
+}
+
+/// The profile for the assembled `roots` (see
+/// [`seatbelt_profile_and_refusals`]): the roots, `cache_roots` and the state
+/// file allowed, every root dir pinned, then denied again what Claude Code
+/// loads from `~/.claude` and each workspace's git hooks and config.
+fn profile_from_roots(
+    roots: WriteRoots,
+    mission_write_roots: &[String],
+    cache_roots: &[String],
+) -> AppResult<(String, Vec<String>)> {
     for why in &roots.refused {
         tracing::warn!(reason = %why, "sandbox: a system write root was left out of the profile");
     }
@@ -1069,6 +1211,7 @@ fn seatbelt_profile_and_refusals(
         deny_literals,
         ..WriteRules::default()
     };
+    rules.extend(claude_deny_rules(&roots.claude));
     let write_roots = rules.subpaths.clone();
     for root in mission_write_roots {
         if let Some(layout) = resolve_git_layout(root)? {
@@ -1672,12 +1815,15 @@ mod tests {
         // A readonly mission has no mission roots: still temp-only, no git allows.
         let p = build_seatbelt_profile(&[], &[]).unwrap();
         assert!(!p.contains("/objects\""));
-        // The only trailing denies are the system root dirs themselves.
+        // The only trailing denies are the system root dirs themselves and
+        // what Claude Code loads from `~/.claude`.
         if let Some(deny) = p.find("(deny file-write*\n") {
-            assert!(!p[deny..].contains("(subpath "));
+            for line in p[deny..].lines().filter(|l| l.contains("(subpath ") || l.contains("(regex ")) {
+                assert!(line.contains("/.claude/") || line.contains("/\\\\.claude/"), "{line}");
+            }
         }
         assert!(!p.contains("/.git/"));
-        assert!(!p.contains("(regex "));
+        assert!(!p.contains("/worktrees/"));
     }
 
     /// Profile-free check of `resolve_system_root` with `home` as `$HOME`.
@@ -1794,20 +1940,26 @@ mod tests {
             symlink("/usr", home.join(".foreign")).unwrap();
             assert!(!root_ok(&home.join(".foreign"), &home, Some(mine)));
         }
-        // `assemble_write_roots` drops a refused user-home root and says why,
-        // keeping the others.
+        // `assemble_write_roots` drops a refused `~/.claude` with every state
+        // dir in it and says why once, keeping the other roots.
         let h = home.to_string_lossy().into_owned();
+        std::fs::create_dir(home.join("elsewhere/projects")).unwrap();
         let roots = assemble_write_roots(&[], Some(&h), None, foreign, &[]);
         assert!(!roots.subpaths.iter().any(|r| r.starts_with(&format!("{h}/.c"))));
-        assert!(!roots.subpaths.iter().any(|r| r.ends_with("/elsewhere")));
-        assert_eq!(roots.refused.len(), 2, "{:?}", roots.refused);
+        assert!(!roots.subpaths.iter().any(|r| r.contains("/elsewhere")));
+        assert_eq!(roots.refused.len(), 1, "{:?}", roots.refused);
         assert!(roots.subpaths.contains(&"/dev".to_string()));
         let roots = assemble_write_roots(&[], Some(&h), None, Some(mine), &[]);
         assert!(roots.refused.is_empty(), "{:?}", roots.refused);
-        for r in [format!("{h}/.cache"), format!("{h}/.claude"), format!("{h}/elsewhere")] {
+        for r in [format!("{h}/.claude/projects"), format!("{h}/elsewhere/projects"), format!("{h}/.claude/todos")] {
             assert!(roots.subpaths.contains(&r), "{r} is writable");
             assert!(roots.system_roots.contains(&r), "{r} is pinned");
         }
+        // Neither `~/.claude` itself (as given or resolved) nor `~/.cache`.
+        for r in [format!("{h}/.claude"), format!("{h}/elsewhere"), format!("{h}/.cache")] {
+            assert!(!roots.subpaths.contains(&r), "{r} is not writable");
+        }
+        assert_eq!(roots.claude, vec![format!("{h}/.claude"), format!("{h}/elsewhere")]);
     }
 
     #[test]
@@ -1846,6 +1998,17 @@ mod tests {
         for target in [home.join(".zshrc"), near, home.join(".claude"), home.join("gone"), PathBuf::from("/")] {
             symlink(&target, &file).unwrap();
             assert!(ok(mine).is_err(), "a link to {} must be left out", target.display());
+            std::fs::remove_file(&file).unwrap();
+        }
+        // Nor a link to a file Claude Code loads from `~/.claude`, which a
+        // stage could otherwise write through the granted state file.
+        std::fs::create_dir_all(home.join(".claude/skills/x")).unwrap();
+        for loaded in ["settings.json", "settings.local.json", "settings.prod.json", "CLAUDE.md", "skills/x/SKILL.md"] {
+            let target = home.join(".claude").join(loaded);
+            std::fs::write(&target, "{}").unwrap();
+            symlink(&target, &file).unwrap();
+            let why = ok(mine).unwrap_err();
+            assert!(why.contains("Claude Code loads"), "{loaded}: {why}");
             std::fs::remove_file(&file).unwrap();
         }
         // `assemble_write_roots` records the refusal and grants no file.
@@ -1906,15 +2069,243 @@ mod tests {
         let claude = std::fs::symlink_metadata(home.join(".claude")).unwrap();
         assert!(claude.is_dir() && !claude.file_type().is_symlink(), "~/.claude was created");
         assert_eq!(claude.permissions().mode() & 0o777, 0o700, "~/.claude is owner-only");
+        for name in CLAUDE_STATE_DIRS {
+            let dir = std::fs::symlink_metadata(home.join(".claude").join(name)).unwrap();
+            assert!(dir.is_dir() && !dir.file_type().is_symlink(), "~/.claude/{name} was created");
+            assert_eq!(dir.permissions().mode() & 0o777, 0o700, "~/.claude/{name} is owner-only");
+        }
+        // Nothing else: what Claude Code loads is never made, and `~/.cache`
+        // is no write root any more.
+        assert_eq!(std::fs::read_dir(home.join(".claude")).unwrap().count(), CLAUDE_STATE_DIRS.len());
         assert!(std::fs::symlink_metadata(home.join(".cache")).unwrap().file_type().is_symlink());
         assert_eq!(std::fs::read_dir(home.join("target")).unwrap().count(), 0, "nothing written through the link");
+        // A `~/.claude` that links to `$HOME` gets no state dirs made in it.
+        let other = tempfile::tempdir().unwrap();
+        let other_home = std::fs::canonicalize(other.path()).unwrap();
+        symlink(&other_home, other_home.join(".claude")).unwrap();
+        ensure_home_roots(other_home.to_str().unwrap());
+        assert_eq!(std::fs::read_dir(&other_home).unwrap().count(), 1, "only the link itself");
+    }
+
+    #[test]
+    fn the_profile_denies_what_later_claude_code_sessions_load_from_dot_claude() {
+        let forms = vec!["/home/u/.claude".to_string(), "/real/u/.claude".to_string()];
+        let r = claude_deny_rules(&forms);
+        for c in &forms {
+            for d in ["skills", "agents", "commands", "plugins", "hooks", "local", "output-styles", "rules"] {
+                assert!(r.deny_subpaths.contains(&format!("{c}/{d}")), "{c}/{d} must be denied");
+            }
+            for f in ["settings.json", "settings.local.json", "CLAUDE.md"] {
+                assert!(r.deny_literals.contains(&format!("{c}/{f}")), "{c}/{f} must be denied");
+            }
+            for d in ["settings.json", "settings.local.json", "settings.work.json", "projects/-ws/memory", "projects/-ws/memory/MEMORY.md"] {
+                assert!(regex_denies(&r, &format!("{c}/{d}")), "{c}/{d} must be denied");
+                assert!(in_claude_denied(Path::new(&format!("{c}/{d}")), &forms), "{c}/{d}");
+            }
+            // What a stage writes stays allowed.
+            for ok in ["projects/-ws/abc.jsonl", "projects/-ws/abc/subagents/x.jsonl", "todos/x.json", "settings.json.d", "statsig/x"] {
+                assert!(!regex_denies(&r, &format!("{c}/{ok}")), "{c}/{ok} must stay writable");
+                assert!(!in_claude_denied(Path::new(&format!("{c}/{ok}")), &forms), "{c}/{ok}");
+            }
+        }
+        for d in ["/home/u/.claude/skills/x/SKILL.md", "/real/u/.claude/agents/a.md", "/home/u/.claude/CLAUDE.md"] {
+            assert!(in_claude_denied(Path::new(d), &forms), "{d}");
+        }
+        for ok in ["/home/u/.claude", "/home/u/.claude-old/skills", "/home/u/skills", "/home/u/.claude/projects"] {
+            assert!(!in_claude_denied(Path::new(ok), &forms), "{ok}");
+        }
+        // Rendered after every allow, so they beat a state dir that leads there.
+        let mut rules = WriteRules { subpaths: vec!["/home/u/.claude/projects".into()], ..WriteRules::default() };
+        rules.extend(claude_deny_rules(&forms));
+        let p = render_profile(&rules);
+        let allow = p.find("(allow file-write*").unwrap();
+        for op in ["(deny file-write*\n", "(deny file-link\n"] {
+            let deny = p.rfind(op).unwrap();
+            assert!(allow < deny);
+            assert!(p[deny..].contains("(subpath \"/home/u/.claude/skills\")"));
+            assert!(p[deny..].contains("(literal \"/home/u/.claude/settings.json\")"));
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_claude_state_dir_resolving_to_the_config_or_into_what_it_loads_is_left_out() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(dir.path()).unwrap();
+        let h = home.to_string_lossy().into_owned();
+        let claude = home.join(".claude");
+        std::fs::create_dir_all(claude.join("skills")).unwrap();
+        std::fs::create_dir_all(home.join("sync/projects")).unwrap();
+        let uid = current_uid();
+        let forms = claude_forms(&h);
+        let state = |name: &str| resolve_claude_state_dir(&format!("{h}/.claude/{name}"), Some(&h), uid, &[], &forms);
+        // A real dir, a missing one and a link to a dir elsewhere of the user's.
+        std::fs::create_dir(claude.join("todos")).unwrap();
+        assert!(state("todos").is_ok());
+        assert!(state("plans").is_ok());
+        symlink(home.join("sync/projects"), claude.join("projects")).unwrap();
+        assert!(state("projects").unwrap().contains(&format!("{h}/sync/projects")));
+        // A link to `~/.claude` itself, into what it loads, or to `$HOME`.
+        for (name, target) in [("debug", claude.clone()), ("statsig", claude.join("skills")), ("tasks", home.clone())] {
+            symlink(&target, claude.join(name)).unwrap();
+            assert!(state(name).is_err(), "{name} → {} must be left out", target.display());
+        }
+        let roots = assemble_write_roots(&[], Some(&h), None, uid, &[]);
+        assert_eq!(roots.refused.len(), 3, "{:?}", roots.refused);
+        assert!(!roots.subpaths.iter().any(|r| r == &h || r.ends_with("/.claude") || r.ends_with("/skills")));
+        assert!(roots.subpaths.contains(&format!("{h}/.claude/todos")));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_keeps_user_level_claude_config_out_of_a_stages_reach() {
+        // A stand-in `$HOME` with a user's real-looking `~/.claude`, so the
+        // test never risks the machine's own settings.
+        let dir = tempfile::tempdir().unwrap();
+        let home = canonical_string(dir.path());
+        let claude = format!("{home}/.claude");
+        std::fs::create_dir(&claude).unwrap();
+        std::fs::create_dir(format!("{claude}/skills")).unwrap();
+        std::fs::write(format!("{claude}/settings.json"), "{}\n").unwrap();
+        ensure_home_roots(&home);
+        let ws = tempfile::tempdir().unwrap();
+        let ws = canonical_string(ws.path());
+        let roots = assemble_write_roots(std::slice::from_ref(&ws), Some(&home), None, current_uid(), &private_bases());
+        assert!(roots.refused.is_empty(), "{:?}", roots.refused);
+        let (profile, _) = profile_from_roots(roots, std::slice::from_ref(&ws), &[]).unwrap();
+        let sandboxed = |script: String| -> bool {
+            let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
+            std::process::Command::new(prog)
+                .args(args)
+                .current_dir(&ws)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        // What a stage writes: transcripts, todos, the shell snapshot, the state file.
+        for ok in [
+            format!("mkdir -p '{claude}/projects/-ws' && echo x > '{claude}/projects/-ws/s.jsonl.tmp' && mv '{claude}/projects/-ws/s.jsonl.tmp' '{claude}/projects/-ws/s.jsonl'"),
+            format!("echo '[]' > '{claude}/todos/t.json'"),
+            format!("echo x > '{claude}/shell-snapshots/snapshot-bash.sh'"),
+            format!("echo '{{}}' > '{home}/.claude.json'"),
+        ] {
+            assert!(sandboxed(ok.clone()), "{ok} works");
+        }
+        // A user-level skill, agent, command, plugin, hook script or `CLAUDE.md`.
+        for (what, script) in [
+            ("a skill", format!("mkdir -p '{claude}/skills/x' && echo x > '{claude}/skills/x/SKILL.md'")),
+            ("a skill in a new skills dir", format!("rmdir '{claude}/skills'; mkdir -p '{claude}/skills/y'")),
+            ("an agent", format!("mkdir -p '{claude}/agents' && echo x > '{claude}/agents/a.md'")),
+            ("a command", format!("mkdir -p '{claude}/commands' && echo x > '{claude}/commands/c.md'")),
+            ("a plugin", format!("mkdir -p '{claude}/plugins/p'")),
+            ("a hook script", format!("mkdir -p '{claude}/hooks' && echo x > '{claude}/hooks/h.sh'")),
+            ("CLAUDE.md", format!("echo x > '{claude}/CLAUDE.md'")),
+            ("a local claude binary", format!("mkdir -p '{claude}/local' && echo x > '{claude}/local/claude'")),
+            ("project memory", format!("mkdir -p '{claude}/projects/-ws/memory' && echo x > '{claude}/projects/-ws/memory/MEMORY.md'")),
+        ] {
+            assert!(!sandboxed(script), "a stage can't plant {what}");
+        }
+        for gone in ["skills/x", "skills/y", "agents", "commands", "plugins", "hooks", "CLAUDE.md", "local", "projects/-ws/memory"] {
+            assert!(std::fs::symlink_metadata(format!("{claude}/{gone}")).is_err(), "{gone} was created");
+        }
+        assert!(Path::new(&format!("{claude}/skills")).is_dir(), "the skills dir is still there");
+        // A hook in the settings: appended, replaced by an atomic rename, a
+        // new `settings.local.json`, or written through a link from a state dir.
+        let hook = r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"touch /tmp/pwned"}]}]}}"#;
+        for (what, script) in [
+            ("modify settings.json", format!("echo '{hook}' >> '{claude}/settings.json'")),
+            ("replace settings.json", format!("echo '{hook}' > '{claude}/projects/s' && mv '{claude}/projects/s' '{claude}/settings.json'")),
+            ("add settings.local.json", format!("echo '{hook}' > '{claude}/settings.local.json'")),
+            ("write through a link", format!("ln -s ../settings.json '{claude}/todos/s' && echo '{hook}' > '{claude}/todos/s'")),
+            ("hard-link settings.json in", format!("ln '{claude}/settings.json' '{claude}/todos/h' && echo '{hook}' >> '{claude}/todos/h'")),
+        ] {
+            assert!(!sandboxed(script), "a stage can't {what}");
+        }
+        assert_eq!(std::fs::read_to_string(format!("{claude}/settings.json")).unwrap(), "{}\n", "settings unchanged");
+        assert!(!Path::new(&format!("{claude}/settings.local.json")).exists());
+        // Nor swap a state dir for a link into what Claude Code loads.
+        assert!(!sandboxed(format!("mv '{claude}/plans' '{claude}/plans.old'; rmdir '{claude}/plans'; ln -s skills '{claude}/plans'")));
+        let plans = std::fs::symlink_metadata(format!("{claude}/plans")).unwrap();
+        assert!(plans.is_dir() && !plans.file_type().is_symlink(), "plans is still a real dir");
+        // And the shared `~/.cache` is no write root any more.
+        assert!(!sandboxed(format!("mkdir -p '{home}/.cache/pre-commit'")));
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_real_claude_p_stage_runs_the_same_under_the_narrowed_profile() {
+        // The real `claude` on the real `$HOME`, as a stage runs it. A model
+        // that doesn't exist fails before any tokens are spent, after the CLI
+        // has started up, read its config and written its state. Skipped
+        // where Claude Code isn't installed.
+        let installed = std::process::Command::new("claude")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !installed {
+            eprintln!("claude not installed; skipping");
+            return;
+        }
+        let ws = tempfile::tempdir().unwrap();
+        let ws_path = canonical_string(ws.path());
+        let args: Vec<String> = [
+            "-p",
+            "Reply with exactly: ok",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--model",
+            "claude-nonexistent-model-0",
+            "--max-turns",
+            "1",
+            "--strict-mcp-config",
+            "--setting-sources",
+            "project",
+        ]
+        .map(String::from)
+        .to_vec();
+        fn run(program: &OsStr, args: &[OsString], env: &[(String, String)], cwd: &str) -> (Option<i32>, String) {
+            let mut child = std::process::Command::new(program)
+                .args(args)
+                .envs(env.iter().cloned())
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let start = std::time::Instant::now();
+            while child.try_wait().unwrap().is_none() {
+                if start.elapsed() > std::time::Duration::from_secs(120) {
+                    let _ = child.kill();
+                    panic!("claude -p didn't finish in 120s");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            let out = child.wait_with_output().unwrap();
+            let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+            (out.status.code(), text)
+        }
+        let plain: Vec<OsString> = args.iter().map(OsString::from).collect();
+        let (want, plain_text) = run(OsStr::new("claude"), &plain, &[], &ws_path);
+        let roots = vec![ws_path.clone()];
+        let scope = format!("{ws_path}-real-claude-test");
+        let prepared = prepare_with(&roots, Some(scope.as_str()), RC, OsStr::new("claude"), &args, true, |_| Vec::new()).unwrap();
+        let (got, text) = run(&prepared.program, &prepared.args, &prepared.env, &ws_path);
+        let _ = remove_workspace_build_caches(&scope);
+        assert!(prepared.left_out.is_empty(), "{:?}", prepared.left_out);
+        assert!(!text.contains("EPERM") && !text.contains("operation not permitted"), "a write was refused:\n{text}");
+        let result = "\"type\":\"result\"";
+        assert_eq!(text.contains(result), plain_text.contains(result), "the stage reports a result as unsandboxed:\n{text}");
+        assert_eq!(got, want, "the same exit as unsandboxed:\n{text}");
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn seatbelt_keeps_a_system_root_writable_inside_but_not_replaceable() {
-        // `$TMPDIR` and `/private/tmp` are system roots on every Mac; `~/.cache`
-        // is created by the profile builder when missing.
+        // `$TMPDIR` and `/private/tmp` are system roots on every Mac; the
+        // `~/.claude` state dirs are created by the profile builder when missing.
         let ws = tempfile::tempdir().unwrap();
         let roots = vec![ws.path().to_string_lossy().into_owned()];
         let run = |script: &str| -> bool {
@@ -1927,14 +2318,14 @@ mod tests {
                 .unwrap_or(false)
         };
         let home = std::env::var("HOME").unwrap();
-        let cache = format!("{home}/.cache");
+        let projects = format!("{home}/.claude/projects");
         let tmpdir = canonical_string(Path::new(&std::env::var("TMPDIR").unwrap()));
         let tag = format!("octopush-root-test-{}", std::process::id());
         // Writes and the atomic write-then-rename editors and the CLI use work
         // inside each real root. (Renaming a real root itself is left to the
         // root below: their parents aren't writable anyway, so it would prove
         // nothing about the pin.)
-        for root in ["/private/tmp".to_string(), tmpdir, cache] {
+        for root in ["/private/tmp".to_string(), tmpdir, projects] {
             let inside = format!("{root}/{tag}");
             let script = format!("mkdir -p '{inside}' && echo x > '{inside}/probe.tmp' && mv '{inside}/probe.tmp' '{inside}/probe'");
             assert!(run(&script), "writes and renames inside {root} work");
@@ -2277,9 +2668,17 @@ mod tests {
     fn assemble_write_roots_is_narrow() {
         let roots = assemble_write_roots(&["/ws".to_string()], Some("/home/u"), Some("/tmp/session"), None, &[]).subpaths;
         assert!(roots.contains(&"/ws".to_string()));
-        assert!(roots.contains(&"/home/u/.claude".to_string()));
+        assert!(roots.contains(&"/home/u/.claude/projects".to_string()));
         assert!(roots.contains(&"/tmp/session".to_string()));
         assert!(roots.contains(&"/dev".to_string()));
+        // Only Claude Code's state dirs, never `~/.claude` itself (skills,
+        // agents, settings hooks) nor the shared `~/.cache` (#774).
+        let in_claude: Vec<&String> = roots.iter().filter(|r| r.starts_with("/home/u/.claude")).collect();
+        assert_eq!(in_claude.len(), CLAUDE_STATE_DIRS.len(), "{in_claude:?}");
+        for name in CLAUDE_STATE_DIRS {
+            assert!(roots.contains(&format!("/home/u/.claude/{name}")));
+        }
+        assert!(!roots.iter().any(|r| r == "/home/u/.claude" || r.starts_with("/home/u/.cache")));
         // No GLOBAL package-manager dirs are writable — several are config/exec
         // dirs (a sandboxed agent must not plant a ~/.cargo/config.toml
         // rustc-wrapper or ~/.gradle/init.d/*.gradle that runs outside the
@@ -2310,7 +2709,8 @@ mod tests {
         assert!(!roots.contains(&"/ws".to_string()));
         // Temp + the CLI's own dirs are still there (a shell needs them).
         assert!(roots.contains(&"/tmp/session".to_string()));
-        assert!(roots.contains(&"/home/u/.claude".to_string()));
+        assert!(roots.contains(&"/home/u/.claude/projects".to_string()));
+        assert!(!roots.contains(&"/home/u/.claude".to_string()));
     }
 
     #[test]
@@ -2325,6 +2725,8 @@ mod tests {
         assert!(env.contains_key("npm_config_cache"));
         assert!(env.contains_key("GOPATH"));
         assert!(env.contains_key("GRADLE_USER_HOME"));
+        // XDG tools cache there too, not in the shared, unwritable ~/.cache.
+        assert_eq!(env.get("XDG_CACHE_HOME").map(String::as_str), Some("/c/build-cache/abc/xdg"));
     }
 
     #[test]
@@ -2400,9 +2802,9 @@ mod tests {
         assert_eq!(ws_dir.parent(), Some(base));
         assert_ne!(ws_dir, workspace_cache_dir(base, "/ws-b"));
         assert_eq!(ws_dir, workspace_cache_dir(base, "/ws-a/"), "a trailing slash is the same workspace");
-        // The base sits outside every root all missions share (temp, ~/.claude,
-        // ~/.cache), so only the own subtree is ever writable.
-        let shared = system_write_roots(Some(home), Some(tmpdir));
+        // The base sits outside every root all missions share (temp, the
+        // ~/.claude state dirs), so only the own subtree is ever writable.
+        let shared = assemble_write_roots(&[], Some(home), Some(tmpdir), None, &[]).subpaths;
         for r in &shared {
             assert!(!base.starts_with(r), "the cache base {} is inside the write root {r}", base.display());
         }
@@ -2549,8 +2951,8 @@ mod tests {
         let without_tmp: Vec<(String, String)> = env.iter().filter(|(k, _)| k != "TMPDIR").cloned().collect();
         assert_eq!(without_tmp, sandbox_cache_env(&root));
         // Outside every shared write root, so no other workspace's stage can
-        // write it (or plant `.claude/skills` in it). (Linux's cache dir is
-        // `~/.cache`, itself a shared root; macOS's isn't.)
+        // write it (or plant `.claude/skills` in it). (Only macOS runs the
+        // sandbox, so only its cache dir is checked.)
         #[cfg(target_os = "macos")]
         {
             let home = std::env::var("HOME").ok();
