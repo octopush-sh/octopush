@@ -16705,6 +16705,175 @@ mod sync_opt_in_tests {
     }
 }
 
+// ── Sync pulls through the api_base()/access_token() seams (#753) ─────
+#[cfg(test)]
+mod sync_pull_tests {
+    use crate::settings::test_sync_override;
+    use crate::sync::{test_net, SyncKind};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    /// An HTTP server answering every request with `code` and `body` (JSON).
+    /// Returns its base URL and the request heads it received.
+    async fn serve(code: u16, body: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (log, body) = (seen.clone(), body.to_string());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, body) = (log.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = String::from_utf8_lossy(&buf).find("\r\n\r\n") {
+                            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..end]).to_string());
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The one request the server saw: its request line, and whether it
+    /// carried the test token.
+    fn only_request(seen: &Arc<Mutex<Vec<String>>>) -> (String, bool) {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let head = &seen[0];
+        let line = head.lines().next().unwrap_or_default().to_string();
+        let authed = head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-token"));
+        (line, authed)
+    }
+
+    const RUNS: &str = r#"{"runs":[
+        {"run_id":"r1","task":"t","status":"completed","cost_usd":0.5,"stages":[{"role":"implement","status":"done"}]},
+        {"task":"no run id: unreadable"},
+        "not even an object"
+    ]}"#;
+
+    #[tokio::test]
+    async fn pull_runs_keeps_the_readable_rows() {
+        reset(true, false);
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1, "the malformed rows are skipped");
+        assert_eq!((runs[0].run_id.as_str(), runs[0].stages.len()), ("r1", 1));
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-runs "), "{line}");
+        assert!(authed, "the session token is sent");
+    }
+
+    #[tokio::test]
+    async fn pull_runs_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_reads_404_as_no_detail_and_an_unreadable_blob_as_none() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        let (base, seen) = serve(200, r#"{"detail":{"run_id":"r1","stages":[]}}"#).await;
+        test_net::set(Some(base), token());
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("a detail");
+        assert_eq!(detail.run_id, "r1");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-run-detail?run_id=r1 "), "{line}");
+        assert!(authed);
+
+        test_net::set(Some(serve(404, "{}").await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404: no detail");
+        test_net::set(Some(serve(200, r#"{"detail":{"stages":"not a list"}}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "unreadable: no detail");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history detail fetch failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_library_keeps_the_readable_items() {
+        reset(false, true);
+        let body = r#"{"items":[
+            {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+            {"kind":"role","item_id":"r1","deleted":true},
+            {"item_id":"no kind: unreadable"}
+        ]}"#;
+        let (base, seen) = serve(200, body).await;
+        test_net::set(Some(base), token());
+        let items = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let got: Vec<(&str, bool)> = items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(got, [("p1", false), ("r1", true)], "the malformed item is skipped; tombstones stay");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-library "), "{line}");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn pull_library_http_errors_and_signed_out() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("library sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+}
+
 // ── Last sync attempt under each Sync toggle (#518) ───────────────────
 #[cfg(test)]
 mod sync_status_tests {
