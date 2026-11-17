@@ -85,7 +85,6 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
   // saves the key ("Wake the crew"); otherwise it sets the crew on the brief.
   const hasTypedKey = keyValue.trim().length > 0;
   const wakeOnly = ready === false && hasTypedKey && !canGenesis;
-  const primed = canGenesis ? ready !== false || hasTypedKey : wakeOnly;
 
   const secondary: ReactNode[] = [];
   if (onSketch) {
@@ -194,22 +193,17 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
             />
           </div>
         )}
-        {/* The block's one primary CTA. Outlined until it has something to
-            do with confidence (a brief plus a key, or just a key to save),
-            then the brass-ghost fill. */}
+        {/* The block's one primary CTA, always in the ceremonial recipe
+            (brass-dim border, brass-ghost fill, brass serif) so it leads the
+            footer in every state. Until there is something to do it keeps
+            the recipe's frame and only its ink recedes: a ghost outline in
+            sage made it the faintest thing on the screen (#758). */}
         <button
           type="button"
           data-tour="genesis-begin"
           onClick={() => void (wakeOnly ? saveKey() : submit())}
           disabled={!(canGenesis || wakeOnly) || loading || savingKey}
-          className={`shrink-0 rounded-md px-4 py-2 font-serif text-[14px] transition-colors duration-[180ms] disabled:cursor-default ${
-            primed ? "text-octo-brass" : "text-octo-sage"
-          }`}
-          style={
-            primed
-              ? { background: "var(--brass-ghost)", border: "1px solid var(--brass-dim)" }
-              : { background: "transparent", border: "1px solid var(--color-octo-border-strong)" }
-          }
+          className={GENESIS_CTA_CLASS}
         >
           {savingKey ? "Waking the crew…" : wakeOnly ? "Wake the crew" : "Set a crew on it"}
         </button>
@@ -231,6 +225,15 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
   );
 }
 
-/** The quiet link style shared by every secondary route under the genesis CTA. */
+/** The genesis block's one primary CTA: the ceremonial recipe (design-system
+ *  §4). Disabled, the frame stays and only the ink recedes — no opacity on the
+ *  whole button, which read as the screen being off (#585). */
+export const GENESIS_CTA_CLASS =
+  "shrink-0 rounded-md border border-[var(--brass-dim)] bg-[var(--brass-ghost)] px-4 py-2 font-serif text-[14px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi disabled:cursor-default disabled:text-octo-brass/50 disabled:hover:text-octo-brass/50";
+
+/** The quiet link style shared by every secondary route under the genesis CTA:
+ *  one ink (sage, ivory on hover) and one underline for all of them, so none
+ *  outshouts the primary (#758). A disabled route keeps the ink; its `title`
+ *  says why, and the primary beside it shows the same disabled state. */
 export const GENESIS_LINK_CLASS =
-  "font-serif text-[12px] text-octo-ivory underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:decoration-octo-brass disabled:cursor-default disabled:opacity-60";
+  "font-serif text-[12px] text-octo-sage underline decoration-octo-brass/40 underline-offset-2 transition-colors duration-[180ms] hover:text-octo-ivory hover:decoration-octo-brass disabled:cursor-default disabled:hover:text-octo-sage disabled:hover:decoration-octo-brass/40";
