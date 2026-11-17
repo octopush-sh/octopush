@@ -220,10 +220,12 @@ fn check_stream_shape(fixture: &str, events: &[Value]) {
         for f in USAGE_FIELDS {
             require_u64(fixture, a, &format!("message.usage.{f}"));
         }
-        assert!(
-            usage_from_stream_event(a).is_some(),
-            "[{fixture}] usage_from_stream_event returned None for an assistant event"
-        );
+        // A stopped stage prices each message at the model that answered it
+        // (a subagent may run on another model than the stage).
+        let model = require_str(fixture, a, "message.model");
+        let (_, u) = usage_from_stream_event(a)
+            .unwrap_or_else(|| panic!("[{fixture}] usage_from_stream_event returned None for an assistant event"));
+        assert_eq!(u.model.as_deref(), Some(model), "[{fixture}] usage_from_stream_event lost `message.model`");
     }
     let result = result_event(fixture, events);
     for f in ["subtype", "is_error", "result", "session_id", "total_cost_usd"] {
@@ -511,8 +513,46 @@ fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
 #[test]
 fn synthetic_fixture_directories_are_not_recordings() {
     let names: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
-    assert!(!names.iter().any(|v| v == DEFERRED_VERSION), "{names:?}");
-    assert_eq!(synthesized(DEFERRED_VERSION).version, DEFERRED_VERSION);
+    for v in [DEFERRED_VERSION, SUBAGENT_MODEL_VERSION] {
+        assert!(!names.iter().any(|n| n == v), "{names:?}");
+        assert_eq!(synthesized(v).version, v);
+    }
+}
+
+const SUBAGENT_MODEL_VERSION: &str = "2.1.325";
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
+fn stream_json_stopped_stage_prices_a_subagent_at_its_own_model() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost, CliUsage};
+    // Isolated catalog: never the owner's ~/.octopush/providers.json.
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Synthetic (see the 2.1.325 README): an Opus stage stopped while its
+    // Haiku subagent was mid-message — no `result` event.
+    let rec = synthesized(SUBAGENT_MODEL_VERSION);
+    let rel = "stream-json/stopped-with-subagent.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    assert!(!events.iter().any(is_result_event), "[{fx}] a stopped stage has no result event");
+    // Latest usage per message id, exactly as `CliRunner::run` keeps it.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    for e in of_type(&events, "assistant") {
+        let model = require_str(&fx, e, "message.model");
+        let (id, u) = usage_from_stream_event(e).unwrap();
+        assert_eq!(u.model.as_deref(), Some(model), "[{fx}]");
+        map.insert(id.unwrap(), u);
+    }
+    assert_eq!(map.len(), 2, "[{fx}] two messages, one of them in two content blocks");
+    // Opus 5 at $5/$25 per M, Haiku 4.5 at $1/$5 per M, each on its own.
+    let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+    let haiku = (20_000.0 * 1.0 + 2_000.0 * 5.0) / 1e6;
+    let c = streamed_cost("claude-opus-5", &map);
+    assert!((c - (opus + haiku)).abs() < 1e-12, "[{fx}] {c}, not {}", opus + haiku);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}] every message was priced");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    assert_eq!((out.input_tokens, out.output_tokens), (21_000, 2_100), "[{fx}]");
+    assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "[{fx}] {}", out.cost_usd);
 }
 
 #[test]

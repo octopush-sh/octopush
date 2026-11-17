@@ -1289,11 +1289,13 @@ impl Orchestrator {
                 if session_not_saved {
                     self.db.lock().set_stage_session(&stage.id, None)?;
                 }
-                // A Codex stage stopped before it reported usage: its cost is
-                // unknown, never $0 — flag it for the ledger and say so once.
-                if crate::orchestrator::cli_runner::is_usage_unreported(&err) {
+                // A Codex stage stopped before it reported usage, or a stopped
+                // stage with streamed usage it can't price (a subagent model or
+                // fast mode with no price): that cost is unknown, never $0 —
+                // flag it for the ledger and say why once.
+                if let Some(line) = crate::orchestrator::cli_runner::usage_unreported_line(&err) {
                     self.db.lock().set_run_stage_usage_unreported(&stage.id)?;
-                    self.journal_notice(&run.id, &stage.id, crate::orchestrator::cli_runner::USAGE_UNREPORTED);
+                    self.journal_notice(&run.id, &stage.id, line);
                 }
                 // Persist whatever usage the failed attempt burned (e.g. an
                 // iteration-capped agentic loop) so run cost stays truthful,
