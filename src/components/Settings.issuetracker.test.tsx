@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, waitFor, act } from "@testing-library/react";
+import { readable } from "../test-utils/readable";
 
 // ─── IPC mocks ────────────────────────────────────────────────────────
 
@@ -233,7 +234,8 @@ describe("Settings — Integrations / Issue Tracker section", () => {
     // …and a FLEX box: as a block, the inline-flex MidTruncate inside it was
     // sized from its own text and ran under the key input, hard-cut (#757).
     expect(mobile).toHaveClass("flex", "min-w-0", "flex-1");
-    expect(mobile.textContent).toBe("octopush-enterprise-mobile");
+    // Full name in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(readable(mobile)).toBe("octopush-enterprise-mobile");
   });
 
   it("saving a Project links row calls updateProjectJiraKey with the right args", async () => {
