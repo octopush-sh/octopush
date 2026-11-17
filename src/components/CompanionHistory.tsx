@@ -137,7 +137,7 @@ export function CompanionHistory({
                   can never look like a second selection. */}
               <div
                 data-active={active ? "true" : undefined}
-                className={`octo-rise-in group relative flex items-center rounded-md border pr-1 transition-colors duration-[220ms] ${
+                className={`octo-rise-in group relative flex items-center rounded-md border transition-colors duration-[220ms] ${
                   active
                     ? "border-[color:var(--brass-dim)] bg-octo-panel-2"
                     : "border-transparent hover:bg-[var(--brass-ghost)]"
@@ -225,7 +225,11 @@ export function CompanionHistory({
                     </button>
                   </span>
                 ) : !editing ? (
-                  <span className="flex shrink-0 items-center opacity-0 transition group-hover:opacity-100 focus-within:opacity-100">
+                  // The actions take no width until hover/focus (the rail's
+                  // max-width + opacity idiom): hidden by opacity alone they
+                  // kept ~95px of every row empty and the title wrapped early
+                  // (#756). Focus rings are inset so the clip can't cut them.
+                  <span className="flex max-w-0 shrink-0 items-center overflow-hidden opacity-0 transition-[max-width,opacity] duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] group-hover:max-w-[112px] group-hover:opacity-100 focus-within:max-w-[112px] focus-within:opacity-100">
                     {onPinChat && (
                       <button
                         type="button"
@@ -235,7 +239,7 @@ export function CompanionHistory({
                         }}
                         title={c.pinned ? "Unpin conversation" : "Pin conversation"}
                         aria-label={c.pinned ? "Unpin conversation" : "Pin conversation"}
-                        className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                        className={`flex items-center justify-center rounded p-1 transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass ${
                           c.pinned ? "text-octo-brass" : "text-octo-mute"
                         }`}
                       >
@@ -248,7 +252,7 @@ export function CompanionHistory({
                         onClick={() => startRename(c)}
                         title="Rename conversation"
                         aria-label="Rename conversation"
-                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
                       >
                         <Pencil size={12} />
                       </button>
@@ -262,7 +266,7 @@ export function CompanionHistory({
                         }}
                         title="Copy conversation as Markdown"
                         aria-label="Export conversation"
-                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
                       >
                         <Download size={12} />
                       </button>
@@ -277,7 +281,7 @@ export function CompanionHistory({
                         }}
                         title="Delete conversation"
                         aria-label="Delete conversation"
-                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-octo-rouge/15 hover:text-octo-rouge focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                        className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-octo-rouge/15 hover:text-octo-rouge focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
                       >
                         <X size={14} />
                       </button>

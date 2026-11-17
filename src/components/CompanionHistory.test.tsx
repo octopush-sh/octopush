@@ -174,3 +174,15 @@ describe("CompanionHistory — keyboard reachability", () => {
     expect(screen.getByRole("button", { name: "Delete conversation" })).toHaveFocus();
   });
 });
+
+describe("CompanionHistory — the title owns the row (#756)", () => {
+  it("hidden row actions take no width, so the title can use the full row", () => {
+    renderHistory({ onRenameChat: vi.fn(), onExportChat: vi.fn(), onPinChat: vi.fn() });
+    const actions = screen.getAllByRole("button", { name: "Delete conversation" })[0].parentElement!;
+    // Opacity alone kept ~95px of every row empty; the width collapses too.
+    expect(actions).toHaveClass("max-w-0", "overflow-hidden", "opacity-0");
+    expect(actions).toHaveClass("group-hover:max-w-[112px]", "focus-within:max-w-[112px]");
+    // Symmetric inset: the row adds no right padding of its own.
+    expect(actions.parentElement).not.toHaveClass("pr-1");
+  });
+});
