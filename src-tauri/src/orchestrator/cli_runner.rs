@@ -3273,13 +3273,17 @@ impl CliRunner {
                     } else {
                         &recent
                     };
-                    Ok(apply_plan_limit(
-                        failed_stage(&format!(
-                            "claude produced no result: {}",
-                            failure_detail(&stderr_out, fallback)
-                        )),
-                        &plan_watch.lock(),
-                    ))
+                    // A crashed or killed CLI still burned what it streamed.
+                    let (counted, drift) = counted_usage();
+                    let ran = ran_model.lock().clone();
+                    let mut out = claude_no_result_stage(
+                        &failure_detail(&stderr_out, fallback),
+                        ran.as_deref().unwrap_or(&stage.agent_model),
+                        &counted,
+                    );
+                    flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                    out.cli.ran_model = ran;
+                    Ok(apply_plan_limit(out, &plan_watch.lock()))
                 }
             },
         }
@@ -3629,6 +3633,18 @@ pub(crate) fn stopped_stage(
         return failed_stage_with_usage(&format!("{msg}\n{USAGE_UNREPORTED}"), model, map);
     }
     failed_stage_with_usage(msg, model, map)
+}
+
+/// The outcome of a Claude stage whose stream reached EOF with no `result`
+/// line (a crashed or killed CLI, not a stop): "claude produced no result:
+/// `detail`", with the streamed usage priced as an estimate
+/// ([`failed_stage_with_usage`]) instead of $0.
+pub(crate) fn claude_no_result_stage(
+    detail: &str,
+    model: &str,
+    map: &std::collections::HashMap<String, CliUsage>,
+) -> StageOutcome {
+    failed_stage_with_usage(&format!("claude produced no result: {detail}"), model, map)
 }
 
 fn failed_stage(msg: &str) -> StageOutcome {
