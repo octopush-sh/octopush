@@ -26,7 +26,8 @@ use std::path::{Path, PathBuf};
 
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
-    apply_stage_env, build_cli_args, build_cli_args_resume, cli_auth_from_init, is_result_event,
+    apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, is_builtin_claude_model, DISABLE_1M_CONTEXT_ENV,
+    MAX_CONTEXT_TOKENS_ENV, cli_auth_from_init, is_result_event,
     parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
     CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
@@ -220,10 +221,12 @@ fn check_stream_shape(fixture: &str, events: &[Value]) {
         for f in USAGE_FIELDS {
             require_u64(fixture, a, &format!("message.usage.{f}"));
         }
-        assert!(
-            usage_from_stream_event(a).is_some(),
-            "[{fixture}] usage_from_stream_event returned None for an assistant event"
-        );
+        // A stopped stage prices each message at the model that answered it
+        // (a subagent may run on another model than the stage).
+        let model = require_str(fixture, a, "message.model");
+        let (_, u) = usage_from_stream_event(a)
+            .unwrap_or_else(|| panic!("[{fixture}] usage_from_stream_event returned None for an assistant event"));
+        assert_eq!(u.model.as_deref(), Some(model), "[{fixture}] usage_from_stream_event lost `message.model`");
     }
     let result = result_event(fixture, events);
     for f in ["subtype", "is_error", "result", "session_id", "total_cost_usd"] {
@@ -576,8 +579,79 @@ fn recorded_results_without_a_terminal_reason_are_never_read_as_deferred() {
 #[test]
 fn synthetic_fixture_directories_are_not_recordings() {
     let names: Vec<String> = recordings().into_iter().map(|r| r.version).collect();
-    assert!(!names.iter().any(|v| v == DEFERRED_VERSION), "{names:?}");
-    assert_eq!(synthesized(DEFERRED_VERSION).version, DEFERRED_VERSION);
+    for v in [DEFERRED_VERSION, SUBAGENT_MODEL_VERSION] {
+        assert!(!names.iter().any(|n| n == v), "{names:?}");
+        assert_eq!(synthesized(v).version, v);
+    }
+}
+
+const SUBAGENT_MODEL_VERSION: &str = "2.1.325";
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
+fn stream_json_synthetic_error_message_is_never_unpriced() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_estimate, CliUsage};
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Recorded: Claude Code's own model_not_found error message, stamped
+    // `message.model: "<synthetic>"` with zero usage.
+    let rec = recording("2.1.314");
+    let rel = "stream-json/error-unknown-model.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let synthetic = of_type(&events, "assistant")
+        .into_iter()
+        .find(|e| e.pointer("/message/model").and_then(Value::as_str) == Some("<synthetic>"))
+        .unwrap_or_else(|| panic!("[{fx}] no <synthetic> assistant message"));
+    let (id, u) = usage_from_stream_event(synthetic).unwrap();
+    assert_eq!(u.model.as_deref(), Some("<synthetic>"), "[{fx}]");
+    // Alone, and beside a priced message of the stage's model.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    map.insert(id.unwrap(), u);
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+    let priced = CliUsage { input_tokens: 1_000, output_tokens: 100, model: Some("claude-opus-5".into()), ..Default::default() };
+    map.insert("msg_priced".into(), priced);
+    let est = streamed_estimate("claude-opus-5", &map);
+    assert!(est.unpriced.is_empty(), "[{fx}] {:?}", est.unpriced);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}]");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    // A token-less message on an unknown model is not unpriced either.
+    map.insert("msg_empty".into(), CliUsage { model: Some("claude-mystery-9".into()), ..Default::default() });
+    assert!(streamed_estimate("claude-opus-5", &map).unpriced.is_empty(), "[{fx}]");
+}
+
+#[test]
+#[serial_test::serial(pricing_catalog)]
+fn stream_json_stopped_stage_prices_a_subagent_at_its_own_model() {
+    use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost, CliUsage};
+    // Isolated catalog: never the owner's ~/.octopush/providers.json.
+    let _cfg = crate::provider_router::TestConfigDir::new();
+    // Synthetic (see the 2.1.325 README): an Opus stage stopped while its
+    // Haiku subagent was mid-message — no `result` event.
+    let rec = synthesized(SUBAGENT_MODEL_VERSION);
+    let rel = "stream-json/stopped-with-subagent.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    assert!(!events.iter().any(is_result_event), "[{fx}] a stopped stage has no result event");
+    // Latest usage per message id, exactly as `CliRunner::run` keeps it.
+    let mut map: HashMap<String, CliUsage> = HashMap::new();
+    for e in of_type(&events, "assistant") {
+        let model = require_str(&fx, e, "message.model");
+        let (id, u) = usage_from_stream_event(e).unwrap();
+        assert_eq!(u.model.as_deref(), Some(model), "[{fx}]");
+        map.insert(id.unwrap(), u);
+    }
+    assert_eq!(map.len(), 2, "[{fx}] two messages, one of them in two content blocks");
+    // Opus 5 at $5/$25 per M, Haiku 4.5 at $1/$5 per M, each on its own.
+    let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+    let haiku = (20_000.0 * 1.0 + 2_000.0 * 5.0) / 1e6;
+    let c = streamed_cost("claude-opus-5", &map);
+    assert!((c - (opus + haiku)).abs() < 1e-12, "[{fx}] {c}, not {}", opus + haiku);
+    let out = stopped_stage(CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+    assert_eq!(out.error.as_deref(), Some("Stopped by the director"), "[{fx}] every message was priced");
+    assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+    assert_eq!((out.input_tokens, out.output_tokens), (21_000, 2_100), "[{fx}]");
+    assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "[{fx}] {}", out.cost_usd);
 }
 
 #[test]
@@ -804,6 +878,146 @@ fn claude_stage_env_keeps_the_skills_the_stage_started_with() {
     assert!(!CliDialect::Codex.stage_env().iter().any(|(k, _)| *k == "CLAUDE_CODE_PLUGIN_DIR_WATCH"));
 }
 
+// ─── Gateway models' context window (#790) ──
+//
+// 2.1.323: "Changed the context window assumed for a model ID that Claude
+// Code doesn't recognize from 200K to 1M; use `/autocompact` to compact
+// earlier, or `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` to keep 200K" and "Changed
+// sessions on other vendors' models with a smaller window: once full, they
+// can fail every turn until `/clear`, so set `CLAUDE_CODE_DISABLE_1M_CONTEXT=1`
+// before they fill". 2.1.325: "Changed `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to
+// also set the context window of unrecognized model IDs that start with
+// `claude-`, such as a gateway's `claude-sonnet-latest`".
+
+#[test]
+fn context_window_variables_are_the_documented_names() {
+    assert_eq!(MAX_CONTEXT_TOKENS_ENV, "CLAUDE_CODE_MAX_CONTEXT_TOKENS");
+    assert_eq!(DISABLE_1M_CONTEXT_ENV, "CLAUDE_CODE_DISABLE_1M_CONTEXT");
+}
+
+#[test]
+fn a_builtin_claude_model_gets_no_context_window_variable() {
+    // Claude Code knows the builtin catalog's ids and their windows, also
+    // behind a gateway or Bedrock prefix (the builtin check normalizes).
+    for model in [
+        "claude-sonnet-5",
+        "claude-opus-5-5",
+        "claude-haiku-4-5",
+        "bedrock/claude-haiku-4-5",
+        "us.anthropic.claude-haiku-4-5-v1:0",
+    ] {
+        assert!(is_builtin_claude_model(model), "{model}");
+        let env = stage_spawn_env_for(model);
+        assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{model}: {env:?}");
+    }
+    assert!(!is_builtin_claude_model("claude-sonnet-latest"));
+    assert!(!is_builtin_claude_model("gpt-4o"));
+    assert!(context_window_env("claude-haiku-4-5", true, Some(200_000), None, |_| false).is_empty());
+}
+
+#[test]
+fn a_gateway_model_gets_the_variable_for_its_window() {
+    let none = |_: &str| false;
+    let max = |w: &str| (MAX_CONTEXT_TOKENS_ENV, w.to_string());
+    let disable = (DISABLE_1M_CONTEXT_ENV, "1".to_string());
+    // Ids that don't start with `claude-` already honoured the max-tokens
+    // variable before 2.1.325 (that entry says it "also" covers `claude-`
+    // ids): never the process-wide DISABLE_1M switch, whatever the CLI version.
+    for v in [None, Some("2.1.323"), Some("2.1.325")] {
+        assert_eq!(context_window_env("gpt-4o", false, Some(128_000), v, none), vec![max("128000")], "{v:?}");
+        assert_eq!(context_window_env("kimi-k3", false, Some(512_000), v, none), vec![max("512000")], "{v:?}");
+    }
+    // A `claude-` gateway id on 2.1.325+: the variable alone.
+    let new = Some("2.1.325");
+    assert_eq!(context_window_env("claude-sonnet-latest", false, Some(200_000), new, none), vec![max("200000")]);
+    assert_eq!(context_window_env("claude-internal-128k", false, Some(128_000), Some("2.2.0"), none), vec![max("128000")]);
+    assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), new, none), vec![max("512000")]);
+    // Below 2.1.325 (or an unknown version) Claude Code ignores it for a
+    // `claude-` id, so a window up to 200K also keeps 200K; below 200K
+    // can't be expressed there, and 200K–1M gets only the ignored variable.
+    for old in [Some("2.1.323"), Some("2.1.324"), None] {
+        assert_eq!(
+            context_window_env("claude-sonnet-latest", false, Some(200_000), old, none),
+            vec![max("200000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(
+            context_window_env("claude-internal-128k", false, Some(128_000), old, none),
+            vec![max("128000"), disable.clone()],
+            "{old:?}"
+        );
+        assert_eq!(context_window_env("claude-gateway-512k", false, Some(512_000), old, none), vec![max("512000")], "{old:?}");
+    }
+    // A 1M window and an unknown one: nothing.
+    assert!(context_window_env("claude-sonnet-latest", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(1_000_000), new, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, None, None, none).is_empty());
+    assert!(context_window_env("claude-sonnet-latest", false, Some(0), None, none).is_empty());
+}
+
+#[test]
+fn a_users_own_context_window_export_is_never_overridden() {
+    let set = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
+    assert!(context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.325"), set).is_empty());
+    assert!(context_window_env("gpt-4o", false, Some(128_000), None, set).is_empty());
+    // Only the variable the user set is left alone.
+    assert_eq!(
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
+        vec![(DISABLE_1M_CONTEXT_ENV, "1".to_string())]
+    );
+    let set = |k: &str| k == DISABLE_1M_CONTEXT_ENV;
+    assert_eq!(
+        context_window_env("claude-sonnet-latest", false, Some(200_000), Some("2.1.323"), set),
+        vec![(MAX_CONTEXT_TOKENS_ENV, "200000".to_string())]
+    );
+}
+
+#[test]
+fn codex_stages_get_no_context_window_variable() {
+    let mut command = tokio::process::Command::new("codex");
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    let keys: Vec<String> = command.as_std().get_envs().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+    assert!(!keys.iter().any(|k| k == MAX_CONTEXT_TOKENS_ENV || k == DISABLE_1M_CONTEXT_ENV), "{keys:?}");
+}
+
+#[test]
+fn a_custom_gateway_model_reaches_the_spawn_with_its_catalog_window() {
+    // The user's own provider entry (a LiteLLM gateway) gives the window.
+    let cfg = crate::provider_router::TestConfigDir::new();
+    let model = |id: &str, ctx: u64| {
+        serde_json::json!({"id": id, "displayName": id, "inputCostPerM": 3.0, "outputCostPerM": 15.0, "maxContext": ctx})
+    };
+    let providers = serde_json::json!([{
+        "name": "gateway", "apiBase": "https://gateway.example", "apiKeyEnv": "GATEWAY_KEY", "enabled": true,
+        "models": [model("claude-sonnet-latest", 200_000), model("team-llama", 128_000), model("claude-sonnet-5", 100_000)],
+    }]);
+    std::fs::write(cfg.path().join("providers.json"), providers.to_string()).unwrap();
+    // (Whether DISABLE_1M joins it depends on the probed CLI version; the
+    // pure `context_window_env` tests pin that.)
+    let env = stage_spawn_env_for("claude-sonnet-latest");
+    assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("200000".to_string())), "{env:?}");
+    let env = stage_spawn_env_for("team-llama");
+    assert_eq!(env.get(MAX_CONTEXT_TOKENS_ENV), Some(&Some("128000".to_string())), "{env:?}");
+    assert!(!env.contains_key(DISABLE_1M_CONTEXT_ENV), "a non-`claude-` id never gets the process-wide switch");
+    // A builtin id stays untouched even when a custom entry repeats it.
+    let env = stage_spawn_env_for("claude-sonnet-5");
+    assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+    // An id no catalog lists: nothing.
+    let env = stage_spawn_env_for("claude-unknown-gateway");
+    assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+}
+
+/// [`stage_spawn_env`] for a Claude stage on `model`.
+fn stage_spawn_env_for(model: &str) -> HashMap<String, Option<String>> {
+    let mut command = tokio::process::Command::new("claude");
+    apply_stage_env(&mut command, CliDialect::Claude, model, None, false, None);
+    command
+        .as_std()
+        .get_envs()
+        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+        .collect()
+}
+
 #[test]
 fn claude_stage_env_turns_off_subagent_progress_summaries() {
     // 2.1.323: "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available
@@ -837,7 +1051,7 @@ fn stage_spawn_env(
     quiet: bool,
 ) -> HashMap<String, Option<String>> {
     let mut command = tokio::process::Command::new("claude");
-    apply_stage_env(&mut command, dialect, effort, quiet);
+    apply_stage_env(&mut command, dialect, "claude-sonnet-5", effort, quiet, None);
     command
         .as_std()
         .get_envs()
