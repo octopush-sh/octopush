@@ -12124,6 +12124,59 @@ mod live_tests {
         assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0), "nothing priced: every token kept, $0");
     }
 
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_claude_stream_ending_without_a_result_keeps_its_streamed_estimate() {
+        use crate::orchestrator::cli_runner::{
+            claude_no_result_stage, read_stream, usage_from_stream_event, CliDialect, ReadEnd, ReadLimits,
+        };
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        use std::time::Duration;
+        let limits = ReadLimits {
+            idle: Duration::from_secs(20),
+            command_idle: Duration::from_secs(20),
+            cap: Duration::from_secs(60),
+            settle: Duration::from_millis(150),
+        };
+        // Read a stream to EOF the way the runner does, keyed by message id.
+        let read = |events: &[serde_json::Value]| {
+            let bytes: String = events.iter().map(|e| format!("{e}\n")).collect();
+            let mut map = std::collections::HashMap::new();
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let end = rt.block_on(read_stream(
+                std::io::Cursor::new(bytes.into_bytes()),
+                CliDialect::Claude,
+                limits,
+                |v| {
+                    if let Some((id, u)) = usage_from_stream_event(v) {
+                        map.insert(id.unwrap(), u);
+                    }
+                },
+                |_| {},
+            ));
+            assert!(matches!(end, ReadEnd::Eof(None, _)), "expected EOF with no result, got {end:?}");
+            map
+        };
+        // An Opus 5 stage and its Haiku subagent each streamed a message, then the CLI died.
+        let map = read(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-haiku-4-5-20251001"), false),
+        ]);
+        let out = claude_no_result_stage("Killed: 9", "claude-opus-5", &map);
+        assert!(matches!(out.status, crate::orchestrator::types::StageStatus::Failed));
+        assert_eq!(out.error.as_deref(), Some("claude produced no result: Killed: 9"));
+        assert_eq!((out.input_tokens, out.output_tokens), (2_000, 200));
+        let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let haiku = (1_000.0 * 1.0 + 100.0 * 5.0) / 1e6;
+        assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "{}, not the streamed estimate", out.cost_usd);
+
+        // No assistant usage streamed: still $0 and no tokens.
+        let none = read(&[serde_json::json!({ "type": "system", "subtype": "init", "model": "claude-opus-5" })]);
+        let out = claude_no_result_stage("claude emitted no result event", "claude-opus-5", &none);
+        assert_eq!(out.error.as_deref(), Some("claude produced no result: claude emitted no result event"));
+        assert_eq!((out.input_tokens, out.output_tokens, out.cost_usd), (0, 0, 0.0));
+    }
+
     #[tokio::test]
     async fn agentic_loop_ask_director_blocks_and_supersedes_acting() {
         let dir = tempfile::tempdir().unwrap();
