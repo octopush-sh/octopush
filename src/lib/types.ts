@@ -123,11 +123,39 @@ export interface ProjectInfo {
   jiraProjectKey: string | null;
   pinned: boolean;
   tint: string | null;
+  /** The project-scope rail group this project sits in. Null (or absent, in
+   *  a row built before the backend answers) means ungrouped; so does an id
+   *  that matches no loaded group. */
+  groupId?: string | null;
 }
 
 // ─── Workspaces ───────────────────────────────────────────────────
 
 export type TintName = "brass" | "verdigris" | "rouge" | "indigo" | "lavender" | "smoke" | "bone";
+
+// ─── Rail groups ──────────────────────────────────────────────────
+
+/** What a rail group holds: projects (at the rail's top level) or one
+ *  project's workspaces. Also the `kind` of an item moved between groups. */
+export type GroupScope = "project" | "workspace";
+
+/** A rail group: a named, optionally tinted, one-level container. It outlives
+ *  its members: an emptied group stays until it is deleted. Membership is the
+ *  member's own `groupId` (`ProjectInfo.groupId`, `Workspace.groupId`), so an
+ *  item is in at most one group. Whether a group is folded is a UI preference
+ *  and is not stored here. */
+export interface Group {
+  id: string;
+  scope: GroupScope;
+  /** The owning project of a `workspace` group; null for a `project` group. */
+  projectId: string | null;
+  name: string;
+  tint: TintName | null;
+  /** Position among the groups of the same scope (and, for `workspace`
+   *  groups, the same project). Ascending; not necessarily dense. */
+  sortOrder: number;
+  createdAt: string;
+}
 
 export interface Workspace {
   id: string;
@@ -147,6 +175,10 @@ export interface Workspace {
   /** Resolved base branch this workspace was created from (null for rows
    *  predating the column and for the auto-created default-branch row). */
   fromBranch: string | null;
+  /** The workspace-scope rail group this workspace sits in, kept through
+   *  archive and restore. Null or absent means ungrouped; so does an id that
+   *  matches no loaded group. */
+  groupId?: string | null;
 }
 
 /** `create_workspace`'s response: the workspace, plus its `setup` terminal when
