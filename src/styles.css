@@ -428,6 +428,10 @@
    reduced-motion halo drew a 1px brass ring hugging the verdigris border, and
    a working card read exactly like an awaiting-gate one (#749). */
 .octo-stage-pulse-running { --pulse-ink: var(--verdigris-ghost); --pulse-halo: var(--verdigris-strong); }
+/* An AMBER halt's CTA (transient fault, Claude plan limit) holding the beacon
+   pulses amber: amber is caution, never brass (§5 halt glyphs). A brass ring
+   on the amber border read as a gate, not a pause awaiting Resume (#818). */
+.octo-stage-pulse-warning { --pulse-ink: var(--warning-ghost); --pulse-halo: var(--warning-border); }
 @media (prefers-reduced-motion: reduce) {
   .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
@@ -438,10 +442,19 @@
    exactly what the row shows beneath it: the panel the list sits on (panel-2
    on the open, boxed row) plus, on a hovered unboxed row, the brass-ghost wash
    — two layers, so the composite matches the row rather than approximating it.
-   The first 20px (the element's left padding) fade to transparent. */
+   The first 20px (the element's left padding) fade to transparent.
+   `--row-wash` is a registered colour so it fades with the element's opacity
+   (same 220ms + --ease-octo as the row's own wash) instead of dropping at
+   once on unhover and baring an unwashed patch at the row's end (#818). */
+@property --row-wash {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: transparent;
+}
 .octo-row-actions-fade {
   --row-fill: var(--color-octo-panel);
   --row-wash: transparent;
+  transition-property: opacity, --row-wash;
   background:
     linear-gradient(to left, var(--row-wash) calc(100% - 20px), transparent),
     linear-gradient(to left, var(--row-fill) calc(100% - 20px), transparent);

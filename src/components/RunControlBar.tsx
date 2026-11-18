@@ -252,6 +252,10 @@ function BlockedAskBar({
   );
 }
 
+/** The beacon on an amber halt's CTA (transient fault, plan limit): the same
+ *  pulse, in amber ink — amber is caution, never brass (#818). */
+const AMBER_BEACON = "octo-stage-pulse octo-stage-pulse-warning";
+
 /** A stage stopped by the director's Claude plan (#731). With an automatic
  *  resume scheduled the bar is calm — nobody has to decide, so it never
  *  carries the beacon: "Resume now" continues early, "Don't resume
@@ -287,7 +291,7 @@ function PlanWaitBar({
           type="button"
           onClick={() => onResume()}
           title={scheduled ? "Continue the same session now, before the plan's window resets" : "Continue the same session"}
-          className={`${!scheduled && beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}
+          className={`${!scheduled && beacon ? `${AMBER_BEACON} ` : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}
         >
           {scheduled ? "Resume now" : "Resume the stage"}
         </button>
@@ -505,7 +509,7 @@ function DecisionBar({
               </span>
               {transient ? (
                 <button type="button" onClick={() => onResume()}
-                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}>
+                  className={`${beacon ? `${AMBER_BEACON} ` : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}>
                   Resume the stage
                 </button>
               ) : failed ? (
