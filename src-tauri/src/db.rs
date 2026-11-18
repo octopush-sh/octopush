@@ -6507,6 +6507,17 @@ impl Db {
         rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
     }
 
+    /// Whether any of `ids` is a recorded Direct-stage CLI session (#890).
+    pub fn any_direct_cli_session(&self, ids: &[String]) -> AppResult<bool> {
+        let mut stmt = self.conn.prepare_cached("SELECT 1 FROM direct_cli_sessions WHERE session_id = ?1")?;
+        for id in ids {
+            if stmt.exists(params![id])? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Delete the transcript-ingested RUN rows with these idempotency keys —
     /// the duplicates a Direct stage's transcript produced (#861). Only
     /// `surface = 'run'` rows: the stage's own `direct` row is never touched.
