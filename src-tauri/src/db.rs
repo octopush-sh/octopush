@@ -1137,8 +1137,60 @@ impl Db {
             self.meta_set("spend_events_retired_reconcile_v1", "done")?;
         }
 
+        // #861: every Claude CLI session a Direct stage ran, kept for good
+        // (`run_stages.session_id` is overwritten per attempt and cleared on
+        // completion paths). The transcript ingestor skips these sessions —
+        // their spend is already metered as the stage's `direct` row — and
+        // removes any `run` rows it recorded for them before they were known.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS direct_cli_sessions (
+                session_id TEXT PRIMARY KEY,
+                run_id     TEXT,
+                stage_id   TEXT,
+                created_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // One-time backfill from what the stage rows still remember: the last
+        // attempt's session id, and the session its reported usage belongs to.
+        // The ingestor then purges the duplicate `run` rows those sessions'
+        // transcripts produced (it has to read the files to know their keys).
+        if self.meta_get("direct_cli_sessions_backfill_v1")?.is_none() {
+            self.backfill_direct_cli_sessions()?;
+            self.meta_set("direct_cli_sessions_backfill_v1", "done")?;
+        }
+
         self.backfill_default_threads()?;
 
+        Ok(())
+    }
+
+    /// Seed `direct_cli_sessions` from `run_stages.session_id` and the session
+    /// named in `run_stages.session_usage` (#861). Idempotent.
+    fn backfill_direct_cli_sessions(&self) -> AppResult<()> {
+        let rows: Vec<(String, String, Option<String>, Option<String>, Option<String>)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, run_id, session_id, session_usage, COALESCE(finished_at, started_at)
+                 FROM run_stages
+                 WHERE session_id IS NOT NULL OR session_usage IS NOT NULL",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let now = Utc::now().to_rfc3339();
+        for (stage_id, run_id, session_id, usage, at) in rows {
+            let from_usage = usage
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
+                .and_then(|v| v.get("session").and_then(|s| s.as_str()).map(str::to_string));
+            for sid in [session_id, from_usage].into_iter().flatten().filter(|s| !s.is_empty()) {
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO direct_cli_sessions (session_id, run_id, stage_id, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![sid, run_id, stage_id, at.as_deref().unwrap_or(&now)],
+                )?;
+            }
+        }
         Ok(())
     }
 
@@ -6426,7 +6478,47 @@ impl Db {
             "UPDATE run_stages SET session_id = ?2 WHERE id = ?1",
             params![stage_id, session_id],
         )?;
+        if let Some(sid) = session_id {
+            self.record_direct_cli_session(stage_id, sid)?;
+        }
         Ok(())
+    }
+
+    /// Remember for good that `session_id` is a Direct stage's CLI session
+    /// (#861): its spend is the stage's `direct` row, so the transcript
+    /// ingestor must never meter its transcript as RUN spend. Idempotent.
+    pub fn record_direct_cli_session(&self, stage_id: &str, session_id: &str) -> AppResult<()> {
+        if session_id.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT OR IGNORE INTO direct_cli_sessions (session_id, run_id, stage_id, created_at)
+             VALUES (?1, (SELECT run_id FROM run_stages WHERE id = ?2), ?2, ?3)",
+            params![session_id, stage_id, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Every CLI session id a Direct stage has run (see
+    /// [`Self::record_direct_cli_session`]).
+    pub fn direct_cli_session_ids(&self) -> AppResult<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT session_id FROM direct_cli_sessions")?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        rows.collect::<Result<std::collections::HashSet<_>, _>>().map_err(Into::into)
+    }
+
+    /// Delete the transcript-ingested RUN rows with these idempotency keys —
+    /// the duplicates a Direct stage's transcript produced (#861). Only
+    /// `surface = 'run'` rows: the stage's own `direct` row is never touched.
+    pub fn delete_run_spend_by_keys(&self, keys: &[String]) -> AppResult<usize> {
+        let mut n = 0usize;
+        for k in keys {
+            n += self.conn.execute(
+                "DELETE FROM spend_events WHERE surface = 'run' AND idempotency_key = ?1",
+                params![k],
+            )?;
+        }
+        Ok(n)
     }
 
     /// Mark that the next run of this stage should `--resume` its session_id.

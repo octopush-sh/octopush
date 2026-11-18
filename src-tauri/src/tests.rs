@@ -9604,6 +9604,90 @@ mod orchestrator_tests {
         assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
         assert_eq!(seen[1].resume_prior_cost_usd, 0.03);
     }
+    /// A Claude CLI stage that reports its `claude -p` session id.
+    struct SessionRunner;
+    #[async_trait::async_trait]
+    impl AgentRunner for SessionRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 1_000,
+                output_tokens: 200,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.25,
+                status: StageStatus::Done,
+                tool_calls: vec![],
+                error: None,
+                verdict: None,
+                session_id: Some("sess-direct-861".into()),
+                blocked: None,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// One assistant line of a Claude Code transcript, stamped now.
+    fn cc_line(session: &str, req: &str, cwd: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "requestId": req,
+            "timestamp": chrono::Utc::now().to_rfc3339(),
+            "cwd": cwd,
+            "sessionId": session,
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": "claude-opus-4-8",
+                "role": "assistant",
+                "usage": { "input_tokens": 500, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0, "output_tokens": 100 }
+            }
+        })
+        .to_string()
+    }
+
+    /// #861: a Direct CLI stage's own transcript (and its sub-agent files)
+    /// lands in the worktree's Claude Code project directory, which the
+    /// transcript ingestor reads — it must not meter that spend a second time.
+    #[tokio::test]
+    async fn direct_cli_stage_transcript_is_not_double_counted_in_mission_spend() {
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-861/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner));
+        orch.run_to_pause(&run).await.unwrap();
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        assert!((cost - 0.25).abs() < 1e-9, "run card: {cost}");
+
+        // The stage's session transcript and a sub-agent's, as Claude Code writes them.
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct-861/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n{}\n", cc_line("sess-direct-861", "req_a", cwd), cc_line("sess-direct-861", "req_b", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct-861/subagents/agent-1.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_sub", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        let s = ing.ingest().unwrap();
+        assert_eq!(s.rows_inserted, 0, "the stage's session is already its direct row");
+
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!((spend - cost).abs() < 1e-9, "mission spend {spend} equals the run's cost {cost}");
+    }
 }
 
 #[cfg(test)]
@@ -15660,6 +15744,85 @@ mod transcript_tests {
         engine.scan_and_record("term-1", 2, b"Total cost: $5.00 | Input: 10K | Output: 1K");
         let rep = db.lock().usage_report(ALL.0, ALL.1, None, 0).unwrap();
         assert_eq!(rep.totals.calls, 2);
+    }
+    /// A workspace on `cwd` with an active mission: `(db file, mission id)`.
+    fn mission_ws(db: &Db, cwd: &str) -> String {
+        db.insert_project("p861", "P", "/tmp/p861").unwrap();
+        db.insert_workspace("w861", "p861", "ws", "", "b861", Some(cwd), "", None).unwrap();
+        let ws = db.get_workspace("w861").unwrap().unwrap();
+        crate::mission::ensure_for_workspace(db, &ws, "build", "worktree").unwrap().id
+    }
+
+    fn cc_now(session: &str, req: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, "claude-opus-4-8", 500, 0, 0, 100, &now_iso(), cwd)).unwrap();
+        v["sessionId"] = serde_json::json!(session);
+        v.to_string()
+    }
+
+    /// #861: RUN rows recorded from a Direct stage's transcript before its
+    /// session id was known (or before the fix) are removed once it is —
+    /// the stage's session and its sub-agent files — and an unrelated
+    /// transcript in the same worktree keeps its rows.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn direct_session_cleanup_removes_duplicates_and_keeps_unrelated_transcripts() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let cwd = "/tmp/octo-861/cleanup";
+        let mission = mission_ws(&db.lock(), cwd);
+        let root = TempDir::new().unwrap();
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n{}\n", cc_now("sess-direct", "req_d1", cwd), cc_now("sess-direct", "req_d2", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct/subagents/agent-1.jsonl"), format!("{}\n", cc_now("sess-direct", "req_dsub", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-user.jsonl"), format!("{}\n", cc_now("sess-user", "req_u1", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4, "not yet known as a Direct session: all metered");
+        let (all, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+
+        db.lock().record_direct_cli_session("stage-x", "sess-direct").unwrap();
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 3), "the session and its sub-agent rows are removed");
+        let (left, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+        assert!(left > 0.0 && (left - all / 4.0).abs() < 1e-9, "only the unrelated transcript's row stays: {left} of {all}");
+        let keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(keys, vec!["cc:req_u1".to_string()]);
+
+        // Later passes skip the Direct files without reading them again.
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n{}\n{}\n", cc_now("sess-direct", "req_d1", cwd), cc_now("sess-direct", "req_d2", cwd), cc_now("sess-direct", "req_d3", cwd))).unwrap();
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// #861: the one-time migration seeds `direct_cli_sessions` from the
+    /// session ids stage rows still carry, so existing duplicates are found.
+    #[test]
+    fn migration_backfills_direct_cli_sessions_from_stage_rows() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            db.insert_project("p1", "P", "/tmp/p1").unwrap();
+            db.insert_workspace("w1", "p1", "ws", "", "b1", Some("/tmp/wt861"), "", None).unwrap();
+            db.seed_builtin_pipelines().unwrap();
+            let pid = db.list_pipelines().unwrap()[0].id.clone();
+            let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+            let stages = db.list_run_stages(&run).unwrap();
+            // Rows from before the table existed: written behind its back.
+            db.conn_ref().execute("UPDATE run_stages SET session_id = 'sess-old' WHERE id = ?1", [&stages[0].id]).unwrap();
+            db.conn_ref()
+                .execute(
+                    "UPDATE run_stages SET session_usage = ?2 WHERE id = ?1",
+                    rusqlite::params![stages[1 % stages.len()].id, r#"{"session":"sess-usage","usage":{}}"#],
+                )
+                .unwrap();
+            db.conn_ref().execute("DELETE FROM direct_cli_sessions", []).unwrap();
+            db.meta_delete("direct_cli_sessions_backfill_v1").unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        let ids = db.direct_cli_session_ids().unwrap();
+        assert!(ids.contains("sess-old") && ids.contains("sess-usage"), "{ids:?}");
     }
 }
 

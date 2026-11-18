@@ -1225,6 +1225,9 @@ impl Orchestrator {
         // of it subtracts this (Codex reports thread-wide usage on resume).
         if let Some(sid) = outcome.session_id.as_deref() {
             self.db.lock().set_stage_session_usage(&stage.id, sid, outcome.cli.session_usage.as_ref())?;
+            // Every attempt's session, kept for good: the transcript ingestor
+            // skips it — this stage's `direct` row already meters it (#861).
+            self.db.lock().record_direct_cli_session(&stage.id, sid)?;
         }
         // The model this attempt actually ran on (Claude Code's settings can
         // pick another than `--model`), recorded before any completion below

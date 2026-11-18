@@ -1009,6 +1009,10 @@ export const ipc = {
   /** Rust asks this window to confirm closing (an app quit hit unsaved edits). */
   onConfirmCloseRequest: (handler: () => void) =>
     listen("octo://confirm-close", () => handler()),
+  /** A transcript ingest pass changed the spend ledger (rows added or
+   *  Direct-session duplicates removed). */
+  onSpendIngested: (handler: () => void) =>
+    listen("octo://spend-ingested", () => handler()),
   /** Theme changes cross windows (the DOM `octo:theme` event does not). */
   broadcastTheme: (theme: ThemeConfig) => emit("octo://theme", theme),
   onThemeBroadcast: (handler: (theme: ThemeConfig) => void) =>

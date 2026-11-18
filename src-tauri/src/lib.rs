@@ -490,10 +490,19 @@ pub fn run() {
             // even while the Usage page is closed.
             {
                 let ingestor = std::sync::Arc::clone(&state.transcripts);
+                let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     loop {
                         let i = std::sync::Arc::clone(&ingestor);
-                        let _ = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
+                        let done = tauri::async_runtime::spawn_blocking(move || i.maybe_ingest()).await;
+                        // The ledger moved: cost readers (the mission Logbook)
+                        // re-read instead of waiting for their next edge.
+                        if let Ok(Some(s)) = done {
+                            if s.rows_inserted + s.rows_removed > 0 {
+                                use tauri::Emitter;
+                                let _ = handle.emit("octo://spend-ingested", ());
+                            }
+                        }
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
                 });

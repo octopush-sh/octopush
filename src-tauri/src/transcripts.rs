@@ -37,6 +37,12 @@
 //!   root and every terminal of the workspace is flagged
 //!   (`transcript_seen:<id>`), and the first time a target's transcripts
 //!   are read its already-scraped rows from that point on are removed.
+//! - A Direct stage's `claude -p` session runs in a workspace worktree too,
+//!   but its spend is already the stage's `direct` row: every session id a
+//!   stage reports is kept in `direct_cli_sessions`, and its transcript —
+//!   with any sub-agent files under `<session>/` — is never metered here.
+//!   One read before the id was known is undone: its RUN rows are deleted
+//!   by request key (#861).
 //! - Side effects that describe *now* (a session's live counters, the
 //!   Logbook activity span) fire only for messages minutes old; historical
 //!   rows are attributed to the mission that existed at their timestamp.
@@ -189,6 +195,9 @@ pub struct TranscriptUsage {
 pub struct IngestSummary {
     pub files_scanned: usize,
     pub rows_inserted: usize,
+    /// RUN rows removed because their transcript turned out to be a Direct
+    /// stage's CLI session (#861).
+    pub rows_removed: usize,
 }
 
 /// The directory name Claude Code derives from a working directory: every
@@ -336,6 +345,26 @@ fn jsonl_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The Direct-stage session `file` belongs to, if any: its own stem (the
+/// session file, `<session>.jsonl`) or a directory between the project
+/// directory and it (a sub-agent transcript under `<session>/…`).
+fn direct_session_of(project_dir: &Path, file: &Path, direct: &std::collections::HashSet<String>) -> Option<String> {
+    if direct.is_empty() {
+        return None;
+    }
+    if let Some(stem) = file.file_stem().and_then(|s| s.to_str()) {
+        if direct.contains(stem) {
+            return Some(stem.to_string());
+        }
+    }
+    let rel = file.strip_prefix(project_dir).ok()?;
+    rel.parent()?
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .find(|c| direct.contains(*c))
+        .map(str::to_string)
+}
+
 pub struct TranscriptIngestor {
     db: Arc<Mutex<Db>>,
     root: PathBuf,
@@ -435,6 +464,7 @@ impl TranscriptIngestor {
         if !self.root.is_dir() {
             return Ok(summary);
         }
+        let direct_sessions = self.db.lock().direct_cli_session_ids()?;
         for (dir_name, target) in self.targets()? {
             let dir = self.root.join(&dir_name);
             if !dir.is_dir() {
@@ -465,6 +495,15 @@ impl TranscriptIngestor {
             let mut earliest: Option<String> = None;
             for file in files {
                 summary.files_scanned += 1;
+                // A Direct stage's own `claude -p` session (or one of its
+                // sub-agents) is already metered as the stage's `direct` row.
+                if let Some(sid) = direct_session_of(&dir, &file, &direct_sessions) {
+                    match self.drop_direct_file(&file) {
+                        Ok(removed) => summary.rows_removed += removed,
+                        Err(e) => tracing::warn!(file = %file.display(), session = %sid, error = %e, "direct-session transcript cleanup failed"),
+                    }
+                    continue;
+                }
                 match self.ingest_file(&file, &target) {
                     Ok((inserted, first_ts)) => {
                         summary.rows_inserted += inserted;
@@ -494,6 +533,34 @@ impl TranscriptIngestor {
             }
         }
         Ok(summary)
+    }
+
+    /// A transcript of a Direct stage's CLI session: never metered as RUN
+    /// spend (#861). If an earlier pass already read it — before the stage
+    /// reported its session id, or before this rule existed — the RUN rows it
+    /// produced are found by re-reading the file (the ledger keys each one
+    /// `cc:<request id>`) and deleted, and the file's offset is dropped, so
+    /// every later pass skips it with no read. Returns the rows removed.
+    fn drop_direct_file(&self, path: &Path) -> AppResult<usize> {
+        let meta_key = format!("cc_transcript:{}", path.display());
+        let offset = self
+            .db
+            .lock()
+            .meta_get(&meta_key)?
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        if offset == 0 {
+            return Ok(0);
+        }
+        let (entries, _) = read_new_entries(path, 0)?;
+        let keys: Vec<String> = entries.into_iter().map(|u| u.key).collect();
+        let db = self.db.lock();
+        let removed = db.delete_run_spend_by_keys(&keys)?;
+        db.meta_delete(&meta_key)?;
+        if removed > 0 {
+            tracing::info!(file = %path.display(), removed, "removed RUN rows double-counting a Direct stage session");
+        }
+        Ok(removed)
     }
 
     /// Ingest one file: `(rows inserted, earliest timestamp seen)`.
