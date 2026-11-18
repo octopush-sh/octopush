@@ -90,6 +90,32 @@ describe("GeneralPane — Claude Code hooks (on by default)", () => {
   });
 });
 
+describe("GeneralPane — secret guard (on by default)", () => {
+  const toggle = () => screen.getByTestId("secret-guard-switch");
+
+  it("is on when nothing is saved", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    expect(screen.getByText("Guard commits against secrets")).toBeInTheDocument();
+  });
+
+  it("switching off saves an explicit false, without clobbering other settings", async () => {
+    getSettings.mockResolvedValue({ ...BASE_SETTINGS, editorCommand: "cursor" });
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(saveSettings).toHaveBeenCalledTimes(1));
+    expect(saveSettings).toHaveBeenLastCalledWith(
+      expect.objectContaining({ editorCommand: "cursor", secretGuardEnabled: false }),
+    );
+  });
+});
+
 describe.each([
   {
     name: "tool turns per message",

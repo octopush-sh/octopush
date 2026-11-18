@@ -178,6 +178,44 @@ describe("PrComposer", () => {
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Pull request #7 opened" }));
   });
 
+  it("secret guard: the push and the PR each ask; one override never covers both", async () => {
+    ready();
+    // Ahead until the confirmed push lands, then published.
+    let pushed = false;
+    ipcMock.getGitStatus.mockImplementation(async () => status({ ahead: pushed ? 0 : 1 }));
+    const finding = { file: "seed.js", line: 9, rule: "your-credential", kind: "your Anthropic API key", yours: true };
+    const pushRefusal = { kind: "SecretsFound", message: "m", total: 1, partial: false, fingerprint: "fp-push", findings: [finding] };
+    const prRefusal = { kind: "SecretsFound", message: "m", total: 1, partial: false, fingerprint: "fp-pr", findings: [finding] };
+    ipcMock.pushBranch
+      .mockRejectedValueOnce(pushRefusal)
+      .mockRejectedValueOnce(pushRefusal)
+      .mockImplementationOnce(async () => { pushed = true; return "ok"; });
+    const pr = { number: 8, title: "Add CSV export", url: "https://github.com/o/r/pull/8", isDraft: false, state: "open" };
+    ipcMock.createPullRequest.mockRejectedValueOnce(prRefusal).mockResolvedValueOnce(pr);
+    const onClose = vi.fn();
+    renderComposer(onClose);
+    await screen.findByDisplayValue("Add CSV export");
+    fireEvent.click(screen.getByRole("button", { name: "Open the pull request" }));
+    // The push's own scan asks first.
+    expect(await screen.findByText("This push adds what looks like your Anthropic API key in seed.js:9.")).toBeTruthy();
+    expect(ipcMock.createPullRequest).not.toHaveBeenCalled();
+    // Escape closes only the guard, never the composer underneath.
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByText(/your Anthropic API key/)).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open the pull request" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Push regardless" }));
+    // The push went through on its fingerprint; the PR's scan asks on its own.
+    expect(await screen.findByText("This pull request adds what looks like your Anthropic API key in seed.js:9.")).toBeTruthy();
+    expect(ipcMock.pushBranch).toHaveBeenLastCalledWith("/w", "fp-push");
+    expect(ipcMock.createPullRequest).toHaveBeenLastCalledWith("/w", "main", "Add CSV export", "Closes #42\n\n## Summary\nExports.", false);
+    expect(onClose).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Open it regardless" }));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(ipcMock.pushBranch).toHaveBeenCalledTimes(3);
+    expect(ipcMock.createPullRequest).toHaveBeenLastCalledWith("/w", "main", "Add CSV export", "Closes #42\n\n## Summary\nExports.", false, "fp-pr");
+  });
+
   it("shows a create failure inline and stays open", async () => {
     ready();
     ipcMock.createPullRequest.mockRejectedValue("gh pr create failed: a pull request already exists");

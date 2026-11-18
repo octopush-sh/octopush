@@ -72,6 +72,12 @@ pub struct AppSettings {
     #[serde(default)]
     pub quiet_claude_code: bool,
 
+    /// Secret guard (#730, Settings › General › "Guard commits against
+    /// secrets"): `None` = the default, read as **on** by
+    /// `secret_scan::guard_enabled`; an explicit `false` turns it off.
+    #[serde(default)]
+    pub secret_guard_enabled: Option<bool>,
+
     /// Provider-agnostic model tiers — `fast`, `balanced`, `strong` → a
     /// configured model id. What a sub-agent definition's `model: haiku`
     /// (or an `Agent` call's `model: "fast"`) resolves to on THIS machine,

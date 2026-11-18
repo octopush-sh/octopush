@@ -1730,6 +1730,79 @@ impl Orchestrator {
         Ok(())
     }
 
+    /// The secret guard's boundary check for one about-to-start stage (#730).
+    /// Only Action-environment roles are checked. Scans the worktree's
+    /// changes against the workspace's base (commits + staged + unstaged +
+    /// untracked) on a blocking thread; on a finding, a partial scan (the
+    /// 16 MB budget ran out) or a worktree it couldn't read — fail closed, so
+    /// a detached run or a Routine never ships unchecked — parks the stage
+    /// `awaiting_checkpoint` (never started, like a budget park) with its
+    /// `secret_hold`, journals the reason and fires the "decision" checkpoint
+    /// unless the director already approved exactly this hold (same
+    /// fingerprint). Returns `true` when it parked. With the guard off, a stale
+    /// hold is cleared. Never journals or stores a value: the hold and the
+    /// notice carry the file, the line and the kind only.
+    async fn secret_gate(&self, run: &crate::db::RunRow, stage: &RunStageRow) -> AppResult<bool> {
+        let role = self.db.lock().get_role(&stage.role).ok().flatten();
+        let Some(role) = role else { return Ok(false) };
+        if role.environment != crate::orchestrator::types::RoleEnvironment::Action {
+            return Ok(false);
+        }
+        let settings = crate::settings::load_settings().unwrap_or_default();
+        if !crate::secret_scan::guard_enabled(&settings) {
+            if stage.secret_hold.is_some() {
+                self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+            }
+            return Ok(false);
+        }
+        let base = self
+            .db
+            .lock()
+            .get_workspace(&run.workspace_id)
+            .ok()
+            .flatten()
+            .and_then(|w| w.from_branch);
+        let known = crate::secret_scan::known_secrets_from(&settings);
+        let scanned = match self.workspace_path(run) {
+            Ok(path) => tokio::task::spawn_blocking(move || {
+                crate::secret_scan::worktree_files(&path, base.as_deref())
+                    .map(|c| crate::secret_scan::scan_collected(&c, &known))
+            })
+            .await
+            .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}")))),
+            Err(e) => Err(e),
+        };
+        let hold = match scanned {
+            Ok(report) if !report.needs_confirmation() => {
+                if stage.secret_hold.is_some() {
+                    self.db.lock().set_stage_secret_hold(&stage.id, None)?;
+                }
+                return Ok(false);
+            }
+            Ok(report) => crate::secret_scan::SecretHold::from_report(report),
+            Err(e) => {
+                tracing::warn!(run_id = %run.id, "secret guard couldn't scan the worktree: {e}");
+                crate::secret_scan::SecretHold::unreadable()
+            }
+        };
+        if let Some(h) = &stage.secret_hold {
+            if h.acknowledged && h.fingerprint == hold.fingerprint {
+                self.journal_notice(&run.id, &stage.id, &format!(
+                    "secret guard: the director approved proceeding · {}",
+                    hold.summary()
+                ));
+                return Ok(false);
+            }
+        }
+        self.db.lock().set_stage_secret_hold(&stage.id, Some(&hold))?;
+        self.db.lock().set_run_stage_status(&stage.id, "awaiting_checkpoint")?;
+        let label = secret_hold_stage_label(&stage.role, &role.label);
+        self.journal_notice(&run.id, &stage.id, &crate::secret_scan::hold_notice(&label, &hold));
+        self.emit_run_update(&run.id);
+        self.emit_checkpoint(&run.id, &stage.id, "decision");
+        Ok(true)
+    }
+
     /// Ask a running run to pause at its next stage boundary. Consumed once, in
     /// `drive_inner`. A no-op if the run isn't driving (the flag is harmless).
     pub fn request_pause(&self, run_id: &str) {
@@ -1900,6 +1973,21 @@ impl Orchestrator {
                 batch.truncate(1);
             }
             skip_budget_once = false; // only the drive's first batch may bypass
+
+            // Secret guard (#730): an Action stage (commit / push / PR /
+            // merge / release) never starts while the worktree's changes hold
+            // a possible secret the director hasn't approved. Independent of
+            // the budget override above: approving a budget park never
+            // approves a secret. Detached runs and Routines park the same way.
+            let mut held = false;
+            for s in &batch {
+                held |= self.secret_gate(&run, s).await?;
+            }
+            if held {
+                self.db.lock().set_run_status(run_id, "paused", false)?;
+                self.emit_run_update(run_id);
+                return Ok(RunStatus::Paused);
+            }
 
             // Intra-stage budget headroom, SHARED across the batch: the
             // remaining run budget divided by the batch size, so N concurrent
@@ -2376,7 +2464,17 @@ impl Orchestrator {
             CheckpointAction::Approve | CheckpointAction::Edit => {
                 if let Some(s) = &blocked {
                     if s.status == "awaiting_checkpoint" {
-                        if s.started_at.is_none() && s.artifact.is_none() {
+                        let secret_held = s.secret_hold.as_ref().filter(|h| !h.acknowledged);
+                        if s.started_at.is_none() && s.artifact.is_none() && secret_held.is_some() {
+                            // Held by the secret guard (#730): approving is the
+                            // director's explicit "proceed regardless" for
+                            // exactly these findings. It doesn't skip a budget
+                            // gate — that gate still fires on the re-drive.
+                            let mut ack = secret_held.cloned().expect("checked above");
+                            ack.acknowledged = true;
+                            self.db.lock().set_stage_secret_hold(&s.id, Some(&ack))?;
+                            self.db.lock().set_run_stage_status(&s.id, "pending")?;
+                        } else if s.started_at.is_none() && s.artifact.is_none() {
                             // Budget-parked: the stage never ran. Release it to
                             // pending so it actually executes (past the gate).
                             self.db.lock().set_run_stage_status(&s.id, "pending")?;
@@ -2864,5 +2962,16 @@ impl Orchestrator {
                 );
             }
         });
+    }
+}
+
+/// How a held stage reads in the journal: "the pull request", "the merge",
+/// "the release", else "the <label> stage".
+pub(crate) fn secret_hold_stage_label(role: &str, label: &str) -> String {
+    match role {
+        "pull_request" => "the pull request".into(),
+        "merge" => "the merge".into(),
+        "release" => "the release".into(),
+        _ => format!("the {} stage", label.to_lowercase()),
     }
 }

@@ -74,6 +74,11 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
         </div>
 
         <div className="space-y-4">
+          <SectionLabel>Safety</SectionLabel>
+          <SecretGuardRow />
+        </div>
+
+        <div className="space-y-4">
           <SectionLabel>Attention</SectionLabel>
           <ToggleRow
             label="Play sound when an agent or terminal needs attention"
@@ -124,6 +129,41 @@ function ClaudeHooksRow() {
         checked={enabled}
         onChange={(on) => void persist(on)}
         testId="claude-hooks-switch"
+      />
+    </div>
+  );
+}
+
+/** `secretGuardEnabled` — **on unless saved as `false`** (#730). Off restores
+ *  the unguarded commit, push and pull request paths exactly. */
+function SecretGuardRow() {
+  const [enabled, setEnabled] = useState(true);
+
+  useEffect(() => {
+    ipc
+      .getSettings()
+      .then((s) => setEnabled(s.secretGuardEnabled ?? true))
+      .catch(() => {});
+  }, []);
+
+  async function persist(on: boolean) {
+    setEnabled(on);
+    try {
+      const s = await ipc.getSettings();
+      await ipc.saveSettings({ ...s, secretGuardEnabled: on });
+    } catch {
+      // Leave the switch where the user put it; the next change retries.
+    }
+  }
+
+  return (
+    <div data-tour="settings-secret-guard">
+      <ToggleRow
+        label="Guard commits against secrets"
+        description="Before a commit, a push or a pull request, and before a crew's commit, PR, merge or release stage, Octopush checks the change on this Mac for API keys, tokens, private keys and the keys you saved here. A finding asks you first; a crew run waits for you. Nothing is sent anywhere."
+        checked={enabled}
+        onChange={(on) => void persist(on)}
+        testId="secret-guard-switch"
       />
     </div>
   );
