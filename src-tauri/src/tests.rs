@@ -15099,17 +15099,26 @@ mod clone_command_tests {
 
     #[test]
     fn first_attempt_uses_the_users_helpers_in_a_fixed_locale() {
+        let (cmd, env) = build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false);
         assert_eq!(
-            build_clone_command("https://dev.azure.com/o/p/_git/r", "/tmp/r", false),
-            "env LC_ALL=C git clone --progress -- 'https://dev.azure.com/o/p/_git/r' '/tmp/r'"
+            cmd,
+            "env LC_ALL=C git clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("OCTOPUSH_CLONE_URL", "https://dev.azure.com/o/p/_git/r".to_string()),
+                ("OCTOPUSH_CLONE_TARGET", "/tmp/r".to_string()),
+            ]
         );
     }
 
     #[test]
     fn a_retry_with_typed_credentials_bypasses_stored_helpers() {
+        let (cmd, _) = build_clone_command("https://github.com/o/r", "/tmp/r", true);
         assert_eq!(
-            build_clone_command("https://github.com/o/r", "/tmp/r", true),
-            "env LC_ALL=C git -c credential.helper= clone --progress -- 'https://github.com/o/r' '/tmp/r'"
+            cmd,
+            "env LC_ALL=C git -c credential.helper= clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
         );
     }
 
@@ -15131,11 +15140,34 @@ mod clone_command_tests {
     }
 
     #[test]
-    fn single_quotes_in_url_or_path_are_escaped() {
-        assert_eq!(
-            build_clone_command("https://h/o/it's", "/tmp/o'k", false),
-            "env LC_ALL=C git clone --progress -- 'https://h/o/it'\\''s' '/tmp/o'\\''k'"
-        );
+    fn the_url_and_path_never_reach_the_command_line() {
+        let url = "https://h/o/it's\\'; touch PWNED; echo '";
+        let target = "/tmp/o'k\\'; touch PWNED #";
+        let (cmd, env) = build_clone_command(url, target, false);
+        assert!(!cmd.contains("it's") && !cmd.contains("o'k") && !cmd.contains("PWNED"), "{cmd}");
+        assert_eq!(env[0].1, url);
+        assert_eq!(env[1].1, target);
+    }
+
+    #[test]
+    fn a_hostile_url_and_path_clone_verbatim_under_every_shell() {
+        // A local repo whose path, and a target, hold `\'` — the sequence fish
+        // reads as an escaped quote inside single quotes.
+        for shell in crate::tests::login_shell_fixture::available_shells() {
+            let dir = tempfile::tempdir().unwrap();
+            let src = dir.path().join("src a\\'; touch PWNED; echo '");
+            std::fs::create_dir(&src).unwrap();
+            crate::tests::login_shell_fixture::git(&src, &["init", "-q"]);
+            crate::tests::login_shell_fixture::git(&src, &["commit", "-q", "--allow-empty", "-m", "init"]);
+            let target = dir.path().join("dst it's\\'; touch PWNED #");
+
+            let (cmd, env) = build_clone_command(&src.to_string_lossy(), &target.to_string_lossy(), false);
+            let out = crate::commands::login_shell_output(&shell, &dir.path().to_string_lossy(), &cmd, &env)
+                .unwrap();
+            assert!(out.status.success(), "{shell}: {}", String::from_utf8_lossy(&out.stderr));
+            assert!(target.join(".git").is_dir(), "{shell}: clone not where asked");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the path");
+        }
     }
 }
 
@@ -18069,6 +18101,106 @@ mod updater_channel_tests {
         let raw = serde_json::json!({"version": "1.2.0", "pub_date": "2026-10-30T06:00:00Z"});
         assert_eq!(manifest_date(&raw).as_deref(), Some("2026-10-30T06:00:00Z"));
         assert_eq!(manifest_date(&serde_json::json!({})), None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod login_shell_fixture {
+    //! The shells a user's login shell may be. sh, bash and zsh ship with
+    //! macOS; fish runs only where it is installed and is skipped otherwise.
+    use std::process::Command;
+
+    pub fn available_shells() -> Vec<String> {
+        let fish = ["/opt/homebrew/bin/fish", "/usr/local/bin/fish", "/usr/bin/fish", "/bin/fish"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        ["/bin/sh", "/bin/bash", "/bin/zsh"]
+            .into_iter()
+            .filter(|p| std::path::Path::new(p).exists())
+            .chain(fish)
+            .map(String::from)
+            .collect()
+    }
+
+    /// `git` in `dir` with a fixed identity and no signing, so the user's
+    /// own gitconfig can't fail the test.
+    pub fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(["-c", "user.name=T", "-c", "user.email=t@e", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A repo with one commit whose local config sets the identity, as the
+    /// login shell's `git commit` reads it from there.
+    pub fn repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        git(dir.path(), &["init", "-q"]);
+        for (k, v) in [("user.name", "T"), ("user.email", "t@e"), ("commit.gpgsign", "false")] {
+            git(dir.path(), &["config", k, v]);
+        }
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "init"]);
+        dir
+    }
+
+    pub fn head_message(dir: &std::path::Path) -> String {
+        let out = Command::new("git")
+            .args(["log", "-1", "--format=%B"])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    }
+}
+
+#[cfg(test)]
+mod commit_message_shell_tests {
+    use super::login_shell_fixture::{available_shells, git, head_message, repo};
+    use crate::commands::{commit_in_login_shell, git_commit_command, COMMIT_MSG_FILE_ENV};
+
+    const HOSTILE: &str = "a\\'; touch PWNED; echo '";
+
+    #[test]
+    fn the_command_is_constant_and_names_the_message_file() {
+        assert_eq!(git_commit_command(false), "git commit -F \"$OCTOPUSH_COMMIT_MSG_FILE\"");
+        assert_eq!(git_commit_command(true), "git commit --amend -F \"$OCTOPUSH_COMMIT_MSG_FILE\"");
+        assert_eq!(COMMIT_MSG_FILE_ENV, "OCTOPUSH_COMMIT_MSG_FILE");
+    }
+
+    #[test]
+    fn refs_keep_their_single_quoting() {
+        assert_eq!(crate::git_ops::quote_git_ref("feat/it's"), "'feat/it'\\''s'");
+    }
+
+    #[test]
+    fn a_hostile_message_commits_verbatim_under_every_shell() {
+        for shell in available_shells() {
+            let dir = repo();
+            std::fs::write(dir.path().join("f.txt"), &shell).unwrap();
+            git(dir.path(), &["add", "f.txt"]);
+            let ws = dir.path().to_string_lossy().to_string();
+            let sha = commit_in_login_shell(&shell, &ws, HOSTILE, false)
+                .unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert!(!sha.is_empty(), "{shell}");
+            assert_eq!(head_message(dir.path()), HOSTILE, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the message");
+        }
+    }
+
+    #[test]
+    fn a_hostile_message_amends_verbatim_under_every_shell() {
+        for shell in available_shells() {
+            let dir = repo();
+            let ws = dir.path().to_string_lossy().to_string();
+            let msg = format!("{HOSTILE}\n\nbody $(id) `id` \"q\" #");
+            commit_in_login_shell(&shell, &ws, &msg, true).unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert_eq!(head_message(dir.path()), msg, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the message");
+        }
     }
 }
 

@@ -3436,14 +3436,22 @@ pub fn url_with_user(url: &str, username: &str) -> Option<String> {
 /// holds for the host (a valid token for the wrong account is never rejected
 /// by the server, so the askpass would otherwise never be consulted). The
 /// success path then stores the credentials itself — see
-/// `credential_approve_payload`.
-pub fn build_clone_command(url: &str, target: &str, with_typed_credentials: bool) -> String {
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+/// `credential_approve_payload`. The URL and target path travel in the
+/// returned environment, never in the command (see `login_shell_output`).
+pub fn build_clone_command(
+    url: &str,
+    target: &str,
+    with_typed_credentials: bool,
+) -> (String, Vec<(&'static str, String)>) {
     let helper = if with_typed_credentials { " -c credential.helper=" } else { "" };
-    format!(
-        "env LC_ALL=C git{helper} clone --progress -- {} {}",
-        quote(url),
-        quote(target)
+    (
+        format!(
+            "env LC_ALL=C git{helper} clone --progress -- \"$OCTOPUSH_CLONE_URL\" \"$OCTOPUSH_CLONE_TARGET\""
+        ),
+        vec![
+            ("OCTOPUSH_CLONE_URL", url.to_string()),
+            ("OCTOPUSH_CLONE_TARGET", target.to_string()),
+        ],
     )
 }
 
@@ -3620,13 +3628,15 @@ async fn clone_via_shell(
         }
         _ => url.to_string(),
     };
-    let git_cmd = build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
+    let (git_cmd, clone_env) =
+        build_clone_command(&clone_url, &target.to_string_lossy(), credentials.is_some());
 
     // Build environment overrides.
     let mut env_overrides: Vec<(String, String)> = vec![
         // Prevent git from blocking on tty prompts.
         ("GIT_TERMINAL_PROMPT".into(), "0".into()),
     ];
+    env_overrides.extend(clone_env.into_iter().map(|(k, v)| (k.to_string(), v)));
 
     // Askpass script path — only created when credentials are provided.
     // We hold an `Option<tempfile::TempPath>` so the file lives until after
@@ -5145,34 +5155,80 @@ pub async fn commit_changes(
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let msg_escaped = message.replace('\'', "'\\''");
-    let cmd = format!("git commit -m '{}'", msg_escaped);
+    commit_in_login_shell(&shell, &workspace_path, &message, false)
+}
 
-    let output = std::process::Command::new(&shell)
-        .arg("-l").arg("-c").arg(&cmd)
-        .current_dir(&workspace_path)
+/// Environment variable naming the file `git commit -F` reads the message from.
+pub const COMMIT_MSG_FILE_ENV: &str = "OCTOPUSH_COMMIT_MSG_FILE";
+
+/// The login-shell command that commits (or amends) with the message in the
+/// file named by `COMMIT_MSG_FILE_ENV`. Constant, so no message text is ever
+/// spliced into it — see `login_shell_output`.
+pub fn git_commit_command(amend: bool) -> &'static str {
+    if amend {
+        "git commit --amend -F \"$OCTOPUSH_COMMIT_MSG_FILE\""
+    } else {
+        "git commit -F \"$OCTOPUSH_COMMIT_MSG_FILE\""
+    }
+}
+
+/// Run `cmd` in `shell` as a login shell in `cwd`, with `env` added. User
+/// values never go into `cmd`: they travel in `env` and `cmd` names them as
+/// `"$VAR"`, which sh, bash, zsh and fish all expand as one untouched
+/// argument. Single-quoting with `'\''` is not safe under fish, where `\'`
+/// inside single quotes is an escape (so `a\'; touch x` would run `touch x`);
+/// it is kept only for refs and SHAs, which git forbids backslashes in
+/// (`git_ops::quote_git_ref`).
+pub(crate) fn login_shell_output(
+    shell: &str,
+    cwd: &str,
+    cmd: &str,
+    env: &[(&str, String)],
+) -> std::io::Result<std::process::Output> {
+    std::process::Command::new(shell)
+        .arg("-l").arg("-c").arg(cmd)
+        .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+        .current_dir(cwd)
         .output()
-        .map_err(|e| AppError::Other(format!("failed to spawn git commit: {e}")))?;
+}
+
+/// `git commit` (or `--amend`) with `message` in `shell`, the shared core of
+/// `commit_changes` and `amend_commit`. The message goes to a temp file passed
+/// with `-F` through the environment, deleted once git is done; `-F` keeps the
+/// same whitespace cleanup as `-m`. Returns the new HEAD's short SHA.
+pub(crate) fn commit_in_login_shell(
+    shell: &str,
+    workspace_path: &str,
+    message: &str,
+    amend: bool,
+) -> AppResult<String> {
+    let what = if amend { "git commit --amend" } else { "git commit" };
+    let mut msg_file = tempfile::Builder::new()
+        .prefix("octopush-commit-msg-")
+        .tempfile()
+        .map_err(|e| AppError::Other(format!("couldn't write the commit message: {e}")))?;
+    std::io::Write::write_all(&mut msg_file, message.as_bytes())
+        .map_err(|e| AppError::Other(format!("couldn't write the commit message: {e}")))?;
+    let env = [(COMMIT_MSG_FILE_ENV, msg_file.path().to_string_lossy().into_owned())];
+
+    let output = login_shell_output(shell, workspace_path, git_commit_command(amend), &env)
+        .map_err(|e| AppError::Other(format!("failed to spawn {what}: {e}")))?;
+    drop(msg_file);
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() {
-            stderr.to_string()
-        } else {
-            stdout.to_string()
-        };
-        return Err(AppError::Other(format!("git commit failed: {}", detail.trim())));
+        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
+        return Err(AppError::Other(format!("{what} failed: {}", detail.trim())));
     }
 
     // Return the new HEAD short SHA so the frontend can show a confirmation.
     let head = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&workspace_path)
+        .current_dir(workspace_path)
         .output()
         .map_err(|e| AppError::Other(format!("failed to read HEAD: {e}")))?;
-    let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    Ok(sha)
+    Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
 }
 
 /// A branch and its open PR, for the rail's per-workspace PR indicator.
@@ -5456,8 +5512,8 @@ async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str)
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
     let cmd = format!(
-        "gh pr list --state all --head '{}' --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
-        branch.replace('\'', "'\\''"),
+        "gh pr list --state all --head {} --json number,title,url,state,isDraft,mergedAt,headRefOid,statusCheckRollup --limit 1",
+        crate::git_ops::quote_git_ref(branch),
     );
 
     let output = tokio::process::Command::new(&shell)
@@ -5832,8 +5888,8 @@ pub async fn push_branch(workspace_path: String, allow_findings: Option<String>)
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let cmd = format!(
-        "git push --set-upstream origin '{}' 2>&1",
-        branch.replace('\'', "'\\''")
+        "git push --set-upstream origin {} 2>&1",
+        crate::git_ops::quote_git_ref(&branch)
     );
 
     let output = std::process::Command::new(&shell)
@@ -6670,25 +6726,7 @@ pub async fn amend_commit(
         .await?;
     }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let msg_escaped = message.replace('\'', "'\\''");
-    let cmd = format!("git commit --amend -m '{}'", msg_escaped);
-    let output = std::process::Command::new(&shell)
-        .arg("-l").arg("-c").arg(&cmd)
-        .current_dir(&workspace_path)
-        .output()
-        .map_err(|e| AppError::Other(format!("failed to spawn git commit --amend: {e}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let detail = if !stderr.trim().is_empty() { stderr } else { stdout };
-        return Err(AppError::Other(format!("git commit --amend failed: {}", detail.trim())));
-    }
-    let head = std::process::Command::new("git")
-        .args(["rev-parse", "--short", "HEAD"])
-        .current_dir(&workspace_path)
-        .output()
-        .map_err(|e| AppError::Other(format!("failed to read HEAD: {e}")))?;
-    Ok(String::from_utf8_lossy(&head.stdout).trim().to_string())
+    commit_in_login_shell(&shell, &workspace_path, &message, true)
 }
 
 /// Sync core of `discard_file` (testable). Tracked → restore to HEAD; untracked → delete.

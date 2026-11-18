@@ -1157,12 +1157,23 @@ pub fn friendly_switch_error(name: &str, combined: &str) -> String {
     }
 }
 
+/// `s` single-quoted for a login-shell command line, `'` written as `'\''`.
+/// Only for refs and SHAs: git forbids a backslash in a ref name
+/// (`git check-ref-format`) and a SHA is hex, and without one this quoting is
+/// safe in sh, bash, zsh and fish alike. Anything else — messages, URLs,
+/// paths — must travel through the environment (`commands::login_shell_output`):
+/// fish treats `\'` inside single quotes as an escape, so a backslash would
+/// end the quoted string early.
+pub fn quote_git_ref(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
 /// `git switch <name>` via the user's login shell (gitconfig, hooks and
 /// filters behave like the user's terminal). Returns the trimmed combined
 /// output; failures come back as friendly errors via `friendly_switch_error`.
 pub fn switch_branch(path: &Path, name: &str) -> AppResult<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!("git switch '{}' 2>&1", name.replace('\'', "'\\''"));
+    let cmd = format!("git switch {} 2>&1", quote_git_ref(name));
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(path)
@@ -1324,10 +1335,7 @@ pub fn clean_untracked(path: &Path) -> AppResult<Vec<String>> {
 /// patterns, so the kinds collapse to Ok / Conflict / Error.
 pub fn cherry_pick(path: &Path, sha: &str) -> AppResult<PullOutcome> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!(
-        "git -c core.editor=true cherry-pick '{}' 2>&1",
-        sha.replace('\'', "'\\''")
-    );
+    let cmd = format!("git -c core.editor=true cherry-pick {} 2>&1", quote_git_ref(sha));
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(path)
