@@ -229,6 +229,39 @@ describe("RunFlow — an aborted run (#891)", () => {
     expect(container.querySelector(".border-octo-brass")).toBeNull();
   });
 
+  it("keeps the selection highlight on a selected cut card (#904)", () => {
+    const frozen = [mk({ id: "b", status: "running", startedAt: 1 })];
+    const { container } = render(
+      <RunFlow stages={frozen} selectedStageId="b" beaconStageId={null} runAborted onSelectStage={() => {}} />,
+    );
+    const card = container.querySelector("button")!;
+    expect(card.className).toContain("border-[var(--brass-dim)]");
+    expect(card.className).toContain("bg-[var(--brass-ghost)]");
+  });
+
+  it("leaves an unselected cut card on the hairline skin", () => {
+    const frozen = [mk({ id: "a", status: "done" }), mk({ id: "b", position: 1, status: "running", startedAt: 1 })];
+    const { container } = render(
+      <RunFlow stages={frozen} selectedStageId="a" beaconStageId={null} runAborted onSelectStage={() => {}} />,
+    );
+    const cards = container.querySelectorAll("button");
+    expect(cards[1].className).toContain("border-octo-hairline");
+    expect(cards[1].className).not.toContain("brass-ghost");
+  });
+
+  it("mutes the gate mark on a dead run (#904)", () => {
+    const gate = [mk({ id: "g", status: "awaiting_checkpoint", checkpoint: true })];
+    render(<RunFlow stages={gate} selectedStageId="g" beaconStageId={null} runAborted onSelectStage={() => {}} />);
+    const mark = screen.getByText("⟜");
+    expect(mark.className).toContain("text-octo-mute");
+    expect(mark.className).not.toContain("text-octo-brass");
+  });
+
+  it("keeps the gate mark brass on a live run", () => {
+    render(<RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />);
+    expect(screen.getByText("⟜").className).toContain("text-octo-brass");
+  });
+
   it("leaves a live run's stages alone", () => {
     render(<RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />);
     expect(screen.getByTitle("running").textContent).toBe("●");

@@ -8,7 +8,9 @@ export type ReviewSource = "working" | "committed";
 
 /** The view Review shows. With no commits ahead there is only the working
  *  tree. Otherwise the user's pick wins; without one, the working tree when
- *  it has changes (today's behaviour), else the commits. */
+ *  it has changes (today's behaviour), else the commits. App passes the
+ *  pinned default as the pick once a default has been shown (#903), so a
+ *  crew touching a file never flips the view mid-read. */
 export function resolveReviewSource(
   pick: ReviewSource | null | undefined,
   hasWorkingChanges: boolean,
@@ -29,11 +31,21 @@ export function sinceBaseLabel(commitsAhead: number): string {
   return `Since base · ${commitCount(commitsAhead)}`;
 }
 
-/** Files in a unified diff (one `diff --git` header each). */
+/** The line `git_ops::diff_to_text` appends when the 1 MiB cap cut a diff. */
+export const DIFF_TRUNCATED_MARKER = "... diff truncated (too large to display fully) ...";
+
+/** Files in a unified diff (one `diff --git` header each). A diff the 1 MiB
+ *  cap truncated holds only the files before the cut, so the count is a
+ *  floor: `truncated` says so, and the copy reads "N+ files" (#903). */
 export function diffFileCount(diff: string): number {
   let n = 0;
   for (const line of diff.split("\n")) if (line.startsWith("diff --git ")) n++;
   return n;
+}
+
+/** True when the backend's 1 MiB cap cut this diff short. */
+export function isDiffTruncated(diff: string): boolean {
+  return diff.trimEnd().endsWith(DIFF_TRUNCATED_MARKER);
 }
 
 /** The base as copy: "main", or "the base branch" when unknown. */

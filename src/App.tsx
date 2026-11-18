@@ -103,8 +103,9 @@ import { useCompanionFold } from "./hooks/useCompanionFold";
 import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
-import { diffFileCount, resolveReviewSource } from "./lib/reviewSource";
+import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
 import { useReviewSource } from "./stores/reviewSourceStore";
+import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
@@ -439,6 +440,11 @@ function App() {
   // Live for the shortcut table, which doesn't re-register on every status poll.
   const gitStatusRef = useRef<GitStatus | null>(null);
   gitStatusRef.current = gitStatus;
+  // The git status and committed answer one Review refresh fetched together,
+  // tagged with their workspace (#903). Only Review's refresh sets it; a
+  // workspace switch or leaving Review drops it, so it is always fresh for
+  // this visit. It feeds the default-source pin, never the display.
+  const [reviewAnswers, setReviewAnswers] = useState<ReviewAnswers | null>(null);
   // Per-workspace cache of the most recently fetched PR (or null when there
   // isn't one). Keyed by workspace id so switching back to a workspace
   // doesn't flicker until the next refresh; lives in prStore so a PR opened
@@ -780,9 +786,13 @@ function App() {
   useEffect(() => {
     setGitStatus(null);
     setGitDiff("");
+    setReviewAnswers(null);
     gitSigRef.current = "";
     gitDiffRef.current = "";
   }, [activeWorkspaceId]);
+  useEffect(() => {
+    if (activeMode !== "review") setReviewAnswers(null);
+  }, [activeMode]);
 
   useEffect(() => {
     const ws = workspaces.find((w) => w.id === activeWorkspaceId);
@@ -809,7 +819,22 @@ function App() {
           needDiff && ws ? ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null) : Promise.resolve(undefined),
         ]);
         if (cancelled) return;
-        if (ws && c !== undefined) useReviewSource.getState().setCommitted(ws.id, c);
+        if (ws && c !== undefined) {
+          useReviewSource.getState().setCommitted(ws.id, c);
+          const fresh: ReviewAnswers = {
+            workspaceId: ws.id,
+            dirty: (s?.changedFiles.length ?? 0) > 0,
+            commitsAhead: c?.commits ?? 0,
+          };
+          setReviewAnswers((prev) =>
+            prev &&
+            prev.workspaceId === fresh.workspaceId &&
+            prev.dirty === fresh.dirty &&
+            prev.commitsAhead === fresh.commitsAhead
+              ? prev
+              : fresh,
+          );
+        }
         // Status change-detection (file metadata). hasUpstream is intentionally
         // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
         // its own git status). The diff is compared separately, by content.
@@ -1278,15 +1303,22 @@ function App() {
     activeWorkspaceId ? s.committedByWs[activeWorkspaceId] ?? null : null,
   );
   const reviewPick = useReviewSource((s) => (activeWorkspaceId ? s.pickByWs[activeWorkspaceId] : undefined));
+  const reviewPinned = useReviewSource((s) => (activeWorkspaceId ? s.pinnedByWs[activeWorkspaceId] : undefined));
   const reviewSource = resolveReviewSource(
-    reviewPick,
+    reviewPick ?? reviewPinned,
     (gitStatus?.changedFiles.length ?? 0) > 0,
     committed?.commits ?? 0,
   );
+  // Pin the default once Review has shown it (#903), from this visit's fresh
+  // answers only: a crew touching a file must not switch a reader of Since
+  // base to the working tree mid-read. Leaving Review drops the pins.
+  useReviewDefaultPin(activeMode, activeWorkspaceId, reviewAnswers);
   const reviewDiff = reviewSource === "committed" ? committed?.diff ?? "" : gitDiff;
   const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
   const reviewChangedCount =
     reviewSource === "committed" ? diffFileCount(reviewDiff) : gitStatus?.changedFiles.length ?? 0;
+  // The 1 MiB cap can cut the committed diff, so its file count is a floor.
+  const reviewCountPartial = reviewSource === "committed" && isDiffTruncated(reviewDiff);
   const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
@@ -1294,6 +1326,7 @@ function App() {
         tokensUsed: lastTurnInputTokens,
         tokensLimit: activeModelMaxContext,
         changedCount: reviewChangedCount,
+        changedCountPartial: reviewCountPartial,
         diffStat: reviewDiffStat,
         runState: runTailState(activeRuns),
       }),
@@ -1303,6 +1336,7 @@ function App() {
       lastTurnInputTokens,
       activeModelMaxContext,
       reviewChangedCount,
+      reviewCountPartial,
       reviewDiffStat,
       activeRuns,
     ],
@@ -1315,8 +1349,8 @@ function App() {
   // In Review the tail is a demotion ladder rather than one truncating line,
   // so a narrow band sheds whole atoms instead of ending on "· …".
   const reviewParts = useMemo(
-    () => reviewTailParts(reviewChangedCount, reviewDiffStat),
-    [reviewChangedCount, reviewDiffStat],
+    () => reviewTailParts(reviewChangedCount, reviewDiffStat, reviewCountPartial),
+    [reviewChangedCount, reviewDiffStat, reviewCountPartial],
   );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
@@ -1518,10 +1552,23 @@ function App() {
     navigateToFile(`${root}/${pendingWorkspaceOpen.relativePath}`, "editor");
   }, [pendingWorkspaceOpen, activeWorkspace, project, navigateToFile]);
 
+  // The Changes rail, the secret guard and the provenance chips point at the
+  // working tree, so a jump from them while Since base is on screen switches
+  // to the working tree first instead of toasting "Not in the current diff"
+  // (#903). The switch is an explicit pick, like a click on the toggle.
+  const toWorkingTree = useCallback(() => {
+    if (activeWorkspaceId && reviewSource === "committed") {
+      useReviewSource.getState().pick(activeWorkspaceId, "working");
+    }
+  }, [activeWorkspaceId, reviewSource]);
+
   // Companion provenance chips jump into the diff at the file (best-effort line).
   const handleJumpToFile = useCallback(
-    (file: string, line: number | null) => navigateToFile(file, "diff", line),
-    [navigateToFile],
+    (file: string, line: number | null) => {
+      toWorkingTree();
+      navigateToFile(file, "diff", line);
+    },
+    [navigateToFile, toWorkingTree],
   );
 
   // ── Review · locate the open file in the tree ────────────────────
@@ -2271,7 +2318,10 @@ function App() {
                       projectPath={activeWorkspace.worktreePath || project.path}
                       workspaceId={activeWorkspaceId!}
                       diff={gitDiff}
-                      onChangesFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                      onChangesFileClick={(filePath) => {
+                        toWorkingTree();
+                        navigateToFile(filePath, "diff");
+                      }}
                       registerFocusCommit={registerFocusCommit}
                       fileTree={fileTreeProps ?? {
                         rootPath: activeWorkspace.worktreePath || project.path,

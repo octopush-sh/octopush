@@ -419,13 +419,21 @@ export function ReviewCanvas({
               <button
                 onClick={() => onSourceChange?.("committed")}
                 aria-pressed={readOnly}
+                // The count sheds on a narrow toolbar; the name keeps it.
+                aria-label={sinceBaseLabel(commitsAhead)}
                 title={sinceTitle}
-                className={`whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
+                className={`inline-flex items-center whitespace-nowrap border-l border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors focus-visible:outline-1 focus-visible:-outline-offset-1 focus-visible:outline-octo-brass ${
                   readOnly ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"
                 }`}
                 style={readOnly ? { background: "var(--brass-ghost)" } : undefined}
               >
-                {sinceBaseLabel(commitsAhead)}
+                {/* The toolbar's first rung (≤ 600px, `.octo-reviewbar`): the
+                    commit count sheds, "Since base" is the floor; the count
+                    stays in the aria-label and the lock's tooltip. */}
+                Since base
+                <span className="octo-demote octo-demote-source-count" data-testid="review-source-count">
+                  {`\u00a0· ${commitCount(commitsAhead)}`}
+                </span>
               </button>
             </div>
             {readOnly && (
@@ -712,7 +720,7 @@ export function ReviewCanvas({
             readOnly={readOnly}
             // The committed side matches the disk only while the tree is clean.
             diskContext={!readOnly || workingCount === 0}
-            empty={{ source, commitsAhead, base, workingCount }}
+            empty={{ source, commitsAhead, base, workingCount, ignoreWhitespace }}
             onShowCommitted={() => onSourceChange?.("committed")}
             stagedCount={
               gitStatus?.changedFiles.filter((f) => f.staged).length ?? 0

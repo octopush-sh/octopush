@@ -18533,6 +18533,17 @@ mod open_pull_request_tests {
         assert!(!c.diff.contains("main-only.txt"), "the base's own commits never count: {}", c.diff);
         // Cached by (HEAD, merge base): the same answer on a repeat call.
         assert_eq!(committed_diff(d, Some("main"), false).unwrap(), c);
+        // Another base at the same merge base: same diff, but the answer names
+        // the base asked for, never the cached one (#903).
+        let mb_sha = String::from_utf8(
+            std::process::Command::new("git").args(["merge-base", "crew", "main"]).current_dir(d).output().unwrap().stdout,
+        )
+        .unwrap();
+        git(d, &["branch", "same-base", mb_sha.trim()]);
+        let other = committed_diff(d, Some("same-base"), false).unwrap();
+        assert_eq!(other.base.as_deref(), Some("same-base"));
+        assert_eq!((other.commits, &other.merge_base, &other.diff), (c.commits, &c.merge_base, &c.diff));
+        assert_eq!(committed_diff(d, Some("main"), false).unwrap().base.as_deref(), Some("main"));
         // A new commit moves HEAD and the answer with it.
         std::fs::write(d.join("moved.txt"), "dirty\n").unwrap();
         git(d, &["commit", "-qam", "third"]);

@@ -995,11 +995,14 @@ pub struct CommittedDiff {
     pub diff: String,
 }
 
-type CommittedKey = (std::path::PathBuf, git2::Oid, git2::Oid, bool);
+type CommittedKey = (std::path::PathBuf, git2::Oid, git2::Oid, bool, String);
 
 /// The last committed diff per worktree, keyed by (HEAD, merge base,
-/// whitespace mode): Review polls every 3 s, and committed history only moves
-/// when HEAD or the base does, so a poll that finds both still costs no patch.
+/// whitespace mode, base name): Review polls every 3 s, and committed history
+/// only moves when HEAD or the base does, so a poll that finds both still
+/// costs no patch. The base name is in the key because the answer carries it:
+/// a workspace re-based onto another branch at the same merge base must not
+/// keep the old `base` label (#903).
 fn committed_cache() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>> {
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>>,
@@ -1032,7 +1035,7 @@ pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) 
     if mb == head.id() {
         return Ok(empty(base, Some(mb)));
     }
-    let key: CommittedKey = (path.to_path_buf(), head.id(), mb, ignore_whitespace);
+    let key: CommittedKey = (path.to_path_buf(), head.id(), mb, ignore_whitespace, b.to_string());
     if let Ok(cache) = committed_cache().lock() {
         if let Some((k, v)) = cache.get(path) {
             if *k == key {

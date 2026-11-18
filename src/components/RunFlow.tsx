@@ -158,8 +158,12 @@ function StageCard({
 
   // Status keeps its own colour family (running verdigris, needs-you brass,
   // stall amber, hard fail rouge) — but the PULSE belongs to the beacon alone.
+  // A cut card drops its live colour but keeps the selection highlight (#904).
+  const selectedSkin = "border-[var(--brass-dim)] bg-[var(--brass-ghost)]";
   const skin = cut
-    ? "border-octo-hairline bg-octo-panel-2"
+    ? selected
+      ? selectedSkin
+      : "border-octo-hairline bg-octo-panel-2"
     : transientHalt
     ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
     : failed
@@ -169,7 +173,7 @@ function StageCard({
         : awaiting
           ? "border-octo-brass bg-octo-panel-2"
           : selected
-            ? "border-[var(--brass-dim)] bg-[var(--brass-ghost)]"
+            ? selectedSkin
             : "border-octo-hairline bg-octo-panel-2";
 
   return (
@@ -186,8 +190,8 @@ function StageCard({
       <div className="flex w-full min-w-0 items-center gap-2">
         {s.checkpoint && (
           <span
-            className="shrink-0 font-mono text-[12px] text-octo-brass"
-            title="Checkpoint — pauses for your approval"
+            className={`shrink-0 font-mono text-[12px] ${runAborted ? "text-octo-mute" : "text-octo-brass"}`}
+            title={runAborted ? "Checkpoint — the run ended" : "Checkpoint — pauses for your approval"}
           >
             ⟜
           </span>

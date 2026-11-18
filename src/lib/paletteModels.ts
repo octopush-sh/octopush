@@ -1,4 +1,5 @@
 import type { ModelWithProvider } from "./types";
+import { MODEL_VALUE_PREFIX } from "./paletteWorkspaces";
 
 /** How many models ⌘K shows before anything is typed (#850). */
 export const MODEL_PREVIEW = 3;
@@ -22,4 +23,22 @@ export function paletteModels(
   const active = activeModelId ? models.find((m) => m.model.id === activeModelId) : undefined;
   const ordered = active ? [active, ...models.filter((m) => m !== active)] : models;
   return { shown: ordered.slice(0, MODEL_PREVIEW), hidden: models.length - MODEL_PREVIEW };
+}
+
+/** cmdk `value` of a ⌘K Models row. */
+export function paletteModelValue(m: ModelWithProvider): string {
+  return `${MODEL_VALUE_PREFIX}${m.provider}/${m.model.id}`;
+}
+
+/**
+ * The model "Show all models" reveals first: the first one in the full list
+ * that the preview did not show. The palette moves the selection onto it, so
+ * Enter on the row continues into the models instead of jumping to the top
+ * of the palette (#897).
+ */
+export function firstRevealedModel(
+  models: ModelWithProvider[],
+  preview: ModelWithProvider[],
+): ModelWithProvider | undefined {
+  return models.find((m) => !preview.includes(m));
 }

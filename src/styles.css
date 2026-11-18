@@ -603,6 +603,8 @@
    Accept all are the floor; below 600px the secondary toggles (inline/split,
    ±WS, tests) shed together and a "More" button grows in their place, opening
    a menu with the same controls — so nothing is lost and nothing is clipped.
+   The Working tree / Since base toggle sheds its commit count on the same
+   rung ("Since base · 3 commits" → "Since base"); both segments are floor.
    The header is the containing block of the menu and the tests popover (they
    can't live inside a rung, whose `overflow: hidden` would clip them). Its
    z-index lifts them above what follows it in the canvas — the diff and the
@@ -616,7 +618,14 @@
   max-width: 0; opacity: 0; margin-right: -8px;
   visibility: hidden; --demote-vis-delay: var(--dur-standard);
 }
+/* The Since base segment's commit count is a rung inside a button: no gap to
+   eat and no focus ring to make room for (the button draws its own). */
+.octo-demote.octo-demote-source-count { gap: 0; padding: 0; margin-left: 0; }
 @container octo-reviewbar (max-width: 600px) {
+  .octo-demote-source-count {
+    max-width: 0; opacity: 0;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
   .octo-demote-secondary {
     max-width: 0; opacity: 0; margin-right: -8px;
     visibility: hidden; --demote-vis-delay: var(--dur-standard);

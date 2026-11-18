@@ -1,5 +1,6 @@
 import { Command } from "cmdk";
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { flushSync } from "react-dom";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
@@ -16,7 +17,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
-import { paletteModels } from "../lib/paletteModels";
+import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
 
 interface Props {
   open: boolean;
@@ -62,13 +63,22 @@ export function CommandPalette({
 
   const [search, setSearch] = useState("");
   const [allModels, setAllModels] = useState(false);
+  // cmdk's selection, controlled so "Show all models" can hand it to the
+  // first revealed model (#897).
+  const [selected, setSelected] = useState("");
+  const listRef = useRef<HTMLDivElement>(null);
 
+  // The palette stays mounted while closed (it renders nothing), so reset on
+  // close: a reopen must never paint the old query or expanded list for a
+  // frame before an open-time reset lands (#897).
   useEffect(() => {
     if (open) {
-      setSearch("");
-      setAllModels(false);
       ipc.listModels().then(setModels).catch(() => {});
       ipc.listTemplates().then(setTemplates).catch(() => {});
+    } else {
+      setSearch("");
+      setAllModels(false);
+      setSelected("");
     }
   }, [open]);
 
@@ -95,7 +105,13 @@ export function CommandPalette({
             "0 30px 60px -10px rgba(0,0,0,0.6), 0 0 0 6px rgba(212, 165, 116, 0.04)",
         }}
       >
-        <Command loop filter={paletteFilter} className="overflow-hidden rounded-xl">
+        <Command
+          loop
+          filter={paletteFilter}
+          value={selected}
+          onValueChange={setSelected}
+          className="overflow-hidden rounded-xl"
+        >
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
@@ -116,7 +132,7 @@ export function CommandPalette({
             </button>
           </div>
 
-          <Command.List className="max-h-[380px] overflow-y-auto py-2">
+          <Command.List ref={listRef} className="max-h-[380px] overflow-y-auto py-2">
             <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
               Nothing matches.
             </Command.Empty>
@@ -165,6 +181,8 @@ export function CommandPalette({
               {modelRows.shown.map((m) => (
                 <Item
                   key={m.model.id}
+                  value={paletteModelValue(m)}
+                  keywords={[m.model.displayName, m.provider]}
                   glyph="◇"
                   label={m.model.displayName}
                   detail={`${m.provider} · $${m.model.inputCostPerM}/M in`}
@@ -189,7 +207,26 @@ export function CommandPalette({
                   label="Show all models"
                   detail={`${modelRows.hidden} more`}
                   tour={tourId("palette-models-more")}
-                  onSelect={() => setAllModels(true)}
+                  onSelect={() => {
+                    // If this row were still selected when it unmounts, cmdk
+                    // would re-select the palette's first item ("New
+                    // session") (#897). So park the selection on the last
+                    // shown model, reveal, then select the first revealed
+                    // row through cmdk itself. A controlled `value` change
+                    // moves aria-selected but not cmdk's aria-activedescendant
+                    // (cmdk 1.1 recomputes it only when it selects a row), so
+                    // setting the value alone would leave assistive tech on
+                    // this removed row.
+                    const next = firstRevealedModel(models, modelRows.shown);
+                    const park = modelRows.shown[modelRows.shown.length - 1];
+                    if (!next || !park) {
+                      setAllModels(true);
+                      return;
+                    }
+                    flushSync(() => setSelected(paletteModelValue(park)));
+                    flushSync(() => setAllModels(true));
+                    selectRow(listRef.current, paletteModelValue(next));
+                  }}
                 />
               )}
             </Group>
@@ -399,14 +436,30 @@ function Group({
   );
 }
 
+/** Select a mounted row the way cmdk selects one under the pointer, so cmdk
+ *  updates its own value, aria-selected and aria-activedescendant together
+ *  (#897), then bring the row into view as keyboard navigation would. */
+function selectRow(list: HTMLElement | null, value: string) {
+  const row = Array.from(list?.querySelectorAll<HTMLElement>("[cmdk-item]") ?? []).find(
+    (el) => el.dataset.paletteValue === value,
+  );
+  if (!row) return;
+  row.dispatchEvent(new Event("pointermove", { bubbles: true }));
+  row.scrollIntoView?.({ block: "nearest" });
+}
+
 function Item({
   glyph,
   label,
   detail,
   shortcut,
   tour,
+  value,
+  keywords,
   onSelect,
 }: {
+  value?: string;
+  keywords?: string[];
   glyph: string;
   label: string;
   detail?: string;
@@ -416,8 +469,11 @@ function Item({
 }) {
   return (
     <Command.Item
+      value={value}
+      keywords={keywords}
       onSelect={onSelect}
       data-tour={tour}
+      data-palette-value={value}
       className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
       style={
         {

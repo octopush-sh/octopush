@@ -22,6 +22,9 @@ export interface ModeMetaInput {
   tokensLimit: number;
   /** Changed files in the worktree (Review). */
   changedCount: number;
+  /** `changedCount` is a floor: the 1 MiB cap truncated the diff it was
+   *  counted from, so the tail reads "N+ files" (#903). */
+  changedCountPartial?: boolean;
   /** Added/removed line counts of the working diff (Review). Zeroes outside
    *  review mode — App only fetches the diff there. */
   diffStat: DiffStat;
@@ -84,10 +87,10 @@ export interface ReviewTailParts {
   stat: string | null;
 }
 
-export function reviewTailParts(changedCount: number, stat: DiffStat): ReviewTailParts | null {
+export function reviewTailParts(changedCount: number, stat: DiffStat, partial = false): ReviewTailParts | null {
   if (changedCount <= 0) return null;
   return {
-    files: changedCount === 1 ? "1 file" : `${changedCount} files`,
+    files: partial ? `${changedCount}+ files` : changedCount === 1 ? "1 file" : `${changedCount} files`,
     verb: "changed",
     stat: stat.added === 0 && stat.removed === 0 ? null : `+${stat.added} −${stat.removed}`,
   };
@@ -108,7 +111,7 @@ export function modeMetaLabel(mode: WorkspaceMode, input: ModeMetaInput): string
       return `${formatContextTokens(input.tokensUsed)} / ${formatContextTokens(input.tokensLimit)} context`;
     }
     case "review": {
-      const parts = reviewTailParts(input.changedCount, input.diffStat);
+      const parts = reviewTailParts(input.changedCount, input.diffStat, input.changedCountPartial);
       if (!parts) return "Nothing to review";
       const files = `${parts.files} ${parts.verb}`;
       return parts.stat ? `${files} · ${parts.stat}` : files;
