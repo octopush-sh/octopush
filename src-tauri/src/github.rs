@@ -327,8 +327,8 @@ pub fn pr_infos_from_json(raw: &str) -> Result<Vec<PrInfo>, String> {
 
 /// The login-shell command that materialises a PR's head ref as a local
 /// branch: `git fetch origin pull/<n>/head:<headRefName>`. Single quotes in
-/// the branch name are shell-escaped (`'\''`), matching the push/pull
-/// commands' escaping convention.
+/// the branch name are shell-escaped (`'\''`), which is safe only because a
+/// ref can't contain a backslash (see `git_ops::quote_git_ref`).
 pub fn pr_fetch_command(number: u64, head_ref_name: &str) -> String {
     format!(
         "git fetch origin 'pull/{}/head:{}' 2>&1",
