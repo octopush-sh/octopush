@@ -13,10 +13,11 @@
  */
 
 import { useEffect, useMemo, useState } from "react";
-import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit } from "lucide-react";
+import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, ShieldAlert } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
+import { findingLocation, previewSummary, type SecretPreview } from "../lib/secretGuard";
 import { formatRelTime } from "../lib/relTime";
 import { collisionTooltip, notable, shownCount } from "../lib/collisions";
 import { useCollisionStore } from "../stores/collisionStore";
@@ -37,6 +38,8 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
   const staged = files.filter((f) => f.staged).length;
   const conflicted = gitStatus?.conflicted ?? 0;
   const fileCount = files.length;
+  const secret = useStagedSecretPreview(workspacePath, files);
+  const held = secret ? Math.max(secret.total, secret.findings.length) > 0 || secret.partial : false;
 
   // ── Verdict — deliberately AI-free; the AI review lives in the diff. ──
   // The file count and +/− stat live once, in the mode band's tail; the
@@ -46,9 +49,11 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
       ? { text: "Working tree is clean.", tone: "text-octo-mute" }
       : conflicted > 0
         ? { text: `Resolve ${conflicted} conflict${conflicted !== 1 ? "s" : ""} first.`, tone: "text-octo-rouge" }
-        : staged > 0
-          ? { text: `${staged} staged · ready to commit.`, tone: "text-octo-ivory" }
-          : { text: `${fileCount} file${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
+        : staged > 0 && held
+          ? { text: `${staged} staged · the secret guard will ask first.`, tone: "text-octo-rouge" }
+          : staged > 0
+            ? { text: `${staged} staged · ready to commit.`, tone: "text-octo-ivory" }
+            : { text: `${fileCount} file${fileCount !== 1 ? "s" : ""} to review.`, tone: "text-octo-ivory" };
 
   return (
     <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
@@ -56,6 +61,7 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
       <div className="border-b border-octo-hairline px-4 py-3">
         <div className="font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">Review</div>
         <div data-tour="review-companion-verdict" className={`mt-1.5 font-serif text-[15px] leading-snug ${verdict.tone}`}>{verdict.text}</div>
+        <SecretVerdict preview={staged > 0 && conflicted === 0 ? secret : null} onJump={onJump} />
         <CollisionVerdict workspaceId={workspaceId} />
       </div>
 
@@ -126,6 +132,88 @@ export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
             >
               Open {view.top.otherName}
             </button>
+          </span>
+        </div>
+      )}
+    </Reveal>
+  );
+}
+
+// ─── Secret guard (#835) ──────────────────────────────────────────
+
+/** The guard's scan of the staged diff — what Commit would check — redone
+ *  whenever the staged set changes. `null` while nothing is staged, with the
+ *  guard off, or when the scan can't run (Commit still scans on its own). */
+function useStagedSecretPreview(workspacePath: string, files: GitStatus["changedFiles"]): SecretPreview | null {
+  const stagedKey = useMemo(
+    () =>
+      files
+        .filter((f) => f.staged)
+        .map((f) => `${f.path}:${f.status}:${f.unstaged ? 1 : 0}`)
+        .sort()
+        .join("|"),
+    [files],
+  );
+  const [preview, setPreview] = useState<SecretPreview | null>(null);
+  useEffect(() => {
+    if (!stagedKey) {
+      setPreview(null);
+      return;
+    }
+    let cancelled = false;
+    Promise.resolve()
+      .then(() => ipc.secretScanStaged(workspacePath))
+      .then((p) => { if (!cancelled) setPreview(p ?? null); })
+      .catch(() => { if (!cancelled) setPreview(null); });
+    return () => { cancelled = true; };
+  }, [workspacePath, stagedKey]);
+  return preview;
+}
+
+/** One line under the verdict when Commit would stop for a possible secret
+ *  ("possible secret · GitHub token in a.ts:3"), with a jump to the first
+ *  finding. Unfolds on the grid-rows Reveal; the last line stays mounted
+ *  while it folds away. */
+export function SecretVerdict({
+  preview,
+  onJump,
+}: {
+  preview: SecretPreview | null;
+  onJump?: (file: string, line: number | null) => void;
+}) {
+  const current = useMemo(() => {
+    const text = previewSummary(preview);
+    return text ? { text, first: preview?.findings[0] ?? null } : null;
+  }, [preview]);
+  const [shown, setShown] = useState(current);
+  useEffect(() => {
+    if (current) setShown(current);
+  }, [current]);
+  const view = current ?? shown;
+
+  return (
+    <Reveal open={!!current}>
+      {view && (
+        <div
+          data-tour="review-companion-secret"
+          className="mt-1.5 flex items-start gap-1.5 text-[12px] leading-snug text-octo-sage"
+        >
+          <ShieldAlert size={12} aria-hidden className="mt-[2px] shrink-0 text-octo-rouge" />
+          <span className="min-w-0 break-words">
+            {view.text}
+            {view.first && onJump && (
+              <>
+                {" "}
+                <button
+                  type="button"
+                  onClick={() => onJump(view.first!.file, view.first!.line)}
+                  title={`Jump to ${findingLocation(view.first)}`}
+                  className="font-serif text-octo-ivory underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+                >
+                  Show it
+                </button>
+              </>
+            )}
           </span>
         </div>
       )}

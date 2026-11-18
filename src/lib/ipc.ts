@@ -1,5 +1,5 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
-import type { SecretHold } from "./secretGuard";
+import type { SecretHold, SecretPreview } from "./secretGuard";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -1139,6 +1139,12 @@ export const ipc = {
    *  exactly what the dialog showed. The core rescans every time. */
   commitChanges: (workspacePath: string, message: string, allowFindings?: string) =>
     invoke<string>("commit_changes", { workspacePath, message, allowFindings: allowFindings ?? null }),
+
+  /** Secret guard (#835): what Commit's scan of the staged diff would find,
+   *  for the Review Companion's verdict. `null` when the guard is off. Never
+   *  blocks anything and carries no fingerprint: Commit rescans and asks. */
+  secretScanStaged: (workspacePath: string) =>
+    invoke<SecretPreview | null>("secret_scan_staged", { workspacePath }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
   amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>

@@ -5123,6 +5123,15 @@ pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
     Ok(combined)
 }
 
+/// The secret guard's view of the staged diff — what Commit would check — for
+/// the Review Companion's verdict (#835). `None` when the guard is off.
+/// Read-only: it never blocks anything, and Commit rescans on its own.
+#[tauri::command]
+pub async fn secret_scan_staged(workspace_path: String) -> AppResult<Option<crate::secret_scan::ScanPreview>> {
+    let p = expand_tilde(&workspace_path);
+    crate::secret_scan::preview(move || crate::secret_scan::staged_files(std::path::Path::new(&p))).await
+}
+
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.

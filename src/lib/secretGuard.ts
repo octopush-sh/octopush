@@ -95,6 +95,23 @@ export function secretSummary(findings: SecretFinding[], total = findings.length
   return n > 1 ? `${lead} and ${n - 1} more` : lead;
 }
 
+/** What the guard would find before an action runs (the Review Companion's
+ *  preview of the staged diff). No fingerprint: only the dialog confirms. */
+export interface SecretPreview {
+  findings: SecretFinding[];
+  total: number;
+  partial: boolean;
+}
+
+/** The preview's one-liner ("possible secret · GitHub token in a.ts:3"), or
+ *  `null` when Commit wouldn't ask. */
+export function previewSummary(p: SecretPreview | null): string | null {
+  if (!p) return null;
+  const total = Math.max(p.total, p.findings.length);
+  if (total === 0 && !p.partial) return null;
+  return holdSummary({ acknowledged: false, fingerprint: "", findings: p.findings, total, partial: p.partial });
+}
+
 /** A Direct stage's persisted hold (`run_stages.secret_hold`). */
 export interface SecretHold {
   acknowledged: boolean;

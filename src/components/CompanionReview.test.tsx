@@ -2,14 +2,15 @@ import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-const { listFileEdits, getMessage, getLastCommit } = vi.hoisted(() => ({
+const { listFileEdits, getMessage, getLastCommit, secretScanStaged } = vi.hoisted(() => ({
   listFileEdits: vi.fn(),
   getMessage: vi.fn(),
   getLastCommit: vi.fn(),
+  secretScanStaged: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", () => ({
-  ipc: { listFileEdits, getMessage, getLastCommit },
+  ipc: { listFileEdits, getMessage, getLastCommit, secretScanStaged },
 }));
 
 import { CompanionReview } from "./CompanionReview";
@@ -36,6 +37,7 @@ beforeEach(() => {
   listFileEdits.mockResolvedValue([]);
   getLastCommit.mockResolvedValue(null);
   getMessage.mockResolvedValue(null);
+  secretScanStaged.mockResolvedValue({ findings: [], total: 0, partial: false });
 });
 
 describe("CompanionReview", () => {
@@ -116,6 +118,72 @@ describe("CompanionReview", () => {
   it("shows 'Not published yet' without an upstream", () => {
     render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus({ hasUpstream: false })} />);
     expect(screen.getByText(/not published yet/i)).toBeInTheDocument();
+  });
+});
+
+describe("CompanionReview — secret guard verdict (#835)", () => {
+  const stagedA = gitStatus({
+    changedFiles: [{ path: "src/a.ts", status: "modified", staged: true, unstaged: false, conflicted: false }],
+  } as Partial<GitStatus>);
+  const finding = { file: "src/a.ts", line: 3, rule: "github-token", kind: "GitHub token", yours: false };
+
+  it("names what Commit would stop for, with a jump to it", async () => {
+    secretScanStaged.mockResolvedValue({ findings: [finding], total: 1, partial: false });
+    const onJump = vi.fn();
+    const { container } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} onJump={onJump} />,
+    );
+    await waitFor(() =>
+      expect(container.querySelector('[data-tour="review-companion-secret"]')).toHaveTextContent(
+        "possible secret · GitHub token in src/a.ts:3",
+      ),
+    );
+    expect(secretScanStaged).toHaveBeenCalledWith("/repo");
+    expect(screen.getByText("1 staged · the secret guard will ask first.")).toBeInTheDocument();
+    expect(screen.queryByText(/ready to commit/)).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Show it" }));
+    expect(onJump).toHaveBeenCalledWith("src/a.ts", 3);
+  });
+
+  it("says a partial scan too, and stays quiet on a clean or unstaged change", async () => {
+    secretScanStaged.mockResolvedValue({ findings: [], total: 0, partial: true });
+    const { container, unmount } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />,
+    );
+    await waitFor(() =>
+      expect(container.querySelector('[data-tour="review-companion-secret"]')).toHaveTextContent(
+        "scanned the first 16 MB; the rest wasn't checked",
+      ),
+    );
+    unmount();
+
+    secretScanStaged.mockClear();
+    secretScanStaged.mockResolvedValue({ findings: [], total: 0, partial: false });
+    const clean = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />);
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalled());
+    expect(await screen.findByText("1 staged · ready to commit.")).toBeInTheDocument();
+    expect(clean.container.querySelector('[data-tour="review-companion-secret"]')).toBeNull();
+    clean.unmount();
+
+    // Nothing staged: nothing for Commit to scan, so no call.
+    secretScanStaged.mockClear();
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    expect(secretScanStaged).not.toHaveBeenCalled();
+  });
+
+  it("treats a failed scan or the guard turned off as nothing to say", async () => {
+    secretScanStaged.mockResolvedValue(null);
+    const { container, unmount } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />,
+    );
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalled());
+    expect(screen.getByText("1 staged · ready to commit.")).toBeInTheDocument();
+    expect(container.querySelector('[data-tour="review-companion-secret"]')).toBeNull();
+    unmount();
+    secretScanStaged.mockRejectedValue(new Error("not a repo"));
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />);
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalledTimes(2));
+    expect(screen.getByText("1 staged · ready to commit.")).toBeInTheDocument();
   });
 });
 

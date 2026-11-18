@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { findingLocation, guardHeadline, holdSummary, overrideLabel, secretRefusal, secretSummary, type SecretFinding } from "./secretGuard";
+import { findingLocation, guardHeadline, holdSummary, overrideLabel, previewSummary, secretRefusal, secretSummary, type SecretFinding } from "./secretGuard";
 
 const f = (over: Partial<SecretFinding> = {}): SecretFinding => ({
   file: "tests/fixtures.ts", line: 12, rule: "anthropic-key", kind: "Anthropic API key", yours: false, ...over,
@@ -37,6 +37,18 @@ describe("secretGuard", () => {
     expect(holdSummary({ acknowledged: false, fingerprint: "x", findings: [], total: 0, partial: true })).toBe(
       "scanned the first 16 MB; the rest wasn't checked",
     );
+  });
+
+  it("summarises a preview only when Commit would ask", () => {
+    expect(previewSummary(null)).toBeNull();
+    expect(previewSummary({ findings: [], total: 0, partial: false })).toBeNull();
+    expect(previewSummary({ findings: [f({ kind: "GitHub token", file: "a.ts", line: 3 })], total: 1, partial: false })).toBe(
+      "possible secret · GitHub token in a.ts:3",
+    );
+    expect(previewSummary({ findings: [f()], total: 2, partial: true })).toBe(
+      "possible secrets · Anthropic API key in tests/fixtures.ts:12 and 1 more · scanned the first 16 MB; the rest wasn't checked",
+    );
+    expect(previewSummary({ findings: [], total: 0, partial: true })).toBe("scanned the first 16 MB; the rest wasn't checked");
   });
 
   it("names each override", () => {
