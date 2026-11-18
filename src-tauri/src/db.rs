@@ -5252,20 +5252,29 @@ impl Db {
     /// Undo a claim whose Resume couldn't be applied: the run is parked by its
     /// plan again, its automatic resume due at `resume_at` (`None` = it now
     /// waits for the director), and the claim no longer counts against the cap.
+    ///
+    /// Only the claim's own park is put back: the schedule must still be the
+    /// `claimed_at` the claim set, or the park must be gone entirely (the
+    /// failed apply cleared it). A park whose schedule changed meanwhile (the
+    /// director turned the automatic resume off, which keeps the window but
+    /// clears `plan_resume_at`) is left as the director left it. Returns
+    /// whether the park was put back.
     pub fn restore_plan_resume(
         &self,
         run_id: &str,
         window: &str,
         resets_at: i64,
         resume_at: Option<i64>,
-    ) -> AppResult<()> {
-        self.conn.execute(
+        claimed_at: i64,
+    ) -> AppResult<bool> {
+        let n = self.conn.execute(
             "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,
                  plan_resume_count = MAX(plan_resume_count - 1, 0)
-             WHERE id = ?1 AND status = 'paused'",
-            params![run_id, window, resets_at, resume_at],
+             WHERE id = ?1 AND status = 'paused'
+               AND (plan_resume_at = ?5 OR (plan_window IS NULL AND plan_resume_at IS NULL))",
+            params![run_id, window, resets_at, resume_at, claimed_at],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
     /// A fresh allowance of automatic resumes (the director acted, or a stage

@@ -6357,7 +6357,7 @@ mod orchestrator_tests {
     async fn resolve_checkpoint_scoped_targets_the_passed_stage_id() {
         // Two stages parked at a gate at once (constructed by hand). `.find`
         // alone resolves the FIRST; the caller's validated `stage_id` must
-        // select the intended one, and a stale/absent id falls back to `.find`.
+        // select the intended one, and a stale id is refused (no fallback).
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -6382,10 +6382,18 @@ mod orchestrator_tests {
         assert_eq!(stages[1].status, "done", "the passed stage_id was the one resolved");
         assert_eq!(stages[0].status, "awaiting_checkpoint", "the unselected stage is untouched");
 
-        // A stale/absent id falls back to `.find` (the remaining parked stage 0).
-        orch.resolve_checkpoint_apply_only(&run_id, Some("nonexistent"), CheckpointAction::Approve).unwrap();
+        // A stale id (stage 1 was just decided) or an unknown one is refused,
+        // never redirected to the remaining parked stage 0.
+        for stale in [ids[1].as_str(), "nonexistent"] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(stale), CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
         let stages = db.lock().list_run_stages(&run_id).unwrap();
-        assert_eq!(stages[0].status, "done", "a stale id falls back to the single parked stage");
+        assert_eq!(stages[0].status, "awaiting_checkpoint", "the other gate stays waiting");
+        // No id keeps the single-parked rule.
+        orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
     #[test]
@@ -20081,6 +20089,93 @@ mod plan_wait_tests {
         assert_eq!(wait.resume_at, None, "waits for the director");
         assert_eq!(wait.resume_count, 0, "failed claims don't count");
         assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// A decision naming a stage that is no longer waiting (decided
+    /// elsewhere) is refused, never redirected to the first resolvable
+    /// stage: the other gate and the plan stage stay as they were.
+    #[tokio::test]
+    async fn a_stale_stage_id_is_refused_and_nothing_else_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let stale = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone(); // already done
+        for action in [CheckpointAction::Approve, CheckpointAction::Resume { max_turns_override: None }] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&stale), action).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
+        let err = orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Approve).unwrap_err();
+        assert!(err.to_string().contains("already decided"), "{err}");
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"], "the other gate stays waiting");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+        // No id keeps the single-parked rule; Abort never needs a live stage.
+        assert!(orch.check_named_stage(&run_id, None, &CheckpointAction::Approve).is_ok());
+        assert!(orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Abort).is_ok());
+    }
+
+    /// The director turning the automatic resume off while a claim is in
+    /// flight wins: the apply doesn't resume, and putting the claim's park
+    /// back never brings the schedule back.
+    #[tokio::test]
+    async fn a_cancel_during_a_claim_is_never_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let before = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        let t = now();
+        let claimed_at = t + RETRY_SECS;
+        assert!(db.lock().claim_plan_resume(&run_id, t, claimed_at).unwrap());
+        orch.cancel_plan_resume(&run_id).unwrap(); // the director, mid-claim
+        assert_eq!(orch.apply_claimed_plan_resume(&run_id, claimed_at).unwrap(), PlanClaim::NotClaimed);
+        assert_eq!(statuses(&db, &run_id), ["failed"], "not resumed");
+        let restored = db
+            .lock()
+            .restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + RETRY_SECS), claimed_at)
+            .unwrap();
+        assert!(!restored, "the cancel stands");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "no automatic resume came back");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+        // The claim's own park is still put back when it is untouched.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1", rusqlite::params![run_id, claimed_at]).unwrap();
+        assert!(db.lock().restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + 5), claimed_at).unwrap());
+    }
+
+    /// A Resume applied only in part (the plan stage reset to pending, then
+    /// the apply failed) leaves a paused run nobody drives: the next claim
+    /// announces it instead of going quiet.
+    #[tokio::test]
+    async fn a_partial_apply_with_no_driver_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        let log = db.lock().list_stage_log(&stage).unwrap();
+        assert!(log.iter().any(|e| e.contains("the resume didn't finish")), "{log:?}");
+    }
+
+    /// The same partial apply with a driver on the run says nothing: that
+    /// driver runs the pending stage.
+    #[tokio::test]
+    async fn a_partial_apply_with_a_driver_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
     }
 
     /// Two windows in one batch: the park keeps the one that resets LAST.

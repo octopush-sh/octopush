@@ -220,7 +220,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onStopStage={() => void stopStage(run.id)}
           onAbort={() => void abort(run.id)}
           // Every decision names the stage its bar shows, so the backend never
-          // falls back to another resolvable stage of the run.
+          // resolves another stage of the run: if that stage was decided
+          // elsewhere meanwhile, it refuses, the store toasts the refusal and
+          // the refresh shows what is waiting now.
           onApprove={() => void resolve(run.id, "approve", undefined, undefined, undefined, blockedStage?.id)}
           onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns, blockedStage?.id)}
           onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns, blockedStage?.id)}

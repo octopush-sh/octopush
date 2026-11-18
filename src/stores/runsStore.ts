@@ -128,7 +128,8 @@ interface RunsState {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
-    /** The stage decided on (see `ipc.resolveCheckpoint`). */
+    /** The stage decided on (see `ipc.resolveCheckpoint`). A refusal is
+     *  toasted, never thrown, and the detail refreshes either way. */
     stageId?: string,
   ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
@@ -446,7 +447,18 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   },
 
   resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride, stageId) => {
-    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride, stageId);
+    try {
+      await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride, stageId);
+    } catch (e) {
+      // A refusal (e.g. the stage was already decided elsewhere) is shown
+      // calmly — the callers fire-and-forget — and the refresh below brings
+      // the canvas up to what is actually waiting.
+      pushToast({
+        level: "info",
+        title: "Nothing changed",
+        body: String(e).split("\n")[0],
+      });
+    }
     await get().refreshDetail(runId);
   },
 

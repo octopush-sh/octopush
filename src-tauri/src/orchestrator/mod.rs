@@ -140,6 +140,11 @@ pub(crate) fn downstream_of(
 pub(crate) const BLOCKER_FEEDBACK_HEADER: &str =
     "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n";
 
+/// A decision named a stage that is no longer waiting for one.
+pub(crate) fn stale_stage_error() -> AppError {
+    AppError::Other("This stage was already decided — refresh to see what's waiting.".into())
+}
+
 /// Format the director's answers to a blocked stage's `ask_director` questions
 /// into the feedback block that `user_input_for` injects on the re-run. Answers
 /// are positional; a missing or empty answer falls back to that question's
@@ -2222,6 +2227,32 @@ impl Orchestrator {
         self.apply_checkpoint_action(run_id, stage_id, action)
     }
 
+    /// Refuse a decision on a named stage that is no longer waiting for one
+    /// (decided elsewhere since the caller looked), before anything changes.
+    /// `dispatch_checkpoint` calls it so the in-process path, which applies
+    /// in the background, still answers the caller with the error; the apply
+    /// itself checks again (`apply_checkpoint_action`). Abort and `None`
+    /// always pass.
+    pub fn check_named_stage(&self, run_id: &str, stage_id: Option<&str>, action: &CheckpointAction) -> AppResult<()> {
+        let Some(id) = stage_id else {
+            return Ok(());
+        };
+        if matches!(action, CheckpointAction::Abort) {
+            return Ok(());
+        }
+        let resolvable = self
+            .db
+            .lock()
+            .list_run_stages(run_id)?
+            .iter()
+            .any(|s| s.id == id && (s.status == "awaiting_checkpoint" || s.status == "failed"));
+        if resolvable {
+            Ok(())
+        } else {
+            Err(stale_stage_error())
+        }
+    }
+
     /// The shared mutation section of a checkpoint resolution (in-process and
     /// detached paths). The caller MUST hold this run's `active` claim.
     /// Returns `Some(budget_override)` when the run should be driven again,
@@ -2235,15 +2266,21 @@ impl Orchestrator {
         let stages = self.db.lock().list_run_stages(run_id)?;
         let is_resolvable =
             |s: &crate::db::RunStageRow| s.status == "awaiting_checkpoint" || s.status == "failed";
-        // Prefer the caller's VALIDATED stage_id (e.g. `answer_blocker` checked
-        // exactly this stage): resolve THAT parked/failed stage. Only when no
-        // resolvable stage matches the id (stale/absent) do we fall back to the
-        // single-parked-stage `.find` — so nothing regresses for callers that
-        // pass no id (the plain `resolve_checkpoint`).
-        let blocked = stage_id
-            .and_then(|id| stages.iter().find(|s| s.id == id && is_resolvable(s)))
-            .or_else(|| stages.iter().find(|s| is_resolvable(s)))
-            .cloned();
+        // A caller that names a stage (the canvas's decision bar, the escape
+        // valve, the automatic plan resume) resolves exactly THAT parked/failed
+        // stage. A named stage that is no longer resolvable (decided elsewhere
+        // since the caller looked) is refused, never redirected to another
+        // stage of the run (`stale_stage_error`). Abort tears the whole run
+        // down, so it needs no stage. No id = the single-parked-stage rule.
+        let is_abort = matches!(action, CheckpointAction::Abort);
+        let blocked = match stage_id {
+            Some(id) => match stages.iter().find(|s| s.id == id && is_resolvable(s)) {
+                Some(s) => Some(s.clone()),
+                None if is_abort => stages.iter().find(|s| is_resolvable(s)).cloned(),
+                None => return Err(stale_stage_error()),
+            },
+            None => stages.iter().find(|s| is_resolvable(s)).cloned(),
+        };
 
         // Escape-valve guard: a stage parked via `ask_director` (awaiting a
         // checkpoint WITH questions) can ONLY be resolved by AnswerBlocker (or
@@ -2252,7 +2289,6 @@ impl Orchestrator {
         // empty hand-off — refuse it with a clear message. Conversely,
         // AnswerBlocker only makes sense on an actual block.
         let is_answer = matches!(action, CheckpointAction::AnswerBlocker { .. });
-        let is_abort = matches!(action, CheckpointAction::Abort);
         if let Some(s) = &blocked {
             let is_block = s.status == "awaiting_checkpoint" && s.blocked_questions.is_some();
             if is_block && !is_answer && !is_abort {

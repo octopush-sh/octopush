@@ -156,6 +156,13 @@ pub fn needs_director(run: &crate::db::RunRow, stages: &[crate::db::RunStageRow]
     })
 }
 
+/// Pure: stages still to run and none waiting for a decision (no halt, gate
+/// or question). On a paused run with no driver, nothing moves it on its own.
+pub fn stalled(stages: &[crate::db::RunStageRow]) -> bool {
+    stages.iter().any(|s| s.status == "pending")
+        && !stages.iter().any(|s| matches!(s.status.as_str(), "failed" | "awaiting_checkpoint" | "running"))
+}
+
 /// The drive's budget gate, exactly: a budget of `0` (or less) is no budget.
 fn budget_spent(run: &crate::db::RunRow) -> bool {
     run.budget_usd.is_some_and(|b| b > 0.0 && run.cost_usd >= b)
@@ -244,10 +251,11 @@ impl Orchestrator {
         };
         // The claim keeps the park due again at `now + RETRY_SECS` until the
         // apply ends it: a failure (or a crash) here never loses the resume.
-        if !self.db.lock().claim_plan_resume(run_id, now, now + RETRY_SECS)? {
+        let claimed_at = now + RETRY_SECS;
+        if !self.db.lock().claim_plan_resume(run_id, now, claimed_at)? {
             return Ok(PlanClaim::NotClaimed);
         }
-        match self.apply_claimed_plan_resume(run_id) {
+        match self.apply_claimed_plan_resume(run_id, claimed_at) {
             Ok(PlanClaim::Retry) | Err(_) => {
                 let tries = {
                     let mut r = self.plan_retries.lock();
@@ -258,7 +266,11 @@ impl Orchestrator {
                 if tries >= MAX_PLAN_RETRIES {
                     // Retrying blind forever helps nobody: hand it over.
                     self.plan_retries.lock().remove(run_id);
-                    self.restore_park(run_id, &before, None);
+                    if !self.restore_park(run_id, &before, None, claimed_at) {
+                        // The director changed the park meanwhile: theirs stands.
+                        self.emit_run_update(run_id);
+                        return Ok(PlanClaim::NotClaimed);
+                    }
                     if let Some(s) = self.first_plan_stage(run_id) {
                         self.journal_notice(
                             run_id,
@@ -272,10 +284,12 @@ impl Orchestrator {
                     }
                     return Ok(PlanClaim::NeedsYou);
                 }
-                // Put the park back, due again shortly, the claim uncounted.
-                self.restore_park(run_id, &before, Some(now + RETRY_SECS));
+                // Put the park back, due again shortly, the claim uncounted —
+                // unless the director changed it meanwhile (turned the
+                // automatic resume off): theirs stands.
+                let restored = self.restore_park(run_id, &before, Some(now + RETRY_SECS), claimed_at);
                 self.emit_run_update(run_id);
-                Ok(PlanClaim::Retry)
+                Ok(if restored { PlanClaim::Retry } else { PlanClaim::NotClaimed })
             }
             Ok(claim) => {
                 self.plan_retries.lock().remove(run_id);
@@ -286,15 +300,20 @@ impl Orchestrator {
 
     /// Put a claimed park back (best effort, retried: the apply may have
     /// cleared it). If every write fails the claim's own `RETRY_SECS` hold
-    /// still stands unless the apply got as far as clearing the park.
-    fn restore_park(&self, run_id: &str, before: &crate::db::PlanWait, resume_at: Option<i64>) {
+    /// still stands unless the apply got as far as clearing the park. Only
+    /// the claim's own park (`claimed_at`) is restored: a director's cancel
+    /// meanwhile is never undone. Returns `false` only when the park was left
+    /// alone because it changed hands (a write error still reads `true`: the
+    /// claim's hold keeps it due).
+    fn restore_park(&self, run_id: &str, before: &crate::db::PlanWait, resume_at: Option<i64>, claimed_at: i64) -> bool {
         for attempt in 0..3 {
-            match self.db.lock().restore_plan_resume(run_id, &before.window, before.resets_at, resume_at) {
-                Ok(()) => return,
+            match self.db.lock().restore_plan_resume(run_id, &before.window, before.resets_at, resume_at, claimed_at) {
+                Ok(restored) => return restored,
                 Err(e) => tracing::warn!(run_id = %run_id, attempt, error = %e, "plan resume: restoring the park failed"),
             }
             std::thread::sleep(std::time::Duration::from_millis(100 << attempt));
         }
+        true
     }
 
     /// The first stage of `run_id` stopped by a Claude plan limit.
@@ -311,10 +330,15 @@ impl Orchestrator {
     /// The part of [`Self::claim_plan_resume`] after the claim: resume, or
     /// hand the run to the director. `Retry` (or an error) means the caller
     /// schedules the resume again.
-    fn apply_claimed_plan_resume(&self, run_id: &str) -> AppResult<PlanClaim> {
+    pub(crate) fn apply_claimed_plan_resume(&self, run_id: &str, claimed_at: i64) -> AppResult<PlanClaim> {
         let Some(run) = self.db.lock().get_run(run_id)? else {
             return Ok(PlanClaim::NotClaimed);
         };
+        // The director turned the automatic resume off after the claim (the
+        // schedule is no longer the claim's): the run stays parked for them.
+        if run.plan_wait.as_ref().and_then(|w| w.resume_at) != Some(claimed_at) {
+            return Ok(PlanClaim::NotClaimed);
+        }
         let stages = self.db.lock().list_run_stages(run_id)?;
         let Some(stage) = stages
             .iter()
@@ -324,6 +348,19 @@ impl Orchestrator {
             // The parked stage was resolved another way: nothing to resume.
             self.db.lock().clear_run_plan_wait(run_id)?;
             self.emit_run_update(run_id);
+            // ...but a Resume that was applied only in part (the stages reset
+            // to pending, then the apply failed) leaves a paused run that
+            // nobody drives. Say so instead of going quiet.
+            if self.stalled_without_driver(&run, &stages) {
+                if let Some(s) = stages.iter().find(|s| s.status == "pending") {
+                    self.journal_notice(
+                        run_id,
+                        &s.id,
+                        "Claude plan window reset · the resume didn't finish, so it waits for you",
+                    );
+                }
+                return Ok(PlanClaim::NeedsYou);
+            }
             return Ok(PlanClaim::NotClaimed);
         };
         if budget_spent(&run) {
@@ -361,6 +398,15 @@ impl Orchestrator {
                 Ok(PlanClaim::Retry)
             }
         }
+    }
+
+    /// A paused run with stages still to run, none waiting for a decision,
+    /// and no driver: neither a drive in this process nor a live worker.
+    fn stalled_without_driver(&self, run: &crate::db::RunRow, stages: &[crate::db::RunStageRow]) -> bool {
+        run.status == "paused"
+            && stalled(stages)
+            && !self.active.lock().contains(&run.id)
+            && !self.db.lock().worker_lease_fresh(&run.id).unwrap_or(true)
     }
 
     /// The director turned off this run's automatic resume: it stays parked

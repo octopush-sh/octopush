@@ -1427,7 +1427,10 @@ export const ipc = {
     modelOverride?: string,
     maxTurnsOverride?: number,
     /** The stage the director decided on. A run can hold several (a plan
-     *  limit beside a gate): without it the backend picks the first. */
+     *  limit beside a gate): without it the backend picks the first. A named
+     *  stage that is no longer waiting (decided elsewhere) is refused with
+     *  "This stage was already decided — refresh to see what's waiting.",
+     *  never redirected to another stage (Abort always goes through). */
     stageId?: string,
   ) =>
     invoke<void>("resolve_checkpoint", {

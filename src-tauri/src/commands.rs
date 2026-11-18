@@ -2693,7 +2693,9 @@ pub async fn resolve_checkpoint(
     };
     // `stage_id` names the stage the director decided on (the Direct canvas
     // passes the one its decision bar shows), so a run holding several
-    // stages never resolves a different one; `None` = the single-parked rule.
+    // stages never resolves a different one. A named stage that was already
+    // decided is refused ("This stage was already decided — refresh…"), never
+    // redirected to another; `None` = the single-parked rule.
     dispatch_checkpoint(&orch, run_id, stage_id, action)
 }
 
@@ -2709,6 +2711,9 @@ fn dispatch_checkpoint(
     stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
+    // A decision on a stage that was decided elsewhere meanwhile is refused
+    // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
     // The director acted: a fresh allowance of automatic plan resumes.
     orch.db().lock().reset_plan_resume_count(&run_id)?;
     // Pro (`runs.detached`): apply the decision's mutations here — they're
