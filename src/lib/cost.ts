@@ -35,6 +35,21 @@ export function formatTokenCount(n: number): string {
   return `${n}`;
 }
 
+/**
+ * The one context-window formatter (#853): every surface that shows context
+ * size or usage — the Talk header tail, the Companion's context meter, the
+ * model pickers — goes through this, so a 1M window reads "1M" everywhere and
+ * never "1000k". 4_200 → "4k", 200_000 → "200k", 1_000_000 → "1M",
+ * 1_500_000 → "1.5M", 999_600 → "1M" (rounding never yields "1000k").
+ */
+export function formatContextTokens(n: number): string {
+  if (!Number.isFinite(n) || n < 1000) return String(Math.max(0, Math.round(Number.isFinite(n) ? n : 0)));
+  const k = Math.round(n / 1000);
+  if (k < 1000) return `${k}k`;
+  const m = Math.round(n / 100_000) / 10;
+  return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+}
+
 /** Compact token count: "12k tokens" or "850 tokens". */
 export function formatTokens(n: number): string {
   return `${formatTokenCount(n)} tokens`;

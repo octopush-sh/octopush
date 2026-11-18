@@ -137,6 +137,7 @@ Current anchors:
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
+| `palette-models-more` | Command palette, Models group: "Show all models" (only with no query and more than three models) | `CommandPalette.tsx` |
 | `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
 | `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |

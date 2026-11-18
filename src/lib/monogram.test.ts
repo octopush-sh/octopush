@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { resolveMonogram, TINTS, TINT_NAMES } from "./monogram";
+import { normalizeGlyph, resolveMonogram, TINTS, TINT_NAMES } from "./monogram";
+import { paletteWorkspaces } from "./paletteWorkspaces";
 import type { Workspace } from "./types";
 
 function makeWorkspace(overrides: Partial<Workspace> = {}): Workspace {
@@ -60,6 +61,51 @@ describe("monogram resolution", () => {
     expect(resolveMonogram(makeWorkspace({ glyph: "X", tint: null })).isCustom).toBe(true);
     expect(resolveMonogram(makeWorkspace({ glyph: null, tint: "rouge" })).isCustom).toBe(true);
     expect(resolveMonogram(makeWorkspace({ glyph: null, tint: null })).isCustom).toBe(false);
+  });
+});
+
+describe("glyph normalization (#848)", () => {
+  it("a main workspace reads M, never ß", () => {
+    expect(resolveMonogram(makeWorkspace({ name: "main" })).glyph).toBe("M");
+  });
+
+  it("a stored ß (macOS ⌥S) falls back to the name's initial", () => {
+    const m = resolveMonogram(makeWorkspace({ name: "main", glyph: "ß" }));
+    expect(m.glyph).toBe("M");
+    expect(normalizeGlyph("ß")).toBeNull();
+  });
+
+  it("never renders a multi-letter capital form", () => {
+    expect(resolveMonogram(makeWorkspace({ name: "ßeta" })).glyph).toBe("S");
+    expect(normalizeGlyph("ﬁ")).toBeNull();
+  });
+
+  it("uppercases a lowercase stored glyph and keeps symbols, digits and emoji whole", () => {
+    expect(normalizeGlyph("m")).toBe("M");
+    expect(normalizeGlyph(" é ")).toBe("É");
+    expect(normalizeGlyph("7")).toBe("7");
+    expect(normalizeGlyph("•")).toBe("•");
+    expect(normalizeGlyph("🐙x")).toBe("🐙");
+  });
+
+  it("treats empty, whitespace and control input as no glyph", () => {
+    expect(normalizeGlyph("")).toBeNull();
+    expect(normalizeGlyph("   ")).toBeNull();
+    expect(normalizeGlyph("\u0007")).toBeNull();
+    expect(resolveMonogram(makeWorkspace({ name: "main", glyph: "" })).glyph).toBe("M");
+  });
+
+  it("the rail and ⌘K resolve the same glyph", () => {
+    const workspaces = [
+      makeWorkspace({ id: "a", name: "main", glyph: "ß" }),
+      makeWorkspace({ id: "b", name: "auth", glyph: "x" }),
+      makeWorkspace({ id: "c", name: "ßeta" }),
+    ];
+    const rows = paletteWorkspaces([{ name: "p", workspaces }], {}, {}, {});
+    for (const w of workspaces) {
+      expect(rows.find((r) => r.id === w.id)?.glyph).toBe(resolveMonogram(w).glyph);
+    }
+    expect(rows.map((r) => r.glyph).sort()).toEqual(["M", "S", "X"]);
   });
 });
 

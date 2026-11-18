@@ -121,6 +121,10 @@ describe("modeMetaLabel", () => {
     expect(modeMetaLabel("talk", { ...base, tokensUsed: 34120, tokensLimit: 200000 })).toBe(
       "34k / 200k context",
     );
+    // #853: a 1M window reads "1M", as in the Companion, never "1000k".
+    expect(modeMetaLabel("talk", { ...base, tokensUsed: 4200, tokensLimit: 1_000_000 })).toBe(
+      "4k / 1M context",
+    );
     expect(modeMetaLabel("talk", { ...base, tokensUsed: 0, tokensLimit: 200000 })).toBeNull();
     expect(modeMetaLabel("talk", { ...base, tokensUsed: 500, tokensLimit: 0 })).toBeNull();
   });

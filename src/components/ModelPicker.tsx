@@ -4,7 +4,7 @@ import { clsx } from "clsx";
 import { ipc } from "../lib/ipc";
 import type { ModelInfo } from "../lib/types";
 import { AUTO_MODEL } from "../lib/policy";
-import { formatUsd } from "../lib/cost";
+import { formatContextTokens, formatUsd } from "../lib/cost";
 import { useProvidersStore } from "../stores/providersStore";
 
 /** localStorage key for the recently-used model ids (most-recent first). */
@@ -54,10 +54,6 @@ function formatCost(perM: number): string {
 }
 
 // Format context window: "200k", "1M", etc.
-function formatCtx(maxContext: number): string {
-  if (maxContext >= 1_000_000) return `${maxContext / 1_000_000}M`;
-  return `${Math.round(maxContext / 1000)}k`;
-}
 
 interface Props {
   activeModel: string;
@@ -509,7 +505,7 @@ function ModelRow({
   // comparing providers, not a live cost estimator. The inline preview
   // below the chat input handles "what does THIS prompt cost?" because
   // there you can edit text and see the number update in place.
-  const meta = `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatCtx(model.maxContext)} ctx`;
+  const meta = `${formatCost(model.inputCostPerM)}/${formatCost(model.outputCostPerM)} · ${formatContextTokens(model.maxContext)} ctx`;
 
   return (
     <button

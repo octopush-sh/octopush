@@ -27,6 +27,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
+import { useScrollActiveIntoView } from "../hooks/useScrollActiveIntoView";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { MENU_CHROME } from "../lib/menuStyles";
 import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
@@ -233,6 +234,10 @@ export function WorkspaceRail({
       return next;
     });
   }, []);
+  // #846: a newly active workspace (a project just opened, a jump key, a
+  // palette pick) is scrolled into view, calmly, and only when off-screen.
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useScrollActiveIntoView(listRef, isCollapsed ? null : activeWorkspaceId, visibleProjects);
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
@@ -312,7 +317,7 @@ export function WorkspaceRail({
             )}
           </div>
 
-          <div className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
+          <div ref={listRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
             <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
               <SortableContext
                 items={visibleProjects.map(({ project }) => project.id)}
@@ -969,6 +974,8 @@ function CollapsedRail({
 }: CollapsedRailProps) {
   const [flyout, setFlyout] = useState<FlyoutAnchor | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const listRef = useRef<HTMLDivElement | null>(null);
+  useScrollActiveIntoView(listRef, activeWorkspaceId, projects);
 
   const cancelClose = useCallback(() => {
     if (closeTimer.current) {
@@ -1014,6 +1021,7 @@ function CollapsedRail({
         )}
       </div>
       <div
+        ref={listRef}
         className="flex min-h-0 w-full flex-1 flex-col items-center overflow-y-auto pb-2"
         // Scrolling moves the cells out from under a measured flyout, so the
         // flyout goes rather than drifting off its anchor.

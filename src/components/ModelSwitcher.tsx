@@ -5,6 +5,7 @@ import { shortModel } from "../lib/modelLabel";
 import { useSessionStore } from "../stores/sessionStore";
 import { pushToast } from "./Toasts";
 import type { ModelWithProvider } from "../lib/types";
+import { formatContextTokens } from "../lib/cost";
 import { clsx } from "clsx";
 
 interface Props {
@@ -134,7 +135,7 @@ export function ModelSwitcher({ open, onClose }: Props) {
                       </span>
                     </div>
                     <div className="text-[10px] text-zinc-600">
-                      {(m.model.maxContext / 1000).toFixed(0)}K ctx
+                      {formatContextTokens(m.model.maxContext)} ctx
                       {m.model.supportsVision && " • vision"}
                       {m.model.supportsTools && " • tools"}
                     </div>

@@ -4,6 +4,7 @@
 // wording stays unit-testable.
 
 import type { WorkspaceMode } from "./modes";
+import { formatContextTokens } from "./cost";
 
 export interface DiffStat {
   added: number;
@@ -72,14 +73,6 @@ export function runTailState(
   return "settled";
 }
 
-/** Compact token count: 34120 → "34k", 980 → "980". Deliberately not
- *  `stageMeta.fmtTokens` — that one keeps a decimal ("34.1k") for the Direct
- *  surfaces and pulls the roles store in with it; the tail wants the shortest
- *  honest number and no store dependency. */
-function compactTokens(n: number): string {
-  return n >= 1000 ? `${Math.round(n / 1000)}k` : String(n);
-}
-
 /** The Review tail split into the atoms its demotion ladder sheds
  *  (`ReviewTail.tsx`): `files` is the floor ("2 files"), `verb` ("changed")
  *  goes first as the band narrows, then `stat` ("+2 −1", null with no line
@@ -112,7 +105,7 @@ export function modeMetaLabel(mode: WorkspaceMode, input: ModeMetaInput): string
     case "talk": {
       // Before the first assistant turn there is no context to report.
       if (input.tokensUsed <= 0 || input.tokensLimit <= 0) return null;
-      return `${compactTokens(input.tokensUsed)} / ${compactTokens(input.tokensLimit)} context`;
+      return `${formatContextTokens(input.tokensUsed)} / ${formatContextTokens(input.tokensLimit)} context`;
     }
     case "review": {
       const parts = reviewTailParts(input.changedCount, input.diffStat);
