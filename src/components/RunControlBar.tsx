@@ -91,7 +91,7 @@ function useAbortConfirm(onAbort: () => void): [() => void, React.ReactNode] {
         <button type="button" autoFocus onClick={() => setOpen(false)}
           className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory">Keep the run</button>
         <button type="button" onClick={() => { setOpen(false); onAbort(); }}
-          className="rounded-md border border-octo-rouge px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Abort the run</button>
+          className="rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Abort the run</button>
       </div>
     </ModalShell>
   ) : null;

@@ -65,6 +65,27 @@ describe("RunControlBar", () => {
     expect(h.onAbort).toHaveBeenCalledTimes(1);
   });
 
+  it("Abort confirm: Escape keeps the run (#891)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(screen.getByText("End this run here?")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByText("End this run here?")).not.toBeInTheDocument();
+    expect(h.onAbort).not.toHaveBeenCalled();
+  });
+
+  it("halted stage: Abort asks first, then ends the run (#891)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "compile error: missing semicolon" })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/stage halted/i)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+    expect(h.onAbort).toHaveBeenCalledTimes(1);
+  });
+
   it("terminal: offers Run it again", () => {
     const h = handlers();
     render(<RunControlBar run={run("completed")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);
@@ -324,6 +345,29 @@ describe("RunControlBar", () => {
       expect(h.onResume).toHaveBeenCalled();
       fireEvent.click(screen.getByRole("button", { name: /Don.t resume automatically/ }));
       expect(cancelPlanResume).toHaveBeenCalledWith("r1");
+    });
+
+    it("scheduled: Abort asks first, Keep the run cancels, Abort the run ends it (#891)", () => {
+      const h = handlers();
+      render(
+        <RunControlBar run={parked(Math.floor(Date.now() / 1000) + 690)} blockedStage={planStage} loopTargetRole={null} loopState={null} {...h} />,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      expect(screen.getByText("End this run here?")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep the run" }));
+      expect(h.onAbort).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+      expect(h.onAbort).toHaveBeenCalledTimes(1);
+    });
+
+    it("waiting for the director: Abort asks first too (#891)", () => {
+      const h = handlers();
+      render(<RunControlBar run={parked(null)} blockedStage={planStage} loopTargetRole={null} loopState={null} {...h} />);
+      fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+      expect(h.onAbort).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+      expect(h.onAbort).toHaveBeenCalledTimes(1);
     });
 
     it("waiting for the director: Resume the stage is the decision and takes the beacon", () => {

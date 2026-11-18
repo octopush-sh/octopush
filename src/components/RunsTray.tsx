@@ -91,7 +91,7 @@ export function RunsTray({ onOpen }: { onOpen: () => void }) {
       data-tour="fleet-chip"
       className="octo-pop-in flex items-center gap-1.5 rounded px-2 py-1 font-mono text-[10px] uppercase tracking-[0.15em] text-octo-mute transition hover:bg-octo-panel-2"
     >
-      <Square size={10} className="shrink-0" />
+      <Square size={10} fill="currentColor" strokeWidth={0} className="shrink-0" aria-hidden />
       {endedCount} ended
     </button>
   );
