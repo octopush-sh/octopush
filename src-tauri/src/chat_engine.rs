@@ -3865,8 +3865,8 @@ mod tests {
         // inside the workspace pointing at a DENIED location (a hostile repo can
         // commit `link -> $HOME`). Lexically `link/…` is under the workspace, so
         // it passes the fast pre-check — the KERNEL-enforced seatbelt write must
-        // still block it. ($HOME root is denied; only ~/.claude/~/.cache are
-        // writable, and a tempdir would be under the allowed $TMPDIR.)
+        // still block it. ($HOME root is denied; only the ~/.claude state dirs
+        // are writable there, and a tempdir would be under the allowed $TMPDIR.)
         let dir = tempfile::tempdir().unwrap();
         let wp = dir.path();
         let roots = vec![wp.to_string_lossy().into_owned()];

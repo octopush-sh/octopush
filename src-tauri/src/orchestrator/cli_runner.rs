@@ -2235,6 +2235,18 @@ pub(crate) fn command_idle_window(bash_max_timeout_ms: Option<&str>) -> std::tim
         + std::time::Duration::from_secs(COMMAND_RESULT_SLACK_SECS)
 }
 
+/// The env a sandboxed stage gets on top of the login shell's: the
+/// prepared cache and temp-dir env and, for a Claude stage only,
+/// `sandbox::claude_stage_env` (auto memory off, since the profile denies
+/// it). An unsandboxed stage never goes through here. Pure.
+pub(crate) fn sandboxed_stage_env(dialect: CliDialect, prepared: Vec<(String, String)>) -> Vec<(String, String)> {
+    let mut env = prepared;
+    if dialect == CliDialect::Claude {
+        env.extend(crate::orchestrator::sandbox::claude_stage_env());
+    }
+    env
+}
+
 /// The variable "Quiet Claude Code in crews and Routines" sets (#703). Shared
 /// with the Routines runner, which exports it to a Routine's own commands.
 pub const QUIET_TRAFFIC_ENV: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
@@ -2835,6 +2847,16 @@ impl CliRunner {
                 "none" => (real_program, args.iter().map(Into::into).collect()),
                 "sandbox" => {
                     let scope = ctx.workspace_path.to_string_lossy();
+                    // A Claude stage keeps its state in `CLAUDE_CONFIG_DIR`
+                    // when the user set one, so the profile grants that
+                    // dir's state instead of `~/.claude`'s. A relative value
+                    // isn't followed, and the launch line says so.
+                    let (claude_config, config_note) = match dialect {
+                        CliDialect::Claude => crate::orchestrator::sandbox::claude_config_dir(
+                            stage_env_value("CLAUDE_CONFIG_DIR").as_deref(),
+                        ),
+                        _ => (None, None),
+                    };
                     // A Claude stage gets its own temp dir (`TMPDIR`) beside
                     // its cache root; a read-confined one names both as
                     // working dirs, or the read guard refuses them. Both are
@@ -2848,11 +2870,13 @@ impl CliRunner {
                         &real_program,
                         &args,
                         dialect == CliDialect::Claude,
+                        claude_config.as_deref(),
                         |own_dirs| sandbox_read_dir_args(reads_confined, own_dirs),
                     ) {
                         Ok(prepared) => {
-                            sandbox_env = prepared.env;
+                            sandbox_env = sandboxed_stage_env(dialect, prepared.env);
                             left_out = prepared.left_out;
+                            left_out.extend(config_note);
                             (prepared.program, prepared.args)
                         }
                         Err(e) => {
