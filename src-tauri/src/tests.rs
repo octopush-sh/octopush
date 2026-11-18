@@ -18279,6 +18279,55 @@ mod open_pull_request_tests {
     }
 
     #[test]
+    fn committed_diff_shows_the_branch_since_its_merge_base_without_working_tree_changes() {
+        use crate::git_ops::committed_diff;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Nothing committed yet: zero commits, an empty diff, still on its base.
+        let none = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!((none.commits, none.diff.as_str(), none.base.as_deref()), (0, "", Some("main")));
+        // Two crew commits: an edit, then a rename with an edit.
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["commit", "-qam", "edit"]);
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        git(d, &["commit", "-qm", "move"]);
+        // Working-tree noise the committed view must leave out.
+        std::fs::write(d.join("moved.txt"), "dirty\n").unwrap();
+        std::fs::write(d.join("untracked.txt"), "u\n").unwrap();
+        // main moving on adds nothing (merge base, not tip).
+        git(d, &["stash", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "main-only.txt"]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+
+        let c = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!(c.commits, 2, "{c:?}");
+        assert_eq!(c.base.as_deref(), Some("main"));
+        assert_eq!(c.merge_base.as_ref().map(String::len), Some(7));
+        // One file section: the rename paired, carrying only its edit.
+        assert_eq!(c.diff.matches("diff --git ").count(), 1, "{}", c.diff);
+        assert!(c.diff.contains("diff --git a/a.txt b/moved.txt"), "{}", c.diff);
+        assert!(c.diff.contains("+TEN") && c.diff.contains("-10"), "{}", c.diff);
+        assert!(!c.diff.contains("dirty"), "the working tree is not committed: {}", c.diff);
+        assert!(!c.diff.contains("untracked.txt"), "untracked files are not committed: {}", c.diff);
+        assert!(!c.diff.contains("main-only.txt"), "the base's own commits never count: {}", c.diff);
+        // Cached by (HEAD, merge base): the same answer on a repeat call.
+        assert_eq!(committed_diff(d, Some("main"), false).unwrap(), c);
+        // A new commit moves HEAD and the answer with it.
+        std::fs::write(d.join("moved.txt"), "dirty\n").unwrap();
+        git(d, &["commit", "-qam", "third"]);
+        let c3 = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!(c3.commits, 3);
+        assert!(c3.diff.contains("+dirty"), "{}", c3.diff);
+        // No base, or one that doesn't resolve: nothing to show.
+        assert_eq!(committed_diff(d, None, false).unwrap().commits, 0);
+        assert_eq!(committed_diff(d, Some("gone/branch"), false).unwrap().commits, 0);
+    }
+
+    #[test]
     fn workspace_base_falls_back_to_the_projects_default_branch() {
         use crate::collisions::workspace_base;
         assert_eq!(workspace_base(Some("dev".into()), Some("main")).as_deref(), Some("dev"));

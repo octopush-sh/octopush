@@ -974,6 +974,103 @@ pub fn diff_size(path: &Path, base: Option<&str>) -> AppResult<DiffSize> {
     Ok(size)
 }
 
+/// At most this many commits are counted for [`CommittedDiff::commits`]; a
+/// branch further ahead reports this number (the diff itself is unaffected).
+pub const MAX_COMMITTED_COUNT: usize = 10_000;
+
+/// What a workspace committed on top of its base: the merge base → HEAD tree
+/// diff Review shows as "Since base" (#851). Working-tree and untracked
+/// changes are never part of it — they are Review's working-tree view.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CommittedDiff {
+    /// The base branch the merge base was resolved against.
+    pub base: Option<String>,
+    /// Short SHA of the merge base, when one resolved.
+    pub merge_base: Option<String>,
+    /// Commits on HEAD since the merge base (capped at [`MAX_COMMITTED_COUNT`]).
+    pub commits: usize,
+    /// The unified diff, merge base tree → HEAD tree, renames paired. Empty
+    /// when there are no commits ahead.
+    pub diff: String,
+}
+
+type CommittedKey = (std::path::PathBuf, git2::Oid, git2::Oid, bool);
+
+/// The last committed diff per worktree, keyed by (HEAD, merge base,
+/// whitespace mode): Review polls every 3 s, and committed history only moves
+/// when HEAD or the base does, so a poll that finds both still costs no patch.
+fn committed_cache() -> &'static std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<std::path::PathBuf, (CommittedKey, CommittedDiff)>>,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// [`CommittedDiff`] for the worktree at `path` against `base`, with the merge
+/// base resolved exactly like the collision radar's and Mission Control's
+/// diff size ([`crate::collisions::resolve_merge_base`]). No base, no HEAD, a
+/// base that doesn't resolve, or HEAD at the merge base: zero commits and an
+/// empty diff.
+pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) -> AppResult<CommittedDiff> {
+    use crate::collisions::{find_renames, resolve_merge_base};
+    let repo = open_repo(path)?;
+    let base = base.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
+    let empty = |base: Option<String>, mb: Option<git2::Oid>| CommittedDiff {
+        base,
+        merge_base: mb.map(|o| o.to_string()[..7].to_string()),
+        commits: 0,
+        diff: String::new(),
+    };
+    let Some(head) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
+        return Ok(empty(base, None));
+    };
+    let Some(b) = base.as_deref() else { return Ok(empty(None, None)) };
+    let Some(mb) = resolve_merge_base(&repo, head.id(), b) else {
+        return Ok(empty(base, None));
+    };
+    if mb == head.id() {
+        return Ok(empty(base, Some(mb)));
+    }
+    let key: CommittedKey = (path.to_path_buf(), head.id(), mb, ignore_whitespace);
+    if let Ok(cache) = committed_cache().lock() {
+        if let Some((k, v)) = cache.get(path) {
+            if *k == key {
+                return Ok(v.clone());
+            }
+        }
+    }
+    let err = |what: &str, e: git2::Error| AppError::Other(format!("{what}: {e}"));
+
+    let mut walk = repo.revwalk().map_err(|e| err("revwalk", e))?;
+    walk.push(head.id()).map_err(|e| err("revwalk", e))?;
+    walk.hide(mb).map_err(|e| err("revwalk", e))?;
+    let commits = walk.take(MAX_COMMITTED_COUNT).filter(|c| c.is_ok()).count();
+
+    let old_tree = repo.find_commit(mb).and_then(|c| c.tree()).map_err(|e| err("merge base tree", e))?;
+    let new_tree = head.tree().map_err(|e| err("head tree", e))?;
+    let mut opts = git2::DiffOptions::new();
+    if ignore_whitespace {
+        opts.ignore_whitespace(true);
+    }
+    let mut diff = repo
+        .diff_tree_to_tree(Some(&old_tree), Some(&new_tree), Some(&mut opts))
+        .map_err(|e| err("committed diff", e))?;
+    find_renames(&mut diff, false);
+    let out = CommittedDiff {
+        base,
+        merge_base: Some(mb.to_string()[..7].to_string()),
+        commits,
+        diff: diff_to_text(&diff)?,
+    };
+    if let Ok(mut cache) = committed_cache().lock() {
+        // One entry per worktree; a stale worktree's entry is bounded by the
+        // number of workspaces ever reviewed in this session.
+        cache.insert(path.to_path_buf(), (key, out.clone()));
+    }
+    Ok(out)
+}
+
 /// (short_sha, subject, body) of HEAD, or None if the repo has no commits yet.
 pub fn last_commit(path: &Path) -> AppResult<Option<(String, String, String)>> {
     let repo = open_repo(path)?;

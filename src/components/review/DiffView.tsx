@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { FileDiffSection } from "./FileDiffSection";
-import { EmptyDiffState } from "./EmptyDiffState";
+import { EmptyDiffState, type EmptyDiffContext } from "./EmptyDiffState";
 import { useDiffKeyboard, type FlatHunk } from "./useDiffKeyboard";
 import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
 
@@ -14,6 +14,14 @@ interface Props {
   files: DiffFile[];
   workspacePath: string;
   stagedCount?: number;
+  /** The committed view (#851): no Accept / Reject, by click or key. */
+  readOnly?: boolean;
+  /** Highlight hunks in the context of the file on disk (default true). Off
+   *  when the disk no longer matches the diff's new side. */
+  diskContext?: boolean;
+  /** What the empty state says: which source, and what the other one holds. */
+  empty?: EmptyDiffContext;
+  onShowCommitted?: () => void;
   onAccept: (filePath: string, hunkIdx: number) => void;
   onReject: (filePath: string, hunkIdx: number) => void;
   onWhy: (filePath: string, hunkIdx: number) => void;
@@ -25,7 +33,7 @@ interface Props {
 }
 
 export function DiffView(props: Props) {
-  const { files, stagedCount = 0, active = true } = props;
+  const { files, stagedCount = 0, active = true, readOnly = false, diskContext = true } = props;
   const containerRef = useRef<HTMLDivElement>(null);
   const [focused, setFocused] = useState(0);
   // A viewed file maps to the fingerprints of the hunks it had when marked, so
@@ -103,9 +111,9 @@ export function DiffView(props: Props) {
     setFocused,
     containerRef,
     actions: {
-      accept: () => cur && props.onAccept(files[cur.fileIdx].filePath, cur.hunkIdx),
-      reject: () => cur && props.onReject(files[cur.fileIdx].filePath, cur.hunkIdx),
-      acceptFile: () => curFile && curFile.hunks.forEach((_, hi) => props.onAccept(curFile.filePath, hi)),
+      accept: () => !readOnly && cur && props.onAccept(files[cur.fileIdx].filePath, cur.hunkIdx),
+      reject: () => !readOnly && cur && props.onReject(files[cur.fileIdx].filePath, cur.hunkIdx),
+      acceptFile: () => !readOnly && curFile && curFile.hunks.forEach((_, hi) => props.onAccept(curFile.filePath, hi)),
       toggleViewed: () => curFile && toggleViewed(curFile),
       open: () => cur && props.onOpen(files[cur.fileIdx].filePath, firstChangedLine(files[cur.fileIdx], cur.hunkIdx)),
       why: () => cur && props.onWhy(files[cur.fileIdx].filePath, cur.hunkIdx),
@@ -119,7 +127,7 @@ export function DiffView(props: Props) {
   if (files.length === 0) {
     return (
       <div className="absolute inset-0">
-        <EmptyDiffState stagedCount={stagedCount} />
+        <EmptyDiffState stagedCount={stagedCount} context={props.empty} onShowCommitted={props.onShowCommitted} />
       </div>
     );
   }
@@ -137,7 +145,8 @@ export function DiffView(props: Props) {
           <FileDiffSection
             key={file.filePath}
             file={file}
-            workspacePath={props.workspacePath}
+            workspacePath={diskContext ? props.workspacePath : undefined}
+            readOnly={readOnly}
             focusedHunk={cur?.fileIdx === fi ? cur.hunkIdx : -1}
             viewed={!!viewed[file.filePath]}
             collapsed={!!collapsed[file.filePath]}
