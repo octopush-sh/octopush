@@ -294,7 +294,10 @@ impl AgentRunner for ApiRunner {
         let (provider, api_base, api_key) = resolve_provider(&stage.agent_model)?;
         // API substrate: the `ask_director` escape valve is available, so the
         // carve-out is included (`can_ask_director = true`).
-        let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
+        // A read-only role (#847) gets the firm instruction, loses the file
+        // write tools and has its git writes refused (`read_only`).
+        let read_only = crate::orchestrator::read_only::role_is_read_only(&stage.artifact_kind, stage.role_environment);
+        let mut system = crate::orchestrator::roles::compose_stage_system_prompt(&stage.role_prompt, stage.role_environment, read_only, stage.loop_mode.clone(), stage.instructions.as_deref(), true);
         // Repo conventions (CLAUDE.md/AGENTS.md/…): the CLI substrate reads
         // them itself; the API substrate must be handed them explicitly or a
         // non-Claude implementer works blind to the project's rules.
@@ -358,6 +361,7 @@ impl AgentRunner for ApiRunner {
         // The per-stage tool-turn budget (validated 1..=100 at save time);
         // clamp defensively so a corrupt row can never yield a zero-turn loop.
         let max_iterations = stage.max_iterations.max(1) as usize;
+        let read_only_tools = read_only.then(|| crate::orchestrator::read_only::read_only_api_tools(stage.tools.as_deref()));
         let result = run_agentic_loop(
             provider.as_ref(),
             &api_base,
@@ -370,7 +374,7 @@ impl AgentRunner for ApiRunner {
             max_iterations,
             &ctx.cancel,
             &emitter,
-            stage.tools.as_deref(),
+            if read_only { read_only_tools.as_deref() } else { stage.tools.as_deref() },
             stage.effort,
             if ctx.exec_isolation == "sandbox" {
                 Some(ctx.allowed_write_roots.as_slice())
@@ -380,7 +384,7 @@ impl AgentRunner for ApiRunner {
             matches!(stage.loop_mode, Some(crate::orchestrator::types::LoopMode::Auto)),
             ctx.spend_limit,
             &ctx.peers,
-            None,
+            if read_only { Some(&crate::orchestrator::read_only::ReadOnlyGitGate as &dyn crate::orchestrator::agentic::ToolGate) } else { None },
             None,
         )
         .await;

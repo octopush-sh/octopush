@@ -22189,3 +22189,113 @@ mod ran_model_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod read_only_role_tests {
+    // #847: in the Bugfix relay, Reproduce and Verify applied the change and
+    // committed it. Read-only roles get a firm instruction everywhere, lose
+    // the file-write tools on the API and are denied git writes on both.
+    use crate::orchestrator::agentic::ToolGate;
+    use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume, cli_disallowed_tools};
+    use crate::orchestrator::read_only::{git_write_in, read_only_api_tools, role_is_read_only, ReadOnlyGitGate};
+    use crate::orchestrator::roles::{builtin_roles, compose_stage_system_prompt, READ_ONLY_CLAUSE};
+
+    #[test]
+    fn read_only_is_decided_per_builtin_role() {
+        let ro: Vec<String> = builtin_roles()
+            .into_iter()
+            .filter(|r| role_is_read_only(&r.artifact_kind, r.environment))
+            .map(|r| r.key)
+            .collect();
+        let mut got = ro.clone();
+        got.sort();
+        assert_eq!(got, ["code_review", "critique", "plan_review", "repro", "security_review", "verify"]);
+        // Writers keep their tools: Tests writes the tests it runs, Fix applies
+        // the fix, action roles commit by design.
+        for k in ["implement", "fix", "test", "refine", "pull_request", "merge", "release"] {
+            assert!(!ro.iter().any(|r| r == k), "{k} must stay a writer");
+        }
+    }
+
+    #[test]
+    fn read_only_api_stages_lose_the_write_tools_but_keep_run_command() {
+        // A seeded builtin stage has no allowlist (= the full set).
+        let t = read_only_api_tools(None);
+        assert!(!t.iter().any(|x| x == "write_file" || x == "edit_file"), "{t:?}");
+        for keep in ["read_file", "list_files", "grep", "glob", "run_command"] {
+            assert!(t.iter().any(|x| x == keep), "{keep} missing: {t:?}");
+        }
+        // An author's allowlist that grants writes is stripped, order kept.
+        let own: Vec<String> = ["read_file", "write_file", "run_command", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(read_only_api_tools(Some(&own)), vec!["read_file".to_string(), "run_command".to_string()]);
+    }
+
+    #[test]
+    fn git_writes_are_detected_and_reads_are_not() {
+        for (cmd, sub) in [
+            ("git commit -am 'append line'", "commit"),
+            ("echo x >> f && git add f && git commit -m x", "add"),
+            ("git -C /w -c user.name=x commit -m y", "commit"),
+            ("cd repo; git push origin HEAD", "push"),
+            ("/usr/bin/git stash", "stash"),
+            ("git --no-pager checkout -- src/a.rs", "checkout"),
+            ("npm test | tee out.txt; git reset --hard", "reset"),
+            ("(git restore .)", "restore"),
+        ] {
+            assert_eq!(git_write_in(cmd), Some(sub), "{cmd}");
+        }
+        for cmd in [
+            "git status",
+            "git diff HEAD~1",
+            "git log --oneline -5",
+            "git -C /w show HEAD",
+            "git branch --show-current",
+            "cargo test commit",
+            "grep -rn 'git commit' src",
+            "echo commit",
+        ] {
+            assert_eq!(git_write_in(cmd), None, "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_gate_refuses_git_writes_only() {
+        let g = ReadOnlyGitGate;
+        let deny = g.check("run_command", &serde_json::json!({"command": "git commit -m x"})).await;
+        assert!(deny.is_some_and(|d| d.contains("read-only")));
+        assert!(g.check("run_command", &serde_json::json!({"command": "cargo test"})).await.is_none());
+        assert!(g.check("run_command", &serde_json::json!({"command": "git diff"})).await.is_none());
+        assert!(g.check("read_file", &serde_json::json!({"path": "a"})).await.is_none());
+    }
+
+    #[test]
+    fn read_only_roles_get_the_clause_on_both_substrates() {
+        for r in builtin_roles() {
+            let ro = role_is_read_only(&r.artifact_kind, r.environment);
+            for api in [true, false] {
+                let s = compose_stage_system_prompt(&r.prompt_body, r.environment, ro, None, None, api);
+                assert_eq!(s.contains(READ_ONLY_CLAUSE), ro, "{} api={api}", r.key);
+            }
+        }
+        let repro = builtin_roles().into_iter().find(|r| r.key == "repro").unwrap();
+        assert!(repro.prompt_body.contains("Do not fix it yourself"));
+    }
+
+    #[test]
+    fn read_only_claude_stages_deny_git_writes_in_cli_args() {
+        let denied = |args: &[String]| -> Vec<String> {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            args[i + 1].split(',').map(str::to_string).collect()
+        };
+        for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
+            let tools = denied(&ro[..]);
+            for t in ["Bash(git commit:*)", "Bash(git push:*)", "Bash(git add:*)", "Bash(git stash:*)", "Write", "Edit"] {
+                assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
+            }
+        }
+        for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
+            assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
+        }
+        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion");
+    }
+}

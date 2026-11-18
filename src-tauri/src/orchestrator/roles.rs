@@ -43,6 +43,21 @@ pub const PREAMBLE_ACTION: &str = "You are one stage in an automated, headless b
     instructs — that is your job. Complete the action autonomously, then end with a brief summary \
     of exactly what you did (branch, PR URL, version, etc.) and anything still outstanding.";
 
+/// Appended after the preamble for a read-only role (#847, see
+/// [`crate::orchestrator::read_only`]): a `review` artifact in the worktree —
+/// repro, verify, plan/code/security review, critique. It overrides the
+/// worktree preamble's "leave changes uncommitted": these roles leave NO
+/// changes. Commands still run (reproduce, re-run, build, test). The leading
+/// space lets it append cleanly after the preamble's closing sentence.
+pub const READ_ONLY_CLAUSE: &str = " This is a READ-ONLY stage: your job is to investigate, \
+    run and report, not to change anything. Do not create, edit, move or delete files in the \
+    workspace — not even to apply the fix, a quick patch or the change the task describes; a later \
+    stage does that. Do not run git commands that change the repository (no commit, add, stash, \
+    reset, checkout, restore, merge, rebase or push). You may run commands to reproduce, build \
+    and test; if you need a scratch script, put it in a temporary directory outside the \
+    workspace and include it in your report. Leave the worktree and git history exactly as you \
+    found them.";
+
 /// The escape-valve carve-out — appended to the preamble ONLY for API-substrate
 /// stages, which have the `ask_director` tool. It is deliberately kept out of the
 /// preamble constants so a CLI-substrate stage (which has no such tool) keeps the
@@ -85,11 +100,28 @@ pub fn compose_system_prompt(
     instructions: Option<&str>,
     api_substrate: bool,
 ) -> String {
+    compose_stage_system_prompt(prompt_body, environment, false, loop_mode, instructions, api_substrate)
+}
+
+/// [`compose_system_prompt`] for a stage whose role may be read-only:
+/// `read_only` (see [`crate::orchestrator::read_only::role_is_read_only`])
+/// adds [`READ_ONLY_CLAUSE`] right after the preamble. Both runners use this.
+pub fn compose_stage_system_prompt(
+    prompt_body: &str,
+    environment: RoleEnvironment,
+    read_only: bool,
+    loop_mode: Option<LoopMode>,
+    instructions: Option<&str>,
+    api_substrate: bool,
+) -> String {
     let preamble = match environment {
         RoleEnvironment::Worktree => PREAMBLE_WORKTREE,
         RoleEnvironment::Action => PREAMBLE_ACTION,
     };
     let mut s = String::from(preamble);
+    if read_only {
+        s.push_str(READ_ONLY_CLAUSE);
+    }
     if api_substrate {
         s.push_str(ASK_DIRECTOR_CLAUSE);
     }
@@ -193,7 +225,8 @@ pub fn builtin_roles() -> Vec<RoleDef> {
             evidence, not speculation. End with these sections: (1) Repro — exact steps or command \
             and the observed result. (2) Root cause — where and why. (3) Fix direction — one or two \
             sentences for the fix stage. If you genuinely cannot reproduce it, say so explicitly \
-            and report what you ruled out.",
+            and report what you ruled out. Do not fix it yourself or modify files — the fix \
+            stage does that.",
         Review, Worktree, false, run_(), "api", false, 8000, 1000),
       r("fix","Fix","Apply the fix",
         "You are a skilled engineer fixing a reproduced bug. Read the repro findings in your \
