@@ -6,6 +6,9 @@ interface Props {
   deletions: number;
   focused: boolean;
   staged: boolean;
+  /** Committed changes (#851): Why? only — Accept and Reject act on the
+   *  working tree, which this hunk is not in. */
+  readOnly?: boolean;
   onAccept: () => void;
   onReject: () => void;
   onWhy: () => void;
@@ -17,6 +20,7 @@ export function HunkRail({
   deletions,
   focused,
   staged,
+  readOnly = false,
   onAccept,
   onReject,
   onWhy,
@@ -57,6 +61,8 @@ export function HunkRail({
             >
               <HelpCircle size={11} className="inline" /> Why?
             </button>
+            {!readOnly && (
+            <>
             <button
               onClick={onReject}
               aria-label="Reject hunk"
@@ -73,6 +79,8 @@ export function HunkRail({
             >
               <CheckCircle size={11} className="inline" /> Accept
             </button>
+            </>
+            )}
           </>
         )}
       </span>

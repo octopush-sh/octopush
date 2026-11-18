@@ -486,6 +486,18 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
+/** `git_ops::CommittedDiff`: what a workspace committed since its base —
+ *  the merge base → HEAD tree diff Review shows as "Since base" (#851). */
+export interface CommittedDiff {
+  base: string | null;
+  /** Short SHA of the merge base, when one resolved. */
+  mergeBase: string | null;
+  /** Commits on HEAD since the merge base. */
+  commits: number;
+  /** Unified diff; "" when there are no commits ahead. */
+  diff: string;
+}
+
 /** `git_ops::DiffSize`: files and lines from the merge base with `base` to
  *  the working tree (commits, edits and untracked files). `base` is null when
  *  the workspace has none that resolves: the size is then the uncommitted
@@ -961,6 +973,10 @@ export const ipc = {
    *  null when the workspace or its worktree is gone. */
   workspaceDiffSize: (workspaceId: string) =>
     invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
+  /** What the workspace committed since its base (Review's "Since base");
+   *  null when the worktree is gone or git timed out. */
+  getCommittedDiff: (workspaceId: string, ignoreWhitespace?: boolean) =>
+    invoke<CommittedDiff | null>("get_committed_diff", { workspaceId, ignoreWhitespace }),
 
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),

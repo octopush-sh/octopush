@@ -244,6 +244,7 @@ pub fn run() {
             commands::project_collisions,
             commands::workspace_diff_size,
             commands::get_git_diff,
+            commands::get_committed_diff,
             // Chat
             commands::send_chat_message,
             commands::truncate_chat_after,

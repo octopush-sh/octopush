@@ -21,6 +21,8 @@ interface Props {
   collapsed: boolean;
   /** This file changed after it was marked viewed (cleared on re-mark). */
   changedSinceViewed?: boolean;
+  /** Committed changes (#851): the hunk rails carry no Accept / Reject. */
+  readOnly?: boolean;
   onAccept: (hunkIdx: number) => void;
   onReject: (hunkIdx: number) => void;
   onWhy: (hunkIdx: number) => void;
@@ -35,6 +37,7 @@ export function FileDiffSection({
   viewed,
   collapsed,
   changedSinceViewed = false,
+  readOnly = false,
   onAccept,
   onReject,
   onWhy,
@@ -168,6 +171,7 @@ export function FileDiffSection({
                 deletions={hunk.deletions}
                 focused={focusedHunk === i}
                 staged={false}
+                readOnly={readOnly}
                 onAccept={() => onAccept(i)}
                 onReject={() => onReject(i)}
                 onWhy={() => onWhy(i)}

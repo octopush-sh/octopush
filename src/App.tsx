@@ -103,6 +103,8 @@ import { useCompanionFold } from "./hooks/useCompanionFold";
 import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
+import { diffFileCount, resolveReviewSource } from "./lib/reviewSource";
+import { useReviewSource } from "./stores/reviewSourceStore";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
@@ -800,11 +802,14 @@ function App() {
         // skip the (non-trivial) diff build in talk/run. Entering review
         // re-runs this effect (activeMode is a dep), fetching the diff then.
         const needDiff = activeMode === "review";
-        const [s, d] = await Promise.all([
+        const [s, d, c] = await Promise.all([
           ipc.getGitStatus(path),
           needDiff ? ipc.getGitDiff(path, ignoreWs).catch(() => "") : Promise.resolve(""),
+          // Review's "Since base" view (#851): what the workspace committed.
+          needDiff && ws ? ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null) : Promise.resolve(undefined),
         ]);
         if (cancelled) return;
+        if (ws && c !== undefined) useReviewSource.getState().setCommitted(ws.id, c);
         // Status change-detection (file metadata). hasUpstream is intentionally
         // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
         // its own git status). The diff is compared separately, by content.
@@ -1267,15 +1272,29 @@ function App() {
     return () => window.removeEventListener(NAVIGATE_EVENT, onNavigate);
   }, [activeWorkspaceId, shortcutCtx]);
   const activeRuns = useRunsStore((s) => s.getRuns(activeWorkspaceId ?? ""));
-  const workingDiffStat = useMemo(() => diffStat(gitDiff), [gitDiff]);
+  // Review's source (#851): the working tree, or what the workspace committed
+  // since its base when the tree is clean (or the user picked it).
+  const committed = useReviewSource((s) =>
+    activeWorkspaceId ? s.committedByWs[activeWorkspaceId] ?? null : null,
+  );
+  const reviewPick = useReviewSource((s) => (activeWorkspaceId ? s.pickByWs[activeWorkspaceId] : undefined));
+  const reviewSource = resolveReviewSource(
+    reviewPick,
+    (gitStatus?.changedFiles.length ?? 0) > 0,
+    committed?.commits ?? 0,
+  );
+  const reviewDiff = reviewSource === "committed" ? committed?.diff ?? "" : gitDiff;
+  const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
+  const reviewChangedCount =
+    reviewSource === "committed" ? diffFileCount(reviewDiff) : gitStatus?.changedFiles.length ?? 0;
   const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
         terminalCount: terminals.length,
         tokensUsed: lastTurnInputTokens,
         tokensLimit: activeModelMaxContext,
-        changedCount: gitStatus?.changedFiles.length ?? 0,
-        diffStat: workingDiffStat,
+        changedCount: reviewChangedCount,
+        diffStat: reviewDiffStat,
         runState: runTailState(activeRuns),
       }),
     [
@@ -1283,8 +1302,8 @@ function App() {
       terminals.length,
       lastTurnInputTokens,
       activeModelMaxContext,
-      gitStatus,
-      workingDiffStat,
+      reviewChangedCount,
+      reviewDiffStat,
       activeRuns,
     ],
   );
@@ -1296,8 +1315,8 @@ function App() {
   // In Review the tail is a demotion ladder rather than one truncating line,
   // so a narrow band sheds whole atoms instead of ending on "· …".
   const reviewParts = useMemo(
-    () => reviewTailParts(gitStatus?.changedFiles.length ?? 0, workingDiffStat),
-    [gitStatus, workingDiffStat],
+    () => reviewTailParts(reviewChangedCount, reviewDiffStat),
+    [reviewChangedCount, reviewDiffStat],
   );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
@@ -2266,10 +2285,12 @@ function App() {
                         Promise.all([
                           ipc.getGitStatus(path),
                           ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+                          ipc.getCommittedDiff(activeWorkspaceId!, ignoreWs).catch(() => null),
                         ])
-                          .then(([s, d]) => {
+                          .then(([s, d, c]) => {
                             setGitStatus(s);
                             setGitDiff(d);
+                            useReviewSource.getState().setCommitted(activeWorkspaceId!, c);
                           })
                           .catch(() => {});
                       }}
@@ -2285,7 +2306,12 @@ function App() {
                         workspaceId={activeWorkspaceId!}
                         workspacePath={activeWorkspace.worktreePath || project.path}
                         gitStatus={gitStatus}
-                        gitDiff={gitDiff}
+                        gitDiff={reviewDiff}
+                        source={reviewSource}
+                        commitsAhead={committed?.commits ?? 0}
+                        base={committed?.base ?? null}
+                        mergeBase={committed?.mergeBase ?? null}
+                        onSourceChange={(src) => useReviewSource.getState().pick(activeWorkspaceId!, src)}
                         viewMode={reviewViewMode}
                         onViewModeChange={setReviewViewMode}
                         onOpenFileAtLine={(p, line) => navigateToFile(p, "editor", line)}

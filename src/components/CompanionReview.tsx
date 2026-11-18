@@ -13,7 +13,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, ShieldAlert } from "lucide-react";
+import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, GitCompare, ShieldAlert } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
@@ -22,6 +22,8 @@ import { formatRelTime } from "../lib/relTime";
 import { collisionTooltip, notable, shownCount } from "../lib/collisions";
 import { useCollisionStore } from "../stores/collisionStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { useReviewSource } from "../stores/reviewSourceStore";
+import { baseName, commitCount } from "../lib/reviewSource";
 import { Reveal } from "./primitives/Reveal";
 import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
 
@@ -69,7 +71,7 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
       <Provenance workspaceId={workspaceId} files={files} onJump={onJump} />
 
       {/* ── Branch & publish ────────────────────────────────────── */}
-      <BranchPublish workspacePath={workspacePath} gitStatus={gitStatus} />
+      <BranchPublish workspaceId={workspaceId} workspacePath={workspacePath} gitStatus={gitStatus} />
     </div>
   );
 }
@@ -406,8 +408,20 @@ function ProvenanceTurn({ turn, onJump }: { turn: Turn; onJump?: (file: string, 
 
 // ─── Branch & publish ─────────────────────────────────────────────
 
-function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gitStatus: GitStatus | null }) {
+function BranchPublish({
+  workspaceId,
+  workspacePath,
+  gitStatus,
+}: {
+  workspaceId: string;
+  workspacePath: string;
+  gitStatus: GitStatus | null;
+}) {
   const [lastCommit, setLastCommit] = useState<LastCommit | null>(null);
+  // Commits since the base (#851), from the committed view App fetches in
+  // Review — no IPC of its own.
+  const committed = useReviewSource((s) => s.committedByWs[workspaceId] ?? null);
+  const sinceBase = committed && committed.commits > 0 ? committed : null;
 
   const ahead = gitStatus?.ahead ?? 0;
   const behind = gitStatus?.behind ?? 0;
@@ -443,6 +457,18 @@ function BranchPublish({ workspacePath, gitStatus }: { workspacePath: string; gi
         <GitBranch size={12} className="shrink-0 text-octo-mute" aria-hidden />
         <span className={`octo-tabular ${sync.tone}`} title={"title" in sync ? sync.title : undefined}>{sync.text}</span>
       </div>
+      {sinceBase && (
+        <div
+          data-tour="review-companion-ahead"
+          className="octo-fade-in mt-1.5 flex items-center gap-1.5 font-mono text-[11px] text-octo-sage"
+          title={`Commits on this branch since ${baseName(sinceBase.base)}${sinceBase.mergeBase ? ` (merge base ${sinceBase.mergeBase})` : ""}`}
+        >
+          <GitCompare size={12} className="shrink-0 text-octo-mute" aria-hidden />
+          <span className="octo-tabular">
+            {commitCount(sinceBase.commits)} ahead of {baseName(sinceBase.base)}
+          </span>
+        </div>
+      )}
       {lastCommit && (
         <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-sage">
           <GitCommit size={12} className="mt-0.5 shrink-0 text-octo-mute" aria-hidden />
