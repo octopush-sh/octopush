@@ -141,11 +141,18 @@ describe("CommandPalette · Models group", () => {
     await act(async () => {});
     const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
     expect(sel).toHaveTextContent("DeepSeek V3");
+    // Assistive tech follows the same row: the combobox and the listbox point
+    // their aria-activedescendant at it, not at the removed "Show all" row.
+    expect(sel?.id).toBeTruthy();
+    expect(input).toHaveAttribute("aria-activedescendant", sel!.id);
+    expect(screen.getByRole("listbox")).toHaveAttribute("aria-activedescendant", sel!.id);
     // The next keystroke moves on from there, not from the top.
     await act(async () => {
       fireEvent.keyDown(input, { key: "ArrowDown" });
     });
-    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("Mistral Large");
+    const next = document.querySelector('[cmdk-item][aria-selected="true"]');
+    expect(next).toHaveTextContent("Mistral Large");
+    expect(input).toHaveAttribute("aria-activedescendant", next!.id);
   });
 
   it("resets the query and the expanded list on close, before a reopen paints (#897)", async () => {

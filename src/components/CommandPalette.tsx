@@ -1,5 +1,5 @@
 import { Command } from "cmdk";
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { flushSync } from "react-dom";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
@@ -66,6 +66,7 @@ export function CommandPalette({
   // cmdk's selection, controlled so "Show all models" can hand it to the
   // first revealed model (#897).
   const [selected, setSelected] = useState("");
+  const listRef = useRef<HTMLDivElement>(null);
 
   // The palette stays mounted while closed (it renders nothing), so reset on
   // close: a reopen must never paint the old query or expanded list for a
@@ -131,7 +132,7 @@ export function CommandPalette({
             </button>
           </div>
 
-          <Command.List className="max-h-[380px] overflow-y-auto py-2">
+          <Command.List ref={listRef} className="max-h-[380px] overflow-y-auto py-2">
             <Command.Empty className="px-6 py-8 text-center font-serif text-[13px] text-octo-mute">
               Nothing matches.
             </Command.Empty>
@@ -207,12 +208,24 @@ export function CommandPalette({
                   detail={`${modelRows.hidden} more`}
                   tour={tourId("palette-models-more")}
                   onSelect={() => {
-                    // Move the selection first, then reveal. If this row were
-                    // still selected when it unmounts, cmdk would re-select
-                    // the palette's first item ("New session") (#897).
+                    // If this row were still selected when it unmounts, cmdk
+                    // would re-select the palette's first item ("New
+                    // session") (#897). So park the selection on the last
+                    // shown model, reveal, then select the first revealed
+                    // row through cmdk itself. A controlled `value` change
+                    // moves aria-selected but not cmdk's aria-activedescendant
+                    // (cmdk 1.1 recomputes it only when it selects a row), so
+                    // setting the value alone would leave assistive tech on
+                    // this removed row.
                     const next = firstRevealedModel(models, modelRows.shown);
-                    if (next) flushSync(() => setSelected(paletteModelValue(next)));
-                    setAllModels(true);
+                    const park = modelRows.shown[modelRows.shown.length - 1];
+                    if (!next || !park) {
+                      setAllModels(true);
+                      return;
+                    }
+                    flushSync(() => setSelected(paletteModelValue(park)));
+                    flushSync(() => setAllModels(true));
+                    selectRow(listRef.current, paletteModelValue(next));
                   }}
                 />
               )}
@@ -423,6 +436,18 @@ function Group({
   );
 }
 
+/** Select a mounted row the way cmdk selects one under the pointer, so cmdk
+ *  updates its own value, aria-selected and aria-activedescendant together
+ *  (#897), then bring the row into view as keyboard navigation would. */
+function selectRow(list: HTMLElement | null, value: string) {
+  const row = Array.from(list?.querySelectorAll<HTMLElement>("[cmdk-item]") ?? []).find(
+    (el) => el.dataset.paletteValue === value,
+  );
+  if (!row) return;
+  row.dispatchEvent(new Event("pointermove", { bubbles: true }));
+  row.scrollIntoView?.({ block: "nearest" });
+}
+
 function Item({
   glyph,
   label,
@@ -448,6 +473,7 @@ function Item({
       keywords={keywords}
       onSelect={onSelect}
       data-tour={tour}
+      data-palette-value={value}
       className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
       style={
         {
