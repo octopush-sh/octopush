@@ -201,8 +201,9 @@ export function GenesisPrompt({ loading = false, onSubmit, onSketch, links = [] 
             (brass-dim border, brass-ghost fill, serif) so it leads the footer
             in every state — a ghost outline in sage made it the faintest
             thing on the screen (#758). Only the ink changes: full brass once
-            it can act with confidence, receded brass/50 otherwise (disabled
-            with nothing to do, or a brief with no key — still clickable). */}
+            it can act with confidence, receded otherwise: sage for a brief
+            with no key (still clickable), brass/50 when disabled with
+            nothing to do. */}
         <button
           type="button"
           data-tour="genesis-begin"
@@ -239,9 +240,12 @@ export const GENESIS_CTA_CLASS =
 /** Brief plus a stored or typed key, or "Wake the crew": full brass. */
 export const GENESIS_CTA_INK_PRIMED = "text-octo-brass hover:text-octo-brass-hi";
 /** Nothing to do yet (disabled), or a brief with no key (clickable, the honest
- *  Settings fallback): the frame stays, the ink recedes. */
+ *  Settings fallback): the frame stays, the ink recedes. Enabled, it recedes to
+ *  sage, which clears AA on the brass-ghost frame in every theme; no brass
+ *  alpha does (brass/70 is 2.7:1 on Vellum, #818). Disabled, it drops further
+ *  to brass/50, which reads as unavailable and is exempt as an inactive control. */
 export const GENESIS_CTA_INK_RECEDED =
-  "text-octo-brass/50 hover:text-octo-brass disabled:hover:text-octo-brass/50";
+  "text-octo-sage hover:text-octo-brass disabled:text-octo-brass/50 disabled:hover:text-octo-brass/50";
 
 /** The quiet link style shared by every secondary route under the genesis CTA:
  *  one ink (sage, ivory on hover) and one underline for all of them, so none

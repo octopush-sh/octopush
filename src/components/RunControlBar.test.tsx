@@ -183,6 +183,26 @@ describe("RunControlBar", () => {
     expect(h.onResume).toHaveBeenCalled();
   });
 
+  it("transient halt: the beacon pulses in amber, never brass (#818)", () => {
+    const h = handlers();
+    const { container } = render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "rate limit exceeded" })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    const pulses = container.querySelectorAll(".octo-stage-pulse");
+    expect(pulses).toHaveLength(1);
+    expect(pulses[0]).toHaveTextContent("Resume the stage");
+    expect(pulses[0]).toHaveClass("octo-stage-pulse-warning", "border-octo-warning");
+  });
+
+  it("brass halts and gates keep the brass pulse", () => {
+    const h = handlers();
+    const gate = render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(gate.container.querySelector(".octo-stage-pulse")).not.toHaveClass("octo-stage-pulse-warning");
+    gate.unmount();
+    const halt = render(<RunControlBar run={run("paused")} blockedStage={stage({ status: "failed", error: "compile error: missing semicolon" })}
+      loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(halt.container.querySelector(".octo-stage-pulse")).not.toHaveClass("octo-stage-pulse-warning");
+  });
+
   it("escape valve: renders the questions pre-filled with defaults and sends edited answers", () => {
     const h = handlers();
     const blocked = stage({
@@ -301,7 +321,8 @@ describe("RunControlBar", () => {
       expect(screen.queryByRole("button", { name: /Don.t resume automatically/ })).not.toBeInTheDocument();
       fireEvent.click(screen.getByRole("button", { name: "Resume the stage" }));
       expect(h.onResume).toHaveBeenCalled();
-      expect(container.querySelector(".octo-stage-pulse")).not.toBeNull();
+      // An amber halt: the pulse follows its ink, never brass (#818).
+      expect(container.querySelector(".octo-stage-pulse")).toHaveClass("octo-stage-pulse-warning");
     });
   });
 });

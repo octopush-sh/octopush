@@ -202,6 +202,27 @@ describe("CompanionHistory — the title owns the row (#756)", () => {
     expect(titleBox().parentElement).not.toHaveClass("pr-1");
   });
 
+  it("the overlay lets clicks through to the title; only its buttons catch them (#818)", () => {
+    renderHistory(withActions);
+    const actions = screen.getAllByTestId("chat-row-actions")[0];
+    expect(actions).toHaveClass("pointer-events-none");
+    const buttons = actions.querySelectorAll("button");
+    expect(buttons).toHaveLength(4);
+    for (const b of buttons) expect(b).toHaveClass("pointer-events-auto");
+  });
+
+  it("the overlay fades on the row's own timing, so unhover drops no patch (#818)", () => {
+    renderHistory(withActions);
+    const actions = screen.getAllByTestId("chat-row-actions")[0];
+    const row = actions.parentElement!;
+    // `.octo-row-actions-fade` transitions opacity AND the registered
+    // `--row-wash`; the utilities give both the row's duration and curve.
+    for (const el of [row, actions]) expect(el).toHaveClass("duration-[220ms]", "ease-[var(--ease-octo)]");
+    // The property list lives in the CSS class alone; a `transition-*`
+    // utility here would hide that `--row-wash` fades too.
+    expect(actions.className).not.toMatch(/(^|\s)transition(-|\s|$)/);
+  });
+
   it("toggling hover or focus doesn't change the title's width classes", async () => {
     const user = userEvent.setup();
     renderHistory({ ...withActions, chats: [chats[0]] });
