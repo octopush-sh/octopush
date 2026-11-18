@@ -477,6 +477,9 @@ describe("MissionControl", () => {
     expect(line.textContent).toMatch(/^plan limit · resumes \d{2}:\d{2}$/);
     expect(line.className).toContain("text-octo-sage");
     expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+    // The design system's lucide Hourglass with a tooltip, no bespoke glyph.
+    expect(screen.getByTitle("Waiting for your Claude plan's window to reset").querySelector("svg")).toBeTruthy();
+    expect(container.textContent).not.toContain("○");
   });
 
   it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", () => {
@@ -488,7 +491,7 @@ describe("MissionControl", () => {
     useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
     renderRoom({ onJumpToRun });
     fireEvent.click(screen.getByLabelText("Resume now"));
-    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "resume", undefined, undefined, undefined);
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "resume", undefined, undefined, undefined, undefined);
     fireEvent.click(screen.getByLabelText("Don't resume automatically"));
     expect(ipc.cancelPlanResume).toHaveBeenCalledWith("a");
     expect(onJumpToRun).not.toHaveBeenCalled();

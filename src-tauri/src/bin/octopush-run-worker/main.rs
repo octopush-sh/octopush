@@ -126,14 +126,14 @@ async fn main() {
         // Release the claim (nonce-guarded: a successor's lease is never touched).
         let _ = db.lock().clear_worker_lease(&args.run_id, &args.nonce);
 
+        // Only a park where the plan is ALL that waits is waited for here: a
+        // sibling's halt, gate or question needs the director now, so that
+        // ends the worker with "The crew needs you" (the app's scheduler
+        // still resumes the plan stages once the director has decided).
         let plan_resume_at = match &result {
-            Ok(RunStatus::Paused) => db
-                .lock()
-                .get_run(&args.run_id)
-                .ok()
-                .flatten()
-                .and_then(|r| r.plan_wait)
-                .and_then(|w| w.resume_at),
+            Ok(RunStatus::Paused) => {
+                db.lock().get_run(&args.run_id).ok().flatten().as_ref().and_then(plan_wait::worker_plan_wait)
+            }
             _ => None,
         };
         let Some(resume_at) = plan_resume_at else {
@@ -151,15 +151,18 @@ async fn main() {
         match wait_for_plan_reset(&db, &orch, &args.run_id).await {
             WaitEnd::Drive(over) => {
                 // Drive the next segment under our own lease again.
-                if !db.lock().reserve_worker_lease(&args.run_id, &args.nonce).unwrap_or(false)
-                    || !db
-                        .lock()
-                        .confirm_worker_lease(&args.run_id, &args.nonce, std::process::id() as i64)
-                        .unwrap_or(false)
-                {
+                match retake_lease(&db, &args.run_id, &args.nonce).await {
+                    Lease::Ours => {}
                     // Someone else owns it now; the resume is already applied
                     // and that driver will run it.
-                    break Ok(RunStatus::Paused);
+                    Lease::Theirs => break Ok(RunStatus::Paused),
+                    // The database stayed unreachable: the resume is applied
+                    // but nobody drives it. Say so instead of going quiet.
+                    Lease::Unreachable => {
+                        let result = Ok(RunStatus::Paused);
+                        announce(&db, &args, &result);
+                        break result;
+                    }
                 }
                 if !app_alive(args.app_pid) {
                     let task = run_task(&db, &args.run_id);
@@ -174,7 +177,7 @@ async fn main() {
                 announce(&db, &args, &result);
                 break result;
             }
-            // Resumed elsewhere, cancelled, aborted or resolved: nothing left here.
+            // Resumed elsewhere, aborted, or nothing left held: nothing to say.
             WaitEnd::Gone => break Ok(RunStatus::Paused),
         }
     };
@@ -183,6 +186,52 @@ async fn main() {
         eprintln!("octopush-run-worker: drive failed: {e}");
         std::process::exit(1);
     }
+}
+
+/// Taking the worker lease back after a plan wait.
+#[derive(Debug, PartialEq, Eq)]
+enum Lease {
+    Ours,
+    /// Another driver holds the run.
+    Theirs,
+    /// The database kept failing.
+    Unreachable,
+}
+
+/// Reserve and confirm the lease again, riding out transient database
+/// errors (a busy database is not "someone else owns it").
+async fn retake_lease(db: &Arc<Mutex<Db>>, run_id: &str, nonce: &str) -> Lease {
+    let pid = std::process::id() as i64;
+    for attempt in 1..=LEASE_RETRIES {
+        let step = db
+            .lock()
+            .reserve_worker_lease(run_id, nonce)
+            .and_then(|ok| if ok { db.lock().confirm_worker_lease(run_id, nonce, pid) } else { Ok(false) });
+        match step {
+            Ok(true) => return Lease::Ours,
+            Ok(false) => return Lease::Theirs,
+            Err(e) => {
+                eprintln!("octopush-run-worker: retaking the lease failed ({attempt}): {e}");
+                tokio::time::sleep(db_backoff(attempt)).await;
+            }
+        }
+    }
+    Lease::Unreachable
+}
+
+/// Attempts [`retake_lease`] makes before giving up (about a minute).
+const LEASE_RETRIES: u32 = 8;
+
+/// [`plan_wait::needs_director`] on the run's current rows (`false` when
+/// they can't be read: the caller has nothing reliable to announce).
+fn paused_with_hold(db: &Arc<Mutex<Db>>, run_id: &str) -> bool {
+    let Ok(Some(run)) = db.lock().get_run(run_id) else {
+        return false;
+    };
+    let Ok(stages) = db.lock().list_run_stages(run_id) else {
+        return false;
+    };
+    plan_wait::needs_director(&run, &stages)
 }
 
 /// How often a waiting worker re-reads the clock and the run. Wall-clock
@@ -197,8 +246,8 @@ enum WaitEnd {
     Drive(bool),
     /// The run waits for the director now: announce it.
     NeedsYou,
-    /// Nothing left for this worker: the app or the director acted, the
-    /// resume was turned off, or the run was aborted or deleted.
+    /// Nothing left for this worker: the app or the director resumed it, or
+    /// the run was aborted, deleted, or holds no stage any more.
     Gone,
 }
 
@@ -239,8 +288,10 @@ async fn wait_for_plan_reset(db: &Arc<Mutex<Db>>, orch: &Arc<Orchestrator>, run_
         if run.status != "paused" {
             return WaitEnd::Gone;
         }
+        // No automatic resume any more (turned off, or handed to the
+        // director): a run still holding a stage needs you.
         let Some(resume_at) = run.plan_wait.and_then(|w| w.resume_at) else {
-            return WaitEnd::Gone;
+            return if paused_with_hold(db, run_id) { WaitEnd::NeedsYou } else { WaitEnd::Gone };
         };
         if chrono::Utc::now().timestamp() < resume_at {
             errors = 0;
@@ -250,7 +301,11 @@ async fn wait_for_plan_reset(db: &Arc<Mutex<Db>>, orch: &Arc<Orchestrator>, run_
         match orch.claim_plan_resume(run_id) {
             Ok(PlanClaim::Resumed { budget_override }) => return WaitEnd::Drive(budget_override),
             Ok(PlanClaim::NeedsYou) => return WaitEnd::NeedsYou,
-            Ok(PlanClaim::NotClaimed) => return WaitEnd::Gone,
+            // Resumed elsewhere is gone; still paused with a stage held (the
+            // plan stages were resolved but a sibling waits) needs you.
+            Ok(PlanClaim::NotClaimed) => {
+                return if paused_with_hold(db, run_id) { WaitEnd::NeedsYou } else { WaitEnd::Gone };
+            }
             Ok(PlanClaim::Retry) => tokio::time::sleep(PLAN_WAIT_POLL).await,
             Err(e) => match on_error(&mut errors, &e) {
                 Some(pause) => tokio::time::sleep(pause).await,

@@ -128,6 +128,8 @@ interface RunsState {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
+    /** The stage decided on (see `ipc.resolveCheckpoint`). */
+    stageId?: string,
   ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
@@ -443,8 +445,8 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
-    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride);
+  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride, stageId) => {
+    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride, stageId);
     await get().refreshDetail(runId);
   },
 

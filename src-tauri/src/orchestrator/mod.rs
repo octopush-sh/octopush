@@ -297,6 +297,9 @@ pub struct Orchestrator {
     /// The bridge's watch table for leased (worker-driven) runs: journal
     /// cursor + last-emitted snapshot per run id (see `bridge`).
     bridge_watch: Mutex<std::collections::HashMap<String, crate::orchestrator::bridge::Watch>>,
+    /// Consecutive automatic plan resumes per run that this process claimed
+    /// but couldn't apply (`plan_wait::MAX_PLAN_RETRIES` caps them).
+    pub(crate) plan_retries: Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl Orchestrator {
@@ -328,6 +331,7 @@ impl Orchestrator {
             headless,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            plan_retries: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -349,6 +353,7 @@ impl Orchestrator {
             headless: false,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            plan_retries: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -2662,6 +2667,17 @@ impl Orchestrator {
                 p.loop_mode.as_deref(),
             )?;
         }
+        // A Claude plan park (#731) whose plan-limited stages this re-run
+        // reset has nothing left to wait for: end it, or the scheduled resume
+        // would claim a run that is no longer parked. The director acted, so
+        // the automatic-resume allowance starts fresh either way.
+        let plan_left = self.db.lock().list_run_stages(run_id)?.iter().any(|s| {
+            s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        });
+        if !plan_left {
+            self.db.lock().clear_run_plan_wait(run_id)?;
+        }
+        self.db.lock().reset_plan_resume_count(run_id)?;
         // `archive_and_reset_stage` already retired each stage's spend onto
         // the run (append, never reset) — recompute folds that in.
         self.recompute_run_cost(run_id)?;

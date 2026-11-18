@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { AUTO_RESUME_CAP, isPlanWaiting, planWaitWhy } from "./planWait";
+import { AUTO_RESUME_CAP, isPlanWaiting, pickBlockedStage, planWaitWhy } from "./planWait";
+import { beaconAnchor } from "./beacon";
 import type { PlanWait } from "./ipc";
 
 function wait(over: Partial<PlanWait> = {}): PlanWait {
@@ -23,6 +24,27 @@ describe("planWait", () => {
     // No resume scheduled: the director resumes.
     expect(isPlanWaiting({ status: "paused", planWait: wait({ resumeAt: null }) })).toBe(false);
     expect(isPlanWaiting({ status: "running", planWait: wait() })).toBe(false);
+  });
+
+  it("a budget of 0 is no budget, like the drive gate", () => {
+    const why = planWaitWhy({ planWait: wait({ resumeAt: null }), budgetUsd: 0, costUsd: 1 });
+    expect(why).toBe("It doesn't resume on its own. Resume it when you're ready.");
+    expect(planWaitWhy({ planWait: wait({ resumeAt: null }), budgetUsd: 1, costUsd: 1 })).toMatch(/budget is spent/);
+  });
+
+  it("puts a sibling's decision before the plan-limited stage, and that decision takes the beacon", () => {
+    const plan = { id: "p", status: "failed", error: "Paused by your Claude plan\n(plan_limit)" };
+    const gate = { id: "g", status: "awaiting_checkpoint", error: null };
+    const halt = { id: "h", status: "failed", error: "the build broke" };
+    expect(pickBlockedStage([plan, gate])?.id).toBe("g");
+    expect(pickBlockedStage([plan, halt])?.id).toBe("h");
+    expect(pickBlockedStage([plan])?.id).toBe("p");
+    expect(pickBlockedStage([{ id: "d", status: "done", error: null }])).toBeNull();
+    // otherHold: isPlanWaiting is false, and the gate is the decision.
+    const run = { status: "paused" as const, planWait: wait({ otherHold: true }) };
+    const blockedStage = pickBlockedStage([plan, gate]);
+    expect(beaconAnchor({ run, blockedStage, runningStage: null, launcherReady: false, planWaiting: isPlanWaiting(run) }))
+      .toEqual({ kind: "decision" });
   });
 
   it("names the cap when it was reached", () => {

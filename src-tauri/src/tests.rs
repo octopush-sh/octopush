@@ -19969,6 +19969,147 @@ mod plan_wait_tests {
         assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
     }
 
+    /// A re-run of the plan-limited stage ends the park: no stale resume is
+    /// left to claim a run that is no longer parked.
+    #[tokio::test]
+    async fn a_rerun_ends_a_stale_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        orch.prepare_rerun(&run_id, &stage, None).unwrap();
+        orch.release_active(&run_id);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none(), "nothing plan-limited is left");
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the director acted");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+
+    /// The worker waits for the plan itself only when the plan is all that
+    /// waits; a sibling's halt makes it announce instead.
+    #[tokio::test]
+    async fn the_worker_waits_only_when_the_plan_is_all_that_waits() {
+        use crate::orchestrator::plan_wait::{needs_director, worker_plan_wait};
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("a.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(worker_plan_wait(&run).is_some(), "only the plan waits: the worker waits");
+        assert!(!needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("b.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.resume_at.is_some()));
+        assert_eq!(worker_plan_wait(&run), None, "a sibling's halt needs you: announce, don't wait");
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+    }
+
+    /// A claim that finds the plan stages resolved while a sibling's gate
+    /// still waits is `NotClaimed`, and the run still needs the director.
+    #[tokio::test]
+    async fn not_claimed_with_a_gate_left_still_needs_you() {
+        use crate::orchestrator::plan_wait::needs_director;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let critique = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().conn_ref().execute(
+            "UPDATE run_stages SET status = 'done', error = NULL WHERE id = ?1", [&critique]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()), "the gate still waits: announce");
+    }
+
+    /// Approve with an explicit stage id resolves THAT stage, never the first
+    /// resolvable one (here the plan-limited stage sits before the gate).
+    #[tokio::test]
+    async fn approve_with_a_stage_id_resolves_that_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        assert!(orch.resolve_checkpoint_apply_only(&run_id, Some(&gate), CheckpointAction::Approve).unwrap().is_some());
+        let st = statuses(&db, &run_id);
+        assert_eq!(st[1], "failed", "the plan-limited stage is untouched");
+        assert_ne!(st[2], "awaiting_checkpoint", "the gate was approved");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+    }
+
+    /// A claim moves the resume forward instead of clearing it: a claimant
+    /// that dies before applying it never loses the park.
+    #[tokio::test]
+    async fn a_claim_that_is_never_applied_keeps_the_park_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert!(!db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap(), "exactly one claimant");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, Some(t + RETRY_SECS));
+        assert_eq!(db.lock().list_due_plan_resumes(t + RETRY_SECS).unwrap(), vec![run_id.clone()]);
+    }
+
+    /// Retries are capped: after MAX_PLAN_RETRIES failed applies the run waits
+    /// for the director (and the worker announces it).
+    #[tokio::test]
+    async fn retries_are_capped_then_it_needs_you() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(wait.resume_count, 0, "failed claims don't count");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// Two windows in one batch: the park keeps the one that resets LAST.
+    #[tokio::test]
+    async fn the_park_keeps_the_latest_reset() {
+        use crate::orchestrator::cli_runner::PlanLimit;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 0, now());
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let late = now() + 7_200;
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "seven_day".into(), resets_at: late }).unwrap();
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "five_hour".into(), resets_at: now() + 600 }).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.window.as_str(), wait.resets_at), ("seven_day", late));
+        assert!(wait.resume_at.unwrap() >= late + RESUME_MARGIN_SECS);
+    }
+
+    /// A budget of 0 is no budget (the drive gate's own rule): it resumes.
+    #[tokio::test]
+    async fn a_zero_budget_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.0)).unwrap();
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+    }
+
     #[tokio::test]
     async fn aborting_ends_the_park() {
         let dir = tempfile::tempdir().unwrap();

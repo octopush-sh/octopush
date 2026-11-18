@@ -2679,6 +2679,7 @@ pub async fn resolve_checkpoint(
     feedback: Option<String>,
     model_override: Option<String>,
     max_turns_override: Option<i64>,
+    stage_id: Option<String>,
 ) -> AppResult<()> {
     let action = match action.as_str() {
         "approve" => CheckpointAction::Approve,
@@ -2690,14 +2691,18 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
-    dispatch_checkpoint(&orch, run_id, None, action)
+    // `stage_id` names the stage the director decided on (the Direct canvas
+    // passes the one its decision bar shows), so a run holding several
+    // stages never resolves a different one; `None` = the single-parked rule.
+    dispatch_checkpoint(&orch, run_id, stage_id, action)
 }
 
 /// Resolve a checkpoint decision and resume the drive, choosing the detached
 /// (Pro) or in-process path. Shared by `resolve_checkpoint` and
 /// `answer_blocker` so the escape valve reuses the exact resume substrate.
 /// `stage_id` scopes which parked/failed stage the action targets — the escape
-/// valve passes its validated id; the plain checkpoint path passes `None`.
+/// valve passes its validated id, the checkpoint path the stage its caller
+/// named (or `None`).
 fn dispatch_checkpoint(
     orch: &Arc<Orchestrator>,
     run_id: String,

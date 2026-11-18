@@ -15,6 +15,15 @@ export function isPlanLimitHalt(error: string | null | undefined): boolean {
   return !!error && error.includes(PLAN_LIMIT_MARKER);
 }
 
+/** The stage the Direct canvas's decision bar acts on. A run can hold
+ *  several at once (a plan limit beside a sibling's gate, halt or question):
+ *  the one that needs a decision comes first, so its bar shows (and takes the
+ *  beacon) instead of the calm plan wait. Plan-limited stages come last. */
+export function pickBlockedStage<S extends { status: string; error?: string | null }>(stages: readonly S[]): S | null {
+  const resolvable = stages.filter((s) => s.status === "awaiting_checkpoint" || s.status === "failed");
+  return resolvable.find((s) => !(s.status === "failed" && isPlanLimitHalt(s.error))) ?? resolvable[0] ?? null;
+}
+
 /** Automatic resumes before a plan-parked run waits for the director. Mirrors
  *  `plan_wait::AUTO_RESUME_CAP` in Rust; `planWait.test.ts` pins the two. */
 export const AUTO_RESUME_CAP = 3;
@@ -50,7 +59,8 @@ export function planWaitWhy(run: Pick<Run, "planWait" | "budgetUsd" | "costUsd">
   if (!w || w.resumeAt != null) {
     return "It continues the same session once your plan's window resets. Nothing you approved is skipped.";
   }
-  if (run.budgetUsd != null && run.costUsd >= run.budgetUsd) {
+  // The drive's budget gate: a budget of 0 is no budget.
+  if (run.budgetUsd != null && run.budgetUsd > 0 && run.costUsd >= run.budgetUsd) {
     return "The run's budget is spent, so it doesn't resume on its own. Resume it when you're ready.";
   }
   if (w.resumeCount >= AUTO_RESUME_CAP) {

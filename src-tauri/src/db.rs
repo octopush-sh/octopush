@@ -5235,24 +5235,29 @@ impl Db {
     /// Claim the automatic resume of a plan-parked run whose time has come:
     /// a compare-and-set, so the app's tick and a waiting detached worker can
     /// race and exactly one of them resumes. Counts the resume.
-    pub fn claim_plan_resume(&self, run_id: &str, now: i64) -> AppResult<bool> {
+    ///
+    /// The claim does NOT clear the resume time: it moves it to `retry_at`.
+    /// Applying the Resume ends the park (`clear_run_plan_wait`); until then
+    /// the park stays due again at `retry_at`, so a claimant that fails or
+    /// dies between the claim and the apply can never lose the resume.
+    pub fn claim_plan_resume(&self, run_id: &str, now: i64, retry_at: i64) -> AppResult<bool> {
         let n = self.conn.execute(
-            "UPDATE runs SET plan_resume_at = NULL, plan_resume_count = plan_resume_count + 1
+            "UPDATE runs SET plan_resume_at = ?3, plan_resume_count = plan_resume_count + 1
              WHERE id = ?1 AND status = 'paused' AND plan_resume_at IS NOT NULL AND plan_resume_at <= ?2",
-            params![run_id, now],
+            params![run_id, now, retry_at],
         )?;
         Ok(n > 0)
     }
 
     /// Undo a claim whose Resume couldn't be applied: the run is parked by its
-    /// plan again, its automatic resume due at `resume_at`, and the claim no
-    /// longer counts against the cap.
+    /// plan again, its automatic resume due at `resume_at` (`None` = it now
+    /// waits for the director), and the claim no longer counts against the cap.
     pub fn restore_plan_resume(
         &self,
         run_id: &str,
         window: &str,
         resets_at: i64,
-        resume_at: i64,
+        resume_at: Option<i64>,
     ) -> AppResult<()> {
         self.conn.execute(
             "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,

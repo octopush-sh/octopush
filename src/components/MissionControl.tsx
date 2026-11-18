@@ -11,7 +11,7 @@
 // acceptance is journaled); any other answer still opens the full form.
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
-import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, X } from "lucide-react";
+import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moon, Play, Plus, Square, Terminal, TimerOff, Hourglass, X } from "lucide-react";
 import type { DiffSize, Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
@@ -476,9 +476,16 @@ function CrewCard({
   const runningStage = stages.find((s) => s.status === "running");
   const planWaiting = isPlanWaiting(run);
 
-  const glyph =
+  // A plan wait reuses the plan-limit bar's lucide `Hourglass` (with a
+  // tooltip), not a bespoke glyph.
+  const glyph: { label: React.ReactNode; cls: string; word: string; title?: string } =
     planWaiting
-      ? { label: "○", cls: "text-octo-sage", word: "waiting" }
+      ? {
+          label: <Hourglass size={10} strokeWidth={1.75} aria-hidden />,
+          cls: "inline-flex items-center text-octo-sage",
+          word: "waiting",
+          title: "Waiting for your Claude plan's window to reset",
+        }
       : band === "needs-you" && stalled
       ? { label: "⟳", cls: "text-octo-warning", word: "stalled" }
       : band === "needs-you" && failedStage
@@ -540,7 +547,7 @@ function CrewCard({
       {/* Row 1 — status glyph · word · workspace · time-in-state. The status
           word never truncates; the workspace name gives way first. */}
       <span className="flex h-4 items-center gap-1.5 font-mono text-[10px]">
-        <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`}>{glyph.label}</span>
+        <span key={glyph.word} className={`octo-pop-in ${glyph.cls}`} title={glyph.title}>{glyph.label}</span>
         <span className="shrink-0 uppercase tracking-[0.25em] text-octo-mute">{glyph.word}</span>
         {wsName && (
           <>

@@ -1426,6 +1426,9 @@ export const ipc = {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
+    /** The stage the director decided on. A run can hold several (a plan
+     *  limit beside a gate): without it the backend picks the first. */
+    stageId?: string,
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
@@ -1433,6 +1436,7 @@ export const ipc = {
       feedback: feedback ?? null,
       modelOverride: modelOverride ?? null,
       maxTurnsOverride: maxTurnsOverride ?? null,
+      stageId: stageId ?? null,
     }),
 
   /** Answer a stage that parked itself via the `ask_director` escape valve.
