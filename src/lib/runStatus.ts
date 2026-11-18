@@ -77,6 +77,24 @@ export function fleetCounts(runs: Pick<Run, "status" | "planWait">[]): { needsYo
   return { needsYou: needs, inFlight };
 }
 
+/** The Settled band split the fleet chip shows (#845): runs that completed
+ *  (`done`) versus runs that ended any other way (`ended` — aborted or
+ *  failed). An aborted run is never "done". Front-end only: the Dock badge
+ *  counts needs-you alone, so there is no Rust twin to keep in parity. */
+export function settledCounts(
+  runs: Pick<Run, "id" | "status">[],
+  settledAt: Record<string, number>,
+): { done: number; ended: number } {
+  let done = 0;
+  let ended = 0;
+  for (const r of runs) {
+    if (!(r.id in settledAt)) continue;
+    if (r.status === "completed") done += 1;
+    else if (r.status === "aborted" || r.status === "failed") ended += 1;
+  }
+  return { done, ended };
+}
+
 /** Whether a halted stage's error is a *transient* substrate fault (rate
  *  limit, overload, 5xx, dropped connection) — recoverable by simply waiting
  *  and resuming — versus a standing fault the work itself caused.

@@ -59,4 +59,11 @@ describe("StageOctoStatus", () => {
     rerender(<StageOctoStatus stage={stage("done")} entries={[]} />);
     expect(container.querySelector(".octo-mascot--pushed-beat")).not.toBeNull();
   });
+
+  it("stays hidden on an aborted run's frozen checkpoint stage (#844)", () => {
+    const { container } = render(
+      <StageOctoStatus stage={stage("awaiting_checkpoint")} entries={[]} runAborted />,
+    );
+    expect(container.textContent ?? "").not.toMatch(/Waiting for you/);
+  });
 });

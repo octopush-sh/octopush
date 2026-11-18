@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { fleetCounts, isTransientHalt, needsYou } from "./runStatus";
+import { fleetCounts, isTransientHalt, needsYou, settledCounts } from "./runStatus";
 import type { RunStatus } from "./ipc";
 import { isPlanWaiting } from "./planWait";
 import fixtures from "./needsYou.fixtures.json";
@@ -128,5 +128,17 @@ describe("isTransientHalt", () => {
     for (const e of notTransient) {
       expect(isTransientHalt(e), e).toBe(false);
     }
+  });
+});
+
+describe("settledCounts", () => {
+  it("counts only completed settled runs as done; aborted and failed are ended (#845)", () => {
+    const runs = [
+      { id: "a", status: "completed" as RunStatus },
+      { id: "b", status: "aborted" as RunStatus },
+      { id: "c", status: "failed" as RunStatus },
+      { id: "d", status: "completed" as RunStatus }, // not settled this session
+    ];
+    expect(settledCounts(runs, { a: 1, b: 2, c: 3 })).toEqual({ done: 1, ended: 2 });
   });
 });

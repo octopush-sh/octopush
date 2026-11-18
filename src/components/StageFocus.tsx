@@ -3,7 +3,7 @@ import { ChevronLeft, ChevronRight, SlidersHorizontal, RotateCcw } from "lucide-
 import type { LiveEntry, Run, RunStage, RunStagePatch, StageIteration } from "../lib/ipc";
 import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
-import { isTransientHalt } from "../lib/runStatus";
+import { isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { formatUsd } from "../lib/cost";
@@ -275,7 +275,13 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // "Waiting for you" never drops below the diff. Held while the stage is
   // inactive so its exit (✓ beat, fade) plays where it was instead of
   // remounting, hidden, in the other slot.
-  const playerLive = stage?.status === "running" || stage?.status === "awaiting_checkpoint";
+  // An aborted run freezes the stage it was on at running / awaiting_checkpoint
+  // (the abort never rewrites the stage row) — the pane shows the abort, not
+  // the gate's "Waiting for you" (#844).
+  const runAborted = run?.status === "aborted";
+  const stageCutByAbort =
+    runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
+  const playerLive = !runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
   const playerWantsTail = stage?.status === "running" && !artifact;
   const [playerAtTail, setPlayerAtTail] = useState(playerWantsTail);
   if (playerLive && playerAtTail !== playerWantsTail) setPlayerAtTail(playerWantsTail);
@@ -423,9 +429,18 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       {/* The Player outside the live journal (spec 2026-07-19 §4, extended to
           DIRECT): right under the header, outside the scroller, so the gate's
           "Waiting for you" stays in view however long the diff is. */}
+      {viewedRow == null && stageCutByAbort && (
+        <div
+          data-testid="stage-aborted"
+          className="octo-fade-in flex items-center gap-2 px-4 pt-2.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute"
+        >
+          <span aria-hidden>{runStatusMeta("aborted").glyph}</span>
+          <span>aborted · the run ended at this stage</span>
+        </div>
+      )}
       {viewedRow == null && !playerAtTail && (
         <div className="px-4 pt-2.5 empty:hidden">
-          <StageOctoStatus stage={stage} entries={liveEntries} />
+          <StageOctoStatus stage={stage} entries={liveEntries} runAborted={runAborted} />
         </div>
       )}
       <div
@@ -523,7 +538,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
         </FadeSwap>
         {/* The Player while the live journal runs: docked inline at its tail
             so it follows the newest line. Hidden while viewing an archived attempt. */}
-        {viewedRow == null && playerAtTail && <StageOctoStatus stage={stage} entries={liveEntries} />}
+        {viewedRow == null && playerAtTail && (
+          <StageOctoStatus stage={stage} entries={liveEntries} runAborted={runAborted} />
+        )}
       </div>
     </div>
     {editOpen && (

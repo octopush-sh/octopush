@@ -51,6 +51,20 @@ describe("RunControlBar", () => {
     expect(screen.queryByRole("button")).not.toBeInTheDocument();
   });
 
+  it("checkpoint: Abort asks first — Keep the run cancels, Abort the run ends it (#849)", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    expect(screen.getByText("End this run here?")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Keep the run" }));
+    expect(h.onAbort).not.toHaveBeenCalled();
+    expect(screen.queryByText("End this run here?")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Abort" }));
+    fireEvent.click(screen.getByRole("button", { name: "Abort the run" }));
+    expect(h.onAbort).toHaveBeenCalledTimes(1);
+  });
+
   it("terminal: offers Run it again", () => {
     const h = handlers();
     render(<RunControlBar run={run("completed")} blockedStage={null} loopTargetRole={null} loopState={null} {...h} />);

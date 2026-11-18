@@ -33,8 +33,22 @@ describe("RunsTray", () => {
     expect(container.firstChild).toBeNull(); // still loading: nothing to show
     await useRunsStore.getState().loadSettledWhileAway();
     rerender(<RunsTray onOpen={() => {}} />);
-    expect(screen.getByRole("button", { name: "1 run settled — open Mission Control" }).textContent).toBe(
+    expect(screen.getByRole("button", { name: "1 run done — open Mission Control" }).textContent).toBe(
       "1 done",
     );
+  });
+
+  it("never counts an aborted run as done (#845)", () => {
+    const aborted: Run = { ...OVERNIGHT, id: "r10", task: "stopped", status: "aborted" };
+    useRunsStore.setState({ runsByWs: { w9: [OVERNIGHT, aborted] }, settledAt: { r9: 1, r10: 2 } });
+    const { rerender } = render(<RunsTray onOpen={() => {}} />);
+    expect(screen.getByRole("button", { name: "1 run done, 1 ended — open Mission Control" }).textContent).toBe(
+      "1 done",
+    );
+    useRunsStore.setState({ runsByWs: { w9: [aborted] }, settledAt: { r10: 2 } });
+    rerender(<RunsTray onOpen={() => {}} />);
+    expect(
+      screen.getByRole("button", { name: "1 run ended without completing — open Mission Control" }).textContent,
+    ).toBe("1 ended");
   });
 });

@@ -76,6 +76,28 @@ function IconCtl({
   );
 }
 
+/** Abort is irreversible (#849): every Abort on the bar asks first. Returns
+ *  the guarded trigger and the confirm dialog (ModalShell, Escape cancels) to
+ *  render beside it. The run ends; the worktree keeps whatever the stages
+ *  already wrote. */
+function useAbortConfirm(onAbort: () => void): [() => void, React.ReactNode] {
+  const [open, setOpen] = useState(false);
+  const dialog = open ? (
+    <ModalShell onClose={() => setOpen(false)} closeOnBackdrop={false} ariaLabel="Confirm abort"
+      panelClassName="w-[420px] rounded-lg border border-octo-hairline bg-octo-panel p-6">
+      <p className="font-serif text-[17px] text-octo-ivory">End this run here?</p>
+      <p className="mt-2 text-sm text-octo-sage">Aborting stops the run for good: it can&apos;t be resumed, only started again. The worktree keeps what the stages already wrote.</p>
+      <div className="mt-4 flex justify-end gap-2">
+        <button type="button" autoFocus onClick={() => setOpen(false)}
+          className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-ivory">Keep the run</button>
+        <button type="button" onClick={() => { setOpen(false); onAbort(); }}
+          className="rounded-md border border-octo-rouge px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]">Abort the run</button>
+      </div>
+    </ModalShell>
+  ) : null;
+  return [() => setOpen(true), dialog];
+}
+
 /**
  * The single, state-adaptive command surface for a run. It subsumes the old
  * RunTrack controls and the CheckpointBar: while running it offers pause / stop
@@ -275,6 +297,7 @@ function PlanWaitBar({
   onAbort: () => void;
 }) {
   const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
+  const [requestAbort, abortDialog] = useAbortConfirm(onAbort);
   const scheduled = run.planWait?.resumeAt != null;
   const why = planWaitWhy(run);
   return (
@@ -306,11 +329,12 @@ function PlanWaitBar({
             Don&apos;t resume automatically
           </button>
         )}
-        <button type="button" onClick={onAbort}
+        <button type="button" onClick={requestAbort}
           className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
           Abort
         </button>
       </div>
+      {abortDialog}
     </div>
   );
 }
@@ -331,6 +355,7 @@ function DecisionBar({
   const [feedback, setFeedback] = useState("");
   const [showWhy, setShowWhy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [requestAbort, abortDialog] = useAbortConfirm(onAbort);
   const defaultTurns = Math.min(100, Math.max(5, Math.round((blockedStage.maxIterations * 2) / 5) * 5));
   const [turns, setTurns] = useState(() => defaultTurns);
 
@@ -425,7 +450,7 @@ function DecisionBar({
                     Resume
                   </button>
                 )}
-                <button type="button" onClick={onAbort}
+                <button type="button" onClick={requestAbort}
                   className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
                   Abort
                 </button>
@@ -541,7 +566,7 @@ function DecisionBar({
                 className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                 {failed ? "Re-run" : "Reject"}
               </button>
-              <button type="button" onClick={onAbort}
+              <button type="button" onClick={requestAbort}
                 className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
                 Abort
               </button>
@@ -570,6 +595,7 @@ function DecisionBar({
           </div>
         )}
       </FadeSwap>
+      {abortDialog}
     </div>
   );
 }
