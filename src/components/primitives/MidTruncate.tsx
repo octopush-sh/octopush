@@ -37,12 +37,16 @@ export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
   const headRef = useRef<HTMLSpanElement>(null);
   const shown = flatten(text);
   const split = shown.length > tail + 4;
+  // Whether there is a lead, not which element: callers pass it inline
+  // (`lead={<GitBranch/>}`), a new element every render, and re-tracking on
+  // each one would re-cut the row for nothing (#833).
+  const hasLead = lead != null;
   useLayoutEffect(() => {
     const box = boxRef.current;
     const head = headRef.current;
     if (!split || !box || !head) return;
     return track(box, head);
-  }, [split, shown, tail, lead, className]);
+  }, [split, shown, tail, hasLead, className]);
 
   const leadEl =
     lead != null ? (
@@ -79,11 +83,14 @@ export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
   );
 }
 
-/** One line, always: a line break or a tab in an identifier renders as a
- *  space (the box is `white-space: nowrap`, which would otherwise collapse a
- *  break into nothing visible at all, or wrap it under `pre`). */
+/** One line, always: a line break, a tab, a form feed or a vertical tab in an
+ *  identifier renders as a space, and so do the Unicode line and paragraph
+ *  separators (U+2028, U+2029) — the box is `white-space: nowrap`, which would
+ *  otherwise collapse a break into nothing visible at all, or wrap it under
+ *  `pre`. */
 export function flatten(text: string): string {
-  return text.replace(/\r\n|[\r\n\t]/g, " ");
+  // `\p{Zl}` and `\p{Zp}` are exactly U+2028 and U+2029.
+  return text.replace(/\r\n|[\r\n\t\f\v\p{Zl}\p{Zp}]/gu, " ");
 }
 
 /** Splits at `at`. Under `nowrap` a space at the very end of the head is a
@@ -244,8 +251,14 @@ function ellOf(box: HTMLElement): HTMLElement | null {
 /** Float noise in range maths, not a rounding allowance: the cut must fit. */
 const EPS = 0.01;
 
+/** `data-measuring` holds the head at `text-overflow: clip` until `applyCut`:
+ *  WebKit clips a Range's rects at its own ellipsis point, so measuring under
+ *  `ellipsis` would cap every `widthTo` at the engine's cut and bypass the
+ *  grapheme search and `trimTrailingSpace` (#833). Set and cleared in the
+ *  same frame, so the clipped head is never painted. */
 function reset(box: HTMLElement, head: HTMLElement) {
   box.removeAttribute("data-elided");
+  box.setAttribute("data-measuring", "");
   head.style.maxWidth = "";
 }
 
@@ -288,6 +301,7 @@ function ellipsisWidth(ell: HTMLElement | null, range: Range): number {
 }
 
 function applyCut(box: HTMLElement, head: HTMLElement, px: number | null) {
+  box.removeAttribute("data-measuring");
   if (px === null) return;
   box.setAttribute("data-elided", "");
   head.style.maxWidth = `${px}px`;
