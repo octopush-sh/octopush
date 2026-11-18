@@ -18195,6 +18195,9 @@ mod commit_message_shell_tests {
     fn a_hostile_message_amends_verbatim_under_every_shell() {
         for shell in available_shells() {
             let dir = repo();
+            // The fixture's commit is empty; stage a change so the amend isn't.
+            std::fs::write(dir.path().join("f.txt"), &shell).unwrap();
+            git(dir.path(), &["add", "f.txt"]);
             let ws = dir.path().to_string_lossy().to_string();
             let msg = format!("{HOSTILE}\n\nbody $(id) `id` \"q\" #");
             commit_in_login_shell(&shell, &ws, &msg, true).unwrap_or_else(|e| panic!("{shell}: {e}"));
