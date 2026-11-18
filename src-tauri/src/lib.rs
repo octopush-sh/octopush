@@ -289,6 +289,7 @@ pub fn run() {
             commands::resolve_checkpoint,
             commands::answer_blocker,
             commands::abort_run,
+            commands::cancel_plan_resume,
             commands::stop_stage,
             commands::request_run_pause,
             commands::update_run_stage,

@@ -26,6 +26,13 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
       ? { title: line, preferRerun: true }
       : { title: line.slice(0, cut), remedy: line.slice(cut + 2), preferRerun: true };
   }
+  if (raw.includes("(plan_limit)")) {
+    return {
+      title: "Paused by your Claude plan",
+      remedy:
+        "The stage keeps its spend and its session. Resuming continues the same session once the plan's window resets; nothing you approved is skipped.",
+    };
+  }
   if (raw.includes("error_max_turns")) {
     return {
       title: `Claude stopped early — it reached the ${maxIterations}-turn limit`,

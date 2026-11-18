@@ -2679,6 +2679,7 @@ pub async fn resolve_checkpoint(
     feedback: Option<String>,
     model_override: Option<String>,
     max_turns_override: Option<i64>,
+    stage_id: Option<String>,
 ) -> AppResult<()> {
     let action = match action.as_str() {
         "approve" => CheckpointAction::Approve,
@@ -2690,20 +2691,31 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
-    dispatch_checkpoint(&orch, run_id, None, action)
+    // `stage_id` names the stage the director decided on (the Direct canvas
+    // passes the one its decision bar shows), so a run holding several
+    // stages never resolves a different one. A named stage that was already
+    // decided is refused ("This stage was already decided — refresh…"), never
+    // redirected to another; `None` = the single-parked rule.
+    dispatch_checkpoint(&orch, run_id, stage_id, action)
 }
 
 /// Resolve a checkpoint decision and resume the drive, choosing the detached
 /// (Pro) or in-process path. Shared by `resolve_checkpoint` and
 /// `answer_blocker` so the escape valve reuses the exact resume substrate.
 /// `stage_id` scopes which parked/failed stage the action targets — the escape
-/// valve passes its validated id; the plain checkpoint path passes `None`.
+/// valve passes its validated id, the checkpoint path the stage its caller
+/// named (or `None`).
 fn dispatch_checkpoint(
     orch: &Arc<Orchestrator>,
     run_id: String,
     stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
+    // A decision on a stage that was decided elsewhere meanwhile is refused
+    // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
+    // The director acted: a fresh allowance of automatic plan resumes.
+    orch.db().lock().reset_plan_resume_count(&run_id)?;
     // Pro (`runs.detached`): apply the decision's mutations here — they're
     // synchronous and cheap — then hand the re-drive to a detached worker.
     // Guard rejections ("run is already executing") surface immediately
@@ -2758,6 +2770,14 @@ pub async fn answer_blocker(
     // Thread the validated `stage_id` through so the resolution acts on exactly
     // the stage we just checked, not merely "the parked stage".
     dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers, source })
+}
+
+/// Turn off the automatic resume of a run parked by a Claude plan limit: it
+/// stays parked and waits for a manual Resume (#731). "Resume now" is the
+/// ordinary `resolve_checkpoint("resume")`.
+#[tauri::command]
+pub async fn cancel_plan_resume(orch: State<'_, Arc<Orchestrator>>, run_id: String) -> AppResult<()> {
+    orch.cancel_plan_resume(&run_id)
 }
 
 #[tauri::command]

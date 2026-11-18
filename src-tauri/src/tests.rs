@@ -440,7 +440,7 @@ mod workspace_tests {
         db.set_run_status(&b, "paused", false).unwrap();
         let badge = |db: &Db| {
             let runs = db.list_active_runs().unwrap();
-            crate::fleet_status::derive(runs.iter().map(|r| r.status.as_str())).badge()
+            crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), crate::fleet_status::plan_waiting(r)))).badge()
         };
         assert_eq!(badge(&db), Some(2));
 
@@ -6357,7 +6357,7 @@ mod orchestrator_tests {
     async fn resolve_checkpoint_scoped_targets_the_passed_stage_id() {
         // Two stages parked at a gate at once (constructed by hand). `.find`
         // alone resolves the FIRST; the caller's validated `stage_id` must
-        // select the intended one, and a stale/absent id falls back to `.find`.
+        // select the intended one, and a stale id is refused (no fallback).
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -6382,10 +6382,18 @@ mod orchestrator_tests {
         assert_eq!(stages[1].status, "done", "the passed stage_id was the one resolved");
         assert_eq!(stages[0].status, "awaiting_checkpoint", "the unselected stage is untouched");
 
-        // A stale/absent id falls back to `.find` (the remaining parked stage 0).
-        orch.resolve_checkpoint_apply_only(&run_id, Some("nonexistent"), CheckpointAction::Approve).unwrap();
+        // A stale id (stage 1 was just decided) or an unknown one is refused,
+        // never redirected to the remaining parked stage 0.
+        for stale in [ids[1].as_str(), "nonexistent"] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(stale), CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
         let stages = db.lock().list_run_stages(&run_id).unwrap();
-        assert_eq!(stages[0].status, "done", "a stale id falls back to the single parked stage");
+        assert_eq!(stages[0].status, "awaiting_checkpoint", "the other gate stays waiting");
+        // No id keeps the single-parked rule.
+        orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
     #[test]
@@ -7464,6 +7472,104 @@ mod orchestrator_tests {
         // must have prevented it.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists(), "the backgrounded child must be killed with the group");
+    }
+
+    /// #731: a crew on Claude Code whose plan is at its wall skips the window
+    /// honestly — no worktree, no setup, no run, no tokens — and says until when.
+    #[tokio::test]
+    async fn routine_skips_while_the_claude_plan_is_rejected() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let cli = db.lock().insert_pipeline("RCli", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&cli, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let resets = chrono::Utc::now().timestamp() + 3_600;
+        let wall = PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some("rejected".into()), overage_status: Some("rejected".into()), using_overage: false,
+        };
+        crate::claude_plan::record(&db.lock(), &[wall], &chrono::Utc::now().to_rfc3339()).unwrap();
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-plan", &routine_input(&cli, "interval", "3600"), Some(past), true).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = Arc::clone(&orch).run_routine_now("r-plan").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { resets_at: resets }));
+        assert_eq!(SkipReason::PlanLimit { resets_at: resets }.token(), "plan_limit");
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "no run while the plan is rejected");
+        assert!(
+            !sink.events.lock().iter().any(|e| e == crate::routines::ROUTINE_PHASE_EVENT),
+            "skipped before any condition, workspace or setup phase",
+        );
+        let r = db.lock().get_routine("r-plan").unwrap().unwrap();
+        assert!(r.last_outcome.as_deref().unwrap_or_default().starts_with("plan limit · resets "), "{:?}", r.last_outcome);
+
+        // An API-only crew isn't stopped by a Claude plan.
+        let api = db.lock().insert_pipeline("RApi", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&api, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_routine("r-api", &routine_input(&api, "interval", "3600"), Some(past), true).unwrap();
+        let outcome = orch.run_routine_now("r-api").await.unwrap();
+        assert!(!matches!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { .. })), "{outcome:?}");
+    }
+
+    #[test]
+    fn plan_wall_needs_a_claude_code_stage_and_a_future_uncovered_rejection() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::plan_wall;
+        let now = 1_793_540_000;
+        let w = |status: &str, resets: i64, overage: bool| PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some(status.into()), overage_status: None, using_overage: overage,
+        };
+        let claude = vec![("cli".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, false)], now), Some(now + 60));
+        assert_eq!(plan_wall(&claude, &[w("rejected", now - 60, false)], now), None, "already reset");
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, true)], now), None, "extra usage covers it");
+        assert_eq!(plan_wall(&claude, &[w("allowed_warning", now + 60, false)], now), None);
+        let latest = [w("rejected", now + 60, false), w("rejected", now + 600, false)];
+        assert_eq!(plan_wall(&claude, &latest, now), Some(now + 600), "waits for the last wall");
+        let codex = vec![("cli".to_string(), "gpt-5.5-codex".to_string())];
+        assert_eq!(plan_wall(&codex, &[w("rejected", now + 60, false)], now), None, "Codex isn't on a Claude plan");
+        let api = vec![("api".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&api, &[w("rejected", now + 60, false)], now), None, "API stages aren't on the plan");
+    }
+
+    #[test]
+    fn plan_wall_is_model_aware_and_ignores_a_stale_snapshot() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{fresh_plan_windows, plan_wall, PLAN_WALL_MAX_AGE_SECS};
+        let now = 1_793_540_000;
+        let w = |kind: &str| PlanWindow {
+            kind: kind.into(), utilization: None, resets_at: Some(now + 3_600),
+            status: Some("rejected".into()), overage_status: None, using_overage: false,
+        };
+        let crew = |model: &str| vec![("cli".to_string(), model.to_string())];
+        // A rejected Opus week doesn't skip a Sonnet crew…
+        assert_eq!(plan_wall(&crew("claude-sonnet-5"), &[w("seven_day_opus")], now), None);
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day_opus")], now), None);
+        // …but does skip an Opus one (and `opusplan`, which plans on Opus).
+        assert_eq!(plan_wall(&crew("claude-opus-5-5"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("opusplan"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        // A mixed crew meets it through its Opus stage.
+        let mixed = vec![("cli".to_string(), "sonnet".to_string()), ("cli".to_string(), "opus".to_string())];
+        assert_eq!(plan_wall(&mixed, &[w("seven_day_opus")], now), Some(now + 3_600));
+        // The shared windows apply to every model.
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("five_hour")], now), Some(now + 3_600));
+
+        let at = |secs_ago: i64| chrono::DateTime::from_timestamp(now - secs_ago, 0).unwrap().to_rfc3339();
+        let snaps = vec![
+            crate::claude_plan::PlanSnapshot { window: w("five_hour"), seen_at: at(60) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day"), seen_at: at(PLAN_WALL_MAX_AGE_SECS + 1) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day_opus"), seen_at: "not a time".into() },
+        ];
+        let fresh = fresh_plan_windows(&snaps, now);
+        assert_eq!(fresh.iter().map(|w| w.kind.as_str()).collect::<Vec<_>>(), ["five_hour"], "stale and unreadable dropped");
     }
 
     /// A condition that exits 1 skips the window with NO run created (zero
@@ -20584,6 +20690,742 @@ mod secret_guard_orchestrator_tests {
     }
 }
 
+
+#[cfg(test)]
+mod plan_wait_tests {
+    //! #731: a Claude plan limit parks the run and resumes it at the reset.
+    use crate::db::Db;
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit, PlanLimitWatch};
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::plan_wait::{PlanClaim, AUTO_RESUME_CAP, RESUME_JITTER_SECS, RESUME_MARGIN_SECS, RETRY_SECS};
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Records every `run://checkpoint` reason.
+    #[derive(Default)]
+    struct ReasonSink {
+        reasons: Mutex<Vec<String>>,
+    }
+    impl EventSink for ReasonSink {
+        fn emit(&self, event: &str, payload: Value) {
+            if event == "run://checkpoint" {
+                self.reasons.lock().push(payload["reason"].as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
+
+    /// Hits the plan wall on its first `walls` runs (as the CLI runner
+    /// reports it), then finishes. Records every built `StageSpec`.
+    struct PlanWallRunner {
+        walls: Mutex<u32>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for PlanWallRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let wall = {
+                let mut w = self.walls.lock();
+                let hit = *w > 0;
+                if hit {
+                    *w -= 1;
+                }
+                hit
+            };
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: "did it".into(), payload: None, refs_worktree: false },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.02,
+                status: if wall { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: wall.then(|| "You've hit your 5-hour limit · resets 7:40pm (UTC)".to_string()),
+                verdict: None,
+                session_id: Some("sess-p".into()),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !wall {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn seed(path: &Path) -> (Arc<Mutex<Db>>, String) {
+        let db = Db::open(path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        let pid = db.insert_pipeline("Plan", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run_id)
+    }
+
+    fn orch(db: &Arc<Mutex<Db>>, walls: u32, resets_at: i64) -> (Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = PlanWallRunner { walls: Mutex::new(walls), resets_at, seen: Arc::clone(&seen) };
+        (Orchestrator::new_with_runner(Arc::clone(db), sink, Box::new(runner)), reasons, seen)
+    }
+
+    /// Make the scheduled resume due now (the clock is not injectable here;
+    /// the schedule's arithmetic is unit-tested in `plan_wait`).
+    fn make_due(db: &Arc<Mutex<Db>>, run_id: &str) {
+        db.lock().conn_ref().execute(
+            "UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1 AND plan_resume_at IS NOT NULL",
+            rusqlite::params![run_id, chrono::Utc::now().timestamp() - 1],
+        ).unwrap();
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    #[tokio::test]
+    async fn a_plan_limit_parks_the_run_keeping_spend_and_session_and_schedules_the_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let resets = now() + 3_600;
+        let (orch, reasons, _) = orch(&db, 1, resets);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed");
+        assert!(is_plan_limit(stage.error.as_deref().unwrap()), "{:?}", stage.error);
+        assert!(stage.error.as_deref().unwrap().starts_with("Paused by your Claude plan"));
+        assert_eq!(stage.session_id.as_deref(), Some("sess-p"), "the session is kept for the Resume");
+        assert_eq!(stage.cost_usd, 0.02, "the spend is kept");
+        assert!(!stage.escalated, "a plan wall never escalates");
+
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("parked by the plan");
+        assert_eq!(wait.window, "five_hour");
+        assert_eq!(wait.resets_at, resets);
+        let at = wait.resume_at.expect("an automatic resume is scheduled");
+        assert!((resets + RESUME_MARGIN_SECS..=resets + RESUME_MARGIN_SECS + RESUME_JITTER_SECS).contains(&at), "{at}");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("plan_limit"), "nobody needs to decide");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("Paused by your Claude plan · resumes at")), "{log:?}");
+        // Not due yet: nothing claims it.
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        assert!(db.lock().list_due_plan_resumes(now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_schedule_survives_a_restart_and_resumes_the_same_session_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let run_id = {
+            let (db, run_id) = seed(&path);
+            let (orch, _, _) = orch(&db, 1, now() + 600);
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            run_id
+        }; // the app quits: orchestrator and DB handle are gone
+
+        let db = Arc::new(Mutex::new(Db::open(&path).unwrap())); // relaunch (migrations re-run)
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+        make_due(&db, &run_id);
+        assert_eq!(db.lock().list_due_plan_resumes(now()).unwrap(), vec![run_id.clone()]);
+
+        let (orch, _, seen) = orch(&db, 0, now());
+        let over = orch.claim_plan_resume(&run_id).unwrap();
+        assert_eq!(over, PlanClaim::Resumed { budget_override: false }, "claimed and applied");
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "a second claimant gets nothing");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        assert_eq!(seen.lock()[0].resume_session.as_deref(), Some("sess-p"), "--resume of the same session");
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "a finished stage resets the allowance");
+    }
+
+    #[tokio::test]
+    async fn automatic_resumes_are_capped_then_the_run_waits_for_the_director() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 10, now() + 60);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        for i in 1..=AUTO_RESUME_CAP {
+            make_due(&db, &run_id);
+            let over = orch.claim_plan_resume(&run_id).unwrap();
+            assert!(matches!(over, PlanClaim::Resumed { .. }), "automatic resume {i}");
+            assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused, "hit the wall again");
+        }
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "after {AUTO_RESUME_CAP} automatic resumes it waits for the director");
+        assert_eq!(wait.resume_count, AUTO_RESUME_CAP);
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"), "now it needs you");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("automatic resumes already ran")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_resume_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        // "Resume now" is the ordinary Resume.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(seen.lock()[1].resume_session.as_deref(), Some("sess-p"));
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none(), "the park ended");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty(), "no stale resume left behind");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_turn_the_automatic_resume_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.cancel_plan_resume(&run_id).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "waits for a manual Resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("director"), "their own hand: silent");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "nothing resumes on its own");
+        assert_eq!(seen.lock().len(), 1);
+        // Today's manual Resume still works.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_budget_is_spent_never_resumes_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap();
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "$0.02 spent of $0.01: no automatic resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    #[tokio::test]
+    async fn a_budget_spent_while_waiting_is_checked_again_at_the_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap(); // lowered meanwhile
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou, "the worker must announce it");
+        assert_eq!(seen.lock().len(), 1, "never resumed");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed", "still parked for the director");
+    }
+
+    /// What a [`RoleRunner`] does on one run of a role.
+    #[derive(Clone, Copy)]
+    enum Act {
+        Wall,
+        Halt,
+        Done,
+    }
+
+    /// Plays a script per role (then finishes), so sibling branches can hit
+    /// the plan wall, halt for real or finish. Records every built spec.
+    struct RoleRunner {
+        script: Mutex<std::collections::HashMap<String, std::collections::VecDeque<Act>>>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for RoleRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let act = self.script.lock().get_mut(&stage.role).and_then(|q| q.pop_front()).unwrap_or(Act::Done);
+            let failed = !matches!(act, Act::Done);
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status: if failed { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: match act {
+                    Act::Wall => Some("You've hit your 5-hour limit".into()),
+                    Act::Halt => Some("the build broke".into()),
+                    Act::Done => None,
+                },
+                verdict: None,
+                session_id: Some(format!("sess-{}", stage.role)),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !matches!(act, Act::Wall) {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn draft(role: &str, parents: Vec<i64>, checkpoint: bool) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            // The substrate is the runner's business here (it reports the
+            // plan wall itself); API read-only tools let branches share a batch.
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents,
+            tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+    fn parents_is_root(role: &str) -> bool {
+        role == "plan"
+    }
+
+    /// plan → two read-only branches (`a`, `b`) ready in one batch.
+    fn branches(path: &Path, b_gated: bool, script: &[(&str, Vec<Act>)]) -> (Arc<Mutex<Db>>, String, Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let (db, _) = seed(path);
+        let stages = vec![draft("plan", vec![], false), draft("critique", vec![0], false), draft("plan_review", vec![0], b_gated)];
+        let pid = db.lock().save_pipeline(None, "Branches", "d", &stages).unwrap();
+        let run_id = db.lock().create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(&db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = RoleRunner {
+            script: Mutex::new(script.iter().map(|(r, a)| (r.to_string(), a.iter().copied().collect())).collect()),
+            resets_at: now() + 600,
+            seen: Arc::clone(&seen),
+        };
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        (db, run_id, orch, reasons, seen)
+    }
+
+    fn statuses(db: &Arc<Mutex<Db>>, run_id: &str) -> Vec<String> {
+        db.lock().list_run_stages(run_id).unwrap().into_iter().map(|s| s.status).collect()
+    }
+
+    fn failed(error: &str) -> StageOutcome {
+        StageOutcome {
+            cli: Default::default(),
+            artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+            input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+            status: StageStatus::Failed, tool_calls: vec![], error: Some(error.into()),
+            verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+        }
+    }
+
+    fn rate_event(status: &str, kind: &str, resets_at: i64) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "resetsAt": resets_at, "rateLimitType": kind, "isUsingOverage": false}})
+    }
+
+    /// Detection: a failure is the plan's only when the rejection was the last
+    /// rate-limit event before the result, or the CLI wrote its limit notice.
+    #[test]
+    fn a_failure_after_a_later_allowed_request_is_not_a_plan_limit() {
+        let at = now() + 600;
+        // Rejected, then another window allowed a request: another cause.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("rejected", "five_hour", at));
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        let out = apply_plan_limit(failed("network error"), &w);
+        assert!(out.cli.plan_limit.is_none());
+        assert_eq!(out.error.as_deref(), Some("network error"));
+        // The same, but the CLI wrote its own limit notice: the plan.
+        w.observe(&json!({"type": "assistant", "error": "rate_limit", "message": {"content": []}}));
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_some());
+        // The rejection is the last rate-limit event: the plan.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        w.observe(&rate_event("rejected", "five_hour", at));
+        let out = apply_plan_limit(failed("x"), &w);
+        assert_eq!(out.cli.plan_limit.as_ref().map(|l| l.resets_at), Some(at));
+        assert!(is_plan_limit(out.error.as_deref().unwrap()));
+    }
+
+    /// Detection only reads the stage's own top-level messages: a
+    /// sub-agent's rejection or limit notice is not the stage's stop.
+    #[test]
+    fn a_sub_agents_rejection_is_not_the_stages_stop() {
+        let mut w = PlanLimitWatch::default();
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = json!("toolu_1");
+        w.observe(&ev);
+        w.observe(&json!({"type": "assistant", "parent_tool_use_id": "toolu_1", "error": "rate_limit", "message": {"content": []}}));
+        assert!(w.limit().is_none());
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_none());
+        // `parent_tool_use_id: null` is top-level.
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = Value::Null;
+        w.observe(&ev);
+        assert!(w.limit().is_some());
+    }
+
+    /// A: two branches hit the wall together; the automatic resume resumes
+    /// BOTH, each on its own session.
+    #[tokio::test]
+    async fn the_automatic_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, seen) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "failed"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(crate::fleet_status::plan_waiting(&run), "only plan limits wait: calm");
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "decision"), "{:?}", reasons.reasons.lock());
+
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+        assert_eq!(statuses(&db, &run_id), ["done", "pending", "pending"], "both plan-limited stages resumed");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        let runs_of = |role: &str| seen.lock().iter().filter(|s| s.role == role).count();
+        assert_eq!((runs_of("critique"), runs_of("plan_review")), (2, 2), "each ran again");
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// A, by hand: the director's Resume on one plan-limited stage resumes them all.
+    #[tokio::test]
+    async fn the_directors_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// C: a sibling's real halt next to a plan limit still needs you: not
+    /// calm, a `decision` checkpoint, and the badge counts it.
+    #[tokio::test]
+    async fn a_siblings_real_halt_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("parked by the plan");
+        assert!(wait.resume_at.is_some(), "the plan stage still resumes on its own");
+        assert!(wait.other_hold, "the halt is another hold");
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(crate::fleet_status::needs_you(&run.status, crate::fleet_status::plan_waiting(&run)));
+        let rs = reasons.reasons.lock().clone();
+        assert!(!rs.iter().any(|r| r == "plan_limit"), "nothing about this run is calm: {rs:?}");
+        assert!(rs.iter().any(|r| r == "decision"), "{rs:?}");
+    }
+
+    /// C: a sibling's gate next to a plan limit is a decision too.
+    #[tokio::test]
+    async fn a_siblings_gate_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.other_hold));
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "plan_limit"), "{:?}", reasons.reasons.lock());
+        // Approving the gate leaves the plan park and its schedule in place.
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        let _ = orch.resolve_checkpoint_scoped(&run_id, Some(&gate), CheckpointAction::Approve).await.unwrap();
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("still parked by the plan");
+        assert!(wait.resume_at.is_some(), "the automatic resume survives a sibling's decision");
+        assert!(!wait.other_hold);
+        assert!(crate::fleet_status::plan_waiting(&run), "now only the plan waits: calm");
+    }
+
+    /// B: a claim whose Resume can't be applied puts the park back (due
+    /// shortly, uncounted) instead of losing the resume.
+    #[tokio::test]
+    async fn a_resume_that_fails_to_apply_is_scheduled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true); // another driver holds the run
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        let at = wait.resume_at.expect("the resume is scheduled again");
+        assert!(at > now() && at <= now() + RETRY_SECS, "{at}");
+        assert_eq!(wait.resume_count, 0, "the failed claim doesn't count");
+        orch.set_active_for_test(&run_id, false);
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+    }
+
+    /// A re-run of the plan-limited stage ends the park: no stale resume is
+    /// left to claim a run that is no longer parked.
+    #[tokio::test]
+    async fn a_rerun_ends_a_stale_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        orch.prepare_rerun(&run_id, &stage, None).unwrap();
+        orch.release_active(&run_id);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none(), "nothing plan-limited is left");
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the director acted");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+
+    /// The worker waits for the plan itself only when the plan is all that
+    /// waits; a sibling's halt makes it announce instead.
+    #[tokio::test]
+    async fn the_worker_waits_only_when_the_plan_is_all_that_waits() {
+        use crate::orchestrator::plan_wait::{needs_director, worker_plan_wait};
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("a.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(worker_plan_wait(&run).is_some(), "only the plan waits: the worker waits");
+        assert!(!needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("b.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.resume_at.is_some()));
+        assert_eq!(worker_plan_wait(&run), None, "a sibling's halt needs you: announce, don't wait");
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+    }
+
+    /// A claim that finds the plan stages resolved while a sibling's gate
+    /// still waits is `NotClaimed`, and the run still needs the director.
+    #[tokio::test]
+    async fn not_claimed_with_a_gate_left_still_needs_you() {
+        use crate::orchestrator::plan_wait::needs_director;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let critique = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().conn_ref().execute(
+            "UPDATE run_stages SET status = 'done', error = NULL WHERE id = ?1", [&critique]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()), "the gate still waits: announce");
+    }
+
+    /// Approve with an explicit stage id resolves THAT stage, never the first
+    /// resolvable one (here the plan-limited stage sits before the gate).
+    #[tokio::test]
+    async fn approve_with_a_stage_id_resolves_that_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        assert!(orch.resolve_checkpoint_apply_only(&run_id, Some(&gate), CheckpointAction::Approve).unwrap().is_some());
+        let st = statuses(&db, &run_id);
+        assert_eq!(st[1], "failed", "the plan-limited stage is untouched");
+        assert_ne!(st[2], "awaiting_checkpoint", "the gate was approved");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+    }
+
+    /// A claim moves the resume forward instead of clearing it: a claimant
+    /// that dies before applying it never loses the park.
+    #[tokio::test]
+    async fn a_claim_that_is_never_applied_keeps_the_park_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert!(!db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap(), "exactly one claimant");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, Some(t + RETRY_SECS));
+        assert_eq!(db.lock().list_due_plan_resumes(t + RETRY_SECS).unwrap(), vec![run_id.clone()]);
+    }
+
+    /// Retries are capped: after MAX_PLAN_RETRIES failed applies the run waits
+    /// for the director (and the worker announces it).
+    #[tokio::test]
+    async fn retries_are_capped_then_it_needs_you() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(wait.resume_count, 0, "failed claims don't count");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// A decision naming a stage that is no longer waiting (decided
+    /// elsewhere) is refused, never redirected to the first resolvable
+    /// stage: the other gate and the plan stage stay as they were.
+    #[tokio::test]
+    async fn a_stale_stage_id_is_refused_and_nothing_else_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let stale = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone(); // already done
+        for action in [CheckpointAction::Approve, CheckpointAction::Resume { max_turns_override: None }] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&stale), action).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
+        let err = orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Approve).unwrap_err();
+        assert!(err.to_string().contains("already decided"), "{err}");
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"], "the other gate stays waiting");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+        // No id keeps the single-parked rule; Abort never needs a live stage.
+        assert!(orch.check_named_stage(&run_id, None, &CheckpointAction::Approve).is_ok());
+        assert!(orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Abort).is_ok());
+    }
+
+    /// The director turning the automatic resume off while a claim is in
+    /// flight wins: the apply doesn't resume, and putting the claim's park
+    /// back never brings the schedule back.
+    #[tokio::test]
+    async fn a_cancel_during_a_claim_is_never_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let before = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        let t = now();
+        let claimed_at = t + RETRY_SECS;
+        assert!(db.lock().claim_plan_resume(&run_id, t, claimed_at).unwrap());
+        orch.cancel_plan_resume(&run_id).unwrap(); // the director, mid-claim
+        assert_eq!(orch.apply_claimed_plan_resume(&run_id, claimed_at).unwrap(), PlanClaim::NotClaimed);
+        assert_eq!(statuses(&db, &run_id), ["failed"], "not resumed");
+        let restored = db
+            .lock()
+            .restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + RETRY_SECS), claimed_at)
+            .unwrap();
+        assert!(!restored, "the cancel stands");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "no automatic resume came back");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+        // The claim's own park is still put back when it is untouched.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1", rusqlite::params![run_id, claimed_at]).unwrap();
+        assert!(db.lock().restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + 5), claimed_at).unwrap());
+    }
+
+    /// A Resume applied only in part (the plan stage reset to pending, then
+    /// the apply failed) leaves a paused run nobody drives: the next claim
+    /// announces it instead of going quiet.
+    #[tokio::test]
+    async fn a_partial_apply_with_no_driver_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        let log = db.lock().list_stage_log(&stage).unwrap();
+        assert!(log.iter().any(|e| e.contains("the resume didn't finish")), "{log:?}");
+    }
+
+    /// The same partial apply with a driver on the run says nothing: that
+    /// driver runs the pending stage.
+    #[tokio::test]
+    async fn a_partial_apply_with_a_driver_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+    }
+
+    /// Two windows in one batch: the park keeps the one that resets LAST.
+    #[tokio::test]
+    async fn the_park_keeps_the_latest_reset() {
+        use crate::orchestrator::cli_runner::PlanLimit;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 0, now());
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let late = now() + 7_200;
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "seven_day".into(), resets_at: late }).unwrap();
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "five_hour".into(), resets_at: now() + 600 }).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.window.as_str(), wait.resets_at), ("seven_day", late));
+        assert!(wait.resume_at.unwrap() >= late + RESUME_MARGIN_SECS);
+    }
+
+    /// A budget of 0 is no budget (the drive gate's own rule): it resumes.
+    #[tokio::test]
+    async fn a_zero_budget_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.0)).unwrap();
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn aborting_ends_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.abort_run(&run_id).await.unwrap();
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+}
 
 #[cfg(test)]
 mod ran_model_tests {

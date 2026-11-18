@@ -143,7 +143,8 @@ export interface FireOutcomeView {
     | "condition_error"
     | "workspace_unavailable"
     | "launch_refused"
-    | "setup_failed";
+    | "setup_failed"
+    | "plan_limit";
 }
 
 /** The phase a routine fire is in (`routine://phase`, `routines::PHASE_*`). */
@@ -267,6 +268,24 @@ export interface Run {
   /** True when the run executes in a detached segment worker (Pro) — the
    *  crew keeps working even if the app quits. */
   detached: boolean;
+  /** Set while a Claude plan limit parks the run (#731). Mirrors the Rust
+   *  `PlanWait`; times are epoch seconds. */
+  planWait?: PlanWait | null;
+}
+
+/** A run parked at a Claude plan limit. */
+export interface PlanWait {
+  /** The plan window that stopped the stage (`five_hour`, `seven_day`, …). */
+  window: string;
+  /** When that window resets (epoch seconds). */
+  resetsAt: number;
+  /** When the automatic resume is due (epoch seconds); null = the director resumes. */
+  resumeAt: number | null;
+  /** Automatic resumes since the director last acted or a stage finished. */
+  resumeCount: number;
+  /** Another stage also waits for the director (a real halt, a gate, a
+   *  question): the run needs you even with a resume scheduled. */
+  otherHold: boolean;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.
@@ -1422,6 +1441,12 @@ export const ipc = {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
+    /** The stage the director decided on. A run can hold several (a plan
+     *  limit beside a gate): without it the backend picks the first. A named
+     *  stage that is no longer waiting (decided elsewhere) is refused with
+     *  "This stage was already decided — refresh to see what's waiting.",
+     *  never redirected to another stage (Abort always goes through). */
+    stageId?: string,
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
@@ -1429,6 +1454,7 @@ export const ipc = {
       feedback: feedback ?? null,
       modelOverride: modelOverride ?? null,
       maxTurnsOverride: maxTurnsOverride ?? null,
+      stageId: stageId ?? null,
     }),
 
   /** Answer a stage that parked itself via the `ask_director` escape valve.
@@ -1442,6 +1468,11 @@ export const ipc = {
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),
+
+  /** Turn off a plan-parked run's automatic resume: it waits for a manual
+   *  Resume. ("Resume now" is `resolveCheckpoint(runId, "resume")`.) */
+  cancelPlanResume: (runId: string) =>
+    invoke<void>("cancel_plan_resume", { runId }),
 
   /** Stop the run's in-flight stage (real cancellation). The stage lands in
    *  the normal failed/decision-strip recovery flow; the run itself survives. */

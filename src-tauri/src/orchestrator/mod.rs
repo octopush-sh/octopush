@@ -10,6 +10,7 @@ pub mod launch;
 pub mod git_baseline;
 pub mod live;
 pub mod persist;
+pub mod plan_wait;
 pub mod roles;
 pub mod runner;
 pub mod sandbox;
@@ -138,6 +139,11 @@ pub(crate) fn downstream_of(
 /// (`CliDialect::resume_prompt`).
 pub(crate) const BLOCKER_FEEDBACK_HEADER: &str =
     "You paused and asked the director; here are their decisions — proceed with these and do not ask again unless a NEW blocking ambiguity arises:\n";
+
+/// A decision named a stage that is no longer waiting for one.
+pub(crate) fn stale_stage_error() -> AppError {
+    AppError::Other("This stage was already decided — refresh to see what's waiting.".into())
+}
 
 /// Format the director's answers to a blocked stage's `ask_director` questions
 /// into the feedback block that `user_input_for` injects on the re-run. Answers
@@ -296,6 +302,9 @@ pub struct Orchestrator {
     /// The bridge's watch table for leased (worker-driven) runs: journal
     /// cursor + last-emitted snapshot per run id (see `bridge`).
     bridge_watch: Mutex<std::collections::HashMap<String, crate::orchestrator::bridge::Watch>>,
+    /// Consecutive automatic plan resumes per run that this process claimed
+    /// but couldn't apply (`plan_wait::MAX_PLAN_RETRIES` caps them).
+    pub(crate) plan_retries: Mutex<std::collections::HashMap<String, u32>>,
 }
 
 impl Orchestrator {
@@ -327,6 +336,7 @@ impl Orchestrator {
             headless,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            plan_retries: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -348,6 +358,7 @@ impl Orchestrator {
             headless: false,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
+            plan_retries: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -363,6 +374,17 @@ impl Orchestrator {
             return Err(AppError::Other(busy_msg.into()));
         }
         Ok(ActiveGuard { orchestrator: self, run_id: run_id.to_string(), forgotten: false })
+    }
+
+    /// Tests: mark `run_id` as executing (as another driver holding its
+    /// claim would), or release that mark.
+    #[cfg(test)]
+    pub(crate) fn set_active_for_test(&self, run_id: &str, active: bool) {
+        if active {
+            self.active.lock().insert(run_id.to_string());
+        } else {
+            self.active.lock().remove(run_id);
+        }
     }
 
     fn runner_for(&self, substrate: &AgentSubstrate) -> Box<dyn AgentRunner> {
@@ -836,6 +858,14 @@ impl Orchestrator {
         }) {
             return Ok(false);
         }
+        // A Claude plan limit: a stronger model meets the same wall.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        {
+            return Ok(false);
+        }
         // Already used its one escalation ⇒ halt (a second failure at the
         // strong tier is a real halt, not another escalation).
         if fresh.escalated {
@@ -1278,6 +1308,8 @@ impl Orchestrator {
                     self.capture_stage_diff_snapshot(run, &stage.id);
                 }
                 self.recompute_run_cost(&run.id)?;
+                // Past the wall: a fresh allowance of automatic plan resumes.
+                self.db.lock().reset_plan_resume_count(&run.id)?;
                 Ok((StageStatus::Done, verdict))
             }
             _ => {
@@ -1334,6 +1366,11 @@ impl Orchestrator {
                 }
                 self.db.lock().fail_run_stage(&stage.id, &err)?;
                 self.record_halt(&run.id, &stage.id, &err);
+                // A Claude plan limit parks the run until the window resets
+                // (the stage keeps its spend and session for the Resume).
+                if let Some(limit) = outcome.cli.plan_limit.as_ref() {
+                    self.park_for_plan(&run.id, &stage.id, limit)?;
+                }
                 // A Claude Code budget stop parks with the budget gate's own
                 // notice; its session (persisted above) lets Resume continue.
                 if crate::orchestrator::cli_runner::is_budget_stop(&err) {
@@ -2000,8 +2037,17 @@ impl Orchestrator {
             let mut must_pause = false;
             let mut first_err: Option<AppError> = None;
             let mut looped_targets: std::collections::HashSet<i64> = std::collections::HashSet::new();
+            // Plan-limited stages fire their checkpoint after every sibling is
+            // handled: a sibling's gate or halt decides whether the park is
+            // calm (`park_reason`), and it may only be marked below.
+            let mut plan_parked: Vec<&crate::db::RunStageRow> = Vec::new();
             for (stage, result) in batch.iter().zip(results) {
                 match result {
+                    // A plan limit never escalates (`try_escalate`): it parks.
+                    Ok((StageStatus::Failed, _)) if self.stage_hit_plan_limit(run_id, &stage.id) => {
+                        plan_parked.push(stage);
+                        must_pause = true;
+                    }
                     Ok((status, verdict)) => {
                         match self.handle_stage_outcome(run_id, stage, status, verdict, &mut looped_targets) {
                             Ok(pause) => must_pause |= pause,
@@ -2021,6 +2067,10 @@ impl Orchestrator {
                     }
                 }
             }
+            for stage in plan_parked {
+                let reason = self.park_reason(run_id, stage);
+                self.emit_checkpoint(run_id, &stage.id, reason);
+            }
             if let Some(e) = first_err {
                 // Leave the run visibly paused (a stage may be parked) before
                 // surfacing the error — a run stranded as "running" has no
@@ -2035,6 +2085,16 @@ impl Orchestrator {
                 return Ok(RunStatus::Paused);
             }
         }
+    }
+
+    /// Whether `stage_id` just failed on a Claude plan limit (its fresh row).
+    fn stage_hit_plan_limit(&self, run_id: &str, stage_id: &str) -> bool {
+        self.db
+            .lock()
+            .list_run_stages(run_id)
+            .ok()
+            .and_then(|st| st.into_iter().find(|s| s.id == stage_id))
+            .is_some_and(|s| s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit))
     }
 
     /// [`stage_read_only`] for a run stage, judged on its EFFECTIVE model
@@ -2128,7 +2188,9 @@ impl Orchestrator {
                     self.emit_run_update(run_id);
                     return Ok(false);
                 }
-                self.emit_checkpoint(run_id, &stage.id, "decision");
+                // A plan-parked stage with a scheduled resume needs nobody.
+                let reason = self.park_reason(run_id, stage);
+                self.emit_checkpoint(run_id, &stage.id, reason);
                 Ok(true)
             }
             StageStatus::AwaitingCheckpoint => {
@@ -2253,6 +2315,32 @@ impl Orchestrator {
         self.apply_checkpoint_action(run_id, stage_id, action)
     }
 
+    /// Refuse a decision on a named stage that is no longer waiting for one
+    /// (decided elsewhere since the caller looked), before anything changes.
+    /// `dispatch_checkpoint` calls it so the in-process path, which applies
+    /// in the background, still answers the caller with the error; the apply
+    /// itself checks again (`apply_checkpoint_action`). Abort and `None`
+    /// always pass.
+    pub fn check_named_stage(&self, run_id: &str, stage_id: Option<&str>, action: &CheckpointAction) -> AppResult<()> {
+        let Some(id) = stage_id else {
+            return Ok(());
+        };
+        if matches!(action, CheckpointAction::Abort) {
+            return Ok(());
+        }
+        let resolvable = self
+            .db
+            .lock()
+            .list_run_stages(run_id)?
+            .iter()
+            .any(|s| s.id == id && (s.status == "awaiting_checkpoint" || s.status == "failed"));
+        if resolvable {
+            Ok(())
+        } else {
+            Err(stale_stage_error())
+        }
+    }
+
     /// The shared mutation section of a checkpoint resolution (in-process and
     /// detached paths). The caller MUST hold this run's `active` claim.
     /// Returns `Some(budget_override)` when the run should be driven again,
@@ -2266,15 +2354,21 @@ impl Orchestrator {
         let stages = self.db.lock().list_run_stages(run_id)?;
         let is_resolvable =
             |s: &crate::db::RunStageRow| s.status == "awaiting_checkpoint" || s.status == "failed";
-        // Prefer the caller's VALIDATED stage_id (e.g. `answer_blocker` checked
-        // exactly this stage): resolve THAT parked/failed stage. Only when no
-        // resolvable stage matches the id (stale/absent) do we fall back to the
-        // single-parked-stage `.find` — so nothing regresses for callers that
-        // pass no id (the plain `resolve_checkpoint`).
-        let blocked = stage_id
-            .and_then(|id| stages.iter().find(|s| s.id == id && is_resolvable(s)))
-            .or_else(|| stages.iter().find(|s| is_resolvable(s)))
-            .cloned();
+        // A caller that names a stage (the canvas's decision bar, the escape
+        // valve, the automatic plan resume) resolves exactly THAT parked/failed
+        // stage. A named stage that is no longer resolvable (decided elsewhere
+        // since the caller looked) is refused, never redirected to another
+        // stage of the run (`stale_stage_error`). Abort tears the whole run
+        // down, so it needs no stage. No id = the single-parked-stage rule.
+        let is_abort = matches!(action, CheckpointAction::Abort);
+        let blocked = match stage_id {
+            Some(id) => match stages.iter().find(|s| s.id == id && is_resolvable(s)) {
+                Some(s) => Some(s.clone()),
+                None if is_abort => stages.iter().find(|s| is_resolvable(s)).cloned(),
+                None => return Err(stale_stage_error()),
+            },
+            None => stages.iter().find(|s| is_resolvable(s)).cloned(),
+        };
 
         // Escape-valve guard: a stage parked via `ask_director` (awaiting a
         // checkpoint WITH questions) can ONLY be resolved by AnswerBlocker (or
@@ -2283,7 +2377,6 @@ impl Orchestrator {
         // empty hand-off — refuse it with a clear message. Conversely,
         // AnswerBlocker only makes sense on an actual block.
         let is_answer = matches!(action, CheckpointAction::AnswerBlocker { .. });
-        let is_abort = matches!(action, CheckpointAction::Abort);
         if let Some(s) = &blocked {
             let is_block = s.status == "awaiting_checkpoint" && s.blocked_questions.is_some();
             if is_block && !is_answer && !is_abort {
@@ -2300,6 +2393,17 @@ impl Orchestrator {
             return Err(AppError::Other(
                 "no stage is awaiting a director decision".into(),
             ));
+        }
+
+        // Resolving a plan-limited stage (an automatic resume comes through
+        // here too, after claiming it) or aborting ends a Claude plan park.
+        // Resolving a sibling (a real halt, a gate) leaves the park and its
+        // scheduled resume in place for the plan-limited stages.
+        let plan_stage = |s: &crate::db::RunStageRow| {
+            s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        };
+        if is_abort || blocked.as_ref().is_none_or(|s| plan_stage(s)) {
+            self.db.lock().clear_run_plan_wait(run_id)?;
         }
 
         // Approving a budget-parked stage (it never ran) is a conscious
@@ -2484,7 +2588,15 @@ impl Orchestrator {
                 // `blocked_transcript` (which this reset deliberately preserves;
                 // consume-once in `run_stage_once` clears it) — the re-run
                 // CONTINUES that conversation instead of starting over.
-                if let Some(s) = &blocked {
+                // Resuming a plan-limited stage resumes EVERY plan-limited
+                // stage of the run: they hit the same wall and the window that
+                // reset reopens for all of them (#731).
+                let targets: Vec<&crate::db::RunStageRow> = match &blocked {
+                    Some(b) if plan_stage(b) => stages.iter().filter(|s| plan_stage(s)).collect(),
+                    Some(b) => vec![b],
+                    None => Vec::new(),
+                };
+                for s in targets {
                     if s.status == "failed" {
                         if s.artifact.is_some() || s.error.is_some() {
                             self.db.lock().archive_stage_attempt(s, None)?;
@@ -2689,6 +2801,17 @@ impl Orchestrator {
                 p.loop_mode.as_deref(),
             )?;
         }
+        // A Claude plan park (#731) whose plan-limited stages this re-run
+        // reset has nothing left to wait for: end it, or the scheduled resume
+        // would claim a run that is no longer parked. The director acted, so
+        // the automatic-resume allowance starts fresh either way.
+        let plan_left = self.db.lock().list_run_stages(run_id)?.iter().any(|s| {
+            s.status == "failed" && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit)
+        });
+        if !plan_left {
+            self.db.lock().clear_run_plan_wait(run_id)?;
+        }
+        self.db.lock().reset_plan_resume_count(run_id)?;
         // `archive_and_reset_stage` already retired each stage's spend onto
         // the run (append, never reset) — recompute folds that in.
         self.recompute_run_cost(run_id)?;
@@ -2772,6 +2895,7 @@ impl Orchestrator {
 
     pub async fn abort_run(&self, run_id: &str) -> AppResult<()> {
         self.db.lock().set_run_status(run_id, "aborted", true)?;
+        self.db.lock().clear_run_plan_wait(run_id)?;
         // Aborting must kill in-flight work, not just mark the DB: the drive
         // loop only checks the status BETWEEN stages.
         self.stop_current_stage(run_id)?;

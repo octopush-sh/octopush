@@ -885,6 +885,14 @@ impl Db {
         // belongs to. Adding a column at the END is safe — no read SELECTs *, all
         // list their columns explicitly, so existing positional maps are unmoved.
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN mission_id TEXT")?;
+        // Claude plan limit park (#731): the window that stopped the run, when
+        // it resets, when the automatic resume is due (NULL = the director
+        // resumes), and how many automatic resumes ran since the director
+        // last acted or a stage finished. Epoch seconds.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_window TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resets_at INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_at INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_count INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mission_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE terminals ADD COLUMN mission_id TEXT")?;
         // One-shot re-parenting: every existing workspace becomes a 'build'
@@ -4625,7 +4633,10 @@ impl Db {
         self.conn
             .query_row(
                 "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                        reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                        reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
                  FROM runs WHERE id = ?1",
                 params![run_id],
                 row_to_run,
@@ -4637,7 +4648,10 @@ impl Db {
     pub fn list_runs(&self, workspace_id: &str) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE workspace_id = ?1 ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![workspace_id], row_to_run)?;
@@ -4650,7 +4664,10 @@ impl Db {
     pub fn list_active_runs(&self) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE status IN ('running', 'paused') ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_run)?;
@@ -4717,7 +4734,10 @@ impl Db {
     pub fn list_terminal_runs(&self, limit: u32) -> AppResult<Vec<RunRow>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs WHERE status IN ('completed', 'aborted') ORDER BY created_at DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit], row_to_run)?;
@@ -4737,7 +4757,10 @@ impl Db {
         let since = since.with_timezone(&Utc).to_rfc3339();
         let mut stmt = self.conn.prepare(
             "SELECT id, workspace_id, pipeline_id, task, status, cost_usd, baseline_usd,
-                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached
+                    reference_model, linked_issue_key, created_at, finished_at, budget_usd, detached,
+                    plan_window, plan_resets_at, plan_resume_at, plan_resume_count, EXISTS (SELECT 1 FROM run_stages s WHERE s.run_id = runs.id
+                      AND (s.status = 'awaiting_checkpoint'
+                           OR (s.status = 'failed' AND instr(COALESCE(s.error, ''), '(plan_limit)') = 0)))
              FROM runs
              WHERE status IN ('completed', 'aborted') AND finished_at IS NOT NULL AND finished_at > ?1
              ORDER BY finished_at DESC LIMIT 50",
@@ -5176,6 +5199,118 @@ impl Db {
             )?;
         }
         Ok(())
+    }
+
+    // ── Claude plan limit park (#731) ────────────────────────────────────────
+
+    /// Park the run at a Claude plan limit: the window, its reset, and the
+    /// automatic resume (`None` = the director resumes).
+    pub fn set_run_plan_wait(
+        &self,
+        run_id: &str,
+        window: &str,
+        resets_at: i64,
+        resume_at: Option<i64>,
+    ) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4 WHERE id = ?1",
+            params![run_id, window, resets_at, resume_at],
+        )?;
+        Ok(())
+    }
+
+    /// The run is no longer parked by its plan (resumed, resolved, aborted).
+    /// The automatic-resume count is kept: see [`Db::reset_plan_resume_count`].
+    pub fn clear_run_plan_wait(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_window = NULL, plan_resets_at = NULL, plan_resume_at = NULL WHERE id = ?1",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// The director turned the automatic resume off: the run stays parked by
+    /// its plan and waits for a manual Resume. Returns whether one was due.
+    pub fn cancel_plan_resume(&self, run_id: &str) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_resume_at = NULL WHERE id = ?1 AND plan_resume_at IS NOT NULL",
+            params![run_id],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Claim the automatic resume of a plan-parked run whose time has come:
+    /// a compare-and-set, so the app's tick and a waiting detached worker can
+    /// race and exactly one of them resumes. Counts the resume.
+    ///
+    /// The claim does NOT clear the resume time: it moves it to `retry_at`.
+    /// Applying the Resume ends the park (`clear_run_plan_wait`); until then
+    /// the park stays due again at `retry_at`, so a claimant that fails or
+    /// dies between the claim and the apply can never lose the resume.
+    pub fn claim_plan_resume(&self, run_id: &str, now: i64, retry_at: i64) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_resume_at = ?3, plan_resume_count = plan_resume_count + 1
+             WHERE id = ?1 AND status = 'paused' AND plan_resume_at IS NOT NULL AND plan_resume_at <= ?2",
+            params![run_id, now, retry_at],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Undo a claim whose Resume couldn't be applied: the run is parked by its
+    /// plan again, its automatic resume due at `resume_at` (`None` = it now
+    /// waits for the director), and the claim no longer counts against the cap.
+    ///
+    /// Only the claim's own park is put back: the schedule must still be the
+    /// `claimed_at` the claim set, or the park must be gone entirely (the
+    /// failed apply cleared it). A park whose schedule changed meanwhile (the
+    /// director turned the automatic resume off, which keeps the window but
+    /// clears `plan_resume_at`) is left as the director left it. Returns
+    /// whether the park was put back.
+    pub fn restore_plan_resume(
+        &self,
+        run_id: &str,
+        window: &str,
+        resets_at: i64,
+        resume_at: Option<i64>,
+        claimed_at: i64,
+    ) -> AppResult<bool> {
+        let n = self.conn.execute(
+            "UPDATE runs SET plan_window = ?2, plan_resets_at = ?3, plan_resume_at = ?4,
+                 plan_resume_count = MAX(plan_resume_count - 1, 0)
+             WHERE id = ?1 AND status = 'paused'
+               AND (plan_resume_at = ?5 OR (plan_window IS NULL AND plan_resume_at IS NULL))",
+            params![run_id, window, resets_at, resume_at, claimed_at],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// A fresh allowance of automatic resumes (the director acted, or a stage
+    /// finished: the run got past the wall).
+    pub fn reset_plan_resume_count(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_resume_count = 0 WHERE id = ?1 AND plan_resume_count <> 0",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Automatic plan resumes since the director last acted or a stage finished.
+    pub fn plan_resume_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_resume_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Paused runs whose automatic plan resume is due at `now`.
+    pub fn list_due_plan_resumes(&self, now: i64) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM runs WHERE status = 'paused' AND plan_resume_at IS NOT NULL
+             AND plan_resume_at <= ?1 ORDER BY plan_resume_at",
+        )?;
+        let rows = stmt.query_map(params![now], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn set_run_cost(&self, run_id: &str, cost_usd: f64, baseline_usd: f64) -> AppResult<()> {
@@ -7346,6 +7481,26 @@ pub struct RunRow {
     /// `true` when this run was handed to a detached segment worker — it
     /// survives the app quitting. Set at spawn, permanent for the run.
     pub detached: bool,
+    /// Set while the run is parked by a Claude plan limit (#731).
+    pub plan_wait: Option<PlanWait>,
+}
+
+/// A run parked at a Claude plan limit. Epoch seconds.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanWait {
+    /// The plan window that stopped the stage (`five_hour`, `seven_day`, …).
+    pub window: String,
+    /// When that window resets.
+    pub resets_at: i64,
+    /// When the automatic resume is due; `None` = parked for the director.
+    pub resume_at: Option<i64>,
+    /// Automatic resumes since the director last acted or a stage finished.
+    pub resume_count: i64,
+    /// Another stage of the run also waits for the director: a real halt, a
+    /// gate or a question (anything resolvable that isn't a plan limit). The
+    /// run then needs you, even with an automatic resume scheduled.
+    pub other_hold: bool,
 }
 
 /// The routines column list, in the order `row_to_routine` reads them.
@@ -7447,6 +7602,20 @@ fn row_to_run(r: &rusqlite::Row) -> rusqlite::Result<RunRow> {
         finished_at: r.get(10)?,
         budget_usd: r.get(11)?,
         detached: r.get::<_, i64>(12)? != 0,
+        plan_wait: {
+            let window: Option<String> = r.get(13)?;
+            let resets_at: Option<i64> = r.get(14)?;
+            let resume_at: Option<i64> = r.get(15)?;
+            let resume_count: i64 = r.get(16)?;
+            let other_hold = r.get::<_, i64>(17)? != 0;
+            resets_at.map(|resets_at| PlanWait {
+                window: window.unwrap_or_default(),
+                resets_at,
+                resume_at,
+                resume_count,
+                other_hold,
+            })
+        },
     })
 }
 

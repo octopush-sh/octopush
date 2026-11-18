@@ -356,6 +356,162 @@ pub(crate) fn forward_plan_and_login(
     }
 }
 
+// ─── Claude plan limit (a stage stopped at the plan's wall) ───────────────
+//
+// When a subscription session hits a plan window, Claude Code streams a
+// `rate_limit_event` whose `rate_limit_info.status` is `rejected` (with the
+// window's `resetsAt`), then a synthetic assistant message (`model:
+// "<synthetic>"`, `error: "rate_limit"`, text like "You've hit your 5-hour
+// limit · resets 7:40pm") and ends the turn. A `rejected` event with
+// `isUsingOverage: true` is not a stop: extra usage covers the request.
+
+/// The marker in the error of a stage that a Claude plan limit stopped.
+/// The drive parks such a stage until the window resets ([`is_plan_limit`]).
+pub const PLAN_LIMIT_MARKER: &str = "(plan_limit)";
+
+/// True when a stage error is a Claude plan limit (see [`apply_plan_limit`]):
+/// never escalated (a stronger model meets the same wall), and resumable.
+pub fn is_plan_limit(error: &str) -> bool {
+    error.contains(PLAN_LIMIT_MARKER)
+}
+
+/// The plan window that stopped a stage, and when it resets (epoch seconds).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanLimit {
+    pub window: String,
+    pub resets_at: i64,
+}
+
+/// Watches one Claude stage's stream for a plan limit. Fed only for a session
+/// that is not API-key authenticated, so API-key users see no change.
+#[derive(Default, Debug)]
+pub(crate) struct PlanLimitWatch {
+    rejected: Option<PlanLimit>,
+    /// The CLI wrote its own limit notice (`error: "rate_limit"`).
+    limit_notice: bool,
+    /// The last rate-limit event seen was that rejection: nothing allowed a
+    /// request after it, so it is what ended the turn.
+    rejection_last: bool,
+}
+
+impl PlanLimitWatch {
+    /// Feed one stream message. Only the stage's own top-level messages
+    /// count: a sub-agent's (`parent_tool_use_id` set) is not the stage's
+    /// stop.
+    pub(crate) fn observe(&mut self, v: &Value) {
+        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return;
+        }
+        let windows = plan_windows_from_stream_event(v);
+        if !windows.is_empty() {
+            // A rate-limit event: the rejection is the last one only if this
+            // event rejects too (other windows it lists may be allowed).
+            self.rejection_last = false;
+        }
+        for w in windows {
+            match w.status.as_deref() {
+                Some("rejected") if !w.using_overage => {
+                    if let Some(resets_at) = w.resets_at {
+                        self.rejected = Some(PlanLimit { window: w.kind, resets_at });
+                        self.rejection_last = true;
+                    }
+                }
+                // The same window allowed again: the wall is gone.
+                Some("allowed") | Some("allowed_warning")
+                    if self.rejected.as_ref().is_some_and(|r| r.window == w.kind) =>
+                {
+                    self.rejected = None;
+                }
+                _ => {}
+            }
+        }
+        if v.get("type").and_then(Value::as_str) == Some("assistant") {
+            let err = v
+                .get("error")
+                .or_else(|| v.get("message").and_then(|m| m.get("error")))
+                .and_then(Value::as_str);
+            if err == Some("rate_limit") {
+                self.limit_notice = true;
+            }
+        }
+    }
+
+    pub(crate) fn limit(&self) -> Option<&PlanLimit> {
+        self.rejected.as_ref()
+    }
+}
+
+/// The full name of a plan window, for the halt copy.
+pub fn plan_window_name(kind: &str) -> String {
+    match kind {
+        "five_hour" => "5-hour window".into(),
+        "seven_day" => "weekly window".into(),
+        k if k.starts_with("seven_day_") => {
+            let model = k["seven_day_".len()..].replace('_', " ");
+            let mut c = model.chars();
+            let cap = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+            format!("weekly {cap} window")
+        }
+        k => format!("{} window", k.replace('_', " ")),
+    }
+}
+
+/// Mark `outcome` as stopped by a Claude plan limit when the stream showed a
+/// `rejected` window and the stage didn't finish: Failed, with the plan copy
+/// and [`PLAN_LIMIT_MARKER`], its spend and session kept for Resume, and
+/// `cli.plan_limit` set so the drive parks it. A result that only *looks*
+/// finished (the CLI's own limit notice as the reply) is a stop too. A
+/// budget stop, a deferred tool and an unsaved session keep their own cause.
+pub(crate) fn apply_plan_limit(mut outcome: StageOutcome, watch: &PlanLimitWatch) -> StageOutcome {
+    let Some(limit) = watch.limit().cloned() else {
+        return outcome;
+    };
+    let own_cause = outcome.error.as_deref().is_some_and(|e| {
+        is_budget_stop(e) || is_tool_deferred(e) || is_deferred_tool_unavailable(e) || is_session_not_saved(e)
+    });
+    if own_cause {
+        return outcome;
+    }
+    let stopped = match outcome.status {
+        // A failure is the plan's only with the CLI's own limit notice, or
+        // when the rejection was the last rate-limit event before the result
+        // (a failure after a later allowed request has another cause).
+        StageStatus::Failed => watch.limit_notice || watch.rejection_last,
+        // The reply is the CLI's own limit notice, not the agent's work.
+        StageStatus::Done | StageStatus::AwaitingCheckpoint => watch.limit_notice,
+        _ => false,
+    };
+    if !stopped {
+        return outcome;
+    }
+    let detail = outcome
+        .error
+        .take()
+        .filter(|e| !e.trim().is_empty())
+        .or_else(|| Some(outcome.artifact.text.trim().to_string()).filter(|t| !t.is_empty()));
+    let mut error = format!(
+        "Paused by your Claude plan — the {} is used up until it resets.\n{PLAN_LIMIT_MARKER}",
+        plan_window_name(&limit.window)
+    );
+    if let Some(d) = detail {
+        error.push('\n');
+        error.push_str(&d);
+    }
+    outcome.status = StageStatus::Failed;
+    outcome.error = Some(error);
+    outcome.verdict = None;
+    outcome.blocked = None;
+    outcome.artifact = StageArtifact {
+        kind: ArtifactKind::Note,
+        text: String::new(),
+        payload: None,
+        refs_worktree: false,
+    };
+    outcome.cli.plan_limit = Some(limit);
+    outcome
+}
+
 /// When the stored claude.ai sign-in ends, epoch seconds, from the `result`
 /// event's `credential_expires_at` (Claude Code 2.1.318+). `None` for other
 /// events, for older CLIs that don't send it and for a value it can't read.
@@ -2855,6 +3011,9 @@ impl CliRunner {
         // From `system/init`: an API-key session's rate-limit events are
         // not plan windows and never reach the plan snapshot.
         let mut auth: Option<CliAuth> = None;
+        // A Claude plan wall in the stream (never for an API-key session).
+        let plan_watch = std::sync::Arc::new(parking_lot::Mutex::new(PlanLimitWatch::default()));
+        let plan_watch_in_loop = std::sync::Arc::clone(&plan_watch);
         // A retry storm journals one line per cause per 10 s, not one per attempt.
         let mut retry_throttle = crate::orchestrator::live::RetryThrottle::default();
         // From `system/init`: the model the session runs on, when it isn't
@@ -2882,6 +3041,9 @@ impl CliRunner {
                     }
                 }
                 forward_plan_and_login(&mut auth, value, &emitter);
+                if auth != Some(CliAuth::ApiKey) {
+                    plan_watch_in_loop.lock().observe(value);
+                }
             }
             CliDialect::Codex => {
                 codex_json_lines += 1;
@@ -3064,7 +3226,10 @@ impl CliRunner {
                 Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
                     Ok(mut outcome) => {
                         outcome.cli.ran_model = ran_model.lock().clone();
-                        Ok(apply_question_guard(with_free_space(outcome, || free_bytes(&ctx.workspace_path))))
+                        Ok(apply_question_guard(apply_plan_limit(
+                            with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
+                            &plan_watch.lock(),
+                        )))
                     }
                     Err(_) => Ok(failed_stage(&format!(
                         "claude produced no parseable result: {}",
@@ -3084,10 +3249,13 @@ impl CliRunner {
                     } else {
                         &recent
                     };
-                    Ok(failed_stage(&format!(
-                        "claude produced no result: {}",
-                        failure_detail(&stderr_out, fallback)
-                    )))
+                    Ok(apply_plan_limit(
+                        failed_stage(&format!(
+                            "claude produced no result: {}",
+                            failure_detail(&stderr_out, fallback)
+                        )),
+                        &plan_watch.lock(),
+                    ))
                 }
             },
         }

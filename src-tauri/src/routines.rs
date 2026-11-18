@@ -66,6 +66,10 @@ pub enum SkipReason {
     /// A fresh worktree's setup script failed — the worktree is discarded and
     /// no run is created.
     SetupFailed(String),
+    /// The crew runs Claude Code and the last Claude plan snapshot says a
+    /// window is `rejected` until `resets_at` (epoch seconds): the fire would
+    /// halt within seconds, so no worktree, setup, run or tokens (#731).
+    PlanLimit { resets_at: i64 },
 }
 
 impl SkipReason {
@@ -78,6 +82,10 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace unavailable".to_string(),
             SkipReason::LaunchRefused(msg) => msg.clone(),
             SkipReason::SetupFailed(msg) => format!("setup failed: {msg}"),
+            SkipReason::PlanLimit { resets_at } => format!(
+                "plan limit · resets {}",
+                crate::orchestrator::plan_wait::clock_label(*resets_at, Utc::now().timestamp())
+            ),
         }
     }
 
@@ -91,6 +99,7 @@ impl SkipReason {
             SkipReason::WorkspaceUnavailable => "workspace_unavailable",
             SkipReason::LaunchRefused(_) => "launch_refused",
             SkipReason::SetupFailed(_) => "setup_failed",
+            SkipReason::PlanLimit { .. } => "plan_limit",
         }
     }
 }
@@ -861,6 +870,9 @@ impl Orchestrator {
         tauri::async_runtime::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(TICK_SECS)).await;
+                // Claude plan parks resume for everyone (Free included), so
+                // before the Routines entitlement check.
+                self.plan_resume_tick();
                 self.routine_tick().await;
             }
         });
@@ -959,11 +971,38 @@ impl Orchestrator {
     /// touch the schedule). Returns whether a run was dispatched or the window
     /// skipped (with the reason).
     async fn fire_routine_inner(self: &Arc<Self>, r: &RoutineRow) -> crate::error::AppResult<FireOutcome> {
+        // A crew on Claude Code whose plan is at its wall would halt within
+        // seconds: skip before any workspace, setup or condition work.
+        if let Some(resets_at) = self.routine_plan_wall(r)? {
+            return Ok(FireOutcome::Skipped(SkipReason::PlanLimit { resets_at }));
+        }
         if r.workspace_mode == "fresh" {
             self.fire_fresh(r).await
         } else {
             self.fire_fixed(r).await
         }
+    }
+
+    /// When the routine's crew (its own model overrides applied) has a Claude
+    /// Code CLI stage and the stored Claude plan snapshot has a window
+    /// `rejected` (not covered by extra usage) with a future reset: that reset.
+    fn routine_plan_wall(&self, r: &RoutineRow) -> crate::error::AppResult<Option<i64>> {
+        let overrides = parse_stage_overrides(r.stage_overrides.as_deref());
+        let stages = self.db().lock().get_pipeline_stages(&r.pipeline_id)?;
+        let crew: Vec<(String, String)> = stages
+            .iter()
+            .map(|s| {
+                let model = overrides
+                    .iter()
+                    .find(|(p, _)| *p == s.position)
+                    .map(|(_, m)| m.clone())
+                    .unwrap_or_else(|| s.agent_model.clone());
+                (s.substrate.clone(), model)
+            })
+            .collect();
+        let snapshots = crate::claude_plan::load(&self.db().lock())?;
+        let now = Utc::now().timestamp();
+        Ok(plan_wall(&crew, &fresh_plan_windows(&snapshots, now), now))
     }
 
     /// Fixed mode: resolve + guard the chosen workspace FIRST (so a deleted
@@ -1225,6 +1264,62 @@ impl Orchestrator {
         .map_err(|e| crate::error::AppError::Other(format!("worktree task panicked: {e}")))?;
         ws
     }
+}
+
+/// A Claude plan snapshot older than this no longer skips a Routine: the
+/// wall may have lifted another way (extra usage turned on, a plan upgrade,
+/// an API-key sign-in), and a fire that does meet it parks cheaply and
+/// refreshes the snapshot.
+pub(crate) const PLAN_WALL_MAX_AGE_SECS: i64 = 6 * 3_600;
+
+/// Pure: the stored plan windows seen within [`PLAN_WALL_MAX_AGE_SECS`] of
+/// `now` (a snapshot whose time can't be read is dropped).
+pub(crate) fn fresh_plan_windows(
+    snapshots: &[crate::claude_plan::PlanSnapshot],
+    now: i64,
+) -> Vec<crate::orchestrator::cli_runner::PlanWindow> {
+    snapshots
+        .iter()
+        .filter(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.seen_at)
+                .is_ok_and(|t| now - t.timestamp() <= PLAN_WALL_MAX_AGE_SECS)
+        })
+        .map(|s| s.window.clone())
+        .collect()
+}
+
+/// Pure: the latest future reset among `rejected` plan windows (not covered
+/// by extra usage) that apply to the crew — `(substrate, model)` per stage —
+/// through one of its Claude Code CLI stages. A window for every model
+/// (`five_hour`, `seven_day`) applies to any such stage; a model's own
+/// window (`seven_day_opus`) only to a stage on that model, so a rejected
+/// Opus week doesn't skip a Sonnet crew. `None` otherwise (an API or
+/// Codex-only crew, or no wall), so API-key users and API crews never skip.
+pub(crate) fn plan_wall(
+    crew: &[(String, String)],
+    windows: &[crate::orchestrator::cli_runner::PlanWindow],
+    now: i64,
+) -> Option<i64> {
+    use crate::orchestrator::cli_runner::{dialect_for_model, CliDialect};
+    let claude_models: Vec<String> = crew
+        .iter()
+        .filter(|(sub, model)| sub == "cli" && dialect_for_model(model) == CliDialect::Claude)
+        .map(|(_, model)| model.to_ascii_lowercase())
+        .collect();
+    if claude_models.is_empty() {
+        return None;
+    }
+    let applies = |kind: &str| match kind.strip_prefix("seven_day_") {
+        // `opusplan` plans on Opus: it meets an Opus wall too.
+        Some(family) => claude_models.iter().any(|m| m.contains(family)),
+        None => true,
+    };
+    windows
+        .iter()
+        .filter(|w| w.status.as_deref() == Some("rejected") && !w.using_overage && applies(&w.kind))
+        .filter_map(|w| w.resets_at)
+        .filter(|t| *t > now)
+        .max()
 }
 
 /// Parse the stored `[[position, model], …]` JSON overrides into the shape

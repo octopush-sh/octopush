@@ -52,6 +52,18 @@ describe("runsStore", () => {
     vi.clearAllMocks();
   });
 
+  it("resolve toasts a refusal calmly and still refreshes the run", async () => {
+    (ipc.resolveCheckpoint as any).mockRejectedValue("This stage was already decided — refresh to see what's waiting.");
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+    await expect(
+      useRunsStore.getState().resolve("r1", "approve", undefined, undefined, undefined, "st-stale"),
+    ).resolves.toBeUndefined();
+    expect(pushToastMock).toHaveBeenCalledTimes(1);
+    expect(pushToastMock.mock.calls[0][0]).toMatchObject({ level: "info" });
+    expect(pushToastMock.mock.calls[0][0].body).toContain("already decided");
+    expect(ipc.getRun).toHaveBeenCalledWith("r1");
+  });
+
   it("appendEntry accumulates structured entries per stage and caps the buffer", () => {
     const s = useRunsStore.getState();
     s.appendEntry("st1", { kind: "text", text: "first" });

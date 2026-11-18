@@ -1,5 +1,6 @@
 import type { Run, RunStageStatus, RunStatus } from "./ipc";
 import { isDeferredToolHalt } from "./stageHalt";
+import { isPlanLimitHalt, isPlanWaiting } from "./planWait";
 
 export interface StatusMeta {
   label: string;
@@ -52,23 +53,26 @@ export function runStatusMeta(status: RunStatus | string): RunStatusMeta {
 
 /** Whether a run needs the director's attention right now. `paused` always
  *  means a human must act in this engine (gate / halted stage / budget park /
- *  director pause). The fleet chip (`RunsTray`) reads this predicate; Mission
+ *  director pause), except a Claude plan park with an automatic resume
+ *  scheduled (`isPlanWaiting`), which is in flight. The fleet chip (`RunsTray`) reads this predicate; Mission
  *  Control inlines the same `status === "paused"` check on the run side of its
  *  discriminated-union board (it also folds in non-run attention items), so keep
  *  the two definitions of "a paused run needs you" in lockstep. */
-export function needsYou(run: Pick<Run, "status">): boolean {
-  return run.status === "paused";
+export function needsYou(run: Pick<Run, "status" | "planWait">): boolean {
+  // A run waiting for its Claude plan to reset, with an automatic resume
+  // scheduled, needs nobody: it is in flight (#731).
+  return run.status === "paused" && !isPlanWaiting(run);
 }
 
 /** The fleet split the chip shows: runs that need you, and runs in flight
  *  (running, nobody waiting). The Dock badge counts the same `needsYou` in
  *  Rust (`fleet_status::derive`); `needsYou.fixtures.json` pins the two. */
-export function fleetCounts(runs: Pick<Run, "status">[]): { needsYou: number; inFlight: number } {
+export function fleetCounts(runs: Pick<Run, "status" | "planWait">[]): { needsYou: number; inFlight: number } {
   let needs = 0;
   let inFlight = 0;
   for (const r of runs) {
     if (needsYou(r)) needs += 1;
-    else if (r.status === "running") inFlight += 1;
+    else if (r.status === "running" || isPlanWaiting(r)) inFlight += 1;
   }
   return { needsYou: needs, inFlight };
 }
@@ -87,6 +91,8 @@ export function isTransientHalt(error: string | null): boolean {
   // A hook-deferred tool halt is never transient, whatever its tool name or
   // stderr tail says ("cloudflare-dns", "timed out"): re-run is the way on.
   if (isDeferredToolHalt(error)) return false;
+  // A Claude plan limit is the clearest wait-and-resume there is.
+  if (isPlanLimitHalt(error)) return true;
   const e = error.toLowerCase();
   return (
     // Startup recovery stamps "interrupted — Octopush closed while…" on stages
