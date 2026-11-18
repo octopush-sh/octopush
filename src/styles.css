@@ -501,6 +501,10 @@
    measured in the same layout pass and reserved beside the head. */
 .octo-midtrunc-ell   { flex: none; width: 0; visibility: hidden; user-select: none; -webkit-user-select: none; }
 .octo-midtrunc[data-elided] .octo-midtrunc-head { text-overflow: clip; }
+/* While MidTruncate measures (one frame, never painted): WebKit clips a
+   Range's rects at its own ellipsis point, which would hide every glyph past
+   it from the grapheme search (#833). */
+.octo-midtrunc[data-measuring] .octo-midtrunc-head { text-overflow: clip; }
 .octo-midtrunc[data-elided] .octo-midtrunc-ell  { width: auto; visibility: visible; }
 /* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
    it as a flex item in the split box, `vertical-align` as inline content in
