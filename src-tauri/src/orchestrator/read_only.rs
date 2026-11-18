@@ -71,6 +71,8 @@ pub const CLI_STASH_DENY_RULES: &[&str] = &[
     "Bash(git stash branch:*)",
     "Bash(git stash store:*)",
     "Bash(git stash create:*)",
+    "Bash(git stash import:*)",
+    "Bash(git stash export:*)",
 ];
 
 /// The effective API tool allowlist for a read-only stage: the stage's own
@@ -119,11 +121,12 @@ pub fn stripped_write_tools_notice(read_only: bool, tools: Option<&[String]>) ->
 /// (`-C <dir>`, `-c <k=v>`, `--git-dir=…` or `--git-dir <dir>`,
 /// `--work-tree <dir>`, `--no-pager`…) and checks the subcommand against
 /// [`GIT_WRITE_SUBCOMMANDS`] (`stash list`/`stash show` excepted). A heuristic, not a parser:
-/// quoted text is skipped, so `sh -c "git commit"` style indirection gets
+/// quoted text becomes a `_` placeholder word, so `sh -c "git commit"` style indirection gets
 /// through, which is what the commit notice is for. Pure.
 pub fn git_write_in(cmd: &str) -> Option<&'static str> {
     // Quoted text is data (`grep 'git commit'`, a commit message), not a
-    // command: blank it out first.
+    // command: blank it out first, leaving a `_` placeholder so a quoted
+    // option value (`--git-dir "/w/.git"`) still counts as one word.
     let mut unquoted = String::with_capacity(cmd.len());
     let mut quote: Option<char> = None;
     for c in cmd.chars() {
@@ -132,7 +135,7 @@ pub fn git_write_in(cmd: &str) -> Option<&'static str> {
             Some(_) => {}
             None if c == '\'' || c == '"' => {
                 quote = Some(c);
-                unquoted.push(' ');
+                unquoted.push('_');
             }
             None => unquoted.push(c),
         }
@@ -150,7 +153,7 @@ pub fn git_write_in(cmd: &str) -> Option<&'static str> {
                     // spelling is one word and needs no skip).
                     if matches!(
                         words[j],
-                        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--exec-path"
+                        "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--config-env" | "--attr-source"
                     ) {
                         j += 1;
                     }

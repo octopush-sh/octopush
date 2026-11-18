@@ -22386,6 +22386,14 @@ mod read_only_role_tests {
             ("git --work-tree /w add .", "add"),
             ("git --git-dir /w/.git --work-tree /w reset --hard", "reset"),
             ("git --git-dir=/w/.git push", "push"),
+            // A quoted option value still counts as one word.
+            ("git --git-dir \"/w/.git\" commit -m x", "commit"),
+            ("git -C \"/w\" commit", "commit"),
+            ("git -c \"user.name=x\" commit -m y", "commit"),
+            ("git --work-tree \"$PWD\" add .", "add"),
+            ("git --git-dir=\"/w/.git\" push", "push"),
+            ("git --attr-source HEAD commit -m x", "commit"),
+            ("git --exec-path commit", "commit"),
         ] {
             assert_eq!(git_write_in(cmd), Some(sub), "{cmd}");
         }
@@ -22406,6 +22414,8 @@ mod read_only_role_tests {
             "git --git-dir /w/.git log",
             "git --work-tree /w status",
             "git --git-dir add log",
+            "grep 'git commit' src",
+            "git log --grep \"commit\"",
         ] {
             assert_eq!(git_write_in(cmd), None, "{cmd}");
         }
