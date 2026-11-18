@@ -159,7 +159,7 @@ export function DiffView(props: Props) {
           />
         ))}
       </div>
-      {help && <KeyboardHelp onClose={() => setHelp(false)} />}
+      {help && <KeyboardHelp readOnly={readOnly} onClose={() => setHelp(false)} />}
       {anchor && props.anchorSlot?.(anchor, () => {
         /* clear handled when anchor selection lands in G5 */
       })}
@@ -172,7 +172,14 @@ function firstChangedLine(file: DiffFile, hunkIdx: number): number {
   return r?.newLine ?? r?.oldLine ?? 1;
 }
 
-function KeyboardHelp({ onClose }: { onClose: () => void }) {
+/** The `?` overlay. The committed view is read-only, so it leaves out the
+ *  accept / reject keys it ignores (#903). Exported for tests. */
+export function keyboardHelpLine(readOnly: boolean): string {
+  const act = readOnly ? "" : " · a accept · x reject · A file";
+  return `j/k move · ]/[ file · Space fold${act} · v viewed · o open · w why`;
+}
+
+function KeyboardHelp({ readOnly, onClose }: { readOnly: boolean; onClose: () => void }) {
   return (
     <div
       className="octo-fade-in fixed bottom-4 right-4 z-50 rounded-md border border-octo-hairline bg-octo-panel p-3 font-mono text-[10px] text-octo-sage shadow-2xl"
@@ -180,7 +187,7 @@ function KeyboardHelp({ onClose }: { onClose: () => void }) {
       aria-label="Keyboard shortcuts"
     >
       <div className="mb-1 text-octo-brass">Keyboard · press ? to close</div>
-      <div>j/k move · ]/[ file · Space fold · a accept · x reject · A file · v viewed · o open · w why</div>
+      <div>{keyboardHelpLine(readOnly)}</div>
       <button onClick={onClose} className="sr-only">Close</button>
     </div>
   );

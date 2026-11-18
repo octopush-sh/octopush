@@ -155,6 +155,13 @@ describe("modeMetaLabel", () => {
     });
   });
 
+  it("reads a truncated diff's file count as a floor (#903)", () => {
+    expect(reviewTailParts(1, { added: 2, removed: 0 }, true)?.files).toBe("1+ files");
+    expect(modeMetaLabel("review", { ...base, changedCount: 40, changedCountPartial: true, diffStat: { added: 9, removed: 1 } })).toBe(
+      "40+ files changed · +9 −1",
+    );
+  });
+
   it("reports the crew's state in direct mode", () => {
     expect(modeMetaLabel("direct", { ...base, runState: "running" })).toBe("Crew running");
     expect(modeMetaLabel("direct", { ...base, runState: "paused" })).toBe("Crew waiting on you");

@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { baseName, commitCount, diffFileCount, resolveReviewSource, sinceBaseLabel } from "./reviewSource";
+import {
+  DIFF_TRUNCATED_MARKER, baseName, commitCount, diffFileCount, isDiffTruncated, resolveReviewSource, sinceBaseLabel,
+} from "./reviewSource";
 import { emptyDiffCopy } from "../components/review/EmptyDiffState";
 
 describe("resolveReviewSource (#851)", () => {
@@ -44,5 +46,28 @@ describe("review source copy", () => {
     expect(emptyDiffCopy(0, { ...ctx, source: "committed", commitsAhead: 2 }).body).toBe(
       "The 2 commits since main leave the code as it was.",
     );
+  });
+});
+
+describe("review source follow-ups (#903)", () => {
+  it("knows when the 1 MiB cap cut the diff, so its file count is a floor", () => {
+    const cut = `diff --git a/x b/x\n@@\n+1\n\n${DIFF_TRUNCATED_MARKER}\n`;
+    expect(isDiffTruncated(cut)).toBe(true);
+    expect(diffFileCount(cut)).toBe(1);
+    expect(isDiffTruncated("diff --git a/x b/x\n@@\n+1\n")).toBe(false);
+    expect(isDiffTruncated("")).toBe(false);
+  });
+
+  it("says whitespace is ignored when an empty committed diff may be whitespace-only", () => {
+    const ctx = { source: "committed" as const, commitsAhead: 2, base: "main", workingCount: 0, ignoreWhitespace: true };
+    expect(emptyDiffCopy(0, ctx).body).toBe("With whitespace ignored, the 2 commits since main change nothing.");
+    expect(emptyDiffCopy(0, { ...ctx, ignoreWhitespace: false }).body).toBe(
+      "The 2 commits since main leave the code as it was.",
+    );
+  });
+
+  it("a pinned default holds like a pick while the tree's dirtiness changes", () => {
+    // Shown as Since base on a clean tree, then a crew touches a file.
+    expect(resolveReviewSource("committed", true, 2)).toBe("committed");
   });
 });

@@ -9,6 +9,9 @@ export interface EmptyDiffContext {
   base: string | null;
   /** Changed files in the working tree. */
   workingCount: number;
+  /** ±WS is on: whitespace-only changes are hidden, so commits that only
+   *  re-indent leave an empty committed diff (#903). */
+  ignoreWhitespace?: boolean;
 }
 
 /** The empty state's title and line, by case. Exported for tests. */
@@ -21,7 +24,9 @@ export function emptyDiffCopy(
   if (ctx?.source === "committed") {
     return {
       title: "Nothing to review.",
-      body: `The ${commitCount(commits)} since ${base} leave the code as it was.`,
+      body: ctx.ignoreWhitespace
+        ? `With whitespace ignored, the ${commitCount(commits)} since ${base} change nothing.`
+        : `The ${commitCount(commits)} since ${base} leave the code as it was.`,
       showCommitted: false,
     };
   }

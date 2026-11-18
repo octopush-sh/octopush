@@ -103,7 +103,7 @@ import { useCompanionFold } from "./hooks/useCompanionFold";
 import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
-import { diffFileCount, resolveReviewSource } from "./lib/reviewSource";
+import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
 import { useReviewSource } from "./stores/reviewSourceStore";
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
@@ -1278,15 +1278,35 @@ function App() {
     activeWorkspaceId ? s.committedByWs[activeWorkspaceId] ?? null : null,
   );
   const reviewPick = useReviewSource((s) => (activeWorkspaceId ? s.pickByWs[activeWorkspaceId] : undefined));
+  const reviewPinned = useReviewSource((s) => (activeWorkspaceId ? s.pinnedByWs[activeWorkspaceId] : undefined));
+  const committedFetched = useReviewSource((s) => !!activeWorkspaceId && activeWorkspaceId in s.committedByWs);
   const reviewSource = resolveReviewSource(
-    reviewPick,
+    reviewPick ?? reviewPinned,
     (gitStatus?.changedFiles.length ?? 0) > 0,
     committed?.commits ?? 0,
   );
+  // Pin the default once Review has shown it with both answers in (#903): it
+  // follows the tree's dirtiness, and a crew touching a file must not switch
+  // a reader of Since base to the working tree mid-read. An explicit pick
+  // still wins. Leaving Review drops the pins, so the next visit starts from
+  // the default again.
+  const commitsAhead = committed?.commits ?? 0;
+  useEffect(() => {
+    const store = useReviewSource.getState();
+    if (activeMode !== "review") {
+      store.clearPins();
+      return;
+    }
+    if (!activeWorkspaceId || reviewPick || reviewPinned) return;
+    if (!committedFetched || !gitStatus || commitsAhead <= 0) return;
+    store.pinDefault(activeWorkspaceId, reviewSource);
+  }, [activeMode, activeWorkspaceId, reviewPick, reviewPinned, committedFetched, gitStatus, commitsAhead, reviewSource]);
   const reviewDiff = reviewSource === "committed" ? committed?.diff ?? "" : gitDiff;
   const reviewDiffStat = useMemo(() => diffStat(reviewDiff), [reviewDiff]);
   const reviewChangedCount =
     reviewSource === "committed" ? diffFileCount(reviewDiff) : gitStatus?.changedFiles.length ?? 0;
+  // The 1 MiB cap can cut the committed diff, so its file count is a floor.
+  const reviewCountPartial = reviewSource === "committed" && isDiffTruncated(reviewDiff);
   const modeMetaText = useMemo(
     () =>
       modeMetaLabel(activeMode, {
@@ -1294,6 +1314,7 @@ function App() {
         tokensUsed: lastTurnInputTokens,
         tokensLimit: activeModelMaxContext,
         changedCount: reviewChangedCount,
+        changedCountPartial: reviewCountPartial,
         diffStat: reviewDiffStat,
         runState: runTailState(activeRuns),
       }),
@@ -1303,6 +1324,7 @@ function App() {
       lastTurnInputTokens,
       activeModelMaxContext,
       reviewChangedCount,
+      reviewCountPartial,
       reviewDiffStat,
       activeRuns,
     ],
@@ -1315,8 +1337,8 @@ function App() {
   // In Review the tail is a demotion ladder rather than one truncating line,
   // so a narrow band sheds whole atoms instead of ending on "· …".
   const reviewParts = useMemo(
-    () => reviewTailParts(reviewChangedCount, reviewDiffStat),
-    [reviewChangedCount, reviewDiffStat],
+    () => reviewTailParts(reviewChangedCount, reviewDiffStat, reviewCountPartial),
+    [reviewChangedCount, reviewDiffStat, reviewCountPartial],
   );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
@@ -1518,10 +1540,23 @@ function App() {
     navigateToFile(`${root}/${pendingWorkspaceOpen.relativePath}`, "editor");
   }, [pendingWorkspaceOpen, activeWorkspace, project, navigateToFile]);
 
+  // The Changes rail, the secret guard and the provenance chips point at the
+  // working tree, so a jump from them while Since base is on screen switches
+  // to the working tree first instead of toasting "Not in the current diff"
+  // (#903). The switch is an explicit pick, like a click on the toggle.
+  const toWorkingTree = useCallback(() => {
+    if (activeWorkspaceId && reviewSource === "committed") {
+      useReviewSource.getState().pick(activeWorkspaceId, "working");
+    }
+  }, [activeWorkspaceId, reviewSource]);
+
   // Companion provenance chips jump into the diff at the file (best-effort line).
   const handleJumpToFile = useCallback(
-    (file: string, line: number | null) => navigateToFile(file, "diff", line),
-    [navigateToFile],
+    (file: string, line: number | null) => {
+      toWorkingTree();
+      navigateToFile(file, "diff", line);
+    },
+    [navigateToFile, toWorkingTree],
   );
 
   // ── Review · locate the open file in the tree ────────────────────
@@ -2271,7 +2306,10 @@ function App() {
                       projectPath={activeWorkspace.worktreePath || project.path}
                       workspaceId={activeWorkspaceId!}
                       diff={gitDiff}
-                      onChangesFileClick={(filePath) => navigateToFile(filePath, "diff")}
+                      onChangesFileClick={(filePath) => {
+                        toWorkingTree();
+                        navigateToFile(filePath, "diff");
+                      }}
                       registerFocusCommit={registerFocusCommit}
                       fileTree={fileTreeProps ?? {
                         rootPath: activeWorkspace.worktreePath || project.path,

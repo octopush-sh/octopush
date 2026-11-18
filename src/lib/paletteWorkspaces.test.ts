@@ -75,6 +75,11 @@ describe("paletteFilter", () => {
     expect(paletteFilter(id, "dec", [])).toBe(0);
   });
 
+  it("scores a model row on its keywords, never its `model:` value (#897)", () => {
+    expect(paletteFilter("model:anthropic/opus-46", "model", ["Claude Opus 4.6", "anthropic"])).toBe(0);
+    expect(paletteFilter("model:anthropic/opus-46", "opus", ["Claude Opus 4.6", "anthropic"])).toBeGreaterThan(0);
+  });
+
   it("leaves every other row on cmdk's default scoring", () => {
     expect(paletteFilter("Toggle word wrap", "wrap", undefined)).toBe(defaultFilter("Toggle word wrap", "wrap", undefined));
     expect(paletteFilter("Sonnet", "anth", ["anthropic"])).toBe(defaultFilter("Sonnet", "anth", ["anthropic"]));

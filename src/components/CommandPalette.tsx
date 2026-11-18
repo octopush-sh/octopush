@@ -1,5 +1,6 @@
 import { Command } from "cmdk";
 import { useEffect, useMemo, useState, useCallback } from "react";
+import { flushSync } from "react-dom";
 import { useSessionStore } from "../stores/sessionStore";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "./Toasts";
@@ -16,7 +17,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
-import { paletteModels } from "../lib/paletteModels";
+import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
 
 interface Props {
   open: boolean;
@@ -62,13 +63,21 @@ export function CommandPalette({
 
   const [search, setSearch] = useState("");
   const [allModels, setAllModels] = useState(false);
+  // cmdk's selection, controlled so "Show all models" can hand it to the
+  // first revealed model (#897).
+  const [selected, setSelected] = useState("");
 
+  // The palette stays mounted while closed (it renders nothing), so reset on
+  // close: a reopen must never paint the old query or expanded list for a
+  // frame before an open-time reset lands (#897).
   useEffect(() => {
     if (open) {
-      setSearch("");
-      setAllModels(false);
       ipc.listModels().then(setModels).catch(() => {});
       ipc.listTemplates().then(setTemplates).catch(() => {});
+    } else {
+      setSearch("");
+      setAllModels(false);
+      setSelected("");
     }
   }, [open]);
 
@@ -95,7 +104,13 @@ export function CommandPalette({
             "0 30px 60px -10px rgba(0,0,0,0.6), 0 0 0 6px rgba(212, 165, 116, 0.04)",
         }}
       >
-        <Command loop filter={paletteFilter} className="overflow-hidden rounded-xl">
+        <Command
+          loop
+          filter={paletteFilter}
+          value={selected}
+          onValueChange={setSelected}
+          className="overflow-hidden rounded-xl"
+        >
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
             <span className="font-mono text-[11px] text-octo-brass">⌘ K</span>
             <Command.Input
@@ -165,6 +180,8 @@ export function CommandPalette({
               {modelRows.shown.map((m) => (
                 <Item
                   key={m.model.id}
+                  value={paletteModelValue(m)}
+                  keywords={[m.model.displayName, m.provider]}
                   glyph="◇"
                   label={m.model.displayName}
                   detail={`${m.provider} · $${m.model.inputCostPerM}/M in`}
@@ -189,7 +206,14 @@ export function CommandPalette({
                   label="Show all models"
                   detail={`${modelRows.hidden} more`}
                   tour={tourId("palette-models-more")}
-                  onSelect={() => setAllModels(true)}
+                  onSelect={() => {
+                    // Move the selection first, then reveal. If this row were
+                    // still selected when it unmounts, cmdk would re-select
+                    // the palette's first item ("New session") (#897).
+                    const next = firstRevealedModel(models, modelRows.shown);
+                    if (next) flushSync(() => setSelected(paletteModelValue(next)));
+                    setAllModels(true);
+                  }}
                 />
               )}
             </Group>
@@ -405,8 +429,12 @@ function Item({
   detail,
   shortcut,
   tour,
+  value,
+  keywords,
   onSelect,
 }: {
+  value?: string;
+  keywords?: string[];
   glyph: string;
   label: string;
   detail?: string;
@@ -416,6 +444,8 @@ function Item({
 }) {
   return (
     <Command.Item
+      value={value}
+      keywords={keywords}
       onSelect={onSelect}
       data-tour={tour}
       className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-2 text-[13px] text-octo-sage aria-selected:text-octo-ivory"

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
-import { DiffView } from "./DiffView";
+import { DiffView, keyboardHelpLine } from "./DiffView";
 import type { DiffFile } from "../../lib/diffParser";
 
 const files: DiffFile[] = [{
@@ -10,6 +10,17 @@ const files: DiffFile[] = [{
 }];
 
 describe("DiffView", () => {
+  it("leaves the accept / reject keys out of the ? help in the read-only view (#903)", () => {
+    expect(keyboardHelpLine(false)).toContain("a accept · x reject · A file");
+    expect(keyboardHelpLine(true)).not.toMatch(/\ba accept|x reject|A file/);
+    const { getByRole } = render(
+      <DiffView files={files} readOnly workspacePath="/w" onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />,
+    );
+    fireEvent.keyDown(window, { key: "?" });
+    const help = getByRole("dialog", { name: "Keyboard shortcuts" });
+    expect(help.textContent).not.toContain("accept");
+    expect(help.textContent).toContain("w why");
+  });
   it("pressing o opens the focused hunk's file at its first changed new-file line", () => {
     const withContext: DiffFile[] = [{
       filePath: "src/a.ts", changeType: "modified", fileHeader: "",

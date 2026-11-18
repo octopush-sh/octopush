@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { MODEL_PREVIEW, paletteModels } from "./paletteModels";
+import { MODEL_PREVIEW, firstRevealedModel, paletteModelValue, paletteModels } from "./paletteModels";
 import type { ModelWithProvider } from "./types";
 
 const m = (id: string): ModelWithProvider => ({
@@ -31,5 +31,20 @@ describe("paletteModels (#850)", () => {
 
   it("shows a short list whole", () => {
     expect(paletteModels(all.slice(0, 3), "", false)).toEqual({ shown: all.slice(0, 3), hidden: 0 });
+  });
+});
+
+describe("firstRevealedModel (#897)", () => {
+  it("is the first model of the full list the preview left out", () => {
+    const preview = paletteModels(all, "", false, "b").shown; // b, a, c
+    expect(firstRevealedModel(all, preview)).toBe(all[3]);
+  });
+
+  it("is undefined when nothing was hidden", () => {
+    expect(firstRevealedModel(all, all)).toBeUndefined();
+  });
+
+  it("keys a row on its provider and id", () => {
+    expect(paletteModelValue(all[0])).toBe("model:p/a");
   });
 });

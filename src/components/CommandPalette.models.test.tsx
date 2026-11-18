@@ -118,4 +118,62 @@ describe("CommandPalette · Models group", () => {
     expect(screen.getByText("Mistral Large")).toBeInTheDocument();
     expect(screen.queryByText("Show all models")).toBeNull();
   });
+  it("keeps the selection on the first revealed model after Show all models (#897)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    await renderPalette();
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    // Walk the keyboard down to the "Show all models" row, then press Enter.
+    for (let n = 0; n < 20; n++) {
+      const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+      if (sel?.textContent?.includes("Show all models")) break;
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("Show all models");
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    await act(async () => {});
+    const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+    expect(sel).toHaveTextContent("DeepSeek V3");
+    // The next keystroke moves on from there, not from the top.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "ArrowDown" });
+    });
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("Mistral Large");
+  });
+
+  it("resets the query and the expanded list on close, before a reopen paints (#897)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValue(many);
+    const props = { onClose: vi.fn(), onNewSession: vi.fn(), onToggleTokens: vi.fn() };
+    let rerender!: (ui: React.ReactElement) => void;
+    await act(async () => {
+      ({ rerender } = render(<CommandPalette open {...props} />));
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByText("Show all models"));
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("Type a command, or search…"), { target: { value: "mistral" } });
+    });
+    await act(async () => {
+      rerender(<CommandPalette open={false} {...props} />);
+    });
+    // The first frame of the reopen, before any effect runs, is already clean.
+    rerender(<CommandPalette open {...props} />);
+    expect(screen.getByPlaceholderText("Type a command, or search…")).toHaveValue("");
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    expect(screen.getByText("Show all models")).toBeInTheDocument();
+    await act(async () => {});
+    vi.mocked(ipc.listModels).mockReset();
+  });
 });

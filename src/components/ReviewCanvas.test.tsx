@@ -552,6 +552,14 @@ describe("ReviewCanvas source toggle", () => {
     expect(onSourceChange).toHaveBeenCalledWith("committed");
   });
 
+  it("puts the commit count on the toolbar's narrow-canvas rung, keeping it in the name (#903)", () => {
+    renderCanvas({ commitsAhead: 3, base: "main" });
+    const count = screen.getByTestId("review-source-count");
+    expect(count.className).toContain("octo-demote-source-count");
+    expect(count.textContent).toBe("\u00a0· 3 commits");
+    expect(screen.getByRole("button", { name: "Since base · 3 commits" })).toContainElement(count);
+  });
+
   it("makes the committed view read-only: no Accept / Reject, a lock with a tooltip", () => {
     renderCanvas({ gitStatus: CLEAN, source: "committed", commitsAhead: 2, base: "main", mergeBase: "abc1234" });
     expect(screen.getByRole("button", { name: "Since base · 2 commits" })).toHaveAttribute("aria-pressed", "true");

@@ -9,12 +9,19 @@ import { defaultFilter } from "cmdk";
  *  prefix lets {@link paletteFilter} keep that id out of the score. */
 export const WORKSPACE_VALUE_PREFIX = "ws:";
 
+/** Prefix on a Models row's cmdk `value` (`model:<provider>/<id>`). An
+ *  explicit value lets the palette move the selection onto a model row
+ *  (#897); the row is scored on its keywords (name, provider). */
+export const MODEL_VALUE_PREFIX = "model:";
+
 /** The palette's cmdk filter. A workspace row is scored on its keywords
  *  only (name, branch, project): its value is a UUID, and fuzzy-matching
  *  that would let any query of hex letters and digits ("772", "dec") hit
- *  most workspaces. Every other row keeps cmdk's default scoring. */
+ *  most workspaces. A model row is scored on its keywords too, so the
+ *  `model:` prefix never matches. Every other row keeps cmdk's default
+ *  scoring. */
 export function paletteFilter(value: string, search: string, keywords?: string[]): number {
-  if (value.startsWith(WORKSPACE_VALUE_PREFIX)) {
+  if (value.startsWith(WORKSPACE_VALUE_PREFIX) || value.startsWith(MODEL_VALUE_PREFIX)) {
     const text = (keywords ?? []).join(" ");
     return text ? defaultFilter(text, search) : 0;
   }
