@@ -305,6 +305,10 @@ pub struct Orchestrator {
     /// Consecutive automatic plan resumes per run that this process claimed
     /// but couldn't apply (`plan_wait::MAX_PLAN_RETRIES` caps them).
     pub(crate) plan_retries: Mutex<std::collections::HashMap<String, u32>>,
+    /// Claude Code's transcript directory (`~/.claude/projects`): a stage's
+    /// session rows a mid-run ingest pass metered are dropped from it the
+    /// moment the stage reports its session (#863).
+    transcripts_root: std::path::PathBuf,
 }
 
 impl Orchestrator {
@@ -337,7 +341,15 @@ impl Orchestrator {
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
             plan_retries: Mutex::new(std::collections::HashMap::new()),
+            transcripts_root: crate::transcripts::projects_root(),
         }
+    }
+
+    /// Read Claude Code transcripts from `root` instead of
+    /// `~/.claude/projects` (tests).
+    pub fn with_transcripts_root(mut self, root: std::path::PathBuf) -> Self {
+        self.transcripts_root = root;
+        self
     }
 
     /// Test constructor: force a specific runner for every stage.
@@ -359,6 +371,7 @@ impl Orchestrator {
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
             plan_retries: Mutex::new(std::collections::HashMap::new()),
+            transcripts_root: crate::transcripts::projects_root(),
         }
     }
 
@@ -1239,6 +1252,15 @@ impl Orchestrator {
             // Every attempt's session, kept for good: the transcript ingestor
             // skips it — this stage's `direct` row already meters it (#861).
             self.db.lock().record_direct_cli_session(&stage.id, sid)?;
+            // A transcript pass that ran while the stage did already metered
+            // part of this session as RUN rows; the stage's `direct` row is
+            // about to count it all. Drop them now, not at the next pass, so
+            // the budget, Talk and AI-review gates never see it twice (#863).
+            match crate::transcripts::drop_direct_session(&self.db, &self.transcripts_root, sid) {
+                Ok(n) if n > 0 => tracing::info!(stage_id = %stage.id, removed = n, "dropped RUN rows already ingested from the stage's session"),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup failed"),
+            }
         }
         // The model this attempt actually ran on (Claude Code's settings can
         // pick another than `--model`), recorded before any completion below
