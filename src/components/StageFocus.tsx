@@ -229,6 +229,8 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // Looking at a different stage = back to its current attempt.
   useEffect(() => { setViewedAttempt(null); }, [stage?.id]);
 
+  const frozenByAbort = run?.status === "aborted" && stage?.status === "running";
+
   // D5 + D1 — fetch the archive list and the persisted journal for this stage.
   // Re-fetched on status changes too: a loop-back both archives an attempt and
   // resets the live journal. Hydration fills the in-memory journal of a
@@ -242,7 +244,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     const stageId = stage.id;
     // Any non-running stage may hydrate from the persisted log (done/failed,
     // and budget-parked awaiting_checkpoint stages whose only content is a notice).
-    const terminal = stage.status !== "running";
+    // So may a stage an abort froze at `running`: nothing streams into it any
+    // more, so after a relaunch its journal would otherwise stay empty (#891).
+    const terminal = stage.status !== "running" || frozenByAbort;
     void ipc.listStageIterations(stageId)
       .then((rows) => { if (!cancelled) setIterations(rows); })
       .catch(() => {});
@@ -258,7 +262,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
       })
       .catch(() => {});
     return () => { cancelled = true; };
-  }, [stage?.id, stage?.status]);
+  }, [stage?.id, stage?.status, frozenByAbort]);
 
   // Keep the live journal pinned to the newest activity while a stage runs (S6: smooth).
   useEffect(() => {

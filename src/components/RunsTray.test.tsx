@@ -50,5 +50,8 @@ describe("RunsTray", () => {
     expect(
       screen.getByRole("button", { name: "1 run ended without completing — open Mission Control" }).textContent,
     ).toBe("1 ended");
+    // The square is filled, like the aborted ■ everywhere else (#891).
+    const square = screen.getByRole("button", { name: /ended without completing/ }).querySelector("svg");
+    expect(square?.getAttribute("fill")).toBe("currentColor");
   });
 });

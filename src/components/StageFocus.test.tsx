@@ -395,6 +395,19 @@ describe("StageFocus journal hydration (D1)", () => {
     ]);
   });
 
+  it("hydrates a stage an abort froze at running (#891)", async () => {
+    vi.mocked(ipc.getStageLog).mockResolvedValue([{ kind: "text", text: "persisted" }]);
+    const abortedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "aborted",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: "t", budgetUsd: null, detached: false,
+    } as any;
+    render(<StageFocus stage={baseStage} workspacePath="/tmp" run={abortedRun} />);
+    await waitFor(() =>
+      expect(useRunsStore.getState().getLiveEntries("st1")).toEqual([{ kind: "text", text: "persisted" }]),
+    );
+  });
+
   it("does not hydrate a running stage from the persisted log", async () => {
     vi.mocked(ipc.getStageLog).mockResolvedValue([{ kind: "text", text: "persisted" }]);
     render(<StageFocus stage={baseStage} workspacePath="/tmp" />);

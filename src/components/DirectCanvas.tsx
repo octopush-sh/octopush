@@ -197,6 +197,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             stages={stages}
             selectedStageId={shownStageId}
             beaconStageId={anchor?.kind === "stage" ? anchor.stageId : null}
+            runAborted={run.status === "aborted"}
             onSelectStage={(id) => selectStage(run.id, id)}
           />
         </div>

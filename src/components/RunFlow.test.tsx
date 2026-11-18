@@ -202,3 +202,35 @@ describe("RunFlow — a stage that ran on another model (#791)", () => {
   });
 });
 
+
+describe("RunFlow — an aborted run (#891)", () => {
+  it("reads the stage the abort froze at running as aborted, muted, without the waiting line", () => {
+    const frozen = [mk({ id: "a", status: "done" }), mk({ id: "b", position: 1, status: "running", startedAt: 1 })];
+    const { container } = render(
+      <RunFlow stages={frozen} selectedStageId="b" beaconStageId="b" runAborted onSelectStage={() => {}} />,
+    );
+    expect(screen.queryByText("waiting for first tool call")).not.toBeInTheDocument();
+    expect(screen.queryByText("running")).not.toBeInTheDocument();
+    expect(screen.getByText("aborted")).toBeInTheDocument();
+    const glyph = screen.getByTitle("aborted");
+    expect(glyph.textContent).toBe("■");
+    expect(glyph.className).toContain("text-octo-mute");
+    expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+    expect(container.querySelector(".border-octo-verdigris")).toBeNull();
+  });
+
+  it("reads a gate frozen by an abort as aborted, never brass review", () => {
+    const gate = [mk({ id: "g", status: "awaiting_checkpoint", checkpoint: true })];
+    const { container } = render(
+      <RunFlow stages={gate} selectedStageId="g" beaconStageId={null} runAborted onSelectStage={() => {}} />,
+    );
+    expect(screen.queryByText("review")).not.toBeInTheDocument();
+    expect(screen.getByTitle("aborted").textContent).toBe("■");
+    expect(container.querySelector(".border-octo-brass")).toBeNull();
+  });
+
+  it("leaves a live run's stages alone", () => {
+    render(<RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />);
+    expect(screen.getByTitle("running").textContent).toBe("●");
+  });
+});

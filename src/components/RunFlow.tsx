@@ -1,6 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
-import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runStatus";
+import { stageStatusGlyph, stageStatusWord, isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
@@ -18,6 +18,9 @@ interface Props {
   selectedStageId: string | null;
   /** Law 2 — the one stage allowed to pulse (beaconAnchor kind "stage"). */
   beaconStageId: string | null;
+  /** The run was aborted: the stage it froze at running / awaiting checkpoint
+   *  reads as aborted (muted), never as live or waiting for you (#891). */
+  runAborted?: boolean;
   onSelectStage: (id: string) => void;
 }
 
@@ -30,7 +33,7 @@ const EMPTY_ENTRIES: LiveEntry[] = [];
  *  Connectors are drawn solid lines — brass once work has flowed through,
  *  hairline ahead (gradients and the ⟶ glyph are retired); the ⟜ gate mark
  *  lives on the gated card itself. */
-export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage }: Props) {
+export function RunFlow({ stages, selectedStageId, beaconStageId, runAborted = false, onSelectStage }: Props) {
   const railRef = useRef<HTMLDivElement | null>(null);
   const cardRefs = useRef<Map<string, HTMLDivElement>>(new Map());
 
@@ -80,6 +83,7 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, onSelectStage 
                   stages={stages}
                   selected={s.id === selectedStageId}
                   beacon={s.id === beaconStageId}
+                  runAborted={runAborted}
                   onSelect={() => onSelectStage(s.id)}
                 />
               </div>
@@ -98,6 +102,7 @@ function StageCard({
   stages,
   selected,
   beacon,
+  runAborted,
   onSelect,
 }: {
   stage: RunStage;
@@ -105,24 +110,31 @@ function StageCard({
   stages: RunStage[];
   selected: boolean;
   beacon: boolean;
+  runAborted: boolean;
   onSelect: () => void;
 }) {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
-  const elapsed = useElapsed(s.status === "running" ? s.startedAt : null);
-  const running = s.status === "running";
-  const awaiting = s.status === "awaiting_checkpoint";
+  // An abort never rewrites the stage row: the stage it was on stays
+  // `running` / `awaiting_checkpoint`. Read it as aborted, muted (#891).
+  const cut = runAborted && (s.status === "running" || s.status === "awaiting_checkpoint");
+  const running = s.status === "running" && !cut;
+  const awaiting = s.status === "awaiting_checkpoint" && !cut;
+  const elapsed = useElapsed(running ? s.startedAt : null);
   const failed = s.status === "failed";
   const transientHalt = failed && isTransientHalt(s.error);
 
   // Depth of field (Law 1): the subject keeps full ink; everything else
   // recedes to its essence — 38% ink, rising on hover. Nothing is removed:
   // the full detail lives in the focus pane one click away.
-  const subject = running || awaiting || failed || selected;
+  // The stage an abort cut keeps the subject geometry (it is where the run
+  // ended) but in muted ink: no brass, no verdigris, no timer.
+  const subject = running || awaiting || failed || cut || selected;
 
+  const aborted = runStatusMeta("aborted");
   const base = stageStatusGlyph(s.status);
-  const glyph = transientHalt ? "⟳" : base.label;
-  const glyphCls = transientHalt ? "text-octo-warning" : base.className;
-  const word = transientHalt ? "stalled" : stageStatusWord(s.status);
+  const glyph = cut ? aborted.glyph : transientHalt ? "⟳" : base.label;
+  const glyphCls = cut ? aborted.className : transientHalt ? "text-octo-warning" : base.className;
+  const word = cut ? aborted.word : transientHalt ? "stalled" : stageStatusWord(s.status);
   const Icon = iconForRole(s.role);
   const cliManaged = s.substrate === "cli";
 
@@ -131,7 +143,9 @@ function StageCard({
   // waiting state lives (the focus pane keeps only its Player).
   const verdict = s.status === "done" ? lastNotice(entries) : "";
   const activity = running ? lastActivity(entries) : "";
-  const live: { node: React.ReactNode; cls: string; tour?: string } = running
+  const live: { node: React.ReactNode; cls: string; tour?: string } = cut
+    ? { node: "the run ended at this stage", cls: "text-octo-mute" }
+    : running
     ? activity
       ? { node: activity, cls: "text-octo-sage" }
       : { node: "waiting for first tool call", cls: "text-octo-mute", tour: tourId("direct-stage-waiting") }
@@ -144,7 +158,9 @@ function StageCard({
 
   // Status keeps its own colour family (running verdigris, needs-you brass,
   // stall amber, hard fail rouge) — but the PULSE belongs to the beacon alone.
-  const skin = transientHalt
+  const skin = cut
+    ? "border-octo-hairline bg-octo-panel-2"
+    : transientHalt
     ? "border-[var(--warning-border)] bg-octo-panel-2 hover:border-octo-warning"
     : failed
       ? "border-[var(--rouge-border)] bg-octo-panel-2 hover:border-octo-rouge"
@@ -163,7 +179,7 @@ function StageCard({
       style={{ animationDelay: `calc(${Math.min(index, 8)} * var(--stagger-step))` }}
       className={`octo-rise-in flex shrink-0 flex-col gap-2 overflow-hidden rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color,background-color,color] duration-[280ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
         subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70 focus-visible:opacity-70"
-      } ${beacon ? (running ? "octo-stage-pulse octo-stage-pulse-running " : "octo-stage-pulse ") : ""}${skin}`}
+      } ${beacon && !cut ? (running ? "octo-stage-pulse octo-stage-pulse-running " : "octo-stage-pulse ") : ""}${skin}`}
     >
       {/* Header — gate mark · role icon · title · status glyph. Rows are
           `w-full min-w-0` so they clip against the card in WebKit too (#312). */}
@@ -176,7 +192,7 @@ function StageCard({
             ⟜
           </span>
         )}
-        <span className={subject ? "text-octo-brass" : "text-octo-sage"}>
+        <span className={subject && !cut ? "text-octo-brass" : "text-octo-sage"}>
           <Icon size={13} strokeWidth={1.75} />
         </span>
         <span
@@ -185,7 +201,7 @@ function StageCard({
         >
           {stageTitle(s)}
         </span>
-        <span key={`${s.status}-${transientHalt}`} className={`octo-pop-in font-mono text-[10px] ${glyphCls}`} title={word}>
+        <span key={`${s.status}-${transientHalt}-${cut}`} className={`octo-pop-in font-mono text-[10px] ${glyphCls}`} title={word}>
           {glyph}
         </span>
       </div>
@@ -202,7 +218,7 @@ function StageCard({
 
           {/* Live activity / verdict / tokens — fixed height, status-picked. */}
           <span
-            key={`${s.status}-live`}
+            key={`${s.status}-${cut}-live`}
             data-tour={live.tour}
             className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
           >
