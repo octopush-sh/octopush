@@ -1159,6 +1159,15 @@ impl Orchestrator {
             }
         }
 
+        // A custom read-only role whose saved allowlist grants write tools:
+        // they are removed (`read_only::read_only_api_tools`, and the CLI
+        // denies its own write tools), so say so instead of silently
+        // ignoring what the author saved.
+        let stage_read_only = crate::orchestrator::read_only::role_is_read_only(&spec.artifact_kind, spec.role_environment);
+        if let Some(note) = crate::orchestrator::read_only::stripped_write_tools_notice(stage_read_only, spec.tools.as_deref()) {
+            self.journal_notice(&run.id, &stage.id, &note);
+        }
+
         // Build the context and run the agent. ANY hard error here (missing worktree,
         // unresolved provider, unavailable CLI substrate) is converted into a failed
         // stage so the run converges to a clean paused/recoverable state instead of

@@ -22328,7 +22328,9 @@ mod read_only_role_tests {
     // the file-write tools on the API and are denied git writes on both.
     use crate::orchestrator::agentic::ToolGate;
     use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume, cli_disallowed_tools};
-    use crate::orchestrator::read_only::{git_write_in, read_only_api_tools, role_is_read_only, ReadOnlyGitGate};
+    use crate::orchestrator::read_only::{
+        git_write_in, read_only_api_tools, role_is_read_only, stripped_write_tools, stripped_write_tools_notice, ReadOnlyGitGate,
+    };
     use crate::orchestrator::roles::{builtin_roles, compose_stage_system_prompt, READ_ONLY_CLAUSE};
 
     #[test]
@@ -22372,6 +22374,18 @@ mod read_only_role_tests {
             ("git --no-pager checkout -- src/a.rs", "checkout"),
             ("npm test | tee out.txt; git reset --hard", "reset"),
             ("(git restore .)", "restore"),
+            // #902: stash write forms, including the bare and option-led push.
+            ("git stash push -m wip", "stash"),
+            ("git stash pop", "stash"),
+            ("git stash apply stash@{0}", "stash"),
+            ("git stash drop", "stash"),
+            ("git stash clear", "stash"),
+            ("git stash -u", "stash"),
+            // #902: `--git-dir`/`--work-tree` with a separate value.
+            ("git --git-dir /w/.git commit -m x", "commit"),
+            ("git --work-tree /w add .", "add"),
+            ("git --git-dir /w/.git --work-tree /w reset --hard", "reset"),
+            ("git --git-dir=/w/.git push", "push"),
         ] {
             assert_eq!(git_write_in(cmd), Some(sub), "{cmd}");
         }
@@ -22384,6 +22398,14 @@ mod read_only_role_tests {
             "cargo test commit",
             "grep -rn 'git commit' src",
             "echo commit",
+            // #902: stash reads stay allowed.
+            "git stash list",
+            "git stash show -p stash@{0}",
+            "git -C /w stash list",
+            // #902: a separate-value option is not taken for the subcommand.
+            "git --git-dir /w/.git log",
+            "git --work-tree /w status",
+            "git --git-dir add log",
         ] {
             assert_eq!(git_write_in(cmd), None, "{cmd}");
         }
@@ -22397,6 +22419,37 @@ mod read_only_role_tests {
         assert!(g.check("run_command", &serde_json::json!({"command": "cargo test"})).await.is_none());
         assert!(g.check("run_command", &serde_json::json!({"command": "git diff"})).await.is_none());
         assert!(g.check("read_file", &serde_json::json!({"path": "a"})).await.is_none());
+        assert!(g.check("run_command", &serde_json::json!({"command": "git stash list"})).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn read_only_gate_refuses_write_tools_called_by_name() {
+        // #902: API execution dispatches by name, so an unoffered write tool
+        // must still be refused at the gate.
+        let g = ReadOnlyGitGate;
+        for name in ["write_file", "edit_file"] {
+            let deny = g.check(name, &serde_json::json!({"path": "a", "content": "x"})).await;
+            assert!(deny.is_some_and(|d| d.contains(name) && d.contains("read-only")), "{name}");
+        }
+        for name in ["read_file", "list_files", "grep", "glob"] {
+            assert!(g.check(name, &serde_json::json!({"path": "a"})).await.is_none(), "{name}");
+        }
+    }
+
+    #[test]
+    fn stripped_write_tools_are_named_in_a_journal_notice() {
+        // #902: a custom read-only role that saved write tools is told so.
+        let own: Vec<String> = ["read_file", "write_file", "run_command", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(stripped_write_tools(true, Some(&own)), vec!["write_file".to_string(), "edit_file".to_string()]);
+        let note = stripped_write_tools_notice(true, Some(&own)).expect("notice");
+        assert!(note.contains("`write_file`, `edit_file` were removed"), "{note}");
+        let one: Vec<String> = ["read_file", "edit_file"].iter().map(|s| s.to_string()).collect();
+        assert!(stripped_write_tools_notice(true, Some(&one)).is_some_and(|n| n.contains("`edit_file` was removed")));
+        // No list (builtin), no write tools, or a writer role: no notice.
+        assert!(stripped_write_tools_notice(true, None).is_none());
+        let reads: Vec<String> = ["read_file", "grep"].iter().map(|s| s.to_string()).collect();
+        assert!(stripped_write_tools_notice(true, Some(&reads)).is_none());
+        assert!(stripped_write_tools_notice(false, Some(&own)).is_none());
     }
 
     #[test]
@@ -22420,9 +22473,25 @@ mod read_only_role_tests {
         };
         for ro in [build_cli_args("m", "sys", 10, true), build_cli_args_resume("m", "sess", 10, true)] {
             let tools = denied(&ro[..]);
-            for t in ["Bash(git commit:*)", "Bash(git push:*)", "Bash(git add:*)", "Bash(git stash:*)", "Write", "Edit"] {
+            for t in [
+                "Bash(git commit:*)",
+                "Bash(git push:*)",
+                "Bash(git add:*)",
+                "Bash(git stash)",
+                "Bash(git stash -*)",
+                "Bash(git stash push:*)",
+                "Bash(git stash pop:*)",
+                "Bash(git stash apply:*)",
+                "Bash(git stash drop:*)",
+                "Bash(git stash clear:*)",
+                "Write",
+                "Edit",
+            ] {
                 assert!(tools.iter().any(|x| x == t), "{t} missing: {ro:?}");
             }
+            // #902: no wholesale stash rule, so `stash list`/`show` stay allowed.
+            assert!(!tools.iter().any(|x| x == "Bash(git stash:*)"), "{ro:?}");
+            assert!(!tools.iter().any(|x| x.contains("stash list") || x.contains("stash show")), "{ro:?}");
         }
         for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
             assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");

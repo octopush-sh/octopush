@@ -1156,12 +1156,23 @@ pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
 /// [`REVIEW_DISALLOWED_TOOLS`] plus one `Bash(git <sub>:*)` rule per
 /// [`GIT_WRITE_SUBCOMMANDS`](crate::orchestrator::read_only::GIT_WRITE_SUBCOMMANDS)
 /// (#847: a Reproduce and a Verify stage each applied the change and
-/// committed it). Deny rules hold under `bypassPermissions`. A command that
+/// committed it), except `stash`, which gets
+/// [`CLI_STASH_DENY_RULES`](crate::orchestrator::read_only::CLI_STASH_DENY_RULES)
+/// so `git stash list`/`show` stay allowed. Deny rules hold under `bypassPermissions`. A command that
 /// hides git behind `sh -c` or a script still gets through — the commit
 /// notice is the backstop. Pure.
 pub fn review_disallowed_tools() -> String {
     let mut s = String::from(REVIEW_DISALLOWED_TOOLS);
     for sub in crate::orchestrator::read_only::GIT_WRITE_SUBCOMMANDS {
+        // Prefix rules: `Bash(git stash:*)` would deny `stash list`/`show`
+        // too, so stash's write forms are listed one by one.
+        if *sub == "stash" {
+            for rule in crate::orchestrator::read_only::CLI_STASH_DENY_RULES {
+                s.push(',');
+                s.push_str(rule);
+            }
+            continue;
+        }
         s.push_str(&format!(",Bash(git {sub}:*)"));
     }
     s
