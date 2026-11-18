@@ -140,7 +140,7 @@ export function LogbookRoom({ open, onClose, project }: Props) {
                     saved {formatUsd(totals.savingsUsd)}
                   </span>
                 )}
-                <span className="octo-tabular text-octo-brass" title="Total spend">
+                <span className="octo-tabular text-octo-ivory" title="Total spend">
                   spent {formatUsd(totals.costUsd)}
                 </span>
               </span>
@@ -198,7 +198,8 @@ export function optionLabelFits(label: string): boolean {
   return label.length * OPTION_PX_PER_CHAR <= OPTION_LABEL_PX;
 }
 
-/** A small mono segmented control — brass ink marks the active option. An
+/** A small mono segmented control — a brass-ghost fill with ivory ink marks
+ *  the active option (brass text stays for the eyebrow and the table). An
  *  `identifier` option (the project name) that can't fit is MIDDLE-truncated
  *  (E1) inside a fixed width — the header is shrink-to-fit, and the
  *  MidTruncate box needs a definite one — with the full label as its title. */
@@ -225,7 +226,7 @@ function Segmented({
             title={o.identifier ? o.label : undefined}
             className={`rounded px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.15em] transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
               mid ? "flex w-[160px] min-w-0" : "max-w-[160px] truncate"
-            } ${active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage"}`}
+            } ${active ? "bg-[var(--brass-ghost)] text-octo-ivory" : "text-octo-mute hover:text-octo-sage"}`}
           >
             {mid ? <MidTruncate text={o.label} tail={OPTION_TAIL} /> : o.label}
           </button>

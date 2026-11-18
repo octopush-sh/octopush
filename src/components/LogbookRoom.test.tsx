@@ -71,6 +71,42 @@ describe("LogbookRoom", () => {
     expect(screen.getByRole("button", { name: "All missions" })).toHaveClass("truncate");
   });
 
+  it("marks the active scope and period with a brass-ghost fill and ivory ink, not brass text", () => {
+    setPlan(["logbook.reports"]);
+    render(
+      <LogbookRoom open onClose={vi.fn()} project={{ id: "p1", name: "atlas" } as ProjectInfo} />,
+    );
+    const active = screen.getAllByRole("button", { pressed: true });
+    expect(active.map((b) => b.textContent)).toEqual(["atlas", "30 days"]);
+    for (const b of active) {
+      expect(b).toHaveClass("bg-[var(--brass-ghost)]", "text-octo-ivory");
+      expect(b).not.toHaveClass("text-octo-brass");
+    }
+    const idle = screen.getByRole("button", { name: "All missions" });
+    expect(idle).toHaveClass("text-octo-mute");
+    expect(idle).not.toHaveClass("bg-[var(--brass-ghost)]");
+  });
+
+  it("sets the header spent total in ivory so only the table's spent cells are brass", async () => {
+    setPlan(["logbook.reports"]);
+    logbookSummaryMock.mockResolvedValue([
+      {
+        missionId: "m1",
+        title: "Refund webhooks",
+        intent: "build",
+        hoursSecs: 3600,
+        costUsd: 12.5,
+        savingsUsd: 0,
+        runsCount: 1,
+        messagesCount: 2,
+      } as never,
+    ]);
+    render(<LogbookRoom open onClose={vi.fn()} project={null} />);
+    const total = await screen.findByTitle("Total spend");
+    expect(total).toHaveClass("text-octo-ivory");
+    expect(total).not.toHaveClass("text-octo-brass");
+  });
+
   it("fits an option label by its mono character count", () => {
     expect(optionLabelFits("x".repeat(19))).toBe(true);
     expect(optionLabelFits("x".repeat(20))).toBe(false);
