@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, waitFor } from "@testing-library/react";
 import { FileDiffSection, pathTail } from "./FileDiffSection";
 import { parseFullDiff, type DiffFile } from "../../lib/diffParser";
+import { readable } from "../../test-utils/readable";
 
 const { readFileChecked } = vi.hoisted(() => ({ readFileChecked: vi.fn() }));
 vi.mock("../../lib/ipc", () => ({ ipc: { readFileChecked } }));
@@ -30,7 +31,8 @@ describe("FileDiffSection", () => {
     const long = { ...file, filePath: "src-tauri/src/very/deep/module/sync.rs" };
     const { container, getByTitle } = render(<FileDiffSection file={long} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
-    expect(getByTitle(long.filePath)).toHaveTextContent(long.filePath);
+    // Full path in the DOM; the only extra glyph is the aria-hidden `…`.
+    expect(readable(getByTitle(long.filePath))).toBe(long.filePath);
     expect(container.querySelector(".octo-midtrunc-tail")?.textContent).toContain("/sync.rs");
   });
   it("renders a short path as one nowrap line, not a bare string in the flex row", () => {

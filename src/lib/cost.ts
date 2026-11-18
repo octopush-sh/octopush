@@ -87,16 +87,17 @@ export function unpricedTitle(models: string[]): string {
 }
 
 /**
- * Tooltip for a stage whose CLI stopped before reporting its usage: the
- * tokens it burned are unknown, so its cost is too.
+ * Tooltip for a stage with usage whose cost is unknown: Codex stopped before
+ * reporting its usage, or a stopped Claude stage streamed usage Octopush
+ * can't price (a subagent model or fast mode with no price).
  */
 export const USAGE_UNREPORTED_TITLE =
-  "Codex stopped before reporting usage, so this stage's cost is unknown — it is not counted as spend or as savings.";
+  "Codex stopped before reporting usage, or a stopped stage streamed usage with no price (a subagent model or fast mode), so part of this stage's cost is unknown — that part is not counted as spend or as savings.";
 
 /** The run-level tooltip for `n` stages with usage not reported. */
 export function usageUnreportedTitle(n: number): string {
   if (n === 1) return USAGE_UNREPORTED_TITLE;
-  return `Codex stopped before reporting usage in ${n} stages, so their cost is unknown — it is not counted as spend or as savings.`;
+  return `Codex stopped before reporting usage, or a stopped stage streamed usage with no price (a subagent model or fast mode), in ${n} stages, so part of their cost is unknown — that part is not counted as spend or as savings.`;
 }
 
 /** The ledger strip's note that part of the spend is unknown. "" when none is. */

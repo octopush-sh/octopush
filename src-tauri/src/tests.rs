@@ -440,7 +440,7 @@ mod workspace_tests {
         db.set_run_status(&b, "paused", false).unwrap();
         let badge = |db: &Db| {
             let runs = db.list_active_runs().unwrap();
-            crate::fleet_status::derive(runs.iter().map(|r| r.status.as_str())).badge()
+            crate::fleet_status::derive(runs.iter().map(|r| (r.status.as_str(), crate::fleet_status::plan_waiting(r)))).badge()
         };
         assert_eq!(badge(&db), Some(2));
 
@@ -719,7 +719,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: None, max_iterations: 25, parents: vec![],
             tools: None, custom_name: None, instructions: None, session_id: None,
-            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         let huge = format!(
@@ -750,7 +750,7 @@ mod workspace_tests {
             loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
             loop_iterations: 0, diff_snapshot: Some("+line\n".repeat(15_000)), max_iterations: 25,
             parents: vec![], tools: None, custom_name: None, instructions: None,
-            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None,
+            session_id: None, resume_pending: false, baseline_commit: None, blocked_questions: None, blocked_transcript: None, secret_hold: None,
             escalate_model: None, escalate_effort: None, escalated: false,
         };
         // 16 stages ≈ 16 × ~96KB capped diffs ≈ >1.5MB serialized before the budget.
@@ -4172,6 +4172,31 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_zero_dollar_stage_flagged_usage_unreported_is_unpriced_in_the_ledger() {
+        // A stopped stage on a priced model whose streamed tokens were all on
+        // an unpriced subagent model records those tokens at $0: the ledger
+        // row reads "unpriced", never a free "computed" row.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "plan", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let st = db.list_run_stages(&run).unwrap();
+        let basis = |stage: &str| -> String {
+            db.conn_ref()
+                .query_row("SELECT cost_basis FROM spend_events WHERE source_id = ?1", [stage], |r| r.get(0))
+                .unwrap()
+        };
+        db.set_run_stage_usage_unreported(&st[0].id).unwrap();
+        db.complete_run_stage(&st[0].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[0].id), "unpriced");
+        // Unflagged, the same $0 on a priced model stays "computed".
+        db.complete_run_stage(&st[1].id, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(basis(&st[1].id), "computed");
+    }
+
+    #[test]
     fn retire_stage_cost_accumulates_on_the_run() {
         let db = test_db();
         let ws = seed_workspace(&db);
@@ -4219,6 +4244,35 @@ mod run_crud_tests {
         assert_eq!(ws_tokens, 1500);
         let (global_cost, _) = db.period_spend("global", "", "daily").unwrap();
         assert!((global_cost - 0.42).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stage_that_ran_on_another_model_is_attributed_to_it() {
+        // #791: Claude Code's settings ran the stage on Sonnet, not the Opus
+        // it asked for — the ledger row (Usage, savings) names what ran.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+
+        db.set_run_stage_ran_model(&stage, Some("claude-sonnet-5-5")).unwrap();
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        let rep = db.token_report(None).unwrap();
+        assert!(rep.cost_by_model.iter().any(|m| m.label == "claude-sonnet-5-5"), "{:?}", rep.cost_by_model);
+        assert!(!rep.cost_by_model.iter().any(|m| m.label == "claude-opus-5-5"));
+        assert_eq!(db.ran_models(&run).unwrap().get(&stage).map(String::as_str), Some("claude-sonnet-5-5"));
+        // The stage still asked for Opus.
+        assert_eq!(db.list_run_stages(&run).unwrap()[0].agent_model, "claude-opus-5-5");
+
+        // A re-run clears it; an attempt on the model it asked for records none.
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
+        db.set_run_stage_ran_model(&stage, None).unwrap();
+        assert!(db.ran_models(&run).unwrap().is_empty());
     }
 
     #[test]
@@ -6048,6 +6102,127 @@ mod orchestrator_tests {
         assert_eq!(max_iterations, 100, "+turns override reached the re-run");
     }
 
+    /// Records `(resume session, quiet setting, the quiet variable as the CLI
+    /// spawn would set it)` per attempt; fails the first attempt with a
+    /// session so the director can `--resume` it.
+    struct QuietRecordingRunner {
+        failed: std::sync::atomic::AtomicBool,
+        seen: Arc<Mutex<Vec<(Option<String>, bool, Option<String>)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for QuietRecordingRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            _input: &StageInput,
+            ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            use crate::orchestrator::cli_runner::{apply_stage_env, dialect_for_model, QUIET_TRAFFIC_ENV};
+            let mut command = tokio::process::Command::new("claude");
+            apply_stage_env(&mut command, dialect_for_model(&stage.agent_model), &stage.agent_model, stage.effort, ctx.quiet_claude_code, None);
+            let var = command
+                .as_std()
+                .get_envs()
+                .find(|(k, _)| *k == QUIET_TRAFFIC_ENV)
+                .and_then(|(_, v)| v.map(|v| v.to_string_lossy().into_owned()));
+            self.seen.lock().push((stage.resume_session.clone(), ctx.quiet_claude_code, var));
+            let first = !self.failed.swap(true, std::sync::atomic::Ordering::Relaxed);
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Plan, text: "done".into(), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cost_usd: 0.0,
+                cache_read_tokens: 0, cache_creation_tokens: 0,
+                status: if first { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: first.then(|| crate::orchestrator::runner::unfinished_stage_error(true, 25)),
+                verdict: None,
+                session_id: Some("sess-quiet".into()),
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// #703: the quiet setting is read from `settings.json` when each stage
+    /// starts — a fresh attempt and its `--resume` both get what the file says
+    /// at that moment, and the detached worker, a separate process driving the
+    /// same `Orchestrator` over the same file, gets it the same way.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_fresh_and_resumed_stages_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":false}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.run_to_pause(&run_id).await.unwrap();
+
+        // The user turns the toggle on before resuming: the resumed stage sees it.
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        let status = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        test_settings_path::set(None);
+        assert_eq!(status, RunStatus::Completed);
+
+        let seen = seen.lock().clone();
+        assert_eq!(
+            seen,
+            vec![
+                (None, false, None),
+                (Some("sess-quiet".into()), true, Some("1".into())),
+            ],
+            "fresh (off) then --resume (on)",
+        );
+    }
+
+    /// #703: a detached segment — `drive_segment`, the entry point
+    /// `octopush-run-worker` calls in its own process — reads the quiet
+    /// setting from `settings.json` per stage, like the in-process drive.
+    #[tokio::test]
+    async fn quiet_claude_code_reaches_a_detached_segment_from_settings() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        test_settings_path::set(Some(settings.clone()));
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink,
+            Box::new(QuietRecordingRunner { failed: Default::default(), seen: Arc::clone(&seen) }),
+        );
+        orch.drive_segment(&run_id, false).await.unwrap();
+        // The user turns it off; the next detached segment (the resume) is loud again.
+        std::fs::write(&settings, "{}").unwrap();
+        let resumed = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await;
+        test_settings_path::set(None);
+        resumed.unwrap();
+
+        let seen = seen.lock().clone();
+        assert_eq!(seen.first(), Some(&(None, true, Some("1".into()))), "detached segment, on: {seen:?}");
+        assert_eq!(seen.get(1), Some(&(Some("sess-quiet".into()), false, None)), "resumed segment, off: {seen:?}");
+    }
+
     #[test]
     fn blocked_ask_serde_round_trips_camel_case() {
         let ask = BlockedAsk {
@@ -6182,7 +6357,7 @@ mod orchestrator_tests {
     async fn resolve_checkpoint_scoped_targets_the_passed_stage_id() {
         // Two stages parked at a gate at once (constructed by hand). `.find`
         // alone resolves the FIRST; the caller's validated `stage_id` must
-        // select the intended one, and a stale/absent id falls back to `.find`.
+        // select the intended one, and a stale id is refused (no fallback).
         let (db, ws) = db_with_workspace();
         let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
         db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
@@ -6207,10 +6382,18 @@ mod orchestrator_tests {
         assert_eq!(stages[1].status, "done", "the passed stage_id was the one resolved");
         assert_eq!(stages[0].status, "awaiting_checkpoint", "the unselected stage is untouched");
 
-        // A stale/absent id falls back to `.find` (the remaining parked stage 0).
-        orch.resolve_checkpoint_apply_only(&run_id, Some("nonexistent"), CheckpointAction::Approve).unwrap();
+        // A stale id (stage 1 was just decided) or an unknown one is refused,
+        // never redirected to the remaining parked stage 0.
+        for stale in [ids[1].as_str(), "nonexistent"] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(stale), CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
         let stages = db.lock().list_run_stages(&run_id).unwrap();
-        assert_eq!(stages[0].status, "done", "a stale id falls back to the single parked stage");
+        assert_eq!(stages[0].status, "awaiting_checkpoint", "the other gate stays waiting");
+        // No id keeps the single-parked rule.
+        orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap();
+        let stages = db.lock().list_run_stages(&run_id).unwrap();
+        assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
     #[test]
@@ -7085,6 +7268,62 @@ mod orchestrator_tests {
         assert_eq!(run_setup_with_env(script, dir.path(), Duration::from_secs(5), "/usr/bin:/bin", &env).await, Ok(()));
     }
 
+    /// #703: with "Quiet Claude Code in crews and Routines" on, a Routine's own
+    /// commands — its fire condition and the fresh worktree's setup script —
+    /// run with `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, so a `claude`
+    /// they start is quiet like the Routine's crew stages. Off sets nothing.
+    #[tokio::test]
+    async fn routine_commands_get_the_quiet_variable_only_when_on() {
+        use crate::routines::{evaluate_condition_with_env, routine_quiet_env, run_setup_with_env, ConditionEval};
+        use std::time::Duration;
+        assert_eq!(
+            routine_quiet_env(true),
+            vec![("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1".to_string())],
+        );
+        assert!(routine_quiet_env(false).is_empty());
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = "/usr/bin:/bin";
+        let t = Duration::from_secs(5);
+        let is_quiet = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = 1"#;
+        let not_set = r#"test "${CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC-unset}" = unset"#;
+        // Fire condition.
+        assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(true)).await, ConditionEval::Met);
+        // Off adds nothing (checked only when the test runner doesn't export it).
+        let inherited = std::env::var_os("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC").is_some();
+        if !inherited {
+            assert_eq!(evaluate_condition_with_env(is_quiet, dir.path(), t, path, &routine_quiet_env(false)).await, ConditionEval::NotMet);
+        }
+        // Setup script, beside Conductor's variables.
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(true));
+        let both = format!(r#"{is_quiet} && test "$CONDUCTOR_WORKSPACE_NAME" = a"#);
+        assert_eq!(run_setup_with_env(&both, dir.path(), t, path, &env).await, Ok(()));
+        let mut env = crate::workspace_setup::conductor_env("/repo", "/wt/a", "a", |_| false);
+        env.extend(routine_quiet_env(false));
+        if !inherited {
+            assert_eq!(run_setup_with_env(not_set, dir.path(), t, path, &env).await, Ok(()));
+        }
+    }
+
+    /// #703: Run terminals are the user's own sessions — the quiet setting
+    /// never reaches their PTY env, even with it on.
+    #[test]
+    fn run_terminal_env_is_untouched_by_quiet_claude_code() {
+        use crate::settings::test_settings_path;
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"quietClaudeCode":true}"#).unwrap();
+        test_settings_path::set(Some(settings));
+        assert!(crate::settings::quiet_claude_code(), "the toggle is on");
+        let guard = crate::context_guard::ContextGuard::auto_configure("s1", dir.path());
+        let env = crate::commands::run_terminal_env(&guard, "claude-sonnet-5");
+        test_settings_path::set(None);
+        assert!(!env.contains_key("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"), "{env:?}");
+        assert!(!env.keys().any(|k| k.starts_with("CLAUDE_CODE_")), "no stage pins in a Run terminal: {env:?}");
+        assert_eq!(env.get("OCTOPUSH_MODEL").map(String::as_str), Some("claude-sonnet-5"));
+    }
+
     /// A failed setup only discards a worktree the fire just created — never an
     /// adopted, reused or restored checkout.
     #[test]
@@ -7233,6 +7472,104 @@ mod orchestrator_tests {
         // must have prevented it.
         tokio::time::sleep(Duration::from_millis(1200)).await;
         assert!(!marker.exists(), "the backgrounded child must be killed with the group");
+    }
+
+    /// #731: a crew on Claude Code whose plan is at its wall skips the window
+    /// honestly — no worktree, no setup, no run, no tokens — and says until when.
+    #[tokio::test]
+    async fn routine_skips_while_the_claude_plan_is_rejected() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{FireOutcome, SkipReason};
+        let (db, ws) = db_with_workspace();
+        let cli = db.lock().insert_pipeline("RCli", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&cli, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let resets = chrono::Utc::now().timestamp() + 3_600;
+        let wall = PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some("rejected".into()), overage_status: Some("rejected".into()), using_overage: false,
+        };
+        crate::claude_plan::record(&db.lock(), &[wall], &chrono::Utc::now().to_rfc3339()).unwrap();
+        let past = "2000-01-01T00:00:00+00:00";
+        db.lock().insert_routine("r-plan", &routine_input(&cli, "interval", "3600"), Some(past), true).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Arc::new(Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            sink.clone(),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        ));
+        let outcome = Arc::clone(&orch).run_routine_now("r-plan").await.unwrap();
+        assert_eq!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { resets_at: resets }));
+        assert_eq!(SkipReason::PlanLimit { resets_at: resets }.token(), "plan_limit");
+        assert_eq!(db.lock().list_runs(&ws).unwrap().len(), 0, "no run while the plan is rejected");
+        assert!(
+            !sink.events.lock().iter().any(|e| e == crate::routines::ROUTINE_PHASE_EVENT),
+            "skipped before any condition, workspace or setup phase",
+        );
+        let r = db.lock().get_routine("r-plan").unwrap().unwrap();
+        assert!(r.last_outcome.as_deref().unwrap_or_default().starts_with("plan limit · resets "), "{:?}", r.last_outcome);
+
+        // An API-only crew isn't stopped by a Claude plan.
+        let api = db.lock().insert_pipeline("RApi", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&api, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_routine("r-api", &routine_input(&api, "interval", "3600"), Some(past), true).unwrap();
+        let outcome = orch.run_routine_now("r-api").await.unwrap();
+        assert!(!matches!(outcome, FireOutcome::Skipped(SkipReason::PlanLimit { .. })), "{outcome:?}");
+    }
+
+    #[test]
+    fn plan_wall_needs_a_claude_code_stage_and_a_future_uncovered_rejection() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::plan_wall;
+        let now = 1_793_540_000;
+        let w = |status: &str, resets: i64, overage: bool| PlanWindow {
+            kind: "five_hour".into(), utilization: None, resets_at: Some(resets),
+            status: Some(status.into()), overage_status: None, using_overage: overage,
+        };
+        let claude = vec![("cli".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, false)], now), Some(now + 60));
+        assert_eq!(plan_wall(&claude, &[w("rejected", now - 60, false)], now), None, "already reset");
+        assert_eq!(plan_wall(&claude, &[w("rejected", now + 60, true)], now), None, "extra usage covers it");
+        assert_eq!(plan_wall(&claude, &[w("allowed_warning", now + 60, false)], now), None);
+        let latest = [w("rejected", now + 60, false), w("rejected", now + 600, false)];
+        assert_eq!(plan_wall(&claude, &latest, now), Some(now + 600), "waits for the last wall");
+        let codex = vec![("cli".to_string(), "gpt-5.5-codex".to_string())];
+        assert_eq!(plan_wall(&codex, &[w("rejected", now + 60, false)], now), None, "Codex isn't on a Claude plan");
+        let api = vec![("api".to_string(), "claude-sonnet-5".to_string())];
+        assert_eq!(plan_wall(&api, &[w("rejected", now + 60, false)], now), None, "API stages aren't on the plan");
+    }
+
+    #[test]
+    fn plan_wall_is_model_aware_and_ignores_a_stale_snapshot() {
+        use crate::orchestrator::cli_runner::PlanWindow;
+        use crate::routines::{fresh_plan_windows, plan_wall, PLAN_WALL_MAX_AGE_SECS};
+        let now = 1_793_540_000;
+        let w = |kind: &str| PlanWindow {
+            kind: kind.into(), utilization: None, resets_at: Some(now + 3_600),
+            status: Some("rejected".into()), overage_status: None, using_overage: false,
+        };
+        let crew = |model: &str| vec![("cli".to_string(), model.to_string())];
+        // A rejected Opus week doesn't skip a Sonnet crew…
+        assert_eq!(plan_wall(&crew("claude-sonnet-5"), &[w("seven_day_opus")], now), None);
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day_opus")], now), None);
+        // …but does skip an Opus one (and `opusplan`, which plans on Opus).
+        assert_eq!(plan_wall(&crew("claude-opus-5-5"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("opusplan"), &[w("seven_day_opus")], now), Some(now + 3_600));
+        // A mixed crew meets it through its Opus stage.
+        let mixed = vec![("cli".to_string(), "sonnet".to_string()), ("cli".to_string(), "opus".to_string())];
+        assert_eq!(plan_wall(&mixed, &[w("seven_day_opus")], now), Some(now + 3_600));
+        // The shared windows apply to every model.
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("seven_day")], now), Some(now + 3_600));
+        assert_eq!(plan_wall(&crew("sonnet"), &[w("five_hour")], now), Some(now + 3_600));
+
+        let at = |secs_ago: i64| chrono::DateTime::from_timestamp(now - secs_ago, 0).unwrap().to_rfc3339();
+        let snaps = vec![
+            crate::claude_plan::PlanSnapshot { window: w("five_hour"), seen_at: at(60) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day"), seen_at: at(PLAN_WALL_MAX_AGE_SECS + 1) },
+            crate::claude_plan::PlanSnapshot { window: w("seven_day_opus"), seen_at: "not a time".into() },
+        ];
+        let fresh = fresh_plan_windows(&snaps, now);
+        assert_eq!(fresh.iter().map(|w| w.kind.as_str()).collect::<Vec<_>>(), ["five_hour"], "stale and unreadable dropped");
     }
 
     /// A condition that exits 1 skips the window with NO run created (zero
@@ -9318,6 +9655,91 @@ mod cli_runner_tests {
     }"#;
 
     #[test]
+    fn refused_setting_reads_the_validation_line_and_nothing_else() {
+        use crate::orchestrator::cli_runner::{refused_setting, SANDBOX_REQUIRED_UNAVAILABLE};
+        let stderr = "\nError: sandbox required but unavailable: the settings passed with --settings \
+            failed validation, so none of them apply (sandbox.enabled: Expected boolean, but received string). Fix them\n  \
+            Refusing to start without a working sandbox.\n";
+        let line = refused_setting(None, stderr, None).expect("named");
+        assert!(line.starts_with("sandbox required but unavailable:"), "the `Error:` prefix goes: {line}");
+        assert!(line.contains("(sandbox.enabled: Expected boolean, but received string)"), "{line}");
+        // `errors` wins over stderr; non-string entries are skipped.
+        let errors = serde_json::json!([{"code": 1}, "Sandbox required but unavailable: settings failed validation (a.b: bad)"]);
+        assert_eq!(
+            refused_setting(Some(&errors), stderr, None).as_deref(),
+            Some("Sandbox required but unavailable: settings failed validation (a.b: bad)")
+        );
+        // "failed validation" alone is not the signal.
+        let unrelated = "[Bootstrap] Gateway /v1/models failed validation: unexpected shape";
+        assert_eq!(refused_setting(None, unrelated, None), None);
+        let other = serde_json::json!(["Settings failed validation (a.b: bad)"]);
+        assert_eq!(refused_setting(Some(&other), unrelated, None), None);
+        // The machine-readable reason is: the first `errors` string stands in.
+        assert_eq!(
+            refused_setting(Some(&other), unrelated, Some(SANDBOX_REQUIRED_UNAVAILABLE)).as_deref(),
+            Some("Settings failed validation (a.b: bad)")
+        );
+        assert!(refused_setting(None, "", Some(SANDBOX_REQUIRED_UNAVAILABLE)).is_some());
+        assert_eq!(refused_setting(None, "", Some("something_else")), None);
+        // Any other failure stays generic.
+        assert_eq!(refused_setting(None, "Error: API error 529 overloaded", None), None);
+        assert_eq!(refused_setting(Some(&serde_json::json!("failed validation")), "", None), None, "not an array");
+        assert_eq!(refused_setting(None, "", None), None);
+        let long = format!("Sandbox required but unavailable: failed validation {}", "x".repeat(900));
+        assert!(refused_setting(None, &long, None).unwrap().chars().count() <= 400);
+    }
+
+    #[test]
+    fn budget_and_max_turns_stops_with_an_unrelated_validation_line_keep_their_own_handling() {
+        use crate::orchestrator::cli_runner::{is_budget_stop, is_settings_refused, BUDGET_STOP_SUBTYPE};
+        let stderr = "[Bootstrap] Gateway /v1/models failed validation: expected a list\n";
+        let budget = format!(
+            r#"{{"type":"result","subtype":"{BUDGET_STOP_SUBTYPE}","is_error":true,"num_turns":7,
+            "session_id":"s","total_cost_usd":1.5}}"#
+        );
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(is_budget_stop(err) && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        let turns = r#"{"type":"result","subtype":"error_max_turns","is_error":true,"num_turns":30,
+            "session_id":"s","total_cost_usd":0.4}"#;
+        let outcome = parse_cli_result(turns, false, ArtifactKind::Diff, stderr).unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert!(err.contains("error_max_turns") && !is_settings_refused(err), "{err}");
+        assert_eq!(outcome.session_id.as_deref(), Some("s"));
+        // Even the real refused-settings line does not take over a budget stop
+        // or a session that ran turns.
+        let real = "Error: Sandbox required but unavailable: settings failed validation (x: y)";
+        let outcome = parse_cli_result(&budget, false, ArtifactKind::Diff, real).unwrap();
+        assert!(is_budget_stop(outcome.error.as_deref().unwrap()));
+        let ran = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":3,
+            "session_id":"s","total_cost_usd":0.1}"#;
+        let outcome = parse_cli_result(ran, false, ArtifactKind::Diff, real).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+        // A generic execution error with only the unrelated line stays generic.
+        let plain = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0}"#;
+        let outcome = parse_cli_result(plain, false, ArtifactKind::Diff, stderr).unwrap();
+        assert!(!is_settings_refused(outcome.error.as_deref().unwrap()));
+    }
+
+    #[test]
+    fn a_refused_settings_result_is_not_escalated_nor_resumed() {
+        use crate::orchestrator::cli_runner::{is_settings_refused, SETTINGS_REFUSED};
+        let line = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,
+            "session_id":"s","total_cost_usd":0,"errors":["Sandbox required but unavailable: settings failed validation (x: y)."]}"#;
+        let outcome = parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        let err = outcome.error.as_deref().unwrap();
+        assert_eq!(err, format!("{SETTINGS_REFUSED}: Sandbox required but unavailable: settings failed validation (x: y)."));
+        assert!(is_settings_refused(err));
+        assert_eq!(outcome.session_id, None);
+        // An ordinary execution error is unchanged.
+        let plain = parse_cli_result(&line.replace("failed validation", "broke"), false, ArtifactKind::Diff, "").unwrap();
+        assert!(!is_settings_refused(plain.error.as_deref().unwrap()));
+        assert_eq!(plain.session_id.as_deref(), Some("s"));
+    }
+
+    #[test]
     fn budget_stop_keeps_spend_and_session_and_reads_as_a_budget_park() {
         use crate::orchestrator::cli_runner::is_budget_stop;
         let outcome = parse_cli_result(BUDGET_STOPPED, true, ArtifactKind::Diff, "").unwrap();
@@ -10547,7 +10969,7 @@ mod cli_dialect_tests {
             json!({"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}),
         ]);
         let usage = crate::orchestrator::cli_runner::sum_usage(&map);
-        let out = build_codex_outcome(&accum, usage, true, ArtifactKind::Note, "gpt-5", "");
+        let out = build_codex_outcome(&accum, usage.clone(), true, ArtifactKind::Note, "gpt-5", "");
         let err = out.error.as_deref().unwrap();
         assert!(err.contains("no final message"), "{err}");
         assert!(!is_usage_unreported(err), "{err}");
@@ -10560,11 +10982,11 @@ mod cli_dialect_tests {
 
     #[test]
     fn codex_outcome_is_the_last_message_or_an_honest_failure() {
-        let usage = Default::default();
+        let usage = crate::orchestrator::cli_runner::CliUsage::default();
         // Final message → Done, with the verdict sentinel still parsed.
         let ok = build_codex_outcome(
             &CodexAccum { final_message: Some("findings\nVERDICT: PASS".into()), error: None, session_id: Some("th".into()), turn_open: false, activity: true },
-            usage, true, ArtifactKind::Review, "gpt-5", "",
+            usage.clone(), true, ArtifactKind::Review, "gpt-5", "",
         );
         assert!(matches!(ok.status, StageStatus::Done));
         assert_eq!(ok.artifact.text, "findings\nVERDICT: PASS");
@@ -10574,7 +10996,7 @@ mod cli_dialect_tests {
         // turn.failed → Failed, last message preserved as context.
         let failed = build_codex_outcome(
             &CodexAccum { final_message: Some("partial".into()), error: Some("rate limited".into()), session_id: None, turn_open: false, activity: true },
-            usage, true, ArtifactKind::Diff, "gpt-5", "",
+            usage.clone(), true, ArtifactKind::Diff, "gpt-5", "",
         );
         assert!(matches!(failed.status, StageStatus::Failed));
         let msg = failed.error.as_deref().unwrap();
@@ -11504,6 +11926,118 @@ mod live_tests {
         // others still bill at $4/$20.
         let c = streamed_cost("claude-opus-5-5", &map);
         assert!((c - 2.0 * (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
+    /// One streamed assistant message: 1,000 in / 100 out, on `model` (none
+    /// when `None`), fast when `fast`.
+    fn streamed_msg(id: &str, model: Option<&str>, fast: bool) -> serde_json::Value {
+        let mut usage = serde_json::json!({ "input_tokens": 1_000, "output_tokens": 100,
+            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 });
+        if fast {
+            usage["speed"] = serde_json::Value::from("fast");
+        }
+        let mut message = serde_json::json!({ "id": id, "usage": usage });
+        if let Some(m) = model {
+            message["model"] = serde_json::Value::from(m);
+        }
+        serde_json::json!({ "type": "assistant", "message": message })
+    }
+
+    fn streamed_map(events: &[serde_json::Value]) -> std::collections::HashMap<String, crate::orchestrator::cli_runner::CliUsage> {
+        events
+            .iter()
+            .map(|e| {
+                let (id, u) = crate::orchestrator::cli_runner::usage_from_stream_event(e).unwrap();
+                (id.unwrap(), u)
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_prices_each_streamed_message_at_its_own_model() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, streamed_cost};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // An Opus 5 stage whose Haiku subagent answered one message; a message
+        // naming no model is the stage's.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-haiku-4-5-20251001"), false),
+            streamed_msg("msg_3", None, false),
+        ]);
+        assert_eq!(map["msg_2"].model.as_deref(), Some("claude-haiku-4-5-20251001"));
+        assert_eq!(map["msg_3"].model, None);
+        let opus = (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6;
+        let haiku = (1_000.0 * 1.0 + 100.0 * 5.0) / 1e6;
+        let c = streamed_cost("claude-opus-5", &map);
+        assert!((c - (2.0 * opus + haiku)).abs() < 1e-12, "{c}, not the two priced separately");
+        // Before: every message at the stage's model — the subagent over-billed.
+        assert!((c - 3.0 * opus).abs() > 1e-6);
+        // The reverse case: a Haiku stage with an Opus subagent is not under-billed.
+        let rev = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-haiku-4-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5"), false),
+        ]);
+        assert!((streamed_cost("claude-haiku-4-5", &rev) - (opus + haiku)).abs() < 1e-12);
+        // Everything priced: the stopped stage keeps all its tokens, no marker.
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert!(!is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.output_tokens), (3_000, 300));
+        assert!((out.cost_usd - (2.0 * opus + haiku)).abs() < 1e-12);
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_stage_with_a_fast_message_and_no_fast_rate_reads_usage_not_reported() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // Opus 5.5 has no fast rate: its fast message is unpriced, not $0.
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5-5"), false),
+            streamed_msg("msg_2", Some("claude-opus-5-5"), true),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "claude timed out — no output for 5 minutes", "claude-opus-5-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert!(err.starts_with("claude timed out — no output for 5 minutes\n"), "the cause stays the first line: {err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-opus-5-5 (fast))").as_str()));
+        // Only the priced message is spend — and only its tokens are recorded,
+        // so the baseline never re-prices the unknown part as saved.
+        assert!((out.cost_usd - (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{}", out.cost_usd);
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn an_unknown_subagent_model_is_unpriced_and_kept_out_of_savings() {
+        use crate::orchestrator::cli_runner::{is_usage_unreported, stopped_stage, usage_unreported_line, USAGE_UNPRICED};
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let map = streamed_map(&[
+            streamed_msg("msg_1", Some("claude-opus-5"), false),
+            streamed_msg("msg_2", Some("claude-mystery-9"), false),
+            streamed_msg("msg_3", Some("claude-mystery-9"), false),
+        ]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-opus-5", &map, false);
+        let err = out.error.as_deref().unwrap();
+        assert!(is_usage_unreported(err), "{err}");
+        assert_eq!(usage_unreported_line(err), Some(format!("{USAGE_UNPRICED} (claude-mystery-9)").as_str()));
+        // The unknown model's tokens are neither spend nor baseline.
+        assert_eq!((out.input_tokens, out.output_tokens), (1_000, 100));
+        assert!((out.cost_usd - (1_000.0 * 5.0 + 100.0 * 25.0) / 1e6).abs() < 1e-12);
+
+        // A stage that is all its own unpriced model is unchanged: no marker —
+        // its model already reads "unpriced" — and every token kept at $0
+        // (a $0 stage with tokens stays out of the baseline).
+        let own = streamed_map(&[streamed_msg("msg_1", Some("claude-mystery-9"), false), streamed_msg("msg_2", None, false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &own, false);
+        assert_eq!(out.error.as_deref(), Some("Stopped by the director"));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0));
+        // …but an unpriced stage model with an unknown subagent model is marked.
+        let both = streamed_map(&[streamed_msg("msg_1", None, false), streamed_msg("msg_2", Some("claude-enigma-1"), false)]);
+        let out = stopped_stage(crate::orchestrator::cli_runner::CliDialect::Claude, "Stopped by the director", "claude-mystery-9", &both, false);
+        assert!(is_usage_unreported(out.error.as_deref().unwrap()));
+        assert_eq!((out.input_tokens, out.cost_usd), (2_000, 0.0), "nothing priced: every token kept, $0");
     }
 
     #[tokio::test]
@@ -12910,7 +13444,7 @@ mod ancestry_tests {
             session_id: None,
             resume_pending: false,
             baseline_commit: None,
-            blocked_questions: None, blocked_transcript: None,
+            blocked_questions: None, blocked_transcript: None, secret_hold: None,
         }
     }
 
@@ -16521,6 +17055,175 @@ mod sync_opt_in_tests {
     }
 }
 
+// ── Sync pulls through the api_base()/access_token() seams (#753) ─────
+#[cfg(test)]
+mod sync_pull_tests {
+    use crate::settings::test_sync_override;
+    use crate::sync::{test_net, SyncKind};
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    /// An HTTP server answering every request with `code` and `body` (JSON).
+    /// Returns its base URL and the request heads it received.
+    async fn serve(code: u16, body: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (log, body) = (seen.clone(), body.to_string());
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, body) = (log.clone(), body.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = String::from_utf8_lossy(&buf).find("\r\n\r\n") {
+                            log.lock().unwrap().push(String::from_utf8_lossy(&buf[..end]).to_string());
+                            break;
+                        }
+                    }
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    /// The one request the server saw: its request line, and whether it
+    /// carried the test token.
+    fn only_request(seen: &Arc<Mutex<Vec<String>>>) -> (String, bool) {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        let head = &seen[0];
+        let line = head.lines().next().unwrap_or_default().to_string();
+        let authed = head.lines().any(|l| l.eq_ignore_ascii_case("authorization: Bearer test-token"));
+        (line, authed)
+    }
+
+    const RUNS: &str = r#"{"runs":[
+        {"run_id":"r1","task":"t","status":"completed","cost_usd":0.5,"stages":[{"role":"implement","status":"done"}]},
+        {"task":"no run id: unreadable"},
+        "not even an object"
+    ]}"#;
+
+    #[tokio::test]
+    async fn pull_runs_keeps_the_readable_rows() {
+        reset(true, false);
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1, "the malformed rows are skipped");
+        assert_eq!((runs[0].run_id.as_str(), runs[0].stages.len()), ("r1", 1));
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-runs "), "{line}");
+        assert!(authed, "the session token is sent");
+    }
+
+    #[tokio::test]
+    async fn pull_runs_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, RUNS).await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_runs(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_reads_404_as_no_detail_and_an_unreadable_blob_as_none() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        let (base, seen) = serve(200, r#"{"detail":{"run_id":"r1","stages":[]}}"#).await;
+        test_net::set(Some(base), token());
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("a detail");
+        assert_eq!(detail.run_id, "r1");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-run-detail?run_id=r1 "), "{line}");
+        assert!(authed);
+
+        test_net::set(Some(serve(404, "{}").await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404: no detail");
+        test_net::set(Some(serve(200, r#"{"detail":{"stages":"not a list"}}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "unreadable: no detail");
+    }
+
+    #[tokio::test]
+    async fn pull_run_detail_http_errors_and_signed_out() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains(&format!("history detail fetch failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+
+    #[tokio::test]
+    async fn pull_library_keeps_the_readable_items() {
+        reset(false, true);
+        let body = r#"{"items":[
+            {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+            {"kind":"role","item_id":"r1","deleted":true},
+            {"item_id":"no kind: unreadable"}
+        ]}"#;
+        let (base, seen) = serve(200, body).await;
+        test_net::set(Some(base), token());
+        let items = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let got: Vec<(&str, bool)> = items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(got, [("p1", false), ("r1", true)], "the malformed item is skipped; tombstones stay");
+        let (line, authed) = only_request(&seen);
+        assert!(line.starts_with("GET /api/sync-library "), "{line}");
+        assert!(authed);
+    }
+
+    #[tokio::test]
+    async fn pull_library_http_errors_and_signed_out() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        for code in [401, 500] {
+            test_net::set(Some(serve(code, "{}").await.0), token());
+            let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+            assert!(err.contains(&format!("library sync pull failed: HTTP {code}")), "{err}");
+        }
+        let (base, seen) = serve(200, "{}").await;
+        test_net::set(Some(base), Some(None));
+        let err = crate::sync::pull_library(&client).await.unwrap_err().to_string();
+        assert!(err.contains("not signed in"), "{err}");
+        assert!(seen.lock().unwrap().is_empty(), "signed out: no request");
+    }
+}
+
 // ── Last sync attempt under each Sync toggle (#518) ───────────────────
 #[cfg(test)]
 mod sync_status_tests {
@@ -17119,6 +17822,127 @@ mod open_pull_request_tests {
         assert_eq!(pr_target(&repo, "main", "feature").head_remote.as_deref(), Some("upstream"));
         let url = crate::git_ops::remote_slug(&repo, "origin").unwrap();
         assert_eq!((url.owner.as_str(), url.repo.as_str()), ("me", "app"));
+    }
+
+    #[test]
+    fn diff_size_counts_the_branch_against_its_base_plus_uncommitted_and_untracked() {
+        use crate::git_ops::{diff_size, DiffSize};
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        // Nothing changed yet: a real zero, against the named base.
+        assert_eq!(diff_size(d, Some("main")).unwrap(), DiffSize { files: 0, added: 0, removed: 0, base: Some("main".into()), untracked_skipped: 0 });
+        // A commit (2 lines changed), an unstaged edit and an untracked file.
+        std::fs::write(d.join("a.txt"), "1\nTWO\n3\n4\n").unwrap();
+        git(d, &["commit", "-qam", "crew work"]);
+        std::fs::write(d.join("b.txt"), "x\n").unwrap();
+        std::fs::write(d.join("new.txt"), "n1\nn2\n").unwrap();
+        git(d, &["add", "b.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size, DiffSize { files: 3, added: 5, removed: 1, base: Some("main".into()), untracked_skipped: 0 });
+        // main moving on adds nothing to the crew's diff (merge base, not tip).
+        git(d, &["stash", "-u", "-q"]);
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("main-only.txt"), "m\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "main moves"]);
+        git(d, &["checkout", "-q", "crew"]);
+        git(d, &["stash", "pop", "-q"]);
+        assert_eq!(diff_size(d, Some("main")).unwrap(), size);
+        // No base, or one that no longer resolves: the uncommitted changes vs HEAD.
+        let uncommitted = DiffSize { files: 2, added: 3, removed: 0, base: None, untracked_skipped: 0 };
+        assert_eq!(diff_size(d, None).unwrap(), uncommitted);
+        assert_eq!(diff_size(d, Some("gone/branch")).unwrap(), uncommitted);
+    }
+
+    /// A repo on `main` with one committed `a.txt`, checked out on `crew`.
+    fn diff_size_repo() -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let d = dir.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        git(d, &["config", "user.email", "t@example.com"]);
+        git(d, &["config", "user.name", "t"]);
+        std::fs::write(d.join("a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "base"]);
+        git(d, &["checkout", "-q", "-b", "crew"]);
+        dir
+    }
+
+    #[test]
+    fn diff_size_uses_the_collision_radars_merge_base_so_a_stale_local_base_adds_nothing() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // Upstream moved on (origin/main = C1) while the local `main` stayed
+        // at C0; the crew branched from origin/main.
+        git(d, &["checkout", "-q", "main"]);
+        std::fs::write(d.join("up.txt"), "u\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "upstream"]);
+        git(d, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+        git(d, &["checkout", "-q", "-B", "crew"]);
+        git(d, &["branch", "-f", "main", "HEAD~1"]);
+        std::fs::write(d.join("crew.txt"), "c\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-qm", "crew work"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        // Only the crew's file — not upstream's, as `merge_base(HEAD, main)` would add.
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 0), "{size:?}");
+        assert_eq!(size.base.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn workspace_base_falls_back_to_the_projects_default_branch() {
+        use crate::collisions::workspace_base;
+        assert_eq!(workspace_base(Some("dev".into()), Some("main")).as_deref(), Some("dev"));
+        assert_eq!(workspace_base(None, Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(Some("  ".into()), Some("main")).as_deref(), Some("main"));
+        assert_eq!(workspace_base(None, None), None);
+    }
+
+    #[test]
+    fn diff_size_pairs_a_rename_so_a_moved_file_counts_only_its_edit() {
+        use crate::git_ops::diff_size;
+        let dir = diff_size_repo();
+        let d = dir.path();
+        git(d, &["mv", "a.txt", "moved.txt"]);
+        std::fs::write(d.join("moved.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\nTEN\n").unwrap();
+        git(d, &["add", "moved.txt"]);
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!((size.files, size.added, size.removed), (1, 1, 1), "a rename, not a delete plus add: {size:?}");
+    }
+
+    #[test]
+    fn diff_size_bounds_untracked_content() {
+        use crate::collisions::MAX_UNTRACKED_DIR_FILES;
+        use crate::git_ops::{diff_size, MAX_UNTRACKED_LINE_BYTES};
+        let dir = diff_size_repo();
+        let d = dir.path();
+        // A small untracked file, last line without a newline: 2 lines.
+        std::fs::write(d.join("note.txt"), "one\ntwo").unwrap();
+        // An untracked directory past the cap: one entry, never read.
+        std::fs::create_dir(d.join("vendor")).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(d.join("vendor").join(format!("f{i}.js")), "x\n".repeat(100)).unwrap();
+        }
+        // A small untracked directory: each file counted.
+        std::fs::create_dir(d.join("small")).unwrap();
+        std::fs::write(d.join("small").join("s.txt"), "s\n").unwrap();
+        // A file past the byte budget: a file, its lines not read.
+        std::fs::write(d.join("huge.log"), vec![b'l'; MAX_UNTRACKED_LINE_BYTES as usize + 1]).unwrap();
+        // A binary file: a file with no lines, like git.
+        std::fs::write(d.join("blob.bin"), [0u8, 1, 2, b'\n']).unwrap();
+        let size = diff_size(d, Some("main")).unwrap();
+        assert_eq!(size.files, 5, "note, vendor/, small/s.txt, huge.log, blob.bin: {size:?}");
+        assert_eq!(size.added, 3, "note's 2 + s.txt's 1: {size:?}");
+        assert_eq!(size.untracked_skipped, 2, "vendor/ and huge.log: {size:?}");
     }
 
     #[test]
@@ -17940,8 +18764,8 @@ mod crew_tests {
 #[cfg(test)]
 mod cli_command_idle_tests {
     use crate::orchestrator::cli_runner::{
-        command_idle_window, idle_timeout_message, long_command_notice, read_stream, CliDialect, IdleStall,
-        OpenTool, OpenTools, ReadEnd, ReadLimits,
+        command_idle_window, idle_timeout_message, long_command_notice, read_stream, retry_idle_window, CliDialect,
+        IdleStall, OpenTool, OpenTools, ReadEnd, ReadLimits,
     };
     use serde_json::{json, Value};
     use std::time::{Duration, Instant};
@@ -18038,7 +18862,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
     }
 
@@ -18065,8 +18889,93 @@ mod cli_command_idle_tests {
             read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
         assert!(notes.is_empty());
+    }
+
+    fn api_retry(delay_ms: u64, error: &str) -> Value {
+        json!({"type": "system", "subtype": "api_retry", "attempt": 3, "max_retries": 10,
+            "retry_delay_ms": delay_ms, "error_status": 529, "error": error})
+    }
+
+    #[tokio::test]
+    async fn a_stage_waiting_out_an_api_retry_outlives_the_idle_window() {
+        // The retry's delay (600ms) is three times `idle` (200ms): the answer
+        // arriving 700ms later is still inside delay + idle.
+        let (end, notes, took) = read(
+            vec![Some(api_retry(600, "overloaded")), None, Some(result())],
+            Duration::from_millis(700),
+            true,
+            CliDialect::Claude,
+        )
+        .await;
+        assert!(matches!(end, ReadEnd::Eof(Some(_), _)), "got {end:?}");
+        assert!(took >= Duration::from_millis(700), "{took:?}");
+        assert!(notes.is_empty(), "a retry wait is not a long command: {notes:?}");
+    }
+
+    #[tokio::test]
+    async fn silence_past_the_retry_delay_plus_idle_still_stalls_and_names_the_retry() {
+        let (end, notes, took) = read(vec![Some(api_retry(600, "overloaded"))], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took >= Duration::from_millis(800), "{took:?}");
+        assert_eq!(stall.window, Duration::from_millis(800));
+        assert_eq!(stall.after_retry.as_deref(), Some("overloaded"));
+        assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_next_non_retry_line_goes_back_to_the_plain_window() {
+        let (end, _, took) = read(
+            vec![Some(api_retry(5000, "overloaded")), Some(tool_result("toolu_ghost"))],
+            Duration::ZERO,
+            false,
+            CliDialect::Claude,
+        )
+        .await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn a_retry_without_a_numeric_delay_keeps_the_plain_window() {
+        let bare = json!({"type": "system", "subtype": "api_retry", "error": "overloaded", "retry_delay_ms": "soon"});
+        let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[tokio::test]
+    async fn codex_ignores_a_retry_delay() {
+        let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(took < Duration::from_millis(1500), "{took:?}");
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+    }
+
+    #[test]
+    fn the_retry_window_is_the_delay_plus_the_plain_window() {
+        let idle = ReadLimits::STAGE.idle;
+        // `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS` at its 2.1.323 maximum.
+        assert_eq!(retry_idle_window(idle, Duration::from_millis(300_000)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::ZERO), idle);
+        // Longer waits (a 429 Retry-After, CLAUDE_CODE_RETRY_WATCHDOG) are
+        // capped at the 300s overload ceiling: about 10 minutes at most.
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(301)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::from_secs(3_600)), Duration::from_secs(600));
+        assert_eq!(retry_idle_window(idle, Duration::MAX), Duration::from_secs(600));
+    }
+
+    #[test]
+    fn a_stall_after_a_retry_names_it() {
+        let stall = |c: &str| IdleStall { tool: None, window: Duration::from_secs(600), after_retry: Some(c.into()) };
+        assert_eq!(
+            idle_timeout_message(&stall("overloaded")),
+            "timed out — no output for 10 minutes after an API retry (overloaded)"
+        );
+        assert_eq!(idle_timeout_message(&stall("")), "timed out — no output for 10 minutes after an API retry");
     }
 
     #[test]
@@ -18117,13 +19026,2496 @@ mod cli_command_idle_tests {
     fn idle_messages_name_the_open_call() {
         let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660) }),
+            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None }),
             "timed out — Bash `npm test` gave no result for 11 minutes"
         );
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300) }),
+            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None }),
             "timed out — no output for 5 minutes"
         );
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
+    }
+}
+
+#[cfg(test)]
+mod collision_tests {
+    use crate::collisions::{
+        CollisionCache, ScanInput, Severity, MAX_CONFIRMED_PAIRS, MAX_PAIR_FILES, MAX_UNTRACKED_DIR_FILES,
+        REPORT_TTL,
+    };
+    use sha2::{Digest, Sha256};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+    use tempfile::{tempdir, TempDir};
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    const LIMITS: &str = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\n";
+
+    /// A repo on `main` with a few files, plus `names` linked worktrees.
+    struct Fixture {
+        _dir: TempDir,
+        root: PathBuf,
+        wts: Vec<(String, PathBuf)>,
+    }
+
+    impl Fixture {
+        fn new(names: &[&str]) -> Self {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("repo");
+            std::fs::create_dir_all(root.join("src")).unwrap();
+            git(&root, &["init", "-q", "-b", "main"]);
+            git(&root, &["config", "user.email", "t@t.dev"]);
+            git(&root, &["config", "user.name", "T"]);
+            std::fs::write(root.join("src/limits.ts"), LIMITS).unwrap();
+            std::fs::write(root.join("src/plan.ts"), "plan\n").unwrap();
+            std::fs::write(root.join("README.md"), "readme\n").unwrap();
+            std::fs::write(root.join("package-lock.json"), "{\"v\":1}\n").unwrap();
+            git(&root, &["add", "."]);
+            git(&root, &["commit", "-qm", "base"]);
+            let mut wts = Vec::new();
+            for n in names {
+                let p = dir.path().join(format!("wt-{n}"));
+                git(&root, &["worktree", "add", "-q", "-b", n, p.to_str().unwrap(), "main"]);
+                git(&p, &["config", "user.email", "t@t.dev"]);
+                git(&p, &["config", "user.name", "T"]);
+                wts.push((n.to_string(), p));
+            }
+            Fixture { _dir: dir, root, wts }
+        }
+        fn wt(&self, name: &str) -> &Path {
+            &self.wts.iter().find(|(n, _)| n == name).unwrap().1
+        }
+        fn write_commit(&self, name: &str, file: &str, body: &str) {
+            let p = self.wt(name);
+            std::fs::write(p.join(file), body).unwrap();
+            git(p, &["add", "-A"]);
+            git(p, &["commit", "-qm", &format!("{name} edits {file}")]);
+        }
+        fn inputs(&self) -> Vec<ScanInput> {
+            self.wts
+                .iter()
+                .map(|(n, p)| ScanInput {
+                    id: format!("ws-{n}"),
+                    name: n.clone(),
+                    path: p.clone(),
+                    base: Some("main".into()),
+                })
+                .collect()
+        }
+        /// Everything a scan must leave untouched: the bytes and mtime of
+        /// every index (the main one and each `.git/worktrees/*/index`), each
+        /// worktree's status, every ref, and the object count. Hashed before
+        /// any git command runs, and the git commands use
+        /// `--no-optional-locks` so the snapshot itself never refreshes an
+        /// index.
+        fn snapshot(&self) -> String {
+            let gitdir = self.root.join(".git");
+            let mut indexes = vec![gitdir.join("index")];
+            let mut slots: Vec<PathBuf> = std::fs::read_dir(gitdir.join("worktrees"))
+                .unwrap()
+                .map(|e| e.unwrap().path().join("index"))
+                .collect();
+            slots.sort();
+            indexes.extend(slots);
+            let mut s = String::new();
+            for idx in &indexes {
+                let bytes = std::fs::read(idx).unwrap();
+                let mtime = std::fs::metadata(idx).unwrap().modified().unwrap();
+                let hash: String = Sha256::digest(&bytes).iter().map(|b| format!("{b:02x}")).collect();
+                s += &format!("{} {hash} {mtime:?}\n", idx.display());
+            }
+            let quiet = |dir: &Path, args: &[&str]| {
+                let mut all = vec!["--no-optional-locks"];
+                all.extend_from_slice(args);
+                git(dir, &all)
+            };
+            s += &quiet(&self.root, &["for-each-ref"]);
+            s += &quiet(&self.root, &["count-objects", "-v"]);
+            s += &quiet(&self.root, &["status", "--porcelain"]);
+            for (_, p) in &self.wts {
+                s += &quiet(p, &["status", "--porcelain"]);
+                s += &quiet(p, &["rev-parse", "HEAD"]);
+            }
+            s
+        }
+    }
+
+    fn replace_line(body: &str, from: &str, to: &str) -> String {
+        body.replacen(from, to, 1)
+    }
+
+    #[test]
+    fn no_overlap_reports_nothing() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        f.write_commit("gamma", "README.md", "readme c\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.scanned, 3);
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn same_file_that_merges_cleanly_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!((c.a.as_str(), c.b.as_str()), ("ws-alpha", "ws-beta"));
+        assert_eq!(c.files, vec!["src/limits.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.confirmed);
+        assert!(c.conflicting_files.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_conflict_is_reported_as_such() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        f.write_commit("gamma", "src/plan.ts", "gamma\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Conflict);
+        assert_eq!(c.conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_lockfile_only_overlap_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        std::fs::write(f.wt("beta").join("package-lock.json"), "{\"v\":1,\"b\":1}\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Lockfile);
+        assert!(crate::collisions::is_lockfile("web/pnpm-lock.yaml"));
+        assert!(!crate::collisions::is_lockfile("src/lock.ts"));
+    }
+
+    #[test]
+    fn uncommitted_changes_count_but_are_not_merge_confirmed() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Alpha: staged only. Beta: an untracked new file plus a worktree edit.
+        std::fs::write(f.wt("alpha").join("src/plan.ts"), "alpha plan\n").unwrap();
+        git(f.wt("alpha"), &["add", "src/plan.ts"]);
+        std::fs::write(f.wt("beta").join("src/plan.ts"), "beta plan\n").unwrap();
+        std::fs::write(f.wt("beta").join("notes.md"), "new\n").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files, vec!["src/plan.ts".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(!c.confirmed);
+    }
+
+    #[test]
+    fn a_rename_counts_its_old_path() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["mv", "src/plan.ts", "src/strategy.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "rename"]);
+        f.write_commit("beta", "src/plan.ts", "plan b\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        assert_eq!(report.collisions[0].files, vec!["src/plan.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_delete_against_an_edit_is_a_conflict() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        git(f.wt("alpha"), &["rm", "-q", "src/limits.ts"]);
+        git(f.wt("alpha"), &["commit", "-qm", "drop limits"]);
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        assert_eq!(report.collisions[0].severity, Severity::Conflict);
+        assert_eq!(report.collisions[0].conflicting_files, vec!["src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn the_same_file_in_three_workspaces_gives_every_pair() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "five", "FIVE"));
+        std::fs::write(f.wt("gamma").join("src/limits.ts"), replace_line(LIMITS, "ten", "TEN")).unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        let pairs: Vec<(&str, &str)> =
+            report.collisions.iter().map(|c| (c.a.as_str(), c.b.as_str())).collect();
+        assert_eq!(pairs, vec![("ws-alpha", "ws-beta"), ("ws-alpha", "ws-gamma"), ("ws-beta", "ws-gamma")]);
+        // Only the committed pair gets a merge-tree check.
+        let confirmed: Vec<bool> = report.collisions.iter().map(|c| c.confirmed).collect();
+        assert_eq!(confirmed, vec![true, false, false]);
+    }
+
+    #[test]
+    fn the_base_branch_moving_on_does_not_count() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        f.write_commit("beta", "README.md", "beta\n");
+        // main moves on and touches both files; neither workspace changed them.
+        std::fs::write(f.root.join("src/plan.ts"), "main\n").unwrap();
+        std::fs::write(f.root.join("README.md"), "main\n").unwrap();
+        git(&f.root, &["commit", "-qam", "main moves"]);
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "{report:?}");
+    }
+
+    #[test]
+    fn a_single_workspace_is_skipped() {
+        let f = Fixture::new(&["alpha"]);
+        f.write_commit("alpha", "src/plan.ts", "alpha\n");
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert!(report.collisions.is_empty());
+        assert_eq!(cache.stats.committed_diffs, 0);
+    }
+
+    #[test]
+    fn a_scan_modifies_no_worktree_index_ref_or_object() {
+        let f = Fixture::new(&["alpha", "beta", "gamma"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "alpha"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "one", "beta"));
+        // Gamma merges cleanly with alpha: libgit2 writes the merged blob
+        // during an automerge, which must land in memory, not on disk.
+        f.write_commit("gamma", "src/limits.ts", &replace_line(LIMITS, "ten", "gamma"));
+        std::fs::write(f.wt("gamma").join("scratch.txt"), "wip\n").unwrap();
+        let before = f.snapshot();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 3);
+        assert_eq!(f.snapshot(), before);
+    }
+
+    #[test]
+    fn scans_are_throttled_and_cached() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        let first = cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(first.collisions.len(), 1);
+        assert_eq!((cache.stats.scans, cache.stats.committed_diffs, cache.stats.merges), (1, 2, 1));
+
+        // Within the TTL the report is reused, even though a file changed.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        let again = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(again, first);
+        assert_eq!(cache.stats.scans, 1);
+
+        // Past the TTL it rescans; HEADs are unchanged, so neither committed
+        // diff nor the merge confirmation runs again.
+        let later = cache.scan_throttled("p", &inputs, t0 + REPORT_TTL + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!((cache.stats.committed_diffs, cache.stats.merges), (2, 1));
+        assert_eq!(later.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A changed workspace list invalidates the report at once.
+        let fewer = cache.scan_throttled("p", &inputs[..1], t0 + REPORT_TTL + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert!(fewer.collisions.is_empty());
+    }
+
+    #[test]
+    fn force_and_a_new_commit_bypass_the_report_ttl() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let inputs = f.inputs();
+        let mut cache = CollisionCache::default();
+        let t0 = Instant::now();
+        cache.scan_throttled("p", &inputs, t0, REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+
+        // An uncommitted edit within the TTL: reused unless forced.
+        std::fs::write(f.wt("alpha").join("README.md"), "alpha\n").unwrap();
+        std::fs::write(f.wt("beta").join("README.md"), "beta\n").unwrap();
+        cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 1);
+        let forced = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(1), REPORT_TTL, true);
+        assert_eq!(cache.stats.scans, 2);
+        assert_eq!(forced.collisions[0].files, vec!["README.md".to_string(), "src/limits.ts".to_string()]);
+
+        // A commit moves HEAD: the cached report is stale at once, no force needed.
+        f.write_commit("alpha", "src/plan.ts", "alpha plan\n");
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let after = cache.scan_throttled("p", &inputs, t0 + Duration::from_secs(2), REPORT_TTL, false);
+        assert_eq!(cache.stats.scans, 3);
+        assert_eq!(after.collisions[0].severity, Severity::Conflict);
+    }
+
+    #[test]
+    fn a_lockfile_conflict_alone_is_low_severity() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert!(c.confirmed, "both sides committed the lockfile, so a merge check ran");
+        assert_eq!(c.severity, Severity::Lockfile);
+        assert!(c.conflicting_files.is_empty(), "{c:?}");
+    }
+
+    #[test]
+    fn a_lockfile_conflict_plus_a_clean_overlap_is_an_overlap() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        f.write_commit("alpha", "package-lock.json", "{\"v\":1,\"a\":1}\n");
+        f.write_commit("beta", "package-lock.json", "{\"v\":1,\"b\":1}\n");
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/limits.ts", &replace_line(LIMITS, "ten", "TEN"));
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.severity, Severity::Overlap);
+        assert!(c.conflicting_files.is_empty(), "the lockfile is not counted: {c:?}");
+        assert_eq!(c.files, vec!["package-lock.json".to_string(), "src/limits.ts".to_string()]);
+    }
+
+    #[test]
+    fn a_large_untracked_dir_collapses_and_pair_files_are_capped() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // A big untracked dir on each side collapses to one `gen/` entry.
+        for wt in ["alpha", "beta"] {
+            let dir = f.wt(wt).join("gen");
+            std::fs::create_dir_all(&dir).unwrap();
+            for i in 0..=MAX_UNTRACKED_DIR_FILES {
+                std::fs::write(dir.join(format!("f{i}.txt")), wt).unwrap();
+            }
+        }
+        // A small untracked dir keeps its files.
+        let small = f.wt("alpha").join("small");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("one.txt"), "1").unwrap();
+        let repo = git2::Repository::open(f.wt("alpha")).unwrap();
+        let set = crate::collisions::uncommitted_paths(&repo);
+        assert!(set.contains("gen/"), "{set:?}");
+        assert!(set.contains("small/one.txt"), "{set:?}");
+        assert!(!set.iter().any(|p| p.starts_with("gen/f")), "{set:?}");
+
+        // More shared files than the IPC cap: the list stops, the rest is counted.
+        let total = MAX_PAIR_FILES + 7;
+        for wt in ["alpha", "beta"] {
+            let src = f.wt(wt).join("src");
+            for i in 0..total {
+                std::fs::write(src.join(format!("m{i:03}.ts")), wt).unwrap();
+            }
+        }
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1);
+        let c = &report.collisions[0];
+        assert_eq!(c.files.len(), MAX_PAIR_FILES);
+        // `gen/` + every src/mNNN.ts
+        assert_eq!(c.files.len() + c.truncated, total + 1);
+    }
+
+    #[test]
+    fn past_the_pair_cap_the_scan_is_marked_capped() {
+        // 9 workspaces all committing the same file = 36 pairs > the 32 cap.
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8", "w9"];
+        assert!(names.len() * (names.len() - 1) / 2 > MAX_CONFIRMED_PAIRS);
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+        }
+        let mut cache = CollisionCache::default();
+        let report = cache.scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 36);
+        assert!(report.capped);
+        assert_eq!(report.collisions.iter().filter(|c| c.confirmed).count(), MAX_CONFIRMED_PAIRS);
+        assert_eq!(cache.stats.merges, MAX_CONFIRMED_PAIRS);
+    }
+
+    /// Point `refs/remotes/origin/main` at `rev` in the shared repo.
+    fn set_origin_main(f: &Fixture, rev: &str) {
+        let oid = git(&f.root, &["rev-parse", rev]);
+        git(&f.root, &["update-ref", "refs/remotes/origin/main", oid.trim()]);
+    }
+
+    #[test]
+    fn a_newer_origin_base_is_used_over_a_stale_local_one() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main moves on (touching plan.ts); local main stays behind.
+        git(&f.root, &["switch", "-q", "-c", "upstream"]);
+        std::fs::write(f.root.join("src/plan.ts"), "upstream\n").unwrap();
+        git(&f.root, &["commit", "-qam", "upstream moves"]);
+        set_origin_main(&f, "HEAD");
+        git(&f.root, &["switch", "-q", "main"]);
+        // Alpha starts from origin/main; beta from the stale local main.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "origin/main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "upstream's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn a_newer_local_base_is_used_over_a_stale_origin() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // origin/main stays at the base; local main moves on (touching plan.ts).
+        set_origin_main(&f, "main");
+        std::fs::write(f.root.join("src/plan.ts"), "local\n").unwrap();
+        git(&f.root, &["commit", "-qam", "local main moves"]);
+        // Alpha starts from the newer local main; beta from the old base.
+        git(f.wt("alpha"), &["reset", "-q", "--hard", "main"]);
+        f.write_commit("alpha", "src/limits.ts", &replace_line(LIMITS, "one", "ONE"));
+        f.write_commit("beta", "src/plan.ts", "beta plan\n");
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.collisions.is_empty(), "local main's plan.ts is not alpha's: {report:?}");
+    }
+
+    #[test]
+    fn eight_live_workspaces_stay_cheap() {
+        let names = ["w1", "w2", "w3", "w4", "w5", "w6", "w7", "w8"];
+        let f = Fixture::new(&names);
+        for (i, n) in names.iter().enumerate() {
+            // Every workspace edits its own line of the shared file and a file of its own.
+            let body = LIMITS.lines().enumerate()
+                .map(|(j, l)| if j == i { format!("{l}-{n}\n") } else { format!("{l}\n") })
+                .collect::<String>();
+            f.write_commit(n, "src/limits.ts", &body);
+            f.write_commit(n, &format!("{n}.txt"), "own\n");
+        }
+        let mut cache = CollisionCache::default();
+        let started = Instant::now();
+        let report = cache.scan(&f.inputs());
+        let cold = started.elapsed();
+        assert_eq!(report.collisions.len(), 28);
+        assert!(!report.capped);
+        let started = Instant::now();
+        cache.scan(&f.inputs());
+        let warm = started.elapsed();
+        assert_eq!(cache.stats.merges, 28, "warm scan reuses every merge confirmation");
+        assert!(cold < Duration::from_secs(10), "cold scan took {cold:?}");
+        assert!(warm < Duration::from_secs(3), "warm scan took {warm:?}");
+    }
+}
+
+// ─── Secret guard (#730) ────────────────────────────────────────────────
+//
+// Every credential-shaped string here is ASSEMBLED AT RUNTIME from fragments
+// and a seeded generator, so this source file never holds anything a scanner
+// (ours, GitHub push protection) would flag.
+#[cfg(test)]
+mod secret_guard_tests {
+    use crate::secret_scan::*;
+    use std::path::Path;
+
+    /// Deterministic pseudo-random string over `alphabet`.
+    fn rnd(seed: u64, len: usize, alphabet: &str) -> String {
+        let a: Vec<char> = alphabet.chars().collect();
+        let mut x = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        (0..len)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                a[((x >> 33) as usize) % a.len()]
+            })
+            .collect()
+    }
+    const B62: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const B64: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const DIGITS: &str = "123456789";
+
+    fn file(path: &str, lines: &[&str]) -> AddedFile {
+        AddedFile {
+            path: path.into(),
+            is_new: true,
+            lines: lines.iter().enumerate().map(|(i, l)| (i as u32 + 1, l.to_string())).collect(),
+        }
+    }
+
+    fn scan_one(path: &str, lines: &[&str]) -> Vec<SecretFinding> {
+        scan_added(&[file(path, lines)], &[])
+    }
+
+    /// (rule id, the secret itself, the line holding it)
+    fn true_positives() -> Vec<(&'static str, String, String)> {
+        let mut v = Vec::new();
+        let ant = ["sk-", "ant-", "api03-"].concat() + &rnd(1, 93, B62) + "AA";
+        v.push(("anthropic-key", ant.clone(), format!("const KEY = \"{ant}\";")));
+        let proj = ["sk-", "proj-"].concat() + &rnd(2, 64, B62);
+        v.push(("openai-key", proj.clone(), format!("OPENAI={proj}")));
+        let legacy = format!("sk-{}{}{}", rnd(3, 20, B62), ["T3Blbk", "FJ"].concat(), rnd(4, 20, B62));
+        v.push(("openai-key", legacy.clone(), format!("key: '{legacy}'")));
+        let plain48 = format!("sk-{}", rnd(5, 48, B62));
+        v.push(("openai-key", plain48.clone(), format!("let k = \"{plain48}\"")));
+        let ghp = ["gh", "p_"].concat() + &rnd(6, 36, B62);
+        v.push(("github-token", ghp.clone(), format!("token = \"{ghp}\"")));
+        let gho = ["gh", "o_"].concat() + &rnd(7, 36, B62);
+        v.push(("github-token", gho.clone(), format!("{gho}")));
+        let pat = ["github", "_pat_", "11"].concat() + &rnd(8, 20, B62) + "_" + &rnd(9, 59, B62);
+        v.push(("github-token", pat.clone(), format!("GH_TOKEN: {pat}")));
+        let stripe = ["sk", "_live_"].concat() + &rnd(10, 24, B62);
+        v.push(("stripe-key", stripe.clone(), format!("stripe.key = \"{stripe}\"")));
+        let slack = format!("{}{}-{}-{}", "xox", "b", rnd(11, 12, DIGITS), rnd(12, 24, B62));
+        v.push(("slack-token", slack.clone(), format!("SLACK={slack}")));
+        let google = ["AI", "za"].concat() + &rnd(13, 35, B62);
+        v.push(("google-api-key", google.clone(), format!("apiKey: \"{google}\",")));
+        v
+    }
+
+    #[test]
+    fn every_prefixed_rule_finds_its_true_positive() {
+        for (rule, secret, line) in true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: expected one finding");
+            assert_eq!(f[0].rule, rule);
+            assert_eq!(f[0].line, Some(1));
+            assert_eq!(f[0].file, "src/config.ts");
+            assert!(!f[0].yours);
+            // A prefixed key is a leak in a fixture too.
+            assert_eq!(scan_one("tests/fixtures/a.ts", &[&line]).len(), 1, "{rule} in a test path");
+            let _ = secret;
+        }
+    }
+
+    #[test]
+    fn prefixed_lookalikes_do_not_match() {
+        let x40 = "x".repeat(44);
+        let near = vec![
+            format!("sk-ant-{x40}"),                                   // placeholder
+            format!("{}{}", ["sk-", "ant-", "api03-"].concat(), "short"), // too short
+            format!("sk-proj-your-key-here-{}", "0".repeat(30)),       // placeholder
+            format!("{}{}", ["gh", "p_"].concat(), rnd(20, 35, B62)), // 35 chars: too short
+            format!("{}{}", ["gh", "p_"].concat(), rnd(21, 37, B62)), // 37 chars: runs on
+            format!("{}{}", ["sk", "_test_"].concat(), rnd(22, 24, B62)), // a test-mode key
+            "xoxb-your-token-goes-here".to_string(),
+            format!("task-{}", rnd(23, 48, B62)),                      // no word boundary
+            format!("{}{}", ["AI", "za"].concat(), rnd(24, 30, B62)), // too short
+            format!("sk-{}", "abcdefghij".repeat(5)),                  // low randomness
+            "Bearer <your-token>".to_string(),
+        ];
+        for line in near {
+            assert!(scan_one("src/a.ts", &[&line]).is_empty(), "false positive on {line:?}");
+        }
+    }
+
+    #[test]
+    fn aws_needs_the_key_id_and_a_secret_nearby() {
+        let id = ["AK", "IA"].concat() + &rnd(30, 16, UPPER);
+        let secret = rnd(31, 40, B64);
+        let both = scan_one("deploy/creds.ini", &[
+            "[default]",
+            &format!("aws_access_key_id = {id}"),
+            &format!("aws_secret_access_key = {secret}"),
+        ]);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].rule, "aws-access-key");
+        assert_eq!(both[0].line, Some(2));
+        // Same-line CSV form.
+        let csv = scan_one("creds.csv", &[&format!("{id},{secret}")]);
+        assert_eq!(csv.len(), 1);
+        // The key id alone is not enough.
+        assert!(scan_one("a.txt", &[&format!("user = {id}")]).is_empty());
+        // AWS's own documentation example is a placeholder.
+        let doc_id = ["AK", "IA", "IOSFODNN7", "EXAMPLE"].concat();
+        let doc_secret = ["wJalrXUtnFEMI/K7MDENG/bPxRfiCY", "EXAMPLE", "KEY"].concat();
+        assert!(scan_one("README.md", &[
+            &format!("aws_access_key_id = {doc_id}"),
+            &format!("aws_secret_access_key = {doc_secret}"),
+        ]).is_empty());
+    }
+
+    #[test]
+    fn private_keys_need_key_material_under_the_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let body = rnd(40, 64, B64);
+        let f = scan_one("deploy/key.pem", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "private-key");
+        // Inline in JSON, with an escaped newline.
+        let inline = format!("\"private_key\": \"{}\\n{}\\n\"", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat(), body);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+        // Code that only mentions the header is not a key.
+        let code = format!("if pem.starts_with(\"{}\") {{", ["-----BEGIN ", "PRIVATE", " KEY-----"].concat());
+        assert!(scan_one("src/pem.rs", &[&code, "    return true;", "}"]).is_empty());
+    }
+
+    #[test]
+    fn env_files_flag_credential_named_variables_only() {
+        let pw = rnd(41, 18, B62);
+        let f = scan_one(".env", &[
+            "LOG_LEVEL=debug",
+            "API_URL=https://api.example.org",
+            "AUTH_ENABLED=true",
+            "TOKEN=${OTHER_TOKEN}",
+            "PORT=8080",
+            &format!("DATABASE_PASSWORD=\"{pw}\""),
+        ]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "env-credential");
+        assert_eq!(f[0].line, Some(6));
+        assert!(f[0].kind.contains("DATABASE_PASSWORD"));
+        assert_eq!(scan_one("apps/web/.env.local", &[&format!("SECRET_KEY={pw}")]).len(), 1);
+        // Templates are committed on purpose.
+        assert!(scan_one(".env.example", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        assert!(scan_one(".env.sample", &[&format!("SECRET_KEY={pw}")]).is_empty());
+        // A URL with credentials in it is one.
+        let url = format!("DATABASE_URL_AUTH=postgres://app:{pw}@db/app");
+        assert!(scan_one(".env", &[&url]).len() == 1 || !url.starts_with("http"));
+        let http = format!("AUTH_URL=https://user:{pw}@host/x");
+        assert_eq!(scan_one(".env", &[&http]).len(), 1);
+    }
+
+    #[test]
+    fn generic_assignment_is_entropy_gated_and_quiet_in_tests() {
+        let v = rnd(50, 32, B62);
+        let line = format!("const apiKey = \"{v}\";");
+        let f = scan_one("src/config.ts", &[&line]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "generic-secret");
+        assert!(scan_one("tests/config.test.ts", &[&line]).is_empty(), "test paths are quiet");
+        assert!(scan_one("src/__mocks__/api.ts", &[&line]).is_empty());
+        let near = [
+            "password = \"correcthorsebatterystaple\"".to_string(),   // no digits, low entropy
+            format!("secret = \"{}\"", rnd(51, 40, "0123456789abcdef")), // hex: ≤ 4 bits/char
+            "api_key = \"your-api-key-goes-here-123\"".to_string(),
+            "auth_token = \"{{ secrets.AUTH_TOKEN_VALUE_2 }}\"".to_string(),
+            "client_secret = \"https://vault.local/secret/path/1\"".to_string(),
+        ];
+        for l in near {
+            assert!(scan_one("src/a.py", &[&l]).is_empty(), "false positive on {l:?}");
+        }
+    }
+
+    #[test]
+    fn placeholders_are_suppressed() {
+        for p in ["xxxxxxxxxxxxxxxxxxxx", "your-key-here", "<token>", "AKIAIOSFODNN7EXAMPLE", "REDACTED", "aaaaaaaaaaaaaaaaaa", "changeme"] {
+            assert!(is_placeholder(p), "{p}");
+        }
+        assert!(!is_placeholder(&rnd(60, 40, B62)));
+    }
+
+    #[test]
+    fn the_canary_names_your_own_configured_key() {
+        let mine = format!("zq{}", rnd(70, 30, B62)); // matches no pattern
+        let mut settings = crate::settings::AppSettings::default();
+        settings.provider_keys.insert("anthropic".into(), mine.clone());
+        settings.provider_keys.insert("short".into(), "tooshort".into());
+        let known = known_secrets_from(&settings);
+        assert_eq!(known.len(), 1, "a too-short credential is never matched");
+        assert!(!format!("{known:?}").contains(&mine), "Debug redacts the value");
+        let f = scan_added(&[file("scripts/seed.js", &["// setup", &format!("client({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "your-credential");
+        assert_eq!(f[0].kind, "your Anthropic API key");
+        assert!(f[0].yours);
+        assert_eq!(f[0].line, Some(2));
+        // The canary wins over a pattern on the same line.
+        let (_, ant, line) = true_positives().remove(0);
+        let known = vec![KnownSecret::new("your Anthropic API key", ant)];
+        let f = scan_added(&[file("a.ts", &[&line])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+    }
+
+    #[test]
+    fn a_newly_added_ssh_key_file_is_flagged_by_name() {
+        let f = scan_added(&[AddedFile { path: "deploy/id_rsa".into(), is_new: true, lines: vec![] }], &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].rule, "ssh-private-key-file");
+        assert_eq!(f[0].line, None);
+        assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, lines: vec![] }], &[]).is_empty());
+    }
+
+    /// The secret never reaches a finding's Debug/Serialize output, the
+    /// error's Display or its IPC form, the summary, the journal notice, the
+    /// persisted hold or its fingerprint.
+    #[test]
+    fn no_secret_value_appears_in_any_output() {
+        let mut lines = Vec::new();
+        let mut secrets = Vec::new();
+        for (_, secret, line) in true_positives() {
+            secrets.push(secret);
+            lines.push(line);
+        }
+        let mine = format!("zq{}", rnd(80, 30, B62));
+        lines.push(format!("x = {mine}"));
+        secrets.push(mine.clone());
+        let known = vec![KnownSecret::new("your OpenAI API key", mine)];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let findings = scan_added(&[file("src/leak.ts", &refs)], &known);
+        assert_eq!(findings.len(), secrets.len());
+
+        let report = scan_report(&[file("src/leak.ts", &refs)], &known, false);
+        let err = crate::error::AppError::SecretsFound {
+            findings: findings.clone(), total: report.total, partial: false, fingerprint: report.fingerprint.clone(),
+        };
+        let hold = SecretHold::from_report(report);
+        let outputs = [
+            format!("{findings:?}"),
+            serde_json::to_string(&findings).unwrap(),
+            err.to_string(),
+            format!("{err:?}"),
+            serde_json::to_string(&err).unwrap(),
+            refusal_summary(&findings, findings.len(), true),
+            hold_notice("the pull request", &hold),
+            serde_json::to_string(&hold).unwrap(),
+            format!("{known:?}"),
+        ];
+        for out in &outputs {
+            for s in &secrets {
+                assert!(!out.contains(s.as_str()), "a secret leaked into {out}");
+                // Not even a recognisable tail of it.
+                assert!(!out.contains(&s[s.len() - 8..]), "a secret's tail leaked into {out}");
+            }
+        }
+        let ipc: serde_json::Value = serde_json::to_value(&err).unwrap();
+        assert_eq!(ipc["kind"], "SecretsFound");
+        assert_eq!(ipc["findings"][0]["file"], "src/leak.ts");
+        assert_eq!(ipc["findings"][0]["line"], 1);
+        assert_eq!(ipc["total"], secrets.len());
+        assert_eq!(ipc["partial"], false);
+        assert_eq!(ipc["fingerprint"].as_str().unwrap().len(), 64);
+    }
+
+    #[test]
+    fn summary_and_notice_read_kind_file_and_line() {
+        let f = scan_one("tests/fixtures.ts", &["", "", "", "", "", "", "", "", "", "", "", &true_positives()[0].2]);
+        assert_eq!(refusal_summary(&f, 1, false), "Anthropic API key in tests/fixtures.ts:12");
+        let tp = true_positives().remove(0).2;
+        let lines = ["", "", "", "", "", "", "", "", "", "", "", tp.as_str()];
+        let hold = SecretHold::from_report(scan_report(&[file("tests/fixtures.ts", &lines)], &[], false));
+        assert_eq!(
+            hold_notice("the pull request", &hold),
+            "Held before the pull request: possible secret · Anthropic API key in tests/fixtures.ts:12"
+        );
+        let partial = SecretHold::from_report(scan_report(&[], &[], true));
+        assert_eq!(
+            hold_notice("the push", &partial),
+            "Held before the push: secret scan incomplete · scanned the first 16 MB; the rest wasn't checked"
+        );
+        assert_eq!(
+            hold_notice("the push", &SecretHold::unreadable()),
+            "Held before the push: the secret guard couldn't read the worktree's changes, so nothing was checked"
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_every_finding_the_value_and_partial_not_order() {
+        let tps = true_positives();
+        let a = file("a.ts", &[tps[0].2.as_str()]);
+        let b = file("b.ts", &[tps[1].2.as_str()]);
+        let fp = |files: &[AddedFile], partial: bool| scan_report(files, &[], partial).fingerprint;
+        assert_eq!(fp(&[a.clone(), b.clone()], false), fp(&[b.clone(), a.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone(), b.clone()], false));
+        assert_ne!(fp(&[a.clone()], false), fp(&[a.clone()], true), "a partial scan is a different question");
+        // Same file, line and rule, a different value: a different fingerprint.
+        let other = ["sk-", "ant-", "api03-"].concat() + &rnd(99, 93, B62) + "AA";
+        let a2 = file("a.ts", &[&format!("const KEY = \"{other}\";")]);
+        assert_eq!(scan_added(&[a2.clone()], &[])[0].rule, "anthropic-key");
+        assert_ne!(fp(&[a.clone()], false), fp(&[a2], false));
+        // Past the display cap: the 51st finding still changes it.
+        let many: Vec<String> = (0..MAX_FINDINGS + 1)
+            .map(|i| format!("k = \"{}\"", ["gh", "p_"].concat() + &rnd(1000 + i as u64, 36, B62)))
+            .collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let full = scan_report(&[file("m.ts", &refs)], &[], false);
+        assert_eq!(full.findings.len(), MAX_FINDINGS);
+        assert_eq!(full.total, MAX_FINDINGS + 1);
+        let capped = scan_report(&[file("m.ts", &refs[..MAX_FINDINGS])], &[], false);
+        assert_eq!(capped.findings, full.findings, "the shown list is identical");
+        assert_ne!(capped.fingerprint, full.fingerprint, "but the fingerprint is not");
+        // The fingerprint holds no part of any value.
+        for (_, secret, _) in tps {
+            assert!(!full.fingerprint.contains(&secret[secret.len() - 8..]));
+        }
+    }
+
+    // ── git-level collection ────────────────────────────────────────────
+
+    fn sig() -> git2::Signature<'static> {
+        git2::Signature::now("Test", "test@example.invalid").unwrap()
+    }
+
+    fn commit_all(repo: &git2::Repository, msg: &str) -> git2::Oid {
+        let mut idx = repo.index().unwrap();
+        idx.add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(Some("HEAD"), &sig(), &sig(), msg, &tree, &parents).unwrap()
+    }
+
+    fn stage(repo: &git2::Repository, rel: &str) {
+        let mut idx = repo.index().unwrap();
+        idx.add_path(Path::new(rel)).unwrap();
+        idx.write().unwrap();
+    }
+
+    /// A repo with one clean commit on `main`.
+    fn repo() -> (tempfile::TempDir, git2::Repository) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hello\n").unwrap();
+        commit_all(&repo, "init");
+        {
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("main", &head, true).unwrap();
+        }
+        repo.set_head("refs/heads/main").unwrap();
+        (dir, repo)
+    }
+
+    /// Point `settings.json` at a temp file for this thread.
+    struct SettingsGuard(tempfile::TempDir);
+    impl SettingsGuard {
+        fn new(json: serde_json::Value) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("settings.json");
+            std::fs::write(&p, json.to_string()).unwrap();
+            crate::settings::test_settings_path::set(Some(p));
+            SettingsGuard(dir)
+        }
+    }
+    impl Drop for SettingsGuard {
+        fn drop(&mut self) {
+            crate::settings::test_settings_path::set(None);
+        }
+    }
+
+    #[test]
+    fn staged_scan_sees_only_what_is_staged() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("staged.ts"), format!("a\n{line}\n")).unwrap();
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "staged.ts");
+        let f = scan_added(&staged_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].location(), "staged.ts:2");
+    }
+
+    #[test]
+    fn push_and_pr_scans_cover_every_commit_on_the_branch() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("leak.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add");
+        // Removed in the next commit: still in the history being pushed.
+        std::fs::write(dir.path().join("leak.ts"), "clean\n").unwrap();
+        commit_all(&repo, "remove");
+        let pr = scan_added(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_eq!(pr.len(), 1, "{pr:?}");
+        assert_eq!(pr[0].rule, "openai-key");
+        // No remote: a first push sends the whole history.
+        let push = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(push.len(), 1);
+        // Main itself is clean against main.
+        repo.set_head("refs/heads/main").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+        assert!(scan_added(&pr_files(dir.path(), "main").unwrap(), &[]).is_empty());
+    }
+
+    #[test]
+    fn worktree_scan_includes_untracked_files_and_skips_ignored_ones() {
+        let (dir, _repo) = repo();
+        let line = true_positives().remove(4).2;
+        std::fs::write(dir.path().join(".gitignore"), "ignored.ts\n").unwrap();
+        std::fs::write(dir.path().join("ignored.ts"), format!("{line}\n")).unwrap();
+        std::fs::create_dir_all(dir.path().join("tests/fixtures")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures/data.ts"), format!("x\n{line}\n")).unwrap();
+        let f = scan_added(&worktree_files(dir.path(), Some("main")).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "tests/fixtures/data.ts:2");
+    }
+
+    /// Scanning a 5,000-line staged diff stays far below a click's latency.
+    #[test]
+    fn a_5k_line_diff_scans_fast() {
+        let (dir, repo) = repo();
+        let mut body = String::new();
+        for i in 0..5000 {
+            body.push_str(&format!(
+                "export const value{i} = computeToken(\"key-{i}\", {{ secret: process.env.SECRET_{i}, password: input }});\n"
+            ));
+        }
+        std::fs::write(dir.path().join("big.ts"), &body).unwrap();
+        stage(&repo, "big.ts");
+        let start = std::time::Instant::now();
+        let files = staged_files(dir.path()).unwrap();
+        let f = scan_added(&files, &[]);
+        let took = start.elapsed();
+        assert_eq!(files[0].lines.len(), 5000);
+        assert!(f.is_empty(), "{f:?}");
+        assert!(took < std::time::Duration::from_millis(1500), "took {took:?}");
+    }
+
+    // ── block points: commit, amend, push, pull request ────────────────
+
+    #[tokio::test]
+    async fn commit_amend_push_and_pr_refuse_a_change_with_a_secret() {
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        stage(&repo, "cfg.ts");
+        let path = dir.path().to_string_lossy().to_string();
+
+        let commit = crate::commands::commit_changes(path.clone(), "msg".into(), None).await;
+        let amend = crate::commands::amend_commit(path.clone(), "msg".into(), Some("stale".into())).await;
+        for r in [commit, amend] {
+            match r {
+                Err(crate::error::AppError::SecretsFound { findings, .. }) => {
+                    assert_eq!(findings[0].location(), "cfg.ts:1");
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
+        }
+        // Nothing was committed.
+        assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap(), Some("init"));
+
+        commit_all(&repo, "leak");
+        let push = crate::commands::push_branch(path.clone(), None).await;
+        let e = push.expect_err("push refused");
+        assert!(matches!(e, crate::error::AppError::SecretsFound { .. }));
+        assert!(!e.to_string().contains(&secret));
+
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        // `main` must not contain the leak for a PR from feature: rewind it.
+        let init = head.parent(0).unwrap();
+        repo.branch("main", &init, true).unwrap();
+        let pr = crate::commands::create_pull_request(path, "main".into(), "t".into(), "b".into(), false, None).await;
+        assert!(matches!(pr, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn confirming_or_turning_the_guard_off_restores_todays_path() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(5).2;
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "leak");
+        let path = dir.path().to_string_lossy().to_string();
+        // Explicit confirm for this one push, bound to what the dialog showed:
+        // the guard steps aside and git runs (and fails here only because
+        // there is no remote).
+        {
+            let _s = SettingsGuard::new(serde_json::json!({}));
+            let shown = match crate::commands::push_branch(path.clone(), None).await {
+                Err(crate::error::AppError::SecretsFound { fingerprint, .. }) => fingerprint,
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            };
+            let r = crate::commands::push_branch(path.clone(), Some(shown.clone())).await;
+            assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // A fingerprint that doesn't match the fresh scan is refused.
+            let r = crate::commands::push_branch(path.clone(), Some("0".repeat(64))).await;
+            assert!(matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+            // A new secret after the dialog: the old fingerprint no longer
+            // covers it, and the refusal carries the new findings.
+            let more = true_positives().remove(4).2;
+            std::fs::write(dir.path().join("more.ts"), format!("{more}\n")).unwrap();
+            commit_all(&repo, "more");
+            match crate::commands::push_branch(path.clone(), Some(shown)).await {
+                Err(crate::error::AppError::SecretsFound { findings, total, .. }) => {
+                    assert_eq!(total, 2);
+                    assert!(findings.iter().any(|f| f.file == "more.ts"));
+                }
+                other => panic!("expected SecretsFound, got {:?}", other.map(|_| ())),
+            }
+        }
+        // Setting off: no scan at all.
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let r = crate::commands::push_branch(path, None).await;
+        assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    const HEX: &str = "0123456789abcdef";
+    const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+
+    /// (rule id, line) for the provider formats added after review. Formats:
+    /// TruffleHog's openrouter/xai/groq detectors; gitleaks' huggingface,
+    /// gitlab-pat, npm-access-token and slack-app-token rules.
+    fn more_true_positives() -> Vec<(&'static str, String)> {
+        vec![
+            ("openrouter-key", format!("OPENROUTER_API_KEY={}", ["sk-", "or-", "v1-"].concat() + &rnd(200, 64, HEX))),
+            ("xai-key", format!("const k = \"{}\";", ["xa", "i-"].concat() + &rnd(201, 80, B62))),
+            ("groq-key", format!("groq = '{}'", ["gs", "k_"].concat() + &rnd(202, 52, B62))),
+            ("huggingface-token", format!("HF_TOKEN: {}", ["h", "f_"].concat() + &rnd(203, 34, LETTERS))),
+            ("gitlab-token", format!("token = \"{}\"", ["gl", "pat-"].concat() + &rnd(204, 20, B62))),
+            ("npm-token", format!("//registry.npmjs.org/:_authToken={}", ["np", "m_"].concat() + &rnd(205, 36, B62))),
+            ("slack-token", format!(
+                "SLACK_APP={}-1-A{}-{}-{}",
+                ["xa", "pp"].concat(), rnd(206, 10, UPPER), rnd(207, 13, DIGITS), rnd(208, 64, HEX)
+            )),
+        ]
+    }
+
+    #[test]
+    fn the_added_provider_rules_find_their_true_positives() {
+        for (rule, line) in more_true_positives() {
+            let f = scan_one("src/config.ts", &[&line]);
+            assert_eq!(f.len(), 1, "{rule}: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+    }
+
+    #[test]
+    fn the_added_provider_rules_skip_near_misses() {
+        let near = vec![
+            ["sk-", "or-", "v1-"].concat() + &rnd(210, 63, HEX),           // 63 hex
+            ["sk-", "or-", "v1-"].concat() + &rnd(211, 64, B62),           // not hex
+            ["xa", "i-"].concat() + &rnd(212, 79, B62),                    // 79
+            ["xa", "i-"].concat() + &rnd(213, 81, B62),                    // runs on
+            ["gs", "k_"].concat() + &rnd(214, 51, B62),                    // 51
+            ["h", "f_"].concat() + &rnd(215, 33, LETTERS),                 // 33
+            ["h", "f_"].concat() + &rnd(216, 34, LETTERS) + "7",           // runs on
+            ["gl", "pat-"].concat() + &rnd(217, 19, B62),                  // 19
+            ["gl", "pat-"].concat() + &"x".repeat(20),                     // placeholder
+            ["np", "m_"].concat() + &rnd(218, 35, B62),                    // 35
+            ["xa", "pp"].concat() + "-your-app-token-here",
+        ];
+        for t in near {
+            assert!(scan_one("src/a.ts", &[&format!("k = \"{t}\"")]).is_empty(), "false positive on {t:?}");
+        }
+    }
+
+    #[test]
+    fn an_encrypted_pem_key_is_still_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let f = scan_one("deploy/key.pem", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "private-key");
+        let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);
+        assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
+    }
+
+    #[test]
+    fn public_by_design_values_are_not_flagged() {
+        let google = ["AI", "za"].concat() + &rnd(220, 35, B62);
+        // A Firebase web config's apiKey is a public identifier.
+        let fb = scan_one("src/firebase.ts", &[
+            "const firebaseConfig = {",
+            &format!("  apiKey: \"{google}\","),
+            "  authDomain: \"demo-app.firebaseapp.com\",",
+            "  projectId: \"demo-app\",",
+            "};",
+        ]);
+        assert!(fb.is_empty(), "{fb:?}");
+        // The same key outside a Firebase config still is one.
+        assert_eq!(scan_one("src/maps.ts", &[&format!("const apiKey = \"{google}\";")]).len(), 1);
+        // NEXT_PUBLIC_* values ship to the browser on purpose…
+        let v = rnd(221, 32, B62);
+        assert!(scan_one(".env.local", &[&format!("NEXT_PUBLIC_API_KEY={v}")]).is_empty());
+        assert!(scan_one(".env", &[&format!("NEXT_PUBLIC_FIREBASE_API_KEY={google}")]).is_empty());
+        assert!(scan_one("src/env.ts", &[&format!("  NEXT_PUBLIC_API_KEY: \"{v}\",")]).is_empty());
+        // …but a provider secret there is still a leak.
+        let stripe = ["sk", "_live_"].concat() + &rnd(222, 24, B62);
+        assert_eq!(scan_one(".env", &[&format!("NEXT_PUBLIC_STRIPE_KEY={stripe}")])[0].rule, "stripe-key");
+        // An example JWT in prose docs is an illustration; in code it isn't.
+        let jwt = format!("eyJ{}.eyJ{}.{}", rnd(223, 30, B62), rnd(224, 60, B62), rnd(225, 43, B62));
+        let line = format!("\"access_token\": \"{jwt}\"");
+        assert!(scan_one("README.md", &[&line]).is_empty());
+        assert!(scan_one("docs/auth.mdx", &[&line]).is_empty());
+        assert_eq!(scan_one("src/client.ts", &[&line]).len(), 1);
+    }
+
+    #[test]
+    fn a_scan_past_the_byte_budget_is_partial_and_needs_confirmation() {
+        let fresh = repo;
+        let (dir, git) = repo();
+        // Three 6 MB files: the 16 MB budget runs out inside the third.
+        let chunk = "const ok = computeValue(input, other) + 1; // filler line\n".repeat(6 * 1024 * 1024 / 58);
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::write(dir.path().join(name), &chunk).unwrap();
+            stage(&git, name);
+        }
+        let c = staged_files(dir.path()).unwrap();
+        assert!(c.partial);
+        let r = scan_report(&c.files, &[], c.partial);
+        assert_eq!(r.total, 0);
+        assert!(r.needs_confirmation(), "partial is never clean");
+        let err = enforce(r.clone(), None).unwrap_err();
+        assert!(err.to_string().contains("scanned the first 16 MB; the rest wasn't checked"), "{err}");
+        assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        for name in ["a.ts", "b.ts", "c.ts"] {
+            std::fs::remove_file(dir.path().join(name)).unwrap();
+        }
+        // One file larger than the whole budget is never read as text.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("huge.txt"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        stage(&git, "huge.txt");
+        assert!(staged_files(dir.path()).unwrap().partial);
+        // A small change is complete.
+        let (dir, git) = fresh();
+        std::fs::write(dir.path().join("x.ts"), "ok\n").unwrap();
+        stage(&git, "x.ts");
+        assert!(!staged_files(dir.path()).unwrap().partial);
+    }
+
+    #[test]
+    fn with_no_upstream_or_default_branch_push_scans_only_unpushed_commits() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let pushed = commit_all(&repo, "already on a fork");
+        // On a remote, but not origin's default branch nor an upstream.
+        repo.reference("refs/remotes/fork/topic", pushed, true, "test").unwrap();
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "history already on a remote isn't rescanned: {f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// A committed blob larger than the scan budget: in a tree-to-tree diff
+    /// its size isn't known until the patch is generated, so it must still
+    /// make push and PR scans partial (never silently clean).
+    #[test]
+    fn a_committed_blob_past_the_limit_makes_push_and_pr_scans_partial() {
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("huge.bin"), "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::write(dir.path().join("small.ts"), "ok\n").unwrap();
+        commit_all(&repo, "add a large blob");
+        let blob = repo.head().unwrap().peel_to_tree().unwrap().get_name("huge.bin").unwrap().id();
+        for (scope, c) in [("push", push_files(dir.path()).unwrap()), ("pr", pr_files(dir.path(), "main").unwrap())] {
+            assert!(c.partial, "{scope}: a blob past the limit was treated as clean");
+            assert_eq!(c.scope, scope);
+            assert!(c.unscanned.contains(&format!("huge.bin@{blob}")), "{scope}: {:?}", c.unscanned);
+            let r = scan_collected(&c, &[]);
+            assert_eq!(r.total, 0);
+            assert!(r.needs_confirmation(), "{scope}: the action must ask first");
+            assert!(enforce(r.clone(), None).is_err());
+            assert!(enforce(r.clone(), Some(&r.fingerprint)).is_ok());
+        }
+        // Push and PR fingerprints differ for the same change.
+        let push = scan_collected(&push_files(dir.path()).unwrap(), &[]);
+        let pr = scan_collected(&pr_files(dir.path(), "main").unwrap(), &[]);
+        assert_ne!(push.fingerprint, pr.fingerprint);
+        std::fs::remove_file(dir.path().join("huge.bin")).unwrap();
+    }
+
+    /// A worktree file git hasn't hashed (untracked, too large to read) is
+    /// bound by size, mtime and inode, not a zero blob id: confirming it
+    /// can't cover a different file at the same path later.
+    #[test]
+    fn an_unhashed_worktree_file_is_bound_to_its_content() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let c1 = worktree_files(dir.path(), Some("main")).unwrap();
+        assert!(c1.partial);
+        let entry = c1.unscanned.iter().find(|u| u.starts_with("huge.bin@")).expect("listed").clone();
+        assert!(!entry.contains(&"0".repeat(40)), "a zero blob id: {entry}");
+        assert!(entry.starts_with("huge.bin@stat:"), "{entry}");
+        let fp1 = scan_collected(&c1, &[]).fingerprint;
+        assert_eq!(scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint, fp1, "stable");
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 20)).unwrap();
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "a different file at the same path asks again");
+        std::fs::remove_file(&big).unwrap();
+    }
+
+    /// Every rule but the generic one reads the whole line: a secret past
+    /// column 16K (a minified bundle) is still found.
+    #[test]
+    fn a_secret_past_column_16k_is_found() {
+        let filler = "a=b(c,d);".repeat(20 * 1024 / 9);
+        assert!(filler.len() > 16 * 1024);
+        for (rule, _secret, line) in true_positives() {
+            let long = format!("{filler} {line}");
+            let f = scan_one("dist/bundle.min.js", &[&long]);
+            assert_eq!(f.len(), 1, "{rule} past 16K: {f:?}");
+            assert_eq!(f[0].rule, rule);
+        }
+        // Your own credential too.
+        let mine = rnd(300, 40, B62);
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let f = scan_added(&[file("dist/app.js", &[&format!("{filler}x({mine})")])], &known);
+        assert_eq!(f.len(), 1);
+        assert!(f[0].yours);
+        // The generic assignment rule stays on the first 16 KB of a line.
+        let generic = format!("api_key = \"{}9z\"", rnd(301, 30, B62));
+        assert_eq!(scan_one("src/a.ts", &[&generic]).len(), 1);
+        assert!(scan_one("src/a.ts", &[&format!("{filler} {generic}")]).is_empty());
+    }
+
+    #[test]
+    fn every_value_on_a_line_is_bound_into_the_fingerprint() {
+        let a = ["sk-", "ant-", "api03-"].concat() + &rnd(310, 93, B62) + "AA";
+        let b1 = ["sk-", "ant-", "api03-"].concat() + &rnd(311, 93, B62) + "AA";
+        let b2 = ["sk-", "ant-", "api03-"].concat() + &rnd(312, 93, B62) + "AA";
+        let line = |b: &str| format!("const A = \"{a}\", B = \"{b}\";");
+        let r1 = scan_report(&[file("k.ts", &[&line(&b1)])], &[], false);
+        let r2 = scan_report(&[file("k.ts", &[&line(&b2)])], &[], false);
+        assert_eq!(r1.total, 2, "two keys on one line are two findings");
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the second key asks again");
+        // The same key twice on a line is one finding.
+        let same = scan_report(&[file("k.ts", &[&format!("{a} {a}")])], &[], false);
+        assert_eq!(same.total, 1);
+    }
+
+    /// A provider hit on a line no longer hides the other rules: a generic
+    /// assignment, a `.env` credential or an AWS key on the same line is
+    /// hashed too, so editing it asks again.
+    #[test]
+    fn a_provider_hit_does_not_hide_the_other_rules_on_its_line() {
+        let ghp = ["gh", "p_"].concat() + &rnd(320, 36, B62);
+        let line = |v: &str| format!("const t = \"{ghp}\"; const apiKey = \"{v}\";");
+        let r1 = scan_report(&[file("src/a.ts", &[&line(&rnd(321, 32, B62))])], &[], false);
+        let r2 = scan_report(&[file("src/a.ts", &[&line(&rnd(322, 32, B62))])], &[], false);
+        let rules: Vec<_> = r1.findings.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["github-token", "generic-secret"]);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the generic value asks again");
+
+        // Your own key on a line with a generic secret: both bound.
+        let mine = rnd(323, 40, B62);
+        let known = [KnownSecret::new("your Anthropic key", mine.clone())];
+        let mline = |v: &str| format!("x = \"{mine}\"; secret = \"{v}\"");
+        let k1 = scan_report(&[file("src/b.ts", &[&mline(&rnd(324, 32, B62))])], &known, false);
+        let k2 = scan_report(&[file("src/b.ts", &[&mline(&rnd(325, 32, B62))])], &known, false);
+        assert_eq!(k1.total, 2);
+        assert_ne!(k1.fingerprint, k2.fingerprint);
+
+        // An `.env` value that IS a provider key is listed once, but the
+        // `.env` rule's value is hashed as well.
+        let env = scan_report(&[file(".env", &[&format!("GITHUB_TOKEN={ghp}")])], &[], false);
+        assert_eq!(env.total, 1, "{:?}", env.findings);
+        assert_eq!(env.findings[0].rule, "github-token");
+    }
+
+    /// The per-line dedupe is linear: a multi-MB minified line holding 100k
+    /// distinct provider tokens scans in well under a few seconds.
+    #[test]
+    fn a_line_with_100k_distinct_tokens_scans_fast() {
+        let prefix = ["gh", "p_"].concat();
+        let line_of = |count: u64| {
+            let mut line = String::with_capacity(count as usize * 42);
+            for i in 0..count {
+                line.push_str(&prefix);
+                line.push_str(&rnd(1_000_000 + i, 36, B62));
+                line.push(' ');
+            }
+            line
+        };
+        let timed = |line: &str| {
+            let started = std::time::Instant::now();
+            let r = scan_report(&[file("dist/bundle.min.js", &[line])], &[], false);
+            (r, started.elapsed())
+        };
+        let big = line_of(100_000);
+        assert!(big.len() > 4_000_000, "a multi-MB line");
+        let (r, took) = timed(&big);
+        // A handful of random bodies read as placeholders or low-entropy.
+        assert!(r.total > 99_900, "{}", r.total);
+        assert_eq!(r.findings.len(), MAX_FINDINGS);
+        let (_, took_10k) = timed(&line_of(10_000));
+        eprintln!("100k-token line: {took:?}; 10k: {took_10k:?}");
+        // Linear: ten times the tokens costs about ten times the time (the
+        // quadratic dedupe cost a hundred times, minutes in all). Debug
+        // builds on a slow runner stay well inside the absolute bound.
+        assert!(took < took_10k * 30, "not linear: 100k {took:?} vs 10k {took_10k:?}");
+        assert!(took < std::time::Duration::from_secs(60), "took {took:?}");
+    }
+
+    /// The whole PEM block is hashed, not the header and first body line:
+    /// that pair is a constant for every unencrypted OpenSSH ed25519 key.
+    #[test]
+    fn two_openssh_keys_at_one_place_have_different_fingerprints() {
+        let header = ["-----BEGIN ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        // `openssh-key-v1\0`, cipher `none`, kdf `none`, one ed25519 key: the
+        // same first line for every such key.
+        let first = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACA"].concat();
+        let key = |seed: u64| {
+            let mut lines = vec![header.clone(), first.clone()];
+            for i in 0..4 {
+                lines.push(rnd(seed * 10 + i, 70, B64));
+            }
+            lines.push(footer.clone());
+            lines
+        };
+        let fp = |lines: &[String]| {
+            let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+            let r = scan_report(&[file("deploy/id_key", &refs)], &[], false);
+            assert_eq!(r.total, 1, "{:?}", r.findings);
+            assert_eq!(r.findings[0].rule, "private-key");
+            assert_eq!(r.findings[0].line, Some(1));
+            r.fingerprint
+        };
+        let (k1, k2) = (key(400), key(401));
+        assert_ne!(fp(&k1), fp(&k2), "two keys at the same file:line");
+        // The last body line counts; what follows the END line does not.
+        let mut k1_last = k1.clone();
+        k1_last[5] = rnd(402, 70, B64);
+        assert_ne!(fp(&k1), fp(&k1_last));
+        let mut k1_after = k1.clone();
+        k1_after.push("unrelated = 1".into());
+        assert_eq!(fp(&k1), fp(&k1_after));
+    }
+
+    /// On a long line the block is hashed from the header on: a key whose
+    /// header starts past the first 64 KB is not reduced to the unrelated
+    /// prefix, so two different keys there ask separately.
+    #[test]
+    fn a_pem_key_past_64k_on_a_long_line_is_hashed_from_its_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let pad = "x".repeat(70_000);
+        let line = |seed: u64| {
+            format!(
+                "{{\"pad\": \"{pad}\", \"key\": \"{header}\\n{}\\n{}\\n{footer}\"}}",
+                rnd(seed, 64, B64),
+                rnd(seed + 1, 64, B64)
+            )
+        };
+        let fp = |l: &str| {
+            let r = scan_report(&[file("config/creds.json", &[l])], &[], false);
+            assert!(r.findings.iter().any(|f| f.rule == "private-key"), "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (k1, k2) = (line(500), line(510));
+        assert!(k1.find(&header).unwrap() > 64 * 1024);
+        assert_ne!(fp(&k1), fp(&k2), "two keys after the same 70K prefix");
+    }
+
+    /// A PEM walk stops at the next header: repeated headers with no END
+    /// don't each run on through the following blocks.
+    #[test]
+    fn a_pem_walk_stops_at_the_next_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(520, 64, B64), rnd(521, 64, B64));
+        let lines: Vec<(u32, String)> =
+            vec![(1, header.clone()), (2, b1.clone()), (3, header.clone()), (4, b2.clone())];
+        let v = pem_block(&lines, 0, 0, &header);
+        assert!(v.contains(&b1));
+        assert!(!v.contains(&b2), "walked into the next block");
+        let refs: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
+        let r = scan_report(&[file("deploy/keys.pem", &refs)], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 2, "{:?}", r.findings);
+    }
+
+    /// A provider token that only partly overlaps one of your own keys is
+    /// still hashed, so editing its other part asks again.
+    #[test]
+    fn a_token_partly_overlapping_your_key_is_still_bound() {
+        let ghp = ["gh", "p_"].concat() + &rnd(410, 36, B62);
+        let known = [KnownSecret::new("your GitHub token", ghp[..24].to_string())];
+        let edited = format!("{}{}", &ghp[..24], rnd(411, 16, B62));
+        let r1 = scan_report(&[file("src/a.ts", &[&format!("t = \"{ghp}\"")])], &known, false);
+        let r2 = scan_report(&[file("src/a.ts", &[&format!("t = \"{edited}\"")])], &known, false);
+        assert_eq!(r1.total, 1, "listed once, as yours: {:?}", r1.findings);
+        assert!(r1.findings[0].yours);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the part outside your key asks again");
+    }
+
+    /// Rewriting an unhashed worktree file with the same size and restoring
+    /// its mtime still changes the stamp: the ctime moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_rewrite_with_a_restored_mtime_asks_again() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        let fp1 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::File::options().write(true).open(&big).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(std::fs::metadata(&big).unwrap().modified().unwrap(), mtime, "mtime restored");
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "same size and mtime, new content");
+        std::fs::remove_file(&big).unwrap();
+    }
+
+    /// The Firebase and AWS proximity checks are lookups, not a scan of the
+    /// file per line: tens of thousands of apiKey / AWS lines stay fast.
+    #[test]
+    fn many_api_key_and_aws_lines_scan_fast() {
+        let google = |i: u64| ["AI", "za"].concat() + &rnd(5_000_000 + i, 35, B62);
+        let id = |i: u64| ["AK", "IA"].concat() + &rnd(6_000_000 + i, 16, UPPER);
+        let mut lines = Vec::new();
+        for i in 0..20_000u64 {
+            lines.push(format!("  apiKey: \"{}\",", google(i)));
+            lines.push(format!("aws_access_key_id = {}", id(i)));
+            lines.push(format!("aws_secret_access_key = {}", rnd(7_000_000 + i, 40, B64)));
+        }
+        // Firebase context only at the very end: no apiKey is near it but the last few.
+        lines.push("  authDomain: \"demo.firebaseapp.com\",".into());
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        let started = std::time::Instant::now();
+        let r = scan_report(&[file("src/config.ts", &refs)], &[], false);
+        let took = started.elapsed();
+        eprintln!("60k apiKey/AWS lines: {took:?}");
+        assert!(r.total > 39_000, "{}", r.total);
+        // Lines are appended from several commits in a range scan: unsorted
+        // line numbers must give the same answer.
+        let mut shuffled = file("src/config.ts", &refs);
+        shuffled.lines.reverse();
+        assert_eq!(scan_report(&[shuffled], &[], false).total, r.total);
+        assert!(took < std::time::Duration::from_secs(30), "took {took:?}");
+    }
+
+    #[test]
+    fn a_partial_fingerprint_is_bound_to_what_was_not_scanned() {
+        let c = |scope: &'static str, unscanned: &[&str]| Collected {
+            files: vec![],
+            partial: true,
+            scope,
+            unscanned: unscanned.iter().map(|s| s.to_string()).collect(),
+        };
+        let fp = |c: Collected| scan_collected(&c, &[]).fingerprint;
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("push", &["big.bin@bbbb"])));
+        assert_ne!(fp(c("push", &["big.bin@aaaa"])), fp(c("pr", &["big.bin@aaaa"])));
+        assert_eq!(fp(c("push", &["a@1", "b@2"])), fp(c("push", &["b@2", "a@1"])));
+    }
+
+    #[test]
+    fn the_key_file_is_created_once_and_a_corrupt_one_is_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let k1 = load_or_create_key_in(&dir.path().join(".octopush")).expect("created");
+        let path = dir.path().join(".octopush").join(KEY_FILE);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k1), "the same key on every load");
+        // An empty (half-written) key file is replaced, not trusted.
+        std::fs::write(&path, "").unwrap();
+        let k2 = load_or_create_key_in(&dir.path().join(".octopush")).expect("replaced");
+        assert_ne!(k2, k1);
+        assert_eq!(load_or_create_key_in(&dir.path().join(".octopush")), Some(k2));
+        // No temp files are left behind.
+        let names: Vec<_> = std::fs::read_dir(dir.path().join(".octopush")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, vec![std::ffi::OsString::from(KEY_FILE)]);
+        // An unreadable key (a directory in its place) falls back to None.
+        let odd = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(odd.path().join(KEY_FILE)).unwrap();
+        assert_eq!(load_or_create_key_in(odd.path()), None);
+    }
+
+    #[test]
+    fn the_setting_defaults_on() {
+        let s = crate::settings::AppSettings::default();
+        assert!(guard_enabled(&s));
+        let s: crate::settings::AppSettings = serde_json::from_str(r#"{"secretGuardEnabled":false}"#).unwrap();
+        assert!(!guard_enabled(&s));
+    }
+}
+
+/// Secret guard at the crew boundary: an Action stage parks needs-you.
+#[cfg(test)]
+mod secret_guard_orchestrator_tests {
+    use crate::db::Db;
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::Value;
+    use std::sync::Arc;
+
+    struct Sink(Mutex<Vec<(String, Value)>>);
+    impl EventSink for Sink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.0.lock().push((event.to_string(), payload));
+        }
+    }
+
+    struct Ok1;
+    #[async_trait::async_trait]
+    impl AgentRunner for Ok1 {
+        async fn run(&self, stage: &StageSpec, _i: &StageInput, _c: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+                status: StageStatus::Done, tool_calls: vec![], error: None, verdict: None, session_id: None,
+                blocked: None, blocked_transcript: None,
+            })
+        }
+    }
+
+    /// The leaked value — assembled at runtime.
+    fn secret() -> String {
+        ["gh", "p_"].concat() + "Qm7Rt2Vx9Lk4Pz8Wn3Hy6Bc1Df5Gj0Ks7Eab"
+    }
+
+    fn setup(settings: Value) -> (Arc<Mutex<Db>>, String, tempfile::TempDir, tempfile::TempDir) {
+        let sdir = tempfile::tempdir().unwrap();
+        let sp = sdir.path().join("settings.json");
+        std::fs::write(&sp, settings.to_string()).unwrap();
+        crate::settings::test_settings_path::set(Some(sp));
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        std::fs::write(dir.path().join("README.md"), "hi\n").unwrap();
+        let mut idx = repo.index().unwrap();
+        idx.add_path(std::path::Path::new("README.md")).unwrap();
+        idx.write().unwrap();
+        let tree = repo.find_tree(idx.write_tree().unwrap()).unwrap();
+        let sig = git2::Signature::now("T", "t@example.invalid").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        // The crew wrote a key into a tracked-to-be fixture.
+        std::fs::create_dir_all(dir.path().join("tests")).unwrap();
+        std::fs::write(dir.path().join("tests/fixtures.ts"), format!("// seed\nexport const t = \"{}\";\n", secret())).unwrap();
+
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main',?1,?2,?2)",
+            rusqlite::params![dir.path().to_string_lossy(), now]).unwrap();
+        let pid = db.insert_pipeline("Ship", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        db.insert_pipeline_stage(&pid, 1, "pull_request", "m", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run, dir, sdir)
+    }
+
+    #[tokio::test]
+    async fn a_pr_stage_with_a_secret_in_the_worktree_parks_needs_you() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({}));
+        let sink = Arc::new(Sink(Mutex::new(vec![])));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink.clone(), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[0].status, "done", "the non-Action stage ran");
+        let pr = &stages[1];
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        assert!(pr.started_at.is_none(), "the PR stage never started");
+        let hold = pr.secret_hold.as_ref().expect("held");
+        assert!(!hold.acknowledged);
+        assert_eq!(hold.findings[0].location(), "tests/fixtures.ts:2");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "paused");
+
+        // A "decision" checkpoint: needs-you, the native notification, the beacon.
+        let events = sink.0.lock().clone();
+        assert!(events.iter().any(|(e, p)| e == "run://checkpoint" && p["stageId"] == pr.id.as_str() && p["reason"] == "decision"));
+
+        // The journal says why, without the value.
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("Held before the pull request: possible secret · GitHub token in tests/fixtures.ts:2"), "{log}");
+        let s = secret();
+        for (_, p) in &events {
+            assert!(!p.to_string().contains(&s), "a secret leaked into an event");
+        }
+        assert!(!log.contains(&s));
+        assert!(!serde_json::to_string(&stages).unwrap().contains(&s), "nor into the stage rows sent to the UI");
+        let raw: String = db.lock().conn_ref()
+            .query_row("SELECT secret_hold FROM run_stages WHERE id = ?1", [&pr.id], |r| r.get(0)).unwrap();
+        assert!(!raw.contains(&s), "nor into the database");
+
+        // Re-driving without a decision holds again.
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "awaiting_checkpoint");
+
+        // The director's explicit approval lets exactly these findings through.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let stages = db.lock().list_run_stages(&run).unwrap();
+        assert_eq!(stages[1].status, "done");
+        assert_eq!(db.lock().get_run(&run).unwrap().unwrap().status, "completed");
+        let log = db.lock().list_stage_log(&stages[1].id).unwrap().join("\n");
+        assert!(log.contains("the director approved proceeding"), "{log}");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_new_secret_after_approval_holds_again() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        orch.run_to_pause(&run).await.unwrap();
+        // Approve, but add another key before the re-drive scans.
+        let pr_id = db.lock().list_run_stages(&run).unwrap()[1].id.clone();
+        std::fs::write(dir.path().join("seed.js"), format!("{}\n", ["gh", "o_"].concat() + "Zx8Wq2Lm5Np7Rt3Vy6Bk9Cd1Fh4Gj0Ks2Eab")).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap().into_iter().find(|s| s.id == pr_id).unwrap();
+        assert_eq!(pr.status, "awaiting_checkpoint", "a different set of findings needs a new decision");
+        assert_eq!(pr.secret_hold.unwrap().findings.len(), 2);
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_clean_worktree_or_the_guard_off_runs_straight_through() {
+        let (db, run, _dir, _s) = setup(serde_json::json!({ "secretGuardEnabled": false }));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_none());
+        crate::settings::test_settings_path::set(None);
+
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        std::fs::remove_file(dir.path().join("tests/fixtures.ts")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Completed));
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_worktree_parks_instead_of_shipping_unchecked() {
+        let (db, run, dir, _s) = setup(serde_json::json!({}));
+        // The worktree vanished (or isn't a repo any more): nothing can be checked.
+        std::fs::remove_dir_all(dir.path().join(".git")).unwrap();
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "awaiting_checkpoint");
+        let hold = pr.secret_hold.clone().expect("held");
+        assert!(hold.unreadable);
+        let log = db.lock().list_stage_log(&pr.id).unwrap().join("\n");
+        assert!(log.contains("couldn't read the worktree's changes, so nothing was checked"), "{log}");
+        // The director may still choose to proceed.
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        assert_eq!(db.lock().list_run_stages(&run).unwrap()[1].status, "done");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn turning_the_guard_off_clears_a_stale_hold() {
+        let (db, run, _dir, sdir) = setup(serde_json::json!({}));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), Arc::new(Sink(Mutex::new(vec![]))), Box::new(Ok1));
+        assert!(matches!(orch.run_to_pause(&run).await.unwrap(), RunStatus::Paused));
+        assert!(db.lock().list_run_stages(&run).unwrap()[1].secret_hold.is_some());
+        std::fs::write(sdir.path().join("settings.json"), r#"{"secretGuardEnabled":false}"#).unwrap();
+        orch.resolve_checkpoint(&run, CheckpointAction::Approve).await.unwrap();
+        let pr = db.lock().list_run_stages(&run).unwrap()[1].clone();
+        assert_eq!(pr.status, "done");
+        assert!(pr.secret_hold.is_none(), "no stale hold left behind");
+        crate::settings::test_settings_path::set(None);
+    }
+
+    #[test]
+    fn hold_labels_read_naturally() {
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("pull_request", "Pull request"), "the pull request");
+        assert_eq!(crate::orchestrator::secret_hold_stage_label("deploy", "Deploy"), "the deploy stage");
+    }
+}
+
+
+#[cfg(test)]
+mod plan_wait_tests {
+    //! #731: a Claude plan limit parks the run and resumes it at the reset.
+    use crate::db::Db;
+    use crate::orchestrator::cli_runner::{apply_plan_limit, is_plan_limit, PlanLimitWatch};
+    use crate::orchestrator::events::EventSink;
+    use crate::orchestrator::plan_wait::{PlanClaim, AUTO_RESUME_CAP, RESUME_JITTER_SECS, RESUME_MARGIN_SECS, RETRY_SECS};
+    use crate::orchestrator::runner::{AgentRunner, StageContext};
+    use crate::orchestrator::types::*;
+    use crate::orchestrator::Orchestrator;
+    use parking_lot::Mutex;
+    use serde_json::{json, Value};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// Records every `run://checkpoint` reason.
+    #[derive(Default)]
+    struct ReasonSink {
+        reasons: Mutex<Vec<String>>,
+    }
+    impl EventSink for ReasonSink {
+        fn emit(&self, event: &str, payload: Value) {
+            if event == "run://checkpoint" {
+                self.reasons.lock().push(payload["reason"].as_str().unwrap_or_default().to_string());
+            }
+        }
+    }
+
+    /// Hits the plan wall on its first `walls` runs (as the CLI runner
+    /// reports it), then finishes. Records every built `StageSpec`.
+    struct PlanWallRunner {
+        walls: Mutex<u32>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for PlanWallRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let wall = {
+                let mut w = self.walls.lock();
+                let hit = *w > 0;
+                if hit {
+                    *w -= 1;
+                }
+                hit
+            };
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: "did it".into(), payload: None, refs_worktree: false },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.02,
+                status: if wall { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: wall.then(|| "You've hit your 5-hour limit · resets 7:40pm (UTC)".to_string()),
+                verdict: None,
+                session_id: Some("sess-p".into()),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !wall {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn seed(path: &Path) -> (Arc<Mutex<Db>>, String) {
+        let db = Db::open(path).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P','/tmp/p',?1,?1)",
+            [&now]).unwrap();
+        db.conn_ref().execute(
+            "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,created_at,last_active)
+             VALUES ('w1','p1','W','main','/tmp',?1,?1)", [&now]).unwrap();
+        let pid = db.insert_pipeline("Plan", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        (Arc::new(Mutex::new(db)), run_id)
+    }
+
+    fn orch(db: &Arc<Mutex<Db>>, walls: u32, resets_at: i64) -> (Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = PlanWallRunner { walls: Mutex::new(walls), resets_at, seen: Arc::clone(&seen) };
+        (Orchestrator::new_with_runner(Arc::clone(db), sink, Box::new(runner)), reasons, seen)
+    }
+
+    /// Make the scheduled resume due now (the clock is not injectable here;
+    /// the schedule's arithmetic is unit-tested in `plan_wait`).
+    fn make_due(db: &Arc<Mutex<Db>>, run_id: &str) {
+        db.lock().conn_ref().execute(
+            "UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1 AND plan_resume_at IS NOT NULL",
+            rusqlite::params![run_id, chrono::Utc::now().timestamp() - 1],
+        ).unwrap();
+    }
+
+    fn now() -> i64 {
+        chrono::Utc::now().timestamp()
+    }
+
+    #[tokio::test]
+    async fn a_plan_limit_parks_the_run_keeping_spend_and_session_and_schedules_the_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let resets = now() + 3_600;
+        let (orch, reasons, _) = orch(&db, 1, resets);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed");
+        assert!(is_plan_limit(stage.error.as_deref().unwrap()), "{:?}", stage.error);
+        assert!(stage.error.as_deref().unwrap().starts_with("Paused by your Claude plan"));
+        assert_eq!(stage.session_id.as_deref(), Some("sess-p"), "the session is kept for the Resume");
+        assert_eq!(stage.cost_usd, 0.02, "the spend is kept");
+        assert!(!stage.escalated, "a plan wall never escalates");
+
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("parked by the plan");
+        assert_eq!(wait.window, "five_hour");
+        assert_eq!(wait.resets_at, resets);
+        let at = wait.resume_at.expect("an automatic resume is scheduled");
+        assert!((resets + RESUME_MARGIN_SECS..=resets + RESUME_MARGIN_SECS + RESUME_JITTER_SECS).contains(&at), "{at}");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("plan_limit"), "nobody needs to decide");
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("Paused by your Claude plan · resumes at")), "{log:?}");
+        // Not due yet: nothing claims it.
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        assert!(db.lock().list_due_plan_resumes(now()).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_schedule_survives_a_restart_and_resumes_the_same_session_exactly_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("o.db");
+        let run_id = {
+            let (db, run_id) = seed(&path);
+            let (orch, _, _) = orch(&db, 1, now() + 600);
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            run_id
+        }; // the app quits: orchestrator and DB handle are gone
+
+        let db = Arc::new(Mutex::new(Db::open(&path).unwrap())); // relaunch (migrations re-run)
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+        make_due(&db, &run_id);
+        assert_eq!(db.lock().list_due_plan_resumes(now()).unwrap(), vec![run_id.clone()]);
+
+        let (orch, _, seen) = orch(&db, 0, now());
+        let over = orch.claim_plan_resume(&run_id).unwrap();
+        assert_eq!(over, PlanClaim::Resumed { budget_override: false }, "claimed and applied");
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "a second claimant gets nothing");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        assert_eq!(seen.lock()[0].resume_session.as_deref(), Some("sess-p"), "--resume of the same session");
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "a finished stage resets the allowance");
+    }
+
+    #[tokio::test]
+    async fn automatic_resumes_are_capped_then_the_run_waits_for_the_director() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 10, now() + 60);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        for i in 1..=AUTO_RESUME_CAP {
+            make_due(&db, &run_id);
+            let over = orch.claim_plan_resume(&run_id).unwrap();
+            assert!(matches!(over, PlanClaim::Resumed { .. }), "automatic resume {i}");
+            assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused, "hit the wall again");
+        }
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "after {AUTO_RESUME_CAP} automatic resumes it waits for the director");
+        assert_eq!(wait.resume_count, AUTO_RESUME_CAP);
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"), "now it needs you");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        let log = db.lock().list_stage_log(&stage.id).unwrap();
+        assert!(log.iter().any(|e| e.contains("automatic resumes already ran")), "{log:?}");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_resume_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        // "Resume now" is the ordinary Resume.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(seen.lock()[1].resume_session.as_deref(), Some("sess-p"));
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none(), "the park ended");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty(), "no stale resume left behind");
+    }
+
+    #[tokio::test]
+    async fn the_director_can_turn_the_automatic_resume_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 3_600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.cancel_plan_resume(&run_id).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "waits for a manual Resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("director"), "their own hand: silent");
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed, "nothing resumes on its own");
+        assert_eq!(seen.lock().len(), 1);
+        // Today's manual Resume still works.
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_run_whose_budget_is_spent_never_resumes_on_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap();
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!(wait.resume_at, None, "$0.02 spent of $0.01: no automatic resume");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    #[tokio::test]
+    async fn a_budget_spent_while_waiting_is_checked_again_at_the_reset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, seen) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().set_run_budget(&run_id, Some(0.01)).unwrap(); // lowered meanwhile
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou, "the worker must announce it");
+        assert_eq!(seen.lock().len(), 1, "never resumed");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed", "still parked for the director");
+    }
+
+    /// What a [`RoleRunner`] does on one run of a role.
+    #[derive(Clone, Copy)]
+    enum Act {
+        Wall,
+        Halt,
+        Done,
+    }
+
+    /// Plays a script per role (then finishes), so sibling branches can hit
+    /// the plan wall, halt for real or finish. Records every built spec.
+    struct RoleRunner {
+        script: Mutex<std::collections::HashMap<String, std::collections::VecDeque<Act>>>,
+        resets_at: i64,
+        seen: Arc<Mutex<Vec<StageSpec>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for RoleRunner {
+        async fn run(&self, stage: &StageSpec, _input: &StageInput, _ctx: &StageContext) -> crate::error::AppResult<StageOutcome> {
+            self.seen.lock().push(stage.clone());
+            let act = self.script.lock().get_mut(&stage.role).and_then(|q| q.pop_front()).unwrap_or(Act::Done);
+            let failed = !matches!(act, Act::Done);
+            let outcome = StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact { kind: ArtifactKind::Note, text: format!("did {}", stage.role), payload: None, refs_worktree: false },
+                input_tokens: 1,
+                output_tokens: 1,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status: if failed { StageStatus::Failed } else { StageStatus::Done },
+                tool_calls: vec![],
+                error: match act {
+                    Act::Wall => Some("You've hit your 5-hour limit".into()),
+                    Act::Halt => Some("the build broke".into()),
+                    Act::Done => None,
+                },
+                verdict: None,
+                session_id: Some(format!("sess-{}", stage.role)),
+                blocked: None,
+                blocked_transcript: None,
+            };
+            if !matches!(act, Act::Wall) {
+                return Ok(outcome);
+            }
+            let mut watch = PlanLimitWatch::default();
+            watch.observe(&json!({"type": "rate_limit_event", "rate_limit_info": {
+                "status": "rejected", "resetsAt": self.resets_at, "rateLimitType": "five_hour",
+                "overageStatus": "rejected", "isUsingOverage": false}}));
+            Ok(apply_plan_limit(outcome, &watch))
+        }
+    }
+
+    fn draft(role: &str, parents: Vec<i64>, checkpoint: bool) -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            // The substrate is the runner's business here (it reports the
+            // plan wall itself); API read-only tools let branches share a batch.
+            role: role.into(), agent_model: "m".into(), substrate: "api".into(),
+            checkpoint, loop_target_position: None, loop_max_iterations: 0, loop_mode: None,
+            max_iterations: 25, pos_x: None, pos_y: None, parents,
+            tools: (!parents_is_root(role)).then(|| vec!["read_file".into(), "list_files".into()]),
+            custom_name: None, instructions: None, effort: None,
+            escalate_model: None, escalate_effort: None,
+        }
+    }
+    fn parents_is_root(role: &str) -> bool {
+        role == "plan"
+    }
+
+    /// plan → two read-only branches (`a`, `b`) ready in one batch.
+    fn branches(path: &Path, b_gated: bool, script: &[(&str, Vec<Act>)]) -> (Arc<Mutex<Db>>, String, Orchestrator, Arc<ReasonSink>, Arc<Mutex<Vec<StageSpec>>>) {
+        let (db, _) = seed(path);
+        let stages = vec![draft("plan", vec![], false), draft("critique", vec![0], false), draft("plan_review", vec![0], b_gated)];
+        let pid = db.lock().save_pipeline(None, "Branches", "d", &stages).unwrap();
+        let run_id = db.lock().create_run("w1", &pid, "t", None, None, &[]).unwrap();
+        let reasons = Arc::new(ReasonSink::default());
+        let sink: Arc<dyn EventSink> = Arc::new(crate::orchestrator::persist::PersistingSink::new(
+            Arc::clone(&reasons) as Arc<dyn EventSink>,
+            Arc::clone(&db),
+        ));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let runner = RoleRunner {
+            script: Mutex::new(script.iter().map(|(r, a)| (r.to_string(), a.iter().copied().collect())).collect()),
+            resets_at: now() + 600,
+            seen: Arc::clone(&seen),
+        };
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        (db, run_id, orch, reasons, seen)
+    }
+
+    fn statuses(db: &Arc<Mutex<Db>>, run_id: &str) -> Vec<String> {
+        db.lock().list_run_stages(run_id).unwrap().into_iter().map(|s| s.status).collect()
+    }
+
+    fn failed(error: &str) -> StageOutcome {
+        StageOutcome {
+            cli: Default::default(),
+            artifact: StageArtifact { kind: ArtifactKind::Note, text: String::new(), payload: None, refs_worktree: false },
+            input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.0,
+            status: StageStatus::Failed, tool_calls: vec![], error: Some(error.into()),
+            verdict: None, session_id: None, blocked: None, blocked_transcript: None,
+        }
+    }
+
+    fn rate_event(status: &str, kind: &str, resets_at: i64) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": {
+            "status": status, "resetsAt": resets_at, "rateLimitType": kind, "isUsingOverage": false}})
+    }
+
+    /// Detection: a failure is the plan's only when the rejection was the last
+    /// rate-limit event before the result, or the CLI wrote its limit notice.
+    #[test]
+    fn a_failure_after_a_later_allowed_request_is_not_a_plan_limit() {
+        let at = now() + 600;
+        // Rejected, then another window allowed a request: another cause.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("rejected", "five_hour", at));
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        let out = apply_plan_limit(failed("network error"), &w);
+        assert!(out.cli.plan_limit.is_none());
+        assert_eq!(out.error.as_deref(), Some("network error"));
+        // The same, but the CLI wrote its own limit notice: the plan.
+        w.observe(&json!({"type": "assistant", "error": "rate_limit", "message": {"content": []}}));
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_some());
+        // The rejection is the last rate-limit event: the plan.
+        let mut w = PlanLimitWatch::default();
+        w.observe(&rate_event("allowed", "seven_day", at + 86_400));
+        w.observe(&rate_event("rejected", "five_hour", at));
+        let out = apply_plan_limit(failed("x"), &w);
+        assert_eq!(out.cli.plan_limit.as_ref().map(|l| l.resets_at), Some(at));
+        assert!(is_plan_limit(out.error.as_deref().unwrap()));
+    }
+
+    /// Detection only reads the stage's own top-level messages: a
+    /// sub-agent's rejection or limit notice is not the stage's stop.
+    #[test]
+    fn a_sub_agents_rejection_is_not_the_stages_stop() {
+        let mut w = PlanLimitWatch::default();
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = json!("toolu_1");
+        w.observe(&ev);
+        w.observe(&json!({"type": "assistant", "parent_tool_use_id": "toolu_1", "error": "rate_limit", "message": {"content": []}}));
+        assert!(w.limit().is_none());
+        assert!(apply_plan_limit(failed("x"), &w).cli.plan_limit.is_none());
+        // `parent_tool_use_id: null` is top-level.
+        let mut ev = rate_event("rejected", "five_hour", now() + 600);
+        ev["parent_tool_use_id"] = Value::Null;
+        w.observe(&ev);
+        assert!(w.limit().is_some());
+    }
+
+    /// A: two branches hit the wall together; the automatic resume resumes
+    /// BOTH, each on its own session.
+    #[tokio::test]
+    async fn the_automatic_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, seen) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "failed"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(crate::fleet_status::plan_waiting(&run), "only plan limits wait: calm");
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "decision"), "{:?}", reasons.reasons.lock());
+
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+        assert_eq!(statuses(&db, &run_id), ["done", "pending", "pending"], "both plan-limited stages resumed");
+        assert_eq!(orch.drive_segment(&run_id, false).await.unwrap(), RunStatus::Completed);
+        let runs_of = |role: &str| seen.lock().iter().filter(|s| s.role == role).count();
+        assert_eq!((runs_of("critique"), runs_of("plan_review")), (2, 2), "each ran again");
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// A, by hand: the director's Resume on one plan-limited stage resumes them all.
+    #[tokio::test]
+    async fn the_directors_resume_resumes_every_plan_limited_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let st = orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        assert_eq!(st, RunStatus::Completed);
+        assert_eq!(statuses(&db, &run_id), ["done", "done", "done"]);
+    }
+
+    /// C: a sibling's real halt next to a plan limit still needs you: not
+    /// calm, a `decision` checkpoint, and the badge counts it.
+    #[tokio::test]
+    async fn a_siblings_real_halt_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("parked by the plan");
+        assert!(wait.resume_at.is_some(), "the plan stage still resumes on its own");
+        assert!(wait.other_hold, "the halt is another hold");
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(crate::fleet_status::needs_you(&run.status, crate::fleet_status::plan_waiting(&run)));
+        let rs = reasons.reasons.lock().clone();
+        assert!(!rs.iter().any(|r| r == "plan_limit"), "nothing about this run is calm: {rs:?}");
+        assert!(rs.iter().any(|r| r == "decision"), "{rs:?}");
+    }
+
+    /// C: a sibling's gate next to a plan limit is a decision too.
+    #[tokio::test]
+    async fn a_siblings_gate_still_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, reasons, _) =
+            branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.other_hold));
+        assert!(!crate::fleet_status::plan_waiting(&run));
+        assert!(!reasons.reasons.lock().iter().any(|r| r == "plan_limit"), "{:?}", reasons.reasons.lock());
+        // Approving the gate leaves the plan park and its schedule in place.
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        let _ = orch.resolve_checkpoint_scoped(&run_id, Some(&gate), CheckpointAction::Approve).await.unwrap();
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        let wait = run.plan_wait.clone().expect("still parked by the plan");
+        assert!(wait.resume_at.is_some(), "the automatic resume survives a sibling's decision");
+        assert!(!wait.other_hold);
+        assert!(crate::fleet_status::plan_waiting(&run), "now only the plan waits: calm");
+    }
+
+    /// B: a claim whose Resume can't be applied puts the park back (due
+    /// shortly, uncounted) instead of losing the resume.
+    #[tokio::test]
+    async fn a_resume_that_fails_to_apply_is_scheduled_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true); // another driver holds the run
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        let at = wait.resume_at.expect("the resume is scheduled again");
+        assert!(at > now() && at <= now() + RETRY_SECS, "{at}");
+        assert_eq!(wait.resume_count, 0, "the failed claim doesn't count");
+        orch.set_active_for_test(&run_id, false);
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Resumed { budget_override: false });
+    }
+
+    /// A re-run of the plan-limited stage ends the park: no stale resume is
+    /// left to claim a run that is no longer parked.
+    #[tokio::test]
+    async fn a_rerun_ends_a_stale_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_count = 2 WHERE id = ?1", [&run_id]).unwrap();
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        orch.prepare_rerun(&run_id, &stage, None).unwrap();
+        orch.release_active(&run_id);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none(), "nothing plan-limited is left");
+        assert_eq!(db.lock().plan_resume_count(&run_id).unwrap(), 0, "the director acted");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+
+    /// The worker waits for the plan itself only when the plan is all that
+    /// waits; a sibling's halt makes it announce instead.
+    #[tokio::test]
+    async fn the_worker_waits_only_when_the_plan_is_all_that_waits() {
+        use crate::orchestrator::plan_wait::{needs_director, worker_plan_wait};
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("a.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(worker_plan_wait(&run).is_some(), "only the plan waits: the worker waits");
+        assert!(!needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+
+        let (db, run_id, orch, _, _) =
+            branches(&dir.path().join("b.db"), false, &[("critique", vec![Act::Wall]), ("plan_review", vec![Act::Halt])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.as_ref().is_some_and(|w| w.resume_at.is_some()));
+        assert_eq!(worker_plan_wait(&run), None, "a sibling's halt needs you: announce, don't wait");
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()));
+    }
+
+    /// A claim that finds the plan stages resolved while a sibling's gate
+    /// still waits is `NotClaimed`, and the run still needs the director.
+    #[tokio::test]
+    async fn not_claimed_with_a_gate_left_still_needs_you() {
+        use crate::orchestrator::plan_wait::needs_director;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let critique = db.lock().list_run_stages(&run_id).unwrap()[1].id.clone();
+        db.lock().conn_ref().execute(
+            "UPDATE run_stages SET status = 'done', error = NULL WHERE id = ?1", [&critique]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+        let run = db.lock().get_run(&run_id).unwrap().unwrap();
+        assert!(run.plan_wait.is_none());
+        assert!(needs_director(&run, &db.lock().list_run_stages(&run_id).unwrap()), "the gate still waits: announce");
+    }
+
+    /// Approve with an explicit stage id resolves THAT stage, never the first
+    /// resolvable one (here the plan-limited stage sits before the gate).
+    #[tokio::test]
+    async fn approve_with_a_stage_id_resolves_that_stage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let gate = db.lock().list_run_stages(&run_id).unwrap()[2].id.clone();
+        assert!(orch.resolve_checkpoint_apply_only(&run_id, Some(&gate), CheckpointAction::Approve).unwrap().is_some());
+        let st = statuses(&db, &run_id);
+        assert_eq!(st[1], "failed", "the plan-limited stage is untouched");
+        assert_ne!(st[2], "awaiting_checkpoint", "the gate was approved");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+    }
+
+    /// A claim moves the resume forward instead of clearing it: a claimant
+    /// that dies before applying it never loses the park.
+    #[tokio::test]
+    async fn a_claim_that_is_never_applied_keeps_the_park_due() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let t = now();
+        assert!(db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap());
+        assert!(!db.lock().claim_plan_resume(&run_id, t, t + RETRY_SECS).unwrap(), "exactly one claimant");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, Some(t + RETRY_SECS));
+        assert_eq!(db.lock().list_due_plan_resumes(t + RETRY_SECS).unwrap(), vec![run_id.clone()]);
+    }
+
+    /// Retries are capped: after MAX_PLAN_RETRIES failed applies the run waits
+    /// for the director (and the worker announces it).
+    #[tokio::test]
+    async fn retries_are_capped_then_it_needs_you() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, reasons, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(wait.resume_count, 0, "failed claims don't count");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// A decision naming a stage that is no longer waiting (decided
+    /// elsewhere) is refused, never redirected to the first resolvable
+    /// stage: the other gate and the plan stage stay as they were.
+    #[tokio::test]
+    async fn a_stale_stage_id_is_refused_and_nothing_else_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id, orch, _, _) = branches(&dir.path().join("o.db"), true, &[("critique", vec![Act::Wall])]);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"]);
+        let stale = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone(); // already done
+        for action in [CheckpointAction::Approve, CheckpointAction::Resume { max_turns_override: None }] {
+            let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&stale), action).unwrap_err();
+            assert!(err.to_string().contains("already decided"), "{err}");
+        }
+        let err = orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Approve).unwrap_err();
+        assert!(err.to_string().contains("already decided"), "{err}");
+        assert_eq!(statuses(&db, &run_id), ["done", "failed", "awaiting_checkpoint"], "the other gate stays waiting");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("the park stays");
+        assert!(wait.resume_at.is_some());
+        // No id keeps the single-parked rule; Abort never needs a live stage.
+        assert!(orch.check_named_stage(&run_id, None, &CheckpointAction::Approve).is_ok());
+        assert!(orch.check_named_stage(&run_id, Some(&stale), &CheckpointAction::Abort).is_ok());
+    }
+
+    /// The director turning the automatic resume off while a claim is in
+    /// flight wins: the apply doesn't resume, and putting the claim's park
+    /// back never brings the schedule back.
+    #[tokio::test]
+    async fn a_cancel_during_a_claim_is_never_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        make_due(&db, &run_id);
+        let before = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        let t = now();
+        let claimed_at = t + RETRY_SECS;
+        assert!(db.lock().claim_plan_resume(&run_id, t, claimed_at).unwrap());
+        orch.cancel_plan_resume(&run_id).unwrap(); // the director, mid-claim
+        assert_eq!(orch.apply_claimed_plan_resume(&run_id, claimed_at).unwrap(), PlanClaim::NotClaimed);
+        assert_eq!(statuses(&db, &run_id), ["failed"], "not resumed");
+        let restored = db
+            .lock()
+            .restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + RETRY_SECS), claimed_at)
+            .unwrap();
+        assert!(!restored, "the cancel stands");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked by the plan");
+        assert_eq!(wait.resume_at, None, "no automatic resume came back");
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+        // The claim's own park is still put back when it is untouched.
+        db.lock().conn_ref().execute("UPDATE runs SET plan_resume_at = ?2 WHERE id = ?1", rusqlite::params![run_id, claimed_at]).unwrap();
+        assert!(db.lock().restore_plan_resume(&run_id, &before.window, before.resets_at, Some(t + 5), claimed_at).unwrap());
+    }
+
+    /// A Resume applied only in part (the plan stage reset to pending, then
+    /// the apply failed) leaves a paused run nobody drives: the next claim
+    /// announces it instead of going quiet.
+    #[tokio::test]
+    async fn a_partial_apply_with_no_driver_needs_you() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        let log = db.lock().list_stage_log(&stage).unwrap();
+        assert!(log.iter().any(|e| e.contains("the resume didn't finish")), "{log:?}");
+    }
+
+    /// The same partial apply with a driver on the run says nothing: that
+    /// driver runs the pending stage.
+    #[tokio::test]
+    async fn a_partial_apply_with_a_driver_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().conn_ref().execute("UPDATE run_stages SET status = 'pending', error = NULL WHERE id = ?1", [&stage]).unwrap();
+        make_due(&db, &run_id);
+        orch.set_active_for_test(&run_id, true);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::NotClaimed);
+    }
+
+    /// Two windows in one batch: the park keeps the one that resets LAST.
+    #[tokio::test]
+    async fn the_park_keeps_the_latest_reset() {
+        use crate::orchestrator::cli_runner::PlanLimit;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 0, now());
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let late = now() + 7_200;
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "seven_day".into(), resets_at: late }).unwrap();
+        orch.park_for_plan(&run_id, &stage, &PlanLimit { window: "five_hour".into(), resets_at: now() + 600 }).unwrap();
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap();
+        assert_eq!((wait.window.as_str(), wait.resets_at), ("seven_day", late));
+        assert!(wait.resume_at.unwrap() >= late + RESUME_MARGIN_SECS);
+    }
+
+    /// A budget of 0 is no budget (the drive gate's own rule): it resumes.
+    #[tokio::test]
+    async fn a_zero_budget_still_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        db.lock().set_run_budget(&run_id, Some(0.0)).unwrap();
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.unwrap().resume_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn aborting_ends_the_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.abort_run(&run_id).await.unwrap();
+        assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
+        assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod ran_model_tests {
+    use crate::orchestrator::cli_runner::{ran_on_notice, same_model, substituted_model};
+    use serde_json::json;
+
+    #[test]
+    fn aliases_snapshots_and_gateway_spellings_are_the_same_model() {
+        for (asked, ran) in [
+            ("sonnet", "claude-sonnet-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
+            ("opus", "claude-opus-5-5-20261001"),
+            ("haiku", "claude-haiku-5-5"),
+            ("fable", "claude-fable-5-2"),
+            ("opusplan", "claude-sonnet-5-5"),
+            ("default", "claude-opus-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5-5"),
+            ("claude-sonnet-4-5", "claude-sonnet-4-5-20250929"),
+            ("claude-opus-4.8", "claude-opus-4-8"),
+            ("bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "claude-sonnet-5-5"),
+            ("claude-opus-4-6[1m]", "claude-opus-4-6"),
+            ("claude-sonnet-latest", "claude-sonnet-latest"),
+            ("Claude-Sonnet-5-5", "claude-sonnet-5-5"),
+        ] {
+            assert!(same_model(asked, ran), "{asked} vs {ran}");
+            assert!(same_model(ran, asked), "{ran} vs {asked}");
+        }
+    }
+
+    #[test]
+    fn another_model_is_not_the_same() {
+        for (asked, ran) in [
+            ("claude-opus-5-5", "claude-sonnet-5-5"),
+            ("opus", "claude-sonnet-5-5"),
+            ("sonnet", "claude-haiku-5-5"),
+            ("claude-sonnet-5-5", "claude-sonnet-5"),
+            ("claude-fable-5-2", "claude-fable-5-1"),
+            ("opusplan", "claude-haiku-5-5"),
+        ] {
+            assert!(!same_model(asked, ran), "{asked} vs {ran}");
+        }
+    }
+
+    #[test]
+    fn only_an_init_naming_another_model_is_a_substitution() {
+        let init = |m: serde_json::Value| json!({"type": "system", "subtype": "init", "model": m});
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!("claude-sonnet-5-5"))).as_deref(), Some("claude-sonnet-5-5"));
+        assert_eq!(substituted_model("sonnet", &init(json!("claude-sonnet-5-5"))), None, "no false alarm on an alias");
+        // A missing, empty or non-string model changes nothing.
+        assert_eq!(substituted_model("claude-opus-5-5", &json!({"type": "system", "subtype": "init"})), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(""))), None);
+        assert_eq!(substituted_model("claude-opus-5-5", &init(json!(42))), None);
+        // Only `system/init` counts.
+        let assistant = json!({"type": "assistant", "message": {"model": "claude-sonnet-5-5", "content": []}});
+        assert_eq!(substituted_model("claude-opus-5-5", &assistant), None);
+    }
+
+    #[test]
+    fn the_notice_names_both_models_by_their_catalog_names() {
+        let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "claude-sonnet-5-5", Some(&router)),
+            "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model settings picked another model"
+        );
+        // An id the catalog doesn't know prints as given.
+        assert_eq!(
+            ran_on_notice("claude-opus-5-5", "team-model", None),
+            "ran on team-model, not claude-opus-5-5 — Claude Code's model settings picked another model"
+        );
     }
 }

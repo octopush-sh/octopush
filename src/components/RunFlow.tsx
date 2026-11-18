@@ -4,7 +4,7 @@ import { stageStatusGlyph, stageStatusWord, isTransientHalt } from "../lib/runSt
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
-import { shortModel } from "../lib/modelLabel";
+import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
 import { effortApplies } from "../lib/claudeCli";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
@@ -163,7 +163,7 @@ function StageCard({
       style={{ animationDelay: `calc(${Math.min(index, 8)} * var(--stagger-step))` }}
       className={`octo-rise-in flex shrink-0 flex-col gap-2 overflow-hidden rounded-lg border px-3.5 py-3 text-left transition-[width,opacity,border-color,background-color,color] duration-[280ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
         subject ? "w-[210px]" : "w-[150px] opacity-[0.38] hover:opacity-70 focus-visible:opacity-70"
-      } ${beacon ? "octo-stage-pulse " : ""}${skin}`}
+      } ${beacon ? (running ? "octo-stage-pulse octo-stage-pulse-running " : "octo-stage-pulse ") : ""}${skin}`}
     >
       {/* Header — gate mark · role icon · title · status glyph. Rows are
           `w-full min-w-0` so they clip against the card in WebKit too (#312). */}
@@ -213,6 +213,15 @@ function StageCard({
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
             <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
+            {s.ranModel && (
+              <span
+                className="octo-pop-in shrink-0 text-octo-warning"
+                title={ranOnTitle(s.agentModel, s.ranModel)}
+                data-tour="direct-stage-ran-on"
+              >
+                {ranOnNote(s.ranModel)}
+              </span>
+            )}
             {s.effort && effortApplies(s.substrate, s.escalated && s.escalateModel ? s.escalateModel : s.agentModel) && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}

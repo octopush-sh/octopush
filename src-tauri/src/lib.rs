@@ -6,9 +6,11 @@ pub mod billing;
 pub mod chat_agents;
 pub mod chat_engine;
 pub mod chat_history;
+pub mod collisions;
 pub mod claude_hooks;
 pub mod claude_login;
 pub mod claude_plan;
+pub mod codex_trust;
 mod commands;
 pub mod context_guard;
 pub mod crew;
@@ -31,6 +33,7 @@ pub mod pty_daemon;
 mod pty_manager;
 mod session;
 pub mod session_recap;
+pub mod secret_scan;
 pub mod settings;
 pub mod skills;
 mod state;
@@ -238,6 +241,8 @@ pub fn run() {
             commands::get_git_status,
             commands::list_branches,
             commands::workspaces_git_summary,
+            commands::project_collisions,
+            commands::workspace_diff_size,
             commands::get_git_diff,
             // Chat
             commands::send_chat_message,
@@ -284,6 +289,7 @@ pub fn run() {
             commands::resolve_checkpoint,
             commands::answer_blocker,
             commands::abort_run,
+            commands::cancel_plan_resume,
             commands::stop_stage,
             commands::request_run_pause,
             commands::update_run_stage,
@@ -417,6 +423,7 @@ pub fn run() {
             commands::connect_claude_code,
             commands::claude_cli_version,
             commands::claude_model_floor_note,
+            commands::codex_trust_note,
             commands::model_retirements,
             commands::readiness_check,
             // Role commands

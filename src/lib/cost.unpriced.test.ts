@@ -56,6 +56,7 @@ describe("usageUnreportedNote / usageUnreportedTitle", () => {
     expect(usageUnreportedNote(1)).toBe("1 stage usage not reported");
     expect(usageUnreportedNote(2)).toBe("2 stages usage not reported");
     expect(usageUnreportedTitle(1)).toBe(USAGE_UNREPORTED_TITLE);
-    expect(usageUnreportedTitle(2)).toMatch(/^Codex stopped before reporting usage in 2 stages, so their cost is unknown/);
+    expect(usageUnreportedTitle(2)).toMatch(/^Codex stopped before reporting usage, or a stopped stage streamed usage with no price .* in 2 stages, so part of their cost is unknown/);
+    expect(USAGE_UNREPORTED_TITLE).toContain("a subagent model or fast mode");
   });
 });

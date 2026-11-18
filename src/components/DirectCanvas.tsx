@@ -10,6 +10,7 @@ import { PipelineBuilder } from "./PipelineBuilder";
 import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
 import { RunControlBar } from "./RunControlBar";
+import { isPlanWaiting, pickBlockedStage } from "../lib/planWait";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -54,7 +55,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
   const run = detail?.run;
   const stages = detail?.stages ?? [];
-  const blockedStage = stages.find((s) => s.status === "awaiting_checkpoint" || s.status === "failed") ?? null;
+  // A sibling's gate, halt or question beats a plan-limited stage: the
+  // decision shows (with the beacon) even while the plan wait is scheduled.
+  const blockedStage = pickBlockedStage(stages);
 
   // D4 — focus follows the action. When the MANUALLY selected stage transitions
   // out of "running" (→ done / failed / awaiting_checkpoint), release the pin so
@@ -115,7 +118,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
 
     const runningStage = stages.find((s) => s.status === "running") ?? null;
     // Law 2 — one beacon per canvas: decision CTA → running card → calm.
-    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false });
+    const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false, planWaiting: !!run && isPlanWaiting(run) });
 
     // Loop props (unchanged logic, but computed off blockedStage)
     let loopTargetRole: string | null = null;
@@ -216,11 +219,15 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onPause={() => void pauseRun(run.id)}
           onStopStage={() => void stopStage(run.id)}
           onAbort={() => void abort(run.id)}
-          onApprove={() => void resolve(run.id, "approve")}
-          onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns)}
-          onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns)}
-          onDiscard={() => void resolve(run.id, "discard")}
-          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined)}
+          // Every decision names the stage its bar shows, so the backend never
+          // resolves another stage of the run: if that stage was decided
+          // elsewhere meanwhile, it refuses, the store toasts the refusal and
+          // the refresh shows what is waiting now.
+          onApprove={() => void resolve(run.id, "approve", undefined, undefined, undefined, blockedStage?.id)}
+          onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns, blockedStage?.id)}
+          onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns, blockedStage?.id)}
+          onDiscard={() => void resolve(run.id, "discard", undefined, undefined, undefined, blockedStage?.id)}
+          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined, undefined, undefined, blockedStage?.id)}
           onAnswerBlocker={(answers) => {
             if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);
           }}

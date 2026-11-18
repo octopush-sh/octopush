@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Ban, RotateCcw, ChevronRight } from "lucide-react";
+import { Ban, RotateCcw, ChevronRight, Hourglass } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
 import { isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "../lib/stageMeta";
@@ -9,6 +9,9 @@ import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
 import { haltCause } from "../lib/stageHalt";
 import { formatUsd } from "../lib/cost";
+import { isPlanLimitHalt, planWaitSentence, planWaitWhy } from "../lib/planWait";
+import { useRunsStore } from "../stores/runsStore";
+import { findingLocation, holdSummary } from "../lib/secretGuard";
 
 interface LoopState {
   iteration: number;
@@ -99,6 +102,18 @@ export function RunControlBar(props: Props) {
           blockedStage={blockedStage}
           beacon={props.beacon ?? false}
           onAnswer={props.onAnswerBlocker}
+        />
+      );
+    }
+    // A Claude plan limit: the stage waits for the plan's window to reset.
+    if (blockedStage.status === "failed" && isPlanLimitHalt(blockedStage.error)) {
+      return (
+        <PlanWaitBar
+          run={run}
+          blockedStage={blockedStage}
+          beacon={props.beacon ?? false}
+          onResume={props.onResume}
+          onAbort={props.onAbort}
         />
       );
     }
@@ -237,6 +252,65 @@ function BlockedAskBar({
   );
 }
 
+/** A stage stopped by the director's Claude plan (#731). With an automatic
+ *  resume scheduled the bar is calm — nobody has to decide, so it never
+ *  carries the beacon: "Resume now" continues early, "Don't resume
+ *  automatically" leaves it for a manual Resume. Without one (cap reached,
+ *  budget spent, turned off) Resume is the decision, and takes the beacon. */
+function PlanWaitBar({
+  run,
+  blockedStage,
+  beacon,
+  onResume,
+  onAbort,
+}: {
+  run: Run;
+  blockedStage: RunStage;
+  beacon: boolean;
+  onResume: (maxTurns?: number) => void;
+  onAbort: () => void;
+}) {
+  const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
+  const scheduled = run.planWait?.resumeAt != null;
+  const why = planWaitWhy(run);
+  return (
+    <div className="octo-fade-in border-t border-[var(--warning-border)] bg-[var(--warning-ghost)] px-4 py-3" data-tour="direct-plan-wait">
+      <div className="flex items-center gap-3">
+        <span className="flex shrink-0 items-center gap-1.5 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-warning">
+          <Hourglass size={11} aria-hidden />
+          plan limit
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm text-octo-sage" title={why}>
+          <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> {planWaitSentence(run, Date.now())}
+        </span>
+        <button
+          type="button"
+          onClick={() => onResume()}
+          title={scheduled ? "Continue the same session now, before the plan's window resets" : "Continue the same session"}
+          className={`${!scheduled && beacon ? "octo-stage-pulse " : ""}rounded-md border border-octo-warning px-3 py-1.5 font-serif text-sm text-octo-warning transition-colors duration-[180ms] hover:bg-[var(--warning-ghost)]`}
+        >
+          {scheduled ? "Resume now" : "Resume the stage"}
+        </button>
+        {scheduled && (
+          <button
+            type="button"
+            onClick={() => void cancelPlanResume(run.id).catch(console.error)}
+            title="Keep it parked until you resume it yourself"
+            data-tour="direct-plan-wait-cancel"
+            className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory"
+          >
+            Don&apos;t resume automatically
+          </button>
+        )}
+        <button type="button" onClick={onAbort}
+          className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-rouge">
+          Abort
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function DecisionBar({
   blockedStage,
   loopTargetRole,
@@ -257,6 +331,14 @@ function DecisionBar({
   const [turns, setTurns] = useState(() => defaultTurns);
 
   const failed = blockedStage.status === "failed";
+  // Secret guard (#730): an Action stage held before it started because the
+  // worktree holds a possible secret, the scan stopped at its 16 MB budget,
+  // or the worktree couldn't be read (fail closed). Approving is the
+  // explicit override.
+  const secret = !failed && blockedStage.secretHold && !blockedStage.secretHold.acknowledged
+    ? blockedStage.secretHold
+    : null;
+  const secretCount = secret ? Math.max(secret.total ?? 0, secret.findings.length) : 0;
   const cause = haltCause(blockedStage.error, blockedStage.maxIterations);
   // A cause that prefers a re-run (a deferred tool) is never a transient wait.
   const transient = failed && !cause.preferRerun && isTransientHalt(blockedStage.error);
@@ -402,8 +484,8 @@ function DecisionBar({
           ) : (
             /* ── Transient or checkpoint decide row ── */
             <div className="flex items-center gap-3">
-              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed ? "text-octo-rouge" : "text-octo-brass"}`}>
-                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : "⟜ checkpoint"}
+              <span className={`font-mono text-[10px] uppercase tracking-[0.25em] ${transient ? "text-octo-warning" : failed || secret ? "text-octo-rouge" : "text-octo-brass"}`}>
+                {transient ? "⟳ awaiting retry" : failed ? "✕ stage halted" : secret ? "possible secret" : "⟜ checkpoint"}
               </span>
               <span
                 className="min-w-0 flex-1 truncate text-sm text-octo-sage"
@@ -413,6 +495,10 @@ function DecisionBar({
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> paused on a transient fault: {firstLine(blockedStage.error)}</>
                 ) : failed ? (
                   <><b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> halted: {firstLine(blockedStage.error)}</>
+                ) : secret ? (
+                  <span data-tour="direct-secret-hold" title={secret.findings.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n") || undefined}>
+                    Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {holdSummary(secret)}
+                  </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
                 )}
@@ -426,6 +512,14 @@ function DecisionBar({
                 <button type="button" onClick={onApprove}
                   className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                   Accept &amp; continue
+                </button>
+              ) : secret ? (
+                <button type="button" onClick={onApprove}
+                  title={secretCount > 0
+                    ? "Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
+                    : "Start this stage anyway, without a complete check."}
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md border border-[color:var(--rouge-border)] px-3 py-1.5 font-serif text-sm text-octo-rouge transition-colors duration-[180ms] hover:bg-[var(--rouge-ghost)]`}>
+                  {secretCount > 1 ? "Proceed past them" : "Proceed regardless"}
                 </button>
               ) : (
                 <button type="button" onClick={onApprove}

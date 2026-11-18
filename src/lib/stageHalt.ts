@@ -26,6 +26,13 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
       ? { title: line, preferRerun: true }
       : { title: line.slice(0, cut), remedy: line.slice(cut + 2), preferRerun: true };
   }
+  if (raw.includes("(plan_limit)")) {
+    return {
+      title: "Paused by your Claude plan",
+      remedy:
+        "The stage keeps its spend and its session. Resuming continues the same session once the plan's window resets; nothing you approved is skipped.",
+    };
+  }
   if (raw.includes("error_max_turns")) {
     return {
       title: `Claude stopped early — it reached the ${maxIterations}-turn limit`,
@@ -55,6 +62,14 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
     return {
       title: `${stalled[1]} gave no result for ${stalled[2]}`,
       remedy: "Claude Code was still waiting on it. Check why it hangs, then resume or re-run.",
+    };
+  }
+  // "claude timed out — no output for 10 minutes after an API retry (overloaded)".
+  const retried = /no output for (\d+ minutes?) after an API retry(?: \(([^)]+)\))?/.exec(raw.split("\n")[0]);
+  if (retried) {
+    return {
+      title: `No answer for ${retried[1]} after an API retry${retried[2] ? ` (${retried[2]})` : ""}`,
+      remedy: "Claude Code waited out its retry delay and the API still didn't answer. Check the provider, then resume or re-run.",
     };
   }
   if (/no output for/i.test(raw)) {

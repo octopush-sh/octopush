@@ -12,9 +12,12 @@ use tauri::{AppHandle, Manager};
 const COALESCE_MS: u64 = 250;
 
 /// Whether a run needs the director: `paused` covers every human-must-act
-/// reason (gate, halted stage, budget park, director pause).
-pub fn needs_you(status: &str) -> bool {
-    status == "paused"
+/// reason (gate, halted stage, budget park, director pause) — except a run
+/// whose only waiting stages are Claude plan limits with an automatic resume
+/// scheduled (`plan_waiting`, see [`plan_waiting`]): nobody has to decide,
+/// so it is in flight (#731). A sibling's real halt or gate keeps it needs-you.
+pub fn needs_you(status: &str, plan_waiting: bool) -> bool {
+    status == "paused" && !plan_waiting
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -31,16 +34,30 @@ impl FleetStatus {
     }
 }
 
-pub fn derive<'a>(statuses: impl IntoIterator<Item = &'a str>) -> FleetStatus {
+/// The fleet split over `(status, plan_waiting)` pairs (see [`needs_you`]).
+pub fn derive<'a>(runs: impl IntoIterator<Item = (&'a str, bool)>) -> FleetStatus {
     let mut fleet = FleetStatus::default();
-    for status in statuses {
-        if needs_you(status) {
+    for (status, plan_waiting) in runs {
+        if needs_you(status, plan_waiting) {
             fleet.needs_you += 1;
-        } else if status == "running" {
+        } else if status == "running" || (status == "paused" && plan_waiting) {
             fleet.in_flight += 1;
         }
     }
     fleet
+}
+
+/// A run waits for its Claude plan with an automatic resume scheduled, and
+/// nothing else in it waits for the director (`PlanWait::other_hold`: no
+/// other failed stage, gate or question).
+pub fn plan_waiting(run: &crate::db::RunRow) -> bool {
+    run.plan_wait.as_ref().is_some_and(|w| calm_plan_wait(w.resume_at, w.other_hold))
+}
+
+/// Pure: a plan park is calm with a resume scheduled and no other hold.
+/// Mirrors TS `isPlanWaiting` (pinned by `needsYou.fixtures.json`).
+pub fn calm_plan_wait(resume_at: Option<i64>, other_hold: bool) -> bool {
+    resume_at.is_some() && !other_hold
 }
 
 /// Run events after which a run's status may have changed.
@@ -79,7 +96,7 @@ pub fn refresh(app: &AppHandle) {
             return;
         }
     };
-    let badge = derive(runs.iter().map(|r| r.status.as_str())).badge();
+    let badge = derive(runs.iter().map(|r| (r.status.as_str(), plan_waiting(r)))).badge();
     let count = badge.unwrap_or(0);
     if SHOWN.load(Ordering::Acquire) == count {
         return;
@@ -114,7 +131,26 @@ mod tests {
         assert_eq!(statuses.len(), 6, "every RunStatus is covered");
         for c in statuses {
             let status = c["status"].as_str().unwrap();
-            assert_eq!(needs_you(status), c["needsYou"].as_bool().unwrap(), "{status}");
+            assert_eq!(needs_you(status, false), c["needsYou"].as_bool().unwrap(), "{status}");
+        }
+        for c in fixtures["planWaiting"].as_array().expect("planWaiting") {
+            let status = c["status"].as_str().unwrap();
+            let waiting = c["planWaiting"].as_bool().unwrap();
+            assert_eq!(needs_you(status, waiting), c["needsYou"].as_bool().unwrap(), "{status} {waiting}");
+        }
+    }
+
+    #[test]
+    fn a_plan_park_is_calm_only_when_nothing_else_waits() {
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/lib/needsYou.fixtures.json")).expect("fixtures");
+        let cases = fixtures["planWait"].as_array().expect("planWait");
+        assert!(cases.iter().any(|c| c["otherHold"].as_bool() == Some(true)), "a sibling-hold case is pinned");
+        for c in cases {
+            let status = c["status"].as_str().unwrap();
+            let calm = status == "paused" && calm_plan_wait(c["resumeAt"].as_i64(), c["otherHold"].as_bool().unwrap());
+            assert_eq!(calm, c["planWaiting"].as_bool().unwrap(), "{c}");
+            assert_eq!(needs_you(status, calm), c["needsYou"].as_bool().unwrap(), "{c}");
         }
     }
 
@@ -125,7 +161,11 @@ mod tests {
         for f in fixtures["fleets"].as_array().expect("fleets") {
             let statuses: Vec<&str> =
                 f["statuses"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
-            let fleet = derive(statuses.iter().copied());
+            let waiting: Vec<bool> = f["planWaiting"]
+                .as_array()
+                .map(|a| a.iter().map(|b| b.as_bool().unwrap()).collect())
+                .unwrap_or_else(|| vec![false; statuses.len()]);
+            let fleet = derive(statuses.iter().copied().zip(waiting.iter().copied()));
             assert_eq!(fleet.needs_you, f["needsYou"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.in_flight, f["inFlight"].as_u64().unwrap() as u32, "{statuses:?}");
             assert_eq!(fleet.badge(), f["badge"].as_i64(), "{statuses:?}");

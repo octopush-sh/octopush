@@ -61,6 +61,17 @@ struct CliResult {
     /// The tool call a PreToolUse hook deferred (`permissionDecision: "defer"`).
     #[serde(default)]
     deferred_tool_use: Option<CliDeferredToolUse>,
+    /// Start-up errors (Claude Code ≥ 2.1.323), e.g. the settings that failed
+    /// validation ([`refused_setting`]). Kept untyped: only strings are read.
+    #[serde(default)]
+    errors: Option<serde_json::Value>,
+    /// Why the CLI never started the session (Claude Code ≥ 2.1.323), e.g.
+    /// [`SANDBOX_REQUIRED_UNAVAILABLE`]. Older CLIs leave it unset.
+    #[serde(default)]
+    startup_failure_reason: Option<String>,
+    /// Turns the session ran; a start-up stop reports 0.
+    #[serde(default)]
+    num_turns: Option<u64>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -69,7 +80,7 @@ struct CliDeferredToolUse {
     name: String,
 }
 
-#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Default, Clone, PartialEq)]
 pub(crate) struct CliUsage {
     #[serde(default)]
     pub(crate) input_tokens: u64,
@@ -88,6 +99,11 @@ pub(crate) struct CliUsage {
     /// set per message by [`usage_from_stream_event`]; a sum doesn't carry it.
     #[serde(skip)]
     pub(crate) fast: bool,
+    /// The model that answered one streamed message (`message.model`) — a
+    /// subagent's can differ from the stage's. Only set per message by
+    /// [`usage_from_stream_event`]; `None` means the stage's model.
+    #[serde(skip)]
+    pub(crate) model: Option<String>,
 }
 
 fn one_hour_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -103,6 +119,11 @@ impl CliUsage {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
     }
+
+    /// Every token the usage counts (input, output, cache reads and writes).
+    fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
 }
 
 /// Per-message usage from an `assistant` NDJSON stream event: the message id
@@ -112,6 +133,8 @@ impl CliUsage {
 /// across ids, so a stop/timeout that never sees the terminal `result` event
 /// still reports an honest ESTIMATE of the burned spend instead of zero.
 /// A missing id yields `None` for the id — the caller keys it uniquely.
+/// The usage carries the message's own `message.model` (a subagent may run
+/// on another model than the stage; `None` when the event names none).
 pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
@@ -129,6 +152,7 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
             cache_creation_input_tokens: g("cache_creation_input_tokens"),
             cache_creation_1h_input_tokens: crate::token_engine::one_hour_cache_writes(u),
             fast: crate::token_engine::is_fast(crate::token_engine::usage_speed(u).as_deref()),
+            model: msg.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_string),
         },
     ))
 }
@@ -239,6 +263,71 @@ pub(crate) fn cli_auth_from_init(v: &Value) -> Option<CliAuth> {
     }
 }
 
+/// The model a Claude session runs on, from its `system/init` event's
+/// `model`; `None` for any other event or an init without one.
+pub(crate) fn init_model(v: &Value) -> Option<&str> {
+    if v.get("type").and_then(Value::as_str) != Some("system")
+        || v.get("subtype").and_then(Value::as_str) != Some("init")
+    {
+        return None;
+    }
+    v.get("model").and_then(Value::as_str).map(str::trim).filter(|m| !m.is_empty())
+}
+
+/// Claude Code's own aliases cover any id of their family: `sonnet` (or
+/// `sonnet[1m]`, already stripped) runs as some `claude-sonnet-*`;
+/// `opusplan` as Opus or Sonnet; `default`/`best` as whatever the account
+/// resolves them to.
+fn alias_covers(alias: &str, id: &str) -> bool {
+    match alias {
+        "default" | "best" => true,
+        "opusplan" => id.starts_with("claude-opus") || id.starts_with("claude-sonnet"),
+        "sonnet" | "opus" | "haiku" | "fable" | "mythos" => id.starts_with(&format!("claude-{alias}")),
+        _ => false,
+    }
+}
+
+/// True when a stage that asked for `requested` and ran on `ran` ran on the
+/// model it asked for: equal after `token_engine::normalize_model_id`
+/// (gateway prefixes, Bedrock/Vertex suffixes, dated snapshots, dotted
+/// gateway versions, `[1m]`), or one is a Claude Code alias covering the
+/// other (`sonnet` vs `claude-sonnet-5-5`). Pure.
+pub fn same_model(requested: &str, ran: &str) -> bool {
+    let norm = |m: &str| crate::token_engine::normalize_model_id(&m.trim().to_ascii_lowercase());
+    let (a, b) = (norm(requested), norm(ran));
+    a == b || alias_covers(&a, &b) || alias_covers(&b, &a)
+}
+
+/// The model a Claude stage ran on when it isn't the one it asked for: the
+/// `system/init` event's `model` that [`same_model`] says differs. A missing
+/// or empty `model` changes nothing. Pure.
+pub fn substituted_model(requested: &str, init: &Value) -> Option<String> {
+    init_model(init).filter(|ran| !same_model(requested, ran)).map(str::to_string)
+}
+
+/// A model's short display name for the journal: the catalog's name
+/// without "Claude " ("Sonnet 5.5"), else the id as given.
+fn model_display(model: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    router
+        .and_then(|r| r.find_model(model))
+        .map(|(_, m)| m.display_name.trim_start_matches("Claude ").to_string())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| model.to_string())
+}
+
+/// The journal line when a Claude stage runs on another model than it
+/// asked for: "ran on Sonnet 5.5, not Opus 5.5 — Claude Code's model
+/// settings picked another model". Since 2.1.323 `claude -p` "now warns on
+/// stderr" when settings block the requested model in text output only;
+/// a stream-json stage says nothing, so this is the only notice.
+pub fn ran_on_notice(requested: &str, ran: &str, router: Option<&crate::provider_router::ProviderRouter>) -> String {
+    format!(
+        "ran on {}, not {} — Claude Code's model settings picked another model",
+        model_display(ran, router),
+        model_display(requested, router)
+    )
+}
+
 /// Hand a Claude stream event's plan windows and sign-in end to
 /// `PersistingSink`, which keeps them for Readiness, Usage and the notes.
 /// `auth` is the session's, from its `system/init`. An API-key session's
@@ -265,6 +354,162 @@ pub(crate) fn forward_plan_and_login(
     if let Some(expires_at) = credential_expiry_from_result(value) {
         emitter.login_expiry(expires_at);
     }
+}
+
+// ─── Claude plan limit (a stage stopped at the plan's wall) ───────────────
+//
+// When a subscription session hits a plan window, Claude Code streams a
+// `rate_limit_event` whose `rate_limit_info.status` is `rejected` (with the
+// window's `resetsAt`), then a synthetic assistant message (`model:
+// "<synthetic>"`, `error: "rate_limit"`, text like "You've hit your 5-hour
+// limit · resets 7:40pm") and ends the turn. A `rejected` event with
+// `isUsingOverage: true` is not a stop: extra usage covers the request.
+
+/// The marker in the error of a stage that a Claude plan limit stopped.
+/// The drive parks such a stage until the window resets ([`is_plan_limit`]).
+pub const PLAN_LIMIT_MARKER: &str = "(plan_limit)";
+
+/// True when a stage error is a Claude plan limit (see [`apply_plan_limit`]):
+/// never escalated (a stronger model meets the same wall), and resumable.
+pub fn is_plan_limit(error: &str) -> bool {
+    error.contains(PLAN_LIMIT_MARKER)
+}
+
+/// The plan window that stopped a stage, and when it resets (epoch seconds).
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanLimit {
+    pub window: String,
+    pub resets_at: i64,
+}
+
+/// Watches one Claude stage's stream for a plan limit. Fed only for a session
+/// that is not API-key authenticated, so API-key users see no change.
+#[derive(Default, Debug)]
+pub(crate) struct PlanLimitWatch {
+    rejected: Option<PlanLimit>,
+    /// The CLI wrote its own limit notice (`error: "rate_limit"`).
+    limit_notice: bool,
+    /// The last rate-limit event seen was that rejection: nothing allowed a
+    /// request after it, so it is what ended the turn.
+    rejection_last: bool,
+}
+
+impl PlanLimitWatch {
+    /// Feed one stream message. Only the stage's own top-level messages
+    /// count: a sub-agent's (`parent_tool_use_id` set) is not the stage's
+    /// stop.
+    pub(crate) fn observe(&mut self, v: &Value) {
+        if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+            return;
+        }
+        let windows = plan_windows_from_stream_event(v);
+        if !windows.is_empty() {
+            // A rate-limit event: the rejection is the last one only if this
+            // event rejects too (other windows it lists may be allowed).
+            self.rejection_last = false;
+        }
+        for w in windows {
+            match w.status.as_deref() {
+                Some("rejected") if !w.using_overage => {
+                    if let Some(resets_at) = w.resets_at {
+                        self.rejected = Some(PlanLimit { window: w.kind, resets_at });
+                        self.rejection_last = true;
+                    }
+                }
+                // The same window allowed again: the wall is gone.
+                Some("allowed") | Some("allowed_warning")
+                    if self.rejected.as_ref().is_some_and(|r| r.window == w.kind) =>
+                {
+                    self.rejected = None;
+                }
+                _ => {}
+            }
+        }
+        if v.get("type").and_then(Value::as_str) == Some("assistant") {
+            let err = v
+                .get("error")
+                .or_else(|| v.get("message").and_then(|m| m.get("error")))
+                .and_then(Value::as_str);
+            if err == Some("rate_limit") {
+                self.limit_notice = true;
+            }
+        }
+    }
+
+    pub(crate) fn limit(&self) -> Option<&PlanLimit> {
+        self.rejected.as_ref()
+    }
+}
+
+/// The full name of a plan window, for the halt copy.
+pub fn plan_window_name(kind: &str) -> String {
+    match kind {
+        "five_hour" => "5-hour window".into(),
+        "seven_day" => "weekly window".into(),
+        k if k.starts_with("seven_day_") => {
+            let model = k["seven_day_".len()..].replace('_', " ");
+            let mut c = model.chars();
+            let cap = c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str()).unwrap_or_default();
+            format!("weekly {cap} window")
+        }
+        k => format!("{} window", k.replace('_', " ")),
+    }
+}
+
+/// Mark `outcome` as stopped by a Claude plan limit when the stream showed a
+/// `rejected` window and the stage didn't finish: Failed, with the plan copy
+/// and [`PLAN_LIMIT_MARKER`], its spend and session kept for Resume, and
+/// `cli.plan_limit` set so the drive parks it. A result that only *looks*
+/// finished (the CLI's own limit notice as the reply) is a stop too. A
+/// budget stop, a deferred tool and an unsaved session keep their own cause.
+pub(crate) fn apply_plan_limit(mut outcome: StageOutcome, watch: &PlanLimitWatch) -> StageOutcome {
+    let Some(limit) = watch.limit().cloned() else {
+        return outcome;
+    };
+    let own_cause = outcome.error.as_deref().is_some_and(|e| {
+        is_budget_stop(e) || is_tool_deferred(e) || is_deferred_tool_unavailable(e) || is_session_not_saved(e)
+    });
+    if own_cause {
+        return outcome;
+    }
+    let stopped = match outcome.status {
+        // A failure is the plan's only with the CLI's own limit notice, or
+        // when the rejection was the last rate-limit event before the result
+        // (a failure after a later allowed request has another cause).
+        StageStatus::Failed => watch.limit_notice || watch.rejection_last,
+        // The reply is the CLI's own limit notice, not the agent's work.
+        StageStatus::Done | StageStatus::AwaitingCheckpoint => watch.limit_notice,
+        _ => false,
+    };
+    if !stopped {
+        return outcome;
+    }
+    let detail = outcome
+        .error
+        .take()
+        .filter(|e| !e.trim().is_empty())
+        .or_else(|| Some(outcome.artifact.text.trim().to_string()).filter(|t| !t.is_empty()));
+    let mut error = format!(
+        "Paused by your Claude plan — the {} is used up until it resets.\n{PLAN_LIMIT_MARKER}",
+        plan_window_name(&limit.window)
+    );
+    if let Some(d) = detail {
+        error.push('\n');
+        error.push_str(&d);
+    }
+    outcome.status = StageStatus::Failed;
+    outcome.error = Some(error);
+    outcome.verdict = None;
+    outcome.blocked = None;
+    outcome.artifact = StageArtifact {
+        kind: ArtifactKind::Note,
+        text: String::new(),
+        payload: None,
+        refs_worktree: false,
+    };
+    outcome.cli.plan_limit = Some(limit);
+    outcome
 }
 
 /// When the stored claude.ai sign-in ends, epoch seconds, from the `result`
@@ -460,6 +705,76 @@ pub fn is_session_not_saved(error: &str) -> bool {
     error.contains(SESSION_NOT_SAVED)
 }
 
+/// The start of the error of a Claude stage that Claude Code refused to start
+/// because the stage's settings failed validation. Since 2.1.323 `claude -p`
+/// "stops at start-up and names the invalid setting" when `--settings` that
+/// turn the sandbox on fail validation, instead of running Bash unsandboxed.
+pub const SETTINGS_REFUSED: &str = "Claude Code refused the stage's settings";
+
+/// True when a stage error is a refused-settings start-up stop (see
+/// [`parse_cli_result`]): the drive must not escalate it — a stronger model
+/// starts with the same settings.
+pub fn is_settings_refused(error: &str) -> bool {
+    error.starts_with(SETTINGS_REFUSED)
+}
+
+/// The `startup_failure_reason` of a result whose `--settings` turn the
+/// sandbox on but failed validation (Claude Code ≥ 2.1.323).
+pub const SANDBOX_REQUIRED_UNAVAILABLE: &str = "sandbox_required_unavailable";
+
+/// The prefix of the line Claude Code prints for that start-up stop.
+const SANDBOX_REQUIRED_PREFIX: &str = "sandbox required but unavailable";
+
+/// A line, without a leading `Error: `, that is Claude Code's own
+/// refused-settings message: the "Sandbox required but unavailable" prefix
+/// together with "failed validation". Any other "failed validation" line
+/// (a gateway probe, a hook) is not one.
+fn refused_settings_line(line: &str) -> Option<&str> {
+    let l = line.trim();
+    let l = l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l);
+    let lower = l.to_ascii_lowercase();
+    (lower.starts_with(SANDBOX_REQUIRED_PREFIX) && lower.contains("failed validation")).then_some(l)
+}
+
+/// The line naming the setting Claude Code refused, from the result's
+/// `errors` (first) or stderr, at most 400 chars. Anchored on the real
+/// signal: `startup_failure_reason` is [`SANDBOX_REQUIRED_UNAVAILABLE`], or
+/// a line is the "Sandbox required but unavailable … failed validation"
+/// message ([`refused_settings_line`]). With the reason but no such line, the
+/// first `errors` string stands in. `None` for any other failure. Pure.
+pub(crate) fn refused_setting(
+    errors: Option<&serde_json::Value>,
+    stderr: &str,
+    startup_failure_reason: Option<&str>,
+) -> Option<String> {
+    let error_lines = || {
+        errors
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.as_str())
+            .flat_map(str::lines)
+    };
+    let clip = |l: &str| -> String { l.chars().take(400).collect() };
+    if let Some(l) = error_lines().chain(stderr.lines()).find_map(refused_settings_line) {
+        return Some(clip(l));
+    }
+    if startup_failure_reason != Some(SANDBOX_REQUIRED_UNAVAILABLE) {
+        return None;
+    }
+    let first = error_lines().map(str::trim).find(|l| !l.is_empty());
+    let first = first.map(|l| l.strip_prefix("Error:").map(str::trim_start).unwrap_or(l));
+    Some(clip(first.unwrap_or("Sandbox required but unavailable: the settings failed validation")))
+}
+
+/// The error for a refused-settings stop ([`SETTINGS_REFUSED`]), with the
+/// stderr tail when there is one.
+fn settings_refused_error(line: &str, stderr: &str) -> String {
+    let error = format!("{SETTINGS_REFUSED}: {line}");
+    let tail = stderr_tail(stderr, 10);
+    if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") }
+}
+
 /// The marker line in the error of a Codex stage that ended (director stop,
 /// stall, 60-minute cap, `turn.failed`, a crash) with its last turn missing
 /// its `turn.completed` / `token_count` event: Codex reports usage only there,
@@ -467,10 +782,24 @@ pub fn is_session_not_saved(error: &str) -> bool {
 /// Also the journal line the drive writes for it.
 pub const USAGE_UNREPORTED: &str = "codex stopped before reporting usage, so this stage's cost is unknown";
 
-/// True when a stage error carries [`USAGE_UNREPORTED`]: the drive flags the
-/// stage `usage_unreported` so the ledger reads "usage not reported".
+/// The marker line in the error of a stopped Claude Code stage whose streamed
+/// usage includes a message Octopush can't price: a subagent on a model with
+/// no price, or a fast-mode message on a model with no fast rate. That part of
+/// the spend is unknown, not $0 — it reads "usage not reported" like
+/// [`USAGE_UNREPORTED`]. The unpriced models follow it on the same line.
+pub const USAGE_UNPRICED: &str = "part of this stage's streamed usage has no price, so that part of its cost is unknown";
+
+/// The line of a stage error that carries [`USAGE_UNREPORTED`] or
+/// [`USAGE_UNPRICED`] — the sentence the drive journals for it.
+pub fn usage_unreported_line(error: &str) -> Option<&str> {
+    error.lines().find(|l| l.contains(USAGE_UNREPORTED) || l.contains(USAGE_UNPRICED))
+}
+
+/// True when a stage error carries [`USAGE_UNREPORTED`] or [`USAGE_UNPRICED`]:
+/// the drive flags the stage `usage_unreported` so the ledger reads "usage
+/// not reported".
 pub fn is_usage_unreported(error: &str) -> bool {
-    error.contains(USAGE_UNREPORTED)
+    usage_unreported_line(error).is_some()
 }
 
 /// The `terminal_reason` of a run that ended because a PreToolUse hook
@@ -698,6 +1027,41 @@ pub fn parse_cli_result(
             blocked: None,
             blocked_transcript: None,
         });
+    }
+
+    // Claude Code refused to start because the stage's settings failed
+    // validation (≥ 2.1.323): name the refused setting, not "stopped early
+    // (error_during_execution)". The session never ran, so there is nothing
+    // to resume. Never a budget stop or a max-turns stop, nor a session that
+    // ran turns: those keep their own handling below.
+    let ran_turns = parsed.num_turns.is_some_and(|n| n > 0);
+    let own_stop = matches!(bad_subtype, Some(BUDGET_STOP_SUBTYPE) | Some("error_max_turns"));
+    if (parsed.is_error || !exit_success) && !ran_turns && !own_stop {
+        if let Some(line) =
+            refused_setting(parsed.errors.as_ref(), stderr_text, parsed.startup_failure_reason.as_deref())
+        {
+            return Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: String::new(),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: parsed.usage.input_tokens,
+                output_tokens: parsed.usage.output_tokens,
+                cache_read_tokens: parsed.usage.cache_read_input_tokens,
+                cache_creation_tokens: parsed.usage.cache_creation_input_tokens,
+                cost_usd: parsed.total_cost_usd,
+                status: StageStatus::Failed,
+                tool_calls: vec![],
+                error: Some(settings_refused_error(&line, stderr_text)),
+                verdict: None,
+                session_id: None,
+                blocked: None,
+                blocked_transcript: None,
+            });
+        }
     }
 
     if parsed.is_error || !exit_success || bad_subtype.is_some() {
@@ -1291,9 +1655,17 @@ impl CliDialect {
     /// so a stage that writes (or is tricked into planting) a skill in the
     /// worktree it edits would change its own instructions mid-stage, and a
     /// reviewer would certify work done under other rules than it started
-    /// with; an older CLI ignores this one too. All are set on fresh and
-    /// `--resume` runs alike; Run-mode terminals never get them — backgrounding
-    /// and skill reloads are theirs to keep, since a human is directing there.
+    /// with; an older CLI ignores this one too. Subagent progress summaries
+    /// are off (`CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES=1`): 2.1.323
+    /// "Added `CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES` (available since
+    /// 2.1.318): set it to `1` to turn off subagent progress summaries and the
+    /// requests that write them". Those requests are billed, and a stage reads
+    /// none of them: the journal leaves `task_summary`-style system events
+    /// out, and the pane shows tool calls and the result. An older CLI ignores
+    /// the unknown variable. All are set on fresh and `--resume` runs alike,
+    /// over any inherited value; Run-mode terminals never get them —
+    /// backgrounding, skill reloads and progress summaries are theirs to keep,
+    /// since a human is directing there.
     pub fn stage_env(&self) -> Vec<(&'static str, String)> {
         match self {
             CliDialect::Claude => vec![
@@ -1301,8 +1673,30 @@ impl CliDialect {
                 ("CLAUDE_CODE_DISABLE_FAST_MODE", "1".to_string()),
                 ("CLAUDE_CODE_DISABLE_MCP_TASK_BACKGROUND", "1".to_string()),
                 ("CLAUDE_CODE_PLUGIN_DIR_WATCH", "0".to_string()),
+                ("CLAUDE_CODE_DISABLE_AGENT_PROGRESS_SUMMARIES", "1".to_string()),
             ],
             CliDialect::Codex => Vec::new(),
+        }
+    }
+
+    /// Settings › Privacy › "Quiet Claude Code in crews and Routines" (#703).
+    /// With it on, a Claude Code stage gets
+    /// `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Claude Code's env-var
+    /// reference: "Set to any non-empty value, such as `1`, to disable
+    /// nonessential network traffic: auto-updates, telemetry, error
+    /// reporting, … release notes, … and availability checks such as the fast
+    /// mode check. … Also disables feature-flag fetching, which makes Remote
+    /// Control and the other features that need feature-flag fetching
+    /// unavailable." **Off ⇒ nothing is set or removed**: the docs say even
+    /// `0` still disables the traffic, so an off toggle never writes a value,
+    /// and a user's own export is left as they set it. Like [`Self::stage_env`]
+    /// it takes no resume flag — fresh and `--resume` runs, in-process or in
+    /// the detached worker, get the same. Codex has no equivalent; Run-mode
+    /// terminals and Talk never get it.
+    pub fn stage_quiet_env(&self, quiet: bool) -> Vec<(&'static str, String)> {
+        match self {
+            CliDialect::Claude if quiet => vec![(QUIET_TRAFFIC_ENV, "1".to_string())],
+            _ => Vec::new(),
         }
     }
 
@@ -1650,6 +2044,7 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
             cache_creation_input_tokens: written,
             cache_creation_1h_input_tokens: 0,
             fast: false,
+            model: None,
         },
     ))
 }
@@ -1852,6 +2247,133 @@ pub(crate) fn sandboxed_stage_env(dialect: CliDialect, prepared: Vec<(String, St
     env
 }
 
+/// The variable "Quiet Claude Code in crews and Routines" sets (#703). Shared
+/// with the Routines runner, which exports it to a Routine's own commands.
+pub const QUIET_TRAFFIC_ENV: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+
+/// Claude Code's knob for a model's context window. 2.1.325: "Changed
+/// `CLAUDE_CODE_MAX_CONTEXT_TOKENS` to also set the context window of
+/// unrecognized model IDs that start with `claude-`, such as a gateway's
+/// `claude-sonnet-latest`".
+pub const MAX_CONTEXT_TOKENS_ENV: &str = "CLAUDE_CODE_MAX_CONTEXT_TOKENS";
+/// Claude Code's switch back to a 200K window. 2.1.323: "Changed the context
+/// window assumed for a model ID that Claude Code doesn't recognize from 200K
+/// to 1M; use `/autocompact` to compact earlier, or
+/// `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` to keep 200K".
+pub const DISABLE_1M_CONTEXT_ENV: &str = "CLAUDE_CODE_DISABLE_1M_CONTEXT";
+/// The window Claude Code (2.1.323+) assumes for a model id it doesn't know.
+const UNRECOGNIZED_MODEL_CONTEXT: u64 = 1_000_000;
+/// The window [`DISABLE_1M_CONTEXT_ENV`] keeps.
+const KEPT_CONTEXT_WITHOUT_1M: u64 = 200_000;
+/// The first Claude Code that applies [`MAX_CONTEXT_TOKENS_ENV`] to an
+/// unrecognized id starting with `claude-` (2.1.325). That entry says the
+/// variable "also" covers those ids, so ids that don't start with `claude-`
+/// already honoured it before 2.1.325.
+pub const CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR: &str = "2.1.325";
+
+/// The context-window variables a Claude stage on `model` gets, so Claude
+/// Code compacts before a smaller gateway window fills instead of assuming
+/// 1M. 2.1.323: "sessions on other vendors' models with a smaller window:
+/// once full, they can fail every turn until `/clear`, so set
+/// `CLAUDE_CODE_DISABLE_1M_CONTEXT=1` before they fill" — and a headless
+/// stage can't `/clear`. Pure:
+/// - a built-in Anthropic catalog id (`builtin`, decided on the normalized
+///   id, [`is_builtin_claude_model`]), or a model whose window is unknown
+///   (`max_context` `None`/0) or at least 1M, gets nothing;
+/// - any other model gets [`MAX_CONTEXT_TOKENS_ENV`] set to its window.
+///   [`DISABLE_1M_CONTEXT_ENV`] is never used for an id that doesn't start
+///   with `claude-`: it is process-wide, so it would also cap a subagent on
+///   a builtin 1M model, and such ids honour the max-tokens variable anyway;
+/// - an id starting with `claude-` on a Claude Code below
+///   [`CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR`] (or an unknown version,
+///   `cli_version` `None`) ignores that variable, so at a window ≤ 200K it
+///   also gets [`DISABLE_1M_CONTEXT_ENV`]`=1`, which keeps 200K. A window
+///   below 200K can't be expressed there (2.1.323–324);
+/// - a variable `user_set` reports (the user's own export) is never
+///   overridden.
+pub(crate) fn context_window_env(
+    model: &str,
+    builtin: bool,
+    max_context: Option<u64>,
+    cli_version: Option<&str>,
+    user_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let Some(window) = max_context.filter(|w| *w > 0 && *w < UNRECOGNIZED_MODEL_CONTEXT) else {
+        return Vec::new();
+    };
+    if builtin {
+        return Vec::new();
+    }
+    let mut picks = vec![(MAX_CONTEXT_TOKENS_ENV, window.to_string())];
+    let claude_prefixed = model.trim().to_ascii_lowercase().starts_with("claude-");
+    let old_cli = cli_version.is_none_or(|v| crate::agent_adapter::version_below(v, CLAUDE_PREFIXED_MAX_CONTEXT_FLOOR));
+    if claude_prefixed && old_cli && window <= KEPT_CONTEXT_WITHOUT_1M {
+        picks.push((DISABLE_1M_CONTEXT_ENV, "1".to_string()));
+    }
+    picks.into_iter().filter(|(k, _)| !user_set(k)).collect()
+}
+
+/// Whether Claude Code knows `model` and its window: its normalized id
+/// ([`crate::token_engine::normalize_model_id`], so `bedrock/claude-haiku-4-5`
+/// and `us.anthropic.claude-sonnet-5-v1:0` count) is a builtin Anthropic
+/// catalog id.
+pub(crate) fn is_builtin_claude_model(model: &str) -> bool {
+    let id = crate::token_engine::normalize_model_id(model);
+    crate::provider_router::builtin_providers()
+        .get("anthropic")
+        .is_some_and(|p| p.models.iter().any(|m| m.id == id))
+}
+
+/// [`context_window_env`] for a stage's model: built-in per
+/// [`is_builtin_claude_model`]; the window comes from the provider catalog,
+/// the user's custom model entries included (`ProviderRouter::find_model`);
+/// `cli_version` is the version the stage probed before spawning
+/// (`run_attempt`'s preflight; `None` when unknown); a user's export is read the way the CLI process will see it
+/// ([`stage_env_value`]). Codex: nothing.
+fn stage_context_env(dialect: CliDialect, model: &str, cli_version: Option<&str>) -> Vec<(&'static str, String)> {
+    if dialect != CliDialect::Claude || is_builtin_claude_model(model) {
+        return Vec::new();
+    }
+    let max_context = crate::provider_router::ProviderRouter::load()
+        .ok()
+        .and_then(|r| r.find_model(model).map(|(_, m)| m.max_context));
+    context_window_env(model, false, max_context, cli_version, |k| stage_env_value(k).is_some())
+}
+
+/// The stage's own environment, applied to its CLI process after the
+/// login-shell and sandbox variables: the dialect's pins
+/// ([`CliDialect::stage_env`]), the inherited effort override dropped
+/// ([`CliDialect::stage_env_remove`]), the subagent effort
+/// ([`CliDialect::stage_effort_env`]), the quiet-traffic opt-in
+/// ([`CliDialect::stage_quiet_env`]) and a gateway model's context window
+/// ([`stage_context_env`]). The ONE place a stage's env is set — fresh and
+/// `--resume` runs, in-process and detached, all spawn through it.
+pub(crate) fn apply_stage_env(
+    command: &mut tokio::process::Command,
+    dialect: CliDialect,
+    model: &str,
+    effort: Option<crate::providers::Effort>,
+    quiet: bool,
+    cli_version: Option<&str>,
+) {
+    for (k, v) in dialect.stage_env() {
+        command.env(k, v);
+    }
+    // After the login-shell env, which may carry the user's own export.
+    for k in dialect.stage_env_remove(effort) {
+        command.env_remove(k);
+    }
+    for (k, v) in dialect.stage_effort_env(effort) {
+        command.env(k, v);
+    }
+    for (k, v) in dialect.stage_quiet_env(quiet) {
+        command.env(k, v);
+    }
+    for (k, v) in stage_context_env(dialect, model, cli_version) {
+        command.env(k, v);
+    }
+}
+
 /// A variable as the stage's CLI process sees it: the login-shell env, which
 /// the spawn sets over the app's own, else the app's.
 fn stage_env_value(key: &str) -> Option<String> {
@@ -1868,22 +2390,43 @@ fn minutes(d: std::time::Duration) -> u64 {
 }
 
 /// What an idle stall found: the tool call still open when it tripped (if
-/// any) and the silence it waited.
+/// any), the silence it waited, and — when the last line was a Claude
+/// `system/api_retry` — that retry's cause ("" when it named none).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IdleStall {
     pub tool: Option<OpenTool>,
     pub window: std::time::Duration,
+    pub after_retry: Option<String>,
+}
+
+/// The longest retry delay [`retry_idle_window`] waits out: 300s, the
+/// ceiling Claude Code 2.1.323 set for `CLAUDE_CODE_OVERLOADED_RETRY_MAX_DELAY_MS`
+/// (529 overload backoff). A 429 `Retry-After` or a wait under
+/// `CLAUDE_CODE_RETRY_WATCHDOG` can be longer; it is capped here too, so the
+/// window after a retry stays about 10 minutes at most.
+pub(crate) const MAX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long a Claude stage may stay silent after a `system/api_retry` that
+/// says it waits `retry_delay` before the next attempt: that delay (capped at
+/// [`MAX_RETRY_DELAY`]) plus the plain window for the attempt itself, never
+/// below `idle`.
+pub(crate) fn retry_idle_window(idle: std::time::Duration, retry_delay: std::time::Duration) -> std::time::Duration {
+    retry_delay.min(MAX_RETRY_DELAY).saturating_add(idle).max(idle)
 }
 
 /// The stage error for an idle stall, after the CLI's name: "timed out — no
-/// output for 5 minutes", or naming the open call ("timed out — Bash `npm
-/// test` gave no result for 11 minutes").
+/// output for 5 minutes", naming the open call ("timed out — Bash `npm
+/// test` gave no result for 11 minutes"), or the API retry it was waiting
+/// out ("timed out — no output for 10 minutes after an API retry
+/// (overloaded)").
 pub(crate) fn idle_timeout_message(stall: &IdleStall) -> String {
     let m = minutes(stall.window);
     let unit = if m == 1 { "minute" } else { "minutes" };
-    match &stall.tool {
-        Some(t) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
-        None => format!("timed out — no output for {m} {unit}"),
+    match (&stall.tool, stall.after_retry.as_deref()) {
+        (Some(t), _) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
+        (None, Some("")) => format!("timed out — no output for {m} {unit} after an API retry"),
+        (None, Some(cause)) => format!("timed out — no output for {m} {unit} after an API retry ({cause})"),
+        (None, None) => format!("timed out — no output for {m} {unit}"),
     }
 }
 
@@ -1944,7 +2487,11 @@ impl ReadLimits {
 /// window is [`ReadLimits::command_idle`] — Claude Code itself waits that
 /// long on a foreground command that prints nothing to the stream. The first
 /// time a stage stays silent past `idle` on that account, `on_long_wait` gets
-/// the window (the journal line). Codex keeps the plain idle window.
+/// the window (the journal line). After a `system/api_retry` with a numeric
+/// `retry_delay_ms` the next silence may last that delay plus `idle`
+/// ([`retry_idle_window`]) — the CLI is waiting out its own backoff; the
+/// next line of any other kind goes back to the plain window. Codex keeps
+/// the plain idle window.
 pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     stdout: R,
     dialect: CliDialect,
@@ -1964,6 +2511,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     let settled = |at: Option<std::time::Instant>| at.is_some_and(|t| t.elapsed() >= limits.settle);
     let mut open = OpenTools::default();
     let mut long_wait_noted = false;
+    // The last line was a Claude `system/api_retry`: its cause and the
+    // silence it allows ([`retry_idle_window`]).
+    let mut retry_wait: Option<(String, std::time::Duration)> = None;
     loop {
         if settled(result_at) {
             if let Some(line) = result_line.take() {
@@ -1975,12 +2525,16 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             return ReadEnd::AbsCap(result_line, tail);
         }
         raw.clear();
-        let window = if open.command_open() { limits.command_idle.max(limits.idle) } else { limits.idle };
+        let command = open.command_open();
+        let mut window = if command { limits.command_idle.max(limits.idle) } else { limits.idle };
+        if let Some((_, w)) = &retry_wait {
+            window = window.max(*w);
+        }
         let mut wait = window.min(limits.cap - elapsed);
         if let Some(at) = result_at {
             wait = wait.min(limits.settle.saturating_sub(at.elapsed()));
         }
-        let read = if wait > limits.idle {
+        let read = if command && wait > limits.idle {
             // Only an open command waits past `idle`: say so once when it
             // does, then wait out the rest. `raw` keeps a partial line.
             let first = tokio::time::timeout(limits.idle, reader.read_until(b'\n', &mut raw)).await;
@@ -2007,7 +2561,8 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                 if started.elapsed() >= limits.cap {
                     return ReadEnd::AbsCap(result_line, tail);
                 }
-                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window });
+                let after_retry = retry_wait.map(|(cause, _)| cause);
+                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window, after_retry });
             }
             Ok(Ok(0)) => break,  // EOF
             Ok(Ok(_)) => {}
@@ -2026,6 +2581,9 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
             continue;
         };
         if dialect == CliDialect::Claude {
+            retry_wait = crate::orchestrator::live::api_retry_cause(&value).zip(
+                crate::orchestrator::live::api_retry_delay(&value).map(|d| retry_idle_window(limits.idle, d)),
+            );
             open.observe(&value);
             if is_result_event(&value) {
                 result_line = Some(trimmed.to_string());
@@ -2354,16 +2912,14 @@ impl CliRunner {
         for (k, v) in sandbox_env {
             command.env(k, v);
         }
-        for (k, v) in dialect.stage_env() {
-            command.env(k, v);
-        }
-        // After the login-shell env, which may carry the user's own export.
-        for k in dialect.stage_env_remove(effort) {
-            command.env_remove(k);
-        }
-        for (k, v) in dialect.stage_effort_env(effort) {
-            command.env(k, v);
-        }
+        apply_stage_env(
+            &mut command,
+            dialect,
+            &stage.agent_model,
+            effort,
+            ctx.quiet_claude_code,
+            cli_version.as_ref().and_then(|v| v.version.as_deref()),
+        );
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())
@@ -2402,6 +2958,11 @@ impl CliRunner {
         }
         if let Some(note) = codex_git_notice(dialect, read_only, write_scope, stage.role_environment) {
             emitter.notice(note);
+        }
+        if dialect == CliDialect::Codex {
+            if let Some(note) = crate::codex_trust::untrusted_note(&ctx.workspace_path) {
+                emitter.notice(&format!("{} {}", note.line, note.how));
+            }
         }
         let mut child = match command.spawn() {
             Ok(c) => c,
@@ -2474,10 +3035,25 @@ impl CliRunner {
         // From `system/init`: an API-key session's rate-limit events are
         // not plan windows and never reach the plan snapshot.
         let mut auth: Option<CliAuth> = None;
+        // A Claude plan wall in the stream (never for an API-key session).
+        let plan_watch = std::sync::Arc::new(parking_lot::Mutex::new(PlanLimitWatch::default()));
+        let plan_watch_in_loop = std::sync::Arc::clone(&plan_watch);
         // A retry storm journals one line per cause per 10 s, not one per attempt.
         let mut retry_throttle = crate::orchestrator::live::RetryThrottle::default();
+        // From `system/init`: the model the session runs on, when it isn't
+        // the one the stage asked for (settings such as `availableModels`
+        // can make Claude Code pick another). Prices a stop's estimate and
+        // goes on the outcome (`CliOutcomeMeta::ran_model`).
+        let ran_model: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
+            std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let ran_in_loop = std::sync::Arc::clone(&ran_model);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
+                if let Some(ran) = substituted_model(&stage.agent_model, value) {
+                    let catalog = crate::token_engine::catalog();
+                    emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
+                    *ran_in_loop.lock() = Some(ran);
+                }
                 if let Some((id, u)) = usage_from_stream_event(value) {
                     let mut map = usage_in_loop.lock();
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
@@ -2489,6 +3065,9 @@ impl CliRunner {
                     }
                 }
                 forward_plan_and_login(&mut auth, value, &emitter);
+                if auth != Some(CliAuth::ApiKey) {
+                    plan_watch_in_loop.lock().observe(value);
+                }
             }
             CliDialect::Codex => {
                 codex_json_lines += 1;
@@ -2548,14 +3127,16 @@ impl CliRunner {
                 // Estimated spend from the streamed assistant events — a stop
                 // used to record zero and silently understate the budget.
                 let (counted, drift) = counted_usage();
+                let ran = ran_model.lock().clone();
                 let mut out = stopped_stage(
                     dialect,
                     &crate::orchestrator::runner::unfinished_stage_error(true, 0),
-                    &stage.agent_model,
+                    ran.as_deref().unwrap_or(&stage.agent_model),
                     &counted,
                     codex_accum.lock().turn_open,
                 );
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                out.cli.ran_model = ran;
                 return Ok(out);
             }
         };
@@ -2581,14 +3162,16 @@ impl CliRunner {
             stop_cli_child(&mut child, STOP_GRACE).await;
             stderr_task.abort();
             let (counted, drift) = counted_usage();
+            let ran = ran_model.lock().clone();
             let mut out = stopped_stage(
                 dialect,
                 &format!("{bin} {kind}"),
-                &stage.agent_model,
+                ran.as_deref().unwrap_or(&stage.agent_model),
                 &counted,
                 codex_accum.lock().turn_open,
             );
             flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+            out.cli.ran_model = ran;
             return Ok(out);
         }
         // Settled: the CLI declared itself finished and then stayed open on
@@ -2665,15 +3248,24 @@ impl CliRunner {
             }
             CliDialect::Claude => match result_line {
                 Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
-                    Ok(outcome) => Ok(apply_question_guard(with_free_space(
-                        outcome,
-                        || free_bytes(&ctx.workspace_path),
-                    ))),
+                    Ok(mut outcome) => {
+                        outcome.cli.ran_model = ran_model.lock().clone();
+                        Ok(apply_question_guard(apply_plan_limit(
+                            with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
+                            &plan_watch.lock(),
+                        )))
+                    }
                     Err(_) => Ok(failed_stage(&format!(
                         "claude produced no parseable result: {}",
                         failure_detail(&stderr_out, &line)
                     ))),
                 },
+                // No result event, but stderr carries Claude Code's own
+                // "Sandbox required but unavailable … failed validation" line.
+                None if !exit_success && refused_setting(None, &stderr_out, None).is_some() => {
+                    let line = refused_setting(None, &stderr_out, None).unwrap_or_default();
+                    Ok(failed_stage(&settings_refused_error(&line, &stderr_out)))
+                }
                 None => {
                     let recent = tail.into_iter().collect::<Vec<_>>().join("\n");
                     let fallback = if recent.trim().is_empty() {
@@ -2681,10 +3273,13 @@ impl CliRunner {
                     } else {
                         &recent
                     };
-                    Ok(failed_stage(&format!(
-                        "claude produced no result: {}",
-                        failure_detail(&stderr_out, fallback)
-                    )))
+                    Ok(apply_plan_limit(
+                        failed_stage(&format!(
+                            "claude produced no result: {}",
+                            failure_detail(&stderr_out, fallback)
+                        )),
+                        &plan_watch.lock(),
+                    ))
                 }
             },
         }
@@ -2913,59 +3508,108 @@ pub(crate) fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> Cl
     total
 }
 
-/// The estimated cost of the streamed per-message usage: standard-speed
-/// messages at the model's price, fast-mode ones at the fast rate
-/// (`token_engine::fast_prices`). A fast message on a model without a fast
-/// rate adds nothing — unpriced, never billed at the standard rate.
-pub(crate) fn streamed_cost(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> f64 {
-    let mut standard = CliUsage::default();
-    let mut fast = CliUsage::default();
+/// The streamed per-message usage priced as an estimate ([`streamed_estimate`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct StreamedEstimate {
+    /// The tokens to record: every message's when none could be priced,
+    /// otherwise only the priced messages' (so the baseline never re-prices
+    /// tokens whose cost is unknown and reports them as saved).
+    pub(crate) usage: CliUsage,
+    pub(crate) cost_usd: f64,
+    /// The (model, speed) groups that have tokens but no price, as `model`
+    /// or `model (fast)`, sorted and deduplicated. Empty when the estimate is
+    /// complete, and also when every token is the stage's own unpriced model
+    /// at standard speed (the ledger already reads that stage "unpriced" from
+    /// its model). Token-less groups and CLI placeholder models such as
+    /// `<synthetic>` are never listed.
+    pub(crate) unpriced: Vec<String>,
+}
+
+/// The estimated cost of the streamed per-message usage. Messages are
+/// grouped by (model, speed) — each message's own `message.model` (a
+/// subagent may run on another model), falling back to the stage's `model` —
+/// and each group is priced for its own model through the normal catalog:
+/// standard speed at the model's price, fast mode at its fast rate
+/// (`token_engine::prices_at_speed`). A group with no price (an unknown
+/// model, or fast mode on a model with no fast rate) is never billed at
+/// another rate and never read as free: it lands in `unpriced`, except a
+/// stage whose usage is all its own unpriced model at standard speed — the
+/// ledger already reads that stage "unpriced" from its model. A group with
+/// no tokens, or on a CLI placeholder model (`<synthetic>`, which Claude Code
+/// stamps on its own error messages), billed nothing and is never unpriced.
+pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StreamedEstimate {
+    use crate::token_engine::{normalize_model_id, prices_at_speed, prices_for, SPEED_FAST};
+    let stage = normalize_model_id(model);
+    let mut groups: std::collections::BTreeMap<(String, bool), (String, CliUsage)> = std::collections::BTreeMap::new();
     for u in map.values() {
-        if u.fast {
-            fast.add(u);
-        } else {
-            standard.add(u);
+        let m = u.model.as_deref().unwrap_or(model);
+        let entry = groups
+            .entry((normalize_model_id(m), u.fast))
+            .or_insert_with(|| (m.to_string(), CliUsage::default()));
+        entry.1.add(u);
+    }
+    let mut all = CliUsage::default();
+    let mut priced = CliUsage::default();
+    let mut any_priced = false;
+    let mut cost = 0.0;
+    let mut unpriced = Vec::new();
+    let mut only_stage_model_unpriced = true;
+    for ((key, fast), (m, u)) in &groups {
+        all.add(u);
+        let speed = if *fast { Some(SPEED_FAST) } else { None };
+        match prices_at_speed(m, prices_for(m), speed) {
+            Some(p) => {
+                any_priced = true;
+                priced.add(u);
+                cost += p.cost_split(
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                    u.cache_creation_1h_input_tokens,
+                );
+            }
+            None if u.total() == 0 || m.starts_with('<') => {}
+            None => {
+                only_stage_model_unpriced &= !*fast && *key == stage;
+                unpriced.push(if *fast { format!("{m} (fast)") } else { m.clone() });
+            }
         }
     }
-    let mut cost = crate::orchestrator::cost::stage_cost_split(
-        model,
-        standard.input_tokens,
-        standard.output_tokens,
-        standard.cache_read_input_tokens,
-        standard.cache_creation_input_tokens,
-        standard.cache_creation_1h_input_tokens,
-    );
-    if fast != CliUsage::default() {
-        let prices = crate::token_engine::prices_at_speed(
-            model,
-            crate::token_engine::prices_for(model),
-            Some(crate::token_engine::SPEED_FAST),
-        );
-        if let Some(p) = prices {
-            cost += p.cost_split(
-                fast.input_tokens,
-                fast.output_tokens,
-                fast.cache_read_input_tokens,
-                fast.cache_creation_input_tokens,
-                fast.cache_creation_1h_input_tokens,
-            );
-        }
+    if only_stage_model_unpriced && !any_priced {
+        unpriced.clear();
     }
-    cost
+    unpriced.sort();
+    unpriced.dedup();
+    StreamedEstimate { usage: if any_priced { priced } else { all }, cost_usd: cost, unpriced }
+}
+
+/// [`streamed_estimate`]'s cost alone.
+#[cfg(test)]
+pub(crate) fn streamed_cost(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> f64 {
+    streamed_estimate(model, map).cost_usd
 }
 
 /// A failed outcome carrying the ESTIMATED usage summed from the streamed
 /// assistant events (no terminal `result` event arrived to be authoritative).
-/// Cost is priced through the normal catalog ([`streamed_cost`]) so the run
-/// meter and budget see the burned spend instead of zero.
+/// Cost is priced through the normal catalog ([`streamed_estimate`]) so the
+/// run meter and budget see the burned spend instead of zero; a part it
+/// can't price appends [`USAGE_UNPRICED`] (with the models) to the error, so
+/// the stage reads "+ usage not reported" instead of a smaller total.
 fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StageOutcome {
-    let u = sum_usage(map);
-    let mut out = failed_stage(msg);
+    let est = streamed_estimate(model, map);
+    let msg = if est.unpriced.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{msg}\n{USAGE_UNPRICED} ({})", est.unpriced.join(", "))
+    };
+    let u = est.usage;
+    let mut out = failed_stage(&msg);
     out.input_tokens = u.input_tokens;
     out.output_tokens = u.output_tokens;
     out.cache_read_tokens = u.cache_read_input_tokens;
     out.cache_creation_tokens = u.cache_creation_input_tokens;
-    out.cost_usd = streamed_cost(model, map);
+    out.cost_usd = est.cost_usd;
     out
 }
 

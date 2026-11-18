@@ -83,12 +83,7 @@ pub async fn create_session(
         engine.scan_and_record(sid, seq, bytes);
     });
 
-    // Merge guard env into PTY env (isolated HISTFILE, project type, git branch).
-    let mut env = HashMap::new();
-    guard.apply_env(&mut env);
-
-    // Inject the selected model so CLI agents can read it.
-    env.insert("OCTOPUSH_MODEL".into(), session.agent.model.clone());
+    let env = run_terminal_env(&guard, &session.agent.model);
 
     // Spawn PTY
     state.pty.lock().spawn(
@@ -113,6 +108,18 @@ pub async fn create_session(
         .get_session(&id)?
         .ok_or_else(|| AppError::SessionNotFound(id.clone()))?;
     Ok(refreshed)
+}
+
+/// A Run terminal's PTY environment: the context guard's variables (isolated
+/// HISTFILE, project type, git branch) and the selected model, so CLI agents
+/// can read it. Nothing from the crew stage env — a Run terminal is the
+/// user's own session, so Settings › Privacy › "Quiet Claude Code in crews
+/// and Routines" (#703) never reaches it.
+pub(crate) fn run_terminal_env(guard: &ContextGuard, model: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    guard.apply_env(&mut env);
+    env.insert("OCTOPUSH_MODEL".into(), model.to_string());
+    env
 }
 
 #[tauri::command]
@@ -1234,6 +1241,87 @@ pub async fn workspaces_git_summary(
     Ok(out)
 }
 
+/// Collision radar (#732): which live workspaces of a project change the same
+/// files, and whether an in-memory merge confirms a conflict. Read-only: it
+/// never writes objects, refs, the index or locks. Throttled: a report younger
+/// than `collisions::REPORT_TTL` is reused (unless `force`, or a HEAD moved),
+/// and committed diffs and merge confirmations are cached by commit id.
+#[tauri::command]
+pub async fn project_collisions(
+    state: State<'_, AppState>,
+    project_id: String,
+    force: Option<bool>,
+) -> AppResult<crate::collisions::ProjectCollisions> {
+    let (rows, project_path) = {
+        let db = state.db.lock();
+        let rows = db.list_workspaces(&project_id)?;
+        let path = db.get_project(&project_id)?.map(|p| p.path);
+        (rows, path)
+    };
+    let default_base = project_path
+        .as_deref()
+        .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+    let inputs: Vec<crate::collisions::ScanInput> = rows
+        .into_iter()
+        .filter_map(|row| {
+            let wt = expand_tilde(row.worktree_path.as_deref()?);
+            let path = std::path::PathBuf::from(wt);
+            path.is_dir().then(|| crate::collisions::ScanInput {
+                id: row.id,
+                name: row.name,
+                path,
+                base: crate::collisions::workspace_base(row.from_branch, default_base.as_deref()),
+            })
+        })
+        .collect();
+    let cache = std::sync::Arc::clone(&state.collisions);
+    tauri::async_runtime::spawn_blocking(move || {
+        cache.lock().scan_throttled(
+            &project_id,
+            &inputs,
+            std::time::Instant::now(),
+            crate::collisions::REPORT_TTL,
+            force.unwrap_or(false),
+        )
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("collision scan: {e}")))
+}
+
+/// The size of a workspace's diff against its base ([`crate::git_ops::DiffSize`]),
+/// for Mission Control's settled and needs-you cards. `None` when the
+/// workspace or its worktree is gone, it isn't a git repo, or the diff timed
+/// out — the card then shows nothing rather than a made-up zero.
+#[tauri::command]
+pub async fn workspace_diff_size(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<Option<crate::git_ops::DiffSize>> {
+    let (row, project_path) = {
+        let db = state.db.lock();
+        let Some(row) = db.get_workspace(&workspace_id)? else { return Ok(None) };
+        let project_path = db.get_project(&row.project_id)?.map(|p| p.path);
+        (row, project_path)
+    };
+    let Some(wt) = row.worktree_path else { return Ok(None) };
+    let path = expand_tilde(&wt);
+    if !crate::git_ops::is_git_repo(std::path::Path::new(&path)) {
+        return Ok(None);
+    }
+    let from_branch = row.from_branch;
+    Ok(run_with_timeout(std::time::Duration::from_secs(5), move || {
+        // The same base the collision radar uses: the workspace's own base
+        // branch, else the project's default branch.
+        let default_base = project_path
+            .as_deref()
+            .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
+        let base = crate::collisions::workspace_base(from_branch, default_base.as_deref());
+        crate::git_ops::diff_size(std::path::Path::new(&path), base.as_deref()).ok()
+    })
+    .await
+    .flatten())
+}
+
 #[tauri::command]
 pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);
@@ -1971,9 +2059,14 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages, unreported) = {
+    let (run, stages, unreported, ran) = {
         let db = state.db.lock();
-        (db.get_run(&run_id)?, db.list_run_stages(&run_id)?, db.usage_unreported_stage_ids(&run_id)?)
+        (
+            db.get_run(&run_id)?,
+            db.list_run_stages(&run_id)?,
+            db.usage_unreported_stage_ids(&run_id)?,
+            db.ran_models(&run_id)?,
+        )
     };
     // Flag stages whose model has no price (resolved after the DB lock), and
     // stages whose CLI stopped before reporting usage: the ledger shows them
@@ -1983,12 +2076,18 @@ pub async fn get_run(
     let mut stages_json = serde_json::to_value(&stages)?;
     if let Some(arr) = stages_json.as_array_mut() {
         for (v, s) in arr.iter_mut().zip(stages.iter()) {
+            // A stage that ran on another model is priced as what ran.
+            let model = ran.get(&s.id).unwrap_or(&s.agent_model);
             let ok = *priced
-                .entry(s.agent_model.clone())
-                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), &s.agent_model).is_some());
+                .entry(model.clone())
+                .or_insert_with(|| crate::token_engine::prices_in(router.as_deref(), model).is_some());
             if let Some(obj) = v.as_object_mut() {
                 obj.insert("unpricedModel".into(), serde_json::Value::Bool(!ok));
                 obj.insert("usageUnreported".into(), serde_json::Value::Bool(unreported.contains(&s.id)));
+                obj.insert(
+                    "ranModel".into(),
+                    ran.get(&s.id).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.clone())),
+                );
             }
         }
     }
@@ -2580,6 +2679,7 @@ pub async fn resolve_checkpoint(
     feedback: Option<String>,
     model_override: Option<String>,
     max_turns_override: Option<i64>,
+    stage_id: Option<String>,
 ) -> AppResult<()> {
     let action = match action.as_str() {
         "approve" => CheckpointAction::Approve,
@@ -2591,20 +2691,31 @@ pub async fn resolve_checkpoint(
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),
     };
-    dispatch_checkpoint(&orch, run_id, None, action)
+    // `stage_id` names the stage the director decided on (the Direct canvas
+    // passes the one its decision bar shows), so a run holding several
+    // stages never resolves a different one. A named stage that was already
+    // decided is refused ("This stage was already decided — refresh…"), never
+    // redirected to another; `None` = the single-parked rule.
+    dispatch_checkpoint(&orch, run_id, stage_id, action)
 }
 
 /// Resolve a checkpoint decision and resume the drive, choosing the detached
 /// (Pro) or in-process path. Shared by `resolve_checkpoint` and
 /// `answer_blocker` so the escape valve reuses the exact resume substrate.
 /// `stage_id` scopes which parked/failed stage the action targets — the escape
-/// valve passes its validated id; the plain checkpoint path passes `None`.
+/// valve passes its validated id, the checkpoint path the stage its caller
+/// named (or `None`).
 fn dispatch_checkpoint(
     orch: &Arc<Orchestrator>,
     run_id: String,
     stage_id: Option<String>,
     action: CheckpointAction,
 ) -> AppResult<()> {
+    // A decision on a stage that was decided elsewhere meanwhile is refused
+    // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
+    // The director acted: a fresh allowance of automatic plan resumes.
+    orch.db().lock().reset_plan_resume_count(&run_id)?;
     // Pro (`runs.detached`): apply the decision's mutations here — they're
     // synchronous and cheap — then hand the re-drive to a detached worker.
     // Guard rejections ("run is already executing") surface immediately
@@ -2659,6 +2770,14 @@ pub async fn answer_blocker(
     // Thread the validated `stage_id` through so the resolution acts on exactly
     // the stage we just checked, not merely "the parked stage".
     dispatch_checkpoint(&orch, run_id, Some(stage_id), CheckpointAction::AnswerBlocker { answers, source })
+}
+
+/// Turn off the automatic resume of a run parked by a Claude plan limit: it
+/// stays parked and waits for a manual Resume (#731). "Resume now" is the
+/// ordinary `resolve_checkpoint("resume")`.
+#[tauri::command]
+pub async fn cancel_plan_resume(orch: State<'_, Arc<Orchestrator>>, run_id: String) -> AppResult<()> {
+    orch.cancel_plan_resume(&run_id)
 }
 
 #[tauri::command]
@@ -5007,13 +5126,29 @@ pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.
+///
+/// The secret guard (#730) rescans the staged diff first and refuses with
+/// `AppError::SecretsFound` on a finding (or a partial scan), unless
+/// `allow_findings` is the fingerprint of exactly the findings the dialog
+/// showed — the user's "commit regardless" for this one commit.
 #[tauri::command]
-pub async fn commit_changes(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn commit_changes(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
@@ -5201,10 +5336,19 @@ pub async fn create_pull_request(
     title: String,
     body: String,
     draft: bool,
+    allow_findings: Option<String>,
 ) -> AppResult<crate::github::Pr> {
     let path = expand_tilde(&workspace_path);
     if title.trim().is_empty() {
         return Err(AppError::Other("A pull request needs a title.".into()));
+    }
+    // Secret guard (#730): the commits this PR would contain.
+    {
+        let (p, b) = (path.clone(), base.clone());
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::pr_files(std::path::Path::new(&p), &b)
+        })
+        .await?;
     }
     // The base repo and head owner come from the remotes, so a fork, a base
     // picked as `upstream/main` and `gh repo set-default` all open the PR the
@@ -5664,9 +5808,20 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
 /// user's terminal. Returns the trimmed final stderr line, which usually
 /// includes either the new remote refs or the error reason.
+///
+/// The secret guard (#730) rescans the commits the push would send and
+/// refuses with `AppError::SecretsFound` unless `allow_findings` matches the
+/// fresh scan's fingerprint.
 #[tauri::command]
-pub async fn push_branch(workspace_path: String) -> AppResult<String> {
+pub async fn push_branch(workspace_path: String, allow_findings: Option<String>) -> AppResult<String> {
     let workspace_path = expand_tilde(&workspace_path);
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::push_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     // Read current branch shorthand to pass as upstream target.
     let branch_out = std::process::Command::new("git")
@@ -6502,12 +6657,24 @@ pub async fn blame_file(path: String, file: String) -> AppResult<Vec<crate::git_
 }
 
 #[tauri::command]
-pub async fn amend_commit(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn amend_commit(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    // Same secret guard as `commit_changes`: the amend records the staged diff.
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
     let cmd = format!("git commit --amend -m '{}'", msg_escaped);
@@ -6763,6 +6930,29 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
     Ok(crate::agent_adapter::claude_cli_version_cached()
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher: the line saying Codex will skip this repo's `.codex/`
+/// settings and MCP servers because the project isn't trusted in Codex, and
+/// how to trust it. Reads Codex's config only; `None` when the repo has no
+/// `.codex/` dir, the project is trusted, or the config is missing or unreadable.
+#[tauri::command]
+pub async fn codex_trust_note(workspace_path: String) -> AppResult<Option<CodexTrustNote>> {
+    tokio::task::spawn_blocking(move || {
+        crate::codex_trust::untrusted_note(std::path::Path::new(&workspace_path)).map(|note| CodexTrustNote {
+            line: note.line.to_string(),
+            how: note.how.to_string(),
+        })
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("codex trust task failed: {e}")))
+}
+
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexTrustNote {
+    pub line: String,
+    pub how: String,
 }
 
 /// Direct launcher, Readiness and Routines: the models among `models` with a

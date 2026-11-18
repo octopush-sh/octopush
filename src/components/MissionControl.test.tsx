@@ -21,7 +21,10 @@ vi.mock("../lib/ipc", async (orig) => {
       ...actual.ipc,
       getRun: vi.fn().mockResolvedValue({ run: null, stages: [] }),
       abortRun: vi.fn().mockResolvedValue(undefined),
+      resolveCheckpoint: vi.fn().mockResolvedValue(undefined),
+      cancelPlanResume: vi.fn().mockResolvedValue(undefined),
       answerBlocker: vi.fn().mockResolvedValue(undefined),
+      workspaceDiffSize: vi.fn().mockResolvedValue(null),
     },
   };
 });
@@ -32,6 +35,7 @@ const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useAttentionStore } = await import("../stores/attentionStore");
 const { useMissionsStore } = await import("../stores/missionsStore");
 const { ipc } = await import("../lib/ipc");
+const { useDiffSizeStore, resetDiffSizeQueueForTests } = await import("../stores/diffSizeStore");
 
 const mkRun = (id: string, status: RunStatus, over: Partial<Run> = {}): Run => ({
   id,
@@ -110,6 +114,8 @@ beforeEach(() => {
   useWorkspaceStore.setState({ workspacesByProjectId: {} } as any);
   useAttentionStore.setState({ flagsByWs: {} });
   useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
+  useDiffSizeStore.setState({ byKey: {} });
+  resetDiffSizeQueueForTests();
   vi.clearAllMocks();
 });
 
@@ -212,6 +218,128 @@ describe("MissionControl", () => {
     fireEvent.click(screen.getByRole("button", { name: "Confirm abort" }));
     expect(ipc.abortRun).toHaveBeenCalledWith("a");
     expect(onJumpToRun).not.toHaveBeenCalled(); // the action never triggers the jump
+  });
+
+  describe("diff size", () => {
+    const size = (files: number, added: number, removed: number, base: string | null = "main") => ({ files, added, removed, base, untrackedSkipped: 0 });
+    const loaded = (...ids: string[]) =>
+      useWorkspaceStore.setState({
+        workspacesByProjectId: { p1: ids.map((id) => ({ id: `ws-${id}`, name: id.toUpperCase() })) },
+      } as any);
+
+    it("shows a settled card's size, measured once, with what it was measured against", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(size(6, 120, 40));
+      useRunsStore.setState({ runsByWs: { "ws-c": [mkRun("c", "completed")] }, settledAt: { c: Date.now() - 60_000 } });
+      loaded("c");
+      const { rerender } = renderRoom();
+      const slot = await screen.findByText("· +120 −40 · 6 files");
+      expect(slot.getAttribute("data-tour")).toBe("mission-control-card-size");
+      expect(slot.className).toContain("text-octo-mute");
+      expect(slot.className).not.toContain("brass");
+      expect(slot).toHaveAttribute("title", "Against main: 6 files changed, +120 −40 lines");
+      rerender(<MissionControl open onClose={noop} onJumpToRun={noop} onJumpToAttention={noop} onDispatch={noop} />);
+      await act(async () => {});
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1);
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-c");
+    });
+
+    it("sizes needs-you cards but not in-flight ones", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(size(1, 12, 0));
+      useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "paused")], "ws-b": [mkRun("b", "running")] } });
+      loaded("a", "b");
+      renderRoom();
+      expect(await screen.findByText("· +12 −0 · 1 file")).toBeTruthy();
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1);
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-a");
+    });
+
+    it("shows nothing for an unloaded or vanished workspace — never a made-up zero", async () => {
+      useRunsStore.setState({
+        runsByWs: { "ws-gone": [mkRun("gone", "completed")], "ws-c": [mkRun("c", "completed")] },
+        settledAt: { gone: Date.now() - 60_000, c: Date.now() - 50_000 },
+      });
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue(null);
+      loaded("c"); // ws-c is loaded but its worktree is gone: the command says null
+      renderRoom();
+      await act(async () => {});
+      expect(ipc.workspaceDiffSize).toHaveBeenCalledTimes(1); // never for the unloaded one
+      expect(document.querySelector('[data-tour="mission-control-card-size"]')).toBeNull();
+    });
+
+    it("says 'no changes' for a crew that changed nothing, and orders the band smallest first on request", async () => {
+      const sizes: Record<string, ReturnType<typeof size>> = {
+        "ws-big": size(40, 1800, 200),
+        "ws-none": size(0, 0, 0),
+        "ws-mid": size(3, 30, 10),
+      };
+      vi.mocked(ipc.workspaceDiffSize).mockImplementation(async (id: string) => sizes[id] ?? null);
+      const now = Date.now();
+      useRunsStore.setState({
+        runsByWs: {
+          "ws-big": [mkRun("big", "completed")],
+          "ws-none": [mkRun("none", "completed")],
+          "ws-mid": [mkRun("mid", "completed")],
+          "ws-unk": [mkRun("unk", "completed")],
+        },
+        settledAt: { big: now - 4000, none: now - 3000, mid: now - 2000, unk: now - 1000 },
+        statusSince: { big: 1, none: 2, mid: 3, unk: 4 },
+      });
+      loaded("big", "none", "mid", "unk");
+      renderRoom();
+      expect(await screen.findByText("· no changes")).toBeTruthy();
+      await screen.findByText("· +1800 −200 · 40 files");
+      await screen.findByText("· +30 −10 · 3 files");
+      await vi.waitFor(() => expect(ipc.workspaceDiffSize).toHaveBeenCalledWith("ws-unk"));
+      await act(async () => {});
+      const tasks = () => screen.getAllByText(/^task /).map((el) => el.textContent);
+      expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]); // oldest first by default
+      const toggle = screen.getByRole("button", { name: "Order settled crews by smallest diff first" });
+      expect(toggle).toHaveTextContent("Oldest first");
+      fireEvent.click(toggle);
+      expect(tasks()).toEqual(["task none", "task mid", "task big", "task unk"]); // unmeasured last
+      fireEvent.click(screen.getByRole("button", { name: "Order settled crews oldest first" }));
+      expect(tasks()).toEqual(["task big", "task none", "task mid", "task unk"]);
+    });
+  });
+
+  describe("diff size while loading", () => {
+    it("holds Smallest first at the oldest-first order until every visible size is in", async () => {
+      const pending: Record<string, (v: unknown) => void> = {};
+      vi.mocked(ipc.workspaceDiffSize).mockImplementation(
+        (id: string) => new Promise((resolve) => { pending[id] = resolve as (v: unknown) => void; }) as never,
+      );
+      const now = Date.now();
+      useRunsStore.setState({
+        runsByWs: { "ws-big": [mkRun("big", "completed")], "ws-mid": [mkRun("mid", "completed")] },
+        settledAt: { big: now - 4000, mid: now - 2000 },
+        statusSince: { big: 1, mid: 2 },
+      });
+      useWorkspaceStore.setState({
+        workspacesByProjectId: { p1: [{ id: "ws-big", name: "BIG" }, { id: "ws-mid", name: "MID" }] },
+      } as any);
+      renderRoom();
+      const tasks = () => screen.getAllByText(/^task /).map((el) => el.textContent);
+      fireEvent.click(screen.getByRole("button", { name: "Order settled crews by smallest diff first" }));
+      await vi.waitFor(() => expect(Object.keys(pending)).toHaveLength(2));
+      // Only the big one is in: no jump yet.
+      await act(async () => pending["ws-big"]({ files: 40, added: 1800, removed: 200, base: "main", untrackedSkipped: 0 }));
+      await screen.findByText("· +1800 −200 · 40 files");
+      expect(tasks()).toEqual(["task big", "task mid"]);
+      // Every size in: one reorder.
+      await act(async () => pending["ws-mid"]({ files: 3, added: 30, removed: 10, base: "main", untrackedSkipped: 0 }));
+      await screen.findByText("· +30 −10 · 3 files");
+      expect(tasks()).toEqual(["task mid", "task big"]);
+    });
+
+    it("drops the sizes of runs that left the board", async () => {
+      vi.mocked(ipc.workspaceDiffSize).mockResolvedValue({ files: 1, added: 1, removed: 0, base: "main", untrackedSkipped: 0 });
+      useRunsStore.setState({ runsByWs: { "ws-c": [mkRun("c", "completed")] }, settledAt: { c: Date.now() } });
+      useWorkspaceStore.setState({ workspacesByProjectId: { p1: [{ id: "ws-c", name: "C" }] } } as any);
+      useDiffSizeStore.setState({ byKey: { "old:completed:1": { files: 9, added: 9, removed: 9, base: "main", untrackedSkipped: 0 } } });
+      renderRoom();
+      await screen.findByText("· +1 −0 · 1 file");
+      expect(Object.keys(useDiffSizeStore.getState().byKey).some((k) => k.startsWith("old:"))).toBe(false);
+    });
   });
 
   it("dismiss removes a settled card from the board", () => {
@@ -333,6 +461,63 @@ describe("MissionControl", () => {
     });
     renderRoom();
     expect(screen.getByText(/holds the gate/)).toBeTruthy();
+  });
+
+  it("a run waiting for its Claude plan sits in flight with a sage line and no beacon", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
+    });
+    const halted = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [halted] } } });
+    const { container } = renderRoom();
+    expect(screen.queryByText("Needs you")).toBeNull();
+    expect(screen.getByText("In flight")).toBeTruthy();
+    const line = container.querySelector('[data-tour="mission-control-plan-wait"]')!;
+    expect(line.textContent).toMatch(/^plan limit · resumes \d{2}:\d{2}$/);
+    expect(line.className).toContain("text-octo-sage");
+    expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+    // The design system's lucide Hourglass with a tooltip, no bespoke glyph.
+    expect(screen.getByTitle("Waiting for your Claude plan's window to reset").querySelector("svg")).toBeTruthy();
+    expect(container.textContent).not.toContain("○");
+  });
+
+  it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
+    });
+    const onJumpToRun = vi.fn();
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
+    renderRoom({ onJumpToRun });
+    fireEvent.click(screen.getByLabelText("Resume now"));
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "resume", undefined, undefined, undefined, undefined);
+    fireEvent.click(screen.getByLabelText("Don't resume automatically"));
+    expect(ipc.cancelPlanResume).toHaveBeenCalledWith("a");
+    expect(onJumpToRun).not.toHaveBeenCalled();
+  });
+
+  it("a plan park beside a sibling's real halt is in Needs you", () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: true },
+    });
+    const plan = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    const halt = { ...mkStage("s2", "a", 1, "failed"), error: "the build broke" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [plan, halt] } } });
+    renderRoom();
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.queryByText("In flight")).toBeNull();
+  });
+
+  it("a plan park the director must resume is back in Needs you", () => {
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 60, resumeAt: null, resumeCount: 3, otherHold: false },
+    });
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
+    renderRoom();
+    expect(screen.getByText("Needs you")).toBeTruthy();
+    expect(screen.queryByLabelText("Resume now")).toBeNull();
   });
 
   it("keeps brass dots to needs-you gates: in-flight running dots are verdigris", () => {
@@ -582,5 +767,56 @@ describe("MissionControl", () => {
     expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
     // Both the run and the attention card are present in Needs you.
     expect(screen.getByText("waiting in Talk")).toBeInTheDocument();
+  });
+});
+
+const { useCollisionStore } = await import("../stores/collisionStore");
+const { collisionsByWorkspace } = await import("../lib/collisions");
+
+describe("MissionControl — collision radar (#732)", () => {
+  it("adds one meta segment to an in-flight card, never a needs-you item", () => {
+    useWorkspaceStore.setState({
+      workspacesByProjectId: {
+        p: [
+          { id: "ws-a", projectId: "p", name: "auth-flow" },
+          { id: "ws-b", projectId: "p", name: "refund-webhooks" },
+        ],
+      },
+    } as any);
+    useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    useCollisionStore.setState({
+      byWorkspace: collisionsByWorkspace([
+        {
+          a: "ws-a",
+          aName: "auth-flow",
+          b: "ws-b",
+          bName: "refund-webhooks",
+          files: ["src/billing/limits.ts", "src/billing/plan.ts"],
+          truncated: 0,
+          conflictingTruncated: 0,
+          conflictingFiles: [],
+          severity: "overlap",
+          confirmed: true,
+        },
+      ]),
+    });
+    renderRoom();
+    const seg = document.querySelector('[data-tour="mission-control-card-collision"]');
+    expect(seg).not.toBeNull();
+    expect(seg).toHaveTextContent("overlaps refund-webhooks · 2 files");
+    expect(seg).toHaveAttribute(
+      "title",
+      "Overlaps refund-webhooks · 2 files: src/billing/limits.ts, src/billing/plan.ts",
+    );
+    // Still in flight: the overlap adds no needs-you card and no beacon.
+    expect(document.querySelectorAll(".octo-stage-pulse")).toHaveLength(0);
+    expect(seg?.closest(".border-octo-brass")).toBeNull();
+    useCollisionStore.getState().reset();
+  });
+
+  it("shows nothing when the workspace overlaps no one", () => {
+    useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    renderRoom();
+    expect(document.querySelector('[data-tour="mission-control-card-collision"]')).toBeNull();
   });
 });

@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render, screen, fireEvent } from "@testing-library/react";
 import { RunControlBar } from "./RunControlBar";
 import type { Run, RunStage } from "../lib/ipc";
+import { useRunsStore } from "../stores/runsStore";
 
 const run = (status: Run["status"]): Run => ({
   id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status,
@@ -229,5 +230,78 @@ describe("RunControlBar", () => {
     render(<RunControlBar run={run("paused")} blockedStage={stage({})} loopTargetRole={null} loopState={null} {...h} />);
     expect(screen.getByRole("button", { name: /Approve & continue/i })).toBeInTheDocument();
     expect(screen.queryByText(/the crew asked you/i)).not.toBeInTheDocument();
+  });
+  it("secret hold: names what was found and makes approving an explicit override", () => {
+    const h = handlers();
+    const held = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "f", findings: [
+        { file: "tests/fixtures.ts", line: 12, rule: "github-token", kind: "GitHub token", yours: false },
+      ] },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={held} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText("possible secret")).toBeInTheDocument();
+    expect(screen.getByText(/possible secret · GitHub token in tests\/fixtures\.ts:12/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Proceed regardless" }));
+    expect(h.onApprove).toHaveBeenCalled();
+  });
+  it("secret hold: says when nothing, or not everything, was checked", () => {
+    const h = handlers();
+    const unreadable = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "unreadable", findings: [], total: 0, partial: false, unreadable: true },
+    });
+    const { unmount } = render(<RunControlBar run={run("paused")} blockedStage={unreadable} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/couldn't read the worktree's changes, so nothing was checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed regardless" })).toBeInTheDocument();
+    unmount();
+    const partial = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "p", findings: [
+        { file: "a.ts", line: 1, rule: "github-token", kind: "GitHub token", yours: false },
+      ], total: 3, partial: true },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={partial} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/GitHub token in a\.ts:1 and 2 more · scanned the first 16 MB; the rest wasn't checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed past them" })).toBeInTheDocument();
+  });
+
+  describe("Claude plan limit", () => {
+    const planStage = stage({
+      role: "implement", substrate: "cli", checkpoint: false, status: "failed", sessionId: "sess-p",
+      error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)",
+    });
+    const parked = (resumeAt: number | null): Run => ({
+      ...run("paused"),
+      planWait: { window: "five_hour", resetsAt: Math.floor(Date.now() / 1000) + 600, resumeAt, resumeCount: resumeAt ? 0 : 3, otherHold: false },
+    });
+
+    it("scheduled: says when it resumes, offers Resume now and the opt-out, never the beacon", () => {
+      const cancelPlanResume = vi.fn().mockResolvedValue(undefined);
+      useRunsStore.setState({ cancelPlanResume });
+      const h = handlers();
+      const { container } = render(
+        <RunControlBar run={parked(Math.floor(Date.now() / 1000) + 690)} blockedStage={planStage} loopTargetRole={null} loopState={null} beacon {...h} />,
+      );
+      expect(screen.getByText(/paused by your Claude plan · resumes at \d{2}:\d{2}/)).toBeInTheDocument();
+      expect(container.querySelector(".octo-stage-pulse")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Resume now" }));
+      expect(h.onResume).toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: /Don.t resume automatically/ }));
+      expect(cancelPlanResume).toHaveBeenCalledWith("r1");
+    });
+
+    it("waiting for the director: Resume the stage is the decision and takes the beacon", () => {
+      const h = handlers();
+      const { container } = render(
+        <RunControlBar run={parked(null)} blockedStage={planStage} loopTargetRole={null} loopState={null} beacon {...h} />,
+      );
+      expect(screen.getByText(/the 5-hour window resets at/)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Don.t resume automatically/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Resume the stage" }));
+      expect(h.onResume).toHaveBeenCalled();
+      expect(container.querySelector(".octo-stage-pulse")).not.toBeNull();
+    });
   });
 });

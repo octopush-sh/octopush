@@ -1,4 +1,5 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
+import type { SecretHold } from "./secretGuard";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -142,7 +143,8 @@ export interface FireOutcomeView {
     | "condition_error"
     | "workspace_unavailable"
     | "launch_refused"
-    | "setup_failed";
+    | "setup_failed"
+    | "plan_limit";
 }
 
 /** The phase a routine fire is in (`routine://phase`, `routines::PHASE_*`). */
@@ -266,6 +268,24 @@ export interface Run {
   /** True when the run executes in a detached segment worker (Pro) — the
    *  crew keeps working even if the app quits. */
   detached: boolean;
+  /** Set while a Claude plan limit parks the run (#731). Mirrors the Rust
+   *  `PlanWait`; times are epoch seconds. */
+  planWait?: PlanWait | null;
+}
+
+/** A run parked at a Claude plan limit. */
+export interface PlanWait {
+  /** The plan window that stopped the stage (`five_hour`, `seven_day`, …). */
+  window: string;
+  /** When that window resets (epoch seconds). */
+  resetsAt: number;
+  /** When the automatic resume is due (epoch seconds); null = the director resumes. */
+  resumeAt: number | null;
+  /** Automatic resumes since the director last acted or a stage finished. */
+  resumeCount: number;
+  /** Another stage also waits for the director (a real halt, a gate, a
+   *  question): the run needs you even with a resume scheduled. */
+  otherHold: boolean;
 }
 /** One question a blocked stage asks the director via `ask_director` — paired
  *  with the agent's own best guess so the director can accept it in one click.
@@ -317,6 +337,10 @@ export interface RunStage {
    *  its cost reads "usage not reported", never $0.00, and like an unpriced
    *  stage it is invisible to the run budget. */
   usageUnreported?: boolean;
+  /** The model the stage's last attempt actually ran on, when Claude Code's
+   *  `system/init` named another than `agentModel` (set by `get_run`; #791).
+   *  null/absent = it ran on the model it asked for. */
+  ranModel?: string | null;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -347,6 +371,11 @@ export interface RunStage {
    *  awaiting_checkpoint stage as a question-block (answer form) rather than a
    *  normal gate (Approve/Reject). */
   blockedQuestions?: BlockedAsk | null;
+  /** Secret guard (#730): set when an Action stage (commit / push / PR /
+   *  merge / release) was held because the worktree holds a possible secret.
+   *  `acknowledged` once the director approved proceeding past exactly these
+   *  findings. Findings carry file, line and kind only — never the value. */
+  secretHold?: SecretHold | null;
 }
 export interface RunDetail {
   run: Run | null;
@@ -457,6 +486,20 @@ export interface ContinueOutcome { kind: ContinueKind; output: string }
 
 export interface LastCommit { shortSha: string; subject: string; body: string }
 
+/** `git_ops::DiffSize`: files and lines from the merge base with `base` to
+ *  the working tree (commits, edits and untracked files). `base` is null when
+ *  the workspace has none that resolves: the size is then the uncommitted
+ *  changes against HEAD. */
+export interface DiffSize {
+  files: number;
+  added: number;
+  removed: number;
+  base: string | null;
+  /** Untracked entries counted as files but not line-counted (a large
+   *  untracked directory, or past the read budget). */
+  untrackedSkipped: number;
+}
+
 /** One line of per-line blame (G7 slice III). Lines are 1-based and refer
  *  to the committed (HEAD) version of the file. */
 export interface BlameLine {
@@ -547,6 +590,7 @@ import type {
   CreatedWorkspace,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
+  ProjectCollisions,
 } from "./types";
 
 // ─── Entitlement (premium scaffolding — P0) ───────────────────────
@@ -779,6 +823,11 @@ export const ipc = {
 
   workspacesGitSummary: (projectId: string) =>
     invoke<WorkspaceGitSummary[]>("workspaces_git_summary", { projectId }),
+  /** Collision radar (#732): live workspaces of a project changing the same
+   *  files. Read-only; the backend reuses a report for a few seconds unless
+   *  `force` (or a workspace's HEAD moved). */
+  projectCollisions: (projectId: string, force = false) =>
+    invoke<ProjectCollisions>("project_collisions", { projectId, force }),
   deleteWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
     invoke<void>("delete_workspace", { workspaceId, projectPath, branch, worktreePath }),
   archiveWorkspace: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) =>
@@ -908,6 +957,10 @@ export const ipc = {
   listBranches: (path: string) => invoke<BranchList>("list_branches", { path }),
   getGitDiff: (path: string, ignoreWhitespace?: boolean) =>
     invoke<string>("get_git_diff", { path, ignoreWhitespace }),
+  /** The workspace's diff size against its base (Mission Control cards);
+   *  null when the workspace or its worktree is gone. */
+  workspaceDiffSize: (workspaceId: string) =>
+    invoke<DiffSize | null>("workspace_diff_size", { workspaceId }),
 
   // ─── File operations ───────────────────────────────────────────
   openFileInSystem: (path: string) => invoke<void>("open_file_in_system", { path }),
@@ -1076,12 +1129,16 @@ export const ipc = {
     invoke<void>("unstage_all_changes", { workspacePath }),
 
   /** Returns the new short SHA on success. */
-  commitChanges: (workspacePath: string, message: string) =>
-    invoke<string>("commit_changes", { workspacePath, message }),
+  /** Secret guard (#730): rejects with `SecretsFound` (see `lib/secretGuard`)
+   *  on a possible credential in the staged diff (or a partial scan), unless
+   *  `allowFindings` is the refusal's `fingerprint` — the user's confirm of
+   *  exactly what the dialog showed. The core rescans every time. */
+  commitChanges: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("commit_changes", { workspacePath, message, allowFindings: allowFindings ?? null }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
-  amendCommit: (workspacePath: string, message: string) =>
-    invoke<string>("amend_commit", { workspacePath, message }),
+  amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>
+    invoke<string>("amend_commit", { workspacePath, message, allowFindings: allowFindings ?? null }),
   getLastCommit: (workspacePath: string) =>
     invoke<LastCommit | null>("get_last_commit", { workspacePath }),
   /** Newest-first commit page from HEAD; `skip` offsets for pagination. */
@@ -1178,9 +1235,12 @@ export const ipc = {
   /** All tag names, alphabetical. */
   listTags: (workspacePath: string) => invoke<string[]>("list_tags", { workspacePath }),
 
-  /** Returns the trimmed git-push output (combined stdout+stderr). */
-  pushBranch: (workspacePath: string) =>
-    invoke<string>("push_branch", { workspacePath }),
+  /** Returns the trimmed git-push output (combined stdout+stderr). Secret
+   *  guard (#730): rejects with `SecretsFound` on a possible credential in the
+   *  commits being pushed, unless `allowFindings` is the fingerprint the
+   *  dialog showed and the fresh scan still matches it. */
+  pushBranch: (workspacePath: string, allowFindings?: string) =>
+    invoke<string>("push_branch", { workspacePath, allowFindings: allowFindings ?? null }),
 
   /** Workspace-wide file listing (respects .gitignore). Returns paths
    *  relative to the workspace root. Capped at 20k entries. */
@@ -1236,9 +1296,11 @@ export const ipc = {
   prDraftContext: (workspacePath: string, base: string) =>
     invoke<PrDraftContext>("pr_draft_context", { workspacePath, base }),
   /** `gh pr create` from the current branch (body passed via a file). The
-   *  branch must already be published. Resolves to the new PR. */
-  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean) =>
-    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft }),
+   *  branch must already be published. Resolves to the new PR. Secret guard
+   *  (#730): the PR's own scan, separate from the push's; `allowFindings`
+   *  confirms only the fingerprint the PR dialog showed. */
+  createPullRequest: (workspacePath: string, base: string, title: string, body: string, draft: boolean, allowFindings?: string) =>
+    invoke<Pr>("create_pull_request", { workspacePath, base, title, body, draft, allowFindings: allowFindings ?? null }),
 
   /** Fetch a PR's head ref as a local branch (no-op if it already exists),
    *  so it can serve as the base of a new workspace. */
@@ -1379,6 +1441,12 @@ export const ipc = {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
+    /** The stage the director decided on. A run can hold several (a plan
+     *  limit beside a gate): without it the backend picks the first. A named
+     *  stage that is no longer waiting (decided elsewhere) is refused with
+     *  "This stage was already decided — refresh to see what's waiting.",
+     *  never redirected to another stage (Abort always goes through). */
+    stageId?: string,
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
@@ -1386,6 +1454,7 @@ export const ipc = {
       feedback: feedback ?? null,
       modelOverride: modelOverride ?? null,
       maxTurnsOverride: maxTurnsOverride ?? null,
+      stageId: stageId ?? null,
     }),
 
   /** Answer a stage that parked itself via the `ask_director` escape valve.
@@ -1399,6 +1468,11 @@ export const ipc = {
 
   abortRun: (runId: string) =>
     invoke<void>("abort_run", { runId }),
+
+  /** Turn off a plan-parked run's automatic resume: it waits for a manual
+   *  Resume. ("Resume now" is `resolveCheckpoint(runId, "resume")`.) */
+  cancelPlanResume: (runId: string) =>
+    invoke<void>("cancel_plan_resume", { runId }),
 
   /** Stop the run's in-flight stage (real cancellation). The stage lands in
    *  the normal failed/decision-strip recovery flow; the run itself survives. */
@@ -1539,6 +1613,9 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
+  codexTrustNote: (workspacePath: string) =>
+    invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
   /** The models among `models` with a published retirement date
    *  (`token_engine::MODEL_RETIREMENTS`), each id once; the caller does the date math. */
   modelRetirements: (models: string[]) =>
@@ -1628,6 +1705,15 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+}
+
+/** Codex will skip the repo's `.codex/` config: the project is marked
+ *  untrusted in Codex, or has no trust decision saved
+ *  (`commands::codex_trust_note`). */
+export interface CodexTrustNote {
+  line: string;
+  /** How the user can trust it themselves; differs between the two states. */
+  how: string;
 }
 
 /** A crew model the installed Claude Code is too old for (mirrors Rust

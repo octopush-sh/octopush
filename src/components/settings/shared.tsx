@@ -50,7 +50,8 @@ export function ToggleRow({
   title,
 }: {
   label: string;
-  description?: string;
+  /** Plain copy, or copy with inline code (e.g. an env-var chip). */
+  description?: React.ReactNode;
   checked: boolean;
   onChange: (v: boolean) => void;
   testId?: string;

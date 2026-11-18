@@ -222,6 +222,9 @@ impl Orchestrator {
                     // be the director's own (silent) hand.
                     let reason = if !repaired_error && self.director_pauses.lock().remove(run_id) {
                         "director"
+                    } else if !repaired_error {
+                        // A Claude plan park with a scheduled resume needs nobody.
+                        self.park_reason(run_id, s)
                     } else {
                         "decision"
                     };

@@ -7,7 +7,7 @@ import {
   checkDraft, prepareDrafts, prepareIntel, applyCadence, historyFrom, parseDrafts, parsePosted, lastDraftNumber, fingerprint,
   linkProblems, extractUrls, aiRuleOk, secretProblems, secretValues, isEnglish, phaseOf, fence, post, buildContext, todaysIssue,
   vision, quote, unquote, normText, oneLine, threadKey, presentsProRuns, planWording, MARKETING_FILES, MAX_BODY, FOOTER,
-  canonical, octoMentionProblems, rulebook, isNotFound,
+  canonical, octoMentionProblems, rulebook, isNotFound, draftsBody,
 } from "./social.mjs";
 import { claudeArgs, ROLES } from "./agent.mjs";
 import { localDate } from "./ideas.mjs";
@@ -481,4 +481,13 @@ test("the social agent: web research, read-only checkout, writes only .agent-out
   const s = JSON.parse(claudeArgs("social", "/home/runner/work/_temp", "/home/runner/work/o/o").find((a) => a.startsWith("{")));
   assert.deepEqual(s.permissions.allow.filter((x) => x.startsWith("Edit")), ["Edit(//home/runner/work/o/o/.agent-out/**)"]);
   assert.ok(s.permissions.deny.includes("Read(//home/runner/work/_temp/**)"), "the runner's temp dir (prompt, script copies) is out of reach");
+});
+
+test("an empty drafts batch says whether the drafter proposed none or the validator dropped them", () => {
+  const history = { mentions: 0, total: 0 };
+  const none = draftsBody({ phase: 1, drafts: [], history });
+  assert.match(none, /the drafter proposed none/);
+  assert.doesNotMatch(none, /nothing passed the rules/);
+  const dropped = draftsBody({ phase: 1, drafts: [], history, rejected: [{ i: 0, reason: "no thread" }] });
+  assert.match(dropped, /nothing passed the rules/);
 });

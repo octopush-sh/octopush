@@ -18,7 +18,8 @@ const { model } = vi.hoisted(() => ({
   }),
 }));
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/ipc")>()),
   ipc: {
     listModels: vi.fn().mockResolvedValue([
       model("opus-46", "Claude Opus 4.6", "anthropic"),

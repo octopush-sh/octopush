@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeAll } from "vitest";
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 
 const live: { liveByStage: Record<string, unknown[]> } = vi.hoisted(() => ({ liveByStage: {} }));
 vi.mock("../stores/runsStore", () => ({
@@ -39,6 +39,25 @@ describe("RunFlow — depth of field & the single beacon", () => {
       <RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />,
     );
     expect(container.querySelectorAll(".octo-stage-pulse")).toHaveLength(1);
+  });
+
+  it("a running beacon pulses in verdigris, never brass (#749)", () => {
+    const { container } = render(
+      <RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />,
+    );
+    const card = container.querySelector(".octo-stage-pulse")!;
+    expect(card).toHaveClass("octo-stage-pulse-running", "border-octo-verdigris");
+    expect(card.className).not.toMatch(/border-octo-brass|brass-dim/);
+  });
+
+  it("an awaiting-gate beacon keeps the brass pulse", () => {
+    const gate = [mk({ id: "g", status: "awaiting_checkpoint", checkpoint: true })];
+    const { container } = render(
+      <RunFlow stages={gate} selectedStageId="g" beaconStageId="g" onSelectStage={() => {}} />,
+    );
+    const card = container.querySelector(".octo-stage-pulse")!;
+    expect(card).toHaveClass("border-octo-brass");
+    expect(card).not.toHaveClass("octo-stage-pulse-running");
   });
 
   it("never pulses without a beacon, even while running", () => {
@@ -166,3 +185,20 @@ describe("RunFlow — depth of field & the single beacon", () => {
     }
   });
 });
+
+describe("RunFlow — a stage that ran on another model (#791)", () => {
+  it("notes the model that ran, with what it asked for in the tooltip", () => {
+    const ran = [mk({ id: "a", status: "done", substrate: "cli", agentModel: "claude-opus-5-5", ranModel: "claude-sonnet-5-5" })];
+    render(<RunFlow stages={ran} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />);
+    const note = screen.getByText("ran on sonnet-5-5");
+    expect(note.getAttribute("title")).toContain("asked for claude-opus-5-5");
+    expect(note.className).toContain("text-octo-warning");
+  });
+
+  it("says nothing when it ran on the model it asked for", () => {
+    const same = [mk({ id: "a", status: "done", substrate: "cli", agentModel: "claude-opus-5-5", ranModel: null })];
+    render(<RunFlow stages={same} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />);
+    expect(screen.queryByText(/ran on/)).not.toBeInTheDocument();
+  });
+});
+

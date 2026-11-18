@@ -128,6 +128,9 @@ interface RunsState {
     feedback?: string,
     modelOverride?: string,
     maxTurnsOverride?: number,
+    /** The stage decided on (see `ipc.resolveCheckpoint`). A refusal is
+     *  toasted, never thrown, and the detail refreshes either way. */
+    stageId?: string,
   ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
@@ -135,6 +138,8 @@ interface RunsState {
    *  re-running stage. `source` names the answering surface for the journal. */
   answerBlocker: (runId: string, stageId: string, answers: string[], source?: AnswerSource) => Promise<void>;
   abort: (runId: string) => Promise<void>;
+  /** Turn off a plan-parked run's automatic resume (#731). */
+  cancelPlanResume: (runId: string) => Promise<void>;
   /** Stop the in-flight stage (fire-and-forget — run:// events carry the fallout). */
   stopStage: (runId: string) => Promise<void>;
   /** Ask the run to pause at its next stage boundary (parks the next stage). */
@@ -441,8 +446,19 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride) => {
-    await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride);
+  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride, stageId) => {
+    try {
+      await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride, stageId);
+    } catch (e) {
+      // A refusal (e.g. the stage was already decided elsewhere) is shown
+      // calmly — the callers fire-and-forget — and the refresh below brings
+      // the canvas up to what is actually waiting.
+      pushToast({
+        level: "info",
+        title: "Nothing changed",
+        body: String(e).split("\n")[0],
+      });
+    }
     await get().refreshDetail(runId);
   },
 
@@ -453,6 +469,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
 
   abort: async (runId) => {
     await ipc.abortRun(runId);
+    await get().refreshDetail(runId);
+  },
+
+  cancelPlanResume: async (runId) => {
+    await ipc.cancelPlanResume(runId);
     await get().refreshDetail(runId);
   },
 
