@@ -31,6 +31,11 @@ interface CollisionState {
   /** Poll `projectIds()` every `POLL_MS` while the window is visible.
    *  Returns the stop function. */
   startPolling: (projectIds: () => string[]) => () => void;
+  /** A workspace was archived or deleted: drop its entries and every peer's
+   *  collision with it at once, then rescan its project (forced, so a scan in
+   *  flight that still saw it is followed by one that doesn't). The poll skips
+   *  a project left with one workspace, so nothing else would clear them. */
+  forgetWorkspace: (workspaceId: string) => void;
   /** Test seam. */
   reset: () => void;
 }
@@ -79,6 +84,30 @@ export const useCollisionStore = create<CollisionState>((set, get) => ({
     tick();
     const timer = setInterval(tick, POLL_MS);
     return () => clearInterval(timer);
+  },
+
+  forgetWorkspace: (workspaceId) => {
+    const projectId = Object.keys(get().idsByProject).find((p) =>
+      get().idsByProject[p].includes(workspaceId),
+    );
+    if (!projectId) return;
+    set((s) => {
+      const next = { ...s.byWorkspace };
+      delete next[workspaceId];
+      const ids: string[] = [];
+      for (const id of s.idsByProject[projectId]) {
+        if (!next[id]) continue;
+        const rest = next[id].filter((c) => c.otherId !== workspaceId);
+        if (rest.length) {
+          next[id] = rest;
+          ids.push(id);
+        } else {
+          delete next[id];
+        }
+      }
+      return { byWorkspace: next, idsByProject: { ...s.idsByProject, [projectId]: ids } };
+    });
+    void get().refresh(projectId, { force: true });
   },
 
   reset: () => {

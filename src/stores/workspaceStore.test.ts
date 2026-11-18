@@ -539,6 +539,33 @@ describe("workspaceStore — archive & rename", () => {
     expect(s.activeId).toBeNull();
   });
 
+  it.each(["archive", "remove"] as const)(
+    "%s clears the peer's collision mark when it was the only other workspace",
+    async (action) => {
+      const { useCollisionStore } = await import("./collisionStore");
+      const { collisionsByWorkspace } = await import("../lib/collisions");
+      const a = makeWorkspace("p1", "alpha");
+      const b = makeWorkspace("p1", "beta");
+      useWorkspaceStore.setState({ workspaces: [a, b], workspacesByProjectId: { p1: [a, b] } });
+      const mine = collisionsByWorkspace([
+        {
+          a: a.id, aName: a.name, b: b.id, bName: b.name, files: ["src/x.ts"], truncated: 0,
+          conflictingFiles: [], conflictingTruncated: 0, severity: "overlap", confirmed: false,
+        },
+      ]);
+      useCollisionStore.setState({ byWorkspace: mine, idsByProject: { p1: [a.id, b.id] } });
+      mockIpc.archiveWorkspace.mockResolvedValueOnce(undefined);
+      mockIpc.deleteWorkspace.mockResolvedValueOnce(undefined);
+
+      await useWorkspaceStore.getState()[action](a.id, "/repo", a.branch, a.worktreePath);
+
+      // The poll skips a project with one workspace left: the mark goes now.
+      expect(useCollisionStore.getState().byWorkspace[b.id]).toBeUndefined();
+      expect(useCollisionStore.getState().byWorkspace[a.id]).toBeUndefined();
+      useCollisionStore.getState().reset();
+    },
+  );
+
   it("rename updates the name in both maps", async () => {
     const a = makeWorkspace("p1", "alpha");
     useWorkspaceStore.setState({
