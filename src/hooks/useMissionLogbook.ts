@@ -8,8 +8,8 @@ import type { LogbookMissionRow } from "../lib/types";
 /**
  * The active mission's Logbook slice (worked hours + cost + savings) for a
  * workspace. Loads on mission change and re-reads when a TALK turn settles
- * (streaming true→false) or a DIRECT run changes status — the edges that
- * land new spend/hours. Figures update in place on a refresh (never blink
+ * (streaming true→false), a DIRECT run changes status, or a transcript
+ * ingest pass changes the ledger — the edges that land new spend/hours. Figures update in place on a refresh (never blink
  * to empty); they clear only when the mission itself changes.
  */
 export function useMissionLogbook(workspaceId: string): {
@@ -22,10 +22,27 @@ export function useMissionLogbook(workspaceId: string): {
   // Keyed on status only (not cost) so live per-tick cost updates don't
   // cause a fetch storm — a run settling is the meaningful edge.
   const runsSig = useRunsStore((s) => (s.runsByWs[workspaceId] ?? []).map((r) => r.status).join(","));
+  const [ingestTick, setIngestTick] = useState(0);
   const [row, setRow] = useState<LogbookMissionRow | null>(null);
   const [loaded, setLoaded] = useState(false);
   const seq = useRef(0);
   const prevMission = useRef<string | null>(null);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let disposed = false;
+    void ipc
+      .onSpendIngested(() => setIngestTick((t) => t + 1))
+      .then((u) => {
+        if (disposed) u();
+        else unlisten = u;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, []);
 
   useEffect(() => {
     if (!missionId) {
@@ -53,7 +70,7 @@ export function useMissionLogbook(workspaceId: string): {
       .catch(() => {
         if (seq.current === token) setLoaded(true);
       });
-  }, [missionId, streaming, runsSig]);
+  }, [missionId, streaming, runsSig, ingestTick]);
 
   return { missionId, row, loaded };
 }
