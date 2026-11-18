@@ -560,6 +560,8 @@ export interface AppSettings {
    *  crew stages and Routines start Claude Code with
    *  `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`. Unset → **off**. */
   quietClaudeCode?: boolean;
+  /** Secret guard (#730): on unless saved `false`. */
+  secretGuardEnabled?: boolean | null;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */

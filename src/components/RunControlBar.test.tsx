@@ -230,4 +230,39 @@ describe("RunControlBar", () => {
     expect(screen.getByRole("button", { name: /Approve & continue/i })).toBeInTheDocument();
     expect(screen.queryByText(/the crew asked you/i)).not.toBeInTheDocument();
   });
+  it("secret hold: names what was found and makes approving an explicit override", () => {
+    const h = handlers();
+    const held = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "f", findings: [
+        { file: "tests/fixtures.ts", line: 12, rule: "github-token", kind: "GitHub token", yours: false },
+      ] },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={held} loopTargetRole={null} loopState={null} beacon {...h} />);
+    expect(screen.getByText("possible secret")).toBeInTheDocument();
+    expect(screen.getByText(/possible secret · GitHub token in tests\/fixtures\.ts:12/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Proceed regardless" }));
+    expect(h.onApprove).toHaveBeenCalled();
+  });
+  it("secret hold: says when nothing, or not everything, was checked", () => {
+    const h = handlers();
+    const unreadable = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "unreadable", findings: [], total: 0, partial: false, unreadable: true },
+    });
+    const { unmount } = render(<RunControlBar run={run("paused")} blockedStage={unreadable} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/couldn't read the worktree's changes, so nothing was checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed regardless" })).toBeInTheDocument();
+    unmount();
+    const partial = stage({
+      role: "pull_request", checkpoint: false, startedAt: null,
+      secretHold: { acknowledged: false, fingerprint: "p", findings: [
+        { file: "a.ts", line: 1, rule: "github-token", kind: "GitHub token", yours: false },
+      ], total: 3, partial: true },
+    });
+    render(<RunControlBar run={run("paused")} blockedStage={partial} loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/GitHub token in a\.ts:1 and 2 more · scanned the first 16 MB; the rest wasn't checked/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Proceed past them" })).toBeInTheDocument();
+  });
 });

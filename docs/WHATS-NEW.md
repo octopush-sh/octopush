@@ -129,6 +129,9 @@ Current anchors:
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-quiet-claude-code` | Settings › Privacy: the "Quiet Claude Code in crews and Routines" toggle | `settings/PrivacyPane.tsx` |
+| `settings-secret-guard` | Settings › General › Safety: "Guard commits against secrets" | `settings/GeneralPane.tsx` |
+| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push or PR is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` |
+| `direct-secret-hold` | Direct run bar, on an Action stage held by the secret guard: "Held before Pull request: possible secret · …" | `RunControlBar.tsx` |
 | `settings-appearance-legacy` | Settings › Appearance: the Legacy theme group (Dark, Midnight, Solarized Dark; only when the theme list has any) | `settings/AppearancePane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |

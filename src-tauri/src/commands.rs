@@ -5106,13 +5106,29 @@ pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.
+///
+/// The secret guard (#730) rescans the staged diff first and refuses with
+/// `AppError::SecretsFound` on a finding (or a partial scan), unless
+/// `allow_findings` is the fingerprint of exactly the findings the dialog
+/// showed — the user's "commit regardless" for this one commit.
 #[tauri::command]
-pub async fn commit_changes(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn commit_changes(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
@@ -5300,10 +5316,19 @@ pub async fn create_pull_request(
     title: String,
     body: String,
     draft: bool,
+    allow_findings: Option<String>,
 ) -> AppResult<crate::github::Pr> {
     let path = expand_tilde(&workspace_path);
     if title.trim().is_empty() {
         return Err(AppError::Other("A pull request needs a title.".into()));
+    }
+    // Secret guard (#730): the commits this PR would contain.
+    {
+        let (p, b) = (path.clone(), base.clone());
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::pr_files(std::path::Path::new(&p), &b)
+        })
+        .await?;
     }
     // The base repo and head owner come from the remotes, so a fork, a base
     // picked as `upstream/main` and `gh repo set-default` all open the PR the
@@ -5763,9 +5788,20 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
 /// user's terminal. Returns the trimmed final stderr line, which usually
 /// includes either the new remote refs or the error reason.
+///
+/// The secret guard (#730) rescans the commits the push would send and
+/// refuses with `AppError::SecretsFound` unless `allow_findings` matches the
+/// fresh scan's fingerprint.
 #[tauri::command]
-pub async fn push_branch(workspace_path: String) -> AppResult<String> {
+pub async fn push_branch(workspace_path: String, allow_findings: Option<String>) -> AppResult<String> {
     let workspace_path = expand_tilde(&workspace_path);
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::push_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
 
     // Read current branch shorthand to pass as upstream target.
     let branch_out = std::process::Command::new("git")
@@ -6601,12 +6637,24 @@ pub async fn blame_file(path: String, file: String) -> AppResult<Vec<crate::git_
 }
 
 #[tauri::command]
-pub async fn amend_commit(workspace_path: String, message: String) -> AppResult<String> {
+pub async fn amend_commit(
+    workspace_path: String,
+    message: String,
+    allow_findings: Option<String>,
+) -> AppResult<String> {
     if message.trim().is_empty() {
         return Err(AppError::Other("commit message cannot be empty".into()));
     }
     let workspace_path = expand_tilde(&workspace_path);
     let _guard = crate::git_lock::git_lock(&workspace_path).await;
+    // Same secret guard as `commit_changes`: the amend records the staged diff.
+    {
+        let p = workspace_path.clone();
+        crate::secret_scan::guard(allow_findings, move || {
+            crate::secret_scan::staged_files(std::path::Path::new(&p))
+        })
+        .await?;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let msg_escaped = message.replace('\'', "'\\''");
     let cmd = format!("git commit --amend -m '{}'", msg_escaped);
