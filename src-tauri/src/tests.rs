@@ -22152,6 +22152,30 @@ mod ran_model_tests {
     }
 
     #[test]
+    fn a_provider_native_id_without_a_claude_family_is_not_a_substitution() {
+        let init = |m: &str| json!({"type": "system", "subtype": "init", "model": m});
+        // Bedrock application-inference-profile ARNs and Foundry deployment
+        // names: unknown, not another model — no note, cost stays as asked.
+        for ran in [
+            "arn:aws:bedrock:us-east-1:123456789012:application-inference-profile/a1b2c3d4e5f6",
+            "my-foundry-deployment",
+            "prod-opus",
+        ] {
+            for asked in ["claude-opus-5-5", "opus", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0"] {
+                assert_eq!(substituted_model(asked, &init(ran)), None, "{asked} vs {ran}");
+            }
+        }
+        // A Claude id behind a provider prefix is still a real substitution.
+        assert_eq!(
+            substituted_model("claude-opus-5-5", &init("us.anthropic.claude-sonnet-5-5-v1:0")).as_deref(),
+            Some("us.anthropic.claude-sonnet-5-5-v1:0")
+        );
+        // A stage that asked for a non-Claude id still sees any other id.
+        assert_eq!(substituted_model("team-model", &init("other-model")).as_deref(), Some("other-model"));
+        assert_eq!(substituted_model("team-model", &init("claude-sonnet-5-5")).as_deref(), Some("claude-sonnet-5-5"));
+    }
+
+    #[test]
     fn the_notice_names_both_models_by_their_catalog_names() {
         let router = crate::provider_router::ProviderRouter::from_map(crate::provider_router::builtin_providers());
         assert_eq!(
