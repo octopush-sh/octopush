@@ -9804,6 +9804,54 @@ mod orchestrator_tests {
         let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
         assert!((spend - cost).abs() < 1e-9, "mission spend {spend} equals the run's cost {cost}");
     }
+
+    /// #863: an ingest pass that ran while the stage did (before it reported
+    /// its session id) metered part of the session as RUN rows. The drive
+    /// drops them the moment the stage reports the session, so right after
+    /// the stage completes — with no ingest pass in between — the mission's
+    /// spend is the run's cost, and the budget gates never see it twice.
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn direct_cli_stage_mid_run_transcript_rows_are_dropped_when_the_stage_reports_its_session() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-863/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        // Mid-run: the stage's transcript (and a sub-agent's) is on disk and
+        // a pass meters it — the session id isn't known yet.
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct-861/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n{}\n", cc_line("sess-direct-861", "req_a", cwd), cc_line("sess-direct-861", "req_b", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct-861/subagents/agent-1.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_sub", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+        let (mid, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!(mid > 0.0, "the mid-run pass metered the session: {mid}");
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner))
+            .with_transcripts_root(root.path().to_path_buf());
+        orch.run_to_pause(&run).await.unwrap();
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        assert!((cost - 0.25).abs() < 1e-9, "run card: {cost}");
+
+        // No ingest pass since the stage completed.
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!((spend - cost).abs() < 1e-9, "mission spend {spend} equals the run's cost {cost}");
+        let run_rows: i64 = db.lock().conn_ref()
+            .query_row("SELECT COUNT(*) FROM spend_events WHERE surface = 'run'", [], |r| r.get(0)).unwrap();
+        assert_eq!(run_rows, 0, "the session's RUN rows are gone");
+        // The next pass finds nothing left to do.
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
 }
 
 #[cfg(test)]

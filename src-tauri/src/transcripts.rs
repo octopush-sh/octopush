@@ -42,7 +42,9 @@
 //!   stage reports is kept in `direct_cli_sessions`, and its transcript —
 //!   with any sub-agent files under `<session>/` — is never metered here.
 //!   One read before the id was known is undone: its RUN rows are deleted
-//!   by request key (#861).
+//!   by request key (#861) — by the drive itself, the moment the stage
+//!   reports its session (`drop_direct_session`, #863), so no budget gate
+//!   sees the stage counted twice until the next pass.
 //! - Side effects that describe *now* (a session's live counters, the
 //!   Logbook activity span) fire only for messages minutes old; historical
 //!   rows are attributed to the mission that existed at their timestamp.
@@ -365,6 +367,68 @@ fn direct_session_of(project_dir: &Path, file: &Path, direct: &std::collections:
         .map(str::to_string)
 }
 
+/// A transcript of a Direct stage's CLI session: never metered as RUN
+/// spend (#861). If an earlier pass already read it — before the stage
+/// reported its session id, or before this rule existed — the RUN rows it
+/// produced are found by re-reading the file (the ledger keys each one
+/// `cc:<request id>`) and deleted, and the file's offset is dropped, so
+/// every later pass skips it with no read. Returns the rows removed.
+fn drop_direct_file(db: &Arc<Mutex<Db>>, path: &Path) -> AppResult<usize> {
+    let meta_key = format!("cc_transcript:{}", path.display());
+    let offset = db
+        .lock()
+        .meta_get(&meta_key)?
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    if offset == 0 {
+        return Ok(0);
+    }
+    let (entries, _) = read_new_entries(path, 0)?;
+    let keys: Vec<String> = entries.into_iter().map(|u| u.key).collect();
+    let db = db.lock();
+    let removed = db.delete_run_spend_by_keys(&keys)?;
+    db.meta_delete(&meta_key)?;
+    if removed > 0 {
+        tracing::info!(file = %path.display(), removed, "removed RUN rows double-counting a Direct stage session");
+    }
+    Ok(removed)
+}
+
+/// Undo, right now, whatever the ingestor already metered from a Direct
+/// stage's CLI session `session_id` — its `<session>.jsonl` and any
+/// sub-agent files under `<session>/`, in every project directory under
+/// `root` (#863). The drive calls this as soon as the stage reports its
+/// session, so the budget gates never see the stage counted twice (its
+/// `direct` row plus the RUN rows of a mid-run ingest pass) while waiting
+/// for the next pass to clean up. Same cleanup as the pass itself
+/// ([`drop_direct_file`]); a file never read costs one `stat`. Returns the
+/// rows removed.
+pub fn drop_direct_session(db: &Arc<Mutex<Db>>, root: &Path, session_id: &str) -> AppResult<usize> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.starts_with('.') {
+        return Ok(0);
+    }
+    let mut files = Vec::new();
+    for dir_name in project_dir_listing(root) {
+        let dir = root.join(&dir_name);
+        let main = dir.join(format!("{session_id}.jsonl"));
+        if main.is_file() {
+            files.push(main);
+        }
+        let sub = dir.join(session_id);
+        if sub.is_dir() {
+            jsonl_files(&sub, 1, &mut files);
+        }
+    }
+    let mut removed = 0usize;
+    for file in files {
+        match drop_direct_file(db, &file) {
+            Ok(n) => removed += n,
+            Err(e) => tracing::warn!(file = %file.display(), session = %session_id, error = %e, "direct-session transcript cleanup failed"),
+        }
+    }
+    Ok(removed)
+}
+
 pub struct TranscriptIngestor {
     db: Arc<Mutex<Db>>,
     root: PathBuf,
@@ -498,7 +562,7 @@ impl TranscriptIngestor {
                 // A Direct stage's own `claude -p` session (or one of its
                 // sub-agents) is already metered as the stage's `direct` row.
                 if let Some(sid) = direct_session_of(&dir, &file, &direct_sessions) {
-                    match self.drop_direct_file(&file) {
+                    match drop_direct_file(&self.db, &file) {
                         Ok(removed) => summary.rows_removed += removed,
                         Err(e) => tracing::warn!(file = %file.display(), session = %sid, error = %e, "direct-session transcript cleanup failed"),
                     }
@@ -533,34 +597,6 @@ impl TranscriptIngestor {
             }
         }
         Ok(summary)
-    }
-
-    /// A transcript of a Direct stage's CLI session: never metered as RUN
-    /// spend (#861). If an earlier pass already read it — before the stage
-    /// reported its session id, or before this rule existed — the RUN rows it
-    /// produced are found by re-reading the file (the ledger keys each one
-    /// `cc:<request id>`) and deleted, and the file's offset is dropped, so
-    /// every later pass skips it with no read. Returns the rows removed.
-    fn drop_direct_file(&self, path: &Path) -> AppResult<usize> {
-        let meta_key = format!("cc_transcript:{}", path.display());
-        let offset = self
-            .db
-            .lock()
-            .meta_get(&meta_key)?
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(0);
-        if offset == 0 {
-            return Ok(0);
-        }
-        let (entries, _) = read_new_entries(path, 0)?;
-        let keys: Vec<String> = entries.into_iter().map(|u| u.key).collect();
-        let db = self.db.lock();
-        let removed = db.delete_run_spend_by_keys(&keys)?;
-        db.meta_delete(&meta_key)?;
-        if removed > 0 {
-            tracing::info!(file = %path.display(), removed, "removed RUN rows double-counting a Direct stage session");
-        }
-        Ok(removed)
     }
 
     /// Ingest one file: `(rows inserted, earliest timestamp seen)`.
