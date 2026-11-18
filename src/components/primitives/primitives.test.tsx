@@ -8,6 +8,7 @@ import {
   flatten,
   graphemeBoundaries,
   lastFitting,
+  seatEllipsis,
   trimTrailingSpace,
   widthAnchor,
 } from "./MidTruncate";
@@ -417,6 +418,93 @@ describe("MidTruncate — review fixes (#807)", () => {
     const { rerender } = render(<MidTruncate text={text} tail={14} className="a" />);
     act(flushFrames);
     rerender(<MidTruncate text={text} tail={14} className="b" />);
+    expect(frames).toHaveLength(1);
+  });
+});
+
+describe("MidTruncate — follow-ups (#833)", () => {
+  let frames: FrameRequestCallback[] = [];
+  const flushFrames = () => {
+    const run = frames;
+    frames = [];
+    run.forEach((cb) => cb(0));
+  };
+  const GLYPH = 7;
+  let room = 0;
+  const realRangeRect = Range.prototype.getBoundingClientRect;
+  // `data-measuring` on the box at each Range read of the head's text.
+  let measuringAtRead: boolean[] = [];
+
+  beforeEach(() => {
+    frames = [];
+    measuringAtRead = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? room : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      const parent = this.startContainer.parentElement;
+      if (parent?.classList.contains("octo-midtrunc-head")) {
+        measuringAtRead.push(parent.parentElement!.hasAttribute("data-measuring"));
+      }
+      const w = (this.endOffset - this.startOffset) * GLYPH;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    Range.prototype.getBoundingClientRect = realRangeRect;
+  });
+
+  const text = "Production deploy (octopush-web)-12345";
+
+  it("measures with the head held at clip, and clears the hold after the cut", () => {
+    for (const r of [70, 2000]) {
+      room = r; // cut, then nothing to cut
+      const { container, unmount } = render(<MidTruncate text={text} tail={14} />);
+      act(flushFrames);
+      const box = container.querySelector(".octo-midtrunc")!;
+      expect(measuringAtRead.length).toBeGreaterThan(0);
+      expect(measuringAtRead.every(Boolean)).toBe(true);
+      expect(box).not.toHaveAttribute("data-measuring");
+      expect(box.hasAttribute("data-elided")).toBe(r === 70);
+      measuringAtRead = [];
+      unmount();
+    }
+  });
+
+  it("holds the head at clip during a synchronous seatEllipsis too", () => {
+    room = 70;
+    const { container } = render(<MidTruncate text={text} tail={14} />);
+    const box = container.querySelector<HTMLElement>(".octo-midtrunc")!;
+    const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
+    measuringAtRead = [];
+    seatEllipsis(box, head);
+    expect(measuringAtRead.length).toBeGreaterThan(0);
+    expect(measuringAtRead.every(Boolean)).toBe(true);
+    expect(box).not.toHaveAttribute("data-measuring");
+    expect(box).toHaveAttribute("data-elided");
+  });
+
+  it("flattens form feeds, vertical tabs and the Unicode line and paragraph separators", () => {
+    const LS = String.fromCharCode(0x2028);
+    const PS = String.fromCharCode(0x2029);
+    expect(flatten(`a\fb\vc${LS}d${PS}e`)).toBe("a b c d e");
+    const raw = `fix: the${LS}seam${PS}handling (octopush-web)`;
+    const { container } = render(<MidTruncate text={raw} tail={15} />);
+    expect(container.textContent).not.toMatch(/[\f\v\p{Zl}\p{Zp}]/u);
+    expect(container.querySelector(".octo-midtrunc-head")!.textContent).toBe("fix: the seam handling");
+  });
+
+  it("keeps tracking across renders with a new inline lead element", () => {
+    const { rerender } = render(<MidTruncate text={text} tail={14} lead={<svg />} />);
+    act(flushFrames);
+    rerender(<MidTruncate text={text} tail={14} lead={<svg />} />);
+    expect(frames).toHaveLength(0);
+    // Adding or dropping the lead still re-seats: it changes the box.
+    rerender(<MidTruncate text={text} tail={14} />);
     expect(frames).toHaveLength(1);
   });
 });
