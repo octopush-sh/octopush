@@ -231,6 +231,11 @@ pub fn user_input_for(
     } else if input.refs_worktree {
         s.push_str("The current code changes are present in the workspace; inspect them with your tools.\n\n");
     }
+    // Collision radar (#732): other live workspaces changing the same files.
+    if let Some(note) = input.concurrent_work.as_deref().filter(|n| !n.trim().is_empty()) {
+        s.push_str(note);
+        s.push_str("\n\n");
+    }
     // Attempt history BEFORE the current feedback: the history is context,
     // the feedback below is the binding directive for THIS attempt.
     if let Some(h) = input.history.as_deref().filter(|h| !h.trim().is_empty()) {

@@ -3223,6 +3223,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         }
     }
 
@@ -3363,6 +3364,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         };
         let s = user_input_for("implement", "Add a dark-mode toggle", &input, None);
         assert!(s.contains("The plan to follow (from the plan stage):"), "{s}");
@@ -3384,6 +3386,24 @@ mod runner_helpers_tests {
         input.refs_worktree = true;
         let some = user_input_for("code_review", "T", &input, None);
         assert!(some.contains("The current code changes are present in the workspace"));
+    }
+
+    #[test]
+    fn dossier_carries_the_concurrent_work_note_only_when_set() {
+        let mut input = plan_input("plan text");
+        let none = user_input_for("implement", "T", &input, None);
+        assert!(!none.contains("concurrently changing"), "{none}");
+        input.concurrent_work = Some(
+            "Note: workspace `refund-webhooks` is concurrently changing src/billing/limits.ts. Avoid unrelated edits there."
+                .into(),
+        );
+        let some = user_input_for("implement", "T", &input, None);
+        assert!(
+            some.contains("Note: workspace `refund-webhooks` is concurrently changing src/billing/limits.ts."),
+            "{some}"
+        );
+        // Context, after the plan it complements.
+        assert!(some.find("The plan to follow").unwrap() < some.find("concurrently changing").unwrap());
     }
 
     #[test]
@@ -3514,6 +3534,7 @@ mod runner_helpers_tests {
             refs_worktree: false,
             worktree_diff: None,
             history: None,
+            concurrent_work: None,
         };
         let s = user_input_for("code_review", "T", &input, None);
         assert!(!s.contains("Context (from"));
@@ -6573,6 +6594,101 @@ mod orchestrator_tests {
         assert_eq!(kinds, vec![ArtifactKind::Plan, ArtifactKind::Review]);
         assert!(input.sections[0].text.contains("plan output"));
         assert!(input.sections[1].text.contains("plan_review output"));
+    }
+
+    /// Collision radar, phase 2 (#732): a code-writing stage hears which other
+    /// live workspaces change its files; a planning stage, a workspace whose
+    /// only overlap is a lockfile, and an archived peer add nothing.
+    #[tokio::test]
+    async fn implement_hears_about_overlapping_workspaces_only() {
+        use std::process::Command;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        git(&root, &["config", "user.email", "t@t.dev"]);
+        git(&root, &["config", "user.name", "T"]);
+        std::fs::write(root.join("src/limits.ts"), "one\ntwo\n").unwrap();
+        std::fs::write(root.join("README.md"), "readme\n").unwrap();
+        std::fs::write(root.join("package-lock.json"), "{}\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "base"]);
+        let names = ["auth-flow", "refund-webhooks", "docs-pass", "old-lane"];
+        for n in names {
+            let p = dir.path().join(n);
+            git(&root, &["worktree", "add", "-q", "-b", n, p.to_str().unwrap(), "main"]);
+            git(&p, &["config", "user.email", "t@t.dev"]);
+            git(&p, &["config", "user.name", "T"]);
+        }
+        let wt = |n: &str| dir.path().join(n);
+        // auth-flow (the runs' workspace): uncommitted edits, as crews leave them.
+        std::fs::write(wt("auth-flow").join("src/limits.ts"), "ONE\ntwo\n").unwrap();
+        std::fs::write(wt("auth-flow").join("package-lock.json"), "{\"a\":1}\n").unwrap();
+        // refund-webhooks: committed work on the same file.
+        std::fs::write(wt("refund-webhooks").join("src/limits.ts"), "one\nTWO\n").unwrap();
+        git(&wt("refund-webhooks"), &["commit", "-qam", "limits"]);
+        // docs-pass: only the lockfile in common.
+        std::fs::write(wt("docs-pass").join("README.md"), "docs\n").unwrap();
+        std::fs::write(wt("docs-pass").join("package-lock.json"), "{\"d\":1}\n").unwrap();
+        // old-lane: the same file, but archived.
+        std::fs::write(wt("old-lane").join("src/limits.ts"), "old\n").unwrap();
+
+        let tmp = NamedTempFile::new().unwrap();
+        let db = Db::open(tmp.path()).unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        db.conn_ref().execute(
+            "INSERT INTO projects (id,name,path,created_at,last_opened) VALUES ('p1','P',?1,?2,?2)",
+            rusqlite::params![root.to_str().unwrap(), now]).unwrap();
+        for n in names {
+            db.conn_ref().execute(
+                "INSERT INTO workspaces (id,project_id,name,branch,worktree_path,from_branch,created_at,last_active)
+                 VALUES (?1,'p1',?2,?2,?3,'main',?4,?4)",
+                rusqlite::params![format!("ws-{n}"), n, wt(n).to_str().unwrap(), now]).unwrap();
+        }
+        db.conn_ref().execute("UPDATE workspaces SET status = 'archived' WHERE id = 'ws-old-lane'", []).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let db = Arc::new(Mutex::new(db));
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+
+        let drive = |ws: &'static str| {
+            let db = Arc::clone(&db);
+            let pid = pid.clone();
+            async move {
+                let run_id = db.lock().create_run(ws, &pid, "task", None, None, &[]).unwrap();
+                let seen = Arc::new(Mutex::new(vec![]));
+                let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+                let orch = Orchestrator::new_with_runner(
+                    Arc::clone(&db),
+                    sink,
+                    Box::new(RecordingRunner { seen: Arc::clone(&seen) }),
+                );
+                assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+                let mut out = Vec::new();
+                std::mem::swap(&mut out, &mut *seen.lock());
+                out
+            }
+        };
+
+        let seen = drive("ws-auth-flow").await;
+        assert_eq!(seen[0].0, "plan");
+        assert_eq!(seen[0].1.concurrent_work, None, "planning stages hear nothing");
+        assert_eq!(seen[1].0, "implement");
+        let note = seen[1].1.concurrent_work.clone().expect("implement hears about refund-webhooks");
+        assert_eq!(
+            note,
+            "Note: workspace `refund-webhooks` is concurrently changing src/limits.ts. Avoid unrelated edits there."
+        );
+
+        // docs-pass shares only the lockfile with auth-flow: nothing to say.
+        let seen = drive("ws-docs-pass").await;
+        assert_eq!(seen[1].0, "implement");
+        assert_eq!(seen[1].1.concurrent_work, None);
     }
 
     /// Two producers of the same kind: BOTH survive into the dossier — the
@@ -19432,6 +19548,66 @@ mod collision_tests {
         assert_eq!(c.files, vec!["src/plan.ts".to_string()]);
         assert_eq!(c.severity, Severity::Overlap);
         assert!(!c.confirmed);
+    }
+
+    fn collision(a: &str, b: &str, files: &[&str], severity: Severity) -> crate::collisions::Collision {
+        crate::collisions::Collision {
+            a: format!("ws-{a}"),
+            a_name: a.into(),
+            b: format!("ws-{b}"),
+            b_name: b.into(),
+            files: files.iter().map(|f| f.to_string()).collect(),
+            truncated: 0,
+            conflicting_files: vec![],
+            conflicting_truncated: 0,
+            severity,
+            confirmed: false,
+        }
+    }
+
+    #[test]
+    fn the_dossier_note_names_each_peer_conflicts_first_without_lockfiles() {
+        use crate::collisions::{concurrent_work_note, ProjectCollisions};
+        let report = ProjectCollisions {
+            collisions: vec![
+                collision("auth-flow", "billing", &["src/plan.ts", "Cargo.lock"], Severity::Overlap),
+                collision("refund-webhooks", "auth-flow", &["src/limits.ts"], Severity::Conflict),
+                collision("auth-flow", "deps", &["package-lock.json"], Severity::Lockfile),
+                collision("billing", "deps", &["src/other.ts"], Severity::Overlap),
+            ],
+            scanned: 4,
+            ..Default::default()
+        };
+        assert_eq!(
+            concurrent_work_note(&report, "ws-auth-flow").as_deref(),
+            Some(
+                "Note: workspace `refund-webhooks` is concurrently changing src/limits.ts. Avoid unrelated edits there.\n\
+                 Note: workspace `billing` is concurrently changing src/plan.ts. Avoid unrelated edits there."
+            )
+        );
+        // Not part of any collision, or only through a lockfile: nothing.
+        assert_eq!(concurrent_work_note(&report, "ws-quiet"), None);
+        let lock_only = ProjectCollisions { collisions: vec![report.collisions[2].clone()], ..Default::default() };
+        assert_eq!(concurrent_work_note(&lock_only, "ws-deps"), None);
+    }
+
+    #[test]
+    fn the_dossier_note_stays_short() {
+        use crate::collisions::{concurrent_work_note, ProjectCollisions, MAX_NOTE_FILES, MAX_NOTE_PEERS};
+        let files: Vec<String> = (0..MAX_NOTE_FILES + 2).map(|i| format!("src/f{i}.ts")).collect();
+        let refs: Vec<&str> = files.iter().map(String::as_str).collect();
+        let mut first = collision("me", "p0", &refs, Severity::Overlap);
+        first.truncated = 3;
+        let mut collisions = vec![first];
+        for i in 1..MAX_NOTE_PEERS + 2 {
+            collisions.push(collision("me", &format!("p{i}"), &["src/x.ts"], Severity::Overlap));
+        }
+        let note = concurrent_work_note(&ProjectCollisions { collisions, ..Default::default() }, "ws-me").unwrap();
+        let lines: Vec<&str> = note.lines().collect();
+        assert_eq!(lines.len(), MAX_NOTE_PEERS + 1, "{note}");
+        assert!(lines[0].contains("src/f4.ts and 5 more files."), "{note}");
+        assert!(!lines[0].contains("src/f5.ts"), "{note}");
+        assert_eq!(lines[MAX_NOTE_PEERS], "Note: 2 more workspaces of this project change files you may touch.");
     }
 
     #[test]

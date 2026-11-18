@@ -250,6 +250,11 @@ pub struct StageInput {
     /// blind to what iterations 1..N-1 tried and why they were closed — the
     /// setup for the classic review-loop oscillation between two answers.
     pub history: Option<String>,
+    /// Collision radar, phase 2 (#732): for a code-writing stage whose
+    /// workspace changes the same files as another live workspace of the
+    /// project, one line per peer naming it and the shared files
+    /// (`collisions::concurrent_work_note`). `None` when nothing overlaps.
+    pub concurrent_work: Option<String>,
 }
 
 /// A director's hot-edit riding along with a re-run: validated BEFORE any
