@@ -730,14 +730,18 @@ fn any_within(sorted: &[u32], n: u32, w: u32) -> bool {
 /// The most of a PEM block hashed into the fingerprint.
 const MAX_PEM_BYTES: usize = 64 * 1024;
 
-/// The whole PEM block starting at `lines[idx]`: the header line through the
-/// line holding the matching `-----END …-----` (or through the end of the
-/// consecutive added lines), bounded to [`MAX_PEM_BYTES`]. Hashing only the
+/// The whole PEM block whose header starts at byte `start` of `lines[idx]`:
+/// the header line from that offset through the line holding the matching
+/// `-----END …-----` (or through the end of the consecutive added lines,
+/// stopping before the next PEM header line), bounded to [`MAX_PEM_BYTES`]. Hashing only the
 /// header and the first body line would hash a constant for an unencrypted
 /// OpenSSH key (and the `Proc-Type:` line for a legacy encrypted one).
-fn pem_block(lines: &[(u32, String)], idx: usize, header: &str) -> String {
+pub(crate) fn pem_block(lines: &[(u32, String)], idx: usize, start: usize, header: &str) -> String {
     let end_marker = header.replacen("-----BEGIN ", "-----END ", 1);
-    let (first_n, first) = &lines[idx];
+    let (first_n, line) = &lines[idx];
+    // From the header on: on a long line the bytes before it are unrelated,
+    // and the cap must not spend itself on them.
+    let first = line.get(start..).unwrap_or(line.as_str());
     let mut v = String::new();
     let push = |v: &mut String, l: &str| {
         let room = MAX_PEM_BYTES.saturating_sub(v.len());
@@ -755,7 +759,9 @@ fn pem_block(lines: &[(u32, String)], idx: usize, header: &str) -> String {
         return v;
     }
     for (expect, (n, l)) in (first_n + 1..).zip(&lines[idx + 1..]) {
-        if *n != expect || v.len() >= MAX_PEM_BYTES {
+        // A new header starts its own block: repeated headers with no END
+        // must not each walk the next MAX_PEM_BYTES.
+        if *n != expect || v.len() >= MAX_PEM_BYTES || PEM_HEADER.is_match(l) {
             break;
         }
         push(&mut v, l);
@@ -861,7 +867,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     .filter(|(_, l)| PEM_BODY_LINE.is_match(l));
                 if inline || next.is_some() {
                     let h = PEM_HEADER.find(line);
-                    let v = pem_block(&file.lines, idx, h.map(|h| h.as_str()).unwrap_or(""));
+                    let v = pem_block(&file.lines, idx, h.map(|h| h.start()).unwrap_or(0), h.map(|h| h.as_str()).unwrap_or(""));
                     if let Some(h) = h {
                         claimed.claim(h.start(), h.end());
                     }

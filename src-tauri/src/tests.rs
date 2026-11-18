@@ -20242,6 +20242,47 @@ mod secret_guard_tests {
         assert_eq!(fp(&k1), fp(&k1_after));
     }
 
+    /// On a long line the block is hashed from the header on: a key whose
+    /// header starts past the first 64 KB is not reduced to the unrelated
+    /// prefix, so two different keys there ask separately.
+    #[test]
+    fn a_pem_key_past_64k_on_a_long_line_is_hashed_from_its_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let pad = "x".repeat(70_000);
+        let line = |seed: u64| {
+            format!(
+                "{{\"pad\": \"{pad}\", \"key\": \"{header}\\n{}\\n{}\\n{footer}\"}}",
+                rnd(seed, 64, B64),
+                rnd(seed + 1, 64, B64)
+            )
+        };
+        let fp = |l: &str| {
+            let r = scan_report(&[file("config/creds.json", &[l])], &[], false);
+            assert!(r.findings.iter().any(|f| f.rule == "private-key"), "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (k1, k2) = (line(500), line(510));
+        assert!(k1.find(&header).unwrap() > 64 * 1024);
+        assert_ne!(fp(&k1), fp(&k2), "two keys after the same 70K prefix");
+    }
+
+    /// A PEM walk stops at the next header: repeated headers with no END
+    /// don't each run on through the following blocks.
+    #[test]
+    fn a_pem_walk_stops_at_the_next_header() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(520, 64, B64), rnd(521, 64, B64));
+        let lines: Vec<(u32, String)> =
+            vec![(1, header.clone()), (2, b1.clone()), (3, header.clone()), (4, b2.clone())];
+        let v = pem_block(&lines, 0, 0, &header);
+        assert!(v.contains(&b1));
+        assert!(!v.contains(&b2), "walked into the next block");
+        let refs: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
+        let r = scan_report(&[file("deploy/keys.pem", &refs)], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 2, "{:?}", r.findings);
+    }
+
     /// A provider token that only partly overlaps one of your own keys is
     /// still hashed, so editing its other part asks again.
     #[test]
