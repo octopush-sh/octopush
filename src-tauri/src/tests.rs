@@ -19919,6 +19919,9 @@ mod secret_guard_tests {
         let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
         let body = rnd(40, 64, B64);
         let f = scan_one("deploy/key.pem", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["pem-file", "private-key"], "a new .pem is also flagged by name");
+        let f = scan_one("deploy/key.txt", &[&header, &body, "-----END RSA PRIVATE KEY-----"]);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "private-key");
         // Inline in JSON, with an escaped newline.
@@ -19966,7 +19969,6 @@ mod secret_guard_tests {
         assert!(scan_one("src/__mocks__/api.ts", &[&line]).is_empty());
         let near = [
             "password = \"correcthorsebatterystaple\"".to_string(),   // no digits, low entropy
-            format!("secret = \"{}\"", rnd(51, 40, "0123456789abcdef")), // hex: ≤ 4 bits/char
             "api_key = \"your-api-key-goes-here-123\"".to_string(),
             "auth_token = \"{{ secrets.AUTH_TOKEN_VALUE_2 }}\"".to_string(),
             "client_secret = \"https://vault.local/secret/path/1\"".to_string(),
@@ -20014,6 +20016,113 @@ mod secret_guard_tests {
         assert_eq!(f[0].rule, "ssh-private-key-file");
         assert_eq!(f[0].line, None);
         assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, lines: vec![] }], &[]).is_empty());
+    }
+
+    #[test]
+    fn a_newly_added_pem_or_claude_local_settings_file_is_flagged_by_name() {
+        let new = |p: &str, lines: Vec<(u32, String)>| AddedFile { path: p.into(), is_new: true, lines };
+        for (path, rule) in [
+            ("certs/server.pem", "pem-file"),
+            ("deploy/CA.PEM", "pem-file"),
+            (".claude/settings.local.json", "claude-local-settings"),
+            ("apps/web/.claude/settings.local.json", "claude-local-settings"),
+        ] {
+            // Whatever it holds, even nothing.
+            for lines in [vec![], vec![(1, "{}".to_string())]] {
+                let f = scan_added(&[new(path, lines)], &[]);
+                assert_eq!(f.len(), 1, "{path}: {f:?}");
+                assert_eq!(f[0].rule, rule);
+                assert_eq!(f[0].line, None);
+                assert_eq!(f[0].location(), path);
+            }
+        }
+        // Only a newly added file: an edit to one already tracked is not.
+        let edited = AddedFile { path: "certs/server.pem".into(), is_new: false, lines: vec![(3, "x".into())] };
+        assert!(scan_added(&[edited], &[]).is_empty());
+        for path in ["certs/server.pem.example", "docs/pem.md", ".claude/settings.json", "settings.local.json", ".claude/settings.local.json.bak"] {
+            assert!(scan_added(&[new(path, vec![])], &[]).is_empty(), "false positive on {path}");
+        }
+    }
+
+    #[test]
+    fn mcp_configs_flag_credential_named_env_values() {
+        let pw = rnd(300, 24, B62);
+        let lines: Vec<String> = vec![
+            "{".into(),
+            "  \"mcpServers\": {".into(),
+            "    \"db\": {".into(),
+            "      \"command\": \"npx\",".into(),
+            "      \"args\": [\"-y\", \"@acme/db-mcp\"],".into(),
+            "      \"env\": {".into(),
+            "        \"LOG_LEVEL\": \"debug\",".into(),
+            "        \"API_URL\": \"https://api.example.org\",".into(),
+            "        \"AUTH_ENABLED\": \"true\",".into(),
+            "        \"GITHUB_TOKEN\": \"${GITHUB_TOKEN}\",".into(),
+            "        \"OTHER_KEY\": \"$OTHER_KEY\",".into(),
+            "        \"API_KEY\": \"your-api-key-here\",".into(),
+            format!("        \"DB_PASSWORD\": \"{pw}\""),
+            "      }".into(),
+            "    }".into(),
+            "  }".into(),
+            "}".into(),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let f = scan_one(".mcp.json", &refs);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].rule, "mcp-env-credential");
+        assert_eq!(f[0].line, Some(13));
+        assert!(f[0].kind.contains("DB_PASSWORD"));
+        assert!(!f[0].kind.contains(&pw));
+        // Cursor's config, nested projects and a one-line config.
+        let inline = format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"STRIPE_SECRET\":\"{pw}\"}}}}}}}}");
+        for path in [".cursor/mcp.json", "packages/api/.mcp.json", "packages/api/.cursor/mcp.json"] {
+            let f = scan_one(path, &[&inline]);
+            assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{path}: {f:?}");
+        }
+        // A provider token in the env block is listed once, as what it is.
+        let ghp = ["gh", "p_"].concat() + &rnd(301, 36, B62);
+        let f = scan_one(".mcp.json", &[&format!("\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"{ghp}\"")]);
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["github-token"]);
+        // Not an MCP config: the rule stays out.
+        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md"] {
+            let f = scan_one(path, &[&inline]);
+            assert!(f.iter().all(|f| f.rule != "mcp-env-credential"), "{path}: {f:?}");
+        }
+    }
+
+    #[test]
+    fn a_hex_secret_assigned_to_a_credential_name_is_flagged() {
+        // A random-looking hex value: not a placeholder by the existing
+        // filter, and above 3 bits/char.
+        let hex = |seed: u64, len: usize| {
+            (seed..).map(|s| rnd(s, len, HEX)).find(|v| !is_placeholder(v) && shannon_entropy(v) > 3.0).unwrap()
+        };
+        let (h32, h40, h64) = (hex(310, 32), hex(320, 40), hex(330, 64));
+        for (path, line) in [
+            ("src/a.py", format!("secret = \"{h40}\"")),
+            ("src/config.ts", format!("const API_KEY = '{h32}';")),
+            ("config/app.json", format!("\"client_secret\": \"{h64}\",")),
+            ("src/a.rb", format!("auth_token: \"{}\"", h40.to_ascii_uppercase())),
+        ] {
+            let f = scan_one(path, &[&line]);
+            assert_eq!(f.len(), 1, "{line}: {f:?}");
+            assert_eq!(f[0].rule, "generic-secret");
+        }
+        let near = [
+            ("src/a.py", format!("secret = \"{}\"", &h32[..31])),                // 31: too short
+            ("tests/a.py", format!("secret = \"{h40}\"")),                        // test path
+            ("src/a_test.go", format!("secret := \"{h40}\"")),
+            ("src/a.py", format!("password_hash = \"{h64}\"")),                   // a digest
+            ("src/a.py", format!("secret_sha256: \"{h64}\"")),
+            ("src/a.py", format!("commit = \"{h40}\"")),                          // not a credential name
+            ("src/a.py", format!("api_key = \"{}\"", "0123456789abcdef".repeat(2))), // placeholder
+            ("src/a.py", format!("secret = \"{}\"", "deadbeef".repeat(4))),       // few distinct chars
+            ("src/a.py", format!("secret = \"{}\"", "1".repeat(40))),             // no letters
+        ];
+        for (path, line) in near {
+            assert!(scan_one(path, &[&line]).is_empty(), "false positive on {line:?} in {path}");
+        }
     }
 
     /// The secret never reaches a finding's Debug/Serialize output, the
@@ -20283,6 +20392,34 @@ mod secret_guard_tests {
         assert!(matches!(pr, Err(crate::error::AppError::SecretsFound { .. })));
     }
 
+    /// The Review Companion's preview of the staged diff: the findings, no
+    /// fingerprint (it can't stand in for the confirm), nothing when off.
+    #[tokio::test]
+    async fn the_staged_preview_lists_findings_without_a_fingerprint() {
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        {
+            let _s = SettingsGuard::new(serde_json::json!({}));
+            let clean = crate::commands::secret_scan_staged(path.clone()).await.unwrap().expect("guard on");
+            assert_eq!(clean.total, 0, "nothing staged yet: {clean:?}");
+            stage(&repo, "cfg.ts");
+            let p = crate::commands::secret_scan_staged(path.clone()).await.unwrap().expect("guard on");
+            assert_eq!(p.total, 1, "{p:?}");
+            assert!(!p.partial);
+            assert_eq!(p.findings[0].location(), "cfg.ts:1");
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(!json.contains("fingerprint"), "{json}");
+            assert!(!json.contains(&secret));
+            // A preview commits nothing.
+            assert_eq!(repo.head().unwrap().peel_to_commit().unwrap().summary().unwrap(), Some("init"));
+        }
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        assert!(crate::commands::secret_scan_staged(path).await.unwrap().is_none());
+    }
+
     #[tokio::test]
     async fn confirming_or_turning_the_guard_off_restores_todays_path() {
         let (dir, repo) = repo();
@@ -20376,7 +20513,7 @@ mod secret_guard_tests {
     #[test]
     fn an_encrypted_pem_key_is_still_a_private_key() {
         let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
-        let f = scan_one("deploy/key.pem", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
+        let f = scan_one("deploy/key.key", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
         assert_eq!(f.len(), 1, "{f:?}");
         assert_eq!(f[0].rule, "private-key");
         let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);

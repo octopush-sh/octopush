@@ -9,8 +9,10 @@
 //!
 //! Rules favour precision over recall: provider key prefixes with their real
 //! lengths, AWS access key ids only next to a secret key, PEM private keys
-//! only with key material under the header, `.env` files only for
-//! credential-named variables, an entropy-gated generic assignment rule kept
+//! only with key material under the header, `.env` files and MCP configs'
+//! `env` entries only for credential-named variables, a few files by name
+//! (`id_rsa`, `*.pem`, `.claude/settings.local.json`), an entropy-gated
+//! generic assignment rule (with its own path for 32+ char hex values) kept
 //! out of test paths, and an exact-value canary for the credentials Octopush
 //! itself holds (provider keys, git tokens, the Jira token).
 //!
@@ -468,6 +470,12 @@ static ENV_CREDENTIAL_NAME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PWD|PRIVATE|CREDENTIAL|AUTH)").unwrap()
 });
 
+/// A `"NAME": "value"` pair with an UPPER_SNAKE name: the shape of an entry
+/// in an MCP server's `env` block.
+static MCP_ENV_PAIR: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#""([A-Z][A-Z0-9_]*)"\s*:\s*"([^"]*)""#).unwrap()
+});
+
 static GENERIC_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?i)\b[A-Za-z0-9_.\-]*(?:api[_\-]?key|apikey|secret|access[_\-]?token|auth[_\-]?token|passw(?:or)?d)[A-Za-z0-9_.\-]*["']?\s*(?::|=|:=|=>)\s*["']([^"'\s]{20,})["']"#,
@@ -579,9 +587,41 @@ pub fn is_env_file(path: &str) -> bool {
     !matches!(suffix.as_str(), "example" | "sample" | "template" | "dist" | "defaults" | "schema" | "tpl")
 }
 
-fn is_ssh_private_key_file(path: &str) -> bool {
+/// A file whose name alone makes a newly added copy a finding, whatever it
+/// holds: (rule id, kind).
+fn sensitive_file(path: &str) -> Option<(&'static str, &'static str)> {
     let base = path.rsplit('/').next().unwrap_or(path);
-    matches!(base, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_ecdsa_sk" | "id_ed25519_sk")
+    if matches!(base, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_ecdsa_sk" | "id_ed25519_sk") {
+        return Some(("ssh-private-key-file", "SSH private key file"));
+    }
+    if base.to_ascii_lowercase().ends_with(".pem") {
+        return Some(("pem-file", "PEM file"));
+    }
+    if path == ".claude/settings.local.json" || path.ends_with("/.claude/settings.local.json") {
+        return Some(("claude-local-settings", "Claude Code local settings"));
+    }
+    None
+}
+
+/// A project MCP config: Claude Code's `.mcp.json`, Cursor's `.cursor/mcp.json`.
+fn is_mcp_config(path: &str) -> bool {
+    [".mcp.json", ".cursor/mcp.json"].iter().any(|f| path == *f || path.ends_with(&format!("/{f}")))
+}
+
+/// A hex value of 32+ characters: below the generic rule's 4 bits/char by
+/// construction, so it gets its own path.
+fn is_hex_secret(v: &str) -> bool {
+    v.len() >= 32
+        && v.bytes().all(|b| b.is_ascii_hexdigit())
+        && v.bytes().any(|b| b.is_ascii_digit())
+        && v.bytes().any(|b| b.is_ascii_alphabetic())
+        && shannon_entropy(v) > 3.0
+}
+
+/// A name for a digest of something, not the thing (`password_hash`).
+fn names_a_digest(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    ["hash", "digest", "checksum", "sha1", "sha256", "md5"].iter().any(|m| lower.contains(m))
 }
 
 /// Strip quotes and a trailing `# comment` from a `.env` value.
@@ -778,14 +818,14 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
     let mut seen = HashSet::new();
     for file in files {
         let path = file.path.as_str();
-        if file.is_new && is_ssh_private_key_file(path) {
+        if let Some((rule, kind)) = sensitive_file(path).filter(|_| file.is_new) {
             let body: String = file.lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
             push_hit(&mut out, &mut seen, SecretFinding {
-                file: path.into(), line: None, rule: "ssh-private-key-file".into(),
-                kind: "SSH private key file".into(), yours: false,
+                file: path.into(), line: None, rule: rule.into(), kind: kind.into(), yours: false,
             }, &body, true);
         }
         let env_file = is_env_file(path);
+        let mcp_config = is_mcp_config(path);
         let doc_file = is_doc_file(path);
         let generic_ok = !is_test_path(path) && !is_lockfile(path);
         // AWS needs the key id AND a secret within a few lines of it:
@@ -886,12 +926,23 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     }
                 }
             }
+            if mcp_config {
+                for c in MCP_ENV_PAIR.captures_iter(line) {
+                    let (Some(name), Some(m)) = (c.get(1), c.get(2)) else { continue };
+                    let name = name.as_str();
+                    if ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(m.as_str()) {
+                        let shown = claimed.claim(m.start(), m.end());
+                        push_hit(&mut out, &mut seen, at("mcp-env-credential", format!("credential in an MCP config ({name})"), false), m.as_str(), shown);
+                    }
+                }
+            }
             if generic_ok && !public_web_value {
                 for c in GENERIC_ASSIGN.captures_iter(head) {
                     let Some(m) = c.get(1) else { continue };
                     let v = m.as_str();
+                    let name = c.get(0).map(|all| &head[all.start()..m.start()]).unwrap_or("");
                     let plausible = !is_placeholder(v)
-                        && shannon_entropy(v) > 4.0
+                        && (shannon_entropy(v) > 4.0 || (is_hex_secret(v) && !names_a_digest(name)))
                         && v.chars().any(|c| c.is_ascii_digit())
                         && v.chars().any(|c| c.is_ascii_alphabetic())
                         && !v.contains("://")
@@ -1337,6 +1388,40 @@ where
             Ok(())
         }
     }
+}
+
+/// What the guard would say about a change, for a surface that shows it
+/// before the action (the Review Companion's verdict). No fingerprint: a
+/// preview can't stand in for the confirm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanPreview {
+    pub findings: Vec<SecretFinding>,
+    pub total: usize,
+    pub partial: bool,
+}
+
+impl From<ScanReport> for ScanPreview {
+    fn from(r: ScanReport) -> Self {
+        ScanPreview { findings: r.findings, total: r.total, partial: r.partial }
+    }
+}
+
+/// Scan what `collect` gathers without enforcing anything; `None` when the
+/// guard is off. The action itself still rescans when it runs.
+pub async fn preview<F>(collect: F) -> AppResult<Option<ScanPreview>>
+where
+    F: FnOnce() -> AppResult<Collected> + Send + 'static,
+{
+    let settings = crate::settings::load_settings().unwrap_or_default();
+    if !guard_enabled(&settings) {
+        return Ok(None);
+    }
+    let known = known_secrets_from(&settings);
+    let report = tokio::task::spawn_blocking(move || collect().map(|c| scan_collected(&c, &known)))
+        .await
+        .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}"))))?;
+    Ok(Some(report.into()))
 }
 
 /// A Direct stage held by the guard, persisted on `run_stages.secret_hold`.

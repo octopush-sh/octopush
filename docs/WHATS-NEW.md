@@ -108,6 +108,7 @@ Current anchors:
 | `review-mode-tail` | Review: the mode band's status tail ("2 files changed · +2 −1"; only with changes) | `ReviewTail.tsx` |
 | `review-companion-verdict` | Review Companion: the serif readiness verdict ("2 files to review.") | `CompanionReview.tsx` |
 | `review-companion-collision` | Review Companion, under the verdict: "Will conflict with refund-webhooks in 1 file." + "Open refund-webhooks" (only while the workspace overlaps another) | `CompanionReview.tsx` |
+| `review-companion-secret` | Review Companion, under the verdict: "possible secret · GitHub token in src/a.ts:3" + "Show it" (only while the staged diff holds what Commit's secret guard would stop for) | `CompanionReview.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |

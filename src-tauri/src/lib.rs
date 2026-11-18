@@ -361,6 +361,7 @@ pub fn run() {
             commands::unstage_file,
             commands::unstage_all_changes,
             commands::commit_changes,
+            commands::secret_scan_staged,
             commands::get_staged_diff,
             commands::get_last_commit,
             commands::git_log,
