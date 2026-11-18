@@ -7,7 +7,7 @@
 //! human control point.
 
 use crate::error::{AppError, AppResult};
-use crate::orchestrator::runner::{compose_system_prompt, parse_verdict, user_input_for, AgentRunner, StageContext};
+use crate::orchestrator::runner::{parse_verdict, user_input_for, AgentRunner, StageContext};
 use crate::orchestrator::types::{ArtifactKind, StageArtifact, StageInput, StageOutcome, StageSpec, StageStatus};
 use serde::Deserialize;
 use serde_json::Value;
@@ -1148,8 +1148,24 @@ pub fn parse_cli_result(
 /// the CLI ran with `bypassPermissions` and nothing but a "Do not modify
 /// files" prompt — a reviewer that "fixes" what it reviews corrupts the very
 /// diff the gate then approves. `Bash` stays allowed (reviewers must run
-/// builds/tests), so this is a guardrail, not a sandbox.
+/// builds/tests), so this is a guardrail, not a sandbox; the git writes are
+/// denied separately ([`review_disallowed_tools`]).
 pub const REVIEW_DISALLOWED_TOOLS: &str = "Write,Edit,MultiEdit,NotebookEdit";
+
+/// Everything a read-only (review-kind worktree) Claude stage is denied:
+/// [`REVIEW_DISALLOWED_TOOLS`] plus one `Bash(git <sub>:*)` rule per
+/// [`GIT_WRITE_SUBCOMMANDS`](crate::orchestrator::read_only::GIT_WRITE_SUBCOMMANDS)
+/// (#847: a Reproduce and a Verify stage each applied the change and
+/// committed it). Deny rules hold under `bypassPermissions`. A command that
+/// hides git behind `sh -c` or a script still gets through — the commit
+/// notice is the backstop. Pure.
+pub fn review_disallowed_tools() -> String {
+    let mut s = String::from(REVIEW_DISALLOWED_TOOLS);
+    for sub in crate::orchestrator::read_only::GIT_WRITE_SUBCOMMANDS {
+        s.push_str(&format!(",Bash(git {sub}:*)"));
+    }
+    s
+}
 
 /// Claude Code's interactive question tool, denied to EVERY Claude CLI stage.
 /// A headless `claude -p` stage has nobody to answer it (since 2.1.321 the CLI
@@ -1162,7 +1178,7 @@ pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 /// tool, plus the review denial on a read-only stage.
 pub fn cli_disallowed_tools(read_only: bool) -> String {
     if read_only {
-        format!("{ASK_USER_QUESTION_TOOL},{REVIEW_DISALLOWED_TOOLS}")
+        format!("{ASK_USER_QUESTION_TOOL},{}", review_disallowed_tools())
     } else {
         ASK_USER_QUESTION_TOOL.to_string()
     }
@@ -2662,8 +2678,7 @@ pub struct CliRunner;
 /// is to judge the diff, not to change it (Action-environment roles keep
 /// their write access — committing/pushing IS their job). Pure.
 fn stage_is_read_only(stage: &StageSpec) -> bool {
-    matches!(stage.artifact_kind, ArtifactKind::Review)
-        && matches!(stage.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree)
+    crate::orchestrator::read_only::role_is_read_only(&stage.artifact_kind, stage.role_environment)
 }
 
 /// `outcome` turned into a failure with `msg`, keeping the spend it burned so
@@ -2761,7 +2776,7 @@ impl CliRunner {
         // instructions still shape the stage via the system prompt.
         // CLI substrate has no `ask_director` tool — keep the strict never-ask
         // preamble by NOT appending the carve-out (`can_ask_director = false`).
-        let mut system = compose_system_prompt(&stage.role_prompt, stage.role_environment, stage.loop_mode.clone(), stage.instructions.as_deref(), false);
+        let mut system = crate::orchestrator::roles::compose_stage_system_prompt(&stage.role_prompt, stage.role_environment, stage_is_read_only(stage), stage.loop_mode.clone(), stage.instructions.as_deref(), false);
         // Same skill instructions the API substrate gets. The CLI resolves
         // `/slug` itself only for its own interactive input; a stage prompt is
         // not that, so the body is inlined here rather than hoping the CLI

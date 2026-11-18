@@ -11,6 +11,7 @@ pub mod git_baseline;
 pub mod live;
 pub mod persist;
 pub mod plan_wait;
+pub mod read_only;
 pub mod roles;
 pub mod runner;
 pub mod sandbox;
