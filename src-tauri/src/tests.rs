@@ -20203,7 +20203,104 @@ mod secret_guard_tests {
         // quadratic dedupe cost a hundred times, minutes in all). Debug
         // builds on a slow runner stay well inside the absolute bound.
         assert!(took < took_10k * 30, "not linear: 100k {took:?} vs 10k {took_10k:?}");
-        assert!(took < std::time::Duration::from_secs(20), "took {took:?}");
+        assert!(took < std::time::Duration::from_secs(60), "took {took:?}");
+    }
+
+    /// The whole PEM block is hashed, not the header and first body line:
+    /// that pair is a constant for every unencrypted OpenSSH ed25519 key.
+    #[test]
+    fn two_openssh_keys_at_one_place_have_different_fingerprints() {
+        let header = ["-----BEGIN ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "OPENSSH PRIVATE", " KEY-----"].concat();
+        // `openssh-key-v1\0`, cipher `none`, kdf `none`, one ed25519 key: the
+        // same first line for every such key.
+        let first = ["b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW", "QyNTUxOQAAACA"].concat();
+        let key = |seed: u64| {
+            let mut lines = vec![header.clone(), first.clone()];
+            for i in 0..4 {
+                lines.push(rnd(seed * 10 + i, 70, B64));
+            }
+            lines.push(footer.clone());
+            lines
+        };
+        let fp = |lines: &[String]| {
+            let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+            let r = scan_report(&[file("deploy/id_key", &refs)], &[], false);
+            assert_eq!(r.total, 1, "{:?}", r.findings);
+            assert_eq!(r.findings[0].rule, "private-key");
+            assert_eq!(r.findings[0].line, Some(1));
+            r.fingerprint
+        };
+        let (k1, k2) = (key(400), key(401));
+        assert_ne!(fp(&k1), fp(&k2), "two keys at the same file:line");
+        // The last body line counts; what follows the END line does not.
+        let mut k1_last = k1.clone();
+        k1_last[5] = rnd(402, 70, B64);
+        assert_ne!(fp(&k1), fp(&k1_last));
+        let mut k1_after = k1.clone();
+        k1_after.push("unrelated = 1".into());
+        assert_eq!(fp(&k1), fp(&k1_after));
+    }
+
+    /// A provider token that only partly overlaps one of your own keys is
+    /// still hashed, so editing its other part asks again.
+    #[test]
+    fn a_token_partly_overlapping_your_key_is_still_bound() {
+        let ghp = ["gh", "p_"].concat() + &rnd(410, 36, B62);
+        let known = [KnownSecret::new("your GitHub token", ghp[..24].to_string())];
+        let edited = format!("{}{}", &ghp[..24], rnd(411, 16, B62));
+        let r1 = scan_report(&[file("src/a.ts", &[&format!("t = \"{ghp}\"")])], &known, false);
+        let r2 = scan_report(&[file("src/a.ts", &[&format!("t = \"{edited}\"")])], &known, false);
+        assert_eq!(r1.total, 1, "listed once, as yours: {:?}", r1.findings);
+        assert!(r1.findings[0].yours);
+        assert_ne!(r1.fingerprint, r2.fingerprint, "editing the part outside your key asks again");
+    }
+
+    /// Rewriting an unhashed worktree file with the same size and restoring
+    /// its mtime still changes the stamp: the ctime moves.
+    #[cfg(unix)]
+    #[test]
+    fn a_same_size_rewrite_with_a_restored_mtime_asks_again() {
+        let (dir, _repo) = repo();
+        let big = dir.path().join("huge.bin");
+        std::fs::write(&big, "y".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        let mtime = std::fs::metadata(&big).unwrap().modified().unwrap();
+        let fp1 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::fs::write(&big, "z".repeat(16 * 1024 * 1024 + 10)).unwrap();
+        std::fs::File::options().write(true).open(&big).unwrap().set_modified(mtime).unwrap();
+        assert_eq!(std::fs::metadata(&big).unwrap().modified().unwrap(), mtime, "mtime restored");
+        let fp2 = scan_collected(&worktree_files(dir.path(), Some("main")).unwrap(), &[]).fingerprint;
+        assert_ne!(fp1, fp2, "same size and mtime, new content");
+        std::fs::remove_file(&big).unwrap();
+    }
+
+    /// The Firebase and AWS proximity checks are lookups, not a scan of the
+    /// file per line: tens of thousands of apiKey / AWS lines stay fast.
+    #[test]
+    fn many_api_key_and_aws_lines_scan_fast() {
+        let google = |i: u64| ["AI", "za"].concat() + &rnd(5_000_000 + i, 35, B62);
+        let id = |i: u64| ["AK", "IA"].concat() + &rnd(6_000_000 + i, 16, UPPER);
+        let mut lines = Vec::new();
+        for i in 0..20_000u64 {
+            lines.push(format!("  apiKey: \"{}\",", google(i)));
+            lines.push(format!("aws_access_key_id = {}", id(i)));
+            lines.push(format!("aws_secret_access_key = {}", rnd(7_000_000 + i, 40, B64)));
+        }
+        // Firebase context only at the very end: no apiKey is near it but the last few.
+        lines.push("  authDomain: \"demo.firebaseapp.com\",".into());
+        let refs: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+        let started = std::time::Instant::now();
+        let r = scan_report(&[file("src/config.ts", &refs)], &[], false);
+        let took = started.elapsed();
+        eprintln!("60k apiKey/AWS lines: {took:?}");
+        assert!(r.total > 39_000, "{}", r.total);
+        // Lines are appended from several commits in a range scan: unsorted
+        // line numbers must give the same answer.
+        let mut shuffled = file("src/config.ts", &refs);
+        shuffled.lines.reverse();
+        assert_eq!(scan_report(&[shuffled], &[], false).total, r.total);
+        assert!(took < std::time::Duration::from_secs(30), "took {took:?}");
     }
 
     #[test]

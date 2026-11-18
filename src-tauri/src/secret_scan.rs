@@ -257,7 +257,7 @@ struct Hit {
 /// Fingerprint over the scope (`commit`, `push`, `pr`, `worktree`), every hit
 /// (file, line, rule, keyed value hash), the total, the partial flag and,
 /// for a partial scan, what wasn't scanned (paths with blob ids or, for a
-/// worktree file git hasn't hashed, its size, mtime and inode; commits),
+/// worktree file git hasn't hashed, its size, mtime, inode and ctime; commits),
 /// so a confirmed partial scan can't cover a different unread blob later.
 /// Order-independent.
 fn fingerprint_hits(hits: &[Hit], scope: &str, partial: bool, unscanned: &[String]) -> String {
@@ -665,12 +665,14 @@ impl Spans {
     }
 }
 
-/// Every prefixed-token hit on `line` with its matched span. `skip_google`
-/// drops the Google rule (a Firebase web config or a `NEXT_PUBLIC_*` value).
-/// Spans already in `claimed` (your own credentials) are skipped, and each
-/// returned token is claimed, so two rules matching one token keep the
-/// first. Linear in the number of matches.
-fn token_hits(line: &str, skip_google: bool, claimed: &mut Spans) -> Vec<(&'static TokenRule, usize, usize)> {
+/// Every prefixed-token hit on `line` with its matched span and whether to
+/// list it. `skip_google` drops the Google rule (a Firebase web config or a
+/// `NEXT_PUBLIC_*` value). Each listed token is claimed, so two rules
+/// matching one token list the first. A token overlapping a claimed span
+/// (your own credential, or a token an earlier rule listed), even only
+/// partly, is still returned unlisted: it is hashed into the fingerprint, so
+/// editing its part outside your key asks again. Linear in the matches.
+fn token_hits(line: &str, skip_google: bool, claimed: &mut Spans) -> Vec<(&'static TokenRule, usize, usize, bool)> {
     let mut out = Vec::new();
     for r in TOKEN_RULES.iter() {
         if skip_google && r.id == "google-api-key" {
@@ -687,11 +689,9 @@ fn token_hits(line: &str, skip_google: bool, claimed: &mut Spans) -> Vec<(&'stat
                 continue;
             }
             // Your own key (reported as yours), or a token an earlier rule
-            // matched (`sk-…` shapes): keep the first.
-            if !claimed.claim(m.start(), m.end()) {
-                continue;
-            }
-            out.push((r, m.start(), m.end()));
+            // matched (`sk-…` shapes): list the first, hash this one too.
+            let shown = claimed.claim(m.start(), m.end());
+            out.push((r, m.start(), m.end(), shown));
         }
     }
     out
@@ -714,6 +714,58 @@ fn aws_bare_secret_on(line: &str) -> bool {
     })
 }
 
+/// The entries of `sorted` (by line number) within `w` lines of `n`.
+fn window_of<T>(sorted: &[(u32, T)], n: u32, w: u32) -> &[(u32, T)] {
+    let lo = sorted.partition_point(|(x, _)| *x < n.saturating_sub(w));
+    let hi = sorted.partition_point(|(x, _)| *x <= n.saturating_add(w));
+    &sorted[lo..hi.max(lo)]
+}
+
+/// Whether `sorted` holds a line number within `w` lines of `n`.
+fn any_within(sorted: &[u32], n: u32, w: u32) -> bool {
+    let i = sorted.partition_point(|x| *x < n.saturating_sub(w));
+    sorted.get(i).is_some_and(|x| *x <= n.saturating_add(w))
+}
+
+/// The most of a PEM block hashed into the fingerprint.
+const MAX_PEM_BYTES: usize = 64 * 1024;
+
+/// The whole PEM block starting at `lines[idx]`: the header line through the
+/// line holding the matching `-----END …-----` (or through the end of the
+/// consecutive added lines), bounded to [`MAX_PEM_BYTES`]. Hashing only the
+/// header and the first body line would hash a constant for an unencrypted
+/// OpenSSH key (and the `Proc-Type:` line for a legacy encrypted one).
+fn pem_block(lines: &[(u32, String)], idx: usize, header: &str) -> String {
+    let end_marker = header.replacen("-----BEGIN ", "-----END ", 1);
+    let (first_n, first) = &lines[idx];
+    let mut v = String::new();
+    let push = |v: &mut String, l: &str| {
+        let room = MAX_PEM_BYTES.saturating_sub(v.len());
+        let mut cut = l.len().min(room);
+        while !l.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        v.push_str(&l[..cut]);
+        v.push('\u{0}');
+    };
+    push(&mut v, first);
+    // The header line itself may carry the END (inline JSON/YAML).
+    let after_header = first.find(header).map(|i| i + header.len()).unwrap_or(first.len());
+    if !end_marker.is_empty() && first[after_header..].contains(&end_marker) {
+        return v;
+    }
+    for (expect, (n, l)) in (first_n + 1..).zip(&lines[idx + 1..]) {
+        if *n != expect || v.len() >= MAX_PEM_BYTES {
+            break;
+        }
+        push(&mut v, l);
+        if !end_marker.is_empty() && l.contains(&end_marker) {
+            break;
+        }
+    }
+    v
+}
+
 /// Every hit in `files`, uncapped (the fingerprint covers all of them).
 fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
     let mut out = Vec::new();
@@ -730,12 +782,22 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
         let env_file = is_env_file(path);
         let doc_file = is_doc_file(path);
         let generic_ok = !is_test_path(path) && !is_lockfile(path);
-        // AWS needs the key id AND a secret within a few lines of it.
-        let aws_secret_lines: Vec<u32> =
-            file.lines.iter().filter(|(_, l)| aws_secret_on(l)).map(|(n, _)| *n).collect();
-        // Lines near a Firebase web config's other keys.
-        let firebase_lines: Vec<u32> =
+        // AWS needs the key id AND a secret within a few lines of it:
+        // (line number, index into `file.lines`), sorted. `range_files`
+        // appends lines from several commits, so the numbers aren't monotonic.
+        let mut aws_secret_lines: Vec<(u32, usize)> = file
+            .lines
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, l))| aws_secret_on(l))
+            .map(|(i, (n, _))| (*n, i))
+            .collect();
+        aws_secret_lines.sort_unstable();
+        // Lines near a Firebase web config's other keys, sorted and unique.
+        let mut firebase_lines: Vec<u32> =
             file.lines.iter().filter(|(_, l)| FIREBASE_CONTEXT.is_match(l)).map(|(n, _)| *n).collect();
+        firebase_lines.sort_unstable();
+        firebase_lines.dedup();
 
         for (idx, (n, line)) in file.lines.iter().enumerate() {
             let line = line.as_str();
@@ -754,7 +816,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
             };
             let next_public = NEXT_PUBLIC_ASSIGN.is_match(line);
             let firebase_key = line.to_ascii_lowercase().contains("apikey")
-                && firebase_lines.iter().any(|f| f.abs_diff(*n) <= 8);
+                && any_within(&firebase_lines, *n, 8);
             let public_web_value = next_public || firebase_key;
             // Every rule runs on every line and every value it flags is hashed
             // into the fingerprint, so editing any of them asks again. A value
@@ -771,19 +833,18 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     push_hit(&mut out, &mut seen, at("your-credential", k.label.clone(), true), &k.value, true);
                 }
             }
-            for (r, start, end) in token_hits(line, public_web_value, &mut claimed) {
-                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), &line[start..end], true);
+            for (r, start, end, shown) in token_hits(line, public_web_value, &mut claimed) {
+                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), &line[start..end], shown);
             }
             if let Some(m) = AWS_KEY_ID.find(line) {
-                let near = aws_secret_lines.iter().any(|s| s.abs_diff(*n) <= 5) || aws_bare_secret_on(line);
+                let window = window_of(&aws_secret_lines, *n, 5);
+                let near = !window.is_empty() || aws_bare_secret_on(line);
                 if near && !is_placeholder(m.as_str()) {
                     // The id plus every secret line near it: a new secret is a new question.
                     let mut v = m.as_str().to_string();
-                    for (ln, l) in &file.lines {
-                        if ln.abs_diff(*n) <= 5 && aws_secret_on(l) {
-                            v.push('\u{0}');
-                            v.push_str(l);
-                        }
+                    for &(_, i) in window {
+                        v.push('\u{0}');
+                        v.push_str(&file.lines[i].1);
                     }
                     v.push('\u{0}');
                     v.push_str(line);
@@ -799,8 +860,9 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     .filter(|(m, _)| *m == n + 1)
                     .filter(|(_, l)| PEM_BODY_LINE.is_match(l));
                 if inline || next.is_some() {
-                    let v = format!("{line}\u{0}{}", next.map(|(_, l)| l.as_str()).unwrap_or(""));
-                    if let Some(h) = PEM_HEADER.find(line) {
+                    let h = PEM_HEADER.find(line);
+                    let v = pem_block(&file.lines, idx, h.map(|h| h.as_str()).unwrap_or(""));
+                    if let Some(h) = h {
                         claimed.claim(h.start(), h.end());
                     }
                     push_hit(&mut out, &mut seen, at("private-key", "private key".into(), false), &v, true);
@@ -879,7 +941,7 @@ pub struct Collected {
     /// Which action this is for: `commit`, `push`, `pr` or `worktree`.
     pub scope: &'static str,
     /// What a partial scan didn't read: `path@blob` for a file it couldn't
-    /// (or only partly) read (`path@stat:size:mtime_ns:inode` when git has no
+    /// (or only partly) read (`path@stat:size:mtime_ns:inode:ctime_ns` when git has no
     /// blob id for it yet), `commit <oid>` for a commit it never reached.
     pub unscanned: Vec<String>,
 }
@@ -910,7 +972,7 @@ impl Budget {
 
 /// `path@blob` for the unscanned list. A worktree file git hasn't hashed
 /// (untracked or modified, its blob id still zero) is bound to its content by
-/// `path@stat:size:mtime_ns:inode` instead, so confirming a partial scan
+/// `path@stat:size:mtime_ns:inode:ctime_ns` instead, so confirming a partial scan
 /// can't later cover a different unread file at the same path. Hashing the
 /// file would be stronger but means reading a file the scan skipped for being
 /// too large, so the metadata stands in for it.
@@ -924,7 +986,9 @@ fn unscanned_entry(repo: &Repository, path: &str, id: Oid) -> String {
     format!("{path}@stat:{}", content_stamp(&meta))
 }
 
-/// `size:mtime_ns:inode` of a file (inode 0 where the platform has none).
+/// `size:mtime_ns:inode:ctime_ns` of a file (inode and ctime 0 where the
+/// platform has none). The ctime can't be set back from user space, so a
+/// rewrite with the same size and a restored mtime still changes the stamp.
 fn content_stamp(meta: &std::fs::Metadata) -> String {
     let mtime = meta
         .modified()
@@ -933,10 +997,13 @@ fn content_stamp(meta: &std::fs::Metadata) -> String {
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     #[cfg(unix)]
-    let ino = std::os::unix::fs::MetadataExt::ino(meta);
+    let (ino, ctime) = {
+        use std::os::unix::fs::MetadataExt;
+        (meta.ino(), meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128)
+    };
     #[cfg(not(unix))]
-    let ino = 0u64;
-    format!("{}:{mtime}:{ino}", meta.len())
+    let (ino, ctime) = (0u64, 0i128);
+    format!("{}:{mtime}:{ino}:{ctime}", meta.len())
 }
 
 fn opts() -> DiffOptions {
