@@ -9852,6 +9852,47 @@ mod orchestrator_tests {
         let s = ing.ingest().unwrap();
         assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
     }
+
+    /// #890: the drop removes only the stage's own session. A non-Direct RUN
+    /// session in the same project directory (the user's own `claude` in the
+    /// worktree) keeps its rows.
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn direct_session_drop_keeps_a_non_direct_run_session_in_the_same_project_dir() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let (db, ws) = db_with_workspace();
+        let cwd = "/tmp/octo-890/worktree";
+        db.lock().conn_ref().execute("UPDATE workspaces SET worktree_path = ?1 WHERE id = ?2", rusqlite::params![cwd, ws]).unwrap();
+        let wsrow = db.lock().get_workspace(&ws).unwrap().unwrap();
+        let mission = crate::mission::ensure_for_workspace(&db.lock(), &wsrow, "build", "worktree").unwrap();
+        let pid = db.lock().insert_pipeline("One", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-8", "cli", false, None, 0, None, 25).unwrap();
+        let run = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+
+        let root = tempfile::tempdir().unwrap();
+        let pdir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(pdir.join("sess-direct-861.jsonl"), format!("{}\n", cc_line("sess-direct-861", "req_a", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-mine.jsonl"), format!("{}\n{}\n", cc_line("sess-mine", "req_m1", cwd), cc_line("sess-mine", "req_m2", cwd))).unwrap();
+        let ing = crate::transcripts::TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 3);
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(SessionRunner))
+            .with_transcripts_root(root.path().to_path_buf());
+        orch.run_to_pause(&run).await.unwrap();
+
+        let mut keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["cc:req_m1".to_string(), "cc:req_m2".to_string()], "the user's session keeps its rows");
+        let cost = db.lock().get_run(&run).unwrap().unwrap().cost_usd;
+        let (spend, _) = db.lock().mission_spend(&mission.id, "2000-01-01", "2100-01-01").unwrap();
+        assert!(spend > cost + 1e-9, "mission spend {spend} still counts the user's session beside the run's {cost}");
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
 }
 
 #[cfg(test)]
@@ -16009,6 +16050,47 @@ mod transcript_tests {
 
         // Later passes skip the Direct files without reading them again.
         std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n{}\n{}\n", cc_now("sess-direct", "req_d1", cwd), cc_now("sess-direct", "req_d2", cwd), cc_now("sess-direct", "req_d3", cwd))).unwrap();
+        let s = ing.ingest().unwrap();
+        assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
+    }
+
+    /// #890: a pass whose snapshot of Direct sessions was taken before the
+    /// stage reported its session (and before the drive's drop) re-checks
+    /// membership under the DB lock, so it never puts back what the drop
+    /// removed; an unrelated transcript in the same directory is still metered.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stale_direct_snapshot_never_re_inserts_a_dropped_session() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let cwd = "/tmp/octo-890/race";
+        let mission = mission_ws(&db.lock(), cwd);
+        let root = TempDir::new().unwrap();
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("sess-direct/subagents")).unwrap();
+        std::fs::write(pdir.join("sess-direct.jsonl"), format!("{}\n", cc_now("sess-direct", "req_d1", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-direct/subagents/agent-1.jsonl"), format!("{}\n", cc_now("sess-direct", "req_dsub", cwd))).unwrap();
+        std::fs::write(pdir.join("sess-user.jsonl"), format!("{}\n", cc_now("sess-user", "req_u1", cwd))).unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+
+        // The pass snapshots no Direct session; then the stage reports its
+        // session and the drive drops what was metered (nothing yet).
+        let stale = db.lock().direct_cli_session_ids().unwrap();
+        assert!(stale.is_empty());
+        db.lock().record_direct_cli_session("stage-x", "sess-direct").unwrap();
+        assert_eq!(crate::transcripts::drop_direct_session(&db, root.path(), "sess-direct").unwrap(), 0);
+
+        let s = ing.ingest_with_direct_snapshot(stale).unwrap();
+        assert_eq!(s.rows_inserted, 1, "only the unrelated transcript is metered");
+        let keys: Vec<String> = db.lock().conn_ref()
+            .prepare("SELECT idempotency_key FROM spend_events WHERE surface = 'run'").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(keys, vec!["cc:req_u1".to_string()]);
+        let (spend, _) = db.lock().mission_spend(&mission, ALL.0, ALL.1).unwrap();
+        assert!(spend > 0.0);
+        // No offset was written for the Direct files: nothing left to undo.
+        let offset = db.lock().meta_get(&format!("cc_transcript:{}", pdir.join("sess-direct.jsonl").display())).unwrap();
+        assert_eq!(offset, None);
         let s = ing.ingest().unwrap();
         assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
     }

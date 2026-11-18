@@ -372,7 +372,11 @@ impl Orchestrator {
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
             plan_retries: Mutex::new(std::collections::HashMap::new()),
-            transcripts_root: crate::transcripts::projects_root(),
+            // Tests never read the real `~/.claude/projects`: an empty root
+            // (a path nobody creates) unless `with_transcripts_root` sets one.
+            transcripts_root: std::env::temp_dir()
+                .join(format!("octopush-test-transcripts-{}", std::process::id()))
+                .join("none"),
         }
     }
 
@@ -1257,10 +1261,14 @@ impl Orchestrator {
             // part of this session as RUN rows; the stage's `direct` row is
             // about to count it all. Drop them now, not at the next pass, so
             // the budget, Talk and AI-review gates never see it twice (#863).
-            match crate::transcripts::drop_direct_session(&self.db, &self.transcripts_root, sid) {
-                Ok(n) if n > 0 => tracing::info!(stage_id = %stage.id, removed = n, "dropped RUN rows already ingested from the stage's session"),
-                Ok(_) => {}
-                Err(e) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup failed"),
+            // It stats and re-reads transcript files, so it runs on the
+            // blocking pool, not on this tokio worker (#890).
+            let (db, root, session) = (Arc::clone(&self.db), self.transcripts_root.clone(), sid.to_string());
+            match tokio::task::spawn_blocking(move || crate::transcripts::drop_direct_session(&db, &root, &session)).await {
+                Ok(Ok(n)) if n > 0 => tracing::info!(stage_id = %stage.id, removed = n, "dropped RUN rows already ingested from the stage's session"),
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup failed"),
+                Err(e) => tracing::warn!(stage_id = %stage.id, error = %e, "direct-session transcript cleanup task failed"),
             }
         }
         // The model this attempt actually ran on (Claude Code's settings can

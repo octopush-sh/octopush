@@ -43,8 +43,10 @@
 //!   with any sub-agent files under `<session>/` — is never metered here.
 //!   One read before the id was known is undone: its RUN rows are deleted
 //!   by request key (#861) — by the drive itself, the moment the stage
-//!   reports its session (`drop_direct_session`, #863), so no budget gate
-//!   sees the stage counted twice until the next pass.
+//!   reports its session (`drop_direct_session`, #863). A pass whose
+//!   snapshot of Direct sessions predates that report re-checks each file's
+//!   session under the DB lock before it writes (#890), so it never puts
+//!   back what the drop removed.
 //! - Side effects that describe *now* (a session's live counters, the
 //!   Logbook activity span) fire only for messages minutes old; historical
 //!   rows are attributed to the mission that existed at their timestamp.
@@ -354,17 +356,21 @@ fn direct_session_of(project_dir: &Path, file: &Path, direct: &std::collections:
     if direct.is_empty() {
         return None;
     }
+    session_candidates(project_dir, file).into_iter().find(|c| direct.contains(c))
+}
+
+/// Every session id `file` could belong to, in [`direct_session_of`]'s
+/// order: its own stem, then each directory between the project directory
+/// and it.
+fn session_candidates(project_dir: &Path, file: &Path) -> Vec<String> {
+    let mut out = Vec::new();
     if let Some(stem) = file.file_stem().and_then(|s| s.to_str()) {
-        if direct.contains(stem) {
-            return Some(stem.to_string());
-        }
+        out.push(stem.to_string());
     }
-    let rel = file.strip_prefix(project_dir).ok()?;
-    rel.parent()?
-        .components()
-        .filter_map(|c| c.as_os_str().to_str())
-        .find(|c| direct.contains(*c))
-        .map(str::to_string)
+    if let Some(parent) = file.strip_prefix(project_dir).ok().and_then(Path::parent) {
+        out.extend(parent.components().filter_map(|c| c.as_os_str().to_str()).map(str::to_string));
+    }
+    out
 }
 
 /// A transcript of a Direct stage's CLI session: never metered as RUN
@@ -524,11 +530,25 @@ impl TranscriptIngestor {
     /// session or workspace. A file that cannot be read is logged and
     /// skipped; it never stops the other targets from being metered.
     pub fn ingest(&self) -> AppResult<IngestSummary> {
+        if !self.root.is_dir() {
+            return Ok(IngestSummary::default());
+        }
+        let direct_sessions = self.db.lock().direct_cli_session_ids()?;
+        self.ingest_with_direct_snapshot(direct_sessions)
+    }
+
+    /// [`Self::ingest`] with the Direct-session snapshot taken by the caller.
+    /// The snapshot only spares a known Direct file a read: `ingest_file`
+    /// re-checks membership under the DB lock, so a session recorded after
+    /// the snapshot is still never metered (#890).
+    pub(crate) fn ingest_with_direct_snapshot(
+        &self,
+        direct_sessions: std::collections::HashSet<String>,
+    ) -> AppResult<IngestSummary> {
         let mut summary = IngestSummary::default();
         if !self.root.is_dir() {
             return Ok(summary);
         }
-        let direct_sessions = self.db.lock().direct_cli_session_ids()?;
         for (dir_name, target) in self.targets()? {
             let dir = self.root.join(&dir_name);
             if !dir.is_dir() {
@@ -568,7 +588,7 @@ impl TranscriptIngestor {
                     }
                     continue;
                 }
-                match self.ingest_file(&file, &target) {
+                match self.ingest_file(&dir, &file, &target) {
                     Ok((inserted, first_ts)) => {
                         summary.rows_inserted += inserted;
                         if let Some(ts) = first_ts {
@@ -600,7 +620,7 @@ impl TranscriptIngestor {
     }
 
     /// Ingest one file: `(rows inserted, earliest timestamp seen)`.
-    fn ingest_file(&self, path: &Path, target: &Target) -> AppResult<(usize, Option<String>)> {
+    fn ingest_file(&self, project_dir: &Path, path: &Path, target: &Target) -> AppResult<(usize, Option<String>)> {
         let meta_key = format!("cc_transcript:{}", path.display());
         let offset = self
             .db
@@ -630,7 +650,19 @@ impl TranscriptIngestor {
         // One transaction per file: thousands of historical rows would
         // otherwise each pay a journal sync. A savepoint nests safely.
         db.execute_batch("SAVEPOINT cc_ingest")?;
+        let candidates = session_candidates(project_dir, path);
+        let mut direct = false;
         let result = (|| -> AppResult<()> {
+            // The pass's snapshot of Direct sessions may predate this file's
+            // stage reporting its session, and the drive's drop of what was
+            // already metered (#863) may have run since. Re-check under this
+            // lock: the drive records the session before it drops, so either
+            // this sees it and writes nothing (not even the offset), or these
+            // rows and the offset land first and the drop removes them (#890).
+            if db.any_direct_cli_session(&candidates)? {
+                direct = true;
+                return Ok(());
+            }
             for u in entries {
                 let base = *prices.entry(u.model.clone()).or_insert_with(|| prices_for(&u.model));
                 // A fast-mode turn costs the fast rate, or is unpriced on a
@@ -708,7 +740,7 @@ impl TranscriptIngestor {
         match result {
             Ok(()) => {
                 db.execute_batch("RELEASE cc_ingest")?;
-                Ok((inserted, earliest))
+                Ok(if direct { (0, None) } else { (inserted, earliest) })
             }
             Err(e) => {
                 let _ = db.execute_batch("ROLLBACK TO cc_ingest; RELEASE cc_ingest");
