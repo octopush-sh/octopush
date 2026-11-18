@@ -131,3 +131,12 @@ describe("tint preset table", () => {
     expect(TINTS.rouge.accent).toBe("#d18b8b");
   });
 });
+
+describe("normalizeGlyph private-use symbols", () => {
+  it("keeps a private-use symbol such as the Apple logo", () => {
+    expect(normalizeGlyph("\uF8FF")).toBe("\uF8FF");
+  });
+  it("still drops control characters", () => {
+    expect(normalizeGlyph("\u0007")).toBeNull();
+  });
+});

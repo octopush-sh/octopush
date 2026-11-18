@@ -72,7 +72,7 @@ function singleCapital(g: string): string | null {
 export function normalizeGlyph(raw: string | null | undefined): string | null {
   if (raw == null) return null;
   const g = firstGrapheme(raw.trim());
-  if (g === "" || /^\p{C}/u.test(g)) return null;
+  if (g === "" || /^[\p{Cc}\p{Cf}\p{Cs}]/u.test(g)) return null;
   return singleCapital(g);
 }
 
