@@ -8,7 +8,8 @@ import { render, screen, fireEvent, act } from "@testing-library/react";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 
-vi.mock("../lib/ipc", () => ({
+vi.mock("../lib/ipc", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/ipc")>()),
   ipc: {
     listModels: vi.fn().mockResolvedValue([]),
     listTemplates: vi.fn().mockResolvedValue([]),

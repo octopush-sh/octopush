@@ -80,7 +80,7 @@ struct CliDeferredToolUse {
     name: String,
 }
 
-#[derive(Deserialize, Debug, Default, Clone, Copy, PartialEq)]
+#[derive(Deserialize, Debug, Default, Clone, PartialEq)]
 pub(crate) struct CliUsage {
     #[serde(default)]
     pub(crate) input_tokens: u64,
@@ -99,6 +99,11 @@ pub(crate) struct CliUsage {
     /// set per message by [`usage_from_stream_event`]; a sum doesn't carry it.
     #[serde(skip)]
     pub(crate) fast: bool,
+    /// The model that answered one streamed message (`message.model`) — a
+    /// subagent's can differ from the stage's. Only set per message by
+    /// [`usage_from_stream_event`]; `None` means the stage's model.
+    #[serde(skip)]
+    pub(crate) model: Option<String>,
 }
 
 fn one_hour_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -114,6 +119,11 @@ impl CliUsage {
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
         self.cache_creation_1h_input_tokens += other.cache_creation_1h_input_tokens;
     }
+
+    /// Every token the usage counts (input, output, cache reads and writes).
+    fn total(&self) -> u64 {
+        self.input_tokens + self.output_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens
+    }
 }
 
 /// Per-message usage from an `assistant` NDJSON stream event: the message id
@@ -123,6 +133,8 @@ impl CliUsage {
 /// across ids, so a stop/timeout that never sees the terminal `result` event
 /// still reports an honest ESTIMATE of the burned spend instead of zero.
 /// A missing id yields `None` for the id — the caller keys it uniquely.
+/// The usage carries the message's own `message.model` (a subagent may run
+/// on another model than the stage; `None` when the event names none).
 pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliUsage)> {
     if v.get("type").and_then(Value::as_str) != Some("assistant") {
         return None;
@@ -140,6 +152,7 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
             cache_creation_input_tokens: g("cache_creation_input_tokens"),
             cache_creation_1h_input_tokens: crate::token_engine::one_hour_cache_writes(u),
             fast: crate::token_engine::is_fast(crate::token_engine::usage_speed(u).as_deref()),
+            model: msg.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_string),
         },
     ))
 }
@@ -769,10 +782,24 @@ fn settings_refused_error(line: &str, stderr: &str) -> String {
 /// Also the journal line the drive writes for it.
 pub const USAGE_UNREPORTED: &str = "codex stopped before reporting usage, so this stage's cost is unknown";
 
-/// True when a stage error carries [`USAGE_UNREPORTED`]: the drive flags the
-/// stage `usage_unreported` so the ledger reads "usage not reported".
+/// The marker line in the error of a stopped Claude Code stage whose streamed
+/// usage includes a message Octopush can't price: a subagent on a model with
+/// no price, or a fast-mode message on a model with no fast rate. That part of
+/// the spend is unknown, not $0 — it reads "usage not reported" like
+/// [`USAGE_UNREPORTED`]. The unpriced models follow it on the same line.
+pub const USAGE_UNPRICED: &str = "part of this stage's streamed usage has no price, so that part of its cost is unknown";
+
+/// The line of a stage error that carries [`USAGE_UNREPORTED`] or
+/// [`USAGE_UNPRICED`] — the sentence the drive journals for it.
+pub fn usage_unreported_line(error: &str) -> Option<&str> {
+    error.lines().find(|l| l.contains(USAGE_UNREPORTED) || l.contains(USAGE_UNPRICED))
+}
+
+/// True when a stage error carries [`USAGE_UNREPORTED`] or [`USAGE_UNPRICED`]:
+/// the drive flags the stage `usage_unreported` so the ledger reads "usage
+/// not reported".
 pub fn is_usage_unreported(error: &str) -> bool {
-    error.contains(USAGE_UNREPORTED)
+    usage_unreported_line(error).is_some()
 }
 
 /// The `terminal_reason` of a run that ended because a PreToolUse hook
@@ -2017,6 +2044,7 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
             cache_creation_input_tokens: written,
             cache_creation_1h_input_tokens: 0,
             fast: false,
+            model: None,
         },
     ))
 }
@@ -3456,59 +3484,108 @@ pub(crate) fn sum_usage(map: &std::collections::HashMap<String, CliUsage>) -> Cl
     total
 }
 
-/// The estimated cost of the streamed per-message usage: standard-speed
-/// messages at the model's price, fast-mode ones at the fast rate
-/// (`token_engine::fast_prices`). A fast message on a model without a fast
-/// rate adds nothing — unpriced, never billed at the standard rate.
-pub(crate) fn streamed_cost(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> f64 {
-    let mut standard = CliUsage::default();
-    let mut fast = CliUsage::default();
+/// The streamed per-message usage priced as an estimate ([`streamed_estimate`]).
+#[derive(Debug, Default, Clone, PartialEq)]
+pub(crate) struct StreamedEstimate {
+    /// The tokens to record: every message's when none could be priced,
+    /// otherwise only the priced messages' (so the baseline never re-prices
+    /// tokens whose cost is unknown and reports them as saved).
+    pub(crate) usage: CliUsage,
+    pub(crate) cost_usd: f64,
+    /// The (model, speed) groups that have tokens but no price, as `model`
+    /// or `model (fast)`, sorted and deduplicated. Empty when the estimate is
+    /// complete, and also when every token is the stage's own unpriced model
+    /// at standard speed (the ledger already reads that stage "unpriced" from
+    /// its model). Token-less groups and CLI placeholder models such as
+    /// `<synthetic>` are never listed.
+    pub(crate) unpriced: Vec<String>,
+}
+
+/// The estimated cost of the streamed per-message usage. Messages are
+/// grouped by (model, speed) — each message's own `message.model` (a
+/// subagent may run on another model), falling back to the stage's `model` —
+/// and each group is priced for its own model through the normal catalog:
+/// standard speed at the model's price, fast mode at its fast rate
+/// (`token_engine::prices_at_speed`). A group with no price (an unknown
+/// model, or fast mode on a model with no fast rate) is never billed at
+/// another rate and never read as free: it lands in `unpriced`, except a
+/// stage whose usage is all its own unpriced model at standard speed — the
+/// ledger already reads that stage "unpriced" from its model. A group with
+/// no tokens, or on a CLI placeholder model (`<synthetic>`, which Claude Code
+/// stamps on its own error messages), billed nothing and is never unpriced.
+pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StreamedEstimate {
+    use crate::token_engine::{normalize_model_id, prices_at_speed, prices_for, SPEED_FAST};
+    let stage = normalize_model_id(model);
+    let mut groups: std::collections::BTreeMap<(String, bool), (String, CliUsage)> = std::collections::BTreeMap::new();
     for u in map.values() {
-        if u.fast {
-            fast.add(u);
-        } else {
-            standard.add(u);
+        let m = u.model.as_deref().unwrap_or(model);
+        let entry = groups
+            .entry((normalize_model_id(m), u.fast))
+            .or_insert_with(|| (m.to_string(), CliUsage::default()));
+        entry.1.add(u);
+    }
+    let mut all = CliUsage::default();
+    let mut priced = CliUsage::default();
+    let mut any_priced = false;
+    let mut cost = 0.0;
+    let mut unpriced = Vec::new();
+    let mut only_stage_model_unpriced = true;
+    for ((key, fast), (m, u)) in &groups {
+        all.add(u);
+        let speed = if *fast { Some(SPEED_FAST) } else { None };
+        match prices_at_speed(m, prices_for(m), speed) {
+            Some(p) => {
+                any_priced = true;
+                priced.add(u);
+                cost += p.cost_split(
+                    u.input_tokens,
+                    u.output_tokens,
+                    u.cache_read_input_tokens,
+                    u.cache_creation_input_tokens,
+                    u.cache_creation_1h_input_tokens,
+                );
+            }
+            None if u.total() == 0 || m.starts_with('<') => {}
+            None => {
+                only_stage_model_unpriced &= !*fast && *key == stage;
+                unpriced.push(if *fast { format!("{m} (fast)") } else { m.clone() });
+            }
         }
     }
-    let mut cost = crate::orchestrator::cost::stage_cost_split(
-        model,
-        standard.input_tokens,
-        standard.output_tokens,
-        standard.cache_read_input_tokens,
-        standard.cache_creation_input_tokens,
-        standard.cache_creation_1h_input_tokens,
-    );
-    if fast != CliUsage::default() {
-        let prices = crate::token_engine::prices_at_speed(
-            model,
-            crate::token_engine::prices_for(model),
-            Some(crate::token_engine::SPEED_FAST),
-        );
-        if let Some(p) = prices {
-            cost += p.cost_split(
-                fast.input_tokens,
-                fast.output_tokens,
-                fast.cache_read_input_tokens,
-                fast.cache_creation_input_tokens,
-                fast.cache_creation_1h_input_tokens,
-            );
-        }
+    if only_stage_model_unpriced && !any_priced {
+        unpriced.clear();
     }
-    cost
+    unpriced.sort();
+    unpriced.dedup();
+    StreamedEstimate { usage: if any_priced { priced } else { all }, cost_usd: cost, unpriced }
+}
+
+/// [`streamed_estimate`]'s cost alone.
+#[cfg(test)]
+pub(crate) fn streamed_cost(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> f64 {
+    streamed_estimate(model, map).cost_usd
 }
 
 /// A failed outcome carrying the ESTIMATED usage summed from the streamed
 /// assistant events (no terminal `result` event arrived to be authoritative).
-/// Cost is priced through the normal catalog ([`streamed_cost`]) so the run
-/// meter and budget see the burned spend instead of zero.
+/// Cost is priced through the normal catalog ([`streamed_estimate`]) so the
+/// run meter and budget see the burned spend instead of zero; a part it
+/// can't price appends [`USAGE_UNPRICED`] (with the models) to the error, so
+/// the stage reads "+ usage not reported" instead of a smaller total.
 fn failed_stage_with_usage(msg: &str, model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StageOutcome {
-    let u = sum_usage(map);
-    let mut out = failed_stage(msg);
+    let est = streamed_estimate(model, map);
+    let msg = if est.unpriced.is_empty() {
+        msg.to_string()
+    } else {
+        format!("{msg}\n{USAGE_UNPRICED} ({})", est.unpriced.join(", "))
+    };
+    let u = est.usage;
+    let mut out = failed_stage(&msg);
     out.input_tokens = u.input_tokens;
     out.output_tokens = u.output_tokens;
     out.cache_read_tokens = u.cache_read_input_tokens;
     out.cache_creation_tokens = u.cache_creation_input_tokens;
-    out.cost_usd = streamed_cost(model, map);
+    out.cost_usd = est.cost_usd;
     out
 }
 

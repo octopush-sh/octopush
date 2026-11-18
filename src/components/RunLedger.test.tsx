@@ -117,6 +117,16 @@ describe("RunLedger", () => {
     expect(screen.getByText("$0.20").parentElement!.textContent).toContain("$0.20 + usage not reported");
   });
 
+  it("shows a stopped Claude stage with an unpriced subagent as its priced part + usage not reported", () => {
+    const withSubagent = [
+      { id: "s3", role: "implement", agentModel: "claude-opus-5", costUsd: 0.4, inputTokens: 1000, outputTokens: 100, usageUnreported: true },
+    ] as unknown as RunStage[];
+    render(<RunLedger run={{ ...baseRun, budgetUsd: 5, detached: false } as Run} stages={withSubagent} />);
+    expect(screen.getByTestId("ledger-usage-unreported").getAttribute("title")).toContain("a subagent model or fast mode");
+    fireEvent.click(screen.getByRole("button", { name: /saved/i }));
+    expect(screen.getByText("$0.40").parentElement!.textContent).toContain("Implement $0.40 + usage not reported");
+  });
+
   it("says on the collapsed strip that usage was not reported, even with no budget", () => {
     const withUnreported = [
       ...stages,
@@ -146,7 +156,7 @@ describe("RunLedger", () => {
     render(<RunLedger run={{ ...baseRun, budgetUsd: 0.05, detached: false } as Run} stages={two} />);
     const frag = screen.getByTestId("ledger-usage-unreported");
     expect(frag.textContent).toBe("· 2 stages usage not reported");
-    expect(frag.getAttribute("title")).toContain("in 2 stages, so their cost is unknown");
+    expect(frag.getAttribute("title")).toContain("in 2 stages, so part of their cost is unknown");
     expect(screen.getByTestId("ledger-budget-unenforceable").getAttribute("title")).toContain("their cost is unknown");
   });
 

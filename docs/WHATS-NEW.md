@@ -81,7 +81,7 @@ Current anchors:
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-ran-on` | Direct run track, on a stage card's meta line: the amber "ran on sonnet-5-5" note (only when Claude Code ran the stage on another model than it asked for) | `RunFlow.tsx` |
 | `direct-stage-waiting` | Direct run track, only while a running stage has no activity yet: its card's live line "waiting for first tool call" | `RunFlow.tsx` |
-| `direct-ledger-strip` · `direct-ledger-usage-unreported` · `direct-ledger-usage-unreported-stage` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · the strip's "· N stage(s) usage not reported" fragment after the spent figure (only when a Codex stage ended before its last turn reported usage; visible collapsed, budget or not) · that stage's "usage not reported" cell (once unfolded) | `RunLedger.tsx` |
+| `direct-ledger-strip` · `direct-ledger-usage-unreported` · `direct-ledger-usage-unreported-stage` | Direct run ledger: the cost strip (click unfolds the per-stage breakdown) · the strip's "· N stage(s) usage not reported" fragment after the spent figure (only when a Codex stage ended before its last turn reported usage, or a stopped Claude stage streamed usage with no price — a subagent model or fast mode; visible collapsed, budget or not) · that stage's "usage not reported" cell (once unfolded) | `RunLedger.tsx` |
 | `direct-launcher-import-crew` · `direct-launcher-repo-crews` | Direct launcher: the "import a crew" link beside the ensemble eyebrow · the "from this repo" group (only when the worktree has `.octopush/crews/*.octocrew.json`) | `PipelineSetup.tsx` |
 | `builder-export-crew` | Pipeline builder, top-right toolbar: "Export crew…" (saved pipelines only) | `PipelineBuilder.tsx` |
 | `crew-import-sheet` · `crew-import-add` | Crew import review sheet, while open: the sheet · "Add this crew to my library" | `CrewImportSheet.tsx` |
@@ -133,6 +133,7 @@ Current anchors:
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
 | `palette-input` | Command palette input | `CommandPalette.tsx` |
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
+| `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
 | `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-session-state` | Run Companion, session detail: the State value (`starting` / `shell idle` / `running` / `stopped` / `failed`) | `CompanionSession.tsx` |
