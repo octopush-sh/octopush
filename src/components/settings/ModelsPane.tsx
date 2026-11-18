@@ -5,6 +5,7 @@
 // validates server-side, then keys/base-URLs merge into settings.json.
 import { useEffect, useMemo, useState } from "react";
 import { Pencil, X, RefreshCw } from "lucide-react";
+import { formatContextTokens } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
 import { useProvidersStore } from "../../stores/providersStore";
 import type { ModelInfo, ProviderConfig } from "../../lib/types";
@@ -520,7 +521,7 @@ function ProviderDetail({
                     <span className="ml-2 font-sans text-[10px] text-octo-sage">{m.displayName}</span>
                   )}
                   <span className="octo-tabular ml-2 font-mono text-[9px] text-octo-mute">
-                    ${m.inputCostPerM}/{m.outputCostPerM} · {(m.maxContext / 1000).toFixed(0)}k ctx
+                    ${m.inputCostPerM}/{m.outputCostPerM} · {formatContextTokens(m.maxContext)} ctx
                   </span>
                 </div>
                 <div className="flex shrink-0 items-center gap-1">

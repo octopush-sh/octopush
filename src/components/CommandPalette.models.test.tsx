@@ -5,7 +5,7 @@
  * title.
  */
 import { describe, it, expect, vi, afterAll } from "vitest";
-import { render, screen, act } from "@testing-library/react";
+import { render, screen, act, fireEvent } from "@testing-library/react";
 import type { ModelWithProvider } from "../lib/types";
 
 const { model } = vi.hoisted(() => ({
@@ -83,5 +83,39 @@ describe("CommandPalette · Models group", () => {
     const group = document.querySelector('[data-tour="palette-models"]');
     expect(group).not.toBeNull();
     expect(group).toHaveTextContent("Claude Opus 4.6");
+  });
+
+  it("previews three models with no query, then shows all on demand or while searching (#850)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    await renderPalette();
+    expect(screen.getByText("Llama 3")).toBeInTheDocument();
+    expect(screen.getByText("GPT-4o mini")).toBeInTheDocument();
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    expect(screen.getByText("Show all models")).toBeInTheDocument();
+    expect(screen.getByText("2 more")).toBeInTheDocument();
+    expect(document.querySelector('[data-tour="palette-models-more"]')).not.toBeNull();
+
+    // Typing searches every model, the hidden ones included.
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "deepseek" } });
+    });
+    expect(screen.getByText("DeepSeek V3")).toBeInTheDocument();
+    expect(screen.queryByText("Show all models")).toBeNull();
+
+    await act(async () => {
+      fireEvent.change(input, { target: { value: "" } });
+    });
+    expect(screen.queryByText("DeepSeek V3")).toBeNull();
+    await act(async () => {
+      fireEvent.click(screen.getByText("Show all models"));
+    });
+    expect(screen.getByText("DeepSeek V3")).toBeInTheDocument();
+    expect(screen.getByText("Mistral Large")).toBeInTheDocument();
+    expect(screen.queryByText("Show all models")).toBeNull();
   });
 });

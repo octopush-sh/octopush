@@ -16,6 +16,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
+import { paletteModels } from "../lib/paletteModels";
 
 interface Props {
   open: boolean;
@@ -59,8 +60,13 @@ export function CommandPalette({
     [open, onSelectWorkspace, projects, runsByWs, statusSince, runningByWs],
   );
 
+  const [search, setSearch] = useState("");
+  const [allModels, setAllModels] = useState(false);
+
   useEffect(() => {
     if (open) {
+      setSearch("");
+      setAllModels(false);
       ipc.listModels().then(setModels).catch(() => {});
       ipc.listTemplates().then(setTemplates).catch(() => {});
     }
@@ -77,6 +83,7 @@ export function CommandPalette({
   if (!open) return null;
 
   const activeSession = sessions.find((s) => s.id === activeId);
+  const modelRows = paletteModels(models, search, allModels, activeSession?.agent.model);
 
   return (
     <ModalShell onClose={onClose} align="top" topOffset="pt-[18vh]" ariaLabel="Command palette">
@@ -94,6 +101,8 @@ export function CommandPalette({
             <Command.Input
               data-tour="palette-input"
               autoFocus
+              value={search}
+              onValueChange={setSearch}
               placeholder="Type a command, or search…"
               className="flex-1 bg-transparent font-serif text-[14px] text-octo-ivory outline-none placeholder:text-octo-mute"
             />
@@ -149,9 +158,11 @@ export function CommandPalette({
             )}
 
             {/* Models */}
-            {/* The heading already says "Models", so rows carry the bare name. */}
+            {/* The heading already says "Models", so rows carry the bare name.
+                With no query it is a short preview (#850); typing searches
+                every model. */}
             <Group heading="Models" tour={tourId("palette-models")}>
-              {models.map((m) => (
+              {modelRows.shown.map((m) => (
                 <Item
                   key={m.model.id}
                   glyph="◇"
@@ -172,6 +183,15 @@ export function CommandPalette({
                   }
                 />
               ))}
+              {modelRows.hidden > 0 && (
+                <Item
+                  glyph="⋯"
+                  label="Show all models"
+                  detail={`${modelRows.hidden} more`}
+                  tour={tourId("palette-models-more")}
+                  onSelect={() => setAllModels(true)}
+                />
+              )}
             </Group>
 
             {/* Templates */}

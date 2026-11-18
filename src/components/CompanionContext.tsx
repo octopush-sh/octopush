@@ -5,7 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
-import { formatUsd, unpricedTitle } from "../lib/cost";
+import { formatContextTokens, formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
 
 interface Props {
@@ -103,7 +103,7 @@ export function CompanionContext({
         {/* Context meter */}
         <Row
           label="context"
-          value={`${formatThousands(tokensUsed)} / ${formatThousands(tokensLimit)}`}
+          value={`${formatContextTokens(tokensUsed)} / ${formatContextTokens(tokensLimit)}`}
           valueColor={tokenColor}
           title={
             pct >= 80
@@ -383,13 +383,3 @@ function Row({
   );
 }
 
-function formatThousands(n: number): string {
-  // Millions branch matters: the target model has a 1M context window, which
-  // must read "1M", not "1000k".
-  if (n >= 1_000_000) {
-    const m = n / 1_000_000;
-    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
-  }
-  if (n >= 1000) return `${Math.round(n / 1000)}k`;
-  return String(n);
-}

@@ -34,14 +34,51 @@ export const TINTS: Record<TintName, { accent: string; bg: string }> = {
 };
 
 export function resolveMonogram(ws: Workspace): MonogramConfig {
-  const glyph = ws.glyph ?? deriveFirstLetter(ws.name);
+  // One resolution for every surface (rail, collapsed rail, ⌘K, customize):
+  // a stored glyph is honoured only if it normalizes to a real capital-form
+  // glyph; otherwise the name's initial stands in (#848).
+  const glyph = normalizeGlyph(ws.glyph) ?? deriveFirstLetter(ws.name);
   const tint: TintName = ws.tint ?? "brass";
-  const isCustom = ws.glyph !== null || ws.tint !== null;
+  const isCustom = ws.glyph != null || ws.tint != null;
   return { glyph, tint, isCustom };
 }
 
-function deriveFirstLetter(name: string): string {
-  const trimmed = name.trim();
-  if (trimmed.length === 0) return "?";
-  return trimmed.charAt(0).toUpperCase();
+/** The first user-perceived character of `s` (a grapheme, so an emoji or an
+ *  accented letter built from combining marks stays whole). */
+function firstGrapheme(s: string): string {
+  const Seg = (Intl as unknown as { Segmenter?: typeof Intl.Segmenter }).Segmenter;
+  if (Seg) {
+    for (const { segment } of new Seg("en", { granularity: "grapheme" }).segment(s)) return segment;
+    return "";
+  }
+  return Array.from(s)[0] ?? "";
+}
+
+/** Uppercases with a locale-independent mapping; `null` when the capital form
+ *  isn't a single glyph (ß → "SS", ŉ → "ʼN", ﬁ → "FI"). */
+function singleCapital(g: string): string | null {
+  const up = g.toLocaleUpperCase("en-US");
+  return firstGrapheme(up) === up ? up : null;
+}
+
+/**
+ * Normalizes a stored or typed glyph to what the monogram renders: the first
+ * grapheme, trimmed, in capital form. Returns `null` (use the name's initial)
+ * for empty or whitespace input, control characters, and lowercase letters
+ * with no single-glyph capital — notably `ß`, which macOS types for ⌥S and
+ * which once stood in for a `main` workspace's "M" (#848). Symbols, digits
+ * and emoji pass through unchanged.
+ */
+export function normalizeGlyph(raw: string | null | undefined): string | null {
+  if (raw == null) return null;
+  const g = firstGrapheme(raw.trim());
+  if (g === "" || /^[\p{Cc}\p{Cf}\p{Cs}]/u.test(g)) return null;
+  return singleCapital(g);
+}
+
+function deriveFirstLetter(name: string | null | undefined): string {
+  const g = firstGrapheme((name ?? "").trim());
+  if (g === "") return "?";
+  // A name opening with ß keeps the first letter of its capital form ("S").
+  return singleCapital(g) ?? firstGrapheme(g.toLocaleUpperCase("en-US"));
 }
