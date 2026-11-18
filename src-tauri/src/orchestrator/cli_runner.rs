@@ -298,11 +298,26 @@ pub fn same_model(requested: &str, ran: &str) -> bool {
     a == b || alias_covers(&a, &b) || alias_covers(&b, &a)
 }
 
+/// True when `id`, normalised, names a Claude family: a `claude-*` id or a
+/// Claude Code alias (`sonnet`, `opusplan`, `default`…).
+fn has_claude_family(id: &str) -> bool {
+    let m = crate::token_engine::normalize_model_id(&id.trim().to_ascii_lowercase());
+    m.starts_with("claude-")
+        || matches!(m.as_str(), "default" | "best" | "opusplan" | "sonnet" | "opus" | "haiku" | "fable" | "mythos")
+}
+
 /// The model a Claude stage ran on when it isn't the one it asked for: the
 /// `system/init` event's `model` that [`same_model`] says differs. A missing
-/// or empty `model` changes nothing. Pure.
+/// or empty `model` changes nothing. Nor does a provider-native id with no
+/// Claude family (a Bedrock application-inference-profile ARN, a Foundry
+/// deployment name) for a stage that asked for a Claude model: it is most
+/// likely the requested model under another name, so the stage keeps its
+/// requested model (no note, cost priced as asked). Pure.
 pub fn substituted_model(requested: &str, init: &Value) -> Option<String> {
-    init_model(init).filter(|ran| !same_model(requested, ran)).map(str::to_string)
+    init_model(init)
+        .filter(|ran| !same_model(requested, ran))
+        .filter(|ran| has_claude_family(ran) || !has_claude_family(requested))
+        .map(str::to_string)
 }
 
 /// A model's short display name for the journal: the catalog's name
