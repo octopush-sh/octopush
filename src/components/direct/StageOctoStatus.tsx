@@ -18,21 +18,25 @@ export function roleForStage(entries: LiveEntry[], status: RunStageStatus): Octo
  *  read as a stalled stage). StageFocus docks it at the live journal's tail,
  *  or right under the header in any other active state. A `done` stage earns
  *  the ✓ beat; a `failed` one leaves quietly; switching focused stages
- *  hard-resets (identity = stage id). */
+ *  hard-resets (identity = stage id). An aborted run (`runAborted`) leaves
+ *  its stage row frozen at running / awaiting_checkpoint — the Player leaves
+ *  quietly then too, so the pane never keeps saying "Waiting for you" (#844). */
 export function StageOctoStatus({
   stage,
   entries,
+  runAborted = false,
 }: {
   stage: RunStage | null;
   entries: LiveEntry[];
+  runAborted?: boolean;
 }) {
   const status: RunStageStatus = stage?.status ?? "pending";
   return (
     <OctoPlayer
       identity={String(stage?.id ?? "none")}
-      active={status === "running" || status === "awaiting_checkpoint"}
+      active={!runAborted && (status === "running" || status === "awaiting_checkpoint")}
       role={roleForStage(entries, status)}
-      skipBeat={status === "failed"}
+      skipBeat={runAborted || status === "failed"}
       placement="inline"
     />
   );

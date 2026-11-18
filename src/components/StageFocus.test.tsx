@@ -103,6 +103,21 @@ describe("StageFocus live journal", () => {
     expect(scroller.contains(screen.getByText("Waiting for you"))).toBe(false);
   });
 
+  it("an aborted run's checkpoint stage shows the abort, not \"Waiting for you\" (#844)", () => {
+    const parkedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: null, budgetUsd: null, detached: false,
+    } as any;
+    const gate = { ...baseStage, status: "awaiting_checkpoint", checkpoint: true, startedAt: "t" };
+    const { rerender } = render(<StageFocus stage={gate} workspacePath="/tmp" run={parkedRun} runBlocked />);
+    expect(screen.getByText("Waiting for you")).toBeInTheDocument();
+    expect(screen.queryByTestId("stage-aborted")).not.toBeInTheDocument();
+    rerender(<StageFocus stage={gate} workspacePath="/tmp" run={{ ...parkedRun, status: "aborted" }} />);
+    expect(screen.queryByText("Waiting for you")).not.toBeInTheDocument();
+    expect(screen.getByTestId("stage-aborted").textContent).toMatch(/aborted/);
+  });
+
   it("plays the done beat where the Player was when the stage finishes with an artifact", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "text", text: "wrapping up" }] } });
     const { container, rerender } = render(<StageFocus stage={baseStage} workspacePath="/tmp" />);
