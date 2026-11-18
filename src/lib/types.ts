@@ -628,7 +628,10 @@ export interface Collision {
 export interface ProjectCollisions {
   collisions: Collision[];
   scanned: number;
+  /** The merge-confirmation pair cap was hit: some pairs are overlap only. */
   capped: boolean;
+  /** A workspace's uncommitted set hit its 2000-path cap: overlaps past it may be missing. */
+  uncommittedCapped: boolean;
 }
 
 // ─── Usage report (Settings → Usage) ───────────────────────────────

@@ -29,9 +29,11 @@
 //! overlapping pairs, the scan degrades to file overlap only.
 //!
 //! **Bounded payloads.** An untracked directory holding more than
-//! [`MAX_UNTRACKED_DIR_FILES`] files counts as one `dir/` entry, a worktree's
-//! uncommitted set stops at [`MAX_UNCOMMITTED_PATHS`], and each pair sends at
-//! most [`MAX_PAIR_FILES`] paths over IPC, with the rest counted.
+//! [`MAX_UNTRACKED_DIR_FILES`] files counts as one `dir/` entry (counted, not
+//! walked, and overlapping any path under it on the other side), a worktree's
+//! uncommitted set stops at [`MAX_UNCOMMITTED_PATHS`] (reported as
+//! `uncommitted_capped`), and each pair sends at most [`MAX_PAIR_FILES`] paths
+//! over IPC, with the rest counted.
 
 use git2::{DiffFindOptions, DiffOptions, MergeOptions, Oid, Repository};
 use serde::Serialize;
@@ -108,6 +110,9 @@ pub struct ProjectCollisions {
     pub scanned: usize,
     /// True when the pair cap was hit and some pairs are file overlap only.
     pub capped: bool,
+    /// True when a workspace's uncommitted set hit [`MAX_UNCOMMITTED_PATHS`],
+    /// so overlaps past it may be missing.
+    pub uncommitted_capped: bool,
 }
 
 /// The paths one workspace changes.
@@ -116,6 +121,8 @@ pub struct ChangedSet {
     pub head: Option<Oid>,
     pub committed: BTreeSet<String>,
     pub uncommitted: BTreeSet<String>,
+    /// [`MAX_UNCOMMITTED_PATHS`] left paths out of `uncommitted`.
+    pub uncommitted_capped: bool,
 }
 
 impl ChangedSet {
@@ -214,59 +221,132 @@ pub(crate) fn workspace_base(from_branch: Option<String>, default_base: Option<&
     from_branch.filter(|b| !b.trim().is_empty()).or_else(|| default_base.map(str::to_string))
 }
 
+/// Untracked, non-ignored files under `dir` (relative to the workdir, with a
+/// trailing `/`), counted up to `limit + 1` and no further, so a large
+/// directory is never walked whole. Ignored entries and nested repositories
+/// (which git doesn't recurse into either) count nothing.
+fn count_untracked_files(repo: &Repository, workdir: &Path, dir: &str, limit: usize) -> usize {
+    let mut count = 0usize;
+    let mut stack = vec![dir.to_string()];
+    while let Some(rel) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(workdir.join(&rel)) else { continue };
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(str::to_string) else { continue };
+            let Ok(kind) = entry.file_type() else { continue };
+            let child = format!("{rel}{name}");
+            if repo.is_path_ignored(&child).unwrap_or(false) {
+                continue;
+            }
+            if kind.is_dir() {
+                if name != ".git" && !entry.path().join(".git").exists() {
+                    stack.push(format!("{child}/"));
+                }
+            } else {
+                count += 1;
+                if count > limit {
+                    return count;
+                }
+            }
+        }
+    }
+    count
+}
+
 /// Paths changed between HEAD and the index + working tree (untracked
 /// included). An untracked directory with more than
 /// [`MAX_UNTRACKED_DIR_FILES`] files counts as a single `dir/` entry, and the
 /// set stops at [`MAX_UNCOMMITTED_PATHS`].
 pub fn uncommitted_paths(repo: &Repository) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    uncommitted_paths_capped(repo).0
+}
 
-    // The untracked directories, as git status shows them (`dir/`).
-    let mut untracked_dirs: Vec<String> = Vec::new();
+/// [`uncommitted_paths`], and whether [`MAX_UNCOMMITTED_PATHS`] left paths out.
+///
+/// The non-recursive pass runs first (untracked directories show as `dir/`,
+/// like `git status`); only directories with at most
+/// [`MAX_UNTRACKED_DIR_FILES`] files are then listed file by file, so a stray
+/// `node_modules/` costs a bounded count, never a full walk. Rename detection
+/// isn't needed: both sides of a rename land in the set either way.
+pub fn uncommitted_paths_capped(repo: &Repository) -> (BTreeSet<String>, bool) {
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let Some(workdir) = repo.workdir().map(Path::to_path_buf) else { return (BTreeSet::new(), false) };
+
     let mut shallow = DiffOptions::new();
     shallow.include_untracked(true).recurse_untracked_dirs(false);
-    if let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut shallow)) {
-        for delta in diff.deltas() {
-            if delta.status() != git2::Delta::Untracked {
-                continue;
-            }
-            if let Some(p) = delta.new_file().path().and_then(|p| p.to_str()) {
-                if p.ends_with('/') {
-                    untracked_dirs.push(p.to_string());
+    let Ok(diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut shallow)) else {
+        return (BTreeSet::new(), false);
+    };
+    let mut paths = BTreeSet::new();
+    let mut untracked_dirs: Vec<String> = Vec::new();
+    for delta in diff.deltas() {
+        let dir = (delta.status() == git2::Delta::Untracked)
+            .then(|| delta.new_file().path().and_then(|p| p.to_str()))
+            .flatten()
+            .filter(|p| p.ends_with('/'));
+        match dir {
+            Some(d) => untracked_dirs.push(d.to_string()),
+            None => {
+                for file in [delta.old_file(), delta.new_file()] {
+                    if let Some(p) = file.path().and_then(|p| p.to_str()) {
+                        paths.insert(p.to_string());
+                    }
                 }
             }
         }
     }
 
-    let mut opts = DiffOptions::new();
-    opts.include_untracked(true).recurse_untracked_dirs(true);
-    let Ok(mut diff) = repo.diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut opts)) else {
-        return out;
-    };
-    find_renames(&mut diff, true);
-    let mut paths = BTreeSet::new();
-    delta_paths(&diff, &mut paths);
-
-    // Fold each large untracked directory into one entry.
-    let mut per_dir: HashMap<&str, usize> = HashMap::new();
-    for p in &paths {
-        if let Some(d) = untracked_dirs.iter().find(|d| p.starts_with(d.as_str())) {
-            *per_dir.entry(d.as_str()).or_default() += 1;
+    for d in untracked_dirs {
+        if count_untracked_files(repo, &workdir, &d, MAX_UNTRACKED_DIR_FILES) > MAX_UNTRACKED_DIR_FILES {
+            paths.insert(d);
+            continue;
+        }
+        let mut deep = DiffOptions::new();
+        deep.include_untracked(true)
+            .recurse_untracked_dirs(true)
+            .disable_pathspec_match(true)
+            .pathspec(d.as_str());
+        match repo.diff_index_to_workdir(None, Some(&mut deep)) {
+            Ok(diff) => {
+                for delta in diff.deltas().filter(|x| x.status() == git2::Delta::Untracked) {
+                    if let Some(p) = delta.new_file().path().and_then(|p| p.to_str()) {
+                        paths.insert(p.to_string());
+                    }
+                }
+            }
+            Err(_) => {
+                paths.insert(d);
+            }
         }
     }
-    for p in paths {
-        if out.len() >= MAX_UNCOMMITTED_PATHS {
-            break;
-        }
-        match untracked_dirs.iter().find(|d| p.starts_with(d.as_str())) {
-            Some(d) if per_dir.get(d.as_str()).copied().unwrap_or(0) > MAX_UNTRACKED_DIR_FILES => {
-                out.insert(d.clone());
+
+    let capped = paths.len() > MAX_UNCOMMITTED_PATHS;
+    (paths.into_iter().take(MAX_UNCOMMITTED_PATHS).collect(), capped)
+}
+
+/// Overlapping paths: the exact intersection, plus every path on one side
+/// under a collapsed `dir/` entry on the other (one side may hold more than
+/// [`MAX_UNTRACKED_DIR_FILES`] files there and the other fewer). The more
+/// specific path is the one reported.
+pub fn overlap(a: &BTreeSet<String>, b: &BTreeSet<String>) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = a.intersection(b).cloned().collect();
+    for (dirs, other) in [(a, b), (b, a)] {
+        for d in dirs.iter().filter(|p| p.ends_with('/')) {
+            for p in other.range::<String, _>(d.clone()..).take_while(|p| p.starts_with(d.as_str())) {
+                if p != d {
+                    out.insert(p.clone());
+                }
             }
-            _ => {
-                out.insert(p);
-            }
         }
+    }
+    // A `dir/` already covered by a more specific path says nothing more.
+    let covered: Vec<String> = out
+        .iter()
+        .filter(|d| d.ends_with('/'))
+        .filter(|d| out.range::<String, _>((*d).clone()..).nth(1).is_some_and(|n| n.starts_with(d.as_str())))
+        .cloned()
+        .collect();
+    for d in covered {
+        out.remove(&d);
     }
     out
 }
@@ -298,7 +378,7 @@ impl CollisionCache {
     /// cache when HEAD and the merge base are unchanged.
     pub fn changed_set(&mut self, path: &Path, base: Option<&str>) -> Option<ChangedSet> {
         let repo = Repository::open(path).ok()?;
-        let uncommitted = uncommitted_paths(&repo);
+        let (uncommitted, uncommitted_capped) = uncommitted_paths_capped(&repo);
         let head = repo.head().ok().and_then(|h| h.peel_to_commit().ok()).map(|c| c.id());
         let mut committed = BTreeSet::new();
         if let (Some(head), Some(base)) = (head, base) {
@@ -326,7 +406,7 @@ impl CollisionCache {
                 }
             }
         }
-        Some(ChangedSet { head, committed, uncommitted })
+        Some(ChangedSet { head, committed, uncommitted, uncommitted_capped })
     }
 
     /// Paths `merge_trees(merge_base(a, b), a, b)` reports as conflicting.
@@ -387,6 +467,7 @@ impl CollisionCache {
             }
         }
         let scanned = sets.len();
+        let uncommitted_capped = sets.iter().any(|(_, s)| s.uncommitted_capped);
         let mut collisions = Vec::new();
         let mut confirmed_pairs = 0usize;
         let mut capped = false;
@@ -394,7 +475,7 @@ impl CollisionCache {
             for j in (i + 1)..sets.len() {
                 let (ia, sa) = &sets[i];
                 let (ib, sb) = &sets[j];
-                let files: Vec<String> = sa.all().intersection(&sb.all()).cloned().collect();
+                let files: Vec<String> = overlap(&sa.all(), &sb.all()).into_iter().collect();
                 if files.is_empty() {
                     continue;
                 }
@@ -444,7 +525,7 @@ impl CollisionCache {
                 });
             }
         }
-        ProjectCollisions { collisions, scanned, capped }
+        ProjectCollisions { collisions, scanned, capped, uncommitted_capped }
     }
 
     /// The project's report, reused while younger than `ttl` unless `force`.

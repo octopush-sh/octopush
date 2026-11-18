@@ -21,6 +21,7 @@ const report = (pairs: Array<[string, string]>): ProjectCollisions => ({
   })),
   scanned: 3,
   capped: false,
+  uncommittedCapped: false,
 });
 
 beforeEach(() => {
@@ -109,6 +110,41 @@ describe("collisionStore", () => {
     mockIpc.projectCollisions.mockRejectedValue(new Error("boom"));
     await s.refresh("p1", { force: true });
     expect(useCollisionStore.getState().byWorkspace.a).toHaveLength(1);
+  });
+
+  it("forgetting a workspace drops its peers' collisions with it and rescans", async () => {
+    mockIpc.projectCollisions.mockResolvedValue(report([["a", "b"], ["b", "c"]]));
+    const s = useCollisionStore.getState();
+    await s.refresh("p1");
+    // The rescan still sees a stale pair until it settles: hold it.
+    let release!: (r: ProjectCollisions) => void;
+    mockIpc.projectCollisions.mockReturnValueOnce(new Promise((r) => (release = r)));
+    s.forgetWorkspace("a");
+    let by = useCollisionStore.getState().byWorkspace;
+    expect(by.a).toBeUndefined();
+    expect(by.b.map((c) => c.otherId)).toEqual(["c"]);
+    expect(by.c.map((c) => c.otherId)).toEqual(["b"]);
+    expect(useCollisionStore.getState().idsByProject.p1.sort()).toEqual(["b", "c"]);
+    // Forced past the throttle.
+    expect(mockIpc.projectCollisions.mock.calls.at(-1)).toEqual(["p1", true]);
+    release(report([]));
+    await vi.waitFor(() => expect(useCollisionStore.getState().byWorkspace.b).toBeUndefined());
+    by = useCollisionStore.getState().byWorkspace;
+    expect(by.c).toBeUndefined();
+  });
+
+  it("forgetting a workspace with no report is a no-op", () => {
+    useCollisionStore.getState().forgetWorkspace("zz");
+    expect(mockIpc.projectCollisions).not.toHaveBeenCalled();
+  });
+
+  it("forgetting the only peer clears the mark", async () => {
+    const s = useCollisionStore.getState();
+    await s.refresh("p1");
+    mockIpc.projectCollisions.mockResolvedValue(report([]));
+    s.forgetWorkspace("b");
+    expect(useCollisionStore.getState().byWorkspace).toEqual({});
+    expect(useCollisionStore.getState().idsByProject.p1).toEqual([]);
   });
 
   it("polls at POLL_MS, and not while the window is hidden", async () => {

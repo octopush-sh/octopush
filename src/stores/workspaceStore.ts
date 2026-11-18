@@ -3,6 +3,7 @@ import { ipc } from "../lib/ipc";
 import { useProjectStore } from "./projectStore";
 import { useTerminalsStore } from "./terminalsStore";
 import { useTerminalLayoutStore } from "./terminalLayoutStore";
+import { useCollisionStore } from "./collisionStore";
 import { pushToast } from "../components/Toasts";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
 
@@ -266,6 +267,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     await ipc.deleteWorkspace(workspaceId, projectPath, branch, worktreePath);
     // Its sessions are gone with it: so are its Run and Talk layouts.
     useTerminalLayoutStore.getState().forgetWorkspace(workspaceId);
+    useCollisionStore.getState().forgetWorkspace(workspaceId);
     set((s) => {
       // Drop the workspace from every project's group too — the rail renders
       // from `workspacesByProjectId`, so leaving a stale entry there keeps the
@@ -288,6 +290,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   archive: async (workspaceId, projectPath, branch, worktreePath) => {
     await ipc.archiveWorkspace(workspaceId, projectPath, branch, worktreePath);
+    useCollisionStore.getState().forgetWorkspace(workspaceId);
     // Archived rows are excluded from list_workspaces, so drop locally like
     // remove (also prune the git summary for hygiene).
     set((s) => {

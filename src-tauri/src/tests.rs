@@ -19203,10 +19203,11 @@ mod cli_command_idle_tests {
 #[cfg(test)]
 mod collision_tests {
     use crate::collisions::{
-        CollisionCache, ScanInput, Severity, MAX_CONFIRMED_PAIRS, MAX_PAIR_FILES, MAX_UNTRACKED_DIR_FILES,
-        REPORT_TTL,
+        overlap, uncommitted_paths_capped, CollisionCache, ScanInput, Severity, MAX_CONFIRMED_PAIRS,
+        MAX_PAIR_FILES, MAX_UNCOMMITTED_PATHS, MAX_UNTRACKED_DIR_FILES, REPORT_TTL,
     };
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -19579,6 +19580,74 @@ mod collision_tests {
         assert_eq!(c.files.len(), MAX_PAIR_FILES);
         // `gen/` + every src/mNNN.ts
         assert_eq!(c.files.len() + c.truncated, total + 1);
+    }
+
+    #[test]
+    fn a_collapsed_dir_overlaps_the_files_under_it_on_the_other_side() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Alpha: more than the cap under `gen/`, so one `gen/` entry.
+        let big = f.wt("alpha").join("gen");
+        std::fs::create_dir_all(&big).unwrap();
+        for i in 0..=MAX_UNTRACKED_DIR_FILES {
+            std::fs::write(big.join(format!("f{i}.txt")), "a").unwrap();
+        }
+        // Beta: a few files under `gen/`, listed one by one.
+        let small = f.wt("beta").join("gen");
+        std::fs::create_dir_all(&small).unwrap();
+        std::fs::write(small.join("f3.txt"), "b").unwrap();
+        std::fs::write(small.join("own.txt"), "b").unwrap();
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert_eq!(report.collisions.len(), 1, "{report:?}");
+        let c = &report.collisions[0];
+        assert_eq!(c.files, vec!["gen/f3.txt".to_string(), "gen/own.txt".to_string()]);
+        assert_eq!(c.severity, Severity::Overlap);
+
+        let a: BTreeSet<String> = ["gen/".to_string(), "lib/".to_string()].into();
+        let b: BTreeSet<String> = ["gen/x/".to_string(), "gen".to_string(), "lib/".to_string(), "genx.ts".to_string()].into();
+        let both: Vec<String> = overlap(&a, &b).into_iter().collect();
+        assert_eq!(both, vec!["gen/x/".to_string(), "lib/".to_string()]);
+    }
+
+    #[test]
+    fn untracked_dirs_are_counted_before_they_are_listed() {
+        let f = Fixture::new(&["alpha"]);
+        let wt = f.wt("alpha");
+        // Ignored files never count toward the cap.
+        std::fs::write(wt.join(".gitignore"), "*.log\n").unwrap();
+        let mixed = wt.join("mixed");
+        std::fs::create_dir_all(mixed.join("deep")).unwrap();
+        for i in 0..MAX_UNTRACKED_DIR_FILES * 3 {
+            std::fs::write(mixed.join(format!("noise{i}.log")), "x").unwrap();
+        }
+        std::fs::write(mixed.join("deep").join("kept.ts"), "x").unwrap();
+        // A tracked edit and a top-level untracked file come from the first pass.
+        std::fs::write(wt.join("README.md"), "edited\n").unwrap();
+        std::fs::write(wt.join("loose.txt"), "x").unwrap();
+        let repo = git2::Repository::open(wt).unwrap();
+        let (set, capped) = uncommitted_paths_capped(&repo);
+        let want: BTreeSet<String> =
+            [".gitignore", "README.md", "loose.txt", "mixed/deep/kept.ts"].map(String::from).into();
+        assert_eq!(set, want);
+        assert!(!capped);
+    }
+
+    #[test]
+    fn hitting_the_uncommitted_path_cap_is_reported() {
+        let f = Fixture::new(&["alpha", "beta"]);
+        // Loose files (no directory to collapse into), one past the cap.
+        for i in 0..=MAX_UNCOMMITTED_PATHS {
+            std::fs::write(f.wt("alpha").join(format!("loose{i:05}.txt")), "a").unwrap();
+        }
+        let repo = git2::Repository::open(f.wt("alpha")).unwrap();
+        let (set, capped) = uncommitted_paths_capped(&repo);
+        assert_eq!(set.len(), MAX_UNCOMMITTED_PATHS);
+        assert!(capped);
+        let report = CollisionCache::default().scan(&f.inputs());
+        assert!(report.uncommitted_capped);
+
+        let quiet = Fixture::new(&["alpha", "beta"]);
+        std::fs::write(quiet.wt("alpha").join("one.txt"), "a").unwrap();
+        assert!(!CollisionCache::default().scan(&quiet.inputs()).uncommitted_capped);
     }
 
     #[test]
