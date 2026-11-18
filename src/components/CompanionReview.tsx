@@ -12,7 +12,7 @@
  *   3. Branch & publish — upstream / ahead-behind / last commit at a glance.
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, ShieldAlert } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
@@ -38,7 +38,7 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
   const staged = files.filter((f) => f.staged).length;
   const conflicted = gitStatus?.conflicted ?? 0;
   const fileCount = files.length;
-  const secret = useStagedSecretPreview(workspacePath, files);
+  const secret = useStagedSecretPreview(workspacePath, gitStatus);
   const held = secret ? Math.max(secret.total, secret.findings.length) > 0 || secret.partial : false;
 
   // ── Verdict — deliberately AI-free; the AI review lives in the diff. ──
@@ -141,34 +141,50 @@ export function CollisionVerdict({ workspaceId }: { workspaceId: string }) {
 
 // ─── Secret guard (#835) ──────────────────────────────────────────
 
-/** The guard's scan of the staged diff — what Commit would check — redone
- *  whenever the staged set changes. `null` while nothing is staged, with the
- *  guard off, or when the scan can't run (Commit still scans on its own). */
-function useStagedSecretPreview(workspacePath: string, files: GitStatus["changedFiles"]): SecretPreview | null {
-  const stagedKey = useMemo(
-    () =>
-      files
-        .filter((f) => f.staged)
-        .map((f) => `${f.path}:${f.status}:${f.unstaged ? 1 : 0}`)
-        .sort()
-        .join("|"),
-    [files],
-  );
+/** How often the preview rescans while something is staged, on top of every
+ *  new git status. Catches a hunk staged into an already-staged file (or an
+ *  agent's edit + re-add between two polls), which leaves the status as is. */
+export const SECRET_RESCAN_MS = 5_000;
+
+/** The guard's scan of the staged diff — what Commit would check — redone on
+ *  every new git status and every few seconds while something is staged. A
+ *  result that a newer scan has overtaken is dropped. `null` while nothing is
+ *  staged, with the guard off, or when the scan can't run (Commit still scans
+ *  on its own). */
+function useStagedSecretPreview(workspacePath: string, gitStatus: GitStatus | null): SecretPreview | null {
+  const hasStaged = (gitStatus?.changedFiles ?? []).some((f) => f.staged);
   const [preview, setPreview] = useState<SecretPreview | null>(null);
+  const [tick, setTick] = useState(0);
+  const inFlight = useRef(0);
+
+  // Heartbeat: skipped while the window is hidden or a scan is still running.
   useEffect(() => {
-    if (!stagedKey) {
+    if (!hasStaged) return;
+    const id = setInterval(() => {
+      if (document.visibilityState !== "visible" || inFlight.current > 0) return;
+      setTick((t) => t + 1);
+    }, SECRET_RESCAN_MS);
+    return () => clearInterval(id);
+  }, [workspacePath, hasStaged]);
+
+  useEffect(() => {
+    if (!hasStaged) {
       setPreview(null);
       return;
     }
     let cancelled = false;
+    inFlight.current += 1;
     Promise.resolve()
       .then(() => ipc.secretScanStaged(workspacePath))
       .then((p) => { if (!cancelled) setPreview(p ?? null); })
-      .catch(() => { if (!cancelled) setPreview(null); });
+      .catch(() => { if (!cancelled) setPreview(null); })
+      .finally(() => { inFlight.current -= 1; });
     return () => { cancelled = true; };
-  }, [workspacePath, stagedKey]);
+  }, [workspacePath, gitStatus, hasStaged, tick]);
   return preview;
 }
+
+const SECRET_LINE_TIP = "Secret guard: Commit will ask before recording this";
 
 /** One line under the verdict when Commit would stop for a possible secret
  *  ("possible secret · GitHub token in a.ts:3"), with a jump to the first
@@ -199,7 +215,7 @@ export function SecretVerdict({
           className="mt-1.5 flex items-start gap-1.5 text-[12px] leading-snug text-octo-sage"
         >
           <ShieldAlert size={12} aria-hidden className="mt-[2px] shrink-0 text-octo-rouge" />
-          <span className="min-w-0 break-words">
+          <span className="min-w-0 break-words" title={SECRET_LINE_TIP}>
             {view.text}
             {view.first && onJump && (
               <>

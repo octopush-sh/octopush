@@ -13,7 +13,7 @@ vi.mock("../lib/ipc", () => ({
   ipc: { listFileEdits, getMessage, getLastCommit, secretScanStaged },
 }));
 
-import { CompanionReview } from "./CompanionReview";
+import { CompanionReview, SECRET_RESCAN_MS } from "./CompanionReview";
 import type { GitStatus } from "../lib/types";
 
 function gitStatus(over: Partial<GitStatus> = {}): GitStatus {
@@ -169,6 +169,70 @@ describe("CompanionReview — secret guard verdict (#835)", () => {
     secretScanStaged.mockClear();
     render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
     expect(secretScanStaged).not.toHaveBeenCalled();
+  });
+
+  it("rescans on a fresh status even when the staged set looks the same", async () => {
+    // Accepting a hunk into an already-staged file keeps path/status/unstaged.
+    const partlyStaged = () =>
+      gitStatus({
+        changedFiles: [{ path: "src/a.ts", status: "modified", staged: true, unstaged: true, conflicted: false }],
+      } as Partial<GitStatus>);
+    secretScanStaged.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    const { container, rerender } = render(
+      <CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={partlyStaged()} />,
+    );
+    expect(await screen.findByText("1 staged · ready to commit.")).toBeInTheDocument();
+    expect(secretScanStaged).toHaveBeenCalledTimes(1);
+
+    secretScanStaged.mockResolvedValueOnce({ findings: [finding], total: 1, partial: false });
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={partlyStaged()} />);
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("1 staged · the secret guard will ask first.")).toBeInTheDocument();
+    const line = container.querySelector('[data-tour="review-companion-secret"]');
+    expect(line).toHaveTextContent("possible secret · GitHub token in src/a.ts:3");
+    expect(line?.querySelector("span[title]")).toHaveAttribute(
+      "title",
+      "Secret guard: Commit will ask before recording this",
+    );
+
+    // And back: unstaging the secret's hunk clears the rouge verdict.
+    secretScanStaged.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={partlyStaged()} />);
+    expect(await screen.findByText("1 staged · ready to commit.")).toBeInTheDocument();
+  });
+
+  it("drops a scan result that a newer scan has overtaken", async () => {
+    let resolveOld: (v: unknown) => void = () => {};
+    secretScanStaged.mockImplementationOnce(() => new Promise((r) => { resolveOld = r; }));
+    secretScanStaged.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    const fresh = () =>
+      gitStatus({
+        changedFiles: [{ path: "src/a.ts", status: "modified", staged: true, unstaged: false, conflicted: false }],
+      } as Partial<GitStatus>);
+    const { rerender } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={fresh()} />);
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalledTimes(1));
+    rerender(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={fresh()} />);
+    await waitFor(() => expect(secretScanStaged).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("1 staged · ready to commit.")).toBeInTheDocument();
+    resolveOld({ findings: [finding], total: 1, partial: false });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.getByText("1 staged · ready to commit.")).toBeInTheDocument();
+  });
+
+  it("rescans on a heartbeat while something is staged", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />);
+      expect(await screen.findByText("1 staged · ready to commit.")).toBeInTheDocument();
+      expect(secretScanStaged).toHaveBeenCalledTimes(1);
+      // An agent re-added the file between polls: same status, new staged diff.
+      secretScanStaged.mockResolvedValue({ findings: [finding], total: 1, partial: false });
+      await vi.advanceTimersByTimeAsync(SECRET_RESCAN_MS);
+      expect(await screen.findByText("1 staged · the secret guard will ask first.")).toBeInTheDocument();
+      expect(secretScanStaged).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("treats a failed scan or the guard turned off as nothing to say", async () => {
