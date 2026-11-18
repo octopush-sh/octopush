@@ -1258,22 +1258,7 @@ pub async fn project_collisions(
         let path = db.get_project(&project_id)?.map(|p| p.path);
         (rows, path)
     };
-    let default_base = project_path
-        .as_deref()
-        .and_then(|p| crate::git_ops::repo_default_branch(std::path::Path::new(&expand_tilde(p))));
-    let inputs: Vec<crate::collisions::ScanInput> = rows
-        .into_iter()
-        .filter_map(|row| {
-            let wt = expand_tilde(row.worktree_path.as_deref()?);
-            let path = std::path::PathBuf::from(wt);
-            path.is_dir().then(|| crate::collisions::ScanInput {
-                id: row.id,
-                name: row.name,
-                path,
-                base: crate::collisions::workspace_base(row.from_branch, default_base.as_deref()),
-            })
-        })
-        .collect();
+    let inputs = crate::collisions::scan_inputs(rows, project_path.as_deref());
     let cache = std::sync::Arc::clone(&state.collisions);
     tauri::async_runtime::spawn_blocking(move || {
         cache.lock().scan_throttled(

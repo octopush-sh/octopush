@@ -221,6 +221,80 @@ pub(crate) fn workspace_base(from_branch: Option<String>, default_base: Option<&
     from_branch.filter(|b| !b.trim().is_empty()).or_else(|| default_base.map(str::to_string))
 }
 
+/// The scan inputs for a project's live workspace rows (`Db::list_workspaces`,
+/// which leaves archived ones out): each row whose worktree still exists, on
+/// its own base. `project_path` resolves the default base. Shared by
+/// `project_collisions` and the dossier's concurrent-work line.
+pub(crate) fn scan_inputs(rows: Vec<crate::db::WorkspaceRow>, project_path: Option<&str>) -> Vec<ScanInput> {
+    use crate::commands::expand_tilde;
+    let default_base = project_path
+        .and_then(|p| crate::git_ops::repo_default_branch(Path::new(&expand_tilde(p))));
+    rows.into_iter()
+        .filter_map(|row| {
+            let path = PathBuf::from(expand_tilde(row.worktree_path.as_deref()?));
+            path.is_dir().then(|| ScanInput {
+                id: row.id,
+                name: row.name,
+                path,
+                base: workspace_base(row.from_branch, default_base.as_deref()),
+            })
+        })
+        .collect()
+}
+
+/// At most this many peers get a line in the dossier note.
+pub const MAX_NOTE_PEERS: usize = 3;
+/// At most this many shared files are named per peer in the dossier note.
+pub const MAX_NOTE_FILES: usize = 5;
+
+/// Phase 2: the dossier line telling a crew which other live workspaces
+/// change the same files as `workspace_id`, so it avoids unrelated edits
+/// there. Lockfiles are left out (they are regenerated on merge, so a
+/// lockfile-only overlap says nothing). Confirmed conflicts come first.
+/// `None` when nothing is left to say.
+pub fn concurrent_work_note(report: &ProjectCollisions, workspace_id: &str) -> Option<String> {
+    let mut peers: Vec<(Severity, &str, Vec<&str>, usize)> = report
+        .collisions
+        .iter()
+        .filter_map(|c| {
+            let peer = if c.a == workspace_id {
+                c.b_name.as_str()
+            } else if c.b == workspace_id {
+                c.a_name.as_str()
+            } else {
+                return None;
+            };
+            let files: Vec<&str> = c.files.iter().map(String::as_str).filter(|f| !is_lockfile(f)).collect();
+            (!files.is_empty()).then_some((c.severity, peer, files, c.truncated))
+        })
+        .collect();
+    if peers.is_empty() {
+        return None;
+    }
+    peers.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(y.1)));
+    let mut lines: Vec<String> = peers
+        .iter()
+        .take(MAX_NOTE_PEERS)
+        .map(|(_, peer, files, truncated)| {
+            let more = files.len().saturating_sub(MAX_NOTE_FILES) + truncated;
+            let mut named = files.iter().take(MAX_NOTE_FILES).copied().collect::<Vec<_>>().join(", ");
+            if more > 0 {
+                named.push_str(&format!(" and {more} more file{}", if more == 1 { "" } else { "s" }));
+            }
+            format!("Note: workspace `{peer}` is concurrently changing {named}. Avoid unrelated edits there.")
+        })
+        .collect();
+    let rest = peers.len().saturating_sub(MAX_NOTE_PEERS);
+    if rest > 0 {
+        lines.push(format!(
+            "Note: {rest} more workspace{} of this project change{} files you may touch.",
+            if rest == 1 { "" } else { "s" },
+            if rest == 1 { "s" } else { "" },
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
 /// Untracked, non-ignored files under `dir` (relative to the workdir, with a
 /// trailing `/`), counted up to `limit + 1` and no further, so a large
 /// directory is never walked whole. Ignored entries and nested repositories

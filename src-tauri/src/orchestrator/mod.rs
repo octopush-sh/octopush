@@ -1057,7 +1057,18 @@ impl Orchestrator {
         // don't spend a worktree-diff capture on it.
         // A Codex resume still captures it: when `codex exec resume` fails the
         // runner falls back to a fresh run, which needs the full dossier.
-        let input = self.assemble_stage_input(run, stage.position, !resuming || Self::is_codex_cli(stage))?;
+        let fresh_input = !resuming || Self::is_codex_cli(stage);
+        let mut input = self.assemble_stage_input(run, stage.position, fresh_input)?;
+        // Collision radar, phase 2 (#732): a code-writing stage (its artifact
+        // is the worktree diff — implement, fix) hears which other live
+        // workspaces of the project change the same files, so it keeps clear
+        // of them. Skipped when the runner discards the input (a resume).
+        if fresh_input
+            && matches!(spec.artifact_kind, ArtifactKind::Diff)
+            && matches!(spec.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree)
+        {
+            input.concurrent_work = self.concurrent_work_note(run);
+        }
 
         // Peers for the `ask_stage` consultation channel: completed upstream
         // stages (same ancestry rule as the dossier) with their archived
@@ -1548,7 +1559,27 @@ impl Orchestrator {
             .find(|s| s.position == position)
             .and_then(|s| self.attempt_history_digest(&s.id));
 
-        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history })
+        Ok(StageInput { breadcrumb, sections, refs_worktree, worktree_diff, history, concurrent_work: None })
+    }
+
+    /// The dossier's concurrent-work line for this run's workspace: one
+    /// read-only collision scan of the project's live workspaces (the same
+    /// inputs as `project_collisions`). Best-effort: `None` on any lookup
+    /// failure, a single live workspace, or no overlap.
+    fn concurrent_work_note(&self, run: &crate::db::RunRow) -> Option<String> {
+        let (rows, project_path) = {
+            let db = self.db.lock();
+            let ws = db.get_workspace(&run.workspace_id).ok()??;
+            let rows = db.list_workspaces(&ws.project_id).ok()?;
+            let path = db.get_project(&ws.project_id).ok()?.map(|p| p.path);
+            (rows, path)
+        };
+        if rows.len() < 2 {
+            return None;
+        }
+        let inputs = crate::collisions::scan_inputs(rows, project_path.as_deref());
+        let report = crate::collisions::CollisionCache::default().scan(&inputs);
+        crate::collisions::concurrent_work_note(&report, &run.workspace_id)
     }
 
     /// Compact digest of a stage's archived attempts (`stage_iterations`),
