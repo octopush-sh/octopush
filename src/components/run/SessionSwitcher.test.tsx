@@ -1,6 +1,6 @@
 /**
  * Tests for the ⌘⌥K session switcher — the palette that answers "which
- * session do I want" when the rail's icons aren't enough.
+ * session do I want" when the session line's icons aren't enough.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, fireEvent } from "@testing-library/react";

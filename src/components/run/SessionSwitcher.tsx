@@ -31,7 +31,7 @@ export function sessionWait(
 /**
  * Waiting sessions first, oldest wait first — the prompt that has cost the most
  * idle time is the first row, so ⏎ answers it. Waits with no start time (on
- * screen) follow the timed ones; everything else keeps its rail order. Rows
+ * screen) follow the timed ones; everything else keeps its session order. Rows
  * keep their own `index`, so ⌘⌥N numbers don't move with the sort.
  */
 export function orderWaitingFirst<R extends { t: { id: string } }>(
@@ -39,7 +39,7 @@ export function orderWaitingFirst<R extends { t: { id: string } }>(
   waitOf: (id: string) => SessionWait | null,
 ): Array<R & { wait: SessionWait | null }> {
   const rank = (w: SessionWait | null) => (w ? (w.since ?? Number.MAX_SAFE_INTEGER) : Infinity);
-  // Array.prototype.sort is stable, so equal ranks keep the rail order.
+  // Array.prototype.sort is stable, so equal ranks keep the session order.
   return rows
     .map((r) => ({ ...r, wait: waitOf(r.t.id) }))
     .sort((a, b) => {
@@ -63,7 +63,7 @@ interface Props {
 /**
  * ⌘⌥K — the session switcher.
  *
- * The rail answers "which sessions are there" at a glance; this answers "which
+ * The session line answers "which sessions are there" at a glance; this answers "which
  * one do I want" when four icons aren't enough. It is the CommandPalette
  * pattern scoped to terminals: search across label, role and running command,
  * arrow to move, ⏎ to switch, ⌫ to close a session, and a last row that opens
@@ -124,7 +124,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
 
   const matches = useMemo(() => {
     const q = query.trim().toLowerCase();
-    // The number is the session's rail address (⌘⌥N), also when pairing
+    // The number is the session's address on the session line (⌘⌥N), also when pairing
     // leaves some sessions out.
     const rows = terminals.map((t) => ({ t, index: allTerminals.indexOf(t) }));
     const found = q

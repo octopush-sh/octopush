@@ -1,5 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
+/** Every kind of menu row the keyboard can land on: plain items, and the
+ *  radio and checkbox rows of a menu that sets something. */
+const MENU_ROWS = '[role^="menuitem"]:not([disabled])';
+
 /**
  * Shared chrome for the rail context menus:
  *  - clamps the menu into the viewport after measuring it (B9),
@@ -22,7 +26,7 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
 
   useLayoutEffect(() => {
     const first = ref.current?.querySelector<HTMLElement>(
-      '[role="menuitem"]:not([disabled])',
+      MENU_ROWS,
     );
     first?.focus();
   }, []);
@@ -39,7 +43,7 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
         const items = Array.from(
-          el.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+          el.querySelectorAll<HTMLElement>(MENU_ROWS),
         );
         if (items.length === 0) return;
         const idx = items.indexOf(document.activeElement as HTMLElement);

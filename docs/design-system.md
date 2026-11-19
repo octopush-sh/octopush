@@ -426,7 +426,7 @@ At any moment there is **exactly one** pulsing *live* element per attention scop
 
 ### Entrance keyframes are from-only — do not add a `to{}` block
 
-`octo-enter-fade` / `octo-enter-pop` / `octo-enter-rise` (backing `.octo-fade-in` / `.octo-pop-in` / `.octo-rise-in` / `.octo-overlay-enter` / `.octo-modal-enter` / `.octo-menu-enter`) declare **only a `from{}` block** — no `to{}`. This is a fixed bug, not a stylistic choice: a `to{}` block combined with `animation-fill-mode: both` pins the element's opacity/transform at the animation's end state *forever*, silently overriding whatever utility opacity the element should settle into (e.g. an essence card's `opacity-[0.38]` or a settled row's `opacity-45`) — the depth-of-field dimming never actually rendered while the bug was in place. From-only keyframes animate *to the element's own underlying computed style* and then hand control back to it, so `0 → 0.38` (or whatever the resting opacity is) applies correctly and hover/focus opacity bumps keep working. `animation-fill-mode: both` still back-fills the `from` state during a stagger `animation-delay`, so there's no flash-of-unstyled-content. The one exception is `.octo-rise-in`, which fills `backwards` only: its forward fill is a visual no-op, but an animation still in effect on `transform` makes the row the containing block for its `fixed` descendants (the Run session rail's flyout landed under the terminal because of it), and `backwards` keeps the stagger back-fill.
+`octo-enter-fade` / `octo-enter-pop` / `octo-enter-rise` (backing `.octo-fade-in` / `.octo-pop-in` / `.octo-rise-in` / `.octo-overlay-enter` / `.octo-modal-enter` / `.octo-menu-enter`) declare **only a `from{}` block** — no `to{}`. This is a fixed bug, not a stylistic choice: a `to{}` block combined with `animation-fill-mode: both` pins the element's opacity/transform at the animation's end state *forever*, silently overriding whatever utility opacity the element should settle into (e.g. an essence card's `opacity-[0.38]` or a settled row's `opacity-45`) — the depth-of-field dimming never actually rendered while the bug was in place. From-only keyframes animate *to the element's own underlying computed style* and then hand control back to it, so `0 → 0.38` (or whatever the resting opacity is) applies correctly and hover/focus opacity bumps keep working. `animation-fill-mode: both` still back-fills the `from` state during a stagger `animation-delay`, so there's no flash-of-unstyled-content. The one exception is `.octo-rise-in`, which fills `backwards` only: its forward fill is a visual no-op, but an animation still in effect on `transform` makes the row the containing block for its `fixed` descendants (the flyout of Run's former session rail landed under the terminal because of it), and `backwards` keeps the stagger back-fill.
 
 **Exception:** genuine one-shot animations with a defined terminal state — `octo-exit-fade` (fades **to** 0, an exit), `octo-sweep` (width **to** 100%, a ceremony), `octo-flash` (a flash-and-settle) — legitimately keep both `from{}` and `to{}`. The from-only rule applies specifically to *entrance* keyframes that hand off into a resting, possibly-dimmed state.
 
@@ -482,17 +482,17 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 | Surface       | Width | Notes |
 |---------------|-------|-------|
-| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it borrows the Run session rail's geometry. See "Workspace rail — the index" below. |
+| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. |
 | ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. |
-| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
+| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; in Run that track holds the **session line** (see "Run mode — session navigation"). |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
-| Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
+| Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). |
 | Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
-- **Run** — session rail (44px, canvas-left) + terminal. Companion: the active session's detail.
+- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: the active session's detail.
 - **Review** — unified diff. Companion: Changed + commit.
 - **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
 
@@ -530,8 +530,9 @@ Seven rules, each a direct consequence of §1, §6 and §9:
    workspace and a running one never signal (the marching edge owns that row).
    `.animate-attention-pulse` falls back to a static `--brass-dim` halo under
    `prefers-reduced-motion`.
-7. **Collapsed, it is the Run session rail.** 44px, 32px cells, the same
-   reserved edge, one cluster per project headed by its mark, and a `fixed`
+7. **Collapsed, it is the slim rail.** 44px (the geometry of Review's
+   collapsed navigator), 32px cells, the same reserved edge, one cluster per
+   project headed by its mark, and a `fixed`
    hover/focus flyout in the MenuSurface chrome (project · name · status ·
    `⌘N`) instead of a native title.
 
@@ -540,20 +541,30 @@ upright-serif placeholder whose bottom hairline turns brass on focus, and the
 one `+` icon button (Add project) beside it. Hits are washed with the
 found-match tokens (§4). Nothing else in the rail carries a border.
 
-### Run mode — session navigation
+### Run mode — session navigation (2026-11-18)
 
-Terminal navigation lives on the canvas, never in the Companion: the Companion
-collapses, and a collapse must not remove the only way to change session. Three
-rules, reusable wherever a set of live things needs a compact switcher:
+Terminal navigation lives in the mode band, never in the Companion: the
+Companion collapses, and a collapse must not remove the only way to change
+session. Two surfaces, each with one job:
 
-- **The icon is the identity; the number is the address.** A 32px cell (in a
-  44px rail) holds one glyph well and two badly, so it carries the session's
-  **role icon** at rest and flips to its `⌘⌥N` number while **⌥** is held
-  (`useModifierPeek` — ⌥ only, or every plain ⌘ shortcut would flash the rail
-  on its way past).
+- **The session line switches.** The band's right track holds one 24px cell per
+  session, in session order, then `+`, a hairline and the layout button. It
+  costs no chrome of its own. (It replaced a 44px rail on the canvas's left
+  and a one-session anchor in the band.)
+- **The pane caption is the session's one home.** Name, rename, what it is
+  doing, the waiting state, the Restored badge, its `⌘⌥N` and its actions are
+  on the caption of the pane that shows it, and nowhere else. Every pane has
+  one, a lone pane too. A fact with two homes drifts.
+
+The rules, reusable wherever a set of live things needs a compact switcher:
+
+- **The icon is the identity; the number is the address.** A 24px cell holds
+  one glyph well and two badly, so it carries the session's **role icon** at
+  rest and flips to its `⌘⌥N` number while **⌥** is held (`useModifierPeek` —
+  ⌥ only, or every plain ⌘ shortcut would flash the line on its way past).
   The hint arrives when the hand is already on the modifier — and nothing lives
-  only behind the gesture: the number is permanent in the hover flyout, the
-  Companion inspector and the `⌘⌥K` switcher.
+  only behind the gesture: the number is also in the instant label, on the pane
+  caption and in the `⌘⌥K` switcher.
 - **An icon must encode difference.** A terminal glyph on every session says
   "this is a terminal" once per session — information the user already has. The
   session icon names what is *running* instead (`lib/sessionRole.ts` →
@@ -562,21 +573,49 @@ rules, reusable wherever a set of live things needs a compact switcher:
   editor `PenLine` · unclassified `Terminal`. Roles are **sticky** — only a
   placeable command replaces one — so identity survives the quiet between
   rebuilds (S1: slots hold their meaning while things run).
-- **One glyph, two facts.** The icon carries identity, its colour carries state
-  (verdigris idle, brass busy); the cell's reserved edge carries selection
-  (solid brass) and activity (`.rail-bar-running` marching segments, the
-  workspace rail's own idiom). §7's "no status in brass" holds: the marching
-  edge is **brass only on the active cell and sage everywhere else**, exactly
-  as the workspace rail tints a non-active row — five busy sessions must not
-  put five brass marks on screen. The one brass exception is *attention*, which
-  the app already spends brass on: the per-session "this one rang" marker. It
-  is a **static** dot, not a second pulse, because the mode switcher's pulse
-  owns that signal at the scope above (Law 2).
+- **One channel per fact.** Two facts on one channel fight: a focused session
+  that was busy could only show one of them. So:
+  - the icon's **ink is presence** — ivory in a pane, mute off screen. Never
+    brass: five busy sessions must not put five brass icons on screen (§7,
+    "no status in brass");
+  - the underline's **colour is focus** — a reserved 2px slot under the icon,
+    brass on the focused pane's session and nowhere else;
+  - the underline's **motion is work** — it marches while a command runs
+    (`.rail-bar-running-x`, the workspace rail's idiom laid horizontally): sage,
+    or brass on the focused session, which is focus and work at once. Reduced
+    motion shows a solid bar.
+  - a **static 5px brass dot** is attention, which the app already spends brass
+    on: the session rang, or Claude Code waits on the user there, while it is
+    not the one in focus. Static, not a second pulse, because the mode
+    switcher's pulse owns that signal at the scope above (Law 2).
+- **The label is instant and has no actions.** Hovering a cell, or focusing it
+  from the keyboard, opens a label under it with no delay: the name in sans,
+  then what the session is doing and its `⌘⌥N` in mono. It is the name the
+  icon alone can't give — a native `title` takes about a second, and six of
+  eight sessions can share one glyph. It carries nothing to click (actions
+  have one home, the caption), it is `aria-hidden` (the cell's accessible name
+  is the same text), and it enters and leaves with `.octo-fade-in` /
+  `.octo-fade-out`.
+- **A pane has no `×`.** Taking a pane off screen keeps its session running,
+  and `×` reads as "close" everywhere else: a session that looks closed while
+  its agent keeps spending is the worst outcome here. Leaving the view is a
+  **minus** (*Leave the view · the session keeps running*), in a split view
+  only. Closing is by name, in the caption's `⋯` menu, sage until hovered
+  (`MENU_ITEM_ROUGE`).
+- **The layout button shows the layout.** Its glyph is the panes on screen
+  (`PaneLayoutIcon`: one frame and its dividers, a single family for one to
+  four panes). Pane count and orientation are chosen there, not in a pane's
+  menu: they belong to the view, not to a session.
+- **Narrow, it sheds whole atoms** (E2). The cells fold from the left into one
+  `N sessions` button that opens `⌘⌥K`; the focused session's cell, `+` and
+  the layout button stay. Narrower still the button becomes an icon, then the
+  layout button, `+` and the focused cell go, in that order: the door to every
+  session is the last thing to leave. Past eight sessions the last cell reads
+  `+N`. The line is clipped to its track and never draws over the switcher.
 
 The band's status tail may become a **control** when the mode has one worth
-having — in Run it is the session anchor (`ModeBand` takes a `ReactNode`), which
-is what makes a keyboard-only palette discoverable. It stays compact: identity,
-the running command, and anything still waiting.
+having — in Run it is the session line (`ModeBand` takes a `ReactNode`). A
+keyboard-only switcher is a switcher nobody finds.
 
 ### Direct mode — canvas patterns
 

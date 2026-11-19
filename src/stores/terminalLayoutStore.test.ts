@@ -24,6 +24,11 @@ import {
   setRatios,
   swap,
   touchMru,
+  choosePaneLayout,
+  maxPaneCount,
+  paneLayoutOf,
+  setPaneCount,
+  splitOrientation,
   useTerminalLayoutStore,
   type RunLayout,
 } from "./terminalLayoutStore";
@@ -329,5 +334,95 @@ describe("terminal layout persistence", () => {
     const s = fresh.useTerminalLayoutStore.getState();
     expect(s.getRun("ws")).toEqual(layout(["A", "B"], 1));
     expect(s.getTalk("ws")).toEqual({ terminalId: "B", width: 0.4, open: true });
+  });
+});
+
+describe("pane count (the layout button)", () => {
+  const order = ["A", "B", "C", "D", "E"];
+
+  it("fills new panes with the next sessions not on screen, in session order", () => {
+    const three = setPaneCount(layout(["C"]), 3, order);
+    expect(three.slots).toEqual(["C", "A", "B"]);
+    expect(three.ratios).toEqual([0.5, 0.5]);
+    // Focus stays with the session that had it.
+    expect(focusedId(three)).toBe("C");
+    expect(setPaneCount(three, 4, order).slots).toEqual(["C", "A", "B", "D"]);
+  });
+
+  it("fills an empty seat before it adds a pane", () => {
+    expect(setPaneCount(layout(["A", null]), 3, order).slots).toEqual(["A", "B", "C"]);
+  });
+
+  it("adds one empty seat when the sessions run out, and stops there", () => {
+    const next = setPaneCount(layout(["A"]), 4, ["A", "B"]);
+    expect(next.slots).toEqual(["A", "B", null]);
+    // Already holding its one seat: nothing more to add.
+    expect(setPaneCount(next, 4, ["A", "B"])).toBe(next);
+    expect(setPaneCount(layout(["A"]), 2, ["A"]).slots).toEqual(["A", null]);
+  });
+
+  it("takes the trailing panes off screen for a smaller layout", () => {
+    const two = setPaneCount(layout(["A", "B", "C", "D"]), 2, order);
+    expect(two.slots).toEqual(["A", "B"]);
+    expect(two.ratios).toEqual([0.5]);
+    expect(setPaneCount(two, 1, order).slots).toEqual(["A"]);
+  });
+
+  it("spares the focused session and drops an empty seat first", () => {
+    const one = setPaneCount(layout(["A", "B", "C", "D"], 3), 1, order);
+    expect(one.slots).toEqual(["D"]);
+    expect(focusedId(one)).toBe("D");
+    expect(setPaneCount(layout(["A", "B", "C"], 1), 2, order).slots).toEqual(["A", "B"]);
+    expect(setPaneCount(layout(["A", null, "B"], 0), 2, order).slots).toEqual(["A", "B"]);
+    // An empty seat in focus is not a session to keep on screen.
+    expect(setPaneCount(layout(["A", null], 1), 1, order).slots).toEqual(["A"]);
+  });
+
+  it("is a no-op at the count on screen, and clamps to one through four", () => {
+    const two = layout(["A", "B"]);
+    expect(setPaneCount(two, 2, order)).toBe(two);
+    expect(setPaneCount(two, 9, order).slots).toHaveLength(4);
+    expect(setPaneCount(two, 0, order).slots).toEqual(["A"]);
+  });
+
+  it("a two-pane pick sets the orientation; the others leave it alone", () => {
+    const stacked = choosePaneLayout(layout(["A"]), "two-stacked", order);
+    expect(stacked.slots).toEqual(["A", "B"]);
+    expect(stacked.orientation).toBe("stacked");
+    expect(choosePaneLayout(stacked, "three", order).orientation).toBe("stacked");
+    expect(choosePaneLayout(stacked, "two-side", order).orientation).toBe("side");
+    expect(choosePaneLayout(layout(["A"]), "four", order).orientation).toBe("auto");
+  });
+
+  it("names the layout on screen", () => {
+    expect(paneLayoutOf(1, "stacked")).toBe("one");
+    expect(paneLayoutOf(2, "side")).toBe("two-side");
+    expect(paneLayoutOf(2, "stacked")).toBe("two-stacked");
+    expect(paneLayoutOf(3, "side")).toBe("three");
+    expect(paneLayoutOf(4, "side")).toBe("four");
+  });
+
+  it("reaches one pane per session plus one seat, up to four", () => {
+    expect(maxPaneCount(1)).toBe(2);
+    expect(maxPaneCount(2)).toBe(3);
+    expect(maxPaneCount(3)).toBe(4);
+    expect(maxPaneCount(9)).toBe(4);
+  });
+
+  it("splitOrientation is how two panes would sit, whatever is on screen", () => {
+    // 72 columns of 8px each side need 1152px.
+    expect(splitOrientation(layout(["A"]), 1200, 8)).toBe("side");
+    expect(splitOrientation(layout(["A"]), 1000, 8)).toBe("stacked");
+    expect(splitOrientation(layout(["A", "B", "C", "D"]), 1000, 8)).toBe("stacked");
+    expect(splitOrientation(setOrientation(layout(["A"]), "side"), 1000, 8)).toBe("side");
+  });
+
+  it("keeps the measured split out of the persisted layouts", () => {
+    localStorage.removeItem(LAYOUTS_KEY);
+    useTerminalLayoutStore.getState().setSplit("ws-split", "stacked");
+    expect(useTerminalLayoutStore.getState().splitByWs["ws-split"]).toBe("stacked");
+    expect(localStorage.getItem(LAYOUTS_KEY)).toBeNull();
+    useTerminalLayoutStore.getState().forgetWorkspace("ws-split");
+    expect(useTerminalLayoutStore.getState().splitByWs["ws-split"]).toBeUndefined();
   });
 });

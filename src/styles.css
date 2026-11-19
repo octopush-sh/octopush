@@ -308,8 +308,10 @@
    the attention pulse (which means paused/finished).
    The colour comes from --rail-bar (brass on the active row / cell, sage on
    every other — never a status in brass, never the workspace tint). Consumers
-   size the edge inline (the workspace rail's 2px edge, the Run session rail's
-   3px one). Reduced motion falls back to a solid bar — never a frozen dash. */
+   size the edge inline (the workspace rail's 2px edge). Reduced motion falls
+   back to a solid bar — never a frozen dash.
+   `.rail-bar-running-x` is the same idiom laid horizontally: the Run session
+   line's 2px underline, which its cell positions and sizes. */
 @keyframes rail-march {
   to {
     background-position-y: -11px;
@@ -331,8 +333,25 @@
   animation: rail-march 1.2s linear infinite;
 }
 
+@keyframes rail-march-x {
+  to {
+    background-position-x: 14px;
+  }
+}
+
+.rail-bar-running-x {
+  background: repeating-linear-gradient(
+    to right,
+    var(--rail-bar) 0 4px,
+    transparent 4px 7px
+  );
+  background-size: 14px 100%;
+  animation: rail-march-x 1.2s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .rail-bar-running {
+  .rail-bar-running,
+  .rail-bar-running-x {
     background: var(--rail-bar);
     animation: none;
   }

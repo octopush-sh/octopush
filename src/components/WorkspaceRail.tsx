@@ -55,8 +55,9 @@ import { collisionSegment, worstSeverity } from "../lib/collisions";
  *    the list is never repeated in its header).
  *  - Exactly one brass pulse per rail (the workspace waiting longest); every
  *    other workspace that needs you carries a static brass dot.
- *  - Collapsed, the rail is the Run session rail's geometry (44px, 32px
- *    cells, reserved edge) with a hover flyout for project · name · status.
+ *  - Collapsed, the rail is the slim-rail geometry of Review's collapsed
+ *    navigator (44px, 32px cells, reserved edge) with a hover flyout for
+ *    project · name · status.
  */
 
 /** Hierarchical project/workspace structure for the rail. */
@@ -951,8 +952,8 @@ interface FlyoutAnchor {
 }
 
 /**
- * The slim rail: the Run session rail's geometry (44px, 32px cells, a reserved
- * identity edge), one cluster per project headed by its mark, and a hover /
+ * The slim rail: the geometry of Review's collapsed navigator (44px, 32px
+ * cells, a reserved identity edge), one cluster per project headed by its mark, and a hover /
  * focus flyout that carries what the width cannot — project, name, status and
  * the jump key. Positioned `fixed` against the measured cell, since the
  * scrolling list would clip an absolutely positioned popover.

@@ -10,7 +10,7 @@ interface Props {
   workspaceId?: string;
   /** The active mode's status tail. A string is rendered as the canonical
    *  mono status line; a node is rendered as-is, which is how Run mode puts a
-   *  live control there (the session anchor) instead of a read-out. Null when
+   *  live control there (the session line) instead of a read-out. Null when
    *  the mode has nothing worth reporting. */
   meta?: React.ReactNode;
 }
