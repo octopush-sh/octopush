@@ -573,6 +573,8 @@ import type {
   ModelSuggestion,
   ModelWithProvider,
   GhIssue,
+  Group,
+  GroupScope,
   Pr,
   PrInfo,
   ShipReadiness,
@@ -793,6 +795,44 @@ export const ipc = {
   setProjectPinned: (projectId: string, pinned: boolean) =>
     invoke<void>("set_project_pinned", { projectId, pinned }),
   setProjectOrder: (ids: string[]) => invoke<void>("set_project_order", { ids }),
+
+  // ─── Rail groups ────────────────────────────────────────────────
+  /** Every group, both scopes: project groups, then each project's workspace
+   *  groups, each run in `sortOrder`. */
+  listGroups: () => invoke<Group[]>("list_groups"),
+  /** Create a group and move `memberIds` into it in one step. It takes the
+   *  place of its first member in rail order, or goes last when it has none.
+   *  `projectId` is required for a `workspace` group and refused for a
+   *  `project` group. */
+  createGroup: (args: {
+    scope: GroupScope;
+    projectId?: string | null;
+    name: string;
+    tint?: TintName | null;
+    memberIds?: string[];
+  }) =>
+    invoke<Group>("create_group", {
+      scope: args.scope,
+      projectId: args.projectId ?? null,
+      name: args.name,
+      tint: args.tint ?? null,
+      memberIds: args.memberIds ?? [],
+    }),
+  /** The backend trims the name and refuses an empty one. */
+  renameGroup: (groupId: string, name: string) =>
+    invoke<void>("rename_group", { groupId, name }),
+  setGroupTint: (groupId: string, tint: TintName | null) =>
+    invoke<void>("set_group_tint", { groupId, tint }),
+  /** Persist the order of sibling groups (same scope, same project): each id
+   *  gets its index as `sortOrder`, like `setProjectOrder`. */
+  setGroupOrder: (ids: string[]) => invoke<void>("set_group_order", { ids }),
+  /** Delete a group. Its members stay, ungrouped. */
+  deleteGroup: (groupId: string) => invoke<void>("delete_group", { groupId }),
+  /** Move a project or workspace into a group, or out of any group (`null`).
+   *  Refused for a group of the other scope, and for a workspace group of
+   *  another project. */
+  setItemGroup: (kind: GroupScope, itemId: string, groupId: string | null) =>
+    invoke<void>("set_item_group", { kind, itemId, groupId }),
 
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,
