@@ -75,6 +75,33 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(container.querySelectorAll(".opacity-\\[0\\.38\\]")).toHaveLength(2);
   });
 
+  it("keeps the essence meta on one nowrap line in the compact token format (#874)", () => {
+    const done = [
+      mk({ id: "i", position: 1, status: "done", costUsd: 0.3, inputTokens: 18_412, outputTokens: 3_100 }),
+      mk({ id: "s", position: 2, status: "running", startedAt: 1 }),
+    ];
+    const { container } = render(
+      <RunFlow stages={done} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
+    );
+    const tokens = screen.getByText("↑18k ↓3.1k");
+    expect(tokens).toHaveClass("octo-demote", "octo-tabular");
+    expect(tokens).not.toHaveClass("octo-demote-shed");
+    expect(tokens.parentElement).toHaveClass("whitespace-nowrap", "overflow-hidden", "h-4");
+    expect(container.textContent).not.toContain("18.4k");
+  });
+
+  it("sheds the essence token pair, never position or cost, when the line can't fit", () => {
+    const big = [
+      mk({ id: "i", position: 0, status: "done", costUsd: 123.45, inputTokens: 184_000, outputTokens: 31_000 }),
+      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+    ];
+    render(<RunFlow stages={big} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />);
+    const tokens = screen.getByText("↑184k ↓31k");
+    expect(tokens).toHaveClass("octo-demote-shed");
+    expect(screen.getByText("$123.45")).not.toHaveClass("octo-demote");
+    expect(tokens.parentElement).toHaveAttribute("title", "$123.45 · ↑184.0k ↓31.0k tokens");
+  });
+
   it("renders no connector for a single-stage run", () => {
     const { container } = render(
       <RunFlow stages={[mk({ id: "solo" })]} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,
