@@ -32,6 +32,8 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
 
 import { WorkspaceRail, type ProjectGroup } from "./WorkspaceRail";
 import { sectionDragId } from "../lib/railGroups";
+import { DRAGGED_BLOCK } from "../lib/railDnd";
+import { LIFTED_GROUND } from "../lib/menuStyles";
 import { useGroupsStore } from "../stores/groupsStore";
 
 const CLIENT: Group = {
@@ -126,19 +128,62 @@ describe("a project dragged out of its group stays in sight", () => {
       expect(className).toMatch(/overflow-visible/);
       expect(className).not.toMatch(/overflow-hidden/);
     }
-    expect(projectEl("acme-web").className).toMatch(/relative z-10/);
-    expect(projectEl("acme-api").className).not.toMatch(/z-10/);
+    expect(projectEl("acme-web")).toHaveAttribute("data-dragging", "true");
+    expect(projectEl("acme-api")).not.toHaveAttribute("data-dragging");
+    // The group itself is raised: its filled entrance animation makes it a
+    // stacking context, which would hold the project's z-10 inside it and let
+    // every later block paint over the dragged project.
+    expect(sectionEl().className.split(/\s+/)).toEqual(expect.arrayContaining(["relative", "z-10"]));
+    // It is not the dragged surface itself.
+    expect(sectionEl().className).not.toMatch(/bg-octo-panel/);
   });
 
   it("another group's project, or a loose one, lifts nothing here", () => {
     drag.context = { active: { id: "dotfiles", data: { current: { type: "project", sectionId: null } } }, over: null };
     rail();
     for (const className of clips()) expect(className).toMatch(/overflow-hidden/);
+    expect(sectionEl().className).not.toMatch(/z-10/);
   });
 
-  it("a dragged group paints over the blocks it passes", () => {
+});
+
+describe("a dragged block is an opaque, lifted surface", () => {
+  const classes = (el: HTMLElement) => el.className.split(/\s+/);
+  const surface = DRAGGED_BLOCK.split(" ");
+
+  it("is drawn from tokens: the panel ground and the menus' lift, a hairline ring, above what it passes", () => {
+    // The panel token is opaque in every theme (Vellum's is cream, not a dark
+    // slab), and it is the menus' own ground, so the two cannot drift apart.
+    expect(surface).toEqual(expect.arrayContaining(["bg-octo-panel", "ring-1", "ring-octo-hairline", "relative", "z-10"]));
+    expect(DRAGGED_BLOCK).toContain(LIFTED_GROUND);
+    // No literal colour, and never the recessing panel-2.
+    expect(DRAGGED_BLOCK).not.toMatch(/#[0-9a-f]{3,8}|rgb|panel-2/i);
+  });
+
+  it("a dragged project wears it at full opacity; the others do not", () => {
+    forced.byId["acme-web"] = { isDragging: true, transform: { x: 0, y: 30, scaleX: 1, scaleY: 1 } };
+    rail();
+    expect(classes(projectEl("acme-web"))).toEqual(expect.arrayContaining(surface));
+    expect(projectEl("acme-web").style.opacity).toBe("");
+    for (const id of ["acme-api", "dotfiles"]) {
+      expect(classes(projectEl(id))).not.toContain("bg-octo-panel");
+      expect(classes(projectEl(id))).not.toContain("z-10");
+    }
+  });
+
+  it("a dragged project group wears it at full opacity", () => {
     forced.byId[sectionDragId(CLIENT.id)] = { isDragging: true, transform: { x: 0, y: 40, scaleX: 1, scaleY: 1 } };
     rail();
-    expect(sectionEl().className).toMatch(/relative z-10/);
+    expect(classes(sectionEl())).toEqual(expect.arrayContaining(surface));
+    expect(sectionEl().style.opacity).toBe("");
+    expect(sectionEl()).toHaveAttribute("data-dragging", "true");
+  });
+
+  it("nothing wears it at rest", () => {
+    rail();
+    for (const el of [sectionEl(), projectEl("dotfiles"), projectEl("acme-api")]) {
+      expect(classes(el)).not.toContain("bg-octo-panel");
+      expect(el.style.opacity).toBe("");
+    }
   });
 });

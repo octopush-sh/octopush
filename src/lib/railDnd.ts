@@ -17,6 +17,7 @@ import {
 } from "@dnd-kit/core";
 import { sortableKeyboardCoordinates } from "@dnd-kit/sortable";
 import type { Transform } from "@dnd-kit/utilities";
+import { LIFTED_GROUND } from "./menuStyles";
 import type { RailDragSubject, RailDropTarget } from "./railGroups";
 
 /** What a drag in the rail carries, read back from dnd-kit's `data`. Null for
@@ -158,6 +159,17 @@ export const projectKeyboardCoordinates: KeyboardCoordinateGetter = (event, args
     context: { ...args.context, droppableContainers: projects },
   });
 };
+
+/**
+ * The surface of a block of the rail's top level (a project, or a project
+ * group) while it is dragged. The block itself is what moves (no overlay),
+ * across other blocks and other groups' eyebrows, so it must occlude them:
+ * the lifted ground the menus wear (`LIFTED_GROUND`: the opaque panel token
+ * and the menu's lift), with the hairline drawn as a ring so the block keeps
+ * its size to the pixel. Its content stays at full opacity: the thing under
+ * the pointer is never dimmed. Above the blocks it passes (`z-10`).
+ */
+export const DRAGGED_BLOCK = `relative z-10 rounded-md ring-1 ring-octo-hairline ${LIFTED_GROUND}`;
 
 /** A displacement of a block of the rail's top level: a translation, never a
  *  scale. */

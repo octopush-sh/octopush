@@ -705,6 +705,17 @@ a secondary cue (WCAG 1.4.1).
   nothing. A group dragged by its header moves as one unit, by the sortable
   list's own transform: **no `<DragOverlay>`** for a project or a group (it
   would stop the dragged block following the pointer).
+- **A dragged block is a lifted surface.** The block itself moves (there
+  is no overlay), across other blocks and other groups' eyebrows, so while
+  it is dragged it wears `DRAGGED_BLOCK` (`lib/railDnd.ts`): the menus' own
+  ground and lift (`LIFTED_GROUND` in `lib/menuStyles.ts`: `bg-octo-panel`
+  and their shadow), a hairline ring (so it keeps its size), `rounded-md`,
+  and `z-10`. It is opaque and its content keeps full opacity: the thing
+  under the pointer is never dimmed. The ground is `panel`, never `panel_2`,
+  because `panel_2` recesses in Vellum (§1.1, rule 5) and would read as a
+  slab. A group holding its own dragged project is raised to `z-10` as
+  well: its filled `octo-fade-in` entrance makes it a stacking context,
+  which would otherwise trap the project under every later block.
 - **A dragged block is moved, never scaled.** Only the translation of
   dnd-kit's transform is written (`blockShift` in `lib/railDnd.ts`); written
   whole, it scales the block to the size of what it is over and pulls it off

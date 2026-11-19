@@ -2,7 +2,7 @@ import { useEffect, useRef, type ReactNode } from "react";
 import { ChevronDown } from "lucide-react";
 import { useDndContext, useDroppable } from "@dnd-kit/core";
 import { useSortable } from "@dnd-kit/sortable";
-import { useFollowPointer, type RailTopData } from "../lib/railDnd";
+import { DRAGGED_BLOCK, useFollowPointer, type RailTopData } from "../lib/railDnd";
 import { sectionDragId, sectionHeadId } from "../lib/railGroups";
 import { tourId } from "../lib/tour/ids";
 import type { Group } from "../lib/types";
@@ -117,6 +117,9 @@ export function RailProjectSection({
   // so the fold's clipping is lifted meanwhile: clipped, the block would
   // vanish the moment it crossed the group's edge. The group is open then (a
   // folded group's projects cannot be grabbed), so nothing needs the clip.
+  // The group is raised too: its entrance (`octo-fade-in`, filled) makes it a
+  // stacking context, which would hold its dragged project's `z-10` inside
+  // it, and every later block of the rail would paint over the project.
   const holdsDragged = dragged?.type === "project" && dragged.sectionId === group.id;
 
   // After a rename ends, the header gets the focus back (the input held it).
@@ -139,12 +142,15 @@ export function RailProjectSection({
       ref={unit.setNodeRef}
       data-testid={`rail-section-${group.id}`}
       data-rail-section={group.id}
-      // Dragged, it paints over the blocks it passes.
-      className={`octo-fade-in flex flex-col pb-1 ${LEAD[lead]} ${unit.isDragging ? "relative z-10" : ""}`}
+      data-dragging={unit.isDragging || undefined}
+      // Dragged, it is an opaque, lifted surface that occludes the blocks it
+      // passes, its content at full strength.
+      className={`octo-fade-in flex flex-col pb-1 ${LEAD[lead]} ${
+        unit.isDragging ? DRAGGED_BLOCK : holdsDragged ? "relative z-10" : ""
+      }`}
       style={{
         transform: shown,
         transition: unit.transition,
-        opacity: unit.isDragging ? 0.6 : undefined,
       }}
     >
       <div

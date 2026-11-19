@@ -42,6 +42,7 @@ import {
   railSubjectOf,
   railTargetOf,
   useFollowPointer,
+  DRAGGED_BLOCK,
   type RailTopData,
 } from "../lib/railDnd";
 import {
@@ -1070,12 +1071,13 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     <div
       ref={setNodeRef}
       data-rail-project={project.id}
-      // Dragged, it paints over the blocks it passes.
-      className={`flex flex-col ${PROJECT_LEAD[lead]} ${isDragging ? "relative z-10" : ""}`}
+      data-dragging={isDragging || undefined}
+      // Dragged, it is an opaque, lifted surface that occludes the blocks it
+      // passes, its content at full strength.
+      className={`flex flex-col ${PROJECT_LEAD[lead]} ${isDragging ? DRAGGED_BLOCK : ""}`}
       style={{
         transform: shown,
         transition,
-        opacity: isDragging ? 0.6 : undefined,
       }}
     >
       {/* Header — a line of the index: mark, name, then (folded only) the
