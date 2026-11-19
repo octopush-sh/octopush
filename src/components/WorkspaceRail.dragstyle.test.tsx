@@ -299,6 +299,27 @@ describe("the drop cue on the dragged block", () => {
     expect(cue()).toHaveTextContent("Out of Client work");
   });
 
+  it("follows the rail when it reloads in mid-drag, as the drop does", () => {
+    const { rerender } = rail();
+    dragOver(asProject("dotfiles", null), asProject("acme-api", CLIENT.id));
+    expect(cue()).toHaveTextContent("Into Client work");
+    // The group is renamed elsewhere: the cue reads the new name.
+    act(() => useGroupsStore.setState({ groups: [{ ...CLIENT, name: "Clients" }] }));
+    expect(cue()).toHaveTextContent("Into Clients");
+    // dotfiles is already in the group after a reload: the drop would only reorder.
+    rerender(
+      <WorkspaceRail
+        projects={PROJECTS.map((p) => (p.id === "dotfiles" ? { ...p, groupId: CLIENT.id } : p))}
+        activeWorkspaceId={null}
+        onSelect={vi.fn()}
+        onCustomize={vi.fn()}
+        isCollapsed={false}
+        onReorderProjects={vi.fn()}
+      />,
+    );
+    expect(cue()).toBeNull();
+  });
+
   it("dropCueText", () => {
     expect(dropCueText({ kind: "into", groupId: "g", name: "Client work" })).toBe("Into Client work");
     expect(dropCueText({ kind: "out", groupId: "g", name: "Side projects" })).toBe("Out of Side projects");
