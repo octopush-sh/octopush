@@ -165,7 +165,7 @@ export function TerminalPane({
       const current = store.waitingByTerminal[terminalId] ?? null;
       const next = nextShownWaiting(current, event);
       if (next !== current) store.setShownWaiting(terminalId, next);
-      // The same answers end the wait the rail marks while it is off screen.
+      // The same answers end the wait the session line marks while it is off screen.
       if (clearsWait(event)) store.clearWait(terminalId);
     },
     [terminalId],
@@ -487,7 +487,7 @@ export function TerminalPane({
       if (waiting) notifyClaudeWaiting(workspaceIdRef.current, waiting, shownRef.current);
       applyShownWaiting({ type: "attention", reason, shown: shownRef.current });
       if (shownRef.current) return;
-      // Carry the terminal id so the Run rail can mark the session that rang
+      // Carry the terminal id so Run's session line can mark the session that rang
       // rather than the whole workspace.
       useAttentionStore
         .getState()
@@ -676,7 +676,7 @@ export function TerminalPane({
       // Note: we intentionally do NOT kill the PTY here — the daemon owns it
       // and it should survive this TerminalPane unmounting (e.g. workspace
       // switch, Octopush restart).  The user explicitly kills a terminal via
-      // Close action in the session rail's flyout / Companion, which calls
+      // Close session item of its pane caption's menu (or ⌘⌥K), which calls
       // ipc.deleteTerminal.
       ptySessionIdRef.current = null;
     };
@@ -704,7 +704,7 @@ export function TerminalPane({
   }, [shown, takesFocus, syncSize]);
 
   // Focusing the pane is answering its caption's "waiting on …"; leaving the
-  // screen drops it (the rail flags whatever the session asks for next).
+  // screen drops it (the session line flags whatever the session asks for next).
   useEffect(() => {
     if (!shown) applyShownWaiting({ type: "hidden" });
     else if (takesFocus) applyShownWaiting({ type: "focus" });

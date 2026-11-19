@@ -91,13 +91,15 @@ Current anchors:
 | `palette-import-crew` | Command palette, Actions: "Import a crew…" | `CommandPalette.tsx` |
 | `builder-stage-reasoning` | Pipeline builder, Stage inspector: the Reasoning control (label + effort segments) | `builder/StageInspector.tsx` |
 | `run-starting` | Run canvas, until the shell draws its prompt: the "Starting shell in …" line | `TerminalPane.tsx` |
-| `run-session-rail` · `run-session-cell` · `run-open-beside` | Run canvas: the session rail · the focused session's rail cell · a rail cell flyout's "Open beside" / "Replace in the focused pane" (on hover, while Open beside can do something) | `run/SessionRail.tsx` |
-| `run-pane-caption` · `run-pane-menu` · `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first pane's caption · its "Pane options" button · the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
-| `run-pane-waiting` | Run canvas, with two or more panes: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
-| `run-pane-orientation` | The first pane's options menu, while open with two or three panes: "Automatic" | `run/RunPanes.tsx` |
+| `run-session-line` · `run-session-cell` | Run mode band, right track: the session line (session cells, `+`, the layout button) · the focused session's cell (hover or keyboard focus opens its instant label) | `run/SessionLine.tsx` |
+| `run-layout` · `run-layout-two` | Session line: the layout button · its menu's "Two, side by side" row (while the menu is open) | `run/SessionLine.tsx` |
+| `run-setup-session` | Session line: the cell of a workspace's setup terminal (only while the workspace has one) | `run/SessionLine.tsx` |
+| `run-pane-caption` · `run-open-beside` | Run canvas: the first pane's caption (a lone pane has one too) · its `⋯` "Session actions" button, whose menu holds "Open beside…" (tours from before the session line, which pointed at the rail flyout's Open beside, land here) | `run/RunPanes.tsx` |
+| `run-pane-divider` · `run-empty-seat` | Run canvas, only with two or more panes: the first (main) divider · the empty seat (only while there is one) | `run/RunPanes.tsx` |
+| `run-pane-waiting` | Run canvas: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
-| `run-session-waiting` | Run canvas, session rail: the brass dot on the first off-screen session Claude Code's hooks say waits on you (only while one does) | `run/SessionRail.tsx` |
+| `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
 | `run-switcher-waiting` | ⌘⌥K switcher (or Open beside), while open: the first row's "· waiting on permission" / "· waiting on your input" (only while a listed session waits) | `run/SessionSwitcher.tsx` |
 | `run-pair-input` · `run-pair-pick` | Pairing switcher (Open beside), while open: its query input · its first session row (only when a session is off screen) | `run/SessionSwitcher.tsx` |
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |

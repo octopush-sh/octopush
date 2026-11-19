@@ -141,7 +141,7 @@ export function leave(layout: RunLayout, slot: number): RunLayout {
 }
 
 /**
- * The user leaving a pane (`×`, *Leave the view*). Like `leave`, except that
+ * The user leaving a pane (the caption's minus, *Leave the view*). Like `leave`, except that
  * leaving a session beside nothing but empty seats drops the seats instead:
  * the view returns to one pane showing that session, never to a blank Run
  * while the session still exists. (`prune` keeps using `leave`.)
@@ -173,6 +173,90 @@ export function setRatios(layout: RunLayout, ratios: number[]): RunLayout {
   if (ratios.length !== evenRatios(layout.slots.length).length) return layout;
   if (ratios.some((r) => !Number.isFinite(r))) return layout;
   return { ...layout, ratios: ratios.map((r) => Math.max(RATIO_MIN, Math.min(RATIO_MAX, r))) };
+}
+
+// ─── Pane count (the layout button) ───────────────────────────────
+
+/** The layouts the session line's layout button offers. */
+export type PaneLayout = "one" | "two-side" | "two-stacked" | "three" | "four";
+
+export const PANE_LAYOUT_COUNT: Record<PaneLayout, number> = {
+  one: 1,
+  "two-side": 2,
+  "two-stacked": 2,
+  three: 3,
+  four: 4,
+};
+
+/** The layout on screen: the pane count and, for two panes, how they sit
+ *  (`orientation` is what `resolveOrientation` gave). */
+export function paneLayoutOf(count: number, orientation: "side" | "stacked"): PaneLayout {
+  if (count <= 1) return "one";
+  if (count === 2) return orientation === "side" ? "two-side" : "two-stacked";
+  return count === 3 ? "three" : "four";
+}
+
+/** Most panes a workspace with `sessionCount` sessions can fill: one each,
+ *  plus the one empty seat a layout may hold. */
+export function maxPaneCount(sessionCount: number, max = MAX_SLOTS): number {
+  return Math.max(1, Math.min(max, sessionCount + 1));
+}
+
+/**
+ * Lay Run out in `count` panes. More panes: an empty seat and then each new
+ * pane take the next session of `order` (session order) that is not on
+ * screen; when none is left, one empty seat is added and the layout stops
+ * there (a layout holds at most one). Fewer panes: an empty seat goes first,
+ * then the trailing panes, sparing the focused session so the pane the user
+ * is typing in is never the one that leaves. Leaving never closes a session,
+ * and focus stays with the session that had it.
+ */
+export function setPaneCount(
+  layout: RunLayout,
+  count: number,
+  order: readonly string[],
+  max = MAX_SLOTS,
+): RunLayout {
+  const target = Math.max(1, Math.min(max, Math.round(count)));
+  if (target === layout.slots.length) return layout;
+
+  if (target < layout.slots.length) {
+    let next = layout;
+    while (next.slots.length > target) {
+      const seat = next.slots.lastIndexOf(null);
+      let victim = seat;
+      if (victim === -1) {
+        victim = next.slots.length - 1;
+        if (victim === next.focused) victim -= 1;
+      }
+      next = leave(next, victim);
+    }
+    return next;
+  }
+
+  const slots = layout.slots.slice();
+  const hidden = order.filter((id) => !slots.includes(id));
+  const seat = slots.indexOf(null);
+  // A lone empty pane (no session yet) is not a seat to keep empty.
+  if (seat !== -1 && hidden.length > 0) slots[seat] = hidden.shift()!;
+  while (slots.length < target && hidden.length > 0) slots.push(hidden.shift()!);
+  if (slots.length < target && !slots.includes(null)) slots.push(null);
+  if (slots.length === layout.slots.length && slots.every((id, i) => id === layout.slots[i])) return layout;
+  return withSlots(layout, slots, layout.focused);
+}
+
+/** A pick from the layout button: the pane count, and for the two-pane
+ *  layouts the orientation the user asked for (an override, as before). */
+export function choosePaneLayout(
+  layout: RunLayout,
+  choice: PaneLayout,
+  order: readonly string[],
+  max = MAX_SLOTS,
+): RunLayout {
+  const sized = setPaneCount(layout, PANE_LAYOUT_COUNT[choice], order, max);
+  if (choice === "two-side") return setOrientation(sized, "side");
+  if (choice === "two-stacked") return setOrientation(sized, "stacked");
+  return sized;
 }
 
 // ─── Geometry ─────────────────────────────────────────────────────
@@ -209,6 +293,12 @@ export function resolveOrientation(layout: RunLayout, width: number, cellWidth: 
   const split = evenRatios(count)[0];
   const narrowest = width * Math.min(split, 1 - split);
   return narrowest / cellWidth >= MIN_SIDE_COLUMNS ? "side" : "stacked";
+}
+
+/** How two or three panes of this workspace sit at this width, whatever the
+ *  count on screen now: what the layout button shows and checks. */
+export function splitOrientation(layout: RunLayout, width: number, cellWidth: number): "side" | "stacked" {
+  return resolveOrientation({ ...layout, slots: [null, null] }, width, cellWidth);
 }
 
 /** A slot's place in `paneGrid`: 1-based grid lines, `[start, end]`. */
@@ -399,6 +489,11 @@ interface TerminalLayoutStore {
   /** True while a divider is being dragged: panes refit on animation frames
    *  and only tell the PTY their size on pointer-up. */
   resizing: boolean;
+  /** Per workspace, how two or three panes sit at the canvas's current width
+   *  (`splitOrientation`), published by `RunPanes`, which measures it. Live
+   *  state for the layout button; never persisted. */
+  splitByWs: Record<string, "side" | "stacked">;
+  setSplit: (workspaceId: string, orientation: "side" | "stacked") => void;
   /** True while a mode switch's Companion fold glides (`useFoldSettle`):
    *  like `resizing`, panes refit on frames and tell the PTY their size once,
    *  when it settles. Separate from `resizing`, which also stills the glides. */
@@ -436,6 +531,7 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
   mruByWs: {},
   resizing: false,
   settling: false,
+  splitByWs: {},
   talkByWs: stored.talk,
   talkFocusedByWs: {},
 
@@ -498,8 +594,16 @@ export const useTerminalLayoutStore = create<TerminalLayoutStore>((set, get) => 
       const { [workspaceId]: _mru, ...mruByWs } = s.mruByWs;
       const { [workspaceId]: _talk, ...talkByWs } = s.talkByWs;
       const { [workspaceId]: _focused, ...talkFocusedByWs } = s.talkFocusedByWs;
-      return { runByWs, mruByWs, talkByWs, talkFocusedByWs };
+      const { [workspaceId]: _split, ...splitByWs } = s.splitByWs;
+      return { runByWs, mruByWs, talkByWs, talkFocusedByWs, splitByWs };
     }),
+
+  setSplit: (workspaceId, orientation) =>
+    set((s) =>
+      s.splitByWs[workspaceId] === orientation
+        ? s
+        : { splitByWs: { ...s.splitByWs, [workspaceId]: orientation } },
+    ),
 
   setResizing: (resizing) => set((s) => (s.resizing === resizing ? s : { resizing })),
   setSettling: (settling) => set((s) => (s.settling === settling ? s : { settling })),

@@ -46,9 +46,8 @@ import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { TerminalHost } from "./components/TerminalHost";
 import { RunPanes } from "./components/run/RunPanes";
-import { SessionRail } from "./components/run/SessionRail";
+import { LINE_FLOOR_PX, SessionLine } from "./components/run/SessionLine";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
-import { SessionAnchor } from "./components/run/SessionAnchor";
 import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
 import { WorkspaceSearchPalette } from "./components/WorkspaceSearchPalette";
@@ -1336,8 +1335,9 @@ function App() {
   // band costs no extra IPC. The diff stat is only non-zero in review mode —
   // that is the only mode this component fetches `gitDiff` for — which is
   // also the only mode whose tail reads it.
-  // ⌘⌥K — the session switcher (Run mode). Opened from the band anchor too;
-  // "pair" is its Open beside mode (⌘D, the rail flyout, an empty seat).
+  // ⌘⌥K — the session switcher (Run mode). Opened from the session line too
+  // (its `+N` cell, or the one button a narrow band folds the cells into);
+  // "pair" is its Open beside mode (⌘D, a pane caption's menu, an empty seat).
   // "talk" is the same pairing, for Talk's seat.
   const [sessionSwitcher, setSessionSwitcher] = useState<"switch" | "pair" | "talk" | null>(null);
   const openBeside = useCallback(() => void shortcutCtx.openBeside(), [shortcutCtx]);
@@ -1401,9 +1401,9 @@ function App() {
   );
 
   // In Run mode the tail stops reporting and starts working: the session
-  // anchor names the active session and opens the ⌘⌥K switcher, which is what
-  // makes a keyboard-only palette discoverable. With no sessions open there is
-  // nothing to anchor, so the plain "No terminals" reading stands.
+  // line holds one cell per open session, a new-session control and the
+  // layout button. With no sessions open there is nothing to line up, so the
+  // plain "No terminals" reading stands.
   // In Review the tail is a demotion ladder rather than one truncating line,
   // so a narrow band sheds whole atoms instead of ending on "· …".
   const reviewParts = useMemo(
@@ -1412,9 +1412,9 @@ function App() {
   );
   const modeMeta: React.ReactNode =
     activeMode === "run" && activeWorkspaceId && terminals.length > 0 ? (
-      <SessionAnchor
+      <SessionLine
         workspaceId={activeWorkspaceId}
-        onOpen={() => setSessionSwitcher("switch")}
+        onOpenSwitcher={() => setSessionSwitcher("switch")}
       />
     ) : activeMode === "review" && reviewParts && modeMetaText ? (
       <ReviewTail parts={reviewParts} label={modeMetaText} />
@@ -2330,6 +2330,8 @@ function App() {
               onChange={setMode}
               workspaceId={activeWorkspaceId ?? undefined}
               meta={modeMeta}
+              // The session line never loses its floor to a narrow window.
+              tailMin={activeMode === "run" && terminals.length > 0 ? LINE_FLOOR_PX : undefined}
             />
           )}
           <CanvasSplit>
@@ -2360,19 +2362,16 @@ function App() {
                 </ErrorBoundary>
               </ModeOverlay>
 
-              {/* Run panel — the session rail and the slot the focused
-                  session's pane is drawn over. The panes themselves live in
-                  the TerminalHost below, so they survive project switches,
-                  new-project creation and a crash here. */}
+              {/* Run panel — the captioned slots the sessions' panes are
+                  drawn over. The panes themselves live in the TerminalHost
+                  below, so they survive project switches, new-project
+                  creation and a crash here. Switching session lives in the
+                  mode band (the session line), not here and not in the
+                  Companion: collapsing the Companion must never remove the
+                  only way to change session. */}
               <ModeOverlay active={!!activeWorkspace && activeMode === "run"}>
-                {/* The rail lives INSIDE the canvas (not the Companion) so
-                    collapsing the Companion no longer removes the only way
-                    to change session. */}
                 <ErrorBoundary surface="Run">
                 <div className="flex h-full w-full min-h-0">
-                  {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
-                    <SessionRail workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
-                  )}
                   <div className="relative min-w-0 flex-1">
                   {activeWorkspace && activeWorkspaceId && terminals.length > 0 && (
                     <RunPanes workspaceId={activeWorkspaceId} onOpenBeside={openBeside} />
@@ -2747,7 +2746,7 @@ function App() {
         </ErrorBoundary>
       )}
 
-      {/* Session switcher (⌘⌥K / the band anchor). Available with zero
+      {/* Session switcher (⌘⌥K / the session line). Available with zero
           sessions too — its last row opens one, which is exactly what an empty
           workspace needs. */}
       {sessionSwitcher && activeWorkspaceId && (
@@ -3290,7 +3289,7 @@ function RunEmptyState({ onStart }: { onStart: () => Promise<void> | void }) {
         Start a new terminal.
       </div>
       <p className="max-w-md text-[12px] leading-[1.6] text-octo-sage">
-        A terminal opens in the workspace's worktree directory. You can keep several sessions open, switch from the rail, or open them side by side.
+        A terminal opens in the workspace's worktree directory. You can keep several sessions open, switch between them from the line above, or open them side by side.
       </p>
       <button
         type="button"
