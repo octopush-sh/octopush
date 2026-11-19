@@ -236,6 +236,14 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         // which Octopush never requests). Prompts over 272K input tokens cost
         // 2x input/cache and 1.5x output; that tier is not modelled yet.
         "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
+        // The rest of GPT-6: API pricing page (fetched 2026-11-17), the
+        // short-context input / 30-minute write / cached input / output
+        // columns. The long-context tier is not modelled yet.
+        "gpt-6.2-astra" => (8.0, 10.0, 0.40, 40.0),
+        "gpt-6.2-sol" | "gpt-6.1-sol" => (2.0, 2.50, 0.10, 10.0),
+        "gpt-6-astra" => (10.0, 12.50, 1.0, 50.0),
+        "gpt-6-sol" => (2.0, 2.50, 0.20, 10.0),
+        "gpt-6-luna" => (0.10, 0.125, 0.01, 0.50),
         // GPT-4o family: no cache-write charge, so writes cost the input price.
         "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
         "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),

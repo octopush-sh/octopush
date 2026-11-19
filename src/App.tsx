@@ -2205,7 +2205,7 @@ function App() {
         shortcutByWs={shortcutByWs}
       />
 
-      <main className="mx-4 flex min-w-0 flex-1 flex-col overflow-hidden">
+      <main className="mx-[var(--shell-gutter)] flex min-w-0 flex-1 flex-col overflow-hidden">
         {/* TOP HEADER BAND — workspace identity (ticket / name, branch, PR).
             It spans the middle column only: the rail and the Companion are
             both full-height siblings of <main>, so the header sits between
@@ -2236,7 +2236,7 @@ function App() {
             {activeWorkspace ? <shell> : <EmptyState>} conditional was
             unmounting every running PTY whenever the user crossed that
             boundary. */}
-        <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-4">
+        <div className="relative flex min-w-0 flex-1 flex-col overflow-hidden pb-[var(--shell-foot)]">
           {/* MODE BAND — the switcher's own line, spanning the canvas column
               only (the modes govern the canvas, not the Companion). Gated on
               an active workspace like the ContextHeader is: with no workspace

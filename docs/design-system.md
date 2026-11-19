@@ -106,6 +106,7 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 - **Spacing scale (base 4):** `4 · 8 · 12 · 16 · 24 · 32 · 48`. Default gaps: 12 / 16 / 24. Premium breath: 24 / 32.
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
 - **Layout minimums (Talk's terminal seat):** `--talk-chat-min: 44rem` (the conversation keeps the composer at its natural width), `--talk-seat-min: 21rem` (about 40 terminal columns), `--talk-chat-floor: 18rem` (the narrowest the conversation goes, its composer bar wrapped). Mirrored in `tokens.ts` as `talkSeat`.
+- **Shell spacing (2026-11-18):** `--shell-gutter: 8px` (`<main>`'s inset from the rail and from the Companion), `--shell-stack: 8px` (above the ContextHeader, header to mode band, mode band to canvas), `--shell-foot: 8px` (the canvas column's bottom padding). Mirrored in `tokens.ts` as `shell`. The gaps between the app's standing surfaces go through these three, never through a spacing class of their own. See section 8, "Shell spacing".
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
 - **Brass rule: fully deleted (2026-07-11).** The 28px gradient divider (`linear-gradient(90deg, var(--brass), transparent)`), `.animate-brass-grow`, and `@keyframes brassgrow` are **removed from the codebase**, not just retired-for-new-surfaces — there is no legacy allowance left; `grep -rn "linear-gradient" src` returns only non-divider uses (a repeating-stripe running-bar texture, a scrim fade behind tool output, and `mask-image` edge-fades — none of them a rule/line). Use `--hairline` borders or spacing for visual separation; use the solid `--brass-line` token where an *active* connector is needed (see §6, §8).
 
@@ -482,21 +483,38 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 | Surface       | Width | Notes |
 |---------------|-------|-------|
-| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. |
-| ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. |
-| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; in Run that track holds the **session line** (see "Run mode — session navigation"). |
+| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. Groups (project sections and mission folders) are approved and **planned**: see "Rail groups" below. |
+| ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. Pads 12px inline and 6px block; `--shell-stack` above and below it. |
+| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"). |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
-| Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). |
-| Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
+| Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). Ends `--shell-foot` above the status bar. |
+| Companion     | 280px | Per-mode panels, under one grammar (see "Companion grammar" below): Context+History · the active session's detail · Changed+commit · Runs+Jira. Run's panel becomes Context · Changes · Mission (planned). |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
-- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: the active session's detail.
-- **Review** — unified diff. Companion: Changed + commit.
-- **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
+- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: the active session's detail. *Approved 2026-11-18 and planned, not shipped:* Companion: context · changes · mission.
+- **Review** — unified diff. Companion: how the change was built + branch & publish.
+- **Direct** — horizontal assembly-line track + focus pane. Companion: runs + logbook. The 4th mode is per-workspace and optional; the trinity is always present.
 
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
+
+### Shell spacing (2026-11-18)
+
+The air between the standing surfaces is three tokens (section 3), all 8px, on the 4px scale. Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 5.
+
+| Gap | Token | Where it is applied |
+|-----|-------|---------------------|
+| Rail to `<main>`, `<main>` to Companion | `--shell-gutter` | `<main>` in `App.tsx` (`mx-[var(--shell-gutter)]`) |
+| Above the ContextHeader, header to mode band | `--shell-stack` | `ContextHeader.tsx` (`my-[var(--shell-stack)]`) |
+| Mode band to canvas | `--shell-stack` | `ModeBand.tsx` (`mb-[var(--shell-stack)]`) |
+| Canvas foot, above the status bar | `--shell-foot` | the canvas column in `App.tsx` (`pb-[var(--shell-foot)]`) |
+
+Three rules:
+
+1. **The shell is shared.** The same gaps hold in Run, Talk, Review and Direct, and with the rail or the Companion folded. A mode never adds its own outer margin to the canvas. If one mode needs air, it pads inside its own canvas.
+2. **Change the token, not the class.** A surface that sits in the shell reads these tokens; it doesn't restate `8px` or reach for `mx-4`. `shellSpacing.test.ts` checks that the CSS and TypeScript values agree and that these four elements read the tokens.
+3. **Inner spacing is the surface's own.** The tokens govern the gaps *between* surfaces. The rail's rows, the ContextHeader's padding (12px inline, 6px block) and the Companion's sections keep their own scale values.
 
 ### Workspace rail — the index (2026-09-20)
 
@@ -529,7 +547,9 @@ Seven rules, each a direct consequence of §1, §6 and §9:
    latest `at`) and a static 5px brass dot to every other; the active
    workspace and a running one never signal (the marching edge owns that row).
    `.animate-attention-pulse` falls back to a static `--brass-dim` halo under
-   `prefers-reduced-motion`.
+   `prefers-reduced-motion`. *Planned with groups:* when the flagged workspace
+   is hidden by a fold, the beacon walks up to its **nearest visible
+   ancestor** (the group header, or the project line). Still one beacon.
 7. **Collapsed, it is the slim rail.** 44px (the geometry of Review's
    collapsed navigator), 32px cells, the same reserved edge, one cluster per
    project headed by its mark, and a `fixed`
@@ -541,11 +561,48 @@ upright-serif placeholder whose bottom hairline turns brass on focus, and the
 one `+` icon button (Add project) beside it. Hits are washed with the
 found-match tokens (§4). Nothing else in the rail carries a border.
 
-### Run mode — session navigation (2026-11-18)
+#### Rail groups (approved 2026-11-18 · planned, not shipped)
 
-Terminal navigation lives in the mode band, never in the Companion: the
-Companion collapses, and a collapse must not remove the only way to change
-session. Two surfaces, each with one job:
+Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
+Part 1. The groups' data layer has shipped (#909); the rail draws no groups
+yet. This is the record the rail PRs build to.
+
+A **group** is a named, optionally tinted, foldable run of items: one
+membership per item, no nesting, and it survives being emptied (it reads
+`empty` until the user removes it). It adds two row types, so the rail has
+four levels with **one signature each**:
+
+| Level | Signature |
+|-------|-----------|
+| Project group (a section) | A hairline above, then a caps eyebrow: 26px, mono 9px, tracking 0.25em, mute. Its projects are not indented. Fold chevron on hover, focus or while folded. |
+| Project | Hexagon + serif name (rule 5, unchanged). |
+| Mission group (a folder) | A 28px header: an always-visible chevron in the monogram column, the name in mono 11px, normal case, sage. Its members are indented 14px beside a 1px guide that stops at the last member. |
+| Mission | Glyph + sans name (rule 3, unchanged). |
+
+Each cue means one thing: a hairline with an eyebrow is always a section of
+projects; indentation with a guide is always one group of missions. Neither
+is used for anything else in the rail.
+
+**The tint rule.** A group's tint is drawn on its own two marks only: its
+chevron and its guide (the guide at 50% opacity). **Monograms are never
+recoloured**, so rule 3 stands as written. A project's hexagon may take its
+section's tint, and only when the project has no tint of its own. The palette
+is the seven `TINTS` of `lib/monogram.ts` plus None; no new hues, and brass
+is never a group's default. The name always carries the meaning; the tint is
+a secondary cue (WCAG 1.4.1).
+
+Folding uses the grid-rows idiom and persists like the project fold; a live
+filter unfolds everything without touching the stored state. Folded headers
+show aggregates under rule 4. State stays on rows: a folded group never
+marches. Collapsed (44px), a mission group keeps its guide as a 1px tinted
+line beside its monograms, under a 12px tinted chevron titled with its name.
+
+### Run mode — session navigation (shipped 2026-11-18)
+
+Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
+Parts 2 and 3. Terminal navigation lives in the mode band, never in the
+Companion: the Companion collapses, and a collapse must not remove the only
+way to change session. Two surfaces, each with one job:
 
 - **The session line switches.** The band's right track holds one 24px cell per
   session, in session order, then `+`, a hairline and the layout button. It
@@ -616,6 +673,59 @@ The rules, reusable wherever a set of live things needs a compact switcher:
 The band's status tail may become a **control** when the mode has one worth
 having — in Run it is the session line (`ModeBand` takes a `ReactNode`). A
 keyboard-only switcher is a switcher nobody finds.
+
+**Where the shipped work differs from the spec**, each because of what the
+code can do today:
+
+- **Close has no Undo.** A closed session's shell and scrollback are gone
+  (`delete_terminal` removes the row and kills the PTY), so there is nothing
+  to restore. Closing stays immediate, as it was, and the menu row reads
+  *Close session*, without the ellipsis that would promise a second step.
+- **Cells can't be dragged to reorder.** `terminals.position` is stored, but
+  no command changes it. Reordering needs that command first.
+- **`+` names no shortcut.** `⌘T` is only a hint in the command palette (where
+  it labels opening a workspace); no key is bound to "new session".
+- **The attention dot keeps the rule it had:** a session that rang, or waits,
+  and is *not the one in focus* (the spec says "off screen"). A session put on
+  screen in an unfocused pane keeps its dot until it is answered.
+- **The layout menu has one more row.** With two or three panes it adds
+  *Automatic orientation*: the way back to the 72-column rule once a two-pane
+  row has set an override. A layout that needs more panes than the workspace
+  has sessions (plus the one empty seat) is disabled rather than filled with
+  several empty seats, and a smaller layout never takes the focused session's
+  pane off screen.
+- **The narrow ladder goes further than its floor.** A small window with the
+  rail and the Companion both open leaves the band's right track too narrow
+  for the focused cell, `+` and the layout button together (the mode switcher
+  is centred and keeps its labels). There the line keeps shedding whole
+  controls rather than draw over the switcher, down to the one button that
+  opens `⌘⌥K`.
+
+### Companion grammar (2026-11-18)
+
+Three rules for the Companion in every mode. Talk, Review and Direct already
+follow rules 1 and 2; new Companion work follows all three.
+
+1. **The Companion never repeats the canvas.** It shows what surrounds the
+   work on the canvas: what the canvas can't say about itself.
+2. **It follows the focus.** Its content describes the focused thing (the open
+   chat, the focused pane, the selected run), and says which one when more
+   than one is on screen.
+3. **A section that doesn't apply is not drawn.** When a section has no
+   meaning for the focused thing (a context meter for a plain shell), it folds
+   away through the grid-rows idiom; nothing is invented to fill it. A section
+   that applies but is empty keeps its one calm line ("No runs yet", "The
+   working tree is clean."); those empty states stay.
+
+| Mode | Canvas | The Companion answers |
+|------|--------|-----------------------|
+| Talk | The conversation | Which chats; how full the context is and what it cost |
+| Review | The diff | How the change was built; where the branch stands |
+| Direct | The run | The runs and the logbook |
+| Run | Terminals | Today: the active session's detail, which repeats the canvas. *Planned:* **Context** (the focused agent session's context meter, spend, cache share and model; folds away for a non-agent session) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (intent, ticket, time and spend today) |
+
+Run's three sections are approved and **planned, not shipped**: spec
+`docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 4.
 
 ### Direct mode — canvas patterns
 
