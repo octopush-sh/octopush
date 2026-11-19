@@ -17,7 +17,8 @@ const MODE_TOUR: Record<WorkspaceMode, string> = {
  *  *execute something* to one developer and *where my shells are* to another.
  *  Icons go on all four segments — iconising only Run would read as a special
  *  case rather than a mode — and the labels stay, because mode navigation is
- *  where a wrong guess costs the most. */
+ *  where a wrong guess costs the most. Only a band of 600px or less sheds
+ *  them, and only on the inactive modes, which keep their icon and tooltip. */
 const MODE_ICON: Record<WorkspaceMode, LucideIcon> = {
   run: SquareTerminal,
   talk: MessageSquare,
@@ -71,6 +72,11 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
     if (typeof ResizeObserver !== "undefined" && groupRef.current) {
       ro = new ResizeObserver(measure);
       ro.observe(groupRef.current);
+      // The segments too: on a narrow band the inactive ones shed their
+      // labels (`.octo-demote-mode-label`), and two modes can trade labels of
+      // the same width, which moves the active segment without resizing the
+      // group.
+      for (const el of btnRefs.current.values()) ro.observe(el);
     }
     window.addEventListener("resize", measure);
     return () => {
@@ -122,6 +128,9 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
             data-tour={MODE_TOUR[m]}
             onClick={() => onChange(m)}
             aria-pressed={active}
+            // Named outright: on a narrow band an inactive mode is its icon
+            // alone, and a hidden label names nothing.
+            aria-label={pulse ? `${MODE_LABELS[m]} needs your attention` : MODE_LABELS[m]}
             title={
               pulse
                 ? `${MODE_LABELS[m]} needs your attention`
@@ -133,7 +142,7 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
               // Roomier than the old companion-header tabs (px-2.5 py-1): the
               // band gives the control a line of its own, and the space it
               // buys goes into hit targets rather than point size.
-              "relative z-10 inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass",
+              "octo-mode-seg relative z-10 inline-flex items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.2em] transition-colors duration-[280ms] ease-[cubic-bezier(0.2,0.8,0.3,1)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass",
               active ? "text-octo-brass" : "text-octo-mute hover:text-octo-sage",
               pulse && "animate-attention-pulse !text-octo-brass",
             )}
@@ -142,7 +151,9 @@ export function ModeSwitcher({ mode, onChange, workspaceId }: Props) {
               const Icon = MODE_ICON[m];
               return <Icon size={13} strokeWidth={1.75} aria-hidden />;
             })()}
-            {MODE_LABELS[m]}
+            {/* A rung of the band's ladder (styles.css, `.octo-modeband`):
+                the active mode always keeps its label. */}
+            <span className="octo-demote octo-demote-mode-label">{MODE_LABELS[m]}</span>
           </button>
         );
       })}

@@ -25,9 +25,10 @@ export const MENU_DANGER =
   "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-rouge transition hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge";
 
 /** Destructive row that stays quiet until pointed at: sage at rest, rouge on
- *  hover — for a destructive item at the foot of an otherwise everyday menu. */
+ *  hover and on keyboard focus alike (the arrow keys land on it too) — for a
+ *  destructive item at the foot of an otherwise everyday menu. */
 export const MENU_ITEM_ROUGE =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge";
+  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--rouge-ghost)] hover:text-octo-rouge focus-visible:bg-[var(--rouge-ghost)] focus-visible:text-octo-rouge focus-visible:outline-none";
 
 /** Destructive two-line row (label + muted hint). */
 export const MENU_DANGER_MULTILINE =

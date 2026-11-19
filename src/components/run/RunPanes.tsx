@@ -21,10 +21,12 @@ import { sessionDoing } from "../../lib/sessionDoing";
 import { terminalCellWidth } from "../../lib/xtermTheme";
 import { MENU_HEADER, MENU_ITEM, MENU_ITEM_ROUGE, MENU_SEP } from "../../lib/menuStyles";
 import { tourId } from "../../lib/tour/ids";
+import { useAnchoredMenu } from "../../lib/useAnchoredMenu";
 import { MenuSurface } from "../MenuSurface";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { PaneWaiting } from "./PaneWaiting";
+import { closeAsksFirst, useCloseSession } from "./useCloseSession";
 
 interface Props {
   workspaceId: string;
@@ -332,10 +334,9 @@ function PaneCaption({
 }: CaptionProps) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
   const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
-  const deleteTerminal = useTerminalsStore((s) => s.deleteTerminal);
+  const [requestClose, closeConfirm] = useCloseSession(workspaceId);
   const setup = useTerminalsStore((s) => (terminalId ? s.setupByTerminal[terminalId] : undefined));
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const menuWasOpen = useRef(false);
+  const actions = useAnchoredMenu((r) => ({ x: r.right - 224, y: r.bottom + 4 }));
   const [draft, setDraft] = useState<string | null>(null);
   const nameRef = useRef<HTMLButtonElement>(null);
   const refocusName = useRef(false);
@@ -376,10 +377,7 @@ function PaneCaption({
     setDraft(null);
   };
 
-  const menuItem = (run: () => void) => () => {
-    setMenu(null);
-    run();
-  };
+  const menuItem = actions.pick;
 
   return (
     <div
@@ -393,7 +391,9 @@ function PaneCaption({
         if (e.currentTarget.contains(e.target as Node)) onFocus();
       }}
       className={`octo-rise-in group/caption flex h-8 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel pl-2.5 pr-1.5 transition-shadow duration-[var(--dur-standard)] ${
-        focused ? "shadow-[inset_0_-1px_0_var(--color-octo-border-strong)]" : ""
+        // The line says which pane has the focus, so it is drawn only where
+        // there is more than one to tell apart.
+        focused && split ? "shadow-[inset_0_-1px_0_var(--color-octo-border-strong)]" : ""
       }`}
     >
       {session ? (
@@ -508,24 +508,11 @@ function PaneCaption({
             type="button"
             aria-label="Session actions"
             title="Session actions"
-            aria-haspopup="menu"
-            aria-expanded={menu !== null}
             data-testid={`run-pane-menu-${slot}`}
             // Open beside lives in this menu now: released tours that point
             // at `run-open-beside` land on the button that leads to it.
             data-tour={slot === 0 ? tourId("run-open-beside") : undefined}
-            onMouseDown={() => {
-              menuWasOpen.current = menu !== null;
-            }}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (menuWasOpen.current) {
-                menuWasOpen.current = false;
-                return;
-              }
-              const r = e.currentTarget.getBoundingClientRect();
-              setMenu({ x: r.right - 224, y: r.bottom + 4 });
-            }}
+            {...actions.buttonProps}
             className={CAPTION_BUTTON}
           >
             <MoreHorizontal size={14} strokeWidth={1.75} aria-hidden />
@@ -550,8 +537,8 @@ function PaneCaption({
         </button>
       )}
 
-      {menu && session && (
-        <MenuSurface x={menu.x} y={menu.y} ariaLabel="Session actions" onDismiss={() => setMenu(null)}>
+      {actions.menu && session && (
+        <MenuSurface x={actions.menu.x} y={actions.menu.y} ariaLabel="Session actions" onDismiss={actions.close}>
           <div className={MENU_HEADER}>{session.label}</div>
           <button
             type="button"
@@ -613,14 +600,21 @@ function PaneCaption({
             type="button"
             role="menuitem"
             data-testid={`run-pane-close-${slot}`}
-            title="Ends the session and whatever runs in it"
+            title={
+              closeAsksFirst(session)
+                ? "Something is running in it: you are asked before it ends"
+                : "Ends the session; it can't be reopened"
+            }
             className={MENU_ITEM_ROUGE}
-            onClick={menuItem(() => void deleteTerminal(workspaceId, session.id))}
+            onClick={menuItem(() => requestClose(session))}
           >
-            Close session
+            {/* The ellipsis is a promise of a second step, so it shows only
+                when there is one. */}
+            {closeAsksFirst(session) ? "Close session…" : "Close session"}
           </button>
         </MenuSurface>
       )}
+      {closeConfirm}
     </div>
   );
 }

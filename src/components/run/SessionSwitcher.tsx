@@ -8,6 +8,7 @@ import { ROLE_WORD } from "../../lib/sessionRole";
 import { tourId } from "../../lib/tour/ids";
 import { useAttentionStore, type TerminalWait } from "../../stores/attentionStore";
 import { claudeWaitingCopy, type ClaudeWaitReason } from "../../lib/claudeWaiting";
+import { useCloseSession } from "./useCloseSession";
 
 /** What a session is waiting on, for ordering: `since` is null when the wait
  *  started on screen (a pane caption's mark keeps no start time). */
@@ -118,6 +119,14 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   // closed perfectly well.
   const deleting = useRef(new Set<string>());
   const inputRef = useRef<HTMLInputElement>(null);
+  // ⌫ closes the selected session; one with something running asks first.
+  const [requestClose, closeConfirm] = useCloseSession(workspaceId, (id) => {
+    deleting.current.add(id);
+    void deleteTerminal(workspaceId, id).finally(() => {
+      deleting.current.delete(id);
+    });
+    setSel(0);
+  });
 
   const waits = useAttentionStore((s) => s.waitsByTerminal);
   const shownWaiting = useAttentionStore((s) => s.waitingByTerminal);
@@ -181,15 +190,12 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
       const row = matches[selected];
       if (!row || deleting.current.has(row.t.id)) return;
       e.preventDefault();
-      deleting.current.add(row.t.id);
-      void deleteTerminal(workspaceId, row.t.id).finally(() => {
-        deleting.current.delete(row.t.id);
-      });
-      setSel(0);
+      // A busy session asks first (`useCloseSession`); an idle one goes now.
+      requestClose(row.t);
     }
   };
 
-  return (
+  const palette = (
     <ModalShell
       onClose={onClose}
       align="top"
@@ -337,5 +343,14 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
         </div>
       </div>
     </ModalShell>
+  );
+
+  // The confirm is the palette's sibling, not its child: a key pressed in it
+  // must not bubble into the palette's own handlers.
+  return (
+    <>
+      {palette}
+      {closeConfirm}
+    </>
   );
 }

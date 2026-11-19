@@ -69,6 +69,10 @@ describe("RunPanes", () => {
     expect(caption).toHaveTextContent("shell at the prompt");
     expect(caption.dataset.focused).toBe("true");
     expect(caption.className).toContain("h-8");
+    // Alone there is no other pane to tell it from: no focus line, only the
+    // hairline every caption has.
+    expect(caption.className).not.toContain("border-strong");
+    expect(screen.getByTestId("run-pane-name-0").className).toContain("text-octo-ivory");
     expect(screen.queryByRole("separator")).toBeNull();
     // Leaving is for a split view only.
     expect(screen.queryByTestId("run-pane-leave-0")).toBeNull();
@@ -172,20 +176,94 @@ describe("RunPanes", () => {
     expect(document.querySelector("svg.lucide-x")).toBeNull();
   });
 
-  it("closes a session only from its menu, by name", async () => {
+  it("closes an idle session at once, only from its menu, by name", async () => {
     seed(["a", "b"], ["a", "b"], 0);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+    // No ellipsis: nothing follows the click.
     const close = screen.getByRole("menuitem", { name: "Close session" });
-    // Quiet until pointed at: sage at rest, rouge on hover.
+    // Quiet until pointed at: sage at rest, rouge on hover and on keyboard focus.
     expect(close.className).toContain("text-octo-sage");
     expect(close.className).toContain("hover:text-octo-rouge");
+    expect(close.className).toContain("hover:bg-[var(--rouge-ghost)]");
+    expect(close.className).toContain("focus-visible:text-octo-rouge");
+    expect(close.className).toContain("focus-visible:bg-[var(--rouge-ghost)]");
     await act(async () => {
       fireEvent.click(close);
     });
+    expect(screen.queryByRole("dialog")).toBeNull();
     expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
     expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a"]);
     expect(run().slots).toEqual(["a"]);
+  });
+
+  it("asks before closing a session that is busy, and keeps it unless told to close", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    patch("b", { busy: true, command: "claude", role: "agent" });
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const openMenu = () => fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+
+    openMenu();
+    // The ellipsis promises the question that follows.
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    const dialog = screen.getByRole("dialog", { name: "Confirm closing the session" });
+    expect(dialog).toHaveTextContent("Close this session while it works?");
+    expect(dialog).toHaveTextContent("claude is still running in Label b.");
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    // The safe answer has the focus; the other is an upright-serif rouge phrase.
+    const keep = screen.getByRole("button", { name: "Keep the session" });
+    expect(document.activeElement).toBe(keep);
+    const confirm = screen.getByRole("button", { name: "Close the session" });
+    expect(confirm.className).toContain("font-serif");
+    expect(confirm.className).toContain("text-octo-rouge");
+    expect(confirm.className).not.toContain("italic");
+
+    fireEvent.click(keep);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+
+    // Escape keeps it too.
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(useTerminalsStore.getState().getTerminals(WS)).toHaveLength(2);
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close the session" }));
+    });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a"]);
+  });
+
+  it("the ⋯ button toggles its menu, and gets the focus back when the menu closes", () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const button = screen.getByTestId("run-pane-menu-0");
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    // One real press on the open menu's button: closed on mousedown, and the
+    // click that follows does not open it again.
+    fireEvent.mouseDown(button);
+    fireEvent.click(button);
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.mouseDown(button);
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    // A pick too: swapping leaves the keyboard on the button that opened the menu.
+    fireEvent.click(button);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Label b" }));
+    expect(run().slots).toEqual(["b", "a"]);
+    expect(document.activeElement).toBe(button);
   });
 
   it("renames in place: double-click, Enter commits, Escape abandons, an empty name is rejected", () => {

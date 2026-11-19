@@ -403,6 +403,19 @@ The dot-for-label swap at the last rung is §9's "a state shown by a dot does no
 
 **Shedding by measured width (2026-11-03; born in the Review status tail).** A fixed container breakpoint only works when the rungs have fixed widths. The Review tail's rungs hold counts ("changed", then "· +2 −1"; floor "2 files"), so `ReviewTail.tsx` measures each rung's natural width against the track's and sheds through `.octo-demote-shed` (`rungsToShed`). The motion is the same. This only works when the measured box is sized by its parent (a grid track) and never by the content it sheds, so shedding can't feed back into the measurement.
 
+**The mode band's ladder (2026-11-18; born with Run's session line).** The band (`.octo-modeband`, `ModeBand.tsx`) is its own `@container`. Its switcher is centred and its tail sits in the right track, so on a narrow canvas the two want the same pixels, and what gives way is declared:
+
+| Rung | Sheds | Where it survives |
+|------|-------|-------------------|
+| ≤ 720px, beside a control tail (Run's session line) | the **inactive** modes' labels → their icon | each segment's `title` (`Review (⌘⇧3)`) and accessible name |
+| ≤ 600px, in every mode | the same labels | the same |
+| ≤ 334px | a control tail, whole (`visibility: hidden`, so nothing clipped stays in the tab order) | `⌘⌥K` and the session shortcuts |
+| floor | *nothing more* — the switcher, and the **active** mode's label: the band never stops naming where you are | — |
+
+A redundant word goes before a session's cell does: beside the session line the labels shed sooner (720px), because they buy the line about 73px, six cells instead of a fold; with a read-out tail they stay until a centred, fully labelled switcher would leave each side track under 120px (600px). The label is a rung inside a button (`.octo-demote-mode-label`): no gap or focus-ring room of its own, and a negative margin that eats the button's icon gap. The switcher's indicator re-measures as the segments resize.
+
+The right track also has a **floor of its own** when the tail is a control: `ModeBand`'s `tailMin` (the session line's `LINE_FLOOR_PX`, 119px: the fold button, the focused session's cell, `+`, the hairline and the layout button). The grid is `minmax(0,1fr) auto minmax(tailMin,1fr)`, so when room runs short the empty left track gives up its share first and the switcher slides off centre rather than the control losing a button. A read-out tail (Talk, Review, Direct) has no floor and truncates in its track as before, with more room than it had.
+
 ### Stability doctrine (binding for live surfaces; born in Direct)
 
 - **S1 — Fixed-slot live text.** Text that changes while something runs lives in a fixed-height truncating slot that exists in every state — content changes never resize the container.
@@ -485,8 +498,8 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 |---------------|-------|-------|
 | Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. Groups (project sections and mission folders) are approved and **planned**: see "Rail groups" below. |
 | ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. Pads 12px inline and 6px block; `--shell-stack` above and below it. |
-| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"). |
-| ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
+| ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"), and keeps a floor for it. The band is its own `@container` and ladder: narrow, the switcher's inactive modes shed their labels (see "The mode band's ladder" under the elision doctrine). |
+| ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most; only a narrow band sheds them, and only on the inactive modes, which keep icon, tooltip and name. |
 | Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). Ends `--shell-foot` above the status bar. |
 | Companion     | 280px | Per-mode panels, under one grammar (see "Companion grammar" below): Context+History · the active session's detail · Changed+commit · Runs+Jira. Run's panel becomes Context · Changes · Mission (planned). |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
@@ -663,12 +676,27 @@ The rules, reusable wherever a set of live things needs a compact switcher:
   (`PaneLayoutIcon`: one frame and its dividers, a single family for one to
   four panes). Pane count and orientation are chosen there, not in a pane's
   menu: they belong to the view, not to a session.
-- **Narrow, it sheds whole atoms** (E2). The cells fold from the left into one
-  `N sessions` button that opens `⌘⌥K`; the focused session's cell, `+` and
-  the layout button stay. Narrower still the button becomes an icon, then the
-  layout button, `+` and the focused cell go, in that order: the door to every
-  session is the last thing to leave. Past eight sessions the last cell reads
-  `+N`. The line is clipped to its track and never draws over the switcher.
+- **Narrow, it sheds whole atoms, down to a floor** (E2). The cells fold from
+  the left into one `N sessions` button that opens `⌘⌥K`; narrower still that
+  button is a list icon. The fold button, the focused session's cell, `+` and
+  the layout button are the floor and never go: the mode band reserves their
+  width (`tailMin`) and sheds the switcher's inactive labels to make room
+  (see "The mode band's ladder" under the elision doctrine). Past eight
+  sessions the last cell reads `+N`.
+- **A menu's button toggles it, and gets the focus back.** A press on `⋯` or
+  on the layout button while its menu is open closes it and does not open it
+  again; when the menu closes (Escape, a press elsewhere, a pick), keyboard
+  focus returns to the button (`useAnchoredMenu`). A destructive row is rouge
+  on keyboard focus as well as on hover.
+- **Closing asks only when something would be lost mid-flight.** An idle
+  session closes at once. A busy one (an agent or a command running in it)
+  opens a confirm on `ModalShell`, like the Abort confirm: a short question,
+  *Keep the session* focused, an upright-serif rouge *Close the session*,
+  Escape keeps it. The menu row carries its ellipsis only in that case, and
+  `⌘⌥K`'s `⌫` follows the same rule (`useCloseSession`).
+- **The focus line needs something to tell apart.** The `border-strong` line
+  under the focused pane's caption is drawn only in a split view; alone, a
+  caption keeps its hairline.
 
 The band's status tail may become a **control** when the mode has one worth
 having — in Run it is the session line (`ModeBand` takes a `ReactNode`). A
@@ -679,12 +707,12 @@ code can do today:
 
 - **Close has no Undo.** A closed session's shell and scrollback are gone
   (`delete_terminal` removes the row and kills the PTY), so there is nothing
-  to restore. Closing stays immediate, as it was, and the menu row reads
-  *Close session*, without the ellipsis that would promise a second step.
+  to restore and no toast to offer it. Instead a busy session asks before it
+  closes, and an idle one closes at once, as it always did.
 - **Cells can't be dragged to reorder.** `terminals.position` is stored, but
   no command changes it. Reordering needs that command first.
-- **`+` names no shortcut.** `⌘T` is only a hint in the command palette (where
-  it labels opening a workspace); no key is bound to "new session".
+- **`+` names no shortcut.** No key is bound to "new session". (`⌘T` was only
+  a hint in the command palette, never a binding; the hint is gone.)
 - **The attention dot keeps the rule it had:** a session that rang, or waits,
   and is *not the one in focus* (the spec says "off screen"). A session put on
   screen in an unfocused pane keeps its dot until it is answered.
@@ -694,12 +722,11 @@ code can do today:
   has sessions (plus the one empty seat) is disabled rather than filled with
   several empty seats, and a smaller layout never takes the focused session's
   pane off screen.
-- **The narrow ladder goes further than its floor.** A small window with the
-  rail and the Companion both open leaves the band's right track too narrow
-  for the focused cell, `+` and the layout button together (the mode switcher
-  is centred and keeps its labels). There the line keeps shedding whole
-  controls rather than draw over the switcher, down to the one button that
-  opens `⌘⌥K`.
+- **The floor costs the switcher its centre and its inactive labels.** The
+  spec's floor (the focused cell, `+` and the layout button always stay) did
+  not fit a small window with the rail and the Companion both open while the
+  switcher stayed centred and fully labelled. The band's ladder pays for it:
+  the labels shed, and below that the switcher slides left.
 
 ### Companion grammar (2026-11-18)
 

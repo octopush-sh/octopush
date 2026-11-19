@@ -317,6 +317,37 @@ describe("SessionSwitcher", () => {
     resolve();
   });
 
+  it("asks before ⌫ closes a session that is busy; Escape keeps it and the palette stays", async () => {
+    seed([
+      { id: "a", label: "agent", busy: true, command: "claude", role: "agent" },
+      { id: "b", label: "dev" },
+    ]);
+    mockIpc.deleteTerminal.mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    render(<SessionSwitcher workspaceId={WS} onClose={onClose} />);
+    const input = screen.getByTestId("session-switcher-input");
+
+    fireEvent.keyDown(input, { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    const dialog = screen.getByRole("dialog", { name: "Confirm closing the session" });
+    expect(dialog).toHaveTextContent("claude is still running in agent.");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Keep the session" }));
+
+    // Escape answers the question on top, not the palette under it.
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog", { name: "Confirm closing the session" })).toBeNull();
+    expect(onClose).not.toHaveBeenCalled();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(screen.getByTestId("session-switcher-row-a")).toBeInTheDocument();
+
+    fireEvent.keyDown(input, { key: "Backspace" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close the session" }));
+    });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("a");
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledTimes(1);
+  });
+
   it("opens a new session from the last row", () => {
     seed([{ id: "a", label: "main" }]);
     mockIpc.createTerminal.mockResolvedValue({ id: "new", label: "Terminal 2", position: 1 });

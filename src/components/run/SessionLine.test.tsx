@@ -22,7 +22,7 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useAttentionStore } = await import("../../stores/attentionStore");
 const { useTerminalLayoutStore, evenRatios } = await import("../../stores/terminalLayoutStore");
-const { SessionLine, MAX_CELLS, lineWidth, planLine, visibleSessions } = await import("./SessionLine");
+const { SessionLine, MAX_CELLS, LINE_FLOOR_PX, lineWidth, planLine, visibleSessions } = await import("./SessionLine");
 
 const WS = "ws-line";
 const noop = () => {};
@@ -335,6 +335,23 @@ describe("SessionLine — the instant label", () => {
     expect(screen.queryByTestId("session-label")).toBeNull();
   });
 
+  it("goes when a session opens or closes and the cells shift under it", () => {
+    vi.useFakeTimers();
+    seed([{ id: "a", label: "first" }, { id: "b", label: "second" }, { id: "c", label: "third" }]);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    fireEvent.mouseEnter(cell("c").parentElement!);
+    expect(screen.getByTestId("session-label")).toHaveTextContent("third");
+    // "b" closes: "c" slides one cell to the left, under a label measured
+    // against where it used to be.
+    act(() =>
+      useTerminalsStore.setState((s) => ({
+        terminalsByWs: { ...s.terminalsByWs, [WS]: s.terminalsByWs[WS].filter((t) => t.id !== "b") },
+      })),
+    );
+    act(() => void vi.advanceTimersByTime(130));
+    expect(screen.queryByTestId("session-label")).toBeNull();
+  });
+
   it("opens on keyboard focus, not on the focus a press gives", () => {
     vi.useFakeTimers();
     seed([{ id: "a", label: "first" }, { id: "b", label: "second" }]);
@@ -505,6 +522,43 @@ describe("SessionLine — the layout button", () => {
     expect(run().slots).toEqual(["s1", "s2", null]);
   });
 
+  it("toggles: a click on the button while its menu is open closes it, and does not reopen it", () => {
+    seed(many(4), ["s1"]);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    const button = screen.getByTestId("session-layout");
+    expect(button).toHaveAttribute("aria-expanded", "false");
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    expect(button).toHaveAttribute("aria-expanded", "true");
+    // A real press: the menu's outside-press closes it on mousedown, and the
+    // click that completes the same press must not open it again.
+    fireEvent.mouseDown(button);
+    expect(screen.queryByRole("menu")).toBeNull();
+    fireEvent.click(button);
+    expect(screen.queryByRole("menu")).toBeNull();
+    // The next press opens it as usual.
+    fireEvent.mouseDown(button);
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
+  it("gives focus back to the button when Escape or a pick closes the menu", () => {
+    seed(many(4), ["s1"]);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    const button = screen.getByTestId("session-layout");
+    fireEvent.click(button);
+    expect(document.activeElement).not.toBe(button);
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    fireEvent.click(button);
+    fireEvent.click(item("Three"));
+    expect(run().slots).toHaveLength(3);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(button);
+  });
+
   it("reaches every row from the keyboard", () => {
     seed(many(4), ["s1"]);
     render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
@@ -594,17 +648,30 @@ describe("SessionLine — a narrow band", () => {
     expect(screen.getByTestId("session-more-bell")).toBeInTheDocument();
   });
 
-  it("sheds whole controls as the track narrows, the door to the sessions last", () => {
-    const full = { cells: "all", counter: "none", newSession: true, layout: true };
+  it("folds on a ladder that stops at its floor: the fold button, the focused cell, + and layout", () => {
+    const full = { cells: "all", counter: "none" };
     // Unmeasured (jsdom, a hidden canvas): nothing is decided.
     expect(planLine(0, 6, false)).toEqual(full);
     expect(planLine(lineWidth(6, false), 6, false)).toEqual(full);
     expect(planLine(lineWidth(7, true), 7, true)).toEqual({ ...full, counter: "more" });
-    expect(planLine(lineWidth(6, false) - 1, 6, false)).toEqual({ cells: "focused", counter: "sessions", newSession: true, layout: true });
-    expect(planLine(140, 6, false)).toEqual({ cells: "focused", counter: "list", newSession: true, layout: true });
-    expect(planLine(90, 6, false)).toEqual({ cells: "focused", counter: "list", newSession: true, layout: false });
-    expect(planLine(60, 6, false)).toEqual({ cells: "focused", counter: "list", newSession: false, layout: false });
-    expect(planLine(30, 6, false)).toEqual({ cells: "none", counter: "list", newSession: false, layout: false });
+    expect(planLine(lineWidth(6, false) - 1, 6, false)).toEqual({ cells: "focused", counter: "sessions" });
+    // Narrower: the button is an icon, and nothing else ever goes.
+    for (const width of [140, 117, 90, 60, 30, 1]) {
+      expect(planLine(width, 6, false)).toEqual({ cells: "focused", counter: "list" });
+    }
+    // The floor the mode band reserves holds exactly that: four 24px controls,
+    // the 13px hairline, the gaps, and the root's 1px padding each side.
+    expect(LINE_FLOOR_PX).toBe(24 * 4 + 13 + 2 * 4 + 2);
+  });
+
+  it("keeps the focused cell, + and the layout button however narrow the track", () => {
+    track(40);
+    seed(many(6), ["s3"]);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    expect(screen.getAllByRole("tab")).toEqual([cell("s3")]);
+    expect(screen.getByTestId("session-more")).toHaveAccessibleName("All 6 sessions");
+    expect(screen.getByTestId("session-new")).toBeInTheDocument();
+    expect(screen.getByTestId("session-layout")).toBeInTheDocument();
   });
 
   it("names the icon-only sessions button", () => {

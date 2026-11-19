@@ -13,6 +13,7 @@ import {
 } from "../../stores/terminalLayoutStore";
 import { useAttentionStore } from "../../stores/attentionStore";
 import { useModifierPeek } from "../../hooks/useModifierPeek";
+import { useAnchoredMenu } from "../../lib/useAnchoredMenu";
 import { iconForSessionRole } from "../../lib/roleIcons";
 import { sessionDoing } from "../../lib/sessionDoing";
 import { describeSetup } from "../../lib/setupRun";
@@ -60,15 +61,13 @@ export function visibleSessions(
   return { shown, more: ids.length - shown.length };
 }
 
-/** What the line shows at a given width. */
+/** What the line shows at a given width. `+` and the layout button always do. */
 export interface LinePlan {
-  /** Every session's cell, or only the focused session's, or none. */
-  cells: "all" | "focused" | "none";
+  /** Every session's cell, or only the focused session's. */
+  cells: "all" | "focused";
   /** The button that opens ⌘⌥K: `+N` after the cells, or the folded line's
    *  `N sessions`, which becomes a list icon when that is all that fits. */
   counter: "none" | "more" | "sessions" | "list";
-  newSession: boolean;
-  layout: boolean;
 }
 
 /** Atoms laid in a row with the line's gap between them. */
@@ -81,32 +80,30 @@ export function lineWidth(cells: number, hasMore: boolean): number {
 }
 
 /**
+ * The line's floor: the fold button as an icon, the focused session's cell,
+ * `+`, the hairline and the layout button, plus the root's 1px padding each
+ * side. The mode band keeps its right track at least this wide in Run
+ * (`ModeBand`'s `tailMin`), so the floor always fits and switching is never
+ * lost to a narrow window.
+ */
+export const LINE_FLOOR_PX = row(CELL_PX, CELL_PX, CELL_PX, RULE_PX, CELL_PX) + 2;
+
+/**
  * The line on its demotion ladder: it sheds whole atoms, never half of one.
  * While the cells fit they all show. Too narrow, they fold from the left into
- * one `N sessions` button that opens ⌘⌥K, and the focused session's cell,
- * `+` and the layout button stay. A track narrower still (a small window
- * with the rail and the Companion both open) turns the button into a list
- * icon, then gives up the layout button, `+` and the focused cell, in that
- * order: the door to every session is the last thing to go. An unmeasured
- * track (jsdom, a hidden canvas) decides nothing, and the cells stay.
+ * one `N sessions` button that opens ⌘⌥K; narrower still that button is a
+ * list icon. That is the floor: the fold button, the focused session's cell,
+ * `+` and the layout button never go. An unmeasured track (jsdom, a hidden
+ * canvas) decides nothing, and the cells stay.
  */
 export function planLine(available: number, cells: number, hasMore: boolean): LinePlan {
   if (available <= 0 || lineWidth(cells, hasMore) <= available) {
-    return { cells: "all", counter: hasMore ? "more" : "none", newSession: true, layout: true };
+    return { cells: "all", counter: hasMore ? "more" : "none" };
   }
   if (row(SESSIONS_PX, CELL_PX, CELL_PX, RULE_PX, CELL_PX) <= available) {
-    return { cells: "focused", counter: "sessions", newSession: true, layout: true };
+    return { cells: "focused", counter: "sessions" };
   }
-  if (row(CELL_PX, CELL_PX, CELL_PX, RULE_PX, CELL_PX) <= available) {
-    return { cells: "focused", counter: "list", newSession: true, layout: true };
-  }
-  if (row(CELL_PX, CELL_PX, CELL_PX) <= available) {
-    return { cells: "focused", counter: "list", newSession: true, layout: false };
-  }
-  if (row(CELL_PX, CELL_PX) <= available) {
-    return { cells: "focused", counter: "list", newSession: false, layout: false };
-  }
-  return { cells: "none", counter: "list", newSession: false, layout: false };
+  return { cells: "focused", counter: "list" };
 }
 
 // ─── The instant label ────────────────────────────────────────────
@@ -235,10 +232,8 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
 
   const rootRef = useRef<HTMLDivElement>(null);
   const [available, setAvailable] = useState(0);
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  // A press on the layout button while its menu is open closes it (the menu's
-  // outside-press does); the click that follows must not open it again.
-  const menuWasOpen = useRef(false);
+  // Right-aligned under the button; the menu clamps to the viewport.
+  const layoutMenu = useAnchoredMenu((r) => ({ x: r.right - 224, y: r.bottom + 6 }));
   // A cell focused by a press is being clicked, not read: only keyboard focus
   // opens the label, and a label the keyboard opened outlives the pointer.
   const pressed = useRef(false);
@@ -267,8 +262,7 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const all = visibleSessions(ids, focusedId);
   const plan = planLine(available, all.shown.length, all.more > 0);
   const folded = plan.cells !== "all";
-  const cellIds =
-    plan.cells === "all" ? all.shown : plan.cells === "focused" ? all.shown.filter((id) => id === focusedId) : [];
+  const cellIds = plan.cells === "all" ? all.shown : all.shown.filter((id) => id === focusedId);
   const cells = terminals.filter((t) => cellIds.includes(t.id));
   const uncelled = terminals.filter((t) => !cellIds.includes(t.id));
   const uncelledMarked = uncelled.some((t) => marked(t.id));
@@ -324,10 +318,11 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
 
   // The label is measured once, against its cell: when the line may have
   // moved under it (the panes changed and the Companion folded, the band
-  // resized, another session took the focus), it goes rather than point at
-  // where the cell used to be.
+  // resized, another session took the focus, a session opened or closed and
+  // the cells shifted), it goes rather than point at where the cell used to be.
   const dismissLabel = label.dismiss;
-  useEffect(() => dismissLabel(), [dismissLabel, count, available, focusedId]);
+  const idsKey = ids.join("\n");
+  useEffect(() => dismissLabel(), [dismissLabel, count, available, focusedId, idsKey]);
 
   // A cell that left the line under the pointer never reports the pointer
   // leaving, so the label goes with its cell.
@@ -370,9 +365,9 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
       data-testid="session-line"
       data-folded={folded ? "true" : "false"}
       onKeyDown={onKeyDown}
-      // Clipped, so a track too narrow for even one control shows nothing
-      // rather than drawing over the mode switcher; the 1px padding (and the
-      // margin that takes it back) keeps focus rings inside the clip.
+      // Clipped to its track, so it can never draw over the mode switcher;
+      // the 1px padding (and the margin that takes it back) keeps focus rings
+      // inside the clip. The band keeps the track at least LINE_FLOOR_PX wide.
       className="-m-px flex min-w-0 flex-1 items-center justify-end gap-[2px] overflow-hidden p-px"
     >
       {(plan.counter === "sessions" || plan.counter === "list") &&
@@ -509,54 +504,37 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
       {plan.counter === "more" &&
         counter(`+${all.more}`, `${all.more} more sessions`, `${all.more} more sessions · ⌘⌥K`)}
 
-      {plan.newSession && (
-        <button
-          type="button"
-          data-line-stop
-          tabIndex={stopsOnNew ? 0 : -1}
-          data-testid="session-new"
-          aria-label="Open a new session"
-          title="Open a new session"
-          onClick={() => createTerminal(workspaceId).catch(console.error)}
-          className={CONTROL}
-        >
-          <Plus size={13} strokeWidth={1.75} aria-hidden />
-        </button>
-      )}
+      <button
+        type="button"
+        data-line-stop
+        tabIndex={stopsOnNew ? 0 : -1}
+        data-testid="session-new"
+        aria-label="Open a new session"
+        title="Open a new session"
+        onClick={() => createTerminal(workspaceId).catch(console.error)}
+        className={CONTROL}
+      >
+        <Plus size={13} strokeWidth={1.75} aria-hidden />
+      </button>
 
-      {plan.layout && <span aria-hidden className="mx-1.5 h-3.5 w-px shrink-0 bg-octo-hairline" />}
+      <span aria-hidden className="mx-1.5 h-3.5 w-px shrink-0 bg-octo-hairline" />
 
-      {plan.layout && (
-        <button
-          type="button"
-          data-line-stop
-          tabIndex={-1}
-          data-testid="session-layout"
-          data-tour={tourId("run-layout")}
-          aria-label="Layout"
-          aria-haspopup="menu"
-          aria-expanded={menu !== null}
-          title={`Layout · ${count} ${count === 1 ? "pane" : "panes"}`}
-          onMouseDown={() => {
-            menuWasOpen.current = menu !== null;
-          }}
-          onClick={(e) => {
-            if (menuWasOpen.current) {
-              menuWasOpen.current = false;
-              return;
-            }
-            const r = e.currentTarget.getBoundingClientRect();
-            // Right-aligned under the button; the menu clamps to the viewport.
-            setMenu({ x: r.right - 224, y: r.bottom + 6 });
-          }}
-          className={CONTROL}
-        >
-          <PaneLayoutIcon layout={current} orientation={orientation} />
-        </button>
-      )}
+      <button
+        type="button"
+        data-line-stop
+        tabIndex={-1}
+        data-testid="session-layout"
+        data-tour={tourId("run-layout")}
+        aria-label="Layout"
+        title={`Layout · ${count} ${count === 1 ? "pane" : "panes"}`}
+        {...layoutMenu.buttonProps}
+        className={CONTROL}
+      >
+        <PaneLayoutIcon layout={current} orientation={orientation} />
+      </button>
 
-      {menu && (
-        <MenuSurface x={menu.x} y={menu.y} ariaLabel="Layout" onDismiss={() => setMenu(null)}>
+      {layoutMenu.menu && (
+        <MenuSurface x={layoutMenu.menu.x} y={layoutMenu.menu.y} ariaLabel="Layout" onDismiss={layoutMenu.close}>
           <div className={MENU_HEADER}>Layout</div>
           {LAYOUTS.map((l) => {
             const checked = l.value === current;
@@ -572,10 +550,9 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
                 data-testid={`session-layout-${l.value}`}
                 data-tour={l.value === "two-side" ? tourId("run-layout-two") : undefined}
                 className={`${MENU_ITEM} disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-octo-sage`}
-                onClick={() => {
-                  setMenu(null);
-                  updateLayout(workspaceId, (prev) => choosePaneLayout(prev, l.value, ids, RUN_PANES));
-                }}
+                onClick={layoutMenu.pick(() =>
+                  updateLayout(workspaceId, (prev) => choosePaneLayout(prev, l.value, ids, RUN_PANES)),
+                )}
               >
                 {/* The checked item's Check, in a fixed 14px icon column. */}
                 <span aria-hidden className="flex w-3.5 shrink-0 justify-center">
@@ -597,11 +574,10 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
                 data-testid="session-layout-auto"
                 title="Side by side while every pane keeps 72 columns, stacked below that"
                 className={MENU_ITEM}
-                onClick={() => {
-                  setMenu(null);
-                  // Unchecking pins the orientation on screen.
-                  updateLayout(workspaceId, (prev) => setOrientation(prev, automatic ? orientation : "auto"));
-                }}
+                // Unchecking pins the orientation on screen.
+                onClick={layoutMenu.pick(() =>
+                  updateLayout(workspaceId, (prev) => setOrientation(prev, automatic ? orientation : "auto")),
+                )}
               >
                 <span aria-hidden className="flex w-3.5 shrink-0 justify-center">
                   {automatic && <Check size={13} strokeWidth={1.75} />}
