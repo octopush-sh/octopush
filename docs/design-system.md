@@ -495,7 +495,7 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 
 | Surface       | Width | Notes |
 |---------------|-------|-------|
-| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. Groups (project sections and mission folders) are approved and **planned**: see "Rail groups" below. |
+| Rail          | 280px / 44px | **The index** — one surface, serif project lines, bare tinted glyphs, unboxed mono meta, a 2px state-only edge (brass active / marching), the single beacon; collapsed it is the slim rail (44px, 32px cells). See "Workspace rail — the index" below. Groups (project sections and mission folders) are in the rail: see "Rail groups" below. |
 | ContextHeader | flex  | Floating card, and its own `@container`. One grammar in both states: a mono **eyebrow** carrying every piece of meta (intent · sandbox · ticket chain · status · branch chip · base) over a serif **name** line — the ticket summary, or the workspace name when no ticket resolves. The name owns the full width, so a 160-character branch can never squeeze it out; the branch is middle-truncated with its full provenance in a popover, and the demotion ladder (E2 above) sheds meta as the column narrows. Identity only — never the modes. Pads 12px inline and 6px block; `--shell-stack` above and below it. |
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"), and keeps a floor for it. The band is its own `@container` and ladder: narrow, the switcher's inactive modes shed their labels (see "The mode band's ladder" under the elision doctrine). |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most; only a narrow band sheds them, and only on the inactive modes, which keep icon, tooltip and name. |
@@ -539,7 +539,9 @@ Seven rules, each a direct consequence of §1, §6 and §9 (rail groups, below, 
    Spectral project line over 32px sans rows) and space (12px between projects).
    A mission group adds one more cue of the same kind, an indent beside a 1px
    guide (see "Rail groups" below): a line beside the rows, never a box
-   around them.
+   around them. A project group adds a hairline across the rail above its
+   eyebrow, and a loose project right after a group takes one to close it: a
+   line between blocks, never a card around them.
 2. **The edge speaks of state, never identity.** A reserved 2px slot at the
    row's left: brass on the active row, `.rail-bar-running` marching segments
    while the workspace works (brass on the active row, **sage** elsewhere —
@@ -556,7 +558,8 @@ Seven rules, each a direct consequence of §1, §6 and §9 (rail groups, below, 
    the project is **folded** — a count visible in the list is never repeated in
    its header.
 5. **The project line is quiet.** Hexagon mark in mute (the project's tint only
-   when the user chose one, so N projects never mean N brass hexagons), name in
+   when the user chose one, so N projects never mean N brass hexagons; in a
+   tinted project group an untinted project's hexagon takes the group's tint), name in
    Spectral 13 (ivory for the project holding the active workspace), actions
    revealed on hover/focus (new mission · grip · chevron).
 6. **One beacon.** `resolveAttention()` gives the pulse to the flagged workspace
@@ -567,29 +570,36 @@ Seven rules, each a direct consequence of §1, §6 and §9 (rail groups, below, 
    `prefers-reduced-motion`. When a fold hides the flagged workspace, the
    signal walks up to its **nearest visible ancestor**
    (`nearestVisibleAncestor` in `lib/beacon.ts`, `resolveAttentionCarriers`):
-   the project line when the project is folded (its mark pulses), else the
-   mission-group header (its chevron pulses). A container hiding several
+   the project group's header when that group is folded (its chevron pulses),
+   else the project line when the project is folded (its mark pulses), else
+   the mission-group header (its chevron pulses). A container hiding several
    signals shows the strongest: the pulse, otherwise one static dot. Still
    exactly one beacon.
 7. **Collapsed, it is the slim rail.** 44px (the geometry of Review's
    collapsed navigator), 32px cells, the same reserved edge, one cluster per
-   project headed by its mark, and a `fixed`
+   project headed by its mark (a project group's clusters stand together
+   between two hairlines that span the rail), and a `fixed`
    hover/focus flyout in the MenuSurface chrome (project · name · status ·
-   `⌘N`; `project · group` for a mission in a group) instead of a native
+   `⌘N`; the eyebrow names the groups too, outermost first:
+   `project group · project · mission group`) instead of a native
    title.
 
 The search line is the rail's only chrome: a borderless `Search` icon with an
 upright-serif placeholder whose bottom hairline turns brass on focus, and the
 one `+` icon button (Add project) beside it. Hits are washed with the
-found-match tokens (§4). Nothing else in the rail carries a border; a mission
-group's guide is a 1px line beside its rows, not a border around them.
+found-match tokens (§4). Nothing else in the rail carries a border around
+anything: a mission group's guide is a 1px line beside its rows, and a
+project group's hairline is a 1px line between blocks.
 
-#### Rail groups (2026-11-18 · mission groups shipped, project groups planned)
+#### Rail groups (2026-11-18 · mission groups and project groups shipped)
 
 Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
-Part 1. **Mission groups are in the rail** (`RailMissionGroup.tsx`). Project
-groups have their data layer (#909) and are still planned: the rail draws no
-section yet.
+Part 1. **Both are in the rail**: mission groups (`RailMissionGroup.tsx`) and
+project groups (`RailProjectSection.tsx`; in the code a project group is a
+"section", because `ProjectGroup` already names a project with its missions).
+Still planned: groups in ⌘K, Mission Control and the archived-workspaces
+modal's project line, a keyboard shortcut for **Move to group**, and
+multi-select.
 
 A **group** is a named, optionally tinted, foldable run of items: one
 membership per item, no nesting, and it survives being emptied (it reads
@@ -598,7 +608,7 @@ four levels with **one signature each**:
 
 | Level | Signature |
 |-------|-----------|
-| Project group (a section) · *planned* | A hairline above, then a caps eyebrow: 26px, mono 9px, tracking 0.25em, mute. Its projects are not indented. Fold chevron on hover, focus or while folded. |
+| Project group (a section) · *shipped* | A hairline above, then a caps eyebrow: 26px, mono 9px, tracking 0.25em, mute. Its projects are not indented. Fold chevron on hover, focus or while folded. |
 | Project | Hexagon + serif name (rule 5, unchanged). |
 | Mission group (a folder) · *shipped* | A 28px header: an always-visible chevron in the monogram column, the name in mono 11px, normal case, sage. Its members are indented 14px beside a 1px guide that stops at the last member. |
 | Mission | Glyph + sans name (rule 3, unchanged). |
@@ -651,6 +661,61 @@ a secondary cue (WCAG 1.4.1).
   loose area it leaves; a header dropped on a sibling takes its place. The
   accepting header takes a `--brass-ghost` wash, the one new use of brass here
   and an active state by §7.
+
+**The project group, as built.** Keep these when touching it:
+
+- **Geometry.** A 1px `--color-octo-hairline` across the rail, 6px of air,
+  then a 26px header padded like a project line (`pl-3.5 pr-2`). The name is
+  the eyebrow: mono 9px caps, tracking 0.25em, mute, sage on hover. Its
+  projects are the normal project lines at the outer alignment: no indent, no
+  guide. A group that opens the rail has no hairline above it. 10px separate
+  a loose project's last row from the hairline of a group below it.
+- **Where it ends.** A section has no closing mark of its own. The next
+  group's hairline ends it, or the hairline a **loose project takes when it
+  comes right after a group** (2px, the hairline, 10px, then its line). A
+  bare hairline therefore always reads "a group ended here"; nothing else in
+  the rail draws one.
+- **The chevron** is a 12px `ChevronDown` at the right end of the header, in
+  the group's tint (mute when untinted). It shows on hover, on focus and
+  while folded, where it rotates −90°. It is `aria-hidden` pointer
+  decoration; the eyebrow button is the one tab stop (`aria-expanded`), with
+  the mission group's keys: `←`/`→`, `F2`, `⇧F10` or the context-menu key.
+- **Tint.** On the chevron, and on the hexagon of each project that has no
+  tint of its own (`projectMarkColor`). No guide, so no tinted line. A
+  mission's monogram is never recoloured.
+- **Counts under rule 4.** `N projects` and the attention dot only while
+  folded; `empty` always. Folded over the active mission the eyebrow reads in
+  ivory, the project line's cue; never brass.
+- **Placement, and pinned projects.** `layoutProjects` never reorders
+  projects (pinned first, then the manual order). A group stands where its
+  first project stands and gathers the rest under it. **A pinned project
+  stays in its group**, leads it, and brings the group up into the pinned run;
+  pinning takes no project out of its group and moves no other group. The
+  groups' own `sortOrder` is not a law between them here (projects have a
+  manual order, missions don't): it only orders the empty groups, which stand
+  last.
+- **Drag.** A project dropped on a project takes its place and joins that
+  project's container (a group, or the loose top level). Dropped on a group's
+  header it becomes the group's last project; that header takes the
+  `--brass-ghost` wash. Dropped on the ungrouped area under the rail's last
+  block it leaves its group and goes last; that area draws nothing. A group dragged by its header moves as one unit, by
+  the sortable list's own transform: **no `<DragOverlay>`** for a project or a
+  group (it would stop the dragged block following the pointer). Over a
+  target outside its own list the block follows the pointer by the drag's
+  delta (`useFollowPointer`), so it never snaps back mid-drag. Keyboard: a
+  project's grip steps through projects in any group; a group moves with its
+  menu's **Move up** / **Move down**.
+- **One meaning for "New group" per menu.** In a project's menu the group
+  action is **Move to group ›**, about project groups, and its **New group…**
+  makes a group that already holds the project. The mission-group action in
+  that menu reads **New mission group** (`FolderPlus`) and sits with the
+  project's missions, a block away. A group made from an item never starts
+  empty.
+- **Collapsed (44px).** A sub-cluster: the group's project clusters between
+  two hairlines that span the rail (`w-full`), where the hairline between two
+  projects is 20px. No name, no fold and no header control at this width; a
+  project's mark is titled `group · project` and the flyout's eyebrow starts
+  with the group. Hexagons keep the inherited tint.
 
 ### Run mode — session navigation (shipped 2026-11-18)
 

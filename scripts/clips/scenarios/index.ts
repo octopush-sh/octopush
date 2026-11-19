@@ -7,6 +7,7 @@ import { stress } from "./stress";
 import { runTwoSessions } from "./run-two-sessions";
 import { runFourSessions } from "./run-four-sessions";
 import { railGroups } from "./rail-groups";
+import { railProjectGroups } from "./rail-project-groups";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
@@ -15,4 +16,5 @@ export const SCENARIOS: Record<string, Scenario> = {
   "run-two-sessions": runTwoSessions,
   "run-four-sessions": runFourSessions,
   "rail-groups": railGroups,
+  "rail-project-groups": railProjectGroups,
 };

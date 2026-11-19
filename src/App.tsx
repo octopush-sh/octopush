@@ -91,8 +91,13 @@ import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { useGroupsStore } from "./stores/groupsStore";
-import { missionGroupsOf } from "./lib/railGroups";
-import { createMissionGroup, moveMissionToGroup } from "./lib/groupActions";
+import { layoutProjects, missionGroupsOf, projectGroupsOf, stepInRail } from "./lib/railGroups";
+import {
+  createMissionGroup,
+  createProjectGroup,
+  moveMissionToGroup,
+  moveProjectToGroup,
+} from "./lib/groupActions";
 import type { Group } from "./lib/types";
 
 /** What the mission menu's group selector returns while no menu is open. */
@@ -448,7 +453,20 @@ function App() {
   const [showProjectCustomizer, setShowProjectCustomizer] = useState(false);
   const [customizingProjectId, setCustomizingProjectId] = useState<string | null>(null);
   const [deletingProjectId, setDeletingProjectId] = useState<string | null>(null);
-  const [projectContextMenu, setProjectContextMenu] = useState<{ projectId: string; x: number; y: number } | null>(null);
+  const [projectContextMenu, setProjectContextMenu] = useState<{
+    projectId: string;
+    x: number;
+    y: number;
+    /** Opened with ⇧F10 or the context-menu key: the project line gets the
+     *  focus back when the menu closes. */
+    fromKeyboard?: boolean;
+  } | null>(null);
+  // The open project menu lists the project groups ("Move to group"). Narrow
+  // on purpose, like `contextMenuGroups`: one constant while no menu is open.
+  const projectMenuOpen = projectContextMenu !== null;
+  const projectScopeGroups = useGroupsStore(
+    useShallow((s) => (projectMenuOpen ? projectGroupsOf(s.groups) : NO_GROUPS)),
+  );
   const [archivedForProject, setArchivedForProject] = useState<{ id: string; name: string; path: string } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
@@ -2028,8 +2046,8 @@ function App() {
   }, [activeWorkspaceId, handleGenesis]);
 
   // ── Project context menu handler ──
-  const handleProjectContextMenu = (projectId: string, x: number, y: number) => {
-    setProjectContextMenu({ projectId, x, y });
+  const handleProjectContextMenu = (projectId: string, x: number, y: number, fromKeyboard?: boolean) => {
+    setProjectContextMenu({ projectId, x, y, fromKeyboard });
   };
 
   // ── Project rename handler ──
@@ -2217,11 +2235,20 @@ function App() {
     // just created this session). We deliberately do NOT hoist the active
     // project to the top — selecting a workspace must never reorder the rail,
     // and newly added projects stay at the end.
-    const byId: Record<string, { name: string; tint: string | null }> = {};
-    recentProjects.forEach((p) => { byId[p.id] = { name: p.name, tint: p.tint }; });
-    if (project) byId[project.id] = { name: project.name, tint: project.tint };
+    const byId: Record<string, { name: string; tint: string | null; groupId: string | null }> = {};
+    recentProjects.forEach((p) => { byId[p.id] = { name: p.name, tint: p.tint, groupId: p.groupId ?? null }; });
+    if (project) {
+      // Membership is read from the listed row when there is one: the list is
+      // reloaded often, the open project's own row only when it is opened.
+      const listed = byId[project.id];
+      byId[project.id] = {
+        name: project.name,
+        tint: project.tint,
+        groupId: listed ? listed.groupId : (project.groupId ?? null),
+      };
+    }
 
-    const ordered: { id: string; name: string; tint?: string }[] = [];
+    const ordered: { id: string; name: string; tint?: string; groupId: string | null }[] = [];
     const seen = new Set<string>();
     const pushProject = (id: string, fallbackName: string) => {
       if (seen.has(id)) return;
@@ -2232,6 +2259,7 @@ function App() {
         id,
         name: backend?.name || custom?.name || fallbackName,
         tint: backend?.tint ?? custom?.tint,
+        groupId: backend?.groupId ?? null,
       });
     };
     recentProjects.forEach((p) => pushProject(p.id, p.name));
@@ -2247,6 +2275,7 @@ function App() {
       id: p.id,
       name: p.name,
       tint: p.tint,
+      groupId: p.groupId,
       jiraProjectKey: jiraKeyById[p.id] ?? null,
       workspaces: workspacesByProjectId[p.id] || [],
     }));
@@ -2870,6 +2899,23 @@ function App() {
           setProjectContextMenu(null);
           await copyToClipboard(projPath, "Path copied");
         };
+        // The rail's top level as it is drawn, so "Move up" and "Move down"
+        // step the way the eye expects: among a group's projects for a
+        // project in one, over a whole group for a loose project.
+        const railLayout = layoutProjects(projectGroups, projectScopeGroups);
+        const stepUp = stepInRail(railLayout, proj.id, -1);
+        const stepDown = stepInRail(railLayout, proj.id, 1);
+        const projGroupId = projectScopeGroups.some((g) => g.id === proj.groupId) ? (proj.groupId ?? null) : null;
+        const dismissProjectMenu = () => {
+          const closing = projectContextMenu;
+          setProjectContextMenu(null);
+          // A menu the keyboard opened gives the focus back to its project
+          // line, so Escape does not drop the keyboard out of the rail.
+          if (!closing.fromKeyboard) return;
+          Array.from(document.querySelectorAll<HTMLElement>("[data-rail-project-line]"))
+            .find((el) => el.dataset.railProjectLine === closing.projectId)
+            ?.focus({ preventScroll: true });
+        };
         return (
           <ErrorBoundary surface="Project menu" variant="overlay" onDismiss={() => setProjectContextMenu(null)}>
           <ProjectContextMenu
@@ -2911,37 +2957,29 @@ function App() {
               setProjectContextMenu(null);
             }}
             onNewGroup={() => void createMissionGroup(proj.id)}
+            projectGroups={projectScopeGroups}
+            projectGroupId={projGroupId}
+            onMoveToGroup={(groupId) => void moveProjectToGroup(proj.id, groupId)}
+            onNewProjectGroup={() => void createProjectGroup(proj.id)}
+            onRemoveFromGroup={() => void moveProjectToGroup(proj.id, null)}
             pinned={proj.pinned}
-            canMoveUp={projectGroups.findIndex((g) => g.id === projectContextMenu.projectId) > 0}
-            canMoveDown={(() => {
-              const i = projectGroups.findIndex((g) => g.id === projectContextMenu.projectId);
-              return i >= 0 && i < projectGroups.length - 1;
-            })()}
+            canMoveUp={stepUp !== null}
+            canMoveDown={stepDown !== null}
             onTogglePin={() => {
               void setProjectPinnedAction(projectContextMenu.projectId, !proj.pinned);
               setProjectContextMenu(null);
             }}
             onMoveUp={() => {
-              const ids = projectGroups.map((g) => g.id);
-              const i = ids.indexOf(projectContextMenu.projectId);
-              if (i > 0) {
-                [ids[i - 1], ids[i]] = [ids[i], ids[i - 1]];
-                void setProjectOrderAction(ids);
-              }
+              if (stepUp) void setProjectOrderAction(stepUp);
               setProjectContextMenu(null);
             }}
             onMoveDown={() => {
-              const ids = projectGroups.map((g) => g.id);
-              const i = ids.indexOf(projectContextMenu.projectId);
-              if (i >= 0 && i < ids.length - 1) {
-                [ids[i + 1], ids[i]] = [ids[i], ids[i + 1]];
-                void setProjectOrderAction(ids);
-              }
+              if (stepDown) void setProjectOrderAction(stepDown);
               setProjectContextMenu(null);
             }}
             onClose={() => handleCloseProject(projectContextMenu.projectId)}
             onDelete={() => handleDeleteProject(projectContextMenu.projectId)}
-            onDismiss={() => setProjectContextMenu(null)}
+            onDismiss={dismissProjectMenu}
           />
           </ErrorBoundary>
         );

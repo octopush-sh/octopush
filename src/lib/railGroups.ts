@@ -1,7 +1,9 @@
-// Mission groups in the workspace rail: the pure rules. A mission group is a
-// folder inside one project. It holds that project's missions (workspaces),
-// sits between the loose ones, and never changes their order. The components
-// draw what these functions decide (design-system §8, "Workspace rail").
+// Groups in the workspace rail: the pure rules. A mission group is a folder
+// inside one project. It holds that project's missions (workspaces), sits
+// between the loose ones, and never changes their order. A project group is a
+// section of the rail's top level and holds projects (second half of this
+// file). The components draw what these functions decide (design-system §8,
+// "Workspace rail").
 
 import type { Group, Workspace } from "./types";
 
@@ -154,4 +156,222 @@ export function resolveRailDrop(
   const [moved] = ids.splice(from, 1);
   ids.splice(to, 0, moved);
   return { kind: "reorder", ids };
+}
+
+// ───────────────────────────── project groups ─────────────────────────────
+//
+// A project group is a section of the rail's top level: it holds projects.
+// In the code it is a "section", because `ProjectGroup` already names a
+// project with its missions; in the UI both scopes are a "group".
+
+/** The `project` groups, in their own order. */
+export function projectGroupsOf(groups: readonly Group[]): Group[] {
+  return groups
+    .filter((g) => g.scope === "project")
+    .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt));
+}
+
+/** What the top-level layout needs of a project. */
+export interface RailProject {
+  id: string;
+  groupId?: string | null;
+}
+
+/** One block of the rail's top level: a loose project, or a section with its
+ *  projects (every member, in rail order). */
+export type RailTopItem<P extends RailProject = RailProject> =
+  | { kind: "project"; project: P }
+  | { kind: "section"; group: Group; projects: P[] };
+
+/**
+ * Gather the projects into their sections.
+ *
+ * `projects` arrives in the rail's order, which this never changes: pinned
+ * projects first, then the manual order. A section stands where its FIRST
+ * project stands and holds its other projects under it, in that same order;
+ * loose projects keep their place around it. So a pinned project stays in its
+ * group, leads it, and brings the group up into the pinned run with it.
+ *
+ * Unlike mission groups, the sections' own `sortOrder` is not a law between
+ * them: projects have a manual order, so a section's place always follows its
+ * projects. It only orders the EMPTY sections, which have no project to stand
+ * by and go last. A project whose `groupId` names no known section is loose.
+ */
+export function layoutProjects<P extends RailProject>(
+  projects: readonly P[],
+  sections: readonly Group[],
+): RailTopItem<P>[] {
+  if (sections.length === 0) return projects.map((project) => ({ kind: "project", project }));
+  const byId = new Map(sections.map((g) => [g.id, g]));
+  const members = new Map<string, P[]>(sections.map((g) => [g.id, []]));
+  const sectionOf = (project: P) => {
+    const groupId = project.groupId ?? null;
+    return groupId !== null && byId.has(groupId) ? groupId : null;
+  };
+  for (const project of projects) {
+    const groupId = sectionOf(project);
+    if (groupId) members.get(groupId)!.push(project);
+  }
+  const items: RailTopItem<P>[] = [];
+  const placed = new Set<string>();
+  for (const project of projects) {
+    const groupId = sectionOf(project);
+    if (!groupId) {
+      items.push({ kind: "project", project });
+    } else if (!placed.has(groupId)) {
+      placed.add(groupId);
+      items.push({ kind: "section", group: byId.get(groupId)!, projects: members.get(groupId)! });
+    }
+  }
+  for (const group of sections) {
+    if (!placed.has(group.id)) items.push({ kind: "section", group, projects: [] });
+  }
+  return items;
+}
+
+const SECTION_DRAG = "section:";
+const SECTION_HEAD = "section-head:";
+/** The id a section is dragged by, as one unit with its projects. */
+export const sectionDragId = (groupId: string) => `${SECTION_DRAG}${groupId}`;
+/** The id of a section's header as a drop target ("join this group"). */
+export const sectionHeadId = (groupId: string) => `${SECTION_HEAD}${groupId}`;
+/** The id of the ungrouped area under the last block of the rail: a project
+ *  dropped there leaves its group. */
+export const TOP_LOOSE_ID = "top-loose";
+
+const topItemId = (item: RailTopItem) =>
+  item.kind === "project" ? item.project.id : sectionDragId(item.group.id);
+
+/** Every project id, in the order the rail shows them. */
+export function flattenTop(items: readonly RailTopItem[]): string[] {
+  return items.flatMap((item) =>
+    item.kind === "project" ? [item.project.id] : item.projects.map((p) => p.id),
+  );
+}
+
+/** The section each project sits in (null: loose), by project id. */
+export function sectionByProject(items: readonly RailTopItem[]): Map<string, string | null> {
+  const out = new Map<string, string | null>();
+  for (const item of items) {
+    if (item.kind === "project") out.set(item.project.id, null);
+    else for (const p of item.projects) out.set(p.id, item.group.id);
+  }
+  return out;
+}
+
+function moved<T>(list: readonly T[], from: number, to: number): T[] {
+  const next = [...list];
+  const [item] = next.splice(from, 1);
+  next.splice(to, 0, item);
+  return next;
+}
+
+const sameOrder = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((id, index) => id === b[index]);
+
+/** What a drop at the rail's top level changes. */
+export interface TopDropAction {
+  /** Every project id in the new rail order; null when the order stands. */
+  order: string[] | null;
+  /** The project that changes group (`groupId` null: it leaves its group). */
+  move?: { projectId: string; groupId: string | null };
+}
+
+/**
+ * What dropping `activeId` on `overId` means at the rail's top level, or null
+ * when it means nothing. Ids are project ids, `sectionDragId`s and
+ * `sectionHeadId`s; `items` is the whole layout (no filter).
+ *
+ *  - A section moves as one unit: it takes the place of the top-level block
+ *    it was dropped on (a loose project, or the section around the target).
+ *  - A project dropped on a project takes its place. When the two sit in
+ *    different containers it also joins the target's container: a section, or
+ *    the loose top level (it leaves its group).
+ *  - A project dropped on a section's header joins it as its last project.
+ *  - Anything dropped on the ungrouped area under the rail's last block
+ *    (`TOP_LOOSE_ID`) goes last; a project leaves its group for it.
+ *
+ * The order is the full project order to persist, so a section's projects
+ * stay one run in the stored order too.
+ */
+export function resolveTopDrop(
+  items: readonly RailTopItem[],
+  activeId: string,
+  overId: string,
+): TopDropAction | null {
+  if (activeId === overId) return null;
+  const flat = flattenTop(items);
+  const sectionOf = sectionByProject(items);
+  const headOf = overId.startsWith(SECTION_HEAD) ? overId.slice(SECTION_HEAD.length) : null;
+  const toFoot = overId === TOP_LOOSE_ID;
+
+  if (activeId.startsWith(SECTION_DRAG)) {
+    const topIds = items.map(topItemId);
+    if (toFoot) {
+      const from = topIds.indexOf(activeId);
+      if (from < 0) return null;
+      const order = flattenTop(moved(items, from, items.length - 1));
+      return sameOrder(order, flat) ? null : { order };
+    }
+    const overSection = headOf ?? sectionOf.get(overId) ?? null;
+    const from = topIds.indexOf(activeId);
+    const to = topIds.indexOf(overSection ? sectionDragId(overSection) : overId);
+    if (from < 0 || to < 0 || from === to) return null;
+    const order = flattenTop(moved(items, from, to));
+    return sameOrder(order, flat) ? null : { order };
+  }
+
+  if (!sectionOf.has(activeId)) return null;
+  const mine = sectionOf.get(activeId) ?? null;
+
+  if (toFoot) {
+    const last = [...flat.filter((id) => id !== activeId), activeId];
+    const order = sameOrder(last, flat) ? null : last;
+    if (mine !== null) return { order, move: { projectId: activeId, groupId: null } };
+    return order ? { order } : null;
+  }
+
+  if (headOf !== null) {
+    const section = items.find((item) => item.kind === "section" && item.group.id === headOf);
+    if (!section || section.kind !== "section" || mine === headOf) return null;
+    const move = { projectId: activeId, groupId: headOf };
+    const last = section.projects[section.projects.length - 1];
+    // An empty section stands where its first project will: nothing to reorder.
+    if (!last) return { order: null, move };
+    const order = flat.filter((id) => id !== activeId);
+    order.splice(order.indexOf(last.id) + 1, 0, activeId);
+    return { order: sameOrder(order, flat) ? null : order, move };
+  }
+
+  if (!sectionOf.has(overId)) return null;
+  const target = sectionOf.get(overId) ?? null;
+  const order = moved(flat, flat.indexOf(activeId), flat.indexOf(overId));
+  if (target === mine) return { order };
+  return { order, move: { projectId: activeId, groupId: target } };
+}
+
+/**
+ * The project order after a one-step move from a menu ("Move up", "Move
+ * down"), or null when there is nowhere to go. `id` is a project id or a
+ * `sectionDragId`. A project in a section steps among that section's projects
+ * and stops at its ends; a loose project and a section step over the next
+ * top-level block as a whole. Empty sections are not a step: they stand last
+ * and hold no project to step over.
+ */
+export function stepInRail(items: readonly RailTopItem[], id: string, direction: -1 | 1): string[] | null {
+  const flat = flattenTop(items);
+  const section = sectionByProject(items).get(id) ?? null;
+  if (section) {
+    const run = items.find((item) => item.kind === "section" && item.group.id === section);
+    if (!run || run.kind !== "section") return null;
+    const ids = run.projects.map((p) => p.id);
+    const at = ids.indexOf(id);
+    const neighbour = ids[at + direction];
+    if (!neighbour) return null;
+    return moved(flat, flat.indexOf(id), flat.indexOf(neighbour));
+  }
+  const blocks = items.filter((item) => item.kind === "project" || item.projects.length > 0);
+  const at = blocks.findIndex((item) => topItemId(item) === id);
+  if (at < 0 || !blocks[at + direction]) return null;
+  return flattenTop(moved(blocks, at, at + direction));
 }

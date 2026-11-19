@@ -1,5 +1,5 @@
 import { useId, useRef, useState } from "react";
-import { Pencil, Plus, Trash2, Ungroup } from "lucide-react";
+import { ChevronDown, ChevronUp, Pencil, Plus, Trash2, Ungroup } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
 import { MENU_HEADER, MENU_ITEM, MENU_ITEM_MULTILINE, MENU_SEP } from "../lib/menuStyles";
 import { TINTS, TINT_NAMES } from "../lib/monogram";
@@ -11,14 +11,22 @@ interface Props {
   groupName: string;
   /** The group's tint, or null when it has none. */
   tint: TintName | null;
-  /** True when the group holds no mission: the last row removes it. */
+  /** What the group holds: a mission group's `missions` (the default) or a
+   *  project group's `projects`. It only changes what Ungroup says it keeps. */
+  holds?: "missions" | "projects";
+  /** True when the group holds nothing: the last row removes it. */
   empty: boolean;
   onRename: () => void;
   /** Called with the picked tint, or null for None. The menu stays open. */
   onTint: (tint: TintName | null) => void;
   /** Start a new mission in this group. Left out where the flow is not wired. */
   onNewMission?: () => void;
-  /** Remove the group; its missions stay in the project. */
+  /** Move the group one place up or down the rail. A project group has these
+   *  where it has somewhere to go: they are the keyboard's way to reorder it
+   *  (the pointer drags its header). */
+  onMoveUp?: () => void;
+  onMoveDown?: () => void;
+  /** Remove the group; its members stay where they are. */
   onUngroup: () => void;
   onDismiss: () => void;
 }
@@ -31,9 +39,10 @@ const SWATCH_CURRENT = "ring-1 ring-octo-ivory ring-offset-2 ring-offset-octo-pa
 const titleCase = (name: string) => name[0].toUpperCase() + name.slice(1);
 
 /**
- * The menu of a mission group's header: Rename, Tint (the seven monogram
+ * The menu of a group's header, at both scopes (a mission group's folder
+ * header, a project group's eyebrow): Rename, Tint (the seven monogram
  * tints plus None; no other hue exists), and Ungroup, which keeps the
- * missions. An empty group offers Remove group instead. Picking a tint does
+ * members. An empty group offers Remove group instead. Picking a tint does
  * not close the menu, so tints can be compared on the rail behind it.
  */
 export function GroupContextMenu({
@@ -41,10 +50,13 @@ export function GroupContextMenu({
   y,
   groupName,
   tint,
+  holds = "missions",
   empty,
   onRename,
   onTint,
   onNewMission,
+  onMoveUp,
+  onMoveDown,
   onUngroup,
   onDismiss,
 }: Props) {
@@ -122,6 +134,22 @@ export function GroupContextMenu({
         })}
       </div>
 
+      {(onMoveUp || onMoveDown) && (
+        <>
+          <div className={MENU_SEP} />
+          {onMoveUp && (
+            <button type="button" role="menuitem" className={MENU_ITEM} onClick={run(onMoveUp)}>
+              <ChevronUp size={12} className="shrink-0" /> Move up
+            </button>
+          )}
+          {onMoveDown && (
+            <button type="button" role="menuitem" className={MENU_ITEM} onClick={run(onMoveDown)}>
+              <ChevronDown size={12} className="shrink-0" /> Move down
+            </button>
+          )}
+        </>
+      )}
+
       <div className={MENU_SEP} />
 
       {empty ? (
@@ -133,7 +161,7 @@ export function GroupContextMenu({
           <Ungroup size={12} className="mt-0.5 shrink-0" />
           <span className="flex flex-col text-left">
             <span>Ungroup</span>
-            <span className="text-octo-mute">Keeps the missions</span>
+            <span className="text-octo-mute">Keeps the {holds}</span>
           </span>
         </button>
       )}
