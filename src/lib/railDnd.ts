@@ -76,30 +76,43 @@ const only = (container: DroppableContainer) => [{ id: container.id, data: { dro
  *  - Over another project group, anywhere on it (its eyebrow or its
  *    projects; folded, that is the eyebrow alone): that group's header, which
  *    means "join it, as its last project".
- *  - Over its own group: the nearest of that group's projects (a reorder).
+ *  - Over its own group's eyebrow: that header, where a drop does nothing.
+ *  - Over the rest of its own group: the nearest of that group's projects (a
+ *    reorder).
  *  - Anywhere else, the ungrouped top level: the nearest top-level block, a
  *    loose project or another group as a whole. A group's project leaves its
  *    group for it.
  *
  * The keyboard has no pointer. Its steps are aimed at projects by
  * `projectKeyboardCoordinates`, so the nearest project wins there, with the
- * group headers kept as targets.
+ * group headers kept as targets, and a project of another group stands for
+ * that group's header (the drop joins it, last).
  */
 function projectCollisions(args: Parameters<CollisionDetection>[0]) {
   const all = args.droppableContainers;
   const own = sectionIdOf(args.active.data.current);
+  const headOf = (groupId: string | null) => all.find((c) => isSectionHead(c) && groupIdOf(c) === groupId);
   if (args.pointerCoordinates === null) {
-    return closestCenter({ ...args, droppableContainers: all.filter((c) => isProject(c) || isSectionHead(c)) });
+    const met = closestCenter({ ...args, droppableContainers: all.filter((c) => isProject(c) || isSectionHead(c)) });
+    // A step onto another group's project means that group's header, as the
+    // pointer anywhere on it does: the drop joins it as its last project, so
+    // the group is not opened around the block mid-way.
+    const nearest = met[0]?.data?.droppableContainer as DroppableContainer | undefined;
+    const theirs = nearest && isProject(nearest) ? sectionIdOf(nearest.data.current) : null;
+    const head = theirs !== null && theirs !== own ? headOf(theirs) : undefined;
+    return head ? only(head) : met;
   }
   const others = all.filter((c) => isSection(c) && groupIdOf(c) !== own);
   const [over] = pointerWithin({ ...args, droppableContainers: others });
   if (over) {
-    const groupId = groupIdOf(over.data?.droppableContainer as DroppableContainer);
-    const head = all.find((c) => isSectionHead(c) && groupIdOf(c) === groupId);
+    const head = headOf(groupIdOf(over.data?.droppableContainer as DroppableContainer));
     if (head) return only(head);
   }
   const mine = own === null ? undefined : all.find((c) => isSection(c) && groupIdOf(c) === own);
   if (mine && pointerWithin({ ...args, droppableContainers: [mine] }).length > 0) {
+    // On its own group's eyebrow: that header, where a drop does nothing.
+    const ownHead = headOf(own);
+    if (ownHead && pointerWithin({ ...args, droppableContainers: [ownHead] }).length > 0) return only(ownHead);
     return closestCenter({
       ...args,
       droppableContainers: all.filter((c) => isProject(c) && sectionIdOf(c.data.current) === own),

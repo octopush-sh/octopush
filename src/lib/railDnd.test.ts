@@ -204,22 +204,24 @@ describe("project groups (sections)", () => {
     }
   });
 
-  it("never resolves to the dragged project's own header", () => {
+  it("on its own group's eyebrow it meets that header alone, where a drop does nothing", () => {
     // Side projects open, Client work folded: notebook-cli dragged onto Client
     // work's eyebrow, with its own group's header close by.
     const client = section("client", rect(108, 34));
     const clientHead = head("client", rect(115, 26));
-    const side = section("side", rect(144, 200));
+    const side = section("side", rect(144, 300));
     const sideHead = head("side", rect(151, 26));
     const cli = project("notebook-cli", "side", rect(179, 96));
-    const detectFolded = detectIn([OCTOPUSH, client, clientHead, side, sideHead, cli]);
+    const tool = project("notebook-tool", "side", rect(287, 96));
+    const detectFolded = detectIn([OCTOPUSH, client, clientHead, side, sideHead, cli, tool]);
     const onto = held(128, 124);
     expect(detectFolded(dragged("side"), onto.block, onto.pointer)).toEqual(["section-head:client"]);
-    // Held over its own header instead: a reorder among its own projects, never the header.
+    // Held over its own eyebrow instead: not the slot nearest the block's centre.
     const home = held(164, 124);
-    const met = detectFolded(dragged("side"), home.block, home.pointer);
-    expect(met).toEqual(["notebook-cli"]);
-    expect(met).not.toContain("section-head:side");
+    expect(detectFolded(dragged("side"), home.block, home.pointer)).toEqual(["section-head:side"]);
+    // Below the eyebrow, over its own projects: a reorder among them.
+    const below = held(300, 124);
+    expect(detectFolded(dragged("side"), below.block, below.pointer)[0]).toBe("notebook-tool");
   });
 
   it("over its own group a project meets that group's projects only, by the block's centre", () => {
@@ -268,9 +270,16 @@ describe("project groups (sections)", () => {
   });
 
   it("the keyboard has no pointer: the nearest project or header, never a group as a whole or the area", () => {
-    const met = detect(dragged(null), rect(143, 96), null);
-    expect(met[0]).toBe("acme-api");
+    const met = detect(dragged(null), rect(656, 96), null);
+    expect(met[0]).toBe("dotfiles");
     expect(met.sort()).toEqual(["acme-admin", "acme-api", "dotfiles", "octopush", "section-head:client", "section-head:side"]);
+    // Among its own group's projects: a reorder, by the nearest one.
+    expect(detect(dragged("client"), rect(251, 300), null)[0]).toBe("acme-admin");
+  });
+
+  it("a keyboard step onto another group's project means that group's header: it joins last, not mid-group", () => {
+    expect(detect(dragged(null), rect(143, 96), null)).toEqual(["section-head:client"]);
+    expect(detect(dragged("side"), rect(251, 300), null)).toEqual(["section-head:client"]);
   });
 
   it("the keyboard steps a project among projects only, inside groups too", () => {

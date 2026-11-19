@@ -559,23 +559,29 @@ export function WorkspaceRail({
   };
   // What the drop under the pointer would do to the dragged project's group,
   // shown on the dragged block (`DropCue`) and as the wash of the group it
-  // would join. It comes from the very call the drop makes (see `dropAt`).
-  const [dropCue, setDropCue] = useState<TopDropCue | null>(null);
+  // would join. It comes from the very call the drop makes (see `dropAt`),
+  // made in render from the target the drag is over and the rail as it is
+  // now: a reload in mid-drag re-resolves it, as the drop will.
+  const [pendingDrop, setPendingDrop] = useState<{ activeId: string; overId: string | null } | null>(null);
   /** A top-level drop of `active` on `over`, resolved once for the cue (while
    *  over it) and for the drop (when released there). */
   const dropAt = (active: { id: UniqueIdentifier }, over: { id: UniqueIdentifier } | null) =>
     resolveTopDropWithCue(topItems, String(active.id), over ? String(over.id) : null);
+  const dropCue = useMemo<TopDropCue | null>(
+    () =>
+      pendingDrop ? resolveTopDropWithCue(topItems, pendingDrop.activeId, pendingDrop.overId).cue : null,
+    [pendingDrop, topItems],
+  );
   const handleDragOver = (e: DragOverEvent) => {
     if (railSubjectOf(e.active.data.current)) return;
-    const { cue } = dropAt(e.active, e.over);
-    setDropCue((prev) =>
-      prev?.kind === cue?.kind && prev?.groupId === cue?.groupId && prev?.name === cue?.name ? prev : cue,
-    );
+    const activeId = String(e.active.id);
+    const overId = e.over ? String(e.over.id) : null;
+    setPendingDrop((prev) => (prev?.activeId === activeId && prev.overId === overId ? prev : { activeId, overId }));
   };
   const endDrag = () => {
     scrollLimit.current = null;
     setDragging(null);
-    setDropCue(null);
+    setPendingDrop(null);
   };
   const handleDragStart = (e: DragStartEvent) => {
     const subject = railSubjectOf(e.active.data.current);
