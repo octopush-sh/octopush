@@ -77,7 +77,7 @@ describe("the inline transform of a dragged block", () => {
       transform: { x: 0, y: -437, scaleX: 1, scaleY: 0.4465 },
     };
     rail();
-    expect(sectionEl().style.transform).toBe("translate3d(0px, -437px, 0)");
+    expect(sectionEl().style.transform).toBe("translate3d(0px, -437px, 0px)");
     expect(sectionEl().style.transform).not.toMatch(/scale/);
   });
 
@@ -87,15 +87,15 @@ describe("the inline transform of a dragged block", () => {
       transform: { x: 0, y: 212, scaleX: 1, scaleY: 1.502 },
     };
     rail();
-    expect(sectionEl().style.transform).toBe("translate3d(0px, 212px, 0)");
+    expect(sectionEl().style.transform).toBe("translate3d(0px, 212px, 0px)");
   });
 
   it("a project is translated only: the dragged one, and one making room for it", () => {
     forced.byId["acme-web"] = { isDragging: true, transform: { x: 2, y: -96, scaleX: 1, scaleY: 2.3 } };
     forced.byId["acme-api"] = { transform: { x: 0, y: 124, scaleX: 1, scaleY: 0.43 } };
     rail();
-    expect(projectEl("acme-web").style.transform).toBe("translate3d(2px, -96px, 0)");
-    expect(projectEl("acme-api").style.transform).toBe("translate3d(0px, 124px, 0)");
+    expect(projectEl("acme-web").style.transform).toBe("translate3d(2px, -96px, 0px)");
+    expect(projectEl("acme-api").style.transform).toBe("translate3d(0px, 124px, 0px)");
     for (const id of ["acme-web", "acme-api"]) expect(projectEl(id).style.transform).not.toMatch(/scale/);
   });
 

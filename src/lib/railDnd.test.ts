@@ -291,21 +291,21 @@ describe("blockShift / blockTransform: a dragged block is moved, never scaled", 
     // dnd-kit scales a dragged item to what it is over: a group's header over a short project…
     const squashed = { x: 0, y: -437, scaleX: 1, scaleY: 0.4465 };
     expect(blockShift(squashed, true, { x: 0, y: -437 })).toEqual({ x: 0, y: -437 });
-    expect(blockTransform(blockShift(squashed, true, null))).toBe("translate3d(0px, -437px, 0)");
+    expect(blockTransform(blockShift(squashed, true, null))).toBe("translate3d(0px, -437px, 0px)");
     // …and over a taller group.
     const stretched = { x: 3, y: 120.4, scaleX: 1, scaleY: 1.502 };
-    expect(blockTransform(blockShift(stretched, true, null))).toBe("translate3d(3px, 120px, 0)");
+    expect(blockTransform(blockShift(stretched, true, null))).toBe("translate3d(3px, 120px, 0px)");
     expect(blockTransform(blockShift(stretched, true, null))).not.toMatch(/scale/);
   });
 
   it("makes room in the list for another block by translation alone", () => {
     const room = { x: 0, y: 96, scaleX: 1, scaleY: 0.32 };
-    expect(blockTransform(blockShift(room, false, null))).toBe("translate3d(0px, 96px, 0)");
+    expect(blockTransform(blockShift(room, false, null))).toBe("translate3d(0px, 96px, 0px)");
   });
 
   it("follows the pointer by the drag's delta where the list hands over nothing", () => {
     expect(blockShift(null, true, { x: 4, y: -539 })).toEqual({ x: 4, y: -539 });
-    expect(blockTransform(blockShift(null, true, { x: 4, y: -539 }))).toBe("translate3d(4px, -539px, 0)");
+    expect(blockTransform(blockShift(null, true, { x: 4, y: -539 }))).toBe("translate3d(4px, -539px, 0px)");
   });
 
   it("is nothing at rest, and for a block that is not the one dragged", () => {

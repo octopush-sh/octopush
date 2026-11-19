@@ -195,7 +195,7 @@ export function blockShift(
 
 /** `blockShift` as the inline `transform` of the block: a translation only. */
 export function blockTransform(shift: BlockShift | null): string | undefined {
-  return shift ? `translate3d(${Math.round(shift.x)}px, ${Math.round(shift.y)}px, 0)` : undefined;
+  return shift ? `translate3d(${Math.round(shift.x)}px, ${Math.round(shift.y)}px, 0px)` : undefined;
 }
 
 /**
