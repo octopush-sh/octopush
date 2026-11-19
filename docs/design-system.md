@@ -777,17 +777,26 @@ a secondary cue (WCAG 1.4.1).
   that only hear keys pressed in them, so the chord means one thing wherever
   the focus is, and no global binding is spent. It opens the submenu's
   choices as a menu of their own at the row (`MoveToGroupMenu`, MenuSurface
-  chrome, `octo-menu-enter`), with a mono header `Move to group` (`Move N missions to group` for a selection), the
+  chrome, `octo-menu-enter`; `⌘⌥G` on a Mac only, never Ctrl+Option, which
+  is VoiceOver's; Ctrl+Alt+G elsewhere), with a mono header `Move to group` (`Move N missions to group` for a selection), the
   current group focused first and type-ahead on the group names. A mission
   row now also answers `⇧F10` and the context-menu key, like a project line
   and a group header, so every rail row has a keyboard path to its menu.
-- **The selected row.** A multi-selection of missions (`⌘`-click, `⇧`-click,
-  one project) has no colour of its own: a selected row keeps the **hover
-  ground** (`bg-octo-panel-2`) and an **ivory name**, the two cues hover
-  already gives, held while selected. The active row keeps its brass-ghost
-  ground and edge, so brass still marks the one place you are and a
-  selection never reads as several active rows. In Vellum `panel_2`
-  recesses, which reads as "held down", the right sense for a selection.
+- **The selected row.** A multi-selection of missions (`⌘`-click on a Mac,
+  Ctrl-click elsewhere; `⇧`-click; one project) has no colour of its own.
+  A selected row that is neither active nor working takes a **static 2px
+  sage bar in the identity edge's reserved slot** (`IdentityEdge`'s
+  `selected`), and holds the hover ground (`bg-octo-panel-2`) and an ivory
+  name. The edge is what tells it apart from a hovered row, which changes
+  only its ground and name: in Onyx `panel_2` on the rail is about 1.06:1,
+  too close to read alone. Sage, because the edge already speaks sage for
+  "working" elsewhere in the rail and never brass for a status (§7); static,
+  because marching is the working edge's. The active row keeps its brass
+  edge and brass-ghost ground even when selected, and a working row keeps
+  its marching edge, so brass still marks the one place you are. The
+  selection holds only rows the rail draws: a row archived or deleted away,
+  or folded out of sight (its group, project or project group), leaves it,
+  so the menu's count always matches what is on screen.
   The selection's menu (`Group N missions…`, `Move N missions to group ›`,
   `Clear selection`) is plain MenuSurface rows. Missions only: projects have
   no multi-select.

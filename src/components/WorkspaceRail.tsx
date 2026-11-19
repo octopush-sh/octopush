@@ -45,6 +45,7 @@ import {
   ungroupProjects,
 } from "../lib/groupActions";
 import { prefersReducedMotion } from "../lib/motion";
+import { isMac } from "../lib/platform";
 import { holdMissionRowFocus, holdProjectLineFocus, restoreProjectLineFocus } from "../lib/railFocus";
 import {
   projectKeyboardCoordinates,
@@ -599,7 +600,31 @@ export function WorkspaceRail({
 
   // ── Multi-select (⌘-click / ⇧-click on mission rows, one project) ──
   const selection = useRailSelection((s) => s.selection);
-  const selectedIds = useMemo(() => new Set(selection?.ids ?? []), [selection]);
+  // The rows of the selection's project that the rail draws right now: not
+  // archived or deleted away, not inside a folded group, project or project
+  // group. A selection is only ever of these, so its count, its menu and its
+  // actions match what the user sees.
+  const selectionProjectId = selection?.projectId ?? null;
+  const drawnSelectable = useMemo(() => {
+    const out = new Set<string>();
+    if (!selectionProjectId || isCollapsed || q !== "" || collapsedProjects[selectionProjectId]) return out;
+    const section = sectionOfProject.get(selectionProjectId);
+    if (section && collapsedGroups[section]) return out;
+    for (const item of itemsByProject[selectionProjectId] ?? []) {
+      if (item.kind === "mission") out.add(item.workspace.id);
+      else if (!collapsedGroups[item.group.id]) for (const w of item.members) out.add(w.id);
+    }
+    return out;
+  }, [selectionProjectId, isCollapsed, q, collapsedProjects, sectionOfProject, collapsedGroups, itemsByProject]);
+  useEffect(() => {
+    useRailSelection.getState().retain(drawnSelectable);
+  }, [drawnSelectable]);
+  const drawnRef = useRef(drawnSelectable);
+  drawnRef.current = drawnSelectable;
+  const selectedIds = useMemo(
+    () => new Set((selection?.ids ?? []).filter((id) => drawnSelectable.has(id))),
+    [selection, drawnSelectable],
+  );
   // A filter or the slim rail changes which rows are there to act on: the
   // selection goes rather than act on rows out of sight.
   useEffect(() => {
@@ -622,7 +647,7 @@ export function WorkspaceRail({
   const pickRow = useCallback(
     (e: React.MouseEvent<HTMLButtonElement>, projectId: string, ordered: readonly string[], workspaceId: string) => {
       const sel = useRailSelection.getState();
-      if (e.metaKey || e.ctrlKey) {
+      if (isMac() ? e.metaKey : e.ctrlKey) {
         sel.toggle(projectId, workspaceId);
         // WebKit does not focus a clicked button: the row takes it, so
         // Escape and ⌘⌥G reach the rail.
@@ -650,8 +675,10 @@ export function WorkspaceRail({
   // menu lets the selection go and is the mission's own.
   const openRowMenu = useCallback(
     (workspaceId: string, x: number, y: number, fromKeyboard = false) => {
+      // Decided from the rows still drawn, as the menu itself counts them.
       const sel = useRailSelection.getState().selection;
-      if (sel && sel.ids.length > 1 && sel.ids.includes(workspaceId)) {
+      const live = (sel?.ids ?? []).filter((id) => drawnRef.current.has(id));
+      if (live.length > 1 && live.includes(workspaceId)) {
         setSelectionMenu({ x, y, focusId: workspaceId, fromKeyboard });
         return;
       }
@@ -672,6 +699,11 @@ export function WorkspaceRail({
     const project = (projects || []).find((p) => p?.id === selection.projectId);
     return (project?.workspaces || []).filter((w) => !!w && selectedIds.has(w.id));
   }, [selection, selectedIds, projects]);
+  // A selection menu whose selection fell under two rows (one archived, one
+  // folded away) closes: it must never come back by itself later.
+  useEffect(() => {
+    if (selectionMenu && selectedRows.length < 2) setSelectionMenu(null);
+  }, [selectionMenu, selectedRows]);
 
   // ── "Move to group…" from the keyboard (⌘⌥G on a focused row) ──
   // Rail-scoped on purpose: ⌘⌥G is go-to-line in the editor and the
@@ -700,7 +732,8 @@ export function WorkspaceRail({
       if (!ws) return;
       e.preventDefault();
       const sel = useRailSelection.getState().selection;
-      const ids = sel && sel.ids.includes(id) ? [...sel.ids] : [id];
+      const live = (sel?.ids ?? []).filter((x) => drawnRef.current.has(x));
+      const ids = live.includes(id) ? live : [id];
       const r = row.getBoundingClientRect();
       setMovePicker({ kind: "mission", projectId: ws.projectId, ids, focusId: id, x: r.left + 24, y: r.bottom });
     } else if (line?.dataset.railProjectLine) {
@@ -1157,10 +1190,14 @@ export function WorkspaceRail({
   );
 }
 
-/** ⌘⌥G (Ctrl+Alt+G off a Mac): "Move to group…" on the focused rail row.
- *  The physical key, since Option rewrites the printed letter on a Mac. */
-export function isMoveToGroupChord(e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "key" | "code">): boolean {
-  return (e.metaKey || e.ctrlKey) && e.altKey && !e.shiftKey && (e.code === "KeyG" || e.key.toLowerCase() === "g");
+/** ⌘⌥G on a Mac, Ctrl+Alt+G elsewhere: "Move to group…" on the focused rail
+ *  row. Never Ctrl+Option on a Mac (VoiceOver's modifiers). The physical
+ *  key, since Option rewrites the printed letter on a Mac. */
+export function isMoveToGroupChord(
+  e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "key" | "code">,
+): boolean {
+  const mod = isMac() ? e.metaKey && !e.ctrlKey : e.ctrlKey && !e.metaKey;
+  return mod && e.altKey && !e.shiftKey && (e.code === "KeyG" || e.key.toLowerCase() === "g");
 }
 
 /** The rest of the rail under its last block, as a drop target: the ungrouped
@@ -1214,9 +1251,20 @@ function RailDragGhost({
  * The reserved identity edge every row and cell carries, so state never
  * shifts content by a pixel. Brass marks the active row; the marching bar
  * marks work (brass on the active row, sage everywhere else — never a status
- * in brass, never the workspace tint); transparent at rest.
+ * in brass, never the workspace tint); a static sage bar marks a row of the
+ * multi-selection that is neither active nor working; transparent at rest.
  */
-function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running: boolean; inset?: number }) {
+function IdentityEdge({
+  active,
+  running,
+  selected = false,
+  inset = 0,
+}: {
+  active: boolean;
+  running: boolean;
+  selected?: boolean;
+  inset?: number;
+}) {
   if (running) {
     return (
       <span
@@ -1238,8 +1286,9 @@ function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running
   return (
     <span
       aria-hidden
+      data-selected-edge={!active && selected ? "" : undefined}
       className={`absolute left-0 w-[2px] transition-colors duration-[180ms] ${
-        active ? "bg-octo-brass" : "bg-transparent"
+        active ? "bg-octo-brass" : selected ? "bg-octo-sage" : "bg-transparent"
       }`}
       style={{ top: inset, bottom: inset }}
     />
@@ -1893,7 +1942,7 @@ function WorkspaceRow({
       onContextMenu={handleContextMenu}
       onKeyDown={handleKeyDown}
     >
-      <IdentityEdge active={active} running={!!running} />
+      <IdentityEdge active={active} running={!!running} selected={selected} />
 
       {/* Monogram — the one carrier of the workspace tint: a bare serif glyph,
           no border, no fill. The single beacon pulses here. */}
@@ -1901,7 +1950,7 @@ function WorkspaceRow({
         type="button"
         onClick={activate}
         title={posture ?? undefined}
-        aria-label={attention ? `${name} — needs attention` : name}
+        aria-label={`${name}${attention ? " — needs attention" : ""}${selected ? " — selected" : ""}`}
         aria-current={active ? "location" : undefined}
         className={`flex h-5 w-5 shrink-0 items-center justify-center rounded font-serif text-[12px] leading-none focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
           attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""

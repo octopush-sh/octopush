@@ -32,6 +32,13 @@ interface RailSelectionState {
    */
   extend: (projectId: string, ordered: readonly string[], workspaceId: string, fallbackAnchor?: string | null) => void;
   clear: () => void;
+  /**
+   * Keep only the selected rows that the rail still draws: a row archived,
+   * deleted or reloaded away, or folded out of sight (its group, its project
+   * or its project group folded), leaves the selection, so its count and
+   * its actions always match what the user sees. Empty: no selection.
+   */
+  retain: (drawn: ReadonlySet<string>) => void;
 }
 
 /** The run of `ordered` between `a` and `b`, inclusive, in rail order. */
@@ -71,5 +78,18 @@ export const useRailSelection = create<RailSelectionState>((set, get) => ({
 
   clear: () => {
     if (get().selection) set({ selection: null });
+  },
+
+  retain: (drawn) => {
+    const current = get().selection;
+    if (!current) return;
+    const ids = current.ids.filter((id) => drawn.has(id));
+    if (ids.length === current.ids.length) return;
+    if (ids.length === 0) {
+      set({ selection: null });
+      return;
+    }
+    const anchorId = ids.includes(current.anchorId) ? current.anchorId : ids[ids.length - 1];
+    set({ selection: { ...current, ids, anchorId } });
   },
 }));

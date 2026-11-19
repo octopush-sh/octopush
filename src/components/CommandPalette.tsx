@@ -20,7 +20,7 @@ import type { ProjectGroup } from "./WorkspaceRail";
 import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
 import { GROUP_VALUE_PREFIX, paletteGroups, type PaletteGroup } from "../lib/paletteGroups";
 import { useGroupsStore } from "../stores/groupsStore";
-import { TINTS } from "../lib/monogram";
+import { groupMarkColor } from "./RailMissionGroup";
 import { ChevronDown } from "lucide-react";
 
 interface Props {
@@ -559,8 +559,8 @@ function GroupItem({ row, onSelect }: { row: PaletteGroup; onSelect: () => void 
     >
       <span
         aria-hidden
-        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline text-octo-mute"
-        style={row.tint ? { color: TINTS[row.tint].accent } : undefined}
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline"
+        style={{ color: groupMarkColor(row, "var(--color-octo-mute)") }}
       >
         <ChevronDown size={12} />
       </span>
