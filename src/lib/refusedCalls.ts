@@ -13,4 +13,4 @@ export function refusedCallsNote(count: number): string {
 }
 
 export const REFUSED_CALLS_TITLE =
-  "Claude Code refused these calls with nobody to ask, so they never ran. Each is listed in the stage's journal, and the next stage is told which.";
+  "Claude Code refused these calls with nobody to ask, so they never ran. Each is listed in the stage's journal.";

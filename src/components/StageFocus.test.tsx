@@ -224,6 +224,26 @@ describe("StageFocus live journal", () => {
     rerender(<StageFocus stage={{ ...baseStage, status: "done", artifact, refusedCalls: 0 }} workspacePath="/tmp" />);
     expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
   });
+
+  it("hides a previous attempt's refused count while the stage runs again or an abort cut it (#893)", () => {
+    const { rerender } = render(
+      <StageFocus stage={{ ...baseStage, status: "running", refusedCalls: 3 }} workspacePath="/tmp" />,
+    );
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+    const abortedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "aborted",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: "t", budgetUsd: null, detached: false,
+    } as any;
+    rerender(
+      <StageFocus
+        stage={{ ...baseStage, status: "awaiting_checkpoint", refusedCalls: 3 }}
+        workspacePath="/tmp"
+        run={abortedRun}
+      />,
+    );
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+  });
 });
 
 const archiveRow = {
