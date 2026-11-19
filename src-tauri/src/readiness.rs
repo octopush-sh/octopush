@@ -4,11 +4,13 @@
 //! never cached and with no telemetry. On an explicit Check again,
 //! `claude auth status` runs too, with up to 15 s (it may refresh the OAuth
 //! token, which must not be cut short). The Codex CLI row shows only when a
-//! saved crew or Routine has a Codex CLI stage; `codex login status` runs on
-//! an explicit Check again only, and only its exit code is read.
+//! saved crew or Routine has a Codex CLI stage; `codex --version` runs on
+//! every pass, `codex login status` on an explicit Check again only, and only
+//! its exit code is read.
 
 use crate::agent_adapter::{
-    parse_claude_version, version_below, ClaudeCliVersion, ClaudeLoginProbe, CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
+    codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
+    CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
 };
 use serde::Serialize;
 use std::io::Read;
@@ -678,24 +680,32 @@ pub fn wants_codex(db: &crate::db::Db) -> bool {
         })
 }
 
-/// `codex` on the login-shell PATH (`found`), and what `codex login status`
-/// said (`login`; `None` when not asked): its exit code only.
-pub fn codex_check(found: bool, login: Option<Probe>) -> ReadinessCheck {
+/// `codex` on the login-shell PATH (`found`), what `codex login status`
+/// said (`login`; `None` when not asked): its exit code only, and the
+/// version `codex --version` printed (`None`: unknown, which never warns).
+/// A version below the newest [`crate::agent_adapter::CODEX_SECURITY_FIXES`]
+/// row warns.
+pub fn codex_check(found: bool, login: Option<Probe>, version: Option<&str>) -> ReadinessCheck {
     const ID: &str = "codex";
     const LABEL: &str = "Codex CLI";
-    let warn = |value, fix, command| ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, value, fix, Some(command));
+    let warn = |value: &str, fix: &str, command| ReadinessCheck::not_ok(ID, LABEL, CheckStatus::Warn, value, fix, Some(command));
     let missing = || warn("Not found", "Codex CLI stages run codex. Install it, then check again.", INSTALL_CODEX);
     if !found {
         return missing();
     }
-    match login {
-        None => ReadinessCheck::ok(ID, LABEL, "Found"),
-        Some(Probe::Missing) => missing(),
-        Some(Probe::TimedOut) => ReadinessCheck::timed_out(ID, LABEL, CODEX_LOGIN_STATUS),
-        Some(Probe::Exited { success: true, .. }) => ReadinessCheck::ok(ID, LABEL, "Signed in"),
+    let state = match login {
+        None => "Found",
+        Some(Probe::Missing) => return missing(),
+        Some(Probe::TimedOut) => return ReadinessCheck::timed_out(ID, LABEL, CODEX_LOGIN_STATUS),
+        Some(Probe::Exited { success: true, .. }) => "Signed in",
         Some(Probe::Exited { success: false, .. }) => {
-            warn("Not signed in", "Sign Codex in so its stages don't fail mid-run.", CODEX_LOGIN)
+            return warn("Not signed in", "Sign Codex in so its stages don't fail mid-run.", CODEX_LOGIN)
         }
+    };
+    let value = format!("{state} · {}", version.unwrap_or("version unknown"));
+    match version.and_then(codex_security_notice) {
+        Some(note) => warn(&value, &format!("{note}."), INSTALL_CODEX),
+        None => ReadinessCheck::ok(ID, LABEL, value),
     }
 }
 
@@ -884,11 +894,18 @@ pub fn run_all(stored_login: Option<i64>, ask_claude: bool, want_codex: bool) ->
     let login = ask_claude.then(|| std::thread::spawn(crate::agent_adapter::probe_claude_login));
     let codex = want_codex.then(|| {
         std::thread::spawn(move || {
+            // Local and offline, so it runs on every pass, beside the login probe.
+            crate::agent_adapter::forget_codex_cli_version();
+            let version = std::thread::spawn(|| run_probe(local_command("codex", &["--version"]), CHECK_TIMEOUT));
             let cmd = local_command("codex", &CODEX_LOGIN_STATUS_ARGS);
             let found = cmd.is_some();
             let login = (found && ask_claude)
                 .then(|| run_status_probe_terminating(cmd, CHECK_TIMEOUT, CODEX_TERM_GRACE, CODEX_LOGIN_STATUS_ON_QUIT));
-            codex_check(found, login)
+            let version = match version.join() {
+                Ok(Probe::Exited { success: true, output }) => parse_codex_version(&output),
+                _ => None,
+            };
+            codex_check(found, login, version.as_deref())
         })
     });
     let claude = std::thread::spawn(|| {
@@ -1432,11 +1449,11 @@ mod tests {
     #[test]
     fn codex_found_signed_in_signed_out_missing_and_timeout() {
         // The automatic pass never asks: found is all it knows.
-        let found = codex_check(true, None);
+        let found = codex_check(true, None, Some("0.170.0"));
         assert_eq!((found.id.as_str(), found.label.as_str()), ("codex", "Codex CLI"));
-        assert_eq!((found.status, found.value.as_str(), found.fix), (CheckStatus::Ok, "Found", None));
+        assert_eq!((found.status, found.value.as_str(), found.fix), (CheckStatus::Ok, "Found · 0.170.0", None));
 
-        let missing = codex_check(false, None);
+        let missing = codex_check(false, None, None);
         assert_eq!((missing.status, missing.value.as_str()), (CheckStatus::Warn, "Not found"));
         assert_eq!(missing.command.as_deref(), Some(INSTALL_CODEX));
         assert_eq!(INSTALL_CODEX, "npm i -g @openai/codex");
@@ -1445,19 +1462,40 @@ mod tests {
         let ask = |script: &str| run_status_probe_terminating(sh(script), CHECK_TIMEOUT, CODEX_TERM_GRACE, OnQuit::Kill);
         let printed = ask("echo 'Logged in using ChatGPT'; exit 0");
         assert_eq!(printed, Probe::Exited { success: true, output: String::new() });
-        let signed_in = codex_check(true, Some(printed));
-        assert_eq!((signed_in.status, signed_in.value.as_str(), signed_in.command), (CheckStatus::Ok, "Signed in", None));
+        let signed_in = codex_check(true, Some(printed), Some("0.171.0"));
+        assert_eq!((signed_in.status, signed_in.value.as_str(), signed_in.command), (CheckStatus::Ok, "Signed in · 0.171.0", None));
 
-        let signed_out = codex_check(true, Some(ask("echo 'Not logged in' >&2; exit 1")));
+        // Signing in comes before the version.
+        let signed_out = codex_check(true, Some(ask("echo 'Not logged in' >&2; exit 1")), Some("0.169.0"));
         assert_eq!((signed_out.status, signed_out.value.as_str()), (CheckStatus::Warn, "Not signed in"));
         assert_eq!(signed_out.command.as_deref(), Some(CODEX_LOGIN));
 
-        let hung = codex_check(true, Some(run_status_probe_terminating(sh("sleep 5"), Duration::from_millis(100), Duration::from_millis(100), OnQuit::Kill)));
+        let hung = codex_check(true, Some(run_status_probe_terminating(sh("sleep 5"), Duration::from_millis(100), Duration::from_millis(100), OnQuit::Kill)), None);
         assert_eq!((hung.status, hung.timed_out, hung.command.as_deref()), (CheckStatus::Warn, true, Some(CODEX_LOGIN_STATUS)));
-        assert_eq!(codex_check(true, Some(Probe::Missing)).command.as_deref(), Some(INSTALL_CODEX));
+        assert_eq!(codex_check(true, Some(Probe::Missing), Some("0.170.0")).command.as_deref(), Some(INSTALL_CODEX));
 
         assert_eq!(CODEX_LOGIN_STATUS, format!("codex {}", CODEX_LOGIN_STATUS_ARGS.join(" ")));
         assert_eq!(CODEX_LOGIN_STATUS_ON_QUIT, OnQuit::Leave, "quitting must not cut a token refresh short");
+    }
+
+    #[test]
+    fn codex_below_the_sandbox_fix_warns_and_an_unknown_version_never_does() {
+        let old = codex_check(true, Some(Probe::Exited { success: true, output: String::new() }), Some("0.169.0"));
+        assert_eq!((old.status, old.value.as_str()), (CheckStatus::Warn, "Signed in · 0.169.0"));
+        assert_eq!(
+            old.fix.as_deref(),
+            Some("Update Codex: 0.170.0 fixes permission updates and child threads losing sandbox restrictions.")
+        );
+        assert_eq!(old.command.as_deref(), Some(INSTALL_CODEX));
+        // The automatic pass (no login probe) warns too.
+        assert_eq!(codex_check(true, None, Some("0.169.0")).status, CheckStatus::Warn);
+
+        let at_fix = codex_check(true, None, Some("0.170.0"));
+        assert_eq!((at_fix.status, at_fix.fix), (CheckStatus::Ok, None));
+
+        let unknown = codex_check(true, Some(Probe::Exited { success: true, output: String::new() }), None);
+        assert_eq!((unknown.status, unknown.value.as_str(), unknown.fix), (CheckStatus::Ok, "Signed in · version unknown", None));
+        assert_eq!(codex_check(true, None, None).value, "Found · version unknown");
     }
 
     #[test]

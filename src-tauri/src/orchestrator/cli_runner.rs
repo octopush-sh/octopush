@@ -1724,6 +1724,16 @@ impl CliDialect {
         }
     }
 
+    /// The launch line's version label: `codex 0.169.0` on Codex when its
+    /// version is known; `None` otherwise (Claude Code's version shows in
+    /// its own notices).
+    pub fn version_label(&self, codex_version: Option<&str>) -> Option<String> {
+        match self {
+            CliDialect::Codex => codex_version.map(|v| format!("codex {v}")),
+            CliDialect::Claude => None,
+        }
+    }
+
     /// Resume argv, for dialects with a confirmed session-continuation
     /// contract. `None` ⇒ the runner falls back to a fresh run (worktree
     /// preserved, feedback in the prompt) — the already-graceful path.
@@ -2934,6 +2944,13 @@ impl CliRunner {
             None
         };
         let old_cli = cli_version.as_ref().is_some_and(|v| v.below_floor);
+        // Codex: only named on the launch line (`codex --version`, cached the
+        // same way); the Readiness card says when it lacks a sandbox fix.
+        let codex_version = if dialect == CliDialect::Codex {
+            tokio::task::spawn_blocking(crate::agent_adapter::codex_cli_version).await.ok().flatten()
+        } else {
+            None
+        };
         let effort = stage.effort.filter(|_| !old_cli);
         // Resume only on dialects with a confirmed continuation contract; a
         // dialect without one falls back to a fresh run (worktree preserved,
@@ -3141,7 +3158,7 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
@@ -3151,6 +3168,7 @@ impl CliRunner {
                 .unwrap_or_default(),
             if resuming { " · resuming session" } else { "" },
             crate::orchestrator::sandbox::left_out_label(&left_out).map(|s| format!(" · {s}")).unwrap_or_default(),
+            dialect.version_label(codex_version.as_deref()).map(|s| format!(" · {s}")).unwrap_or_default(),
         ));
         if let Some(cap) = max_budget_args(budget_cap).get(1) {
             emitter.notice(&format!(
