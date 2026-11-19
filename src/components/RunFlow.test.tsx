@@ -102,6 +102,39 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(tokens.parentElement).toHaveAttribute("title", "$123.45 · ↑184.0k ↓31.0k tokens");
   });
 
+  it("reads an unpriced essence cost as mute 'unpriced', never $0.00", () => {
+    const unpriced = [
+      mk({ id: "i", position: 1, status: "done", unpricedModel: true, ranModel: "fable-x", inputTokens: 18_412, outputTokens: 3_100 }),
+      mk({ id: "s", position: 2, status: "running", startedAt: 1 }),
+    ];
+    const { container } = render(
+      <RunFlow stages={unpriced} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
+    );
+    const label = screen.getByText("unpriced");
+    expect(label).toHaveClass("text-octo-mute");
+    expect(label).not.toHaveClass("text-octo-brass");
+    expect(label.getAttribute("title")).toContain("No price for fable-x");
+    // "2 unpriced ↑18k ↓3.1k" is 19ch: the token pair sheds.
+    expect(screen.getByText("↑18k ↓3.1k")).toHaveClass("octo-demote-shed");
+    const line = label.parentElement!;
+    expect(line).toHaveAttribute("title", "unpriced · ↑18.4k ↓3.1k tokens");
+    expect(container.textContent).not.toContain("$0.00");
+  });
+
+  it("reads an unreported essence cost as mute 'usage not reported', never $0.00", () => {
+    const unreported = [
+      mk({ id: "i", position: 0, status: "done", usageUnreported: true }),
+      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+    ];
+    const { container } = render(
+      <RunFlow stages={unreported} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
+    );
+    const label = screen.getByText("usage not reported");
+    expect(label).toHaveClass("text-octo-mute");
+    expect(label.getAttribute("title")).toMatch(/usage/);
+    expect(container.textContent).not.toContain("$0.00");
+  });
+
   it("renders no connector for a single-stage run", () => {
     const { container } = render(
       <RunFlow stages={[mk({ id: "solo" })]} selectedStageId={null} beaconStageId={null} onSelectStage={() => {}} />,

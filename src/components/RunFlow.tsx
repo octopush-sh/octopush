@@ -10,7 +10,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
 import { tourId } from "../lib/tour/ids";
-import { formatUsd } from "../lib/cost";
+import { formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
 import { RunFlowNav } from "./RunFlowNav";
 
 interface Props {
@@ -294,11 +294,14 @@ function StageCard({
 
 /** Essence meta — discreet position · cost · tokens, on ONE nowrap line (S1).
  *  When the three don't fit the card, the token pair sheds (E2); it stays in
- *  the line's tooltip and in the focus pane one click away. */
+ *  the line's tooltip and in the focus pane one click away. An unknown cost
+ *  reads "usage not reported" / "unpriced" in mute, never "$0.00". */
 function EssenceMeta({ stage: s, position }: { stage: RunStage; position: string }) {
   const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
-  const hasMeta = s.costUsd > 0 || hasTokens;
-  const cost = formatUsd(s.costUsd);
+  const unreported = s.usageUnreported && s.costUsd === 0;
+  const unpriced = !unreported && s.unpricedModel && s.costUsd === 0 && hasTokens;
+  const hasMeta = s.costUsd > 0 || hasTokens || unreported;
+  const cost = unreported ? "usage not reported" : unpriced ? "unpriced" : formatUsd(s.costUsd);
   const tokens = hasTokens ? `↑${fmtTokensShort(s.inputTokens)} ↓${fmtTokensShort(s.outputTokens)}` : "";
   const shed = hasTokens && essenceShedsTokens(position, cost, tokens);
   return (
@@ -307,7 +310,19 @@ function EssenceMeta({ stage: s, position }: { stage: RunStage; position: string
       title={shed ? `${cost} · ↑${fmtTokens(s.inputTokens)} ↓${fmtTokens(s.outputTokens)} tokens` : undefined}
     >
       <span className="octo-tabular shrink-0">{position}</span>
-      {hasMeta && <span className="octo-tabular shrink-0 text-octo-brass">{cost}</span>}
+      {hasMeta &&
+        (unreported ? (
+          // 18ch on its own: the one label that can outgrow the line, so it truncates.
+          <span className="min-w-0 truncate text-octo-mute" title={USAGE_UNREPORTED_TITLE}>
+            {cost}
+          </span>
+        ) : unpriced ? (
+          <span className="shrink-0 text-octo-mute" title={unpricedTitle([s.ranModel ?? s.agentModel])}>
+            {cost}
+          </span>
+        ) : (
+          <span className="octo-tabular shrink-0 text-octo-brass">{cost}</span>
+        ))}
       {hasTokens && (
         <span
           className={`octo-demote octo-tabular text-octo-mute${shed ? " octo-demote-shed" : ""}`}

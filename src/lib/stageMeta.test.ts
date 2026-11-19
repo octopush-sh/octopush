@@ -15,6 +15,12 @@ describe("fmtTokensShort", () => {
     expect(fmtTokensShort(999_600)).toBe("1.0M");
     expect(fmtTokensShort(1_240_000)).toBe("1.2M");
   });
+
+  it("never reads 10.0k just under ten thousand", () => {
+    expect(fmtTokensShort(9_949)).toBe("9.9k");
+    expect(fmtTokensShort(9_950)).toBe("10k");
+    expect(fmtTokensShort(9_999)).toBe("10k");
+  });
 });
 
 describe("essenceShedsTokens", () => {
@@ -25,5 +31,7 @@ describe("essenceShedsTokens", () => {
 
   it("sheds the pair when the line would overflow", () => {
     expect(essenceShedsTokens("10", "$12.34", "↑184k ↓31k")).toBe(true);
+    // The shown label counts, not a "$0.00" placeholder.
+    expect(essenceShedsTokens("2", "unpriced", "↑18k ↓3.1k")).toBe(true);
   });
 });

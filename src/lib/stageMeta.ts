@@ -11,10 +11,13 @@ export function fmtTokens(n: number): string {
 }
 
 /** Tighter still, for the 150px essence card: no decimal from 10k up
- *  (18 412 → "18k"), millions as "1.2M". Under 10k it reads as `fmtTokens`. */
+ *  (18 412 → "18k"), millions as "1.2M". Under 10k it reads as `fmtTokens`.
+ *  Not `formatTokenCount` (lib/cost.ts): that one drops the decimal below 10k
+ *  too, while the essence card keeps "3.1k" so it agrees with the focus pane. */
 export function fmtTokensShort(n: number): string {
   if (n >= 999_500) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  // From 9 950 up, since `fmtTokens` would round those to "10.0k".
+  if (n >= 9_950) return `${Math.round(n / 1000)}k`;
   return fmtTokens(n);
 }
 
