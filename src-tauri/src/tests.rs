@@ -13228,6 +13228,34 @@ mod conflict_resolution_tests {
         assert_eq!(status_files(tmp.path()).unwrap().operation, None);
     }
 
+    /// HEAD's oid is in the status, so a commit on a branch with no upstream
+    /// (clean before and after) still changes it.
+    #[test]
+    fn status_carries_the_head_oid() {
+        let tmp = TempDir::new().unwrap();
+        let d = tmp.path();
+        git(d, &["init", "-b", "main"]);
+        git(d, &["config", "user.email", "t@t"]);
+        git(d, &["config", "user.name", "t"]);
+        assert_eq!(status_files(d).unwrap().head, None, "an unborn branch has no HEAD commit");
+        let rev = || {
+            let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(d).output().unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        fs::write(d.join("file.txt"), "one\n").unwrap();
+        git(d, &["add", "."]);
+        git(d, &["commit", "-m", "one"]);
+        let first = status_files(d).unwrap();
+        assert!(first.changed_files.is_empty());
+        assert_eq!(first.head.as_deref(), Some(rev().as_str()));
+        fs::write(d.join("file.txt"), "two\n").unwrap();
+        git(d, &["commit", "-am", "two"]);
+        let second = status_files(d).unwrap();
+        assert!(second.changed_files.is_empty());
+        assert_eq!(second.head.as_deref(), Some(rev().as_str()));
+        assert_ne!(first.head, second.head);
+    }
+
     #[tokio::test]
     async fn take_ours_keeps_head_content_and_clears_conflict() {
         let tmp = conflicted_repo();

@@ -110,8 +110,14 @@ import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
-import { changeStats, NO_CHANGE_STATS, runChangesReader, sameChangeStats, type ChangeStats } from "./lib/runChanges";
-import type { CommitsAhead } from "./components/CompanionRun";
+import {
+  gitStatusSig,
+  NO_CHANGE_STATS,
+  runChangesReader,
+  runChangesTick,
+  type ChangeStats,
+  type CommitsAhead,
+} from "./lib/runChanges";
 import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -879,36 +885,23 @@ function App() {
         // Status change-detection (file metadata). hasUpstream is intentionally
         // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
         // its own git status). The diff is compared separately, by content.
-        const sig =
-          `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
-          `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`;
+        const sig = gitStatusSig(s);
         if (runChanges) {
-          const dirty = (s?.changedFiles.length ?? 0) > 0;
-          const read = runReader.next(sig, dirty);
-          if (read === "diff") {
-            // A file gains lines without its status changing, so the working
-            // diff is read on every tick while there is something to count
-            // (the backend builds it off the async runtime). Only the counts
-            // are kept (see `runChangeStats`). The commits-ahead count is
-            // void from here: a commit may land before the tree is clean.
-            setRunAhead(null);
-            const stats = changeStats(await ipc.getGitDiff(path, ignoreWs).catch(() => ""));
-            if (cancelled) return;
-            setRunChangeStats((prev) => (sameChangeStats(prev, stats) ? prev : stats));
-          } else {
-            setRunChangeStats((prev) => (sameChangeStats(prev, NO_CHANGE_STATS) ? prev : NO_CHANGE_STATS));
-            if (read === "ahead" && ws) {
-              const c = await ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null);
-              if (cancelled) return;
-              runReader.aheadRead(sig);
-              const next: CommitsAhead | null = c ? { commits: c.commits, base: c.base, mergeBase: c.mergeBase } : null;
-              setRunAhead((prev) =>
-                prev?.commits === next?.commits && prev?.base === next?.base && prev?.mergeBase === next?.mergeBase
-                  ? prev
-                  : next,
-              );
-            }
-          }
+          // The backend builds the working diff off the async runtime; only
+          // its counts are kept (see `runChangeStats`).
+          await runChangesTick(runReader, s, {
+            readDiff: () => ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+            readAhead: ws
+              ? async () => {
+                  const c = await ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null);
+                  return c ? { commits: c.commits, base: c.base, mergeBase: c.mergeBase } : null;
+                }
+              : null,
+            setStats: setRunChangeStats,
+            setAhead: setRunAhead,
+            cancelled: () => cancelled,
+          });
+          if (cancelled) return;
         }
         if (ws && reviewCommitted !== undefined) {
           useReviewSource.getState().setCommitted(ws.id, reviewCommitted);

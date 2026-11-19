@@ -2,7 +2,7 @@
 // uncommitted files are and how many lines each gained and lost. Pure (no
 // stores, no React) so the wording and the counting are unit-tested.
 
-import type { FileChange } from "./types";
+import type { FileChange, GitStatus } from "./types";
 import type { DiffStat } from "./modeMeta";
 import { isDiffTruncated } from "./reviewSource";
 
@@ -132,18 +132,36 @@ export function pathTail(path: string): number {
  *  and the count isn't known for this state), or nothing. */
 export type RunChangesRead = "diff" | "ahead" | null;
 
+/** How far the branch is ahead of its base: the count and what it was
+ *  counted against. Never the committed diff itself. */
+export interface CommitsAhead {
+  commits: number;
+  base: string | null;
+  mergeBase: string | null;
+}
+
+/**
+ * The git poll's change-detection key for a status: the branch, the
+ * upstream-relative ahead/behind, HEAD's commit and the changed files. HEAD
+ * is what moves on a commit, reset, merge or cherry-pick when the branch has
+ * no upstream (ahead/behind stay 0/0 there) and the tree is clean again.
+ */
+export function gitStatusSig(s: GitStatus | null): string {
+  return (
+    `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|${s?.head ?? ""}|` +
+    `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`
+  );
+}
+
 /**
  * Decides, tick by tick, what Run's Changes section needs read.
  *
  * The working diff is read on every dirty tick: a file gains lines without
  * its status changing. The commits-ahead count is read once per clean
  * state: when the tree becomes clean, and again when the status signature
- * moves while it stays clean. **Any dirty tick voids it.** The signature
- * holds the branch, the upstream-relative ahead/behind and the changed
- * files; on a workspace branch with no upstream a commit moves none of
- * them, so clean, then edits, then a commit, then clean again gives the
- * very signature the count was read at. Only having been dirty in between
- * says a commit may have landed.
+ * (`gitStatusSig`) moves while it stays clean, as it does when HEAD moves.
+ * Any dirty tick also voids it, so a count is never kept across edits even
+ * where the status carries no HEAD.
  */
 export function runChangesReader() {
   let aheadAt: string | null = null;
@@ -161,4 +179,52 @@ export function runChangesReader() {
       aheadAt = sig;
     },
   };
+}
+
+/** What one tick for Run's Changes section reads with and writes to: App's
+ *  IPC calls and state setters, in a form a test can stand in for. */
+export interface RunChangesIo {
+  /** The working diff; "" when it can't be read. */
+  readDiff(): Promise<string>;
+  /** The commits since the base; null for none or unreadable. Null itself
+   *  when there is no workspace to ask (a project's own checkout). */
+  readAhead: (() => Promise<CommitsAhead | null>) | null;
+  setStats(update: (prev: ChangeStats) => ChangeStats): void;
+  setAhead(update: (prev: CommitsAhead | null) => CommitsAhead | null): void;
+  /** The poll went away while a read was in flight: write nothing. */
+  cancelled(): boolean;
+}
+
+const sameAhead = (a: CommitsAhead | null, b: CommitsAhead | null) =>
+  a?.commits === b?.commits && a?.base === b?.base && a?.mergeBase === b?.mergeBase;
+
+/**
+ * One tick of App's git poll for Run's Changes section, given the status it
+ * just read: the working diff's counts while the tree is dirty (the count of
+ * commits ahead is void from the first dirty tick: a commit may land before
+ * the tree is clean), the count once per clean state (`runChangesReader`).
+ * Only the counts are kept, never the diff text. A setter is handed back
+ * the state it had when nothing changed, so a quiet tick renders nothing.
+ */
+export async function runChangesTick(
+  reader: ReturnType<typeof runChangesReader>,
+  status: GitStatus | null,
+  io: RunChangesIo,
+): Promise<void> {
+  const sig = gitStatusSig(status);
+  const read = reader.next(sig, (status?.changedFiles.length ?? 0) > 0);
+  if (read === "diff") {
+    io.setAhead(() => null);
+    const stats = changeStats(await io.readDiff());
+    if (io.cancelled()) return;
+    io.setStats((prev) => (sameChangeStats(prev, stats) ? prev : stats));
+    return;
+  }
+  io.setStats((prev) => (sameChangeStats(prev, NO_CHANGE_STATS) ? prev : NO_CHANGE_STATS));
+  if (read === "ahead" && io.readAhead) {
+    const next = await io.readAhead();
+    if (io.cancelled()) return;
+    reader.aheadRead(sig);
+    io.setAhead((prev) => (sameAhead(prev, next) ? prev : next));
+  }
 }
