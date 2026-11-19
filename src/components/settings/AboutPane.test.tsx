@@ -80,4 +80,24 @@ describe("AboutPane — reference links (#560)", () => {
       expect(el).not.toHaveClass("text-octo-brass");
     }
   });
+
+  it("sets both links in the same sans voice (#876)", () => {
+    const { container } = render(<AboutPane />);
+    const repo = screen.getByText("github.com/octopush-sh/octopush");
+    const notes = container.querySelector('[data-tour="about-whats-new"]')!;
+    for (const el of [repo, notes]) {
+      expect(el).not.toHaveClass("font-serif");
+      expect(el).not.toHaveClass("font-mono");
+    }
+    expect(notes.className).not.toMatch(/text-\[\d+px\]/);
+  });
+});
+
+describe("AboutPane — last checked (#876)", () => {
+  it("says when it last checked once, beside the status line", () => {
+    useUpdaterStore.setState({ phase: "no-update", currentVersion: "1.3.0", lastCheckedAt: Date.now() });
+    render(<AboutPane />);
+    expect(screen.getByText(/^Checked /)).toBeInTheDocument();
+    expect(screen.queryByText(/Last checked for updates/)).toBeNull();
+  });
 });

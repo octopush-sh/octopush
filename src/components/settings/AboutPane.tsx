@@ -195,12 +195,11 @@ export function AboutPane() {
               type="button"
               data-tour="about-whats-new"
               onClick={() => void openWhatsNewForCurrentVersion()}
-              className={`font-serif text-[13px] ${REFERENCE_LINK_CLASS} focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`}
+              className={`${REFERENCE_LINK_CLASS} focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass`}
             >
               What's in this version
             </button>
           </li>
-          <li>· Last checked for updates: <span className="font-mono text-octo-ivory">{lastChecked}</span></li>
           <li>· Updates are verified with an Ed25519 signature before install.</li>
         </ul>
       </div>
