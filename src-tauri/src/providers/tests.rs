@@ -851,7 +851,7 @@ mod effort {
     #[test]
     fn openai_effort_passes_xhigh_and_max_through_on_gpt6_only() {
         // Every GPT-6 model page accepts xhigh and max (#689).
-        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol"] {
+        for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol"] {
             for e in [Effort::Xhigh, Effort::Max] {
                 assert_eq!(openai_compat::reasoning_effort_level(m, e), e.as_str(), "{m}");
             }
@@ -891,10 +891,12 @@ mod effort {
             let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
             assert_eq!(body["reasoning"], json!({ "effort": "none" }), "{m}");
         }
-        // GPT-6 Astra and GPT-6.1 Sol 400 on it: omitted, so they run at `medium`.
-        // Only a dated snapshot suffix counts: another variant may not take `none`.
+        // GPT-6 Astra, GPT-6.1 Sol and GPT-6.2 Astra/Sol 400 on it: omitted, so
+        // they run at `medium`. Only a dated snapshot suffix counts: another
+        // variant may not take `none`.
         for m in [
-            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-sol-2026-10-01", "gpt-6-solar", "gpt-6.2-terra",
+            "gpt-6-astra", "gpt-6.1-sol", "gpt-6.1-sol-2026-10-01", "gpt-6.2-astra", "gpt-6.2-sol",
+            "openai/gpt-6.2-sol", "gpt-6.2-astra-2026-11-17", "gpt-6-solar", "gpt-6.2-terra",
             "gpt-6-sol-pro", "gpt-6-luna-mini", "gpt-6-sol-2026-08", "gpt-6.1-terra-2026-08-01-pro",
         ] {
             assert_eq!(openai_compat::effort_off_level(m), None, "{m}");
@@ -1098,7 +1100,7 @@ fn openai_responses_keeps_no_raw_without_replayable_reasoning() {
 #[test]
 fn openai_gpt6_models_use_the_responses_api() {
     let openai = "https://api.openai.com/v1";
-    for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol", "GPT-6-Sol"] {
+    for m in ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra", "gpt-6.1-terra", "gpt-6.1-sol", "gpt-6.2-astra", "gpt-6.2-sol", "GPT-6-Sol"] {
         assert!(openai_compat::uses_responses_api(m, openai), "{m} needs the Responses API for tools");
     }
     for m in ["gpt-4o", "gpt-5", "o3-mini", "deepseek-chat", "llama3.1"] {
