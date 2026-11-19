@@ -409,6 +409,49 @@ export function resolveTopDrop(
   return (sectionOf.get(overId) ?? null) === mine ? reorder(order) : loose(order);
 }
 
+/** What a pending top-level drop would do to the dragged project's group,
+ *  as the dragged block says it: join `groupId` ("Into …"), or leave it
+ *  ("Out of …"). Null when the drop only reorders, or does nothing. */
+export interface TopDropCue {
+  kind: "into" | "out";
+  /** The group joined, or the group left. */
+  groupId: string;
+  name: string;
+}
+
+/** A drop at the top level, resolved once: what it does (`resolveTopDrop`)
+ *  and what the dragged block says about it (`TopDropCue`). The rail reads
+ *  the cue while the drag is over a target and applies the action when it is
+ *  dropped there, from this one call, so the two can never disagree. */
+export interface ResolvedTopDrop {
+  action: TopDropAction | null;
+  cue: TopDropCue | null;
+}
+
+/**
+ * Resolve dropping `activeId` on `overId` (null: over nothing) at the rail's
+ * top level. A group dragged as a whole never changes membership, so it never
+ * has a cue; nor does a project that only reorders.
+ */
+export function resolveTopDropWithCue(
+  items: readonly RailTopItem[],
+  activeId: string,
+  overId: string | null,
+): ResolvedTopDrop {
+  const action = overId === null ? null : resolveTopDrop(items, activeId, overId);
+  const move = action?.move;
+  if (!move) return { action, cue: null };
+  const groupId = move.groupId ?? sectionByProject(items).get(move.projectId) ?? null;
+  const section = groupId
+    ? items.find((item) => item.kind === "section" && item.group.id === groupId)
+    : undefined;
+  if (!groupId || section?.kind !== "section") return { action, cue: null };
+  return {
+    action,
+    cue: { kind: move.groupId ? "into" : "out", groupId, name: section.group.name },
+  };
+}
+
 /**
  * The project order after a one-step move from a menu ("Move up", "Move
  * down"), or null when there is nowhere to go. `id` is a project id or a

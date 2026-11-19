@@ -20,7 +20,9 @@ import {
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragOverEvent,
   type DragStartEvent,
+  type UniqueIdentifier,
 } from "@dnd-kit/core";
 import {
   SortableContext,
@@ -54,7 +56,7 @@ import {
   ownGroupId,
   projectGroupsOf,
   resolveRailDrop,
-  resolveTopDrop,
+  resolveTopDropWithCue,
   sectionByProject,
   sectionDragId,
   stepInRail,
@@ -63,6 +65,7 @@ import {
   type RailDropTarget,
   type RailItem,
   type RailTopItem,
+  type TopDropCue,
 } from "../lib/railGroups";
 import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
 import { useGroupsStore } from "../stores/groupsStore";
@@ -71,7 +74,7 @@ import { useRailGroupUi } from "../stores/railGroupUiStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { GroupContextMenu } from "./GroupContextMenu";
 import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
-import { RailProjectSection } from "./RailProjectSection";
+import { EYEBROW, RailProjectSection } from "./RailProjectSection";
 import { ProjectMark } from "./icons/ProjectMark";
 import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { MidTruncate } from "./primitives/MidTruncate";
@@ -554,9 +557,25 @@ export function WorkspaceRail({
     if (list.scrollTop > max) list.scrollTop = max;
     if (list.scrollLeft !== 0) list.scrollLeft = 0;
   };
+  // What the drop under the pointer would do to the dragged project's group,
+  // shown on the dragged block (`DropCue`) and as the wash of the group it
+  // would join. It comes from the very call the drop makes (see `dropAt`).
+  const [dropCue, setDropCue] = useState<TopDropCue | null>(null);
+  /** A top-level drop of `active` on `over`, resolved once for the cue (while
+   *  over it) and for the drop (when released there). */
+  const dropAt = (active: { id: UniqueIdentifier }, over: { id: UniqueIdentifier } | null) =>
+    resolveTopDropWithCue(topItems, String(active.id), over ? String(over.id) : null);
+  const handleDragOver = (e: DragOverEvent) => {
+    if (railSubjectOf(e.active.data.current)) return;
+    const { cue } = dropAt(e.active, e.over);
+    setDropCue((prev) =>
+      prev?.kind === cue?.kind && prev?.groupId === cue?.groupId && prev?.name === cue?.name ? prev : cue,
+    );
+  };
   const endDrag = () => {
     scrollLimit.current = null;
     setDragging(null);
+    setDropCue(null);
   };
   const handleDragStart = (e: DragStartEvent) => {
     const subject = railSubjectOf(e.active.data.current);
@@ -583,8 +602,7 @@ export function WorkspaceRail({
     }
     // The top level: a project or a project group. A project dropped in
     // another container (a group, or the loose top level) joins it too.
-    if (!over) return;
-    const action = resolveTopDrop(topItems, String(active.id), String(over.id));
+    const { action } = dropAt(active, over);
     if (!action) return;
     if (action.move) {
       // The order travels with the owner's callback, so the move persists none.
@@ -618,6 +636,7 @@ export function WorkspaceRail({
         sectionId={section?.id ?? null}
         sectionTint={section?.tint ?? null}
         hidden={sectionFolded}
+        dropCue={dropCue}
         collapsedGroups={collapsedGroups}
         attention={carriers.byProject[project.id] ?? null}
         groupAttention={carriers.byGroup}
@@ -722,6 +741,7 @@ export function WorkspaceRail({
               sensors={sensors}
               collisionDetection={railCollisions}
               onDragStart={handleDragStart}
+              onDragOver={handleDragOver}
               onDragEnd={handleDragEnd}
               onDragCancel={endDrag}
             >
@@ -760,6 +780,7 @@ export function WorkspaceRail({
                       holdsActive={members.some((p) => p.workspaces.some((w) => w?.id === activeWorkspaceId))}
                       attention={sectionFolded ? (carriers.bySection[group.id] ?? null) : null}
                       dragEnabled={dragEnabled}
+                      accepting={dropCue?.kind === "into" && dropCue.groupId === group.id}
                       hitClassName={HIT_WASH}
                       onToggle={() => useRailGroupUi.getState().toggle(group.id)}
                       onContextMenu={(x, y, fromKeyboard) => openGroupMenu(group.id, x, y, fromKeyboard)}
@@ -966,6 +987,9 @@ interface SortableProjectGroupProps {
   /** Its project group is folded: the project is out of sight, so nothing
    *  can be dropped on it (the group's header is the target). */
   hidden: boolean;
+  /** What dropping the dragged project now would do to its group; shown on
+   *  this project's line only while this is the project being dragged. */
+  dropCue: TopDropCue | null;
   /** Folded mission groups by id (the stored state; a filter overrides it). */
   collapsedGroups: Record<string, boolean>;
   /** Set only while folded: the beacon or dot this line carries for the
@@ -998,7 +1022,7 @@ interface SortableProjectGroupProps {
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
-    project, items, lead, sectionId, sectionTint, hidden,
+    project, items, lead, sectionId, sectionTint, hidden, dropCue,
     collapsedGroups, attention, groupAttention, groupDragEnabled, dragging,
     onGroupContextMenu, onNewWorkspaceInGroup,
     q, folded, toggleProjectCollapsed, activeWorkspaceId,
@@ -1235,6 +1259,9 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
             </span>
           </span>
         )}
+        {/* While this project is dragged and the drop would change its group,
+            its own line says so, where the eye is ("Into …" / "Out of …"). */}
+        {isDragging && dropCue && <DropCue cue={dropCue} />}
       </div>
 
       {/* Rows — the grid-rows 0fr↔1fr collapse idiom. The clip wrapper carries
@@ -1288,6 +1315,37 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         </div>
       </div>
     </div>
+  );
+}
+
+/** The text of a drop cue, as the dragged block shows it. */
+export function dropCueText(cue: TopDropCue): string {
+  return `${cue.kind === "into" ? "Into" : "Out of"} ${cue.name}`;
+}
+
+/**
+ * The cue on a dragged project's line: what the drop under the pointer would
+ * do to its group. `Into {group}` in brass (an active state) when it would
+ * join one, `Out of {group}` in mute when it would leave its own. Drawn over
+ * the right end of the line on the block's own ground, so it never changes
+ * the block's size; a long name ends in an ellipsis. It crossfades in when
+ * the drop it describes changes.
+ */
+function DropCue({ cue }: { cue: TopDropCue }) {
+  const text = dropCueText(cue);
+  return (
+    <span
+      data-testid="rail-drop-cue"
+      data-cue={cue.kind}
+      className={`pointer-events-none absolute inset-y-0 right-2 flex max-w-[60%] items-center bg-octo-panel pl-2 ${EYEBROW}`}
+    >
+      <span
+        key={text}
+        className={`octo-fade-in min-w-0 truncate ${cue.kind === "into" ? "text-octo-brass" : "text-octo-mute"}`}
+      >
+        {text}
+      </span>
+    </span>
   );
 }
 

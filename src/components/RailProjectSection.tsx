@@ -36,8 +36,9 @@ const LEAD = {
   "after-section": "mt-0.5 border-t border-octo-hairline pt-1.5",
 } as const;
 
-/** The eyebrow's type: the rail's "Recently closed" idiom. */
-const EYEBROW = "font-mono text-[9px] uppercase leading-none tracking-[0.25em]";
+/** The eyebrow's type: the rail's "Recently closed" idiom. Also the type of
+ *  the cue a dragged project shows ("Into …" / "Out of …"). */
+export const EYEBROW = "font-mono text-[9px] uppercase leading-none tracking-[0.25em]";
 
 interface Props {
   group: Group;
@@ -60,6 +61,10 @@ interface Props {
   attention: GroupAttention;
   /** The section can be dragged as one unit and projects dropped on it. */
   dragEnabled: boolean;
+  /** The project being dragged would join this group if dropped now: its
+   *  header takes the accepting wash. Decided by the rail from the same
+   *  resolution as the drop and as the dragged block's cue. */
+  accepting: boolean;
   hitClassName: string;
   onToggle: () => void;
   /** Open the header's menu. `fromKeyboard`: it was asked for with ⇧F10 or
@@ -79,6 +84,7 @@ export function RailProjectSection({
   holdsActive,
   attention,
   dragEnabled,
+  accepting,
   hitClassName,
   onToggle,
   onContextMenu,
@@ -101,16 +107,8 @@ export function RailProjectSection({
     data: { type: "section-head", groupId: group.id } satisfies RailTopData,
     disabled: !dragEnabled,
   });
-  // A project is being dragged over this section's header or one of its
-  // projects, and it is not one of them yet: dropping it here adds it.
-  const { active, over } = useDndContext();
+  const { active } = useDndContext();
   const dragged = active?.data.current as Partial<RailTopData> | undefined;
-  const target = over?.data.current as Partial<RailTopData> | undefined;
-  const accepts =
-    dragged?.type === "project" &&
-    dragged.sectionId !== group.id &&
-    ((target?.type === "section-head" && target.groupId === group.id) ||
-      (target?.type === "project" && target.sectionId === group.id));
 
   // One of this group's own projects is being dragged. Its block moves by a
   // transform and may leave the group's box (that is how it is dragged out),
@@ -158,7 +156,7 @@ export function RailProjectSection({
         onPointerDown={unit.listeners?.onPointerDown as React.PointerEventHandler<HTMLDivElement> | undefined}
         data-tour="rail-section-header"
         className={`group/shead relative flex h-[26px] items-center gap-2 pl-3.5 pr-2 transition-colors duration-[180ms] ${
-          accepts ? "bg-[var(--brass-ghost)]" : ""
+          accepting ? "bg-[var(--brass-ghost)]" : ""
         }`}
         onContextMenu={(e) => {
           e.preventDefault();

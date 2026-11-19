@@ -25,13 +25,31 @@ vi.mock("@dnd-kit/sortable", async (importOriginal) => {
 
 /** What the drag is made to look like to `useDndContext`, over its real answer. */
 const drag = vi.hoisted(() => ({ context: {} as object }));
+/** The rail's DndContext handlers, so a test can move a drag over a target
+ *  and drop it the way dnd-kit would. */
+const dnd = vi.hoisted(() => ({ props: null as unknown }));
 vi.mock("@dnd-kit/core", async (importOriginal) => {
   const original = await importOriginal<typeof import("@dnd-kit/core")>();
-  return { ...original, useDndContext: () => ({ ...original.useDndContext(), ...drag.context }) };
+  const { createElement } = await import("react");
+  return {
+    ...original,
+    useDndContext: () => ({ ...original.useDndContext(), ...drag.context }),
+    DndContext: (props: import("@dnd-kit/core").DndContextProps) => {
+      dnd.props = props;
+      return createElement(original.DndContext, props);
+    },
+  };
 });
+const mockMove = vi.hoisted(() => vi.fn());
+vi.mock("../lib/groupActions", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../lib/groupActions")>()),
+  moveProjectToGroup: mockMove,
+}));
 
-import { WorkspaceRail, type ProjectGroup } from "./WorkspaceRail";
-import { sectionDragId } from "../lib/railGroups";
+import { act } from "@testing-library/react";
+import type { DndContextProps } from "@dnd-kit/core";
+import { WorkspaceRail, dropCueText, type ProjectGroup } from "./WorkspaceRail";
+import { resolveTopDropWithCue, sectionDragId, sectionHeadId, TOP_LOOSE_ID } from "../lib/railGroups";
 import { DRAGGED_BLOCK } from "../lib/railDnd";
 import { LIFTED_GROUND } from "../lib/menuStyles";
 import { useGroupsStore } from "../stores/groupsStore";
@@ -51,7 +69,7 @@ const PROJECTS: ProjectGroup[] = [
   { id: "acme-web", name: "acme-web", groupId: CLIENT.id, workspaces: [] },
 ];
 
-const rail = () =>
+const rail = (onReorderProjects: (ids: string[]) => void = vi.fn()) =>
   render(
     <WorkspaceRail
       projects={PROJECTS}
@@ -59,7 +77,7 @@ const rail = () =>
       onSelect={vi.fn()}
       onCustomize={vi.fn()}
       isCollapsed={false}
-      onReorderProjects={vi.fn()}
+      onReorderProjects={onReorderProjects}
     />,
   );
 const projectEl = (id: string) => document.querySelector<HTMLElement>(`[data-rail-project="${id}"]`)!;
@@ -68,6 +86,7 @@ const sectionEl = () => document.querySelector<HTMLElement>(`[data-rail-section=
 beforeEach(() => {
   forced.byId = {};
   drag.context = {};
+  mockMove.mockReset().mockResolvedValue(true);
   useGroupsStore.setState({ groups: [CLIENT], loaded: true });
 });
 afterEach(() => useGroupsStore.setState({ groups: [], loaded: false }));
@@ -185,5 +204,103 @@ describe("a dragged block is an opaque, lifted surface", () => {
       expect(classes(el)).not.toContain("bg-octo-panel");
       expect(el.style.opacity).toBe("");
     }
+  });
+});
+
+describe("the drop cue on the dragged block", () => {
+  type Target = { id: string; data: unknown };
+  const asProject = (id: string, sectionId: string | null) => ({ id, data: { type: "project", sectionId } });
+  const head = (groupId: string): Target => ({ id: sectionHeadId(groupId), data: { type: "section-head", groupId } });
+  const foot: Target = { id: TOP_LOOSE_ID, data: { type: "top-loose" } };
+  const props = () => dnd.props as DndContextProps;
+  /** The drag of `active` (forced to render as dragged) moved over `over`. */
+  const dragOver = (active: { id: string; data: unknown }, over: Target | null) => {
+    forced.byId[active.id] = { isDragging: true, transform: { x: 0, y: 10, scaleX: 1, scaleY: 1 } };
+    const event = {
+      active: { id: active.id, data: { current: active.data } },
+      over: over ? { id: over.id, data: { current: over.data } } : null,
+    };
+    act(() => props().onDragOver?.(event as unknown as Parameters<NonNullable<DndContextProps["onDragOver"]>>[0]));
+    return event;
+  };
+  const drop = async (event: unknown) =>
+    act(async () => {
+      props().onDragEnd?.(event as Parameters<NonNullable<DndContextProps["onDragEnd"]>>[0]);
+    });
+  const cue = () => document.querySelector<HTMLElement>('[data-testid="rail-drop-cue"]');
+  const headerWash = () =>
+    sectionEl().querySelector('[data-tour="rail-section-header"]')!.className.includes("bg-[var(--brass-ghost)]");
+
+  it("joining: `Into {group}` in brass on the dragged line, and the group's eyebrow is washed", () => {
+    rail();
+    dragOver(asProject("dotfiles", null), head(CLIENT.id));
+    expect(cue()).toHaveTextContent("Into Client work");
+    expect(cue()).toHaveAttribute("data-cue", "into");
+    expect(cue()!.querySelector("span")!.className).toMatch(/text-octo-brass/);
+    expect(projectEl("dotfiles")).toContainElement(cue());
+    expect(headerWash()).toBe(true);
+  });
+
+  it("leaving: `Out of {group}` in mute; no wash anywhere", () => {
+    rail();
+    dragOver(asProject("acme-web", CLIENT.id), foot);
+    expect(cue()).toHaveTextContent("Out of Client work");
+    expect(cue()).toHaveAttribute("data-cue", "out");
+    expect(cue()!.querySelector("span")!.className).toMatch(/text-octo-mute/);
+    expect(headerWash()).toBe(false);
+  });
+
+  it("a reorder only, a group drag, or nothing under the pointer: no cue", () => {
+    rail();
+    dragOver(asProject("acme-web", CLIENT.id), asProject("acme-api", CLIENT.id));
+    expect(cue()).toBeNull();
+    dragOver(asProject("acme-web", CLIENT.id), null);
+    expect(cue()).toBeNull();
+    dragOver({ id: sectionDragId(CLIENT.id), data: { type: "section", groupId: CLIENT.id } }, asProject("dotfiles", null));
+    expect(cue()).toBeNull();
+  });
+
+  it("is drawn over the line's end on the block's ground, in the eyebrow type, never resizing it", () => {
+    rail();
+    dragOver(asProject("dotfiles", null), head(CLIENT.id));
+    const className = cue()!.className;
+    for (const c of ["absolute", "inset-y-0", "right-2", "bg-octo-panel", "font-mono", "uppercase", "tracking-[0.25em]"]) {
+      expect(className.split(/\s+/)).toContain(c);
+    }
+    expect(cue()!.querySelector("span")!.className).toMatch(/truncate/);
+  });
+
+  it("says what the drop then does: the same resolution feeds both", async () => {
+    const onReorderProjects = vi.fn();
+    rail(onReorderProjects);
+    const items = () =>
+      // The rail's own top level, as the cue and the drop see it.
+      [
+        { kind: "project" as const, project: PROJECTS[0] },
+        { kind: "section" as const, group: CLIENT, projects: [PROJECTS[1], PROJECTS[2]] },
+      ];
+    const event = dragOver(asProject("dotfiles", null), head(CLIENT.id));
+    const expected = resolveTopDropWithCue(items(), "dotfiles", sectionHeadId(CLIENT.id));
+    expect(cue()).toHaveTextContent(dropCueText(expected.cue!));
+    await drop(event);
+    expect(mockMove).toHaveBeenCalledWith("dotfiles", expected.action!.move!.groupId, null);
+    expect(onReorderProjects).toHaveBeenCalledWith(expected.action!.order);
+    // The drag is over: the cue goes.
+    expect(cue()).toBeNull();
+  });
+
+  it("follows the target as the drag moves", () => {
+    rail();
+    dragOver(asProject("acme-web", CLIENT.id), foot);
+    expect(cue()).toHaveTextContent("Out of Client work");
+    dragOver(asProject("acme-web", CLIENT.id), asProject("acme-api", CLIENT.id));
+    expect(cue()).toBeNull();
+    dragOver(asProject("acme-web", CLIENT.id), asProject("dotfiles", null));
+    expect(cue()).toHaveTextContent("Out of Client work");
+  });
+
+  it("dropCueText", () => {
+    expect(dropCueText({ kind: "into", groupId: "g", name: "Client work" })).toBe("Into Client work");
+    expect(dropCueText({ kind: "out", groupId: "g", name: "Side projects" })).toBe("Out of Side projects");
   });
 });

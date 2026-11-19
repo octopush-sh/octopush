@@ -705,6 +705,17 @@ a secondary cue (WCAG 1.4.1).
   nothing. A group dragged by its header moves as one unit, by the sortable
   list's own transform: **no `<DragOverlay>`** for a project or a group (it
   would stop the dragged block following the pointer).
+- **The drop cue is on the dragged block,** where the eye is: the opaque
+  block covers the target's eyebrow, so its wash alone can go unseen. While
+  a project drag would change membership, the block's top line shows,
+  right-aligned in the eyebrow type, `Into {group}` in brass (the drop would
+  join that group: an active state) or `Out of {group}` in mute (it would
+  leave its group). Nothing for a reorder, nothing for a group dragged as a
+  whole. It sits over the line's end on the block's own ground, so the block
+  never resizes; a long name ends in an ellipsis; it crossfades with
+  `octo-fade-in` when the target changes. The cue, the target's wash and the
+  drop are one resolution (`resolveTopDropWithCue`), so the label cannot
+  disagree with the result. The target eyebrow keeps its wash.
 - **A dragged block is a lifted surface.** The block itself moves (there
   is no overlay), across other blocks and other groups' eyebrows, so while
   it is dragged it wears `DRAGGED_BLOCK` (`lib/railDnd.ts`): the menus' own

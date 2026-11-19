@@ -10,6 +10,7 @@ import {
   projectGroupsOf,
   resolveRailDrop,
   resolveTopDrop,
+  resolveTopDropWithCue,
   sectionByProject,
   sectionDragId,
   sectionHeadId,
@@ -524,5 +525,59 @@ describe("stepInRail", () => {
     const plain = layoutProjects([proj("a"), proj("b"), proj("c")], []);
     expect(stepInRail(plain, "b", -1)).toEqual(["b", "a", "c"]);
     expect(stepInRail(plain, "b", 1)).toEqual(["a", "c", "b"]);
+  });
+});
+
+describe("resolveTopDropWithCue: what the dragged block says, from the drop's own resolution", () => {
+  // pinned · [client: api web] · [side: cli] · dotfiles, with names to show.
+  const named = layoutProjects(
+    [proj("pinned"), proj("api", "client"), proj("web", "client"), proj("cli", "side"), proj("dotfiles")],
+    [section("client", { name: "Client work", sortOrder: 0 }), section("side", { name: "Side projects", sortOrder: 1 })],
+  );
+  const cue = (active: string, over: string | null) => resolveTopDropWithCue(named, active, over).cue;
+
+  it("joining a group: Into that group", () => {
+    expect(cue("dotfiles", sectionHeadId("client"))).toEqual({ kind: "into", groupId: "client", name: "Client work" });
+    expect(cue("pinned", "web")).toEqual({ kind: "into", groupId: "client", name: "Client work" });
+    // From one group to another: into the new one.
+    expect(cue("api", sectionHeadId("side"))).toEqual({ kind: "into", groupId: "side", name: "Side projects" });
+  });
+
+  it("leaving its group: Out of the group it is in", () => {
+    expect(cue("web", "dotfiles")).toEqual({ kind: "out", groupId: "client", name: "Client work" });
+    expect(cue("cli", TOP_LOOSE_ID)).toEqual({ kind: "out", groupId: "side", name: "Side projects" });
+    expect(cue("api", sectionDragId("side"))).toEqual({ kind: "out", groupId: "client", name: "Client work" });
+  });
+
+  it("a reorder only, or nothing at all: no cue", () => {
+    expect(cue("web", "api")).toBeNull(); // same group
+    expect(cue("dotfiles", "pinned")).toBeNull(); // loose to loose
+    expect(cue("dotfiles", TOP_LOOSE_ID)).toBeNull(); // already last and loose
+    expect(cue("api", sectionHeadId("client"))).toBeNull(); // its own header
+    expect(cue("dotfiles", null)).toBeNull(); // over nothing
+  });
+
+  it("a group dragged as a whole never has a cue", () => {
+    expect(cue(sectionDragId("side"), "pinned")).toBeNull();
+    expect(cue(sectionDragId("client"), TOP_LOOSE_ID)).toBeNull();
+  });
+
+  it("its action is the drop's, call for call", () => {
+    const pairs: Array<[string, string]> = [
+      ["dotfiles", sectionHeadId("client")],
+      ["web", "dotfiles"],
+      ["web", "api"],
+      ["cli", TOP_LOOSE_ID],
+      [sectionDragId("side"), "pinned"],
+      ["api", sectionDragId("side")],
+    ];
+    for (const [active, over] of pairs) {
+      const { action, cue: said } = resolveTopDropWithCue(named, active, over);
+      expect(action).toEqual(resolveTopDrop(named, active, over));
+      // The cue says exactly what the action does to membership.
+      if (!action?.move) expect(said).toBeNull();
+      else if (action.move.groupId) expect(said).toMatchObject({ kind: "into", groupId: action.move.groupId });
+      else expect(said?.kind).toBe("out");
+    }
   });
 });
