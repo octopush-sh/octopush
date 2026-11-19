@@ -757,6 +757,8 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
                 // OpenAI model and pricing pages (fetched 2026-11-17):
                 // 1,050,000-token context, 128,000 max output, short-context
                 // prices. Prices must match `token_engine::builtin_prices`.
+                // The per-request paths apply the >272K-input-token tier
+                // (`token_engine::request_prices`).
                 ModelInfo {
                     id: "gpt-6.2-astra".into(),
                     superseded_by: None,
