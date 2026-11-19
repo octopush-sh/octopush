@@ -271,7 +271,11 @@ pub fn record_hook_from(
 /// that session, which sets it aside from its first moment (never the
 /// terminal's session, and never taken for a rival of it); its other signals
 /// are queued without its session id, so they change attention exactly as
-/// before.
+/// before. One exception: a print-mode run that reuses a session id some
+/// terminal currently runs (`claude -p --continue`, or `--resume` of its own
+/// id, from the agent's own terminal) queues nothing for its start or end:
+/// that session is still live in its terminal, and ending it would hide
+/// Context there until the next `SessionStart`.
 pub fn record_hook_at(
     db: &Db,
     terminal: Option<&str>,
@@ -289,6 +293,10 @@ pub fn record_hook_at(
         (false, true) => {
             // Nothing to set aside without knowing which session it is.
             let Some(session) = event.session_id.as_deref() else { return false };
+            // A live terminal's own session, reused by print mode: leave it be.
+            if db.claude_session_is_linked(session).unwrap_or(false) {
+                return false;
+            }
             (HookSignal::SessionEnded, Some(session))
         }
         (false, false) => (event.signal, None),
@@ -374,6 +382,8 @@ fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(Strin
 //   was resumed there), it leaves the first, which then has none.
 // - A print-mode or SDK session is never a terminal's: `record_hook_at`
 //   queues its start and its end as an end, so it is set aside at once.
+//   Unless it reuses the id of a session a terminal runs now (`claude -p
+//   --continue`): then neither is queued, and that terminal keeps it.
 // - Each row carries when its hook FIRED, not when it was written. A start
 //   that is not newer than its session's recorded end links nothing: the
 //   asynchronous `SessionStart` of a session that ended at once can be
@@ -901,6 +911,38 @@ mod tests {
         assert_eq!(session_of(&db, "t1"), None, "nothing is shown rather than the nested session");
         unsaid("Stop", "parent");
         assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+    }
+
+    /// `claude -p --continue` (or `--resume` of its own id) run from the
+    /// agent's own terminal reuses the live session's id. Its start and end
+    /// are not that session ending: the terminal keeps it, and it stays live.
+    #[test]
+    fn a_print_mode_run_reusing_a_live_session_id_leaves_that_session_alone() {
+        let (_tmp, db) = test_db();
+        fire(&db, "t1", "SessionStart", "parent");
+        let print = |event: &str, session: &str| record_hook_from(&db, Some("t1"), None, Some("sdk-cli"), &hook(event, session));
+        assert!(!print("SessionStart", "parent"), "nothing queued for the live session's id");
+        // Its turn ending still settles the terminal's attention, without a session id.
+        assert!(print("Stop", "parent"));
+        assert!(!print("SessionEnd", "parent"));
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].signal.as_str(), rows[0].session_id.as_deref()), ("settled", None));
+        remember_sessions(&db, &rows);
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+        let ended: bool = db
+            .conn_ref()
+            .query_row("SELECT EXISTS(SELECT 1 FROM ended_claude_sessions WHERE session_id = 'parent')", [], |r| r.get(0))
+            .unwrap();
+        assert!(!ended, "the parent is not taken for over");
+        // The parent's own later signals still link it, as before.
+        fire(&db, "t1", "Stop", "parent");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+
+        // Once no terminal runs that id, a print-mode run of it is set aside again.
+        fire(&db, "t1", "SessionEnd", "parent");
+        assert!(print("SessionStart", "parent"));
+        assert_eq!(db.drain_hook_signals().unwrap()[0].signal, "session-end");
     }
 
     /// `SessionStart` is asynchronous and `SessionEnd` is not: when a session

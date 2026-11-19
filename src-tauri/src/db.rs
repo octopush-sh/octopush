@@ -1214,7 +1214,8 @@ impl Db {
             );
             "#,
         )?;
-        // Pruned as the app starts: 30 days is far past any message that
+        // Pruned on every migrating open (the app's start, and each
+        // `octopush-mcp` server start): 30 days is far past any message that
         // could still be recent to a live session, or any late signal.
         self.prune_ended_claude_sessions(&(Utc::now() - chrono::Duration::days(ENDED_SESSION_DAYS)).to_rfc3339())?;
         // One-time backfill from what the stage rows still remember: the last
@@ -4452,6 +4453,15 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Whether `session_id` is the current session of some terminal.
+    pub fn claude_session_is_linked(&self, session_id: &str) -> AppResult<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM terminal_claude_session WHERE session_id = ?1)",
+            params![session_id],
+            |r| r.get(0),
+        )?)
     }
 
     /// Drop the ended sessions whose end is older than `cutoff` (RFC3339

@@ -1,7 +1,7 @@
 # Run mode and rail groups: one home per fact, a tighter shell
 
 **Status:** approved by the owner on 2026-11-18, in the PM chat.
-**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. PR 5, the groups' data layer (storage, commands, IPC and store, with no rail UI), shipped first, in #909. PRs 2 and 3, the pane caption and the session line, shipped together; where they differ from this document is listed in `docs/design-system.md` ("Run mode — session navigation"). Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
+**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. PR 5, the groups' data layer (storage, commands, IPC and store, with no rail UI), shipped first, in #909. PRs 2 and 3, the pane caption and the session line, shipped together; where they differ from this document is listed in `docs/design-system.md` ("Run mode — session navigation"). PR 4, Run's Companion (Context · Changes · Mission), shipped in #914, and PR 6, the mission groups in the rail, has shipped too. Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
 
 The approved mockup isn't checked in, because it was built from private screenshots. This document is the record. Its examples use made-up names (`acme-api`, "Vulnerability fixes", "PR reviews").
 
