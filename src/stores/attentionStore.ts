@@ -37,7 +37,7 @@ export interface AttentionFlag {
    */
   since?: number;
   /**
-   * For terminal pings, WHICH session rang — so the Run rail can mark the one
+   * For terminal pings, WHICH session rang — so Run's session line can mark the one
    * session that wants the user instead of the whole workspace. Null for chat
    * pings and for any caller that doesn't know (the flag then behaves exactly
    * as it did before).
@@ -79,7 +79,7 @@ interface AttentionState {
    * Off-screen sessions waiting on the user, from Claude Code's hooks
    * (`permission` / `input` pings). Bell and idle pings stay one per workspace
    * in `flagsByWs`; hook pings land in both, so Mission Control and the mode
-   * pulse read `flagsByWs` as before while the session rail and the ⌘⌥K
+   * pulse read `flagsByWs` as before while the session line and the ⌘⌥K
    * switcher mark every waiting session. Absent = not waiting. Cleared per
    * session by `clearWait` (rule: `clearsWait`, lib/attentionFocus.ts).
    */

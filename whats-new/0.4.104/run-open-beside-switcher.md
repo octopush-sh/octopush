@@ -6,13 +6,11 @@ highlight: true
 scenario: run-two-sessions
 steps:
   - open: mode/run
-    target: run-session-cell
-    caption: Hover a session on the rail; its menu has Open beside, or press ⌘D.
-    action: hover
-  - target: run-open-beside
-    caption: Open beside asks which session sits beside this one.
-    action: click
-  - target: run-pair-input
+    target: run-open-beside
+    caption: A pane's ⋯ menu has Open beside…, or press ⌘D. It asks which session sits beside this one.
+    action: none
+  - open: run/open-beside
+    target: run-pair-input
     caption: Only sessions that aren't on screen are listed. ⌥⏎ in ⌘⌥K does the same from the switcher.
     action: none
 ---

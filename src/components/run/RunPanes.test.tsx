@@ -1,12 +1,16 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, screen, fireEvent, act } from "@testing-library/react";
 
-const mockIpc = { createTerminal: vi.fn() };
+const mockIpc = {
+  createTerminal: vi.fn(),
+  renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
+  deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
+};
 vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 const noop = () => {};
 
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
-const { useTerminalLayoutStore, evenRatios, leaveView } = await import("../../stores/terminalLayoutStore");
+const { useTerminalLayoutStore, evenRatios, leaveView, setOrientation } = await import("../../stores/terminalLayoutStore");
 const { useTerminalSlotsStore } = await import("../../stores/terminalSlotsStore");
 const { RunPanes } = await import("./RunPanes");
 const { useAttentionStore } = await import("../../stores/attentionStore");
@@ -39,18 +43,58 @@ beforeEach(() => {
   // A failed test must not leave its measured rect behind for the next one.
   vi.restoreAllMocks();
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
-  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, resizing: false });
+  useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, splitByWs: {}, resizing: false });
   useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
   useAttentionStore.setState({ waitingByTerminal: {} });
+  vi.clearAllMocks();
+  mockIpc.renameTerminal.mockResolvedValue(undefined);
+  mockIpc.deleteTerminal.mockResolvedValue(undefined);
 });
 
+/** Patch one seeded session's live state. */
+const patch = (id: string, fields: Record<string, unknown>) =>
+  act(() =>
+    useTerminalsStore.setState((s) => ({
+      terminalsByWs: { ...s.terminalsByWs, [WS]: s.terminalsByWs[WS].map((t) => (t.id === id ? { ...t, ...fields } : t)) },
+    })),
+  );
+
 describe("RunPanes", () => {
-  it("is today's full canvas with one pane: one slot, no captions, no divider", () => {
+  it("keeps the caption on a single pane: one slot, no divider, nothing to leave", () => {
     seed(["a", "b"], ["a"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     expect(published()).toEqual(["a"]);
-    expect(screen.queryByTestId("run-pane-caption-0")).toBeNull();
+    const caption = screen.getByTestId("run-pane-caption-0");
+    expect(caption).toHaveTextContent("Label a");
+    expect(caption).toHaveTextContent("shell at the prompt");
+    expect(caption.dataset.focused).toBe("true");
+    expect(caption.className).toContain("h-8");
+    // Alone there is no other pane to tell it from: no focus line, only the
+    // hairline every caption has.
+    expect(caption.className).not.toContain("border-strong");
+    expect(screen.getByTestId("run-pane-name-0").className).toContain("text-octo-ivory");
     expect(screen.queryByRole("separator")).toBeNull();
+    // Leaving is for a split view only.
+    expect(screen.queryByTestId("run-pane-leave-0")).toBeNull();
+
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    const menu = screen.getByRole("menu", { name: "Session actions" });
+    expect(menu.className).toContain("octo-menu-enter");
+    expect(screen.getAllByRole("menuitem").map((m) => m.textContent)).toEqual([
+      "Renamedouble-click",
+      "Open beside…⌘D",
+      "Close session",
+    ]);
+    expect(menu).not.toHaveTextContent("Swap with");
+    expect(menu).not.toHaveTextContent("Leave the view");
+  });
+
+  it("shows nothing to name for a lone pane with no session yet", () => {
+    seed(["a"], [null]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(screen.queryByTestId("run-pane-caption-0")).toBeNull();
+    expect(screen.queryByTestId("run-empty-seat")).toBeNull();
+    expect(published()).toEqual([]);
   });
 
   it("puts two sessions side by side under captions, the focused one ivory; a click focuses", () => {
@@ -59,8 +103,12 @@ describe("RunPanes", () => {
     expect(published()).toEqual(["a", "b"]);
     expect(screen.getByTestId("run-pane-caption-0")).toHaveTextContent("Label a");
     expect(screen.getByTestId("run-pane-caption-0").dataset.focused).toBe("false");
-    expect(screen.getByTestId("run-pane-caption-1").innerHTML).toMatch(/border-octo-border-strong text-octo-ivory/);
-    expect(screen.getByTestId("run-pane-caption-0").innerHTML).toContain("text-octo-mute");
+    // Focused: ivory name over a border-strong line. The other: sage, mute icon.
+    expect(screen.getByTestId("run-pane-caption-1").className).toContain("var(--color-octo-border-strong)");
+    expect(screen.getByTestId("run-pane-name-1").className).toContain("text-octo-ivory");
+    expect(screen.getByTestId("run-pane-caption-0").className).not.toContain("border-strong");
+    expect(screen.getByTestId("run-pane-name-0").className).toContain("text-octo-sage");
+    expect(screen.getByTestId("run-pane-name-0")).toHaveAttribute("aria-pressed", "false");
 
     // A click on a caption focuses its pane without moving sessions.
     fireEvent.click(screen.getByRole("button", { name: /Label a/ }));
@@ -90,16 +138,265 @@ describe("RunPanes", () => {
     expect(screen.getByTestId("run-pane-caption-1")).not.toHaveTextContent("waiting");
   });
 
-  it("leaves the view with ×, back to one pane, and keeps the session", () => {
+  it("leaves the view with the minus, back to one pane, and keeps the session running", async () => {
     seed(["a", "b"], ["a", "b"], 0);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
     const leave = screen.getByTestId("run-pane-leave-0");
     expect(leave).toHaveAttribute("title", "Leave the view · the session keeps running");
+    expect(leave).toHaveAccessibleName("Leave the view");
+    expect(leave.querySelector("svg.lucide-minus")).not.toBeNull();
     fireEvent.click(leave);
     expect(run().slots).toEqual(["b"]);
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("b");
+    // Nothing was closed: both sessions still exist, and the backend heard nothing.
     expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a", "b"]);
-    expect(screen.queryByTestId("run-pane-caption-0")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    // One pane again: its caption stays (the name crossfades), its minus goes.
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)); });
+    expect(screen.getByTestId("run-pane-caption-0")).toHaveTextContent("Label b");
+    expect(screen.queryByTestId("run-pane-leave-0")).toBeNull();
+  });
+
+  it("puts no close × on any pane, alone or split", () => {
+    const closers = () =>
+      screen
+        .getAllByTestId(/^run-pane-caption-/)
+        .flatMap((c) => Array.from(c.querySelectorAll("button")))
+        .filter((b) => /close/i.test(`${b.getAttribute("aria-label")} ${b.title} ${b.textContent}`));
+    seed(["a", "b", "c", "d"], ["a"]);
+    const { unmount } = render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(closers()).toEqual([]);
+    expect(document.querySelector("svg.lucide-x")).toBeNull();
+    unmount();
+
+    seed(["a", "b", "c", "d"], ["a", "b", "c", "d"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(screen.getAllByTestId(/^run-pane-caption-/)).toHaveLength(4);
+    expect(closers()).toEqual([]);
+    expect(document.querySelector("svg.lucide-x")).toBeNull();
+  });
+
+  it("closes an idle session at once, only from its menu, by name", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+    // No ellipsis: nothing follows the click.
+    const close = screen.getByRole("menuitem", { name: "Close session" });
+    // Quiet until pointed at: sage at rest, rouge on hover and on keyboard focus.
+    expect(close.className).toContain("text-octo-sage");
+    expect(close.className).toContain("hover:text-octo-rouge");
+    expect(close.className).toContain("hover:bg-[var(--rouge-ghost)]");
+    expect(close.className).toContain("focus-visible:text-octo-rouge");
+    expect(close.className).toContain("focus-visible:bg-[var(--rouge-ghost)]");
+    await act(async () => {
+      fireEvent.click(close);
+    });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
+    expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a"]);
+    expect(run().slots).toEqual(["a"]);
+  });
+
+  it("asks before closing a session that is busy, and keeps it unless told to close", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    patch("b", { busy: true, command: "claude", role: "agent" });
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const openMenu = () => fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+
+    openMenu();
+    // The ellipsis promises the question that follows.
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    const dialog = screen.getByRole("dialog", { name: "Confirm closing the session" });
+    expect(dialog).toHaveTextContent("Close this session while it works?");
+    expect(dialog).toHaveTextContent("claude is still running in Label b.");
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    // The safe answer has the focus; the other is an upright-serif rouge phrase.
+    const keep = screen.getByRole("button", { name: "Keep the session" });
+    expect(document.activeElement).toBe(keep);
+    const confirm = screen.getByRole("button", { name: "Close the session" });
+    expect(confirm.className).toContain("font-serif");
+    expect(confirm.className).toContain("text-octo-rouge");
+    expect(confirm.className).not.toContain("italic");
+
+    fireEvent.click(keep);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+
+    // Escape keeps it too.
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(useTerminalsStore.getState().getTerminals(WS)).toHaveLength(2);
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close the session" }));
+    });
+    expect(mockIpc.deleteTerminal).toHaveBeenCalledWith("b");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a"]);
+  });
+
+  it("the ⋯ button toggles its menu, and gets the focus back when the menu closes", () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const button = screen.getByTestId("run-pane-menu-0");
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    // One real press on the open menu's button: closed on mousedown, and the
+    // click that follows does not open it again.
+    fireEvent.mouseDown(button);
+    fireEvent.click(button);
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    fireEvent.mouseDown(button);
+    fireEvent.click(button);
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    // A pick too: swapping leaves the keyboard on the button that opened the menu.
+    fireEvent.click(button);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Label b" }));
+    expect(run().slots).toEqual(["b", "a"]);
+    expect(document.activeElement).toBe(button);
+  });
+
+  it("renames in place: double-click, Enter commits, Escape abandons, an empty name is rejected", () => {
+    seed(["a", "b"], ["a"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const name = () => screen.getByTestId("run-pane-name-0");
+    expect(name()).toHaveAttribute("title", "Label a · double-click to rename");
+
+    fireEvent.doubleClick(name());
+    const input = () => screen.getByRole("textbox", { name: "Session name" });
+    expect(input()).toHaveValue("Label a");
+    expect(document.activeElement).toBe(input());
+    fireEvent.change(input(), { target: { value: "  API server  " } });
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(mockIpc.renameTerminal).toHaveBeenCalledWith("a", "API server");
+    expect(name()).toHaveTextContent("API server");
+    // The keyboard gets the name back.
+    expect(document.activeElement).toBe(name());
+
+    fireEvent.doubleClick(name());
+    fireEvent.change(input(), { target: { value: "thrown away" } });
+    fireEvent.keyDown(input(), { key: "Escape" });
+    expect(name()).toHaveTextContent("API server");
+
+    fireEvent.doubleClick(name());
+    fireEvent.change(input(), { target: { value: "   " } });
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(name()).toHaveTextContent("API server");
+    expect(mockIpc.renameTerminal).toHaveBeenCalledTimes(1);
+  });
+
+  it("commits a rename when the input loses focus, but not to the pane taking focus as it opens", () => {
+    seed(["a", "b"], ["a"]);
+    const now = vi.spyOn(performance, "now").mockReturnValue(1000);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.doubleClick(screen.getByTestId("run-pane-name-0"));
+    const input = () => screen.getByRole("textbox", { name: "Session name" });
+    fireEvent.change(input(), { target: { value: "kept" } });
+    // 50ms in, the pane hands the keyboard to its terminal: the rename stays.
+    now.mockReturnValue(1050);
+    fireEvent.blur(input());
+    expect(input()).toHaveValue("kept");
+    expect(mockIpc.renameTerminal).not.toHaveBeenCalled();
+    // Later, the user clicks away: that commits.
+    now.mockReturnValue(3000);
+    fireEvent.blur(input());
+    expect(mockIpc.renameTerminal).toHaveBeenCalledWith("a", "kept");
+    expect(screen.getByTestId("run-pane-name-0")).toHaveTextContent("kept");
+  });
+
+  it("opens the rename from the menu and with F2", () => {
+    seed(["a", "b"], ["a"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Rename/ }));
+    expect(screen.getByRole("textbox", { name: "Session name" })).toHaveValue("Label a");
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Session name" }), { key: "Escape" });
+    fireEvent.keyDown(screen.getByTestId("run-pane-name-0"), { key: "F2" });
+    expect(screen.getByRole("textbox", { name: "Session name" })).toBeInTheDocument();
+  });
+
+  it("says what the session is doing: the command while it runs, else its role, and when it didn't start", () => {
+    seed(["a", "b"], ["a", "b"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    const doing = (slot: number) => screen.getByTestId(`run-pane-doing-${slot}`);
+    expect(doing(0)).toHaveTextContent("shell at the prompt");
+    expect(doing(0).className).toContain("font-mono");
+    expect(doing(0).className).toContain("text-octo-mute");
+
+    patch("a", { busy: true, command: "npm run dev", role: "dev" });
+    expect(doing(0)).toHaveTextContent("npm run dev");
+    expect(doing(0).className).toContain("text-octo-sage");
+    // Work never borrows brass.
+    const icon = screen.getByTestId("run-pane-caption-0").querySelector("svg")!;
+    expect(icon.getAttribute("class")).toContain("text-octo-ivory");
+    expect(`${icon.getAttribute("class")} ${doing(0).className}`).not.toContain("brass");
+
+    patch("b", { failed: true, running: false });
+    expect(doing(1)).toHaveTextContent("didn't start");
+    expect(doing(1).className).toContain("text-octo-rouge");
+  });
+
+  it("carries the Restored badge and the jump key", async () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(screen.queryByTestId("run-pane-restored-1")).toBeNull();
+    patch("b", { restored: true });
+    await act(async () => { await new Promise((r) => setTimeout(r, 150)); });
+    const badge = screen.getByTestId("run-pane-restored-1");
+    expect(badge).toHaveTextContent("Restored");
+    expect(badge).toHaveAttribute("title", "Reattached from the previous Octopush run");
+
+    // The focused pane shows its key; another shows it under the pointer.
+    expect(screen.getByTestId("run-pane-jump-0")).toHaveTextContent("⌘⌥1");
+    expect(screen.getByTestId("run-pane-jump-0").className).toContain("opacity-100");
+    expect(screen.getByTestId("run-pane-jump-1")).toHaveTextContent("⌘⌥2");
+    expect(screen.getByTestId("run-pane-jump-1").className).toContain("opacity-0 group-hover/caption:opacity-100");
+  });
+
+  it("Open beside… asks for the session to pair; with no room it replaces this pane", () => {
+    seed(["a", "b", "c", "d", "e"], ["a", "b"], 0);
+    const onOpenBeside = vi.fn();
+    render(<RunPanes workspaceId={WS} onOpenBeside={onOpenBeside} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Open beside…/ }));
+    expect(onOpenBeside).toHaveBeenCalledTimes(1);
+    expect(run().focused).toBe(0);
+
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => ({ ...l, slots: ["a", "b", "c", "d"], ratios: [0.5, 0.5] })));
+    fireEvent.click(screen.getByTestId("run-pane-menu-2"));
+    expect(screen.queryByRole("menuitem", { name: /Open beside…/ })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Replace in this pane…/ }));
+    expect(onOpenBeside).toHaveBeenCalledTimes(2);
+    // The pick replaces the focused pane, so this one took the focus first.
+    expect(run().focused).toBe(2);
+  });
+
+  it("offers no Open beside when it could do nothing", () => {
+    seed(["a", "b", "c", "d"], ["a", "b", "c", "d"]);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    expect(screen.queryByRole("menuitem", { name: /Open beside|Replace in this pane/ })).toBeNull();
+  });
+
+  it("tells the layout button how two panes sit at this width", () => {
+    sized(1600);
+    seed(["a", "b"], ["a"]);
+    const { unmount } = render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(useTerminalLayoutStore.getState().splitByWs[WS]).toBe("side");
+    unmount();
+    sized(900);
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    expect(useTerminalLayoutStore.getState().splitByWs[WS]).toBe("stacked");
   });
 
   it("swaps from the caption menu (focus stays with its session), and leaves from it", () => {
@@ -113,8 +410,9 @@ describe("RunPanes", () => {
     expect(useTerminalsStore.getState().getActiveId(WS)).toBe("a");
 
     fireEvent.click(screen.getByTestId("run-pane-menu-1"));
-    fireEvent.click(screen.getByRole("menuitem", { name: "Leave the view" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Leave the view/ }));
     expect(run().slots).toEqual(["b"]);
+    expect(useTerminalsStore.getState().getTerminals(WS)).toHaveLength(2);
   });
 
   it("resizes from the keyboard, evens on double-click, and stays within 20–80%", () => {
@@ -183,16 +481,16 @@ describe("RunPanes", () => {
     expect(run().ratios).toEqual([0.5, 0.5]);
   });
 
-  it("stacks from the caption menu for two and three panes, until Automatic again", () => {
+  it("keeps an orientation override at three panes, and has no layout choices in a pane's menu", () => {
     seed(["a", "b"], ["a", "b"]);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    // Orientation and pane count live on the session line's layout button.
     fireEvent.click(screen.getByTestId("run-pane-menu-0"));
-    expect(screen.getByRole("menuitemradio", { name: "Automatic" })).toHaveAttribute("aria-checked", "true");
-    // The checked item carries a Check, not ink alone.
-    const checks = screen.getAllByRole("menuitemradio").map((item) => item.querySelector("svg") !== null);
-    expect(checks).toEqual([false, false, true]);
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "Stack" }));
-    expect(run().orientation).toBe("stacked");
+    expect(screen.queryByRole("menuitemradio")).toBeNull();
+    expect(screen.getByRole("menu")).not.toHaveTextContent(/Stack|Side by side|Automatic/);
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => setOrientation(l, "stacked")));
     expect(screen.getByRole("separator")).toHaveAttribute("aria-orientation", "horizontal");
     fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowUp" });
     expect(run().ratios[0]).toBeCloseTo(0.45);
@@ -200,10 +498,7 @@ describe("RunPanes", () => {
     // The override holds at three panes.
     act(() => useTerminalsStore.getState().openBeside(WS, null));
     expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "horizontal");
-    fireEvent.click(screen.getByTestId("run-pane-menu-1"));
-    expect(screen.getByRole("menuitemradio", { name: "Stack" })).toHaveAttribute("aria-checked", "true");
-    fireEvent.click(screen.getByRole("menuitemradio", { name: "Automatic" }));
-    expect(run().orientation).toBe("auto");
+    act(() => useTerminalsStore.getState().updateLayout(WS, (l) => setOrientation(l, "auto")));
     expect(screen.getAllByRole("separator")[0]).toHaveAttribute("aria-orientation", "vertical");
   });
 
@@ -282,7 +577,7 @@ describe("RunPanes", () => {
     expect(screen.getByRole("menu")).toHaveTextContent("Leave the view");
 
     // Leaving a pane shifts the rest down and lays out three.
-    fireEvent.click(screen.getByRole("menuitem", { name: "Leave the view" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Leave the view/ }));
     fireEvent.click(screen.getByTestId("run-pane-leave-1"));
     expect(run().slots).toEqual(["a", "c"]);
   });

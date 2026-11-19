@@ -54,7 +54,7 @@ export function SessionSidebar({ onNewSession }: Props) {
         <button
           onClick={onNewSession}
           className="rounded-md p-1.5 text-zinc-400 transition hover:bg-zinc-800 hover:text-octo-accent"
-          title="New session (⌘T)"
+          title="New session"
         >
           <Plus size={16} />
         </button>

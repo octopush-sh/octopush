@@ -1,27 +1,32 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { Check, MoreHorizontal, X } from "lucide-react";
+import { Minus, MoreHorizontal } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import {
+  EMPTY_RUN_LAYOUT,
   evenRatios,
   focus,
   leaveView,
   paneGrid,
   resolveOrientation,
-  setOrientation,
   setRatios,
+  splitOrientation,
   swap,
   useTerminalLayoutStore,
   type GridArea,
-  type Orientation,
+  type RunLayout,
 } from "../../stores/terminalLayoutStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
+import { ROLE_WORD } from "../../lib/sessionRole";
+import { sessionDoing } from "../../lib/sessionDoing";
 import { terminalCellWidth } from "../../lib/xtermTheme";
-import { MENU_HEADER, MENU_ITEM, MENU_SEP } from "../../lib/menuStyles";
+import { MENU_HEADER, MENU_ITEM, MENU_ITEM_ROUGE, MENU_SEP } from "../../lib/menuStyles";
 import { tourId } from "../../lib/tour/ids";
+import { useAnchoredMenu } from "../../lib/useAnchoredMenu";
 import { MenuSurface } from "../MenuSurface";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { PaneWaiting } from "./PaneWaiting";
+import { closeAsksFirst, useCloseSession } from "./useCloseSession";
 
 interface Props {
   workspaceId: string;
@@ -34,34 +39,44 @@ const FINE_STEP = 0.01;
 
 /**
  * Run's panes (docs/superpowers/specs/2026-11-03-run-session-pair-design.md).
- * One pane is today's full canvas. Two to four sit in fixed positions in one
- * 2×2 grid (`paneGrid`), each under a caption naming its session, split by 1px
+ * One to four sit in fixed positions in one 2×2 grid (`paneGrid`), each under
+ * a caption that is its session's one home (name, what it is doing, its
+ * actions) — a lone pane keeps its caption too. Two to four are split by 1px
  * dividers; two and three side by side or stacked (`resolveOrientation`), four
- * a 2×2 grid around one shared cross. Each pane is only a
- * `TerminalSlot`: `TerminalHost` draws the session's terminal over it. An
- * empty seat (at most one) invites a session instead.
+ * a 2×2 grid around one shared cross. Each pane is only a `TerminalSlot`:
+ * `TerminalHost` draws the session's terminal over it. An empty seat (at most
+ * one) invites a session instead.
  */
 export function RunPanes({ workspaceId, onOpenBeside }: Props) {
   const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
-  const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
+  const stored = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   const resizing = useTerminalLayoutStore((s) => s.resizing);
   const updateLayout = useTerminalsStore((s) => s.updateLayout);
   const createBeside = useTerminalsStore((s) => s.createBeside);
   const areaRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
 
-  const slots = layout?.slots ?? [activeId];
-  const paired = slots.length > 1 && !!layout;
+  // A workspace seen for the first time is one pane holding whatever is active.
+  const layout: RunLayout = stored ?? { ...EMPTY_RUN_LAYOUT, slots: [activeId] };
+  const slots = layout.slots;
+  const paired = slots.length > 1;
 
   useLayoutEffect(() => {
     const el = areaRef.current;
-    if (!paired || !el) return;
+    if (!el) return;
     const measure = () => setWidth(el.getBoundingClientRect().width);
     measure();
     const ro = new ResizeObserver(measure);
     ro.observe(el);
     return () => ro.disconnect();
-  }, [paired]);
+  }, []);
+
+  // How two or three panes sit at this width, for the layout button: it shows
+  // the layout on screen, and only this component measures the canvas.
+  const split = splitOrientation(layout, width, terminalCellWidth());
+  useEffect(() => {
+    useTerminalLayoutStore.getState().setSplit(workspaceId, split);
+  }, [workspaceId, split]);
 
   // A drag that never sees its release (the view drops to one pane, or Run
   // unmounts mid-drag) must not leave every PTY waiting for its size.
@@ -73,10 +88,6 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
       document.body.style.cursor = "";
     };
   }, [paired]);
-
-  if (!paired || !layout) {
-    return <TerminalSlot mode="run" terminalId={slots[0] ?? null} />;
-  }
 
   const count = slots.length;
   // From the width and the count alone: a divider drag never flips it.
@@ -158,7 +169,7 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
             onDoubleClick={() => setRatio(d.ratio, 0.5)}
             // A 1px hairline with a wider, invisible grip around it. The
             // TerminalHost frames paint over the Run canvas, so the divider
-            // lifts itself (and its grip) above them, as the rail does.
+            // lifts itself (and its grip) above them.
             className={`group absolute z-10 bg-octo-border focus-visible:outline-none ${
               x ? "cursor-col-resize" : "cursor-row-resize"
             }`}
@@ -188,22 +199,25 @@ export function RunPanes({ workspaceId, onOpenBeside }: Props) {
             ...paneInset(grid.areas[i]),
           }}
         >
-          <PaneCaption
-            workspaceId={workspaceId}
-            slot={i}
-            terminalId={id}
-            focused={i === layout.focused}
-            others={slots
-              .map((other, j) => ({ slot: j, id: other }))
-              .filter((o) => o.slot !== i && o.id !== null)}
-            orientation={count < 4 ? layout.orientation : null}
-            onFocus={() => updateLayout(workspaceId, (l) => focus(l, i))}
-            onSwap={(j) => updateLayout(workspaceId, (l) => swap(l, i, j))}
-            onOrient={(o) => updateLayout(workspaceId, (l) => setOrientation(l, o))}
-            onLeave={() => updateLayout(workspaceId, (l) => leaveView(l, i))}
-          />
+          {/* A lone pane with no session yet has nothing to name. */}
+          {(paired || id !== null) && (
+            <PaneCaption
+              workspaceId={workspaceId}
+              slot={i}
+              terminalId={id}
+              focused={i === layout.focused}
+              split={paired}
+              others={slots
+                .map((other, j) => ({ slot: j, id: other }))
+                .filter((o) => o.slot !== i && o.id !== null)}
+              onFocus={() => updateLayout(workspaceId, (l) => focus(l, i))}
+              onSwap={(j) => updateLayout(workspaceId, (l) => swap(l, i, j))}
+              onLeave={() => updateLayout(workspaceId, (l) => leaveView(l, i))}
+              onOpenBeside={onOpenBeside}
+            />
+          )}
           <div className="relative min-h-0 flex-1">
-            {id === null ? (
+            {id === null && !paired ? null : id === null ? (
               <EmptySeat
                 onOpen={() => {
                   updateLayout(workspaceId, (l) => focus(l, i));
@@ -275,154 +289,332 @@ interface CaptionProps {
   slot: number;
   terminalId: string | null;
   focused: boolean;
+  /** More than one pane is on screen: the caption can swap and leave. */
+  split: boolean;
   others: { slot: number; id: string | null }[];
-  /** The workspace's orientation, or null at four panes (always a 2×2 grid). */
-  orientation: Orientation | null;
   onFocus: () => void;
   onSwap: (slot: number) => void;
-  onOrient: (orientation: Orientation) => void;
   onLeave: () => void;
+  /** Open beside: the pairing switcher, or an empty seat (App decides). */
+  onOpenBeside: () => void;
 }
 
-const ORIENTATIONS: { value: Orientation; label: string }[] = [
-  { value: "stacked", label: "Stack" },
-  { value: "side", label: "Side by side" },
-  { value: "auto", label: "Automatic" },
-];
+/** How long after a rename opens a lost focus is the pane taking it, not the
+ *  user leaving: focusing a pane hands the keyboard to its terminal 50ms
+ *  later (`TerminalPane`), which can land on a quick double-click's input. */
+const RENAME_SETTLE_MS = 250;
 
-/** One pane's caption: its session's icon and label, the pane menu and `×`. */
+const CAPTION_BUTTON =
+  "flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
+
+/** A menu row's right-hand hint: a shortcut, or how else to get there. */
+const MENU_HINT = "ml-auto shrink-0 pl-3 text-[10px] text-octo-mute";
+
+/**
+ * One pane's caption — its session's one home. Left to right: the role icon,
+ * the name (double-click renames it in place), what the session is doing and
+ * whether Claude Code waits on the user there, the Restored badge, the ⌘⌥N
+ * jump key (on the focused pane, or under the pointer), the session's menu,
+ * and, in a split view only, the minus that takes the pane off screen.
+ *
+ * A pane has no `×`. Leaving the view keeps the session running, and `×`
+ * reads as "close" everywhere else: closing lives in the menu, by name.
+ */
 function PaneCaption({
   workspaceId,
   slot,
   terminalId,
   focused,
+  split,
   others,
-  orientation,
   onFocus,
   onSwap,
-  onOrient,
   onLeave,
+  onOpenBeside,
 }: CaptionProps) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const session = terminals.find((t) => t.id === terminalId) ?? null;
-  const Icon = iconForSessionRole(session?.role ?? "shell");
+  const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
+  const [requestClose, closeConfirm] = useCloseSession(workspaceId);
+  const setup = useTerminalsStore((s) => (terminalId ? s.setupByTerminal[terminalId] : undefined));
+  const actions = useAnchoredMenu((r) => ({ x: r.right - 224, y: r.bottom + 4 }));
+  const [draft, setDraft] = useState<string | null>(null);
+  const nameRef = useRef<HTMLButtonElement>(null);
+  const refocusName = useRef(false);
+  const renameOpenedAt = useRef(0);
 
-  const iconButton =
-    "flex h-6 w-6 shrink-0 items-center justify-center rounded text-octo-mute transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
+  const index = terminals.findIndex((t) => t.id === terminalId);
+  const session = index === -1 ? null : terminals[index];
+  const Icon = iconForSessionRole(session?.role ?? "shell");
+  const jump = index >= 0 && index < 9 ? `⌘⌥${index + 1}` : null;
+  const doing = session ? sessionDoing(session, { setup }) : null;
+  // Read on every render: the layout and the session list, which decide both
+  // answers, re-render the panes whenever either changes.
+  const beside = useTerminalsStore.getState().besideAction(workspaceId);
+  const replaces = useTerminalsStore.getState().besideReplaces(workspaceId);
+
+  // The pane shows another session: a rename in progress was for the old one.
+  useEffect(() => setDraft(null), [terminalId]);
+
+  // A rename ended from the keyboard hands focus back to the name.
+  useEffect(() => {
+    if (draft !== null || !refocusName.current) return;
+    refocusName.current = false;
+    nameRef.current?.focus();
+  }, [draft]);
+
+  const startRename = () => {
+    if (!session) return;
+    renameOpenedAt.current = performance.now();
+    setDraft(session.label);
+  };
+
+  const commit = () => {
+    if (draft === null || !session) return;
+    const label = draft.trim();
+    if (label && label !== session.label) {
+      renameTerminal(workspaceId, session.id, label).catch(console.error);
+    }
+    setDraft(null);
+  };
+
+  const menuItem = actions.pick;
 
   return (
     <div
       data-testid={`run-pane-caption-${slot}`}
       data-tour={slot === 0 ? tourId("run-pane-caption") : undefined}
       data-focused={focused ? "true" : "false"}
-      className="octo-rise-in flex h-8 shrink-0 items-center gap-1 border-b border-octo-hairline px-2"
+      // A press anywhere on the caption focuses its pane; the name is the
+      // keyboard's way to do the same. Not a press in its menu, which is a
+      // React child of the caption but lives in a portal.
+      onClick={(e) => {
+        if (e.currentTarget.contains(e.target as Node)) onFocus();
+      }}
+      className={`octo-rise-in group/caption flex h-8 shrink-0 items-center gap-2 border-b border-octo-hairline bg-octo-panel pl-2.5 pr-1.5 transition-shadow duration-[var(--dur-standard)] ${
+        // The line says which pane has the focus, so it is drawn only where
+        // there is more than one to tell apart.
+        focused && split ? "shadow-[inset_0_-1px_0_var(--color-octo-border-strong)]" : ""
+      }`}
     >
-      <button
-        type="button"
-        onClick={onFocus}
-        aria-pressed={focused}
-        title={session ? `${session.label} — focus this pane` : undefined}
-        className="flex min-w-0 flex-1 items-center focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-      >
-        <FadeSwap swapKey={terminalId ?? ""} className="min-w-0">
-          <span
-            className={`flex min-w-0 items-center gap-2 border-b py-0.5 font-mono text-[11px] tracking-[0.04em] transition-colors duration-[var(--dur-standard)] ${
-              focused ? "border-octo-border-strong text-octo-ivory" : "border-transparent text-octo-mute"
-            }`}
-          >
-            {session && <Icon size={13} strokeWidth={1.75} aria-hidden className="shrink-0" />}
-            <span className="min-w-0 truncate">{session?.label}</span>
+      {session ? (
+        <>
+          <span title={ROLE_WORD[session.role]} className="flex shrink-0">
+            <Icon
+              size={13}
+              strokeWidth={1.75}
+              aria-hidden
+              className={`transition-colors duration-[var(--dur-standard)] ${
+                focused ? "text-octo-ivory" : "text-octo-mute"
+              }`}
+            />
           </span>
-        </FadeSwap>
-        <PaneWaiting
-          terminalId={terminalId}
-          tour={slot === 0 ? tourId("run-pane-waiting") : undefined}
-        />
-      </button>
-      <button
-        type="button"
-        aria-label="Pane options"
-        title="Pane options"
-        aria-haspopup="menu"
-        data-testid={`run-pane-menu-${slot}`}
-        data-tour={slot === 0 ? tourId("run-pane-menu") : undefined}
-        onClick={(e) => {
-          const r = e.currentTarget.getBoundingClientRect();
-          setMenu({ x: r.left, y: r.bottom + 4 });
-        }}
-        className={iconButton}
-      >
-        <MoreHorizontal size={14} strokeWidth={1.75} aria-hidden />
-      </button>
-      <button
-        type="button"
-        aria-label="Leave the view"
-        title="Leave the view · the session keeps running"
-        data-testid={`run-pane-leave-${slot}`}
-        onClick={onLeave}
-        className={iconButton}
-      >
-        <X size={14} strokeWidth={1.75} aria-hidden />
-      </button>
+          <FadeSwap swapKey={session.id} className="flex min-w-0 max-w-[20rem] shrink items-center">
+            {draft !== null ? (
+              <input
+                autoFocus
+                aria-label="Session name"
+                data-testid={`run-pane-rename-${slot}`}
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onFocus={(e) => e.currentTarget.select()}
+                onClick={(e) => e.stopPropagation()}
+                onBlur={(e) => {
+                  if (performance.now() - renameOpenedAt.current < RENAME_SETTLE_MS) {
+                    const input = e.currentTarget;
+                    requestAnimationFrame(() => input.isConnected && input.focus());
+                    return;
+                  }
+                  commit();
+                }}
+                onKeyDown={(e) => {
+                  // The name is being typed: no Run shortcut should hear it.
+                  e.stopPropagation();
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    refocusName.current = true;
+                    commit();
+                  } else if (e.key === "Escape") {
+                    e.preventDefault();
+                    refocusName.current = true;
+                    setDraft(null);
+                  }
+                }}
+                className="w-[200px] min-w-0 max-w-full rounded border border-octo-border-strong bg-octo-onyx px-1 py-px text-[12px] text-octo-ivory outline-none"
+              />
+            ) : (
+              <button
+                ref={nameRef}
+                type="button"
+                data-testid={`run-pane-name-${slot}`}
+                aria-pressed={focused}
+                title={`${session.label} · double-click to rename`}
+                onDoubleClick={startRename}
+                onKeyDown={(e) => {
+                  if (e.key !== "F2") return;
+                  e.preventDefault();
+                  startRename();
+                }}
+                className={`-ml-[3px] min-w-0 cursor-text truncate rounded-[3px] px-[3px] py-px text-left text-[12px] transition-colors duration-[var(--dur-standard)] hover:bg-[var(--brass-faint)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass ${
+                  focused ? "text-octo-ivory" : "text-octo-sage"
+                }`}
+              >
+                {session.label}
+              </button>
+            )}
+          </FadeSwap>
+          {doing && (
+            <span
+              data-testid={`run-pane-doing-${slot}`}
+              title={doing.text}
+              className={`min-w-0 flex-[1_1_6rem] truncate font-mono text-[10px] ${
+                doing.tone === "failed"
+                  ? "text-octo-rouge"
+                  : doing.tone === "live"
+                    ? "text-octo-sage"
+                    : "text-octo-mute"
+              }`}
+            >
+              {doing.text}
+            </span>
+          )}
+          <PaneWaiting
+            compact
+            terminalId={terminalId}
+            tour={slot === 0 ? tourId("run-pane-waiting") : undefined}
+          />
+          <FadeSwap swapKey={session.restored ? "restored" : ""} className="flex shrink-0 items-center">
+            {session.restored && (
+              <span
+                data-testid={`run-pane-restored-${slot}`}
+                title="Reattached from the previous Octopush run"
+                className="font-mono text-[9px] uppercase tracking-[0.15em] text-octo-verdigris"
+              >
+                Restored
+              </span>
+            )}
+          </FadeSwap>
+          {jump && (
+            <span
+              data-testid={`run-pane-jump-${slot}`}
+              title={`Jump to this session from anywhere in Run · ${jump}`}
+              className={`shrink-0 font-mono text-[9px] text-octo-mute transition-opacity duration-[var(--dur-quick)] ${
+                focused ? "opacity-100" : "opacity-0 group-hover/caption:opacity-100"
+              }`}
+            >
+              {jump}
+            </span>
+          )}
+          <button
+            type="button"
+            aria-label="Session actions"
+            title="Session actions"
+            data-testid={`run-pane-menu-${slot}`}
+            // Open beside lives in this menu now: released tours that point
+            // at `run-open-beside` land on the button that leads to it.
+            data-tour={slot === 0 ? tourId("run-open-beside") : undefined}
+            {...actions.buttonProps}
+            className={CAPTION_BUTTON}
+          >
+            <MoreHorizontal size={14} strokeWidth={1.75} aria-hidden />
+          </button>
+        </>
+      ) : (
+        <span className="min-w-0 flex-1 truncate font-mono text-[10px] text-octo-mute">Empty seat</span>
+      )}
+      {split && (
+        <button
+          type="button"
+          aria-label="Leave the view"
+          title="Leave the view · the session keeps running"
+          data-testid={`run-pane-leave-${slot}`}
+          onClick={(e) => {
+            e.stopPropagation();
+            onLeave();
+          }}
+          className={CAPTION_BUTTON}
+        >
+          <Minus size={14} strokeWidth={1.75} aria-hidden />
+        </button>
+      )}
 
-      {menu && (
-        <MenuSurface x={menu.x} y={menu.y} ariaLabel="Pane options" onDismiss={() => setMenu(null)}>
-          <div className={MENU_HEADER}>Swap with…</div>
-          {others.map((o) => (
+      {actions.menu && session && (
+        <MenuSurface x={actions.menu.x} y={actions.menu.y} ariaLabel="Session actions" onDismiss={actions.close}>
+          <div className={MENU_HEADER}>{session.label}</div>
+          <button
+            type="button"
+            role="menuitem"
+            className={MENU_ITEM}
+            onClick={menuItem(startRename)}
+          >
+            Rename
+            <span className={MENU_HINT}>double-click</span>
+          </button>
+          {beside !== null && (
             <button
-              key={o.slot}
               type="button"
               role="menuitem"
+              title={
+                replaces
+                  ? "Choose the session that takes this pane · ⌘D"
+                  : "Choose a session to sit beside this one · ⌘D"
+              }
               className={MENU_ITEM}
-              onClick={() => {
-                setMenu(null);
-                onSwap(o.slot);
-              }}
+              onClick={menuItem(() => {
+                // With no room left the pick replaces the focused pane: this one.
+                if (replaces) onFocus();
+                onOpenBeside();
+              })}
             >
-              <span className="min-w-0 truncate">{terminals.find((t) => t.id === o.id)?.label}</span>
+              {replaces ? "Replace in this pane…" : "Open beside…"}
+              <span className={MENU_HINT}>⌘D</span>
             </button>
-          ))}
-          {orientation !== null && (
+          )}
+          {split && others.length > 0 && (
             <>
               <div className={MENU_SEP} />
-              {ORIENTATIONS.map((o) => (
+              <div className={MENU_HEADER}>Swap with…</div>
+              {others.map((o) => (
                 <button
-                  key={o.value}
+                  key={o.slot}
                   type="button"
-                  role="menuitemradio"
-                  aria-checked={orientation === o.value}
-                  data-tour={slot === 0 && o.value === "auto" ? tourId("run-pane-orientation") : undefined}
-                  title={o.value === "auto" ? "Side by side while every pane keeps 72 columns" : undefined}
+                  role="menuitem"
                   className={MENU_ITEM}
-                  onClick={() => {
-                    setMenu(null);
-                    onOrient(o.value);
-                  }}
+                  onClick={menuItem(() => onSwap(o.slot))}
                 >
-                  {/* The checked item's Check, in a fixed 14px icon column. */}
-                  <span aria-hidden className="flex w-3.5 shrink-0 justify-center">
-                    {orientation === o.value && <Check size={13} strokeWidth={1.75} />}
-                  </span>
-                  {o.label}
+                  <span className="min-w-0 truncate">{terminals.find((t) => t.id === o.id)?.label}</span>
                 </button>
               ))}
+            </>
+          )}
+          {split && (
+            <>
+              <div className={MENU_SEP} />
+              <button type="button" role="menuitem" className={MENU_ITEM} onClick={menuItem(onLeave)}>
+                Leave the view
+                <span className={MENU_HINT}>keeps running</span>
+              </button>
             </>
           )}
           <div className={MENU_SEP} />
           <button
             type="button"
             role="menuitem"
-            className={MENU_ITEM}
-            onClick={() => {
-              setMenu(null);
-              onLeave();
-            }}
+            data-testid={`run-pane-close-${slot}`}
+            title={
+              closeAsksFirst(session)
+                ? "Something is running in it: you are asked before it ends"
+                : "Ends the session; it can't be reopened"
+            }
+            className={MENU_ITEM_ROUGE}
+            onClick={menuItem(() => requestClose(session))}
           >
-            Leave the view
+            {/* The ellipsis is a promise of a second step, so it shows only
+                when there is one. */}
+            {closeAsksFirst(session) ? "Close session…" : "Close session"}
           </button>
         </MenuSurface>
       )}
+      {closeConfirm}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 # Run mode and rail groups: one home per fact, a tighter shell
 
 **Status:** approved by the owner on 2026-11-18, in the PM chat.
-**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. PR 5, the groups' data layer (storage, commands, IPC and store, with no rail UI), shipped first, in #909. Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
+**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. PR 5, the groups' data layer (storage, commands, IPC and store, with no rail UI), shipped first, in #909. PRs 2 and 3, the pane caption and the session line, shipped together; where they differ from this document is listed in `docs/design-system.md` ("Run mode — session navigation"). Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
 
 The approved mockup isn't checked in, because it was built from private screenshots. This document is the record. Its examples use made-up names (`acme-api`, "Vulnerability fixes", "PR reviews").
 
@@ -317,8 +317,8 @@ Small PRs, each shippable alone. Each updates `docs/FEATURES.md`, adds a `whats-
 | PR | Scope | Files and components | Data |
 |---|---|---|---|
 | 1 | **Shell spacing tokens; this spec; the design-system record** | `src/styles.css`, `src/lib/tokens.ts`, `App.tsx`, `ContextHeader.tsx`, `ModeBand.tsx`, `docs/design-system.md` | — |
-| 2 | Caption on every pane; the caption as the session's home | `run/RunPanes.tsx` (`PaneCaption`: always rendered, doing meta, `⌘⌥N` hint, ⋯ menu with Rename, Open beside and Close, the Restored badge, minus for Leave the view), `terminalsStore` (rename and close reused) | — |
-| 3 | The session line in the band | New `run/SessionLine.tsx` (from `SessionRail`'s logic: roving tabindex, ⌥ peek, bell dot, waits), replacing `SessionAnchor` in `App.tsx`'s `modeMeta`; the layout button and its menu (`RunPanes` layout operations, `terminalLayoutStore`); delete `SessionRail.tsx`, `SessionAnchor.tsx` and their tests; update the tour's `data-tour` ids | A command to reorder sessions, for drag (see the notes below) |
+| 2 (shipped, with PR 3) | Caption on every pane; the caption as the session's home | `run/RunPanes.tsx` (`PaneCaption`: always rendered, doing meta, `⌘⌥N` hint, ⋯ menu with Rename, Open beside and Close, the Restored badge, minus for Leave the view), `terminalsStore` (rename and close reused) | — |
+| 3 (shipped, with PR 2) | The session line in the band | New `run/SessionLine.tsx` (from `SessionRail`'s logic: roving tabindex, ⌥ peek, bell dot, waits), replacing `SessionAnchor` in `App.tsx`'s `modeMeta`; the layout button and its menu (`RunPanes` layout operations, `terminalLayoutStore`); delete `SessionRail.tsx`, `SessionAnchor.tsx` and their tests; update the tour's `data-tour` ids | A command to reorder sessions, for drag (see the notes below) |
 | 4 | Run's Companion: Context · Changes · Mission | Delete `CompanionSession.tsx`. New `CompanionRun.tsx` built from `CompanionSection`: the context meter from `CompanionContext` fed by the focused session, a compact changes list from the workspace's git status (the data `ChangesPanel` uses), the existing mission line | A read-only command for one session's context size and ledger total, if the existing queries don't give it |
 | 5 (shipped, #909) | Groups: data and IPC | `db.rs` migration, `commands.rs` and `lib.rs` (`list_groups`, `set_group_order`, `create_group`, `rename_group`, `set_group_tint`, `delete_group`, `set_item_group`), `types.ts`, `ipc.ts`, new `stores/groupsStore.ts`. Runs `cargo test`. | New `groups(id TEXT PK, scope TEXT CHECK IN ('project','workspace'), project_id TEXT NULL REFERENCES projects ON DELETE CASCADE, name TEXT NOT NULL, tint TEXT NULL, sort_order INTEGER, created_at TEXT)`; `ALTER TABLE projects ADD COLUMN group_id TEXT NULL`; `ALTER TABLE workspaces ADD COLUMN group_id TEXT NULL` (set NULL when the group is deleted; an emptied group stays until `delete_group`) |
 | 6 | Groups: mission groups in the rail | `WorkspaceRail.tsx` (a project's rows become rows or a `MissionGroup`: folder header, indented run with its guide, fold persisted under `railGroupCollapsed`, the ancestor step in `resolveAttention`, the filter matching group names), `WorkspaceContextMenu.tsx` (**Move to group ›**), new `GroupContextMenu.tsx`, drag onto a header | — |
@@ -337,10 +337,10 @@ Checked against `main` on 2026-11-18. These are implementation facts, not design
 
 - **The caption is 32px** (`h-8`), and the gaps give back 32px, which is why a lone pane ends level (PR 2).
 - **The Companion still folds to its strip while Run shows more than one pane** (the 2026-11-03 decision, `docs/superpowers/specs/2026-11-03-run-session-pair-design.md`). This design doesn't change that. `⌘\` brings it back over the panes, and that is when the Context eyebrow's session name matters (PR 4).
-- **Sessions have a stored order (`terminals.position`) but no command changes it.** Dragging a cell needs one (PR 3).
+- **Sessions have a stored order (`terminals.position`) but no command changes it.** Dragging a cell needs one. PR 3 shipped without drag; it is a follow-up.
 - **Claude Code spend is attributed by working directory**, to the most recently active Run session opened on it (`src-tauri/src/transcripts.rs`). Two agent sessions in one workspace share a directory, so `Spent` and the context meter can't yet be told apart per session. PR 4 settles this before it promises per-session numbers.
 - **Projects sort pinned first, then by `sort_order`.** PR 7 has to say where a pinned project sits relative to its group.
-- **`⌘T` is shown as the hint for New session** in the command palette. PR 3 checks it is bound before the `+` button's tooltip repeats it.
+- **`⌘T` is shown as the hint for New session** in the command palette. PR 3 checked: no key is bound to it, so the `+` button's tooltip names no shortcut.
 - **The collapsed workspace rail is specified as "the Run session rail"** (design-system section 8, rail rule 7, and the layout table). PR 3 rewords both when the session rail goes; the collapsed rail's own geometry doesn't change.
 - **Tour anchors** `run-session-rail`, `run-session-cell`, `run-open-beside` and `run-session-waiting` live in `SessionRail.tsx`, and released changesets may point at them. PR 3 moves or retires them with `node scripts/whats-new.mjs check` green.
 
