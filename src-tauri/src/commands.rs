@@ -534,6 +534,8 @@ pub struct ProjectInfo {
     pub jira_project_key: Option<String>,
     pub pinned: bool,
     pub tint: Option<String>,
+    /// The project-scope rail group this project sits in, if any.
+    pub group_id: Option<String>,
 }
 
 #[derive(serde::Serialize, Clone)]
@@ -583,7 +585,8 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
         let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
         let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
         let tint = existing.as_ref().and_then(|p| p.tint.clone());
-        Ok(ProjectInfo { id, name, path: p, jira_project_key, pinned, tint })
+        let group_id = existing.as_ref().and_then(|p| p.group_id.clone());
+        Ok(ProjectInfo { id, name, path: p, jira_project_key, pinned, tint, group_id })
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         let name = std::path::Path::new(&path).file_name()
@@ -591,7 +594,7 @@ pub async fn open_project(state: State<'_, AppState>, path: String) -> AppResult
             .unwrap_or_else(|| path.clone());
         db.insert_project(&id, &name, &path)?;
         ensure_main_workspace(&db, &id, &path, None)?;
-        Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None })
+        Ok(ProjectInfo { id, name, path, jira_project_key: None, pinned: false, tint: None, group_id: None })
     }
 }
 
@@ -618,19 +621,20 @@ pub async fn ensure_sketchbook(state: State<'_, AppState>) -> AppResult<ProjectI
         let jira_project_key = existing.as_ref().and_then(|p| p.jira_project_key.clone());
         let pinned = existing.as_ref().map(|p| p.pinned).unwrap_or(false);
         let tint = existing.as_ref().and_then(|p| p.tint.clone());
-        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint })
+        let group_id = existing.as_ref().and_then(|p| p.group_id.clone());
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path: p, jira_project_key, pinned, tint, group_id })
     } else {
         let id = uuid::Uuid::new_v4().to_string();
         db.insert_project(&id, "Sketchbook", &path)?;
         ensure_main_workspace(&db, &id, &path, None)?;
-        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None })
+        Ok(ProjectInfo { id, name: "Sketchbook".into(), path, jira_project_key: None, pinned: false, tint: None, group_id: None })
     }
 }
 
 #[tauri::command]
 pub async fn list_recent_projects(state: State<'_, AppState>) -> AppResult<Vec<ProjectInfo>> {
     let rows = state.db.lock().list_projects()?;
-    Ok(rows.into_iter().map(|(id, name, path, _, jira_project_key, pinned, tint)| ProjectInfo { id, name, path, jira_project_key, pinned, tint }).collect())
+    Ok(rows.into_iter().map(|(id, name, path, _, jira_project_key, pinned, tint, group_id)| ProjectInfo { id, name, path, jira_project_key, pinned, tint, group_id }).collect())
 }
 
 #[tauri::command]
@@ -638,13 +642,14 @@ pub async fn list_closed_projects(state: State<'_, AppState>) -> AppResult<Vec<P
     let rows = state.db.lock().list_closed_projects()?;
     Ok(rows
         .into_iter()
-        .map(|(id, name, path, _, jira_project_key, pinned, tint)| ProjectInfo {
+        .map(|(id, name, path, _, jira_project_key, pinned, tint, group_id)| ProjectInfo {
             id,
             name,
             path,
             jira_project_key,
             pinned,
             tint,
+            group_id,
         })
         .collect())
 }
@@ -743,7 +748,7 @@ pub async fn create_project(
             let _ = db.update_mission_exec_isolation(&m.id, "sandbox");
         }
     }
-    Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None })
+    Ok(ProjectInfo { id, name, path: full_path_str, jira_project_key: None, pinned: false, tint: None, group_id: None })
 }
 
 /// The canonical Sketchbook path (expanded, no side effect — does NOT provision
@@ -3886,6 +3891,7 @@ pub async fn clone_project(
         jira_project_key: None,
         pinned: false,
         tint: None,
+        group_id: None,
     })
 }
 
@@ -3915,6 +3921,78 @@ pub async fn set_project_pinned(
 #[tauri::command]
 pub async fn set_project_order(state: State<'_, AppState>, ids: Vec<String>) -> AppResult<()> {
     state.db.lock().set_project_order(&ids)
+}
+
+// ─── Rail groups ──────────────────────────────────────────────────
+//
+// A group is a named, optionally tinted, one-level container in the rail:
+// `project` scope holds projects, `workspace` scope holds one project's
+// workspaces. Membership is `group_id` on the project / workspace row, which
+// `list_recent_projects` and `list_workspaces` already return.
+
+/// Every group, both scopes.
+#[tauri::command]
+pub async fn list_groups(state: State<'_, AppState>) -> AppResult<Vec<crate::db::GroupRow>> {
+    state.db.lock().list_groups()
+}
+
+/// Create a group and move `member_ids` into it. It takes the place of its
+/// first member (in rail order), or goes last when it has none.
+#[tauri::command]
+pub async fn create_group(
+    state: State<'_, AppState>,
+    scope: String,
+    project_id: Option<String>,
+    name: String,
+    tint: Option<String>,
+    member_ids: Option<Vec<String>>,
+) -> AppResult<crate::db::GroupRow> {
+    state.db.lock().create_group(
+        &scope,
+        project_id.as_deref(),
+        &name,
+        tint.as_deref(),
+        &member_ids.unwrap_or_default(),
+    )
+}
+
+#[tauri::command]
+pub async fn rename_group(state: State<'_, AppState>, group_id: String, name: String) -> AppResult<()> {
+    state.db.lock().rename_group(&group_id, &name)
+}
+
+/// Set a group's tint (one of the monogram tints), or clear it with `null`.
+#[tauri::command]
+pub async fn set_group_tint(
+    state: State<'_, AppState>,
+    group_id: String,
+    tint: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_group_tint(&group_id, tint.as_deref())
+}
+
+/// Persist the order of sibling groups, like `set_project_order`.
+#[tauri::command]
+pub async fn set_group_order(state: State<'_, AppState>, ids: Vec<String>) -> AppResult<()> {
+    state.db.lock().set_group_order(&ids)
+}
+
+/// Delete a group. Its members stay, ungrouped.
+#[tauri::command]
+pub async fn delete_group(state: State<'_, AppState>, group_id: String) -> AppResult<()> {
+    state.db.lock().delete_group(&group_id)
+}
+
+/// Move a project or workspace (`kind`) into a group, or out of any group
+/// (`group_id` null).
+#[tauri::command]
+pub async fn set_item_group(
+    state: State<'_, AppState>,
+    kind: String,
+    item_id: String,
+    group_id: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_item_group(&kind, &item_id, group_id.as_deref())
 }
 
 #[tauri::command]

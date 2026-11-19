@@ -218,6 +218,14 @@ pub fn run() {
             commands::list_closed_projects,
             commands::reopen_project,
             commands::delete_project,
+            // Rail groups
+            commands::list_groups,
+            commands::create_group,
+            commands::rename_group,
+            commands::set_group_tint,
+            commands::set_group_order,
+            commands::delete_group,
+            commands::set_item_group,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,

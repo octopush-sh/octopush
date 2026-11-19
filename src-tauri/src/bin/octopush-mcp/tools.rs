@@ -744,7 +744,7 @@ fn list_projects(db: &Db) -> Result<Value, String> {
     let rows = db.list_projects().map_err(|e| e.to_string())?;
     let projects: Vec<Value> = rows
         .into_iter()
-        .map(|(id, name, path, last_opened, jira_project_key, pinned, tint)| {
+        .map(|(id, name, path, last_opened, jira_project_key, pinned, tint, _group_id)| {
             json!({
                 "id": id, "name": name, "path": path,
                 "lastOpened": last_opened, "jiraProjectKey": jira_project_key,

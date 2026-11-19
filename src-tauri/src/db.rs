@@ -50,6 +50,45 @@ fn normalize_optional(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// A group's name as stored: trimmed, and never empty.
+fn normalize_group_name(name: &str) -> AppResult<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(group_error("Group name cannot be empty."));
+    }
+    Ok(name.to_string())
+}
+
+/// A group's tint as stored: None for absent or blank, else one of
+/// [`GROUP_TINTS`]. Anything else is refused, so no new hue reaches the rail.
+fn normalize_group_tint(tint: Option<&str>) -> AppResult<Option<String>> {
+    match normalize_optional(tint) {
+        None => Ok(None),
+        Some(t) if GROUP_TINTS.contains(&t.as_str()) => Ok(Some(t)),
+        Some(t) => Err(group_error(format!(
+            "Unknown tint '{t}'. Use one of: {}.",
+            GROUP_TINTS.join(", ")
+        ))),
+    }
+}
+
+/// A refusal from the rail-group layer, worded for the user.
+fn group_error(message: impl Into<String>) -> crate::error::AppError {
+    crate::error::AppError::Other(message.into())
+}
+
+fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
+    group_error(format!("Unknown item kind '{kind}'. Use 'project' or 'workspace'."))
+}
+
+/// Map an UPDATE's row count to "the group exists".
+fn group_found(changed: usize) -> AppResult<()> {
+    if changed == 0 {
+        return Err(group_error("Group not found."));
+    }
+    Ok(())
+}
+
 /// Parse a stage's `parents` JSON column (a list of upstream positions) into a
 /// vec. A NULL or malformed value reads as "no recorded parents" — the caller
 /// then treats the stage as part of a legacy linear chain.
@@ -1178,6 +1217,33 @@ impl Db {
             self.backfill_direct_cli_sessions()?;
             self.meta_set("direct_cli_sessions_backfill_v1", "done")?;
         }
+
+        // Rail groups: a named, optionally tinted, one-level container for the
+        // workspace rail. One table, two scopes. A `project` group holds
+        // projects and belongs to no project; a `workspace` group holds one
+        // project's workspaces and is deleted with that project. Membership is
+        // the nullable `group_id` on the member's own row, so an item is in at
+        // most one group. The columns carry no foreign key: `delete_group`
+        // clears them in its own transaction, and a group that loses every
+        // member stays until it is deleted.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS groups (
+                id          TEXT PRIMARY KEY,
+                scope       TEXT NOT NULL CHECK (scope IN ('project','workspace')),
+                project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
+                name        TEXT NOT NULL,
+                tint        TEXT,
+                sort_order  INTEGER NOT NULL,
+                created_at  TEXT NOT NULL,
+                CHECK ((scope = 'project' AND project_id IS NULL)
+                    OR (scope = 'workspace' AND project_id IS NOT NULL))
+            );
+            CREATE INDEX IF NOT EXISTS idx_groups_scope ON groups(scope, project_id, sort_order);
+            "#,
+        )?;
+        add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN group_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN group_id TEXT")?;
 
         self.backfill_default_threads()?;
 
@@ -2324,21 +2390,21 @@ impl Db {
 
     pub fn list_projects(
         &self,
-    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool, Option<String>)>> {
+    ) -> AppResult<Vec<ProjectListRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint FROM projects \
+            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint, group_id FROM projects \
              WHERE closed_at IS NULL \
              ORDER BY pinned DESC, sort_order IS NULL, sort_order ASC, created_at ASC",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?, r.get(7)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn get_project(&self, project_id: &str) -> AppResult<Option<crate::commands::ProjectInfo>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, jira_project_key, pinned, tint FROM projects WHERE id = ?1",
+            "SELECT id, name, path, jira_project_key, pinned, tint, group_id FROM projects WHERE id = ?1",
         )?;
         let row = stmt
             .query_row(params![project_id], |r| {
@@ -2349,6 +2415,7 @@ impl Db {
                     jira_project_key: r.get(3)?,
                     pinned: r.get::<_, i64>(4)? != 0,
                     tint: r.get(5)?,
+                    group_id: r.get(6)?,
                 })
             })
             .optional()?;
@@ -2465,19 +2532,322 @@ impl Db {
     /// newest first, capped at 10. Same tuple shape as `list_projects`.
     pub fn list_closed_projects(
         &self,
-    ) -> AppResult<Vec<(String, String, String, String, Option<String>, bool, Option<String>)>> {
+    ) -> AppResult<Vec<ProjectListRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint FROM projects \
+            "SELECT id, name, path, last_opened, jira_project_key, pinned, tint, group_id FROM projects \
              WHERE closed_at IS NOT NULL ORDER BY closed_at DESC LIMIT 10",
         )?;
         let rows = stmt.query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?))
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get::<_, i64>(5)? != 0, r.get(6)?, r.get(7)?))
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
     pub fn delete_project(&self, id: &str) -> AppResult<()> {
         self.conn.execute("DELETE FROM projects WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    // ─── Rail groups ──────────────────────────────────────────────
+
+    fn row_to_group(r: &rusqlite::Row) -> rusqlite::Result<GroupRow> {
+        Ok(GroupRow {
+            id: r.get(0)?,
+            scope: r.get(1)?,
+            project_id: r.get(2)?,
+            name: r.get(3)?,
+            tint: r.get(4)?,
+            sort_order: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    }
+
+    /// Every group, both scopes: project groups first, then workspace groups
+    /// project by project, each run in `sort_order`.
+    pub fn list_groups(&self) -> AppResult<Vec<GroupRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, scope, project_id, name, tint, sort_order, created_at FROM groups
+             ORDER BY scope ASC, project_id ASC, sort_order ASC, created_at ASC",
+        )?;
+        let rows = stmt.query_map([], Self::row_to_group)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    pub fn get_group(&self, id: &str) -> AppResult<Option<GroupRow>> {
+        self.conn
+            .query_row(
+                "SELECT id, scope, project_id, name, tint, sort_order, created_at FROM groups WHERE id = ?1",
+                params![id],
+                Self::row_to_group,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Check that an item may join a group of `group_scope` owned by
+    /// `group_project`. `kind` is `project` or `workspace`; a group only holds
+    /// items of its own scope, and a workspace group only its project's.
+    fn ensure_item_fits_group(
+        &self,
+        kind: &str,
+        item_id: &str,
+        group_scope: &str,
+        group_project: Option<&str>,
+    ) -> AppResult<()> {
+        match kind {
+            "project" => {
+                self.ensure_group_item_exists(kind, item_id)?;
+                if group_scope != "project" {
+                    return Err(group_error("A project can only join a project group."));
+                }
+            }
+            "workspace" => {
+                let owner = self.ensure_group_item_exists(kind, item_id)?;
+                if group_scope != "workspace" {
+                    return Err(group_error("A workspace can only join a workspace group."));
+                }
+                if owner.as_deref() != group_project {
+                    return Err(group_error("A workspace can only join a group in its own project."));
+                }
+            }
+            other => return Err(unknown_group_item_kind(other)),
+        }
+        Ok(())
+    }
+
+    /// Check that the item exists. Returns a workspace's project id (None for
+    /// a project).
+    fn ensure_group_item_exists(&self, kind: &str, item_id: &str) -> AppResult<Option<String>> {
+        match kind {
+            "project" => {
+                let found: Option<i64> = self
+                    .conn
+                    .query_row("SELECT 1 FROM projects WHERE id = ?1", params![item_id], |r| r.get(0))
+                    .optional()?;
+                found.map(|_| None).ok_or_else(|| group_error("Project not found."))
+            }
+            "workspace" => {
+                let owner: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT project_id FROM workspaces WHERE id = ?1",
+                        params![item_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                owner.map(Some).ok_or_else(|| group_error("Workspace not found."))
+            }
+            other => Err(unknown_group_item_kind(other)),
+        }
+    }
+
+    /// Where a new group goes among its siblings (the groups of the same scope
+    /// and project). With no members it goes last. With members it takes the
+    /// place of its first member in rail order: before the first sibling whose
+    /// own first member comes later. Siblings that are empty keep their place.
+    /// Rail order is `list_projects`' for projects and `created_at` for
+    /// workspaces; closed projects and archived workspaces count too, so the
+    /// answer doesn't depend on what the rail hides.
+    fn new_group_sort_order(
+        &self,
+        scope: &str,
+        project_id: Option<&str>,
+        member_ids: &[String],
+    ) -> AppResult<i64> {
+        let siblings: Vec<(String, i64)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, sort_order FROM groups WHERE scope = ?1 AND project_id IS ?2
+                 ORDER BY sort_order ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![scope, project_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let last = siblings.iter().map(|(_, order)| *order + 1).max().unwrap_or(0);
+        if member_ids.is_empty() {
+            return Ok(last);
+        }
+        // (item id, its current group) in rail order.
+        let items: Vec<(String, Option<String>)> = if scope == "project" {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, group_id FROM projects
+                 ORDER BY pinned DESC, sort_order IS NULL, sort_order ASC, created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        } else {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, group_id FROM workspaces WHERE project_id = ?1
+                 ORDER BY created_at ASC, rowid ASC",
+            )?;
+            let rows = stmt.query_map(params![project_id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let Some(first_member) = items.iter().position(|(id, _)| member_ids.contains(id)) else {
+            return Ok(last);
+        };
+        // Each sibling's first member that stays with it (the new group's
+        // members are leaving theirs).
+        let mut sibling_first: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for (idx, (id, group)) in items.iter().enumerate() {
+            let Some(group) = group else { continue };
+            if !member_ids.contains(id) {
+                sibling_first.entry(group.as_str()).or_insert(idx);
+            }
+        }
+        for (id, order) in &siblings {
+            if sibling_first.get(id.as_str()).is_some_and(|first| *first > first_member) {
+                return Ok(*order);
+            }
+        }
+        Ok(last)
+    }
+
+    /// Create a group and move `member_ids` into it, in one transaction. The
+    /// group is placed by [`Self::new_group_sort_order`]; siblings at or after
+    /// that place shift down by one. A member that was in another group leaves
+    /// it (one membership per item).
+    pub fn create_group(
+        &self,
+        scope: &str,
+        project_id: Option<&str>,
+        name: &str,
+        tint: Option<&str>,
+        member_ids: &[String],
+    ) -> AppResult<GroupRow> {
+        let name = normalize_group_name(name)?;
+        let tint = normalize_group_tint(tint)?;
+        let project_id = normalize_optional(project_id);
+        match scope {
+            "project" => {
+                if project_id.is_some() {
+                    return Err(group_error("A project group cannot belong to a project."));
+                }
+            }
+            "workspace" => {
+                let Some(pid) = project_id.as_deref() else {
+                    return Err(group_error("A workspace group needs the project it belongs to."));
+                };
+                self.ensure_group_item_exists("project", pid)?;
+            }
+            other => {
+                return Err(group_error(format!(
+                    "Unknown group scope '{other}'. Use 'project' or 'workspace'."
+                )))
+            }
+        }
+        // IMMEDIATE: the checks and the placement read before anything is
+        // written, and another process (octopush-mcp, a run worker) may write
+        // in between. Taking the write lock up front waits for it (busy
+        // timeout) instead of failing the upgrade from a stale read.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        for member in member_ids {
+            self.ensure_item_fits_group(scope, member, scope, project_id.as_deref())?;
+        }
+        let sort_order = self.new_group_sort_order(scope, project_id.as_deref(), member_ids)?;
+        tx.execute(
+            "UPDATE groups SET sort_order = sort_order + 1
+             WHERE scope = ?1 AND project_id IS ?2 AND sort_order >= ?3",
+            params![scope, project_id, sort_order],
+        )?;
+        let group = GroupRow {
+            id: uuid::Uuid::new_v4().to_string(),
+            scope: scope.to_string(),
+            project_id,
+            name,
+            tint,
+            sort_order,
+            created_at: Utc::now().to_rfc3339(),
+        };
+        tx.execute(
+            "INSERT INTO groups (id, scope, project_id, name, tint, sort_order, created_at)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![group.id, group.scope, group.project_id, group.name, group.tint, group.sort_order, group.created_at],
+        )?;
+        let assign = if scope == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        for member in member_ids {
+            tx.execute(assign, params![group.id, member])?;
+        }
+        tx.commit()?;
+        Ok(group)
+    }
+
+    /// Rename a group. The name is trimmed; an empty one is refused.
+    pub fn rename_group(&self, id: &str, name: &str) -> AppResult<()> {
+        let name = normalize_group_name(name)?;
+        let changed = self
+            .conn
+            .execute("UPDATE groups SET name = ?1 WHERE id = ?2", params![name, id])?;
+        group_found(changed)
+    }
+
+    /// Set or clear (None or blank) a group's tint. Only [`GROUP_TINTS`] pass.
+    pub fn set_group_tint(&self, id: &str, tint: Option<&str>) -> AppResult<()> {
+        let tint = normalize_group_tint(tint)?;
+        let changed = self
+            .conn
+            .execute("UPDATE groups SET tint = ?1 WHERE id = ?2", params![tint, id])?;
+        group_found(changed)
+    }
+
+    /// Persist a manual order: each id gets its index in `ids` as `sort_order`,
+    /// like `set_project_order`. Pass the sibling groups of one scope (and
+    /// project) in their new order; ids that match no group are ignored.
+    pub fn set_group_order(&self, ids: &[String]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (idx, id) in ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE groups SET sort_order = ?1 WHERE id = ?2",
+                params![idx as i64, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Delete a group and keep its members: their `group_id` is cleared in the
+    /// same transaction (archived workspaces and closed projects included).
+    pub fn delete_group(&self, id: &str) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("UPDATE projects SET group_id = NULL WHERE group_id = ?1", params![id])?;
+        tx.execute("UPDATE workspaces SET group_id = NULL WHERE group_id = ?1", params![id])?;
+        tx.execute("DELETE FROM groups WHERE id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Move a project or workspace into a group, or out of any group
+    /// (`group_id` None). Refuses a group of the other scope and a workspace
+    /// group of another project. An item is in at most one group, so joining
+    /// one leaves the previous.
+    pub fn set_item_group(&self, kind: &str, item_id: &str, group_id: Option<&str>) -> AppResult<()> {
+        match group_id {
+            Some(gid) => {
+                // Name an unknown kind before an unknown group.
+                if !matches!(kind, "project" | "workspace") {
+                    return Err(unknown_group_item_kind(kind));
+                }
+                let group = self
+                    .get_group(gid)?
+                    .ok_or_else(|| group_error("Group not found."))?;
+                self.ensure_item_fits_group(kind, item_id, &group.scope, group.project_id.as_deref())?;
+            }
+            None => {
+                self.ensure_group_item_exists(kind, item_id)?;
+            }
+        }
+        let sql = if kind == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        self.conn.execute(sql, params![group_id, item_id])?;
         Ok(())
     }
 
@@ -2530,7 +2900,7 @@ impl Db {
 
     pub fn list_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND status != 'archived' ORDER BY created_at ASC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -2550,6 +2920,7 @@ impl Db {
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
                 from_branch: r.get(14)?,
+                group_id: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -2557,7 +2928,7 @@ impl Db {
 
     pub fn get_workspace(&self, workspace_id: &str) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE id = ?1",
         )?;
         let row = stmt
@@ -2578,6 +2949,7 @@ impl Db {
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
                     from_branch: r.get(14)?,
+                    group_id: r.get(15)?,
                 })
             })
             .optional()?;
@@ -2995,7 +3367,7 @@ impl Db {
         branch: &str,
     ) -> AppResult<Option<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND branch = ?2
              ORDER BY (status = 'archived') ASC, created_at ASC LIMIT 1",
         )?;
@@ -3017,6 +3389,7 @@ impl Db {
                     test_command: r.get(12)?,
                     linked_issue_key: r.get(13)?,
                     from_branch: r.get(14)?,
+                    group_id: r.get(15)?,
                 })
             })
             .optional()?;
@@ -3150,7 +3523,7 @@ impl Db {
     /// Archived workspaces for a project (status='archived'), newest first.
     pub fn list_archived_workspaces(&self, project_id: &str) -> AppResult<Vec<WorkspaceRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch
+            "SELECT id, project_id, name, task, branch, worktree_path, setup_script, status, created_at, last_active, glyph, tint, test_command, linked_issue_key, from_branch, group_id
              FROM workspaces WHERE project_id = ?1 AND status = 'archived' ORDER BY created_at DESC",
         )?;
         let rows = stmt.query_map(params![project_id], |r| {
@@ -3170,6 +3543,7 @@ impl Db {
                 test_command: r.get(12)?,
                 linked_issue_key: r.get(13)?,
                 from_branch: r.get(14)?,
+                group_id: r.get(15)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -6894,6 +7268,37 @@ pub struct WorkspaceRow {
     /// The resolved base branch this workspace was created from. None for
     /// rows predating the column and for the auto-created default-branch row.
     pub from_branch: Option<String>,
+    /// The workspace-scope rail group this workspace sits in, if any. Kept
+    /// through archive and restore.
+    pub group_id: Option<String>,
+}
+
+/// One `list_projects` / `list_closed_projects` row: id, name, path,
+/// last_opened, jira_project_key, pinned, tint, group_id.
+pub type ProjectListRow =
+    (String, String, String, String, Option<String>, bool, Option<String>, Option<String>);
+
+/// The tints a rail group may carry: the monogram tints of
+/// `src/lib/monogram.ts` (`TINT_NAMES`), in the same order.
+pub const GROUP_TINTS: [&str; 7] =
+    ["brass", "verdigris", "rouge", "indigo", "lavender", "smoke", "bone"];
+
+/// A rail group (`groups`): a named, optionally tinted, one-level container.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct GroupRow {
+    pub id: String,
+    /// `project` (holds projects) or `workspace` (holds one project's workspaces).
+    pub scope: String,
+    /// The owning project of a `workspace` group; None for a `project` group.
+    pub project_id: Option<String>,
+    pub name: String,
+    /// One of [`GROUP_TINTS`], or None.
+    pub tint: Option<String>,
+    /// Position among the groups of the same scope (and, for `workspace`
+    /// groups, the same project). Ascending; not necessarily dense.
+    pub sort_order: i64,
+    pub created_at: String,
 }
 
 /// One queued Claude Code hook signal (`hook_signals`).

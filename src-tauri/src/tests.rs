@@ -17206,6 +17206,54 @@ mod pricing_table_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn every_gpt_6_model_is_priced() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // OpenAI's API pricing page (2026-11-17), short context:
+        // (input, 30-minute write, cached input, output).
+        for (id, (input, write, hit, output)) in [
+            ("gpt-6.2-astra", (8.0, 10.0, 0.40, 40.0)),
+            ("gpt-6.2-sol", (2.0, 2.50, 0.10, 10.0)),
+            ("gpt-6-astra", (10.0, 12.50, 1.0, 50.0)),
+            ("gpt-6-sol", (2.0, 2.50, 0.20, 10.0)),
+            ("gpt-6-luna", (0.10, 0.125, 0.01, 0.50)),
+            ("gpt-6.1-sol", (2.0, 2.50, 0.10, 10.0)),
+        ] {
+            let want = ModelPrices {
+                input_per_m: input,
+                output_per_m: output,
+                cache_read_per_m: hit,
+                cache_creation_per_m: write,
+                // Not a Claude model: no 1-hour write tier.
+                cache_creation_1h_per_m: write,
+            };
+            assert_eq!(builtin_prices(id), Some(want), "{id}");
+            assert_eq!(builtin_prices(&format!("openai/{id}")), Some(want), "{id}");
+            assert_eq!(prices_for(id), Some(want), "{id}");
+            assert_eq!(ledger_cost_basis(id, 0.0, 1_000), "computed", "{id}");
+        }
+        // Only the bare ids: a similar id stays unpriced.
+        assert_eq!(builtin_prices("gpt-6.2-terra"), None);
+        assert_eq!(builtin_prices("gpt-6-sol-pro"), None);
+        // 1M fresh + 1M written + 1M cached + 1M output = 8 + 10 + 0.40 + 40.
+        let cost = crate::token_engine::request_cost_for("gpt-6.2-astra", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 58.40).abs() < 1e-9, "astra request cost: {cost}");
+
+        // The two new models lead the OpenAI catalog.
+        let providers = crate::provider_router::builtin_providers();
+        let openai = &providers["openai"].models;
+        for (i, (id, name)) in [("gpt-6.2-astra", "GPT-6.2 Astra"), ("gpt-6.2-sol", "GPT-6.2 Sol")].into_iter().enumerate() {
+            let m = &openai[i];
+            assert_eq!(m.id, id);
+            assert_eq!(m.display_name, name);
+            assert_eq!(m.max_context, 1_050_000);
+            assert!(m.supports_tools);
+            assert!(crate::providers::openai_compat::uses_responses_api(id, &providers["openai"].api_base));
+            assert_eq!(crate::providers::openai_compat::effort_off_level(id), None, "{id} rejects effort none");
+        }
+    }
+
+    #[test]
     fn cache_write_unset_on_a_custom_model_bills_at_the_input_price() {
         use crate::provider_router::{builtin_providers, ProviderRouter};
         use crate::token_engine::prices_in;
@@ -22929,5 +22977,544 @@ mod read_only_role_tests {
             assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
         }
         assert_eq!(cli_disallowed_tools(false), "AskUserQuestion");
+    }
+}
+
+/// Rail groups: the `groups` table, `group_id` on projects and workspaces,
+/// and the rules of membership (one group per item, same scope, same project).
+#[cfg(test)]
+mod group_tests {
+    use crate::db::{Db, GroupRow, GROUP_TINTS};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str) {
+        db.insert_project(id, id, &format!("/tmp/octo-groups-{id}")).unwrap();
+    }
+
+    fn seed_workspace(db: &Db, project_id: &str, id: &str) {
+        db.insert_workspace(id, project_id, id, "", id, None, "", None).unwrap();
+    }
+
+    /// One project `p1` holding `w1`, `w2`, `w3`, created in that order.
+    fn seeded() -> Db {
+        let db = test_db();
+        seed_project(&db, "p1");
+        for ws in ["w1", "w2", "w3"] {
+            seed_workspace(&db, "p1", ws);
+        }
+        db
+    }
+
+    fn workspace_group(db: &Db, project_id: &str, name: &str, members: &[&str]) -> GroupRow {
+        let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+        db.create_group("workspace", Some(project_id), name, None, &members).unwrap()
+    }
+
+    fn project_group(db: &Db, name: &str, members: &[&str]) -> GroupRow {
+        let members: Vec<String> = members.iter().map(|m| m.to_string()).collect();
+        db.create_group("project", None, name, None, &members).unwrap()
+    }
+
+    fn group_of_workspace(db: &Db, id: &str) -> Option<String> {
+        db.get_workspace(id).unwrap().unwrap().group_id
+    }
+
+    fn group_of_project(db: &Db, id: &str) -> Option<String> {
+        db.get_project(id).unwrap().unwrap().group_id
+    }
+
+    /// Sibling group names in stored order.
+    fn names(db: &Db, scope: &str, project_id: Option<&str>) -> Vec<String> {
+        db.list_groups()
+            .unwrap()
+            .into_iter()
+            .filter(|g| g.scope == scope && g.project_id.as_deref() == project_id)
+            .map(|g| g.name)
+            .collect()
+    }
+
+    fn refusal(result: crate::error::AppResult<impl std::fmt::Debug>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    fn has_column(db: &Db, table: &str, column: &str) -> bool {
+        let mut stmt = db.conn_ref().prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        names.iter().any(|n| n == column)
+    }
+
+    #[test]
+    fn migration_adds_groups_to_an_existing_db() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            // A database from before groups: the first-release tables, with rows.
+            let conn = rusqlite::Connection::open(tmp.path()).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE projects (
+                    id              TEXT PRIMARY KEY,
+                    name            TEXT NOT NULL,
+                    path            TEXT NOT NULL UNIQUE,
+                    created_at      TEXT NOT NULL,
+                    last_opened     TEXT NOT NULL
+                );
+                CREATE TABLE workspaces (
+                    id              TEXT PRIMARY KEY,
+                    project_id      TEXT NOT NULL,
+                    name            TEXT NOT NULL,
+                    task            TEXT NOT NULL DEFAULT '',
+                    branch          TEXT NOT NULL,
+                    worktree_path   TEXT,
+                    setup_script    TEXT NOT NULL DEFAULT '',
+                    status          TEXT NOT NULL DEFAULT 'active',
+                    created_at      TEXT NOT NULL,
+                    last_active     TEXT NOT NULL,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+                );
+                INSERT INTO projects (id, name, path, created_at, last_opened)
+                    VALUES ('p1', 'Old project', '/tmp/octo-groups-old', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                INSERT INTO workspaces (id, project_id, name, branch, created_at, last_active)
+                    VALUES ('w1', 'p1', 'main', 'main', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert!(has_column(&db, "projects", "group_id"), "projects.group_id missing");
+        assert!(has_column(&db, "workspaces", "group_id"), "workspaces.group_id missing");
+        assert!(db.list_groups().unwrap().is_empty());
+        // Rows from before the migration read as ungrouped.
+        assert_eq!(group_of_project(&db, "p1"), None);
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(db.list_projects().unwrap()[0].7, None);
+        assert_eq!(db.list_workspaces("p1").unwrap()[0].group_id, None);
+        // And they can be grouped right away.
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id.clone()));
+        drop(db);
+
+        // migrate() runs on every launch: a second open keeps the data.
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id));
+    }
+
+    #[test]
+    fn create_group_assigns_its_members() {
+        let db = seeded();
+        let group = db
+            .create_group(
+                "workspace",
+                Some("p1"),
+                "  Vulnerability fixes  ",
+                Some("verdigris"),
+                &["w2".to_string(), "w3".to_string()],
+            )
+            .unwrap();
+        assert_eq!(group.scope, "workspace");
+        assert_eq!(group.project_id.as_deref(), Some("p1"));
+        assert_eq!(group.name, "Vulnerability fixes", "the name is trimmed");
+        assert_eq!(group.tint.as_deref(), Some("verdigris"));
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+        assert_eq!(db.get_group(&group.id).unwrap(), Some(group.clone()));
+
+        // The rows the rail already loads carry the membership.
+        let rows = db.list_workspaces("p1").unwrap();
+        let by_id = |id: &str| rows.iter().find(|w| w.id == id).unwrap().group_id.clone();
+        assert_eq!(by_id("w1"), None);
+        assert_eq!(by_id("w2"), Some(group.id.clone()));
+        assert_eq!(by_id("w3"), Some(group.id.clone()));
+        let found = db.find_workspace_by_branch("p1", "w2").unwrap().unwrap();
+        assert_eq!(found.group_id, Some(group.id));
+    }
+
+    #[test]
+    fn project_groups_hold_projects() {
+        let db = test_db();
+        for p in ["pa", "pb", "pc"] {
+            seed_project(&db, p);
+        }
+        let group = project_group(&db, "Client work", &["pa", "pc"]);
+        assert_eq!(group.scope, "project");
+        assert_eq!(group.project_id, None);
+
+        let rows = db.list_projects().unwrap();
+        let by_id = |id: &str| rows.iter().find(|p| p.0 == id).unwrap().7.clone();
+        assert_eq!(by_id("pa"), Some(group.id.clone()));
+        assert_eq!(by_id("pb"), None);
+        assert_eq!(by_id("pc"), Some(group.id.clone()));
+        assert_eq!(group_of_project(&db, "pa"), Some(group.id.clone()));
+
+        // A closed project keeps its group, in the closed list too.
+        db.close_project("pc").unwrap();
+        let closed = db.list_closed_projects().unwrap();
+        assert_eq!(closed[0].0, "pc");
+        assert_eq!(closed[0].7, Some(group.id));
+    }
+
+    #[test]
+    fn create_group_refuses_bad_scopes_and_writes_nothing() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+
+        assert_eq!(
+            refusal(db.create_group("workspace", None, "PR reviews", None, &[])),
+            "other: A workspace group needs the project it belongs to."
+        );
+        assert_eq!(
+            refusal(db.create_group("project", Some("p1"), "PR reviews", None, &[])),
+            "other: A project group cannot belong to a project."
+        );
+        assert_eq!(
+            refusal(db.create_group("folder", None, "PR reviews", None, &[])),
+            "other: Unknown group scope 'folder'. Use 'project' or 'workspace'."
+        );
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("nope"), "PR reviews", None, &[])),
+            "other: Project not found."
+        );
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "   ", None, &[])),
+            "other: Group name cannot be empty."
+        );
+        // A member from another project refuses the whole create: no group, and
+        // the valid member listed before it is left alone.
+        assert_eq!(
+            refusal(db.create_group(
+                "workspace",
+                Some("p1"),
+                "PR reviews",
+                None,
+                &["w1".to_string(), "x1".to_string()],
+            )),
+            "other: A workspace can only join a group in its own project."
+        );
+        // A project is not a member of a workspace group, nor the reverse.
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "PR reviews", None, &["p1".to_string()])),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.create_group("project", None, "PR reviews", None, &["w1".to_string()])),
+            "other: Project not found."
+        );
+        assert!(db.list_groups().unwrap().is_empty());
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+
+        // The table itself refuses a scope that disagrees with its owner.
+        let insert = |scope: &str, project: Option<&str>| {
+            db.conn_ref().execute(
+                "INSERT INTO groups (id, scope, project_id, name, sort_order, created_at)
+                 VALUES ('raw', ?1, ?2, 'Raw', 0, '2026-01-01T00:00:00Z')",
+                rusqlite::params![scope, project],
+            )
+        };
+        assert!(insert("workspace", None).is_err());
+        assert!(insert("project", Some("p1")).is_err());
+        assert!(insert("folder", None).is_err());
+    }
+
+    #[test]
+    fn a_new_group_takes_the_place_of_its_first_member() {
+        let db = seeded();
+        seed_workspace(&db, "p1", "w4");
+        // The first group, around the third workspace.
+        workspace_group(&db, "p1", "Third", &["w3"]);
+        // An empty one goes last.
+        workspace_group(&db, "p1", "Empty", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["Third", "Empty"]);
+        // A group around the first workspace sits before "Third"; the member
+        // order given doesn't matter, the rail's does.
+        workspace_group(&db, "p1", "First", &["w2", "w1"]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["First", "Third", "Empty"]);
+        // A group whose first member comes after every other group's goes last.
+        workspace_group(&db, "p1", "Fourth", &["w4"]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["First", "Third", "Empty", "Fourth"]);
+        // Taking w2 out of "First" into its own group: "First" still starts at
+        // w1, so the new group lands right after it.
+        workspace_group(&db, "p1", "Second", &["w2"]);
+        assert_eq!(
+            names(&db, "workspace", Some("p1")),
+            ["First", "Second", "Third", "Empty", "Fourth"]
+        );
+        // Stored positions are distinct.
+        let mut orders: Vec<i64> = db.list_groups().unwrap().iter().map(|g| g.sort_order).collect();
+        orders.dedup();
+        assert_eq!(orders.len(), 5);
+
+        // Each scope and each project is its own run of positions.
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        workspace_group(&db, "p2", "Other project", &["x1"]);
+        project_group(&db, "Projects", &["p2"]);
+        project_group(&db, "Projects first", &["p1"]);
+        assert_eq!(names(&db, "workspace", Some("p2")), ["Other project"]);
+        assert_eq!(names(&db, "project", None), ["Projects first", "Projects"]);
+        assert_eq!(
+            names(&db, "workspace", Some("p1")),
+            ["First", "Second", "Third", "Empty", "Fourth"]
+        );
+    }
+
+    #[test]
+    fn an_item_is_in_one_group_at_a_time() {
+        let db = seeded();
+        let a = workspace_group(&db, "p1", "Vulnerability fixes", &["w1"]);
+        let b = workspace_group(&db, "p1", "PR reviews", &[]);
+
+        db.set_item_group("workspace", "w1", Some(&b.id)).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), Some(b.id.clone()));
+        let in_a: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE group_id = ?1", [&a.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(in_a, 0);
+
+        // Creating a group around a grouped item moves it as well.
+        let c = workspace_group(&db, "p1", "Later", &["w1"]);
+        assert_eq!(group_of_workspace(&db, "w1"), Some(c.id));
+
+        // Out of any group.
+        db.set_item_group("workspace", "w1", None).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+
+        // Projects move the same way.
+        let pg = project_group(&db, "Client work", &[]);
+        db.set_item_group("project", "p1", Some(&pg.id)).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), Some(pg.id));
+        db.set_item_group("project", "p1", None).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), None);
+    }
+
+    #[test]
+    fn set_item_group_refuses_scope_and_cross_project_moves() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        let mine = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+        let theirs = workspace_group(&db, "p2", "PR reviews", &[]);
+        let projects = project_group(&db, "Client work", &[]);
+
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some(&theirs.id))),
+            "other: A workspace can only join a group in its own project."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some(&projects.id))),
+            "other: A workspace can only join a workspace group."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("project", "p1", Some(&mine.id))),
+            "other: A project can only join a project group."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "w1", Some("nope"))),
+            "other: Group not found."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("workspace", "nope", Some(&mine.id))),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.set_item_group("project", "nope", None)),
+            "other: Project not found."
+        );
+        for group in [Some(mine.id.as_str()), None] {
+            assert_eq!(
+                refusal(db.set_item_group("mission", "w1", group)),
+                "other: Unknown item kind 'mission'. Use 'project' or 'workspace'."
+            );
+        }
+        // Every refusal left the membership as it was.
+        assert_eq!(group_of_workspace(&db, "w1"), Some(mine.id));
+        assert_eq!(group_of_workspace(&db, "x1"), None);
+        assert_eq!(group_of_project(&db, "p1"), None);
+    }
+
+    #[test]
+    fn rename_group_trims_and_refuses_an_empty_name() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &[]);
+
+        db.rename_group(&group.id, "  Reviews to do \n").unwrap();
+        assert_eq!(db.get_group(&group.id).unwrap().unwrap().name, "Reviews to do");
+
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                refusal(db.rename_group(&group.id, blank)),
+                "other: Group name cannot be empty."
+            );
+        }
+        assert_eq!(db.get_group(&group.id).unwrap().unwrap().name, "Reviews to do");
+        assert_eq!(refusal(db.rename_group("nope", "Name")), "other: Group not found.");
+    }
+
+    #[test]
+    fn group_tint_is_one_of_the_monogram_tints_or_none() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &[]);
+        assert_eq!(group.tint, None);
+        let tint = |db: &Db| db.get_group(&group.id).unwrap().unwrap().tint;
+
+        for name in GROUP_TINTS {
+            db.set_group_tint(&group.id, Some(name)).unwrap();
+            assert_eq!(tint(&db).as_deref(), Some(name));
+        }
+        // No hue outside the list, on change or on create; the stored one stays.
+        let expected =
+            "other: Unknown tint 'teal'. Use one of: brass, verdigris, rouge, indigo, lavender, smoke, bone.";
+        assert_eq!(refusal(db.set_group_tint(&group.id, Some("teal"))), expected);
+        assert_eq!(
+            refusal(db.create_group("workspace", Some("p1"), "Tinted", Some("teal"), &[])),
+            expected
+        );
+        assert!(db.set_group_tint(&group.id, Some("purple")).is_err());
+        assert!(db.set_group_tint(&group.id, Some("Brass")).is_err());
+        assert_eq!(tint(&db).as_deref(), Some("bone"));
+        assert_eq!(db.list_groups().unwrap().len(), 1);
+
+        db.set_group_tint(&group.id, None).unwrap();
+        assert_eq!(tint(&db), None);
+        db.set_group_tint(&group.id, Some("rouge")).unwrap();
+        db.set_group_tint(&group.id, Some("  ")).unwrap();
+        assert_eq!(tint(&db), None, "a blank tint clears it");
+        assert_eq!(refusal(db.set_group_tint("nope", Some("brass"))), "other: Group not found.");
+    }
+
+    /// The backend list is the frontend's `TINT_NAMES`, name for name.
+    #[test]
+    fn group_tints_match_the_frontend_monogram_tints() {
+        let source = include_str!("../../src/lib/monogram.ts");
+        let start = source.find("export const TINT_NAMES").expect("TINT_NAMES in monogram.ts");
+        let list = &source[start..];
+        let list = &list[list.find("= [").unwrap() + 3..];
+        let list = &list[..list.find(']').unwrap()];
+        let frontend: Vec<&str> = list
+            .split(',')
+            .map(|name| name.trim().trim_matches('"'))
+            .filter(|name| !name.is_empty())
+            .collect();
+        assert_eq!(frontend, GROUP_TINTS);
+    }
+
+    #[test]
+    fn delete_group_keeps_its_members_and_clears_their_group() {
+        let db = seeded();
+        let doomed = workspace_group(&db, "p1", "Vulnerability fixes", &["w1", "w2"]);
+        let kept = workspace_group(&db, "p1", "PR reviews", &["w3"]);
+        // An archived member is cleared too, so a later restore can't point at
+        // a group that is gone.
+        db.archive_workspace("w2").unwrap();
+
+        db.delete_group(&doomed.id).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![kept.clone()]);
+        assert!(db.get_workspace("w1").unwrap().is_some(), "the members stay");
+        assert_eq!(db.list_archived_workspaces("p1").unwrap().len(), 1);
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(group_of_workspace(&db, "w2"), None);
+        assert_eq!(group_of_workspace(&db, "w3"), Some(kept.id.clone()));
+        let dangling: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE group_id = ?1", [&doomed.id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dangling, 0);
+
+        // Project groups: same rule, closed projects included.
+        seed_project(&db, "p2");
+        let projects = project_group(&db, "Client work", &["p1", "p2"]);
+        db.close_project("p2").unwrap();
+        db.delete_group(&projects.id).unwrap();
+        assert_eq!(group_of_project(&db, "p1"), None);
+        assert_eq!(group_of_project(&db, "p2"), None);
+        assert!(db.get_project_by_id("p2").unwrap().is_some());
+        assert_eq!(db.list_groups().unwrap(), vec![kept]);
+
+        // Deleting what is already gone is not an error.
+        db.delete_group(&doomed.id).unwrap();
+    }
+
+    #[test]
+    fn an_emptied_group_still_lists() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1", "w2"]);
+        db.set_item_group("workspace", "w1", None).unwrap();
+        db.set_item_group("workspace", "w2", None).unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+
+        // Its last member deleted outright: still there.
+        db.set_item_group("workspace", "w3", Some(&group.id)).unwrap();
+        db.delete_workspace("w3").unwrap();
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()]);
+
+        // And it takes members again.
+        db.set_item_group("workspace", "w1", Some(&group.id)).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), Some(group.id));
+    }
+
+    #[test]
+    fn archive_and_restore_keep_the_group_membership() {
+        let db = seeded();
+        let group = workspace_group(&db, "p1", "PR reviews", &["w1"]);
+
+        db.archive_workspace("w1").unwrap();
+        let archived = db.list_archived_workspaces("p1").unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].group_id, Some(group.id.clone()), "the archived row names its group");
+        assert_eq!(db.list_groups().unwrap(), vec![group.clone()], "the group outlives its only member");
+
+        db.restore_workspace("w1").unwrap();
+        let restored = db.list_workspaces("p1").unwrap().into_iter().find(|w| w.id == "w1").unwrap();
+        assert_eq!(restored.status, "active");
+        assert_eq!(restored.group_id, Some(group.id.clone()), "restored into its group");
+
+        // The group deleted while the workspace is archived: it restores ungrouped.
+        db.archive_workspace("w1").unwrap();
+        db.delete_group(&group.id).unwrap();
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+    }
+
+    #[test]
+    fn deleting_a_project_removes_its_workspace_groups() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        workspace_group(&db, "p1", "Vulnerability fixes", &["w1"]);
+        workspace_group(&db, "p1", "PR reviews", &[]);
+        let other = workspace_group(&db, "p2", "PR reviews", &["x1"]);
+        let projects = project_group(&db, "Client work", &["p1", "p2"]);
+
+        db.delete_project("p1").unwrap();
+        let left: Vec<String> = db.list_groups().unwrap().into_iter().map(|g| g.id).collect();
+        assert_eq!(left, [projects.id.clone(), other.id.clone()]);
+        // The other project's rows are untouched, and the project group that
+        // held the deleted project keeps its other member.
+        assert_eq!(group_of_workspace(&db, "x1"), Some(other.id));
+        assert_eq!(group_of_project(&db, "p2"), Some(projects.id));
+    }
+
+    #[test]
+    fn set_group_order_persists_a_manual_order() {
+        let db = seeded();
+        let a = workspace_group(&db, "p1", "A", &[]);
+        let b = workspace_group(&db, "p1", "B", &[]);
+        let c = workspace_group(&db, "p1", "C", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["A", "B", "C"]);
+
+        db.set_group_order(&[c.id.clone(), a.id.clone(), "nope".to_string(), b.id.clone()]).unwrap();
+        assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B"]);
+        // A group made afterwards still goes last.
+        workspace_group(&db, "p1", "D", &[]);
+        assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B", "D"]);
     }
 }
