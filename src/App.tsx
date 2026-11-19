@@ -104,7 +104,7 @@ import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
-import { changeStats, NO_CHANGE_STATS, sameChangeStats, type ChangeStats } from "./lib/runChanges";
+import { changeStats, NO_CHANGE_STATS, runChangesReader, sameChangeStats, type ChangeStats } from "./lib/runChanges";
 import type { CommitsAhead } from "./components/CompanionRun";
 import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
@@ -823,10 +823,10 @@ function App() {
     // the commits ahead once the tree is clean. Only while that panel is open
     // in Run; a Companion folded for the panes shows neither.
     const runChanges = activeMode === "run" && !companionCollapsed;
-    // The status signature the commits-ahead count was last read at, in Run:
-    // it is re-read when the status moves (a commit lands, the branch
-    // changes), not on every tick. Review reads it every tick, as before.
-    let aheadAtSig: string | null = null;
+    // What each tick reads for that panel (`runChangesReader`): the working
+    // diff while the tree is dirty, the commits-ahead count once per clean
+    // state. Review reads its own diffs every tick, as before.
+    const runReader = runChangesReader();
     // One refresh at a time: a slow git read (a large diff) must not let the
     // 3 s ticks pile up behind it. A skipped tick loses nothing; the one in
     // flight reports the same state, and the next tick follows it.
@@ -854,20 +854,24 @@ function App() {
           `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
           `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`;
         if (runChanges) {
-          if ((s?.changedFiles.length ?? 0) > 0) {
+          const dirty = (s?.changedFiles.length ?? 0) > 0;
+          const read = runReader.next(sig, dirty);
+          if (read === "diff") {
             // A file gains lines without its status changing, so the working
             // diff is read on every tick while there is something to count
             // (the backend builds it off the async runtime). Only the counts
-            // are kept (see `runChangeStats`).
+            // are kept (see `runChangeStats`). The commits-ahead count is
+            // void from here: a commit may land before the tree is clean.
+            setRunAhead(null);
             const stats = changeStats(await ipc.getGitDiff(path, ignoreWs).catch(() => ""));
             if (cancelled) return;
             setRunChangeStats((prev) => (sameChangeStats(prev, stats) ? prev : stats));
           } else {
             setRunChangeStats((prev) => (sameChangeStats(prev, NO_CHANGE_STATS) ? prev : NO_CHANGE_STATS));
-            if (ws && sig !== aheadAtSig) {
+            if (read === "ahead" && ws) {
               const c = await ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null);
               if (cancelled) return;
-              aheadAtSig = sig;
+              runReader.aheadRead(sig);
               const next: CommitsAhead | null = c ? { commits: c.commits, base: c.base, mergeBase: c.mergeBase } : null;
               setRunAhead((prev) =>
                 prev?.commits === next?.commits && prev?.base === next?.base && prev?.mergeBase === next?.mergeBase

@@ -1,7 +1,15 @@
 import { describe, it, expect } from "vitest";
 import type { FileChange } from "./types";
 import { DIFF_TRUNCATED_MARKER } from "./reviewSource";
-import { changeStats, changesMeta, pathTail, sameChangeStats, statLabel, STATUS_LETTER } from "./runChanges";
+import {
+  changeStats,
+  changesMeta,
+  pathTail,
+  runChangesReader,
+  sameChangeStats,
+  statLabel,
+  STATUS_LETTER,
+} from "./runChanges";
 
 const file = (path: string, status: FileChange["status"] = "modified"): FileChange => ({
   path,
@@ -101,5 +109,60 @@ describe("row atoms", () => {
     expect(pathTail("src/main/resources/config.js")).toBe("/config.js".length);
     expect(pathTail("pom.xml")).toBe(8);
     expect(pathTail("docs/a-very-long-file-name-for-a-plan.md")).toBe(20);
+  });
+});
+
+describe("runChangesReader", () => {
+  // A workspace branch with no upstream: ahead/behind are 0/0 whatever is
+  // committed, so a clean tree has one signature before and after a commit.
+  const CLEAN = "feat/x|0|0|";
+  const DIRTY = "feat/x|0|0|src/a.ts:modified:0:1";
+
+  /** One tick, reading what it is told to and saying so. */
+  function tick(reader: ReturnType<typeof runChangesReader>, sig: string, dirty: boolean) {
+    const read = reader.next(sig, dirty);
+    if (read === "ahead") reader.aheadRead(sig);
+    return read;
+  }
+
+  it("reads the count once per clean state, not on every tick", () => {
+    const r = runChangesReader();
+    expect(tick(r, CLEAN, false)).toBe("ahead");
+    expect(tick(r, CLEAN, false)).toBeNull();
+    expect(tick(r, CLEAN, false)).toBeNull();
+  });
+
+  it("reads the working diff on every dirty tick", () => {
+    const r = runChangesReader();
+    expect(tick(r, DIRTY, true)).toBe("diff");
+    expect(tick(r, DIRTY, true)).toBe("diff");
+  });
+
+  it("reads the count again after clean, edits, a commit and clean, though the signature is the same", () => {
+    const r = runChangesReader();
+    expect(tick(r, CLEAN, false)).toBe("ahead"); // nothing ahead yet
+    expect(tick(r, CLEAN, false)).toBeNull();
+    expect(tick(r, DIRTY, true)).toBe("diff"); // the agent edits
+    expect(tick(r, DIRTY, true)).toBe("diff");
+    // The agent commits: clean again, with the signature it had before.
+    expect(tick(r, CLEAN, false)).toBe("ahead");
+    expect(tick(r, CLEAN, false)).toBeNull();
+  });
+
+  it("reads the count again when the signature moves while clean", () => {
+    const r = runChangesReader();
+    expect(tick(r, CLEAN, false)).toBe("ahead");
+    expect(tick(r, "feat/x|1|0|", false)).toBe("ahead"); // pushed branch, a commit pulled in
+    expect(tick(r, "main|0|0|", false)).toBe("ahead"); // another branch checked out
+    expect(tick(r, "main|0|0|", false)).toBeNull();
+  });
+
+  it("keeps asking until the count has been read", () => {
+    const r = runChangesReader();
+    expect(r.next(CLEAN, false)).toBe("ahead");
+    // The read was dropped (the effect went away mid-flight): still due.
+    expect(r.next(CLEAN, false)).toBe("ahead");
+    r.aheadRead(CLEAN);
+    expect(r.next(CLEAN, false)).toBeNull();
   });
 });

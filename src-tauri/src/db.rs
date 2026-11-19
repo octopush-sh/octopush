@@ -1214,6 +1214,9 @@ impl Db {
             );
             "#,
         )?;
+        // Pruned as the app starts: 30 days is far past any message that
+        // could still be recent to a live session, or any late signal.
+        self.prune_ended_claude_sessions(&(Utc::now() - chrono::Duration::days(ENDED_SESSION_DAYS)).to_rfc3339())?;
         // One-time backfill from what the stage rows still remember: the last
         // attempt's session id, and the session its reported usage belongs to.
         // The ingestor then purges the duplicate `run` rows those sessions'
@@ -3733,11 +3736,20 @@ impl Db {
 
     // ─── Claude Code hook signals ──────────────────────────────────
 
-    /// Queue one hook signal for the app's poller (`claude_hooks`).
+    /// Queue one hook signal for the app's poller (`claude_hooks`), stamped now.
     pub fn insert_hook_signal(&self, terminal_id: &str, signal: &str, session_id: Option<&str>) -> AppResult<()> {
+        self.insert_hook_signal_at(terminal_id, signal, session_id, &Utc::now().to_rfc3339())
+    }
+
+    /// [`Self::insert_hook_signal`] stamped `at` (RFC3339 UTC): when the hook
+    /// fired, which the hook process notes as it starts. Rows are queued in
+    /// the order they are WRITTEN, and a hook that waited on the database
+    /// can be written after one that fired later; the stamp keeps the order
+    /// the events happened in.
+    pub fn insert_hook_signal_at(&self, terminal_id: &str, signal: &str, session_id: Option<&str>, at: &str) -> AppResult<()> {
         self.conn.execute(
             "INSERT INTO hook_signals (terminal_id, signal, session_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![terminal_id, signal, session_id, Utc::now().to_rfc3339()],
+            params![terminal_id, signal, session_id, at],
         )?;
         Ok(())
     }
@@ -4374,24 +4386,26 @@ impl Db {
     }
 
     /// Make `session_id` the current Claude Code session of `terminal_id`,
-    /// confirmed at `at` (RFC3339 UTC): what one of that session's hooks just
-    /// said. `started` is its `SessionStart`, which also revives a session
-    /// that had ended (a resume); any other signal of an ended session is
-    /// late and changes nothing (`false`). A session is current in one
+    /// confirmed at `at` (RFC3339 UTC, when the hook fired): what one of
+    /// that session's hooks just said. `started` is its `SessionStart`,
+    /// which also revives a session that had ended (a resume), but only when
+    /// it fired AFTER that end: `SessionStart` is asynchronous and
+    /// `SessionEnd` is not, so the start of a session that ended at once can
+    /// be written after its end, and must not link the terminal to a dead
+    /// session. Any other signal of an ended session is late and changes
+    /// nothing. `false` when nothing was linked. A session is current in one
     /// terminal only: it leaves any other terminal, which then has none.
     pub fn link_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str, started: bool) -> AppResult<bool> {
         let tx = self.conn.unchecked_transaction()?;
-        if started {
-            tx.execute("DELETE FROM ended_claude_sessions WHERE session_id = ?1", params![session_id])?;
-        } else {
-            let ended: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM ended_claude_sessions WHERE session_id = ?1)",
-                params![session_id],
-                |r| r.get(0),
-            )?;
-            if ended {
+        let ended_at: Option<String> = tx
+            .query_row("SELECT ended_at FROM ended_claude_sessions WHERE session_id = ?1", params![session_id], |r| r.get(0))
+            .optional()?;
+        if let Some(ended_at) = ended_at {
+            // Both stamps are RFC3339 UTC in one shape, so they compare as text.
+            if !started || at <= ended_at.as_str() {
                 return Ok(false);
             }
+            tx.execute("DELETE FROM ended_claude_sessions WHERE session_id = ?1", params![session_id])?;
         }
         tx.execute(
             "DELETE FROM terminal_claude_session WHERE session_id = ?1 AND terminal_id != ?2",
@@ -4409,12 +4423,14 @@ impl Db {
     /// The Claude Code session `session_id` ended at `at` (its `SessionEnd`):
     /// it is remembered as ended, and `terminal_id` has no current session
     /// if that was the one it ran (an end naming another session leaves the
-    /// terminal's own alone).
+    /// terminal's own alone). Also how a print-mode session is set aside,
+    /// from its first moment: it is never a terminal's session, and recorded
+    /// here it is never taken for a rival either. The newest end is kept.
     pub fn end_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO ended_claude_sessions (session_id, ended_at) VALUES (?1, ?2)
-             ON CONFLICT(session_id) DO UPDATE SET ended_at = excluded.ended_at",
+             ON CONFLICT(session_id) DO UPDATE SET ended_at = MAX(ended_at, excluded.ended_at)",
             params![session_id, at],
         )?;
         tx.execute(
@@ -4436,6 +4452,15 @@ impl Db {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Drop the ended sessions whose end is older than `cutoff` (RFC3339
+    /// UTC). An ended session only matters while its messages are recent
+    /// enough to be taken for a rival's, or a late signal of its own could
+    /// still arrive; the table would otherwise grow by one row per
+    /// conversation, for good. Returns the rows removed.
+    pub fn prune_ended_claude_sessions(&self, cutoff: &str) -> AppResult<usize> {
+        Ok(self.conn.execute("DELETE FROM ended_claude_sessions WHERE ended_at < ?1", params![cutoff])?)
     }
 
     /// Forget every terminal's current session (the hooks setting went off:
@@ -7679,6 +7704,10 @@ pub struct ThreadCost {
     pub unpriced_calls: i64,
     pub unpriced_models: Vec<String>,
 }
+
+/// How long an ended Claude Code session is remembered
+/// (`ended_claude_sessions`), in days.
+pub const ENDED_SESSION_DAYS: i64 = 30;
 
 /// One Claude Code session's RUN rows in the ledger (see
 /// `run_session_ledger`).

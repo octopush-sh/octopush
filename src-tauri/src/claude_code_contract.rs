@@ -1708,16 +1708,27 @@ fn session_hook_payloads_move_the_terminal_between_sessions() {
     assert_eq!(seen, [Some(first), None, Some(second), None], "start · /clear (end, start) · /exit");
 
     // Print mode fires both events too, and inherits the terminal's id when
-    // an agent runs it. Its hook's environment says `sdk-cli`: never queued.
+    // an agent runs it. Its hook's environment says `sdk-cli`: both are
+    // queued as an end of that session, which sets it aside (never the
+    // terminal's session, never a rival of it) and links nothing.
+    std::thread::sleep(std::time::Duration::from_millis(3));
     record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text("hooks/session-start-startup.json"));
     remember_sessions(&db, &db.drain_hook_signals().unwrap());
+    let nested = session_in("hooks/session-start-print.json");
     for rel in ["hooks/session-start-print.json", "hooks/session-end-print.json"] {
         let fx = rec.label(rel);
         assert!(parse_hook_event(&rec.json(rel), None).is_some_and(|e| e.signal.is_session()), "[{fx}]");
-        assert!(!record_hook_from(&db, Some("term-1"), None, Some("sdk-cli"), &rec.text(rel)), "[{fx}] print mode is not queued");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("sdk-cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(
+            (rows[0].signal.as_str(), rows[0].session_id.as_deref()),
+            (HookSignal::SessionEnded.as_str(), Some(nested.as_str())),
+            "[{fx}] print mode is set aside, not linked",
+        );
+        remember_sessions(&db, &rows);
+        assert_eq!(current(), Some(session_in("hooks/session-start-startup.json")), "[{fx}] the terminal keeps its own session");
     }
-    assert!(db.drain_hook_signals().unwrap().is_empty());
-    assert_eq!(current(), Some(session_in("hooks/session-start-startup.json")), "the terminal keeps its own session");
 }
 
 #[test]

@@ -125,7 +125,7 @@ function ClaudeHooksRow() {
     <div data-tour="settings-claude-hooks">
       <ToggleRow
         label="Let Claude Code say what it's waiting on"
-        description="Octopush adds hook entries to the workspace's .claude/settings.local.json and keeps that file out of git."
+        description="Octopush adds hook entries to the workspace's .claude/settings.local.json and keeps that file out of git. The hooks also say which Claude Code session each terminal runs, which is what the Context section in Run reads. Nothing they report leaves this Mac."
         checked={enabled}
         onChange={(on) => void persist(on)}
         testId="claude-hooks-switch"

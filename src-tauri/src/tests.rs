@@ -16046,6 +16046,12 @@ mod transcript_tests {
         st.end("term-b", "cc-gone", "2026-11-18T11:01:00+00:00");
         assert_eq!(st.shows("term-a"), Some(2_000));
         assert_eq!(st.shows("term-b"), Some(10), "an end naming another session leaves the terminal's own");
+        // A `claude -p` the agent ran from term-a: set aside when it starts
+        // (`record_hook_at` queues a print-mode start as an end), so its
+        // messages never hide the terminal's own figures.
+        st.end("term-a", "cc-print", "2026-11-18T11:02:00+00:00");
+        st.says("cc-print", &[("2026-11-18T11:03:00Z", 9)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
         // And when the newcomer was term-a's after all, its `Stop` says so.
         st.says("cc-next", &[("2026-11-18T11:10:00Z", 77)]);
         assert_eq!(st.shows("term-a"), None);

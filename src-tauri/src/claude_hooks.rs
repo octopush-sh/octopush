@@ -249,11 +249,7 @@ pub fn record_hook(db: &Db, terminal: Option<&str>, kind: Option<&str>, payload:
 }
 
 /// [`record_hook`], told how the hook's session was started (`entrypoint`:
-/// the hook's own `CLAUDE_CODE_ENTRYPOINT`). A print-mode or SDK session is
-/// not the one a person drives in the terminal, though a `claude -p` the
-/// agent runs inherits the terminal's id: its start and end are not queued,
-/// and its other signals are queued without its session id, so it changes
-/// attention exactly as before and never which session the terminal runs.
+/// the hook's own `CLAUDE_CODE_ENTRYPOINT`). Stamped now.
 pub fn record_hook_from(
     db: &Db,
     terminal: Option<&str>,
@@ -261,15 +257,43 @@ pub fn record_hook_from(
     entrypoint: Option<&str>,
     payload: &str,
 ) -> bool {
+    record_hook_at(db, terminal, kind, entrypoint, payload, Utc::now())
+}
+
+/// [`record_hook_from`], stamped `at`: when the hook fired, which
+/// `octopush-mcp hook` notes as its first act. Rows are queued in the order
+/// they are written, and a hook that waited on the database is written
+/// late; the stamp is what orders a session's start against its end.
+///
+/// A print-mode or SDK session is not the one a person drives in the
+/// terminal, though a `claude -p` the agent runs inherits the terminal's id.
+/// It is never linked: its start and its end are both queued as an END of
+/// that session, which sets it aside from its first moment (never the
+/// terminal's session, and never taken for a rival of it); its other signals
+/// are queued without its session id, so they change attention exactly as
+/// before.
+pub fn record_hook_at(
+    db: &Db,
+    terminal: Option<&str>,
+    kind: Option<&str>,
+    entrypoint: Option<&str>,
+    payload: &str,
+    at: DateTime<Utc>,
+) -> bool {
     let Some(terminal) = terminal.map(str::trim).filter(|t| !t.is_empty()) else { return false };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { return false };
     let Some(event) = agent_adapter::parse_hook_event(&value, kind) else { return false };
     let interactive = agent_adapter::interactive_entrypoint(entrypoint);
-    if !interactive && event.signal.is_session() {
-        return false;
-    }
-    let session = event.session_id.as_deref().filter(|_| interactive);
-    db.insert_hook_signal(terminal, event.signal.as_str(), session).is_ok()
+    let (signal, session) = match (interactive, event.signal.is_session()) {
+        (true, _) => (event.signal, event.session_id.as_deref()),
+        (false, true) => {
+            // Nothing to set aside without knowing which session it is.
+            let Some(session) = event.session_id.as_deref() else { return false };
+            (HookSignal::SessionEnded, Some(session))
+        }
+        (false, false) => (event.signal, None),
+    };
+    db.insert_hook_signal_at(terminal, signal.as_str(), session, &at.to_rfc3339()).is_ok()
 }
 
 // ─── App side: the poller ─────────────────────────────────────────
@@ -348,6 +372,12 @@ fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(Strin
 //   to its own session after anything else was taken for it.
 // - A session is current in one terminal only: named by another terminal (it
 //   was resumed there), it leaves the first, which then has none.
+// - A print-mode or SDK session is never a terminal's: `record_hook_at`
+//   queues its start and its end as an end, so it is set aside at once.
+// - Each row carries when its hook FIRED, not when it was written. A start
+//   that is not newer than its session's recorded end links nothing: the
+//   asynchronous `SessionStart` of a session that ended at once can be
+//   written after its synchronous `SessionEnd`.
 
 /// Apply what each of `rows` says about its terminal's session, in order. A
 /// row too old to deliver still counts: its prompt was answered long ago, but
@@ -823,20 +853,39 @@ mod tests {
 
     /// A `claude -p` the agent runs inherits the terminal's id. Claude Code
     /// says in the hook's environment that it is print mode (`sdk-cli`,
-    /// recorded on 2.1.327), so it never becomes the terminal's session.
+    /// recorded on 2.1.327): it never becomes the terminal's session, and it
+    /// is set aside from its first moment, so it is no rival either.
     #[test]
     fn a_print_mode_session_in_the_terminal_never_takes_it_over() {
         let (_tmp, db) = test_db();
         fire(&db, "t1", "SessionStart", "parent");
         let nested = |event: &str| record_hook_from(&db, Some("t1"), None, Some("sdk-cli"), &hook(event, "nested"));
-        assert!(!nested("SessionStart"), "not queued at all");
-        assert!(nested("Stop"), "its turn ending still settles the terminal's attention, as before");
-        assert!(!nested("SessionEnd"));
+        let ended = |session: &str| -> bool {
+            db.conn_ref()
+                .query_row("SELECT EXISTS(SELECT 1 FROM ended_claude_sessions WHERE session_id = ?1)", [session], |r| r.get(0))
+                .unwrap()
+        };
+        // Its start is queued as an end: set aside before it has said a word.
+        assert!(nested("SessionStart"));
         let rows = db.drain_hook_signals().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!((rows[0].signal.as_str(), rows[0].session_id.as_deref()), ("settled", None), "without its session id");
+        assert_eq!((rows[0].signal.as_str(), rows[0].session_id.as_deref()), ("session-end", Some("nested")));
         remember_sessions(&db, &rows);
+        assert!(ended("nested"));
         assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+        // Its turn ending still settles the terminal's attention, as before,
+        // but without its session id: it links nothing.
+        assert!(nested("Stop"));
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!((rows[0].signal.as_str(), rows[0].session_id.as_deref()), ("settled", None));
+        remember_sessions(&db, &rows);
+        // Its end is an end.
+        assert!(nested("SessionEnd"));
+        remember_sessions(&db, &db.drain_hook_signals().unwrap());
+        assert!(ended("nested"));
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"), "the parent keeps the terminal throughout");
+        assert!(!ended("parent"));
+        // A print-mode event that names no session sets nothing aside.
+        assert!(!record_hook_from(&db, Some("t1"), None, Some("sdk-cli"), r#"{"hook_event_name":"SessionStart"}"#));
 
         // A CLI that doesn't say how it was started: the nested session is
         // taken for the terminal's while it runs, its end unlinks it, and the
@@ -852,6 +901,65 @@ mod tests {
         assert_eq!(session_of(&db, "t1"), None, "nothing is shown rather than the nested session");
         unsaid("Stop", "parent");
         assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+    }
+
+    /// `SessionStart` is asynchronous and `SessionEnd` is not: when a session
+    /// ends at once (a resume the user quits straight away), its start can be
+    /// WRITTEN after its end. The rows say when each hook fired, and a start
+    /// that is not newer than the session's end links nothing.
+    #[test]
+    fn a_start_written_after_its_sessions_end_does_not_link_a_dead_session() {
+        let (_tmp, db) = test_db();
+        let t0 = Utc::now() - chrono::Duration::seconds(5);
+        let at = |ms: i64| t0 + chrono::Duration::milliseconds(ms);
+        let queue = |event: &str, session: &str, fired: DateTime<Utc>| {
+            assert!(record_hook_at(&db, Some("t1"), None, Some("cli"), &hook(event, session), fired));
+        };
+        // The start fired at 0 ms and waited on the database; the end fired
+        // at 40 ms and was written first.
+        queue("SessionEnd", "s1", at(40));
+        queue("SessionStart", "s1", at(0));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1"), None, "the session is over; the late start changes nothing");
+        // The same instant is not newer either.
+        queue("SessionStart", "s1", at(40));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1"), None);
+        // A real resume fires after the end, and links.
+        queue("SessionStart", "s1", at(900));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s1"));
+        let (_, linked_at) = db.terminal_claude_session("t1").unwrap().unwrap();
+        assert_eq!(linked_at, at(900).to_rfc3339(), "the link carries when the hook fired");
+
+        // The usual order, written as fired, in one poll: start, then end.
+        queue("SessionStart", "s2", at(1000));
+        queue("SessionEnd", "s2", at(1040));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1"), None, "s2 took the terminal and ended: it runs nothing now");
+        // An older end written late does not move a newer one back.
+        queue("SessionEnd", "s2", at(1010));
+        poll_once(&db, true, Utc::now()).unwrap();
+        queue("SessionStart", "s2", at(1030));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1"), None, "1030 is not newer than the end at 1040");
+    }
+
+    #[test]
+    fn ended_sessions_are_pruned_after_thirty_days() {
+        let (_tmp, db) = test_db();
+        let now = Utc::now();
+        let ago = |days: i64| (now - chrono::Duration::days(days)).to_rfc3339();
+        db.end_terminal_claude_session("t1", "old", &ago(crate::db::ENDED_SESSION_DAYS + 1)).unwrap();
+        db.end_terminal_claude_session("t1", "recent", &ago(2)).unwrap();
+        assert_eq!(db.prune_ended_claude_sessions(&ago(crate::db::ENDED_SESSION_DAYS)).unwrap(), 1);
+        let left: Vec<String> = {
+            let conn = db.conn_ref();
+            let mut stmt = conn.prepare("SELECT session_id FROM ended_claude_sessions").unwrap();
+            let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+            rows.collect::<Result<_, _>>().unwrap()
+        };
+        assert_eq!(left, ["recent"]);
     }
 
     #[test]

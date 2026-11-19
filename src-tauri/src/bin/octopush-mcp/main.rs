@@ -82,7 +82,11 @@ fn main() {
 fn run_hook() {
     use std::io::Read;
     use octopush_lib::agent_adapter::ENTRYPOINT_ENV;
-    use octopush_lib::claude_hooks::{hook_kind, record_hook_from, MAX_PAYLOAD, TERMINAL_ENV};
+    use octopush_lib::claude_hooks::{hook_kind, record_hook_at, MAX_PAYLOAD, TERMINAL_ENV};
+    // When the hook fired, noted before anything that can wait (stdin, the
+    // database): rows are queued in the order they are written, and this is
+    // what orders a session's start against its end.
+    let fired = chrono::Utc::now();
     let mut payload = String::new();
     let _ = io::stdin().lock().take(MAX_PAYLOAD).read_to_string(&mut payload);
     let Ok(terminal) = std::env::var(TERMINAL_ENV) else { return };
@@ -91,7 +95,7 @@ fn run_hook() {
     let entrypoint = std::env::var(ENTRYPOINT_ENV).ok();
     let args: Vec<String> = std::env::args().collect();
     if let Ok(db) = Db::open_without_migrations(&Db::default_path()) {
-        record_hook_from(&db, Some(&terminal), hook_kind(&args), entrypoint.as_deref(), &payload);
+        record_hook_at(&db, Some(&terminal), hook_kind(&args), entrypoint.as_deref(), &payload, fired);
     }
 }
 

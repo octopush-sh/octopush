@@ -126,3 +126,39 @@ export function pathTail(path: string): number {
   const name = path.slice(path.lastIndexOf("/") + 1);
   return Math.max(8, Math.min(20, name.length + 1));
 }
+
+/** What one tick of the git poll must read for Run's Changes section: the
+ *  working diff (the tree is dirty), the commits-ahead count (it is clean
+ *  and the count isn't known for this state), or nothing. */
+export type RunChangesRead = "diff" | "ahead" | null;
+
+/**
+ * Decides, tick by tick, what Run's Changes section needs read.
+ *
+ * The working diff is read on every dirty tick: a file gains lines without
+ * its status changing. The commits-ahead count is read once per clean
+ * state: when the tree becomes clean, and again when the status signature
+ * moves while it stays clean. **Any dirty tick voids it.** The signature
+ * holds the branch, the upstream-relative ahead/behind and the changed
+ * files; on a workspace branch with no upstream a commit moves none of
+ * them, so clean, then edits, then a commit, then clean again gives the
+ * very signature the count was read at. Only having been dirty in between
+ * says a commit may have landed.
+ */
+export function runChangesReader() {
+  let aheadAt: string | null = null;
+  return {
+    /** What to read for this tick's status. */
+    next(sig: string, dirty: boolean): RunChangesRead {
+      if (dirty) {
+        aheadAt = null;
+        return "diff";
+      }
+      return aheadAt === sig ? null : "ahead";
+    },
+    /** The count was read (or could not be) at this clean signature. */
+    aheadRead(sig: string): void {
+      aheadAt = sig;
+    },
+  };
+}
