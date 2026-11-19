@@ -24,6 +24,26 @@ export function missionGroupsOf(groups: readonly Group[], projectId: string): Gr
     .sort((a, b) => a.sortOrder - b.sortOrder || a.createdAt.localeCompare(b.createdAt));
 }
 
+/** Which project each mission group belongs to, by group id. */
+export function missionGroupOwners(groups: readonly Group[]): Map<string, string> {
+  const owners = new Map<string, string>();
+  for (const g of groups) if (g.scope === "workspace" && g.projectId) owners.set(g.id, g.projectId);
+  return owners;
+}
+
+/** The mission group a workspace of `projectId` really sits in: its `groupId`
+ *  when that names a group OF THAT PROJECT, else null (a loose mission). The
+ *  same test `layoutMissions` applies, for the code that has no layout at
+ *  hand: a stale or foreign `groupId` must mean "loose" everywhere at once. */
+export function ownGroupId(
+  workspace: Pick<Workspace, "groupId"> | undefined,
+  projectId: string,
+  owners: ReadonlyMap<string, string>,
+): string | null {
+  const groupId = workspace?.groupId ?? null;
+  return groupId !== null && owners.get(groupId) === projectId ? groupId : null;
+}
+
 /**
  * Interleave a project's groups with its loose missions.
  *

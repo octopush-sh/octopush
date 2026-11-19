@@ -619,6 +619,9 @@ a secondary cue (WCAG 1.4.1).
   glyph and the attention dot **only while folded**. `empty` (mute) is the one
   exception: an empty group has no list to read it from. A folded header never
   marches; state stays on rows.
+- **Folded over the active mission**, the name reads in ivory, the cue the
+  project line gives (rule 5). Open, it stays sage: the active row is in
+  sight and says it. No new colour, and never brass.
 - **One tab stop.** The header is a button with `aria-expanded`: click folds,
   `←`/`→` fold and unfold, double-click or `F2` renames in place, `⇧F10` or
   the context-menu key opens its menu. Its hover `+` is not a tab stop (the

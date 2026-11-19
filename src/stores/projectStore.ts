@@ -1,12 +1,29 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import { loadWithMembership } from "../lib/membershipGuard";
+import { beginMembershipLoad, type MembershipLoad } from "../lib/membershipGuard";
 import type { ProjectInfo } from "../lib/types";
 
-// Both lists are read under the membership guard, so a reload already in
-// flight never undoes a group move (see `lib/membershipGuard.ts`).
-const listRecent = () => loadWithMembership("project", () => ipc.listRecentProjects());
-const listClosed = () => loadWithMembership("project", () => ipc.listClosedProjects());
+/**
+ * Reread project lists under the membership guard (`lib/membershipGuard.ts`).
+ * `read` fetches one list or several; `commit` writes the store, passing each
+ * list through `overlay`, which lays over it every group move the read could
+ * have missed. `commit` runs in the same step as the overlay, so a reload in
+ * flight never undoes a move, and never brings back one the backend refused.
+ */
+async function reload<R>(
+  read: () => Promise<R>,
+  commit: (lists: R, overlay: MembershipLoad["overlay"]) => void,
+): Promise<void> {
+  const guard = beginMembershipLoad("project");
+  try {
+    commit(await read(), guard.overlay);
+  } finally {
+    guard.end();
+  }
+}
+
+const readRecent = () => ipc.listRecentProjects();
+const readBoth = () => Promise.all([ipc.listRecentProjects(), ipc.listClosedProjects()]);
 
 interface ProjectState {
   current: ProjectInfo | null;
@@ -63,8 +80,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   loadRecent: async () => {
     try {
-      const recent = await listRecent();
-      set({ recent });
+      await reload(readRecent, (recent, overlay) => set({ recent: overlay(recent) }));
     } catch {
       // Ignore — recent list is non-critical
     }
@@ -72,8 +88,10 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   loadClosed: async () => {
     try {
-      const closed = await listClosed();
-      set({ closed });
+      await reload(
+        () => ipc.listClosedProjects(),
+        (closed, overlay) => set({ closed: overlay(closed) }),
+      );
     } catch {
       // Ignore — closed list is non-critical.
     }
@@ -81,38 +99,32 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   closeProject: async (id) => {
     await ipc.closeProject(id);
-    const [recent, closed] = await Promise.all([
-      listRecent(),
-      listClosed(),
-    ]);
-    set((s) => ({
-      recent,
-      closed,
-      // Closing the currently-open project drops the app to the empty state
-      // instead of leaving a stale `current` pointing at a hidden project (C2).
-      current: s.current?.id === id ? null : s.current,
-    }));
+    await reload(readBoth, ([recent, closed], overlay) =>
+      set((s) => ({
+        recent: overlay(recent),
+        closed: overlay(closed),
+        // Closing the currently-open project drops the app to the empty state
+        // instead of leaving a stale `current` pointing at a hidden project (C2).
+        current: s.current?.id === id ? null : s.current,
+      })),
+    );
   },
 
   reopenProject: async (id) => {
     await ipc.reopenProject(id);
-    const [recent, closed] = await Promise.all([
-      listRecent(),
-      listClosed(),
-    ]);
-    set({ recent, closed });
+    await reload(readBoth, ([recent, closed], overlay) =>
+      set({ recent: overlay(recent), closed: overlay(closed) }),
+    );
   },
 
   setPinned: async (id, pinned) => {
     await ipc.setProjectPinned(id, pinned);
-    const recent = await listRecent();
-    set({ recent });
+    await reload(readRecent, (recent, overlay) => set({ recent: overlay(recent) }));
   },
 
   setOrder: async (ids) => {
     await ipc.setProjectOrder(ids);
-    const recent = await listRecent();
-    set({ recent });
+    await reload(readRecent, (recent, overlay) => set({ recent: overlay(recent) }));
   },
 
   close: () => set({ current: null }),

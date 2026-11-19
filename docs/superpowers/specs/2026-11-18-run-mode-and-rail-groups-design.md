@@ -332,6 +332,7 @@ No new colours, fonts, glyphs or motion primitives. Everything reuses `TINTS`, `
 - **`⌥⌘G` is taken.** The editor and the scratchpad use it for "go to line". PR 8 must pick another shortcut for **Move to group…**, or bind it only while the rail has focus.
 - **The session line needs a horizontal marching variant.** `.rail-bar-running` is vertical only, so PR 3 adds a horizontal form of the same idiom to `src/styles.css` and documents it. That is a variant of an existing primitive, not a new one.
 - **Rail rules 1 and 3 need rewording when the rail UI ships** (PR 6): a group's hairline and tinted guide are new marks beside the rows, so "nothing else in the rail carries a border" and "nothing else on the row is coloured" must name them.
+- **The mission and project context menus have no keyboard path** (found while building PR 6; true before groups too). They open on right-click only: a rail row and a project line answer neither ⇧F10 nor the context-menu key. Until they do, **Move to group** and **New group** cannot be reached from the keyboard for a mission or a project; only a group header's own menu can (⇧F10, the context-menu key, F2). Follow-up, not in PR 6: give rail rows and project lines the same two keys, opening the menu at the row. PR 8's keyboard **Move to group…** shortcut depends on it or replaces it.
 
 Checked against `main` on 2026-11-18. These are implementation facts, not design changes; where one touches the design, the PR that meets it says so before building.
 

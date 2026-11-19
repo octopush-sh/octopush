@@ -135,6 +135,9 @@ beforeEach(() => {
   localStorage.removeItem("railProjectCollapsed");
   __reloadRailGroupUi();
   useAttentionStore.setState({ flagsByWs: {} });
+  // The launch restore is over: every activation below is a real one unless a
+  // test says otherwise.
+  useWorkspaceStore.setState({ launchRestoredId: null });
   seed();
 });
 afterEach(() => {
@@ -551,6 +554,32 @@ describe("the beacon walks up to the fold that hides it", () => {
     expect(project).toHaveAccessibleName(/needs attention/);
   });
 
+  it("a mission pointing at another project's group is loose: that group's header carries nothing for it", () => {
+    // `g-theirs` belongs to p2; a stale row of p1 still names it.
+    const theirs = group("g-theirs", "Their group", { projectId: "p2" });
+    const missions = [ws("main", "main"), ws("w-stray", "stray", theirs.id)];
+    seed([theirs], missions);
+    useRailGroupUi.getState().setCollapsed(theirs.id, true);
+    useAttentionStore.setState({ flagsByWs: { "w-stray": { kind: "terminal", at: 1, since: 1 } } });
+    render(
+      <WorkspaceRail
+        projects={[
+          { id: "p1", name: "Backend", workspaces: missions },
+          { id: "p2", name: "Frontend", workspaces: [ws("f-main", "main", null, { projectId: "p2" })] },
+        ]}
+        activeWorkspaceId="main"
+        onSelect={vi.fn()}
+        onCustomize={vi.fn()}
+        isCollapsed={false}
+      />,
+    );
+    // Drawn loose in its own project, and pulsing on its own row.
+    expect(rowOf("stray")).toHaveAttribute("data-rail-row", "loose");
+    expect(pulsing()).toEqual([glyph("stray")]);
+    expect(header("Their group").querySelector(".animate-attention-pulse")).toBeNull();
+    expect(header("Their group")).not.toHaveAccessibleName(/needs attention/);
+  });
+
   it("a folded group holding only other waiting missions shows a static dot", () => {
     useAttentionStore.setState({ flagsByWs: flags });
     render(<Rail />);
@@ -563,7 +592,10 @@ describe("the beacon walks up to the fold that hides it", () => {
   it("resolveAttentionCarriers: outermost fold wins, beacon beats dot, open folds carry nothing", () => {
     const p = projects();
     const attention = { "w-codec": "beacon", "w-parser": "dot", "w-billing": "dot", "w-notes": "dot" } as const;
-    const known = new Set([FIXES.id, REVIEWS.id]);
+    const known = new Map([
+      [FIXES.id, "p1"],
+      [REVIEWS.id, "p1"],
+    ]);
     const carriers = (foldedProjects: string[], foldedGroups: string[]) =>
       resolveAttentionCarriers(
         p,
@@ -578,10 +610,19 @@ describe("the beacon walks up to the fold that hides it", () => {
       byGroup: { [FIXES.id]: "beacon", [REVIEWS.id]: "dot" },
     });
     expect(carriers(["p1"], [FIXES.id])).toEqual({ byProject: { p1: "beacon" }, byGroup: {} });
-    // A group the store does not know cannot carry anything.
-    expect(resolveAttentionCarriers(p, attention, new Set(), () => false, () => true)).toEqual({
+    // A group the store does not know cannot carry anything, and neither can
+    // another project's group: the layout draws those missions loose.
+    expect(resolveAttentionCarriers(p, attention, new Map(), () => false, () => true)).toEqual({
       byProject: {},
       byGroup: {},
+    });
+    const foreign = new Map([
+      [FIXES.id, "p2"],
+      [REVIEWS.id, "p1"],
+    ]);
+    expect(resolveAttentionCarriers(p, attention, foreign, () => false, () => true)).toEqual({
+      byProject: {},
+      byGroup: { [REVIEWS.id]: "dot" },
     });
   });
 });
@@ -660,12 +701,64 @@ describe("activating a mission in a folded group", () => {
     expect(row.closest("[inert]")).toBeNull();
   });
 
-  it("leaves a group folded on purpose alone at launch, and when its active mission stays active", () => {
+  it("the rail mounted with nothing active: the first activation unfolds the group", () => {
     useRailGroupUi.getState().setCollapsed(FIXES.id, true);
-    const { rerender } = render(<Rail active="w-codec" />);
-    // The workspace restored at launch is not an activation.
+    const { rerender } = render(<Rail active={null} />);
+    expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "false");
+    rerender(<Rail active="w-codec" />);
+    expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "true");
+    expect(scroll.mock.calls.at(-1)![0]).toBe(glyph("fix-codec"));
+  });
+
+  it("only the workspace restored at launch keeps its group folded, and only that once", () => {
+    useRailGroupUi.getState().setCollapsed(FIXES.id, true);
+    useWorkspaceStore.setState({ launchRestoredId: "w-codec" });
+    // The restore arrives after the rail mounted, as it does at launch.
+    const { rerender } = render(<Rail active={null} />);
+    rerender(<Rail active="w-codec" />);
     expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "false");
     rerender(<Rail active="w-codec" />);
     expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "false");
+    // Leaving and coming back is an activation.
+    rerender(<Rail active="main" />);
+    rerender(<Rail active="w-codec" />);
+    expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("a restored workspace already active at mount keeps its group folded too", () => {
+    useRailGroupUi.getState().setCollapsed(FIXES.id, true);
+    useWorkspaceStore.setState({ launchRestoredId: "w-codec" });
+    render(<Rail active="w-codec" />);
+    expect(header("Vulnerability fixes")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("an activation that is not the launch restore unfolds even as the rail's first", () => {
+    useRailGroupUi.getState().setCollapsed(REVIEWS.id, true);
+    useWorkspaceStore.setState({ launchRestoredId: "main" });
+    render(<Rail active="w-billing" />);
+    expect(header("PR reviews")).toHaveAttribute("aria-expanded", "true");
+  });
+});
+
+describe("a folded group that holds the active mission", () => {
+  const name = (group: string) => within(header(group)).getByTestId("rail-group-name");
+
+  it("reads in ivory, as a project's line does for the project that holds it", () => {
+    useWorkspaceStore.setState({ launchRestoredId: "w-codec" }); // stays folded
+    useRailGroupUi.getState().setCollapsed(FIXES.id, true);
+    useRailGroupUi.getState().setCollapsed(REVIEWS.id, true);
+    render(<Rail active="w-codec" />);
+    expect(name("Vulnerability fixes").className).toMatch(/\btext-octo-ivory\b/);
+    expect(name("Vulnerability fixes").className).not.toMatch(/\btext-octo-sage\b/);
+    // A folded group without it stays sage.
+    expect(name("PR reviews").className).toMatch(/\btext-octo-sage\b/);
+  });
+
+  it("stays sage while open: the active row itself is the cue", () => {
+    useWorkspaceStore.setState({ launchRestoredId: "w-codec" });
+    render(<Rail active="w-codec" />);
+    expect(name("Vulnerability fixes").className).toMatch(/\btext-octo-sage\b/);
+    fireEvent.click(header("Vulnerability fixes"));
+    expect(name("Vulnerability fixes").className).toMatch(/\btext-octo-ivory\b/);
   });
 });

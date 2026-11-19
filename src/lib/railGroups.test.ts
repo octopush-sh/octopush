@@ -1,5 +1,13 @@
 import { describe, it, expect } from "vitest";
-import { filterRailItems, layoutMissions, missionGroupsOf, resolveRailDrop, type RailItem } from "./railGroups";
+import {
+  filterRailItems,
+  layoutMissions,
+  missionGroupOwners,
+  missionGroupsOf,
+  ownGroupId,
+  resolveRailDrop,
+  type RailItem,
+} from "./railGroups";
 import type { Group, Workspace } from "./types";
 
 function ws(id: string, groupId: string | null = null): Workspace {
@@ -51,6 +59,37 @@ describe("missionGroupsOf", () => {
       group("section", { scope: "project", projectId: null }),
     ];
     expect(missionGroupsOf(groups, "p1").map((g) => g.id)).toEqual(["first", "early", "late"]);
+  });
+});
+
+describe("ownGroupId", () => {
+  const owners = missionGroupOwners([
+    group("mine"),
+    group("theirs", { projectId: "p2" }),
+    group("section", { scope: "project", projectId: null }),
+  ]);
+
+  it("maps mission groups to their projects, and nothing else", () => {
+    expect([...owners]).toEqual([
+      ["mine", "p1"],
+      ["theirs", "p2"],
+    ]);
+  });
+
+  it("is the group only when the group is the workspace's own project's", () => {
+    expect(ownGroupId(ws("a", "mine"), "p1", owners)).toBe("mine");
+    expect(ownGroupId(ws("a", "theirs"), "p1", owners)).toBeNull();
+    expect(ownGroupId(ws("a", "gone"), "p1", owners)).toBeNull();
+    expect(ownGroupId(ws("a", "section"), "p1", owners)).toBeNull();
+    expect(ownGroupId(ws("a"), "p1", owners)).toBeNull();
+    expect(ownGroupId(undefined, "p1", owners)).toBeNull();
+  });
+
+  it("agrees with the layout about who is a member", () => {
+    const rows = [ws("a", "mine"), ws("b", "theirs"), ws("c")];
+    const members = layoutMissions(rows, missionGroupsOf([group("mine"), group("theirs", { projectId: "p2" })], "p1"))
+      .flatMap((i) => (i.kind === "group" ? i.members.map((w) => w.id) : []));
+    expect(members).toEqual(rows.filter((w) => ownGroupId(w, "p1", owners)).map((w) => w.id));
   });
 });
 

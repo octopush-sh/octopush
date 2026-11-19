@@ -65,12 +65,37 @@ describe("GroupContextMenu", () => {
     expect(screen.getByRole("menuitem", { name: /Rename/ })).toHaveFocus();
     fireEvent.keyDown(window, { key: "ArrowDown" });
     expect(current).toHaveFocus();
-    fireEvent.keyDown(current, { key: "ArrowRight" });
-    expect(screen.getByRole("menuitemradio", { name: "Lavender" })).toHaveFocus();
-    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
-    fireEvent.keyDown(document.activeElement!, { key: "ArrowLeft" });
-    expect(screen.getByRole("menuitemradio", { name: "Rouge" })).toHaveFocus();
-    current.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitem", { name: /Ungroup/ })).toHaveFocus();
+    // Only one swatch is ever a tab stop.
+    const stops = () => screen.getAllByRole("menuitemradio").filter((s) => s.tabIndex === 0);
+    expect(stops()).toEqual([current]);
+  });
+
+  it("after ←/→ onto another swatch, ↓ goes on to the next row and ↑ to the one before", () => {
+    render(<GroupContextMenu {...base} tint="indigo" onNewMission={vi.fn()} />);
+    const swatch = (name: string) => screen.getByRole("menuitemradio", { name });
+    swatch("Indigo").focus();
+    fireEvent.keyDown(swatch("Indigo"), { key: "ArrowRight" });
+    expect(swatch("Lavender")).toHaveFocus();
+    // The stop moved with the focus; the checked tint did not.
+    expect(screen.getAllByRole("menuitemradio").filter((s) => s.tabIndex === 0)).toEqual([swatch("Lavender")]);
+    expect(swatch("Indigo")).toHaveAttribute("aria-checked", "true");
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitem", { name: /Ungroup/ })).toHaveFocus();
+
+    // Back up: the row is entered where it was left, then the row above it.
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(swatch("Lavender")).toHaveFocus();
+    fireEvent.keyDown(swatch("Lavender"), { key: "ArrowLeft" });
+    fireEvent.keyDown(swatch("Indigo"), { key: "ArrowLeft" });
+    expect(swatch("Rouge")).toHaveFocus();
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(screen.getByRole("menuitem", { name: "New mission in this group" })).toHaveFocus();
+    // ← from the first swatch wraps to the last.
+    swatch("No tint").focus();
+    fireEvent.keyDown(swatch("No tint"), { key: "ArrowLeft" });
+    expect(swatch("Bone")).toHaveFocus();
     fireEvent.keyDown(window, { key: "ArrowDown" });
     expect(screen.getByRole("menuitem", { name: /Ungroup/ })).toHaveFocus();
   });

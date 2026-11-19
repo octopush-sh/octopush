@@ -1,4 +1,4 @@
-import { useId, useRef } from "react";
+import { useId, useRef, useState } from "react";
 import { Pencil, Plus, Trash2, Ungroup } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
 import { MENU_HEADER, MENU_ITEM, MENU_ITEM_MULTILINE, MENU_SEP } from "../lib/menuStyles";
@@ -56,14 +56,19 @@ export function GroupContextMenu({
   };
 
   const options: Array<TintName | null> = [null, ...TINT_NAMES];
-  // One swatch is in the ↑/↓ walk (the current one); ←/→ move along the row.
+  // The swatch row is ONE stop of the menu's ↑/↓ walk, and ←/→ move along it
+  // (a roving tab stop). The stop starts on the current tint and follows the
+  // focus, so ↓ from any swatch goes on to the next row instead of finding
+  // itself outside the walk and starting over at the top.
+  const [stop, setStop] = useState<TintName | null>(tint);
   const onSwatchKey = (e: React.KeyboardEvent<HTMLButtonElement>) => {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
     const all = Array.from(swatches.current?.querySelectorAll<HTMLButtonElement>("button") ?? []);
     const at = all.indexOf(e.currentTarget);
-    const step = e.key === "ArrowRight" ? 1 : -1;
-    all[(at + step + all.length) % all.length]?.focus();
+    const next = (at + (e.key === "ArrowRight" ? 1 : -1) + all.length) % all.length;
+    setStop(options[next]);
+    all[next]?.focus();
   };
 
   return (
@@ -103,8 +108,9 @@ export function GroupContextMenu({
               aria-checked={current}
               aria-label={label}
               title={label}
-              tabIndex={current ? 0 : -1}
-              data-menu-item={current ? "" : undefined}
+              tabIndex={name === stop ? 0 : -1}
+              data-menu-item={name === stop ? "" : undefined}
+              onFocus={() => setStop(name)}
               onClick={() => onTint(name)}
               onKeyDown={onSwatchKey}
               className={`${SWATCH} ${current ? SWATCH_CURRENT : ""} ${

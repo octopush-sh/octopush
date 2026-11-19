@@ -49,4 +49,21 @@ describe("railGroupUiStore", () => {
     expect(stored()).toEqual({ b: true });
     expect(useRailGroupUi.getState().renamingId).toBeNull();
   });
+
+  it("prune keeps only the folds and the rename of groups that exist", () => {
+    const ui = useRailGroupUi.getState();
+    ui.setCollapsed("a", true);
+    ui.setCollapsed("b", true);
+    ui.startRename("b");
+    ui.prune(new Set(["a", "c"]));
+    expect(stored()).toEqual({ a: true });
+    expect(useRailGroupUi.getState().collapsed).toEqual({ a: true });
+    expect(useRailGroupUi.getState().renamingId).toBeNull();
+    // Nothing stale: nothing is written, and the state keeps its identity.
+    const before = useRailGroupUi.getState().collapsed;
+    ui.startRename("a");
+    ui.prune(new Set(["a"]));
+    expect(useRailGroupUi.getState().collapsed).toBe(before);
+    expect(useRailGroupUi.getState().renamingId).toBe("a");
+  });
 });

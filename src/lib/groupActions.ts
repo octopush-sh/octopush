@@ -47,7 +47,8 @@ function loadedMembers(projectId: string | null, groupId: string): string[] {
  * empty one). When it had missions the toast offers Undo, which makes a group
  * of the same name and tint around the ones that are still loose. The new
  * group is a new row: it opens unfolded, and archived missions that sat in the
- * old group do not return to it.
+ * old group do not return to it. Undo does nothing once the project has been
+ * closed or deleted.
  */
 export async function ungroupMissions(groupId: string): Promise<void> {
   const store = useGroupsStore.getState();
@@ -64,11 +65,13 @@ export async function ungroupMissions(groupId: string): Promise<void> {
     action: {
       label: "Undo",
       onClick: () => {
-        const stillLoose = new Set(
-          (useWorkspaceStore.getState().workspacesByProjectId[group.projectId ?? ""] ?? [])
-            .filter((w) => !w.groupId)
-            .map((w) => w.id),
-        );
+        // The project was closed or deleted since: its rows are gone from the
+        // rail, and a group made now would be an empty one nobody can see.
+        const rows = group.projectId
+          ? useWorkspaceStore.getState().workspacesByProjectId[group.projectId]
+          : undefined;
+        if (!rows) return;
+        const stillLoose = new Set(rows.filter((w) => !w.groupId).map((w) => w.id));
         void useGroupsStore.getState().create({
           scope: "workspace",
           projectId: group.projectId,

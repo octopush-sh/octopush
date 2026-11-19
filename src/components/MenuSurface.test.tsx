@@ -60,4 +60,45 @@ describe("MenuSurface", () => {
     );
     expect(screen.getByRole("menu", { name: "Wide" }).className).toContain("w-[244px]");
   });
+
+  it("↑/↓ from a focused control that is not a row go on from where it stands", () => {
+    render(
+      <MenuSurface x={0} y={0} ariaLabel="Walk" onDismiss={vi.fn()}>
+        <button type="button" role="menuitem">One</button>
+        <button type="button" data-testid="aside">Not a row</button>
+        <button type="button" role="menuitem">Two</button>
+        <button type="button" role="menuitem">Three</button>
+      </MenuSurface>,
+    );
+    const aside = screen.getByTestId("aside");
+    aside.focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitem", { name: "Two" })).toHaveFocus();
+    aside.focus();
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(screen.getByRole("menuitem", { name: "One" })).toHaveFocus();
+  });
+
+  it("walks a control that opts in with data-menu-item, and a nested menu on its own", () => {
+    render(
+      <MenuSurface x={0} y={0} ariaLabel="Walk" onDismiss={vi.fn()}>
+        <button type="button" role="menuitem">One</button>
+        <button type="button" role="menuitemradio" aria-checked="true" data-menu-item="">Swatch</button>
+        <div role="menu" aria-label="Inner">
+          <button type="button" role="menuitem">Inner one</button>
+          <button type="button" role="menuitem">Inner two</button>
+        </div>
+        <button type="button" role="menuitem">Two</button>
+      </MenuSurface>,
+    );
+    const item = (name: string) => screen.getByRole("menuitem", { name });
+    expect(item("One")).toHaveFocus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(screen.getByRole("menuitemradio", { name: "Swatch" })).toHaveFocus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(item("Two")).toHaveFocus(); // the nested menu's rows are not the parent's
+    item("Inner two").focus();
+    fireEvent.keyDown(window, { key: "ArrowDown" });
+    expect(item("Inner one")).toHaveFocus(); // and it wraps inside itself
+  });
 });

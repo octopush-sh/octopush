@@ -52,11 +52,22 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
           (item) => (item.closest('[role="menu"]') ?? scope) === scope,
         );
         if (items.length === 0) return;
-        const idx = items.indexOf(document.activeElement as HTMLElement);
-        const next =
-          e.key === "ArrowDown"
-            ? items[(idx + 1) % items.length]
-            : items[(idx - 1 + items.length) % items.length];
+        const down = e.key === "ArrowDown";
+        const idx = focused ? items.indexOf(focused) : -1;
+        if (idx === -1 && focused && scope.contains(focused)) {
+          // The focus is in the menu but on something outside the walk (a
+          // control reached with the pointer or Tab): go on from where it
+          // stands in the document, never back to the top.
+          const after = items.findIndex(
+            (item) => (focused.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+          );
+          const following = after === -1 ? items.length : after;
+          items[(down ? following : following - 1 + items.length) % items.length]?.focus();
+          return;
+        }
+        const next = down
+          ? items[(idx + 1) % items.length]
+          : items[(idx - 1 + items.length) % items.length];
         next?.focus();
       }
     };

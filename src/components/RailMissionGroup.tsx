@@ -49,6 +49,9 @@ interface Props {
   q: string;
   /** A member has an open pull request. */
   hasOpenPr: boolean;
+  /** The active mission is a member. While the group is folded its name
+   *  reads in ivory, the cue a project's line gives for the same fact. */
+  holdsActive: boolean;
   /** Set only while folded: the beacon or a static dot the header carries
    *  for its hidden members. */
   attention: GroupAttention;
@@ -72,6 +75,7 @@ export function RailMissionGroup({
   canFold,
   q,
   hasOpenPr,
+  holdsActive,
   attention,
   dragEnabled,
   dragging,
@@ -191,7 +195,13 @@ export function RailMissionGroup({
             {chevron}
             <span
               data-testid="rail-group-name"
-              className="min-w-0 flex-1 truncate font-mono text-[11px] leading-none text-octo-sage transition-colors duration-[180ms] group-hover/ghead:text-octo-ivory"
+              // Sage at rest. Folded over the active mission it is ivory, as
+              // a project's name is for the project that holds it: with the
+              // active row out of sight, the header says where you are. Open,
+              // the row itself says so and the header stays as designed.
+              className={`min-w-0 flex-1 truncate font-mono text-[11px] leading-none transition-colors duration-[180ms] group-hover/ghead:text-octo-ivory ${
+                folded && holdsActive ? "text-octo-ivory" : "text-octo-sage"
+              }`}
             >
               {hit ? (
                 <HighlightedLabel label={group.name} match={hit} className={hitClassName} testId="rail-hit" />

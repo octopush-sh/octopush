@@ -94,6 +94,10 @@ import type { ProjectGroup } from "./components/WorkspaceRail";
 import { useGroupsStore } from "./stores/groupsStore";
 import { missionGroupsOf } from "./lib/railGroups";
 import { createMissionGroup, moveMissionToGroup } from "./lib/groupActions";
+import type { Group } from "./lib/types";
+
+/** What the mission menu's group selector returns while no menu is open. */
+const NO_GROUPS: Group[] = [];
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
@@ -144,7 +148,6 @@ function App() {
   const activeWorkspaceId = useWorkspaceStore((s) => s.activeId);
   const loadWorkspaces = useWorkspaceStore((s) => s.load);
   const loadAllWorkspaces = useWorkspaceStore((s) => s.loadAllWorkspaces);
-  const railGroups = useGroupsStore((s) => s.groups);
   const updateCustomization = useWorkspaceStore((s) => s.updateCustomization);
   const selectWorkspace = useWorkspaceStore((s) => s.select);
   const rememberActiveForProject = useWorkspaceStore((s) => s.rememberActiveForProject);
@@ -418,6 +421,20 @@ function App() {
   const [showAddProject, setShowAddProject] = useState(false);
   // Context menu: which workspace and where
   const [contextMenu, setContextMenu] = useState<{ workspaceId: string; x: number; y: number } | null>(null);
+  // The open mission menu lists its project's groups ("Move to group"). The
+  // selector is that narrow on purpose: with no menu open it returns one
+  // constant, so a group change elsewhere never re-renders the whole shell.
+  const contextMenuProjectId = useMemo(() => {
+    if (!contextMenu) return null;
+    for (const list of Object.values(workspacesByProjectId)) {
+      const hit = list.find((w) => w.id === contextMenu.workspaceId);
+      if (hit) return hit.projectId;
+    }
+    return null;
+  }, [contextMenu, workspacesByProjectId]);
+  const contextMenuGroups = useGroupsStore(
+    useShallow((s) => (contextMenuProjectId ? missionGroupsOf(s.groups, contextMenuProjectId) : NO_GROUPS)),
+  );
   // Jira ticket picker modal (from workspace context menu)
   const [jiraTicketPickerOpen, setJiraTicketPickerOpen] = useState<{ workspaceId: string; mode: "link" | "change" } | null>(null);
   // Jira project key editor modal (from project context menu)
@@ -2944,7 +2961,7 @@ function App() {
           setContextMenu(null);
           await copyToClipboard(text, label);
         };
-        const wsGroups = missionGroupsOf(railGroups, workspace.projectId);
+        const wsGroups = contextMenuGroups;
         return (
           <ErrorBoundary surface="Workspace menu" variant="overlay" onDismiss={() => setContextMenu(null)}>
           <WorkspaceContextMenu

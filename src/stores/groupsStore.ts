@@ -3,6 +3,7 @@ import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { useProjectStore } from "./projectStore";
 import { useWorkspaceStore } from "./workspaceStore";
+import { useRailGroupUi } from "./railGroupUiStore";
 import { beginMembershipChange } from "../lib/membershipGuard";
 import type { Group, GroupScope, ProjectInfo, TintName, Workspace } from "../lib/types";
 
@@ -158,6 +159,8 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
           const groups = await ipc.listGroups();
           if (startedAt !== epoch) continue;
           set({ groups: sortGroups(groups), loaded: true });
+          // The list is the truth now: folds of groups that are gone go too.
+          useRailGroupUi.getState().prune(new Set(groups.map((g) => g.id)));
           if (!readAgain) return;
         }
       } catch (e) {

@@ -7,7 +7,10 @@
 // The rule: a reload that STARTED before a change settled cannot know about
 // it, so its rows are overlaid with the change. A reload that started after
 // the change settled read the truth and is trusted. One logical clock orders
-// the two; nothing here depends on wall time.
+// the two; nothing here depends on wall time. The overlay is applied when the
+// rows are COMMITTED to the store, not when they are read: a batch reload
+// commits after its slowest read, and a change can start, settle or be
+// refused in between.
 //
 // This module holds no store and imports none, so both the loaders and
 // `groupsStore` can use it without an import cycle.
@@ -68,29 +71,40 @@ export function beginMembershipChange(
   };
 }
 
-/** Run a list reload under the guard: `fetch` reads the rows, and the rows it
- *  returns come back with every membership change the read could have missed
- *  laid over them. */
-export async function loadWithMembership<T extends { id: string; groupId?: string | null }>(
-  kind: GroupScope,
-  fetch: () => Promise<T[]>,
-): Promise<T[]> {
+/** A reload of project or workspace rows, from before its first read to its
+ *  commit into a store. */
+export interface MembershipLoad {
+  /** The rows as they must be committed: every membership change this reload
+   *  could have missed is laid over them. Call it in the same synchronous
+   *  step that writes the rows to the store. An overlay applied earlier (when
+   *  one of several reads resolves, say) is stale by the commit: a move that
+   *  starts in between would be undone, and one refused in between would come
+   *  back. */
+  overlay: <T extends { id: string; groupId?: string | null }>(rows: T[]) => T[];
+  /** The reload is over, committed or failed. Always call it (`finally`). */
+  end: () => void;
+}
+
+/** Begin a reload of `kind` rows. Call it before the first read, so the guard
+ *  knows which changes the reads may have missed. */
+export function beginMembershipLoad(kind: GroupScope): MembershipLoad {
   const startedAt = ++clock;
   loadsInFlight.add(startedAt);
-  try {
-    const rows = await fetch();
-    return rows.map((row) => {
-      const change = changes.get(keyOf(kind, row.id));
-      if (!change) return row;
-      const missed = change.settledAt === null || change.settledAt > startedAt;
-      return missed && (row.groupId ?? null) !== change.groupId
-        ? { ...row, groupId: change.groupId }
-        : row;
-    });
-  } finally {
-    loadsInFlight.delete(startedAt);
-    prune();
-  }
+  return {
+    overlay: (rows) =>
+      rows.map((row) => {
+        const change = changes.get(keyOf(kind, row.id));
+        if (!change) return row;
+        const missed = change.settledAt === null || change.settledAt > startedAt;
+        return missed && (row.groupId ?? null) !== change.groupId
+          ? { ...row, groupId: change.groupId }
+          : row;
+      }),
+    end: () => {
+      loadsInFlight.delete(startedAt);
+      prune();
+    },
+  };
 }
 
 /** Test-only: forget everything. */

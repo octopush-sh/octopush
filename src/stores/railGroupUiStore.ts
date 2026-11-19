@@ -16,6 +16,10 @@ interface RailGroupUiState {
   stopRename: () => void;
   /** Drop a removed group's fold, so the map never grows without bound. */
   forget: (groupId: string) => void;
+  /** Keep only the folds (and the rename) of groups that still exist. Called
+   *  with the ids of a fresh `list_groups`, so folds of groups removed while
+   *  the app was closed, or in another window, do not pile up in storage. */
+  prune: (existingIds: ReadonlySet<string>) => void;
 }
 
 export const GROUP_COLLAPSE_KEY = "railGroupCollapsed";
@@ -64,6 +68,16 @@ export const useRailGroupUi = create<RailGroupUiState>((set, get) => ({
     const { [groupId]: _gone, ...rest } = get().collapsed;
     persist(rest);
     set({ collapsed: rest, renamingId: get().renamingId === groupId ? null : get().renamingId });
+  },
+
+  prune: (existingIds) => {
+    const { collapsed, renamingId } = get();
+    const kept = Object.fromEntries(Object.entries(collapsed).filter(([id]) => existingIds.has(id)));
+    const staleFolds = Object.keys(kept).length !== Object.keys(collapsed).length;
+    const staleRename = renamingId !== null && !existingIds.has(renamingId);
+    if (!staleFolds && !staleRename) return;
+    if (staleFolds) persist(kept);
+    set({ collapsed: staleFolds ? kept : collapsed, renamingId: staleRename ? null : renamingId });
   },
 }));
 

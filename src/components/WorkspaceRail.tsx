@@ -13,22 +13,18 @@ import {
 import {
   DndContext,
   DragOverlay,
-  closestCenter,
-  pointerWithin,
   PointerSensor,
   KeyboardSensor,
   useDraggable,
   useDroppable,
   useSensor,
   useSensors,
-  type CollisionDetection,
   type DragEndEvent,
   type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   verticalListSortingStrategy,
-  sortableKeyboardCoordinates,
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
@@ -40,10 +36,13 @@ import type { Group, Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../
 import { nearestVisibleAncestor } from "../lib/beacon";
 import { moveMissionToGroup, ungroupMissions } from "../lib/groupActions";
 import { prefersReducedMotion } from "../lib/motion";
+import { projectKeyboardCoordinates, railCollisions, railSubjectOf, railTargetOf } from "../lib/railDnd";
 import {
   filterRailItems,
   layoutMissions,
+  missionGroupOwners,
   missionGroupsOf,
+  ownGroupId,
   resolveRailDrop,
   type RailDragSubject,
   type RailDropTarget,
@@ -53,6 +52,7 @@ import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore"
 import { useGroupsStore } from "../stores/groupsStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { useRailGroupUi } from "../stores/railGroupUiStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
 import { GroupContextMenu } from "./GroupContextMenu";
 import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
 import { ProjectMark } from "./icons/ProjectMark";
@@ -210,12 +210,16 @@ export interface AttentionCarriers {
  * unless a fold hides that row: then the outermost folded container around it
  * (its project line, else its group header) carries it. One container hiding
  * several signals shows the strongest, so the pulse still lands on exactly one
- * visible element. Pure and exported, like `resolveAttention`.
+ * visible element. `groupOwners` maps each mission group to its project
+ * (`missionGroupOwners`): a workspace is in a group only when the group is
+ * its own project's, the test the layout applies, so a header never carries a
+ * signal for a row that is drawn loose. Pure and exported, like
+ * `resolveAttention`.
  */
 export function resolveAttentionCarriers(
   projects: ProjectGroup[] | undefined,
   attentionByWs: Record<string, Attention>,
-  knownGroupIds: ReadonlySet<string>,
+  groupOwners: ReadonlyMap<string, string>,
   isProjectFolded: (projectId: string) => boolean,
   isGroupFolded: (groupId: string) => boolean,
 ): AttentionCarriers {
@@ -224,7 +228,7 @@ export function resolveAttentionCarriers(
     for (const ws of project?.workspaces || []) {
       const signal = ws?.id ? attentionByWs[ws.id] : undefined;
       if (!signal) continue;
-      const groupId = ws.groupId && knownGroupIds.has(ws.groupId) ? ws.groupId : null;
+      const groupId = ownGroupId(ws, project.id, groupOwners);
       const carrier = nearestVisibleAncestor([
         { map: out.byProject, id: project.id, folded: isProjectFolded(project.id) },
         ...(groupId ? [{ map: out.byGroup, id: groupId, folded: isGroupFolded(groupId) }] : []),
@@ -249,43 +253,6 @@ interface VisibleProject {
   /** Loose missions and mission groups, interleaved in rail order. */
   items: RailItem[];
 }
-
-/** The id of the mission group a workspace sits in, when that group is known. */
-function groupIdOf(ws: Workspace | undefined, knownGroupIds: ReadonlySet<string>): string | null {
-  return ws?.groupId && knownGroupIds.has(ws.groupId) ? ws.groupId : null;
-}
-
-/** What a drag in the rail carries, read back from dnd-kit's `data`. */
-function railSubjectOf(data: unknown): RailDragSubject | null {
-  const d = data as Partial<RailDragSubject> | undefined;
-  return d?.type === "mission" || d?.type === "group" ? (d as RailDragSubject) : null;
-}
-function railTargetOf(data: unknown): RailDropTarget | null {
-  const d = data as Partial<RailDropTarget> | undefined;
-  return d?.type === "group" || d?.type === "loose" ? (d as RailDropTarget) : null;
-}
-
-/**
- * One DndContext serves three drags, and each only sees its own targets: a
- * project (sortable) lands among projects; a mission or a group header lands
- * on what is under the pointer in its own project, a group first and the
- * project's loose area otherwise.
- */
-const railCollisions: CollisionDetection = (args) => {
-  const subject = railSubjectOf(args.active.data.current);
-  if (!subject) {
-    return closestCenter({
-      ...args,
-      droppableContainers: args.droppableContainers.filter((c) => !railTargetOf(c.data.current)),
-    });
-  }
-  const mine = args.droppableContainers.filter(
-    (c) => railTargetOf(c.data.current)?.projectId === subject.projectId,
-  );
-  const hits = pointerWithin({ ...args, droppableContainers: mine });
-  const onGroup = hits.filter((h) => String(h.id).startsWith("group:"));
-  return onGroup.length > 0 ? onGroup : hits;
-};
 
 export function WorkspaceRail({
   projects,
@@ -322,7 +289,7 @@ export function WorkspaceRail({
   const groups = useGroupsStore((s) => s.groups);
   const collapsedGroups = useRailGroupUi((s) => s.collapsed);
   const renamingGroupId = useRailGroupUi((s) => s.renamingId);
-  const knownGroupIds = useMemo(() => new Set(groups.map((g) => g.id)), [groups]);
+  const groupOwners = useMemo(() => missionGroupOwners(groups), [groups]);
   const itemsByProject = useMemo(() => {
     const out: Record<string, RailItem[]> = {};
     for (const project of projects || []) {
@@ -355,11 +322,11 @@ export function WorkspaceRail({
       resolveAttentionCarriers(
         projects,
         attentionByWs,
-        knownGroupIds,
+        groupOwners,
         (id) => !isCollapsed && q === "" && !!collapsedProjects[id],
         (id) => q === "" && !!collapsedGroups[id],
       ),
-    [projects, attentionByWs, knownGroupIds, isCollapsed, q, collapsedProjects, collapsedGroups],
+    [projects, attentionByWs, groupOwners, isCollapsed, q, collapsedProjects, collapsedGroups],
   );
 
   const toggleProjectCollapsed = useCallback((projectId: string) => {
@@ -383,9 +350,12 @@ export function WorkspaceRail({
   // brings the row into view: the hook above scrolled while the row still had
   // no height, so the scroll is repeated once the fold has opened (at once,
   // which is all reduced motion needs, and again after the 280ms transition).
-  // The workspace restored at launch is not an activation: a group folded on
-  // purpose stays folded across a restart.
-  const seenActive = useRef<string | null | undefined>(undefined);
+  // Only the workspace the app restored by itself at launch is not an
+  // activation (`workspaceStore.launchRestoredId`): a group folded on purpose
+  // stays folded across a restart. Every other first sight of an active id
+  // is one, also when the rail mounted with nothing active.
+  const seenActive = useRef<string | null>(null);
+  const keptForLaunch = useRef<string | null>(null);
   const revealFor = useRef<string | null>(null);
   useEffect(() => {
     if (!activeWorkspaceId) return;
@@ -393,14 +363,18 @@ export function WorkspaceRail({
     const all = (projects || []).flatMap((p) => p?.workspaces || []);
     const ws = all.find((w) => w?.id === activeWorkspaceId);
     if (!ws) return; // its row has not loaded yet: retry when the projects change
-    const firstSeen = seenActive.current === undefined;
     seenActive.current = activeWorkspaceId;
-    if (firstSeen) return;
-    const groupId = groupIdOf(ws, knownGroupIds);
+    const restored = useWorkspaceStore.getState().launchRestoredId;
+    if (restored === activeWorkspaceId && keptForLaunch.current !== restored) {
+      // Once per restore: coming back to it later is an activation.
+      keptForLaunch.current = restored;
+      return;
+    }
+    const groupId = ownGroupId(ws, ws.projectId, groupOwners);
     if (!groupId || !useRailGroupUi.getState().collapsed[groupId]) return;
     revealFor.current = activeWorkspaceId;
     useRailGroupUi.getState().setCollapsed(groupId, false);
-  }, [activeWorkspaceId, projects, knownGroupIds]);
+  }, [activeWorkspaceId, projects, groupOwners]);
   useEffect(() => {
     if (!revealFor.current || revealFor.current !== activeWorkspaceId) return;
     revealFor.current = null;
@@ -436,7 +410,9 @@ export function WorkspaceRail({
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    // Only a project has a keyboard drag, and it must step from project to
+    // project, never onto a mission group's drop target.
+    useSensor(KeyboardSensor, { coordinateGetter: projectKeyboardCoordinates }),
   );
   const dragEnabled = !isCollapsed && q === "" && !!onReorderProjects;
   // Missions and group headers drag whenever the list is whole (no filter).
@@ -580,14 +556,17 @@ export function WorkspaceRail({
                   />
                 ))}
               </SortableContext>
-              {/* The drag ghost of a mission or a group header. It is drawn
-                  outside the list, so the folds' clipping never cuts it. A
-                  project drag has none: the project line moves itself. */}
-              <DragOverlay dropAnimation={null}>
-                {dragging ? (
+              {/* The drag ghost of a mission or a group header, drawn outside
+                  the list so the folds' clipping never cuts it. It is mounted
+                  ONLY for those two drags: a mounted <DragOverlay> wraps any
+                  active drag, children or not, and the sortable list then
+                  takes the drag for an overlay-driven one and stops moving
+                  the dragged project with the pointer. */}
+              {dragging && (
+                <DragOverlay dropAnimation={null}>
                   <RailDragGhost subject={dragging} projects={projects || []} groups={groups} />
-                ) : null}
-              </DragOverlay>
+                </DragOverlay>
+              )}
             </DndContext>
             {q !== "" && visibleProjects.length === 0 && (
               <div className="octo-fade-in px-3.5 py-4 font-serif text-[13px] text-octo-mute">
@@ -988,6 +967,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                   canFold={canFold}
                   q={q}
                   hasOpenPr={members.some((w) => !!prByWs?.[w.id])}
+                  holdsActive={members.some((w) => w.id === activeWorkspaceId)}
                   attention={groupFolded ? (groupAttention[group.id] ?? null) : null}
                   dragEnabled={groupDragEnabled}
                   dragging={dragging}

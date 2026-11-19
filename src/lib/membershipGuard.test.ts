@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from "vitest";
-import { __resetMembershipGuard, beginMembershipChange, loadWithMembership } from "./membershipGuard";
+import { __resetMembershipGuard, beginMembershipChange, beginMembershipLoad } from "./membershipGuard";
+import type { GroupScope } from "./types";
 
 interface Row {
   id: string;
@@ -11,6 +12,16 @@ function read() {
   let resolve!: (rows: Row[]) => void;
   const promise = new Promise<Row[]>((res) => (resolve = res));
   return { fetch: () => promise, resolve };
+}
+
+/** A reload as the stores run one: read, then overlay and commit in one step. */
+async function loadWithMembership(kind: GroupScope, fetch: () => Promise<Row[]>): Promise<Row[]> {
+  const guard = beginMembershipLoad(kind);
+  try {
+    return guard.overlay(await fetch());
+  } finally {
+    guard.end();
+  }
 }
 
 beforeEach(() => __resetMembershipGuard());
@@ -76,5 +87,26 @@ describe("membershipGuard", () => {
     expect(await loadWithMembership("workspace", async () => [{ id: "a", groupId: null }])).toEqual([
       { id: "a", groupId: null },
     ]);
+  });
+
+  it("judges at the commit, not at the read: a move that starts after the rows came back still shows", () => {
+    // A batch reload: this project's rows are back, a slower read is still out.
+    const guard = beginMembershipLoad("workspace");
+    const fetched: Row[] = [{ id: "a", groupId: null }];
+    // An overlay taken now would miss what happens before the commit.
+    expect(guard.overlay(fetched)).toEqual([{ id: "a", groupId: null }]);
+    beginMembershipChange("workspace", ["a"], "g").settle();
+    expect(guard.overlay(fetched)).toEqual([{ id: "a", groupId: "g" }]);
+    guard.end();
+  });
+
+  it("judges at the commit: a move refused before the commit is not brought back", () => {
+    const guard = beginMembershipLoad("workspace");
+    const change = beginMembershipChange("workspace", ["a"], "g");
+    const fetched: Row[] = [{ id: "a", groupId: null }];
+    expect(guard.overlay(fetched)).toEqual([{ id: "a", groupId: "g" }]); // while it is in flight
+    change.drop(); // the backend refused it
+    expect(guard.overlay(fetched)).toEqual([{ id: "a", groupId: null }]);
+    guard.end();
   });
 });

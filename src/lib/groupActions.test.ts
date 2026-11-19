@@ -116,4 +116,16 @@ describe("groupActions", () => {
     expect(pushToast).toHaveBeenCalledTimes(1);
     expect(pushToast.mock.calls[0][0]).toMatchObject({ level: "error" });
   });
+
+  it("Undo does nothing once the project is closed: no invisible empty group", async () => {
+    useGroupsStore.setState({ groups: [group("g1", { name: "Fixes" })] });
+    seed([ws("w1", "g1")]);
+    await ungroupMissions("g1");
+    const toast = pushToast.mock.calls.at(-1)![0];
+    // Closing the project drops its rows from the rail.
+    useWorkspaceStore.getState().pruneProject("p1");
+    toast.action.onClick();
+    await Promise.resolve();
+    expect(mockIpc.createGroup).not.toHaveBeenCalled();
+  });
 });
