@@ -149,6 +149,7 @@ Current anchors:
 | `palette-models` | Command palette: the Models group | `CommandPalette.tsx` |
 | `palette-models-more` | Command palette, Models group: "Show all models" (only with no query and more than three models) | `CommandPalette.tsx` |
 | `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
+| `palette-groups` | Command palette: the Groups section (every rail group of the open projects, in rail order; only when there is one) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
 | `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
 | `companion-run-context` · `companion-run-changes` · `companion-run-read-diff` · `companion-run-mission` | Run Companion: the Context section (only while the focused pane is an agent session Octopush has usage for) · the Changes section · its "Read the diff" link (only with something to read in Review) · the Mission section (only with a mission) | `CompanionRun.tsx` |
@@ -200,6 +201,7 @@ cover.
 | `empty` | Fresh install: no projects, signed out, free plan. |
 | `rail-groups` | `default` with eight missions, two mission groups in the rail and a loose mission after them. |
 | `rail-project-groups` | `default` with seven projects in the rail: a pinned one, two project groups and a loose project after them. |
+| `rail-groups-everywhere` | `default` with a project group ("Client work": `acme-api`, `acme-web`), a mission group ("Fixes") in `acme-api`, a crew at work in one of its missions (Mission Control reads `Fixes · fix-json-parser`) and an archived mission of the group. Moves and new groups last until the page reloads. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 

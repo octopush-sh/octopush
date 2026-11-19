@@ -29,6 +29,13 @@ export function ShortcutsPane() {
           <Shortcut keys="⌘⇧T" desc="Open Settings · Usage" />
         </ShortcutGroup>
 
+        <ShortcutGroup title="Rail">
+          <Shortcut keys="⌘⌥G" desc="Move the focused mission or project to a group" />
+          <Shortcut keys="⇧F10" desc="Open the focused row's menu" />
+          <Shortcut keys="⌘-click · ⇧-click" desc="Select several missions of one project" />
+          <Shortcut keys="Esc" desc="Clear the selection" />
+        </ShortcutGroup>
+
         <ShortcutGroup title="Chat">
           <Shortcut keys="↵" desc="Send message" />
           <Shortcut keys="⇧↵" desc="New line in message" />

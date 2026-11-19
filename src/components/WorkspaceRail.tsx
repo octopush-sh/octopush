@@ -35,9 +35,17 @@ import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { MENU_CHROME } from "../lib/menuStyles";
 import type { Group, TintName, Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
 import { nearestVisibleAncestor } from "../lib/beacon";
-import { moveMissionToGroup, moveProjectToGroup, ungroupMissions, ungroupProjects } from "../lib/groupActions";
+import {
+  createMissionGroup,
+  createProjectGroup,
+  moveMissionToGroup,
+  moveMissionsToGroup,
+  moveProjectToGroup,
+  ungroupMissions,
+  ungroupProjects,
+} from "../lib/groupActions";
 import { prefersReducedMotion } from "../lib/motion";
-import { restoreProjectLineFocus } from "../lib/railFocus";
+import { holdMissionRowFocus, holdProjectLineFocus, restoreProjectLineFocus } from "../lib/railFocus";
 import {
   projectKeyboardCoordinates,
   railCollisions,
@@ -71,8 +79,11 @@ import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore"
 import { useGroupsStore } from "../stores/groupsStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { useRailGroupUi } from "../stores/railGroupUiStore";
+import { useRailSelection } from "../stores/railSelectionStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { GroupContextMenu } from "./GroupContextMenu";
+import { MoveToGroupMenu } from "./MoveToGroupMenu";
+import { RailSelectionMenu } from "./RailSelectionMenu";
 import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
 import { EYEBROW, RailProjectSection } from "./RailProjectSection";
 import { ProjectMark } from "./icons/ProjectMark";
@@ -144,8 +155,10 @@ interface Props {
   activeWorkspaceId: string | null;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
-  /** Called when the user right-clicks a workspace row / cell. */
-  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  /** Called when the user right-clicks a workspace row / cell, or asks for
+   *  its menu from the keyboard (⇧F10 or the context-menu key on a row;
+   *  `fromKeyboard`, so the owner can give the row the focus back). */
+  onContextMenu?: (workspaceId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   /** Called when user clicks to create a workspace for a specific project. */
   onNewWorkspaceForProject?: (projectId: string) => void;
   /** Called from a mission group's "+": start a new mission that joins the
@@ -379,9 +392,12 @@ export function WorkspaceRail({
   const sectionOfProject = useMemo(() => sectionByProject(topItems), [topItems]);
   // A project line the keyboard holds keeps the focus when a move re-renders
   // it under another parent (see `lib/railFocus.ts`).
+  // After every render: a move re-renders the row under another parent, and
+  // a menu the rail owns (Move to group…) closes in a render of its own.
+  // Cheap: nothing is read unless a line is held.
   useLayoutEffect(() => {
     restoreProjectLineFocus();
-  }, [topItems]);
+  });
   const visibleTop = useMemo<VisibleTop[]>(() => {
     const whole = (project: ProjectGroup): VisibleProject => ({
       project,
@@ -506,6 +522,55 @@ export function WorkspaceRail({
     if (projectId && collapsedProjects[projectId]) toggleProjectCollapsed(projectId);
   }, [renamingGroupId, isCollapsed, groups, collapsedProjects, toggleProjectCollapsed]);
 
+  // ⌘K's "Go to group": unfold everything around the group (its project
+  // group, the project that holds a mission group, the group itself), let go
+  // of a filter that hides it, then scroll its header into view and give it
+  // the focus. Re-run as the folds open, until the header is focusable.
+  const revealId = useRailGroupUi((s) => s.revealId);
+  useEffect(() => {
+    if (!revealId) return;
+    const ui = useRailGroupUi.getState();
+    const group = groups.find((g) => g.id === revealId);
+    if (!group) {
+      ui.revealDone(revealId);
+      return;
+    }
+    if (isCollapsed) return; // the owner opens the rail first
+    const projectId = group.scope === "workspace" ? group.projectId : null;
+    const sectionId = group.scope === "project" ? null : projectId ? (sectionOfProject.get(projectId) ?? null) : null;
+    if (sectionId && ui.collapsed[sectionId]) ui.setCollapsed(sectionId, false);
+    if (ui.collapsed[group.id]) ui.setCollapsed(group.id, false);
+    if (projectId && collapsedProjects[projectId]) toggleProjectCollapsed(projectId);
+    const shown = visibleTop.some((item) =>
+      item.kind === "section"
+        ? item.group.id === group.id ||
+          item.entries.some((e) => e.items.some((i) => i.kind === "group" && i.group.id === group.id))
+        : item.entry.items.some((i) => i.kind === "group" && i.group.id === group.id),
+    );
+    if (!shown) {
+      if (filter !== "") setFilter("");
+      else ui.revealDone(group.id); // not in the rail at all (its project is closed)
+      return;
+    }
+    const header = Array.from(
+      asideRef.current?.querySelectorAll<HTMLElement>("[data-rail-group-header]") ?? [],
+    ).find((el) => el.dataset.railGroupHeader === group.id);
+    if (!header || header.closest("[inert]")) return; // a fold is still opening
+    ui.revealDone(group.id);
+    const behavior: ScrollBehavior = prefersReducedMotion() ? "auto" : "smooth";
+    // A frame later, so the palette that asked has closed and handed its
+    // focus back first; again once the folds' 280ms transition has run.
+    // Not cancelled on cleanup: `revealDone` above re-renders at once.
+    requestAnimationFrame(() => {
+      if (!header.isConnected) return;
+      header.focus({ preventScroll: true });
+      header.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior });
+    });
+    setTimeout(() => {
+      if (header.isConnected) header.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior });
+    }, 300);
+  }, [revealId, groups, isCollapsed, sectionOfProject, collapsedProjects, collapsedGroups, toggleProjectCollapsed, visibleTop, filter]);
+
   // The header menu of a group (a mission group's or a project group's),
   // owned by the rail.
   const [groupMenu, setGroupMenu] = useState<{
@@ -531,6 +596,119 @@ export function WorkspaceRail({
       ?.focus({ preventScroll: true });
   };
   const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.groupId) : undefined;
+
+  // ── Multi-select (⌘-click / ⇧-click on mission rows, one project) ──
+  const selection = useRailSelection((s) => s.selection);
+  const selectedIds = useMemo(() => new Set(selection?.ids ?? []), [selection]);
+  // A filter or the slim rail changes which rows are there to act on: the
+  // selection goes rather than act on rows out of sight.
+  useEffect(() => {
+    useRailSelection.getState().clear();
+  }, [q, isCollapsed]);
+  // Escape lets a selection go, unless something else is listening for it:
+  // only a key pressed in the rail itself, or with the focus nowhere (a menu,
+  // a dialog, an editor or a terminal keeps its Escape).
+  useEffect(() => {
+    if (!selection) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented) return;
+      const t = e.target instanceof Element ? e.target : null;
+      const inRail = !!t && !!asideRef.current?.contains(t) && !t.closest("input, textarea");
+      if (inRail || !t || t === document.body) useRailSelection.getState().clear();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [selection]);
+  const pickRow = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement>, projectId: string, ordered: readonly string[], workspaceId: string) => {
+      const sel = useRailSelection.getState();
+      if (e.metaKey || e.ctrlKey) {
+        sel.toggle(projectId, workspaceId);
+        // WebKit does not focus a clicked button: the row takes it, so
+        // Escape and ⌘⌥G reach the rail.
+        e.currentTarget.focus({ preventScroll: true });
+        return true;
+      }
+      if (e.shiftKey) {
+        sel.extend(projectId, ordered, workspaceId, activeWorkspaceId);
+        e.currentTarget.focus({ preventScroll: true });
+        return true;
+      }
+      sel.clear();
+      return false;
+    },
+    [activeWorkspaceId],
+  );
+  // The selection's menu, owned by the rail like the group menus.
+  const [selectionMenu, setSelectionMenu] = useState<{
+    x: number;
+    y: number;
+    focusId: string;
+    fromKeyboard: boolean;
+  } | null>(null);
+  // A selected row's menu is the selection's (two or more); any other row's
+  // menu lets the selection go and is the mission's own.
+  const openRowMenu = useCallback(
+    (workspaceId: string, x: number, y: number, fromKeyboard = false) => {
+      const sel = useRailSelection.getState().selection;
+      if (sel && sel.ids.length > 1 && sel.ids.includes(workspaceId)) {
+        setSelectionMenu({ x, y, focusId: workspaceId, fromKeyboard });
+        return;
+      }
+      useRailSelection.getState().clear();
+      if (fromKeyboard) onContextMenu?.(workspaceId, x, y, true);
+      else onContextMenu?.(workspaceId, x, y);
+    },
+    [onContextMenu],
+  );
+  const closeSelectionMenu = () => {
+    const closing = selectionMenu;
+    setSelectionMenu(null);
+    if (closing?.fromKeyboard) holdMissionRowFocus(closing.focusId);
+  };
+  /** The selected rows, in the rail's order (their project's `created_at`). */
+  const selectedRows = useMemo(() => {
+    if (!selection) return [];
+    const project = (projects || []).find((p) => p?.id === selection.projectId);
+    return (project?.workspaces || []).filter((w) => !!w && selectedIds.has(w.id));
+  }, [selection, selectedIds, projects]);
+
+  // ── "Move to group…" from the keyboard (⌘⌥G on a focused row) ──
+  // Rail-scoped on purpose: ⌘⌥G is go-to-line in the editor and the
+  // scratchpad, whose CodeMirror keymaps only hear a key pressed in them.
+  const [movePicker, setMovePicker] = useState<
+    | { kind: "mission"; projectId: string; ids: string[]; focusId: string; x: number; y: number }
+    | { kind: "project"; projectId: string; x: number; y: number }
+    | null
+  >(null);
+  const closeMovePicker = () => {
+    const closing = movePicker;
+    setMovePicker(null);
+    if (!closing) return;
+    if (closing.kind === "project") holdProjectLineFocus(closing.projectId);
+    else holdMissionRowFocus(closing.focusId);
+  };
+  const onRailKeyDown = (e: React.KeyboardEvent<HTMLElement>) => {
+    if (!isMoveToGroupChord(e)) return;
+    const target = e.target instanceof Element ? e.target : null;
+    if (!target || target.closest("input, textarea, [contenteditable]")) return;
+    const row = target.closest<HTMLElement>("[data-rail-ws]");
+    const line = target.closest<HTMLElement>("[data-rail-project-line]");
+    if (row?.dataset.railWs) {
+      const id = row.dataset.railWs;
+      const ws = (projects || []).flatMap((p) => p?.workspaces || []).find((w) => w?.id === id);
+      if (!ws) return;
+      e.preventDefault();
+      const sel = useRailSelection.getState().selection;
+      const ids = sel && sel.ids.includes(id) ? [...sel.ids] : [id];
+      const r = row.getBoundingClientRect();
+      setMovePicker({ kind: "mission", projectId: ws.projectId, ids, focusId: id, x: r.left + 24, y: r.bottom });
+    } else if (line?.dataset.railProjectLine) {
+      e.preventDefault();
+      const r = line.getBoundingClientRect();
+      setMovePicker({ kind: "project", projectId: line.dataset.railProjectLine, x: r.left + 24, y: r.bottom });
+    }
+  };
 
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
@@ -656,10 +834,12 @@ export function WorkspaceRail({
         shortcutByWs={shortcutByWs}
         onSelect={onSelect}
         onCustomize={onCustomize}
-        onContextMenu={onContextMenu}
+        onContextMenu={onContextMenu ? openRowMenu : undefined}
         onNewWorkspaceForProject={onNewWorkspaceForProject}
         onProjectContextMenu={onProjectContextMenu}
         dragEnabled={dragEnabled}
+        selectedIds={selectedIds}
+        onRowPick={pickRow}
       />
     );
   };
@@ -672,6 +852,7 @@ export function WorkspaceRail({
         isCollapsed ? RAIL_WIDTH_COLLAPSED : RAIL_WIDTH_EXPANDED
       }`}
       aria-label="Missions"
+      onKeyDown={onRailKeyDown}
     >
       {isCollapsed ? (
         <CollapsedRail
@@ -873,8 +1054,107 @@ export function WorkspaceRail({
           onDismiss={closeGroupMenu}
         />
       )}
+      {selectionMenu && selection && selectedRows.length > 1 && (() => {
+        const choices = missionGroupsOf(groups, selection.projectId);
+        const own = (w: Workspace) => (choices.some((g) => g.id === w.groupId) ? w.groupId : null);
+        const first = own(selectedRows[0]);
+        const common = selectedRows.every((w) => own(w) === first) ? first : null;
+        const ids = selectedRows.map((w) => w.id);
+        const done = () => useRailSelection.getState().clear();
+        return (
+          <RailSelectionMenu
+            x={selectionMenu.x}
+            y={selectionMenu.y}
+            count={selectedRows.length}
+            groups={choices}
+            commonGroupId={common ?? null}
+            anyGrouped={selectedRows.some((w) => own(w) !== null)}
+            onGroup={() => {
+              done();
+              void createMissionGroup(selection.projectId, ids);
+            }}
+            onMove={(groupId) => {
+              done();
+              void moveMissionsToGroup(ids, groupId);
+            }}
+            onRemoveFromGroup={() => {
+              done();
+              void moveMissionsToGroup(ids, null);
+            }}
+            onClearSelection={done}
+            onDismiss={closeSelectionMenu}
+          />
+        );
+      })()}
+      {movePicker?.kind === "mission" && (() => {
+        const choices = missionGroupsOf(groups, movePicker.projectId);
+        const rows = (projects || [])
+          .find((p) => p?.id === movePicker.projectId)
+          ?.workspaces.filter((w) => !!w && movePicker.ids.includes(w.id)) ?? [];
+        if (rows.length === 0) return null;
+        const own = (w: Workspace) => (choices.some((g) => g.id === w.groupId) ? w.groupId : null);
+        const first = own(rows[0]);
+        const common = rows.every((w) => own(w) === first) ? first : null;
+        const ids = rows.map((w) => w.id);
+        const many = ids.length > 1;
+        const done = () => {
+          if (many) useRailSelection.getState().clear();
+        };
+        return (
+          <MoveToGroupMenu
+            x={movePicker.x}
+            y={movePicker.y}
+            subject={rows.map((w) => w.name || "Mission").join(", ")}
+            count={ids.length}
+            groups={choices}
+            currentGroupId={common ?? null}
+            onMove={(groupId) => {
+              done();
+              void moveMissionsToGroup(ids, groupId);
+            }}
+            onNewGroup={() => {
+              done();
+              void createMissionGroup(movePicker.projectId, ids);
+            }}
+            onRemoveFromGroup={
+              rows.some((w) => own(w) !== null)
+                ? () => {
+                    done();
+                    void moveMissionsToGroup(ids, null);
+                  }
+                : undefined
+            }
+            onDismiss={closeMovePicker}
+          />
+        );
+      })()}
+      {movePicker?.kind === "project" && (() => {
+        const choices = projectGroupsOf(groups);
+        const project = (projects || []).find((p) => p?.id === movePicker.projectId);
+        if (!project) return null;
+        const current = choices.some((g) => g.id === project.groupId) ? (project.groupId ?? null) : null;
+        return (
+          <MoveToGroupMenu
+            x={movePicker.x}
+            y={movePicker.y}
+            subject={project.name}
+            groups={choices}
+            currentGroupId={current}
+            onMove={(groupId) => void moveProjectToGroup(project.id, groupId)}
+            onNewGroup={() => void createProjectGroup(project.id)}
+            onRemoveFromGroup={current ? () => void moveProjectToGroup(project.id, null) : undefined}
+            onDismiss={closeMovePicker}
+          />
+        );
+      })()}
     </aside>
   );
+}
+
+/** ⌘⌥G (Ctrl+Alt+G off a Mac): "Move to group…" on the focused rail row.
+ *  The physical key, since Option rewrites the printed letter on a Mac. */
+export function isMoveToGroupChord(e: Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "key" | "code">): boolean {
+  return (e.metaKey || e.ctrlKey) && e.altKey && !e.shiftKey && (e.code === "KeyG" || e.key.toLowerCase() === "g");
 }
 
 /** The rest of the rail under its last block, as a drop target: the ungrouped
@@ -1014,10 +1294,20 @@ interface SortableProjectGroupProps {
   shortcutByWs?: Record<string, string>;
   onSelect: (id: string) => void;
   onCustomize: (id: string) => void;
-  onContextMenu?: (workspaceId: string, x: number, y: number) => void;
+  onContextMenu?: (workspaceId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   onNewWorkspaceForProject?: (projectId: string) => void;
   onProjectContextMenu?: (projectId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   dragEnabled: boolean;
+  /** The missions of the rail's multi-selection (empty when none). */
+  selectedIds: ReadonlySet<string>;
+  /** A click on a row, before it activates: true when it was a selection
+   *  gesture. `ordered` is this project's rows as drawn, for a ⇧-click run. */
+  onRowPick?: (
+    e: React.MouseEvent<HTMLButtonElement>,
+    projectId: string,
+    ordered: readonly string[],
+    workspaceId: string,
+  ) => boolean;
 }
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
@@ -1028,7 +1318,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     q, folded, toggleProjectCollapsed, activeWorkspaceId,
     gitSummaryByWs, prByWs, runningByWs, attentionByWs, flagsByWs, shortcutByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
-    dragEnabled,
+    dragEnabled, selectedIds, onRowPick,
   } = props;
 
   const { attributes, listeners, setNodeRef, setActivatorNodeRef, transform, transition, isDragging } =
@@ -1055,11 +1345,23 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     disabled: !missionDrag,
   });
 
+  // The project's rows as the rail draws them (a folded group's members are
+  // out of sight), for the run a ⇧-click selects.
+  const orderedIds = items.flatMap((item) =>
+    item.kind === "mission"
+      ? [item.workspace.id]
+      : q === "" && collapsedGroups[item.group.id]
+        ? []
+        : item.visible.map((w) => w.id),
+  );
+
   const renderRow = (ws: Workspace, groupId: string | null) => (
     <WorkspaceRow
       key={ws?.id || `ws-${project.id}`}
       workspace={ws}
       active={ws?.id === activeWorkspaceId}
+      selected={!!ws?.id && selectedIds.has(ws.id)}
+      onPick={onRowPick && ws?.id ? (e) => onRowPick(e, project.id, orderedIds, ws.id) : undefined}
       q={q}
       grouped={groupId !== null}
       drag={
@@ -1078,7 +1380,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
       shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
       onSelect={() => ws?.id && onSelect(ws.id)}
       onCustomize={() => ws?.id && onCustomize(ws.id)}
-      onContextMenu={onContextMenu && ws?.id ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
+      onContextMenu={onContextMenu && ws?.id ? (x, y, kb) => onContextMenu(ws.id, x, y, kb) : undefined}
     />
   );
 
@@ -1432,9 +1734,17 @@ interface WorkspaceRowProps {
   attention: Attention | null;
   attentionKind: string | null;
   shortcut: string | null;
+  /** In the rail's multi-selection (⌘-click / ⇧-click). */
+  selected?: boolean;
   onSelect: () => void;
+  /** A click on the row's monogram or name, before activation: returns true
+   *  when it was a selection gesture (⌘ / Ctrl or ⇧ held), which then does
+   *  not activate the mission. */
+  onPick?: (e: React.MouseEvent<HTMLButtonElement>) => boolean;
   onCustomize: () => void;
-  onContextMenu?: (x: number, y: number) => void;
+  /** `fromKeyboard`: asked for with ⇧F10 or the context-menu key, so the
+   *  menu opens at the row and the row wants the focus back after it. */
+  onContextMenu?: (x: number, y: number, fromKeyboard?: boolean) => void;
 }
 
 function WorkspaceRow({
@@ -1452,7 +1762,9 @@ function WorkspaceRow({
   attention,
   attentionKind,
   shortcut,
+  selected = false,
   onSelect,
+  onPick,
   onCustomize,
   onContextMenu,
 }: WorkspaceRowProps) {
@@ -1535,20 +1847,45 @@ function WorkspaceRow({
       onCustomize();
     }
   };
+  // The keyboard's way into the mission's menu (and so into "Move to
+  // group"): ⇧F10 or the context-menu key on the monogram or the name,
+  // opened at the row, as on a project line.
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (!onContextMenu) return;
+    if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const r = e.currentTarget.getBoundingClientRect();
+    onContextMenu(r.left + 24, r.bottom, true);
+  };
+  const activate = (e: React.MouseEvent<HTMLButtonElement>) => {
+    if (onPick?.(e)) return;
+    onSelect();
+  };
 
   return (
     <div
       ref={draggable.setNodeRef}
       onPointerDown={draggable.listeners?.onPointerDown as React.PointerEventHandler<HTMLDivElement> | undefined}
+      // ⇧-click selects a run of rows: keep the browser from also
+      // selecting the text between the two clicks.
+      onMouseDown={(e) => {
+        if (e.shiftKey) e.preventDefault();
+      }}
       data-rail-row={grouped ? "member" : "loose"}
+      data-rail-ws={workspace.id}
+      data-selected={selected || undefined}
       // A member is indented 14px beside its group's guide. The row itself
       // stays full width, so the state edge below remains at the rail's edge.
+      // Selected (not active), it keeps the hover ground: the selection is
+      // a set of rows to act on, never a second active row.
       className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pr-3 transition-colors duration-[180ms] ${
         grouped ? "pl-7" : "pl-3.5"
-      } ${active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"} ${
+      } ${active ? "bg-[var(--brass-ghost)]" : selected ? "bg-octo-panel-2" : "hover:bg-octo-panel-2"} ${
         draggable.isDragging ? "opacity-40" : ""
       }`}
       onContextMenu={handleContextMenu}
+      onKeyDown={handleKeyDown}
     >
       <IdentityEdge active={active} running={!!running} />
 
@@ -1556,7 +1893,7 @@ function WorkspaceRow({
           no border, no fill. The single beacon pulses here. */}
       <button
         type="button"
-        onClick={onSelect}
+        onClick={activate}
         title={posture ?? undefined}
         aria-label={attention ? `${name} — needs attention` : name}
         aria-current={active ? "location" : undefined}
@@ -1575,10 +1912,11 @@ function WorkspaceRow({
           stays the single name-labelled control. */}
       <button
         type="button"
-        onClick={onSelect}
+        data-rail-mission={workspace.id}
+        onClick={activate}
         title={`${name}${shedSuffix}${stateSuffix}${hint}`}
         className={`flex min-w-0 flex-1 text-left text-[13px] transition-colors duration-[180ms] focus-visible:outline-none ${
-          active ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
+          active || selected ? "text-octo-ivory" : "text-octo-sage group-hover/row:text-octo-ivory"
         }`}
       >
         {hit ? (
@@ -1588,6 +1926,7 @@ function WorkspaceRow({
         ) : (
           <MidTruncate text={name} tail={RAIL_NAME_TAIL} />
         )}
+        {selected && <span className="sr-only"> — selected</span>}
       </button>
 
       {/* Meta — unboxed, right-aligned, tabular: ticket · ahead/behind · PR ·

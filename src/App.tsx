@@ -92,9 +92,10 @@ import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { useGroupsStore } from "./stores/groupsStore";
 import { layoutProjects, missionGroupsOf, projectGroupsOf, stepInRail } from "./lib/railGroups";
-import { holdProjectLineFocus } from "./lib/railFocus";
+import { holdMissionRowFocus, holdProjectLineFocus } from "./lib/railFocus";
 import {
   createMissionGroup,
+  revealGroup,
   createProjectGroup,
   moveMissionToGroup,
   moveProjectToGroup,
@@ -433,7 +434,27 @@ function App() {
   // live somewhere else.
   const [showAddProject, setShowAddProject] = useState(false);
   // Context menu: which workspace and where
-  const [contextMenu, setContextMenu] = useState<{ workspaceId: string; x: number; y: number } | null>(null);
+  const [contextMenu, setContextMenu] = useState<{
+    workspaceId: string;
+    x: number;
+    y: number;
+    /** Opened with ⇧F10 / the context-menu key on the rail row. */
+    fromKeyboard?: boolean;
+  } | null>(null);
+  // A mission menu the keyboard opened gives its row the focus back when it
+  // closes, whichever action closed it (held, not only set: "Move to group"
+  // renders the row under another parent). A dialog an action opened keeps
+  // the focus it took (`holdMissionRowFocus` only fills a lost focus).
+  const keyboardMenuFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (contextMenu) {
+      keyboardMenuFor.current = contextMenu.fromKeyboard ? contextMenu.workspaceId : null;
+      return;
+    }
+    const closing = keyboardMenuFor.current;
+    keyboardMenuFor.current = null;
+    if (closing) holdMissionRowFocus(closing);
+  }, [contextMenu]);
   // The open mission menu lists its project's groups ("Move to group"). The
   // selector is that narrow on purpose: with no menu open it returns one
   // constant, so a group change elsewhere never re-renders the whole shell.
@@ -2330,7 +2351,7 @@ function App() {
         activeWorkspaceId={activeWorkspaceId}
         onSelect={handleSelectWorkspace}
         onCustomize={(id) => setCustomizingWorkspaceId(id)}
-        onContextMenu={(workspaceId, x, y) => setContextMenu({ workspaceId, x, y })}
+        onContextMenu={(workspaceId, x, y, fromKeyboard) => setContextMenu({ workspaceId, x, y, fromKeyboard })}
         onNewWorkspaceForProject={(projectId) => {
           setCreatorProjectId(projectId);
           setCreatorGroupId(null);
@@ -2845,6 +2866,11 @@ function App() {
         projects={projectGroups}
         runningByWs={runningByWs}
         onSelectWorkspace={handleSelectWorkspace}
+        onRevealGroup={(groupId) => {
+          // The slim rail draws no group names: open it to show the one asked for.
+          setIsRailCollapsed(false);
+          revealGroup(groupId);
+        }}
       />
       </ErrorBoundary>
 

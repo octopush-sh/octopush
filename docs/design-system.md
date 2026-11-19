@@ -591,15 +591,15 @@ found-match tokens (§4). Nothing else in the rail carries a border around
 anything: a mission group's guide is a 1px line beside its rows, and a
 project group's hairline is a 1px line between blocks.
 
-#### Rail groups (2026-11-18 · mission groups and project groups shipped)
+#### Rail groups (2026-11-18 · mission groups, project groups and groups everywhere else shipped)
 
 Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
 Part 1. **Both are in the rail**: mission groups (`RailMissionGroup.tsx`) and
 project groups (`RailProjectSection.tsx`; in the code a project group is a
 "section", because `ProjectGroup` already names a project with its missions).
-Still planned: groups in ⌘K, Mission Control and the archived-workspaces
-modal's project line, a keyboard shortcut for **Move to group**, and
-multi-select.
+Beyond the rail they show in ⌘K, Mission Control and the archived-workspaces
+modal, and the rail adds `⌘⌥G` **Move to group…** and a multi-selection of
+missions: see "Groups beyond the rail, as built" below.
 
 A **group** is a named, optionally tinted, foldable run of items: one
 membership per item, no nesting, and it survives being emptied (it reads
@@ -749,6 +749,48 @@ a secondary cue (WCAG 1.4.1).
   projects is 20px. No name, no fold and no header control at this width; a
   project's mark is titled `group · project` and the flyout's eyebrow starts
   with the group. Hexagons keep the inherited tint.
+
+**Groups beyond the rail, as built.** Keep these when touching them:
+
+- **⌘K, a Groups section.** One row per group, in the rail's reading order
+  (`paletteGroups`). The glyph box holds the group's own mark, the 12px
+  chevron in its tint (mute untinted): the palette borrows the rail's sign
+  for "this holds things and folds" rather than inventing a glyph. Name over
+  a mono meta line (`acme-api · 3 missions`, `2 projects`, `empty`), the
+  Workspaces row's two-line recipe. Choosing it **reveals** the group:
+  every fold above it opens, a filter that hides it is cleared, the slim
+  rail opens, and the header takes the focus. The palette is navigation
+  only; it has no sub-steps or text entry, so renaming and moving stay with
+  the header's own keys and menus. A mission row's meta reads
+  `project · group · branch`, outermost first like the slim rail's flyout.
+- **Mission Control, `group · workspace`.** The card's workspace atom gains
+  the mission group's name before it, in the same mute mono with a `·`; the
+  group truncates first (`shrink-[100]`). Nothing when ungrouped. No tint
+  (the tint lives on the rail's chevron and guide), no chip, no new band.
+- **The archived-workspaces modal** names a mission's group before its
+  branch (mute mono, `Fixes ·`). Restoring returns the mission to that group
+  if it still exists, else it comes back loose; a group that is gone shows
+  nothing, so the modal never promises a return it cannot make.
+- **The keyboard's Move to group (`⌘⌥G`).** Rail-scoped: the rail's own
+  `keydown` hears it only on a focused mission row or project line. The
+  editor's and the scratchpad's `⌘⌥G` (go to line) are CodeMirror keymaps
+  that only hear keys pressed in them, so the chord means one thing wherever
+  the focus is, and no global binding is spent. It opens the submenu's
+  choices as a menu of their own at the row (`MoveToGroupMenu`, MenuSurface
+  chrome, `octo-menu-enter`), with a mono header `Move to group` (`Move N missions to group` for a selection), the
+  current group focused first and type-ahead on the group names. A mission
+  row now also answers `⇧F10` and the context-menu key, like a project line
+  and a group header, so every rail row has a keyboard path to its menu.
+- **The selected row.** A multi-selection of missions (`⌘`-click, `⇧`-click,
+  one project) has no colour of its own: a selected row keeps the **hover
+  ground** (`bg-octo-panel-2`) and an **ivory name**, the two cues hover
+  already gives, held while selected. The active row keeps its brass-ghost
+  ground and edge, so brass still marks the one place you are and a
+  selection never reads as several active rows. In Vellum `panel_2`
+  recesses, which reads as "held down", the right sense for a selection.
+  The selection's menu (`Group N missions…`, `Move N missions to group ›`,
+  `Clear selection`) is plain MenuSurface rows. Missions only: projects have
+  no multi-select.
 
 ### Run mode — session navigation (shipped 2026-11-18)
 

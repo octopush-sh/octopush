@@ -10,6 +10,12 @@ interface RailGroupUiState {
   collapsed: Record<string, boolean>;
   /** The group whose header shows the rename input (one at a time). */
   renamingId: string | null;
+  /** A group the rail is asked to bring into sight and focus (⌘K), until
+   *  the rail has done it (`revealGroup` in `lib/groupActions.ts`). */
+  revealId: string | null;
+  requestReveal: (groupId: string) => void;
+  /** The rail has revealed `groupId` (or given up on it). */
+  revealDone: (groupId: string) => void;
   toggle: (groupId: string) => void;
   setCollapsed: (groupId: string, collapsed: boolean) => void;
   startRename: (groupId: string) => void;
@@ -47,6 +53,16 @@ function persist(collapsed: Record<string, boolean>) {
 export const useRailGroupUi = create<RailGroupUiState>((set, get) => ({
   collapsed: readCollapsed(),
   renamingId: null,
+  revealId: null,
+
+  requestReveal: (groupId) => {
+    // The group unfolds now; the folds above it are the rail's to open.
+    get().setCollapsed(groupId, false);
+    set({ revealId: groupId });
+  },
+  revealDone: (groupId) => {
+    if (get().revealId === groupId) set({ revealId: null });
+  },
 
   toggle: (groupId) => get().setCollapsed(groupId, !get().collapsed[groupId]),
 
@@ -83,5 +99,5 @@ export const useRailGroupUi = create<RailGroupUiState>((set, get) => ({
 
 /** Re-read the folds from localStorage (tests seed it before rendering). */
 export function __reloadRailGroupUi(): void {
-  useRailGroupUi.setState({ collapsed: readCollapsed(), renamingId: null });
+  useRailGroupUi.setState({ collapsed: readCollapsed(), renamingId: null, revealId: null });
 }

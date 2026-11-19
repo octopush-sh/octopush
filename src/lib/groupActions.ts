@@ -16,14 +16,19 @@ import type { ProjectInfo } from "./types";
 /** The name a group is born with; the header opens in edit mode with it selected. */
 export const NEW_GROUP_NAME = "New group";
 
-/** Create a mission group in `projectId`, around `workspaceId` when given
- *  (empty otherwise), and put its name into inline edit. */
-export async function createMissionGroup(projectId: string, workspaceId?: string): Promise<string | null> {
+/** Create a mission group in `projectId`, around the given missions (one,
+ *  several from a rail selection, or none for an empty group), and put its
+ *  name into inline edit. Every member goes in the one `create_group` call. */
+export async function createMissionGroup(
+  projectId: string,
+  workspaceIds?: string | readonly string[],
+): Promise<string | null> {
+  const memberIds = workspaceIds === undefined ? [] : typeof workspaceIds === "string" ? [workspaceIds] : [...workspaceIds];
   const created = await useGroupsStore.getState().create({
     scope: "workspace",
     projectId,
     name: NEW_GROUP_NAME,
-    memberIds: workspaceId ? [workspaceId] : [],
+    memberIds,
   });
   if (!created) return null;
   const ui = useRailGroupUi.getState();
@@ -37,6 +42,29 @@ export async function createMissionGroup(projectId: string, workspaceId?: string
 export function moveMissionToGroup(workspaceId: string, groupId: string | null): Promise<boolean> {
   if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
   return useGroupsStore.getState().moveItem("workspace", workspaceId, groupId);
+}
+
+/** Move several missions (a rail selection) into one group, or out of any
+ *  (`null`). Missions already where they are going are left alone. */
+export async function moveMissionsToGroup(workspaceIds: readonly string[], groupId: string | null): Promise<boolean> {
+  if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
+  const rows = Object.values(useWorkspaceStore.getState().workspacesByProjectId).flat();
+  const moving = workspaceIds.filter((id) => (rows.find((w) => w.id === id)?.groupId ?? null) !== groupId);
+  const results = await Promise.all(
+    moving.map((id) => useGroupsStore.getState().moveItem("workspace", id, groupId)),
+  );
+  return results.every(Boolean);
+}
+
+/**
+ * Bring a group into sight in the rail and give its header the focus (⌘K's
+ * "Groups"): the rail unfolds the group, the project that holds a mission
+ * group and the project group around either, clears a filter that hides it,
+ * scrolls the header into view and focuses it. The rail does the work (the
+ * project folds are its own state); this only asks.
+ */
+export function revealGroup(groupId: string): void {
+  useRailGroupUi.getState().requestReveal(groupId);
 }
 
 /** The loaded (non-archived) missions of a group. */

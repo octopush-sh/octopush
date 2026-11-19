@@ -18,6 +18,10 @@ import { MidTruncate } from "./primitives/MidTruncate";
 import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
 import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
+import { GROUP_VALUE_PREFIX, paletteGroups, type PaletteGroup } from "../lib/paletteGroups";
+import { useGroupsStore } from "../stores/groupsStore";
+import { TINTS } from "../lib/monogram";
+import { ChevronDown } from "lucide-react";
 
 interface Props {
   open: boolean;
@@ -32,6 +36,9 @@ interface Props {
   runningByWs?: Record<string, boolean>;
   /** Switches project and workspace like a rail click. */
   onSelectWorkspace?: (id: string) => void;
+  /** Reveals a rail group (unfolds it, scrolls to it, focuses its header).
+   *  The Groups section shows only when this is wired. */
+  onRevealGroup?: (groupId: string) => void;
 }
 
 export function CommandPalette({
@@ -43,6 +50,7 @@ export function CommandPalette({
   projects,
   runningByWs,
   onSelectWorkspace,
+  onRevealGroup,
 }: Props) {
   const { sessions, activeId, select, kill } = useSessionStore();
   const refresh = useSessionStore((s) => s.refresh);
@@ -56,9 +64,14 @@ export function CommandPalette({
   const blameOn = useBlameStore((s) => s.enabled);
   const runsByWs = useRunsStore((s) => s.runsByWs);
   const statusSince = useRunsStore((s) => s.statusSince);
+  const groups = useGroupsStore((s) => s.groups);
   const workspaceRows = useMemo(
-    () => (open && onSelectWorkspace ? paletteWorkspaces(projects, runsByWs, statusSince, runningByWs) : []),
-    [open, onSelectWorkspace, projects, runsByWs, statusSince, runningByWs],
+    () => (open && onSelectWorkspace ? paletteWorkspaces(projects, runsByWs, statusSince, runningByWs, groups) : []),
+    [open, onSelectWorkspace, projects, runsByWs, statusSince, runningByWs, groups],
+  );
+  const groupRows = useMemo(
+    () => (open && onRevealGroup ? paletteGroups(projects, groups) : []),
+    [open, onRevealGroup, projects, groups],
   );
 
   const [search, setSearch] = useState("");
@@ -94,6 +107,18 @@ export function CommandPalette({
 
   const activeSession = sessions.find((s) => s.id === activeId);
   const modelRows = paletteModels(models, search, allModels, activeSession?.agent.model);
+
+  // Groups — every rail group, in the rail's order. Choosing one reveals it
+  // in the rail and focuses its header, where the group's own keys (F2,
+  // ⇧F10, ←/→) take over: the palette is navigation only, it renames and
+  // moves nothing itself.
+  const groupsSection = groupRows.length > 0 && onRevealGroup && (
+    <Group heading="Groups" tour={tourId("palette-groups")}>
+      {groupRows.map((g) => (
+        <GroupItem key={g.id} row={g} onSelect={() => run(() => onRevealGroup(g.id))} />
+      ))}
+    </Group>
+  );
 
   return (
     <ModalShell onClose={onClose} align="top" topOffset="pt-[18vh]" ariaLabel="Command palette">
@@ -162,6 +187,11 @@ export function CommandPalette({
               )}
             </Group>
 
+            {/* With a query, Groups come before Workspaces: a group's name
+                also finds its missions, and the group itself is the likelier
+                target. At rest the Workspaces, by recency, lead. */}
+            {search.trim() !== "" && groupsSection}
+
             {/* Workspaces — every open project's, needs-you first, then
                 running, then most recently active. Typing part of a branch
                 or a project name finds the row. */}
@@ -172,6 +202,8 @@ export function CommandPalette({
                 ))}
               </Group>
             )}
+
+            {search.trim() === "" && groupsSection}
 
             {/* Models */}
             {/* The heading already says "Models", so rows carry the bare name.
@@ -512,12 +544,46 @@ function Item({
   );
 }
 
-/** A Workspaces row: the name over a mono meta line, "<project> · <branch>",
- *  both middle-truncated like the rail with the full text in a title. A
+/** A Groups row: the group's own mark (the rail's chevron, in its tint) in
+ *  the glyph box, its name over a mono meta line (`acme-api · 3 missions`
+ *  for a mission group, `2 projects` for a project group). */
+function GroupItem({ row, onSelect }: { row: PaletteGroup; onSelect: () => void }) {
+  const kind = row.scope === "project" ? "Project group" : "Mission group";
+  return (
+    <Command.Item
+      value={`${GROUP_VALUE_PREFIX}${row.id}`}
+      keywords={row.keywords}
+      onSelect={onSelect}
+      data-testid="palette-group"
+      className="group mx-1 flex cursor-pointer items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-octo-sage aria-selected:text-octo-ivory"
+    >
+      <span
+        aria-hidden
+        className="flex h-6 w-6 shrink-0 items-center justify-center rounded border border-octo-hairline text-octo-mute"
+        style={row.tint ? { color: TINTS[row.tint].accent } : undefined}
+      >
+        <ChevronDown size={12} />
+      </span>
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex min-w-0" title={`${kind}: ${row.name}`}>
+          <MidTruncate text={row.name} className="min-w-0 flex-1" />
+        </span>
+        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={row.meta}>
+          <MidTruncate text={row.meta} tail={16} className="min-w-0 flex-1" />
+        </span>
+      </span>
+    </Command.Item>
+  );
+}
+
+/** A Workspaces row: the name over a mono meta line, "<project> · <branch>"
+ *  ("<project> · <group> · <branch>" for a mission in a group), both
+ *  middle-truncated like the rail with the full text in a title. A
  *  static dot says the crew needs you (brass, the rail's non-beacon dot) or
  *  that it is working (sage); the palette never pulses. */
 function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () => void }) {
-  const meta = row.branch ? `${row.project} · ${row.branch}` : row.project;
+  // Outermost first, as the slim rail's flyout reads: project · group · branch.
+  const meta = [row.project, row.group, row.branch].filter(Boolean).join(" · ");
   const state = row.needsYou ? "Needs you" : row.running ? "Working" : null;
   return (
     <Command.Item

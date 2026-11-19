@@ -11,7 +11,7 @@ export interface MoveTargetGroup {
   tint: TintName | null;
 }
 
-interface Props {
+export interface MoveToGroupChoicesProps {
   /** The groups the item may join, in rail order. */
   groups: MoveTargetGroup[];
   /** The group the item is in now (shown checked), or null. */
@@ -20,6 +20,12 @@ interface Props {
   onNewGroup: () => void;
   /** Present only while the item is in a group. */
   onRemoveFromGroup?: () => void;
+}
+
+interface ItemProps extends MoveToGroupChoicesProps {
+  /** The row's label; "Move to group" unless it moves several items
+   *  ("Move 3 missions to group"). */
+  label?: string;
 }
 
 /** How long the pointer may be off the row and its submenu before it closes. */
@@ -36,7 +42,14 @@ const CLOSE_GRACE_MS = 160;
  * holding the focus) then treat it as part of the menu. It opens on hover,
  * click, Enter or →; ← returns to the row; Escape closes the whole menu.
  */
-export function MoveToGroupItem({ groups, currentGroupId, onMove, onNewGroup, onRemoveFromGroup }: Props) {
+export function MoveToGroupItem({
+  groups,
+  currentGroupId,
+  onMove,
+  onNewGroup,
+  onRemoveFromGroup,
+  label = "Move to group",
+}: ItemProps) {
   const [open, setOpen] = useState(false);
   // Which way the submenu opens, and how far it is pulled up, decided after
   // measuring it against the window.
@@ -110,7 +123,7 @@ export function MoveToGroupItem({ groups, currentGroupId, onMove, onNewGroup, on
         }}
       >
         <GroupIcon size={12} className="shrink-0" />
-        <span className="flex-1 text-left">Move to group</span>
+        <span className="flex-1 text-left">{label}</span>
         <ChevronRight size={12} className="shrink-0 text-octo-mute" aria-hidden />
       </button>
 
@@ -124,7 +137,7 @@ export function MoveToGroupItem({ groups, currentGroupId, onMove, onNewGroup, on
           <div
             ref={subRef}
             role="menu"
-            aria-label="Move to group"
+            aria-label={label}
             className={`${SUBMENU_CHROME} w-[220px] py-1`}
             style={{ transformOrigin: place.side === "right" ? "top left" : "top right" }}
             onKeyDown={(e) => {
@@ -135,44 +148,65 @@ export function MoveToGroupItem({ groups, currentGroupId, onMove, onNewGroup, on
               }
             }}
           >
-            {groups.map((group) => {
-              const current = group.id === currentGroupId;
-              return (
-                <button
-                  key={group.id}
-                  type="button"
-                  role="menuitemradio"
-                  aria-checked={current}
-                  className={MENU_ITEM}
-                  title={group.name}
-                  onClick={() => onMove(group.id)}
-                >
-                  <span className="flex w-3 shrink-0 items-center justify-center" aria-hidden>
-                    {current ? (
-                      <Check size={12} />
-                    ) : (
-                      <span
-                        className={`h-1.5 w-1.5 rounded-full ${group.tint ? "" : "bg-octo-mute"}`}
-                        style={group.tint ? { background: TINTS[group.tint].accent } : undefined}
-                      />
-                    )}
-                  </span>
-                  <span className="min-w-0 flex-1 truncate text-left">{group.name}</span>
-                </button>
-              );
-            })}
-            {groups.length > 0 && <div className={MENU_SEP} />}
-            <button type="button" role="menuitem" className={MENU_ITEM} onClick={onNewGroup}>
-              <Plus size={12} className="shrink-0" /> New group…
-            </button>
-            {onRemoveFromGroup && (
-              <button type="button" role="menuitem" className={MENU_ITEM} onClick={onRemoveFromGroup}>
-                <span className="w-3 shrink-0" aria-hidden /> Remove from group
-              </button>
-            )}
+            <MoveToGroupChoices
+              groups={groups}
+              currentGroupId={currentGroupId}
+              onMove={onMove}
+              onNewGroup={onNewGroup}
+              onRemoveFromGroup={onRemoveFromGroup}
+            />
           </div>
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * The choices of "Move to group", as rows of the menu that holds them: the
+ * groups of the item's scope (the current one checked, the others with a dot
+ * in their tint), then "New group…" and, for an item in a group, "Remove from
+ * group". Shared by the submenu above and by the keyboard's Move-to-group
+ * menu (`MoveToGroupMenu`), so the two can never offer different things.
+ */
+export function MoveToGroupChoices({ groups, currentGroupId, onMove, onNewGroup, onRemoveFromGroup }: MoveToGroupChoicesProps) {
+  return (
+    <>
+      {groups.map((group) => {
+        const current = group.id === currentGroupId;
+        return (
+          <button
+            key={group.id}
+            type="button"
+            role="menuitemradio"
+            aria-checked={current}
+            className={MENU_ITEM}
+            title={group.name}
+            onClick={() => onMove(group.id)}
+          >
+            <span className="flex w-3 shrink-0 items-center justify-center" aria-hidden>
+              {current ? (
+                <Check size={12} />
+              ) : (
+                <span
+                  className={`h-1.5 w-1.5 rounded-full ${group.tint ? "" : "bg-octo-mute"}`}
+                  style={group.tint ? { background: TINTS[group.tint].accent } : undefined}
+                />
+              )}
+            </span>
+            <span className="min-w-0 flex-1 truncate text-left">{group.name}</span>
+          </button>
+        );
+      })}
+      {groups.length > 0 && <div className={MENU_SEP} />}
+      <button type="button" role="menuitem" className={MENU_ITEM} onClick={onNewGroup}>
+        <Plus size={12} className="shrink-0" /> New group…
+      </button>
+      {onRemoveFromGroup && (
+        <button type="button" role="menuitem" className={MENU_ITEM} onClick={onRemoveFromGroup}>
+          <span className="w-3 shrink-0" aria-hidden /> Remove from group
+        </button>
+      )}
+    </>
   );
 }
