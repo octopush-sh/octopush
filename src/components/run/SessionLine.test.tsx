@@ -121,19 +121,21 @@ describe("SessionLine — cells", () => {
     render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
 
     // Focused and idle: solid brass, no motion.
-    expect(underline("idle-focused").style.background).toBe("var(--color-octo-brass)");
+    expect(underline("idle-focused").className).toContain("bg-octo-brass");
     expect(underline("idle-focused").className).not.toContain("rail-bar-running-x");
     // Busy and not focused: marching, in sage.
     expect(underline("busy-hidden").className).toContain("rail-bar-running-x");
-    expect(underline("busy-hidden").style.getPropertyValue("--rail-bar")).toBe("var(--color-octo-sage)");
+    expect(underline("busy-hidden").className).toContain("[--rail-bar:var(--color-octo-sage)]");
+    expect(underline("busy-hidden").className).not.toContain("brass");
     // Neither: nothing drawn, the slot stays reserved.
-    expect(underline("idle-hidden").style.background).toBe("transparent");
+    expect(underline("idle-hidden").className).toContain("bg-transparent");
     expect(underline("idle-hidden").className).not.toContain("rail-bar-running-x");
 
     // The focused session starts a command: it marches in brass.
     act(() => useTerminalsStore.getState().setBusy(WS, "idle-focused", true, "cargo build"));
     expect(underline("idle-focused").className).toContain("rail-bar-running-x");
-    expect(underline("idle-focused").style.getPropertyValue("--rail-bar")).toBe("var(--color-octo-brass)");
+    expect(underline("idle-focused").className).toContain("[--rail-bar:var(--color-octo-brass)]");
+    expect(underline("idle-focused").className).not.toContain("bg-octo-brass");
   });
 
   it("never turns a busy session's icon brass", () => {
@@ -541,7 +543,7 @@ describe("SessionLine — more sessions than cells", () => {
     render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
     const ids = screen.getAllByRole("tab").map((c) => c.dataset.testid);
     expect(ids).toEqual(["s1", "s2", "s3", "s4", "s5", "s6", "s10"].map((id) => `session-cell-${id}`));
-    expect(underline("s10").style.background).toBe("var(--color-octo-brass)");
+    expect(underline("s10").className).toContain("bg-octo-brass");
     // No jump key past nine: the name leaves it out.
     expect(cell("s10")).toHaveAttribute("aria-label", "Session 10 — shell at the prompt");
     expect(screen.getByTestId("session-more")).toHaveTextContent("+4");

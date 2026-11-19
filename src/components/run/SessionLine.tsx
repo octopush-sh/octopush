@@ -467,18 +467,14 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
                 data-testid={`session-underline-${t.id}`}
                 data-focus={focused ? "true" : "false"}
                 data-busy={t.busy ? "true" : "false"}
+                // Classes, not inline styles: the colour is a token either way.
                 className={`pointer-events-none absolute bottom-px left-[5px] right-[5px] h-0.5 rounded-[1px] ${
-                  t.busy ? "rail-bar-running-x" : "transition-colors duration-[var(--dur-quick)]"
-                }`}
-                style={
                   t.busy
-                    ? ({
-                        ["--rail-bar" as string]: focused
-                          ? "var(--color-octo-brass)"
-                          : "var(--color-octo-sage)",
-                      } as React.CSSProperties)
-                    : { background: focused ? "var(--color-octo-brass)" : "transparent" }
-                }
+                    ? `rail-bar-running-x ${
+                        focused ? "[--rail-bar:var(--color-octo-brass)]" : "[--rail-bar:var(--color-octo-sage)]"
+                      }`
+                    : `transition-colors duration-[var(--dur-quick)] ${focused ? "bg-octo-brass" : "bg-transparent"}`
+                }`}
               />
 
               {/* Rang, or waiting, while it isn't in focus. Static, not
