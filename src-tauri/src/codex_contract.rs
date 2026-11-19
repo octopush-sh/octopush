@@ -9,6 +9,7 @@
 //! | Surface | Production code |
 //! |---|---|
 //! | `codex exec --help`, `codex exec resume --help` (the flags the argv uses) | `CliDialect::argv` / `resume_argv` / `push_flags` |
+//! | `codex --version` | `agent_adapter::parse_codex_version` |
 //! | `codex exec resume --help` (the probe) | `agent_adapter::codex_help_lists_exec_resume` |
 //! | `codex exec resume` with an unknown session (stderr, exit 1) | `cli_runner::codex_resume_failure` |
 //! | the resumed `--json` stream | `codex_fold_event`, `codex_usage_from_event`, `usage_since`, `build_codex_outcome` |
@@ -17,7 +18,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::agent_adapter::codex_help_lists_exec_resume;
+use crate::agent_adapter::{codex_help_lists_exec_resume, parse_codex_version};
 use crate::orchestrator::cli_runner::{
     build_codex_outcome, codex_fold_event, codex_resume_failure, codex_resume_skip_reason, codex_session_usage,
     codex_usage_from_event, codex_resume_failure_notice, codex_writable_root_args, is_resume_problem, is_usage_unreported, merge_resume_fallback,
@@ -88,6 +89,7 @@ fn version_file_matches_the_recorded_cli() {
     for r in recordings() {
         let v = r.text("version.txt");
         assert_eq!(v.trim(), format!("codex-cli {}", r.version), "[{}]", r.label("version.txt"));
+        assert_eq!(parse_codex_version(&v).as_deref(), Some(r.version.as_str()), "[{}]", r.label("version.txt"));
     }
 }
 

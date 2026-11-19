@@ -66,7 +66,8 @@ pub(crate) fn escalation_changes_tier_on(stage: &RunStageRow, claude_cli_below_f
         .as_deref()
         .is_some_and(|m| m != stage.agent_model);
     let target_model = stage.escalate_model.as_deref().unwrap_or(stage.agent_model.as_str());
-    // An old Claude Code drops `--effort`; Codex has no version floor.
+    // An old Claude Code drops `--effort`; Codex gets its effort on any
+    // version (its version only drives the Readiness sandbox-fix note).
     let below_floor = claude_cli_below_floor
         && cli_runner::dialect_for_model(target_model) == cli_runner::CliDialect::Claude;
     let effort_reaches = cli_runner::effort_applies(&stage.substrate, target_model)

@@ -194,6 +194,14 @@ pub const CLAUDE_SECURITY_FIXES: &[(&str, &str)] = &[
     ("2.1.325", "fixes the Bash sandbox not fully protecting a worktree's settings, hooks and shared git folder"),
 ];
 
+/// Codex CLI releases that fix a sandbox or permission escape, oldest first:
+/// (version, why it matters in one line). Codex writer stages run in Codex's
+/// own `workspace-write` sandbox, so the Readiness card's Codex row warns
+/// below the newest. Codex has no tested floor; this list is all it gets.
+pub const CODEX_SECURITY_FIXES: &[(&str, &str)] = &[
+    ("0.170.0", "fixes permission updates and child threads losing sandbox restrictions"),
+];
+
 /// Models a Claude Code CLI stage can only launch on a new enough CLI:
 /// (normalized model id, display name, oldest Claude Code that runs it). From
 /// the upstream model docs; matched on [`crate::token_engine::normalize_model_id`].
@@ -345,6 +353,29 @@ pub fn parse_claude_version(output: &str) -> Option<String> {
     })
 }
 
+/// The version on `codex --version`'s `codex-cli 0.169.0` line (pinned by
+/// `tests/fixtures/codex/<version>/version.txt`); `None` for anything else.
+pub fn parse_codex_version(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let v = line.trim().strip_prefix("codex-cli ")?.trim();
+        version_key(v)?;
+        Some(v.split(['-', '+']).next().unwrap_or(v).to_string())
+    })
+}
+
+/// The newest of `fixes` the known `version` is below: (version, reason).
+/// `None` when it has them all, or the version doesn't parse.
+pub fn missing_security_fix<'a>(version: &str, fixes: &[(&'a str, &'a str)]) -> Option<(&'a str, &'a str)> {
+    fixes.iter().filter(|(fix, _)| version_below(version, fix)).max_by_key(|(fix, _)| version_key(fix)).copied()
+}
+
+/// "Update Codex: 0.170.0 fixes …" when the known Codex `version` lacks a
+/// [`CODEX_SECURITY_FIXES`] row; `None` otherwise. Never blocks a run.
+pub fn codex_security_notice(version: &str) -> Option<String> {
+    let (fix, reason) = missing_security_fix(version, CODEX_SECURITY_FIXES)?;
+    Some(format!("Update Codex: {fix} {reason}"))
+}
+
 /// True when `version` is strictly older than `floor`. Unparseable input on
 /// either side is never "below" — an unknown version must not warn.
 pub fn version_below(version: &str, floor: &str) -> bool {
@@ -476,16 +507,36 @@ impl Drop for ProbingGuard<'_> {
 }
 
 fn probe_claude_version() -> Option<String> {
+    probe_version("claude", parse_claude_version)
+}
+
+/// The installed Codex CLI's version (`codex --version`, local), probed like
+/// [`claude_cli_version`] and cached until the Readiness card re-probes
+/// ([`forget_codex_cli_version`]). `None` when not found or unparseable.
+pub fn codex_cli_version() -> Option<String> {
+    CODEX_VERSION_CACHE.get_or_probe(|| probe_version("codex", parse_codex_version))
+}
+
+/// Drop the cached Codex version so the next stage probes again.
+pub fn forget_codex_cli_version() {
+    CODEX_VERSION_CACHE.forget();
+}
+
+static CODEX_VERSION_CACHE: VersionCache = VersionCache::new();
+
+/// `<name> --version` with the login-shell PATH and environment the CLI
+/// stages run with, read by `parse`.
+fn probe_version(name: &str, parse: fn(&str) -> Option<String>) -> Option<String> {
     use crate::orchestrator::cli_runner::{login_shell_env, resolve_executable, resolved_cli_path};
     let path_env = resolved_cli_path();
-    let bin = resolve_executable("claude", &path_env)?;
+    let bin = resolve_executable(name, &path_env)?;
     let mut cmd = Command::new(bin);
     cmd.arg("--version");
     for (k, v) in login_shell_env() {
         cmd.env(k, v);
     }
     cmd.env("PATH", &path_env);
-    parse_claude_version(&run_bounded(cmd, VERSION_TIMEOUT)?)
+    parse(&run_bounded(cmd, VERSION_TIMEOUT)?)
 }
 
 // ─── `codex exec resume` probe ─────────────────────────────────────
@@ -1429,6 +1480,39 @@ mod tests {
         assert!(keys.windows(2).all(|w| w[0] < w[1]), "oldest first, no duplicates: {CLAUDE_SECURITY_FIXES:?}");
         let versions: Vec<_> = CLAUDE_SECURITY_FIXES.iter().map(|(v, _)| *v).collect();
         assert_eq!(versions, ["2.1.319", "2.1.321", "2.1.323", "2.1.325"]);
+    }
+
+    #[test]
+    fn codex_version_parses_only_the_codex_cli_line() {
+        assert_eq!(parse_codex_version("codex-cli 0.169.0\n").as_deref(), Some("0.169.0"));
+        assert_eq!(parse_codex_version("WARNING: proceeding\ncodex-cli 0.170.0-alpha.2\n").as_deref(), Some("0.170.0"));
+        assert_eq!(parse_codex_version("0.169.0"), None, "no codex-cli prefix");
+        assert_eq!(parse_codex_version("codex-cli dev"), None);
+        assert_eq!(parse_codex_version("codex-cli 0.169"), None);
+        assert_eq!(parse_codex_version(""), None);
+    }
+
+    #[test]
+    fn codex_security_notice_below_at_and_above_the_fix() {
+        assert!(!CODEX_SECURITY_FIXES.is_empty());
+        let keys: Vec<_> = CODEX_SECURITY_FIXES.iter().map(|(v, _)| version_key(v)).collect();
+        assert!(keys.iter().all(Option::is_some) && keys.windows(2).all(|w| w[0] < w[1]), "{CODEX_SECURITY_FIXES:?}");
+        for (v, reason) in CODEX_SECURITY_FIXES {
+            assert!(!reason.trim().is_empty() && !reason.ends_with('.'), "{v}: one line, no full stop");
+        }
+        assert_eq!(
+            codex_security_notice("0.169.0").as_deref(),
+            Some("Update Codex: 0.170.0 fixes permission updates and child threads losing sandbox restrictions")
+        );
+        assert!(codex_security_notice("0.9.99").is_some());
+        assert_eq!(codex_security_notice("0.170.0"), None);
+        assert_eq!(codex_security_notice("0.171.3"), None);
+        assert_eq!(codex_security_notice("1.0.0"), None);
+        assert_eq!(codex_security_notice("version unknown"), None, "an unparseable version never warns");
+        // The newest missing fix wins.
+        let fixes = [("0.1.0", "a"), ("0.3.0", "c"), ("0.2.0", "b")];
+        assert_eq!(missing_security_fix("0.0.9", &fixes), Some(("0.3.0", "c")));
+        assert_eq!(missing_security_fix("0.3.0", &fixes), None);
     }
 
     #[test]

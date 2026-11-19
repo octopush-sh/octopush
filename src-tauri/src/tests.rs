@@ -10944,6 +10944,10 @@ mod cli_dialect_tests {
         assert_eq!(CliDialect::Codex.sandbox_label(true, ws), None);
         assert_eq!(CliDialect::Claude.sandbox_label(false, ws), None);
         assert_eq!(CliDialect::Codex.sandbox_label(false, CodexWriteScope::MissionSandbox), None);
+        // The launch line names Codex's version when it is known.
+        assert_eq!(CliDialect::Codex.version_label(Some("0.169.0")).as_deref(), Some("codex 0.169.0"));
+        assert_eq!(CliDialect::Codex.version_label(None), None);
+        assert_eq!(CliDialect::Claude.version_label(Some("0.169.0")), None);
         // Claude stages ignore the scope.
         assert_eq!(
             CliDialect::Claude.argv("claude-sonnet-4-6", "sys", 5, false, ws),
