@@ -72,6 +72,11 @@ struct CliResult {
     /// Turns the session ran; a start-up stop reports 0.
     #[serde(default)]
     num_turns: Option<u64>,
+    /// The tool calls Claude Code refused with nobody to ask (`bypassPermissions`
+    /// asks or denies some calls since 2.1.326). Kept untyped: a missing or
+    /// malformed list reads as none ([`refused_calls`]).
+    #[serde(default)]
+    permission_denials: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize, Debug, Default)]
@@ -869,6 +874,98 @@ pub(crate) fn deferred_tool_label(name: &str) -> String {
     }
 }
 
+/// One kind of tool call Claude Code refused in a stage (the result event's
+/// `permission_denials`): the tool, a redacted one-line hint (its command or
+/// path) and how many times that same call was refused.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RefusedCall {
+    pub tool: String,
+    pub hint: String,
+    pub count: u32,
+}
+
+/// Every journal notice about refused calls starts with this (the done
+/// card's verdict line skips them: `lastNotice` in `src/lib/liveLine.ts`).
+pub const REFUSED_NOTICE_PREFIX: &str = "refused · ";
+
+/// The most of a refused call's hint the journal shows.
+const REFUSED_HINT_CHARS: usize = 80;
+
+/// The hint for one refused call: `tool_input.command`, else `file_path`,
+/// else `path`, on one line, redacted by the secret guard, then cut to
+/// [`REFUSED_HINT_CHARS`]. Empty when the input names none of them.
+fn refused_hint(input: Option<&Value>, known: &[crate::secret_scan::KnownSecret]) -> String {
+    let raw = ["command", "file_path", "path"]
+        .iter()
+        .find_map(|k| input.and_then(|i| i.get(*k)).and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
+        .unwrap_or_default();
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = crate::secret_scan::redact_line(&one_line, known);
+    if redacted.chars().count() > REFUSED_HINT_CHARS {
+        let cut: String = redacted.chars().take(REFUSED_HINT_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        redacted
+    }
+}
+
+/// The calls in a result event's `permission_denials`, repeats of the same
+/// tool and hint collapsed, in first-seen order. Anything but a list, and
+/// any entry without a `tool_name`, reads as nothing. Pure.
+pub fn refused_calls(denials: Option<&Value>, known: &[crate::secret_scan::KnownSecret]) -> Vec<RefusedCall> {
+    let mut out: Vec<RefusedCall> = Vec::new();
+    for d in denials.and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default() {
+        let Some(tool) = d.get("tool_name").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) else {
+            continue;
+        };
+        let hint = refused_hint(d.get("tool_input"), known);
+        match out.iter_mut().find(|c| c.tool == tool && c.hint == hint) {
+            Some(c) => c.count += 1,
+            None => out.push(RefusedCall { tool: tool.to_string(), hint, count: 1 }),
+        }
+    }
+    out
+}
+
+/// How many calls were refused in all (repeats counted).
+pub fn refused_total(calls: &[RefusedCall]) -> u32 {
+    calls.iter().map(|c| c.count).sum()
+}
+
+/// The journal notice for one refused call: `refused · Bash · git push ×2`.
+pub fn refused_notice(call: &RefusedCall) -> String {
+    let mut s = format!("{REFUSED_NOTICE_PREFIX}{}", call.tool);
+    if !call.hint.is_empty() {
+        s.push_str(&format!(" · {}", call.hint));
+    }
+    if call.count > 1 {
+        s.push_str(&format!(" ×{}", call.count));
+    }
+    s
+}
+
+/// What a finished writer stage hands the next stage about its refused
+/// calls, appended to its artifact, so a review stage can check them.
+/// Empty when nothing was refused.
+pub fn refused_handoff(calls: &[RefusedCall]) -> String {
+    if calls.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from(
+        "\n\nClaude Code refused these tool calls during this stage, so they never ran — check whether the work still needs them:",
+    );
+    for c in calls {
+        s.push_str(&format!("\n- {}", c.tool));
+        if !c.hint.is_empty() {
+            s.push_str(&format!(": {}", c.hint));
+        }
+        if c.count > 1 {
+            s.push_str(&format!(" (×{})", c.count));
+        }
+    }
+    s
+}
+
 /// Free space for an unprivileged user on the volume holding `path`.
 #[allow(clippy::unnecessary_cast)] // statvfs field widths differ between macOS and Linux
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
@@ -944,6 +1041,10 @@ pub fn max_budget_args(cap: Option<f64>) -> Vec<String> {
 /// A [`TOOL_DEFERRED`] or [`DEFERRED_TOOL_UNAVAILABLE`] `terminal_reason` is
 /// read first, whatever the exit code and `is_error` say: Failed, the session
 /// kept for Resume ([`is_tool_deferred`], [`is_deferred_tool_unavailable`]).
+/// The calls Claude Code refused (`permission_denials`) go on
+/// `outcome.cli.refused_calls` whatever the outcome; a `Done` writer stage
+/// (diff or tests) also names them at the end of its artifact
+/// ([`refused_handoff`]), so the next stage sees them.
 /// Returns `Err` only when the line isn't parseable at all.
 pub fn parse_cli_result(
     stdout: &str,
@@ -951,11 +1052,38 @@ pub fn parse_cli_result(
     artifact_kind: ArtifactKind,
     stderr_text: &str,
 ) -> AppResult<StageOutcome> {
+    parse_cli_result_redacting(stdout, exit_success, artifact_kind, stderr_text, &[])
+}
+
+/// [`parse_cli_result`], with the refused calls' hints also redacted for
+/// `known` (the credentials Octopush holds).
+pub fn parse_cli_result_redacting(
+    stdout: &str,
+    exit_success: bool,
+    artifact_kind: ArtifactKind,
+    stderr_text: &str,
+    known: &[crate::secret_scan::KnownSecret],
+) -> AppResult<StageOutcome> {
     let parsed: CliResult = serde_json::from_str(stdout.trim()).map_err(|e| {
         let preview: String = stdout.chars().take(300).collect();
         AppError::Other(format!("could not parse claude output: {e}; got: {preview}"))
     })?;
+    let refused = refused_calls(parsed.permission_denials.as_ref(), known);
+    let mut outcome = outcome_of_result(&parsed, exit_success, artifact_kind, stderr_text);
+    if matches!(outcome.status, StageStatus::Done) && outcome.artifact.refs_worktree {
+        outcome.artifact.text.push_str(&refused_handoff(&refused));
+    }
+    outcome.cli.refused_calls = refused;
+    Ok(outcome)
+}
 
+/// The outcome of a parsed `result` event (see [`parse_cli_result`]).
+fn outcome_of_result(
+    parsed: &CliResult,
+    exit_success: bool,
+    artifact_kind: ArtifactKind,
+    stderr_text: &str,
+) -> StageOutcome {
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
     let kind = artifact_kind;
     let refs_worktree = matches!(kind, ArtifactKind::Diff | ArtifactKind::Tests);
@@ -981,7 +1109,7 @@ pub fn parse_cli_result(
         let error = format!("{copy}\n{}", terminal_reason_marker(reason));
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
-        return Ok(StageOutcome {
+        return StageOutcome {
             cli: Default::default(),
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -1001,7 +1129,7 @@ pub fn parse_cli_result(
             session_id: parsed.session_id.clone(),
             blocked: None,
             blocked_transcript: None,
-        });
+        };
     }
 
     // The CLI finished the work and reported success, then exited non-zero:
@@ -1021,7 +1149,7 @@ pub fn parse_cli_result(
         );
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
-        return Ok(StageOutcome {
+        return StageOutcome {
             cli: Default::default(),
             artifact: StageArtifact {
                 kind,
@@ -1041,7 +1169,7 @@ pub fn parse_cli_result(
             session_id: None,
             blocked: None,
             blocked_transcript: None,
-        });
+        };
     }
 
     // Claude Code refused to start because the stage's settings failed
@@ -1055,7 +1183,7 @@ pub fn parse_cli_result(
         if let Some(line) =
             refused_setting(parsed.errors.as_ref(), stderr_text, parsed.startup_failure_reason.as_deref())
         {
-            return Ok(StageOutcome {
+            return StageOutcome {
                 cli: Default::default(),
                 artifact: StageArtifact {
                     kind: ArtifactKind::Note,
@@ -1075,7 +1203,7 @@ pub fn parse_cli_result(
                 session_id: None,
                 blocked: None,
                 blocked_transcript: None,
-            });
+            };
         }
     }
 
@@ -1096,7 +1224,7 @@ pub fn parse_cli_result(
         };
         let tail = stderr_tail(stderr_text, 10);
         let error = if tail.is_empty() { error } else { format!("{error}\n— stderr —\n{tail}") };
-        return Ok(StageOutcome {
+        return StageOutcome {
             cli: Default::default(),
             artifact: StageArtifact {
                 kind: ArtifactKind::Note,
@@ -1117,10 +1245,10 @@ pub fn parse_cli_result(
             // `ask_director` is an API-substrate tool only; a CLI stage never blocks.
             blocked: None,
                 blocked_transcript: None,
-        });
+        };
     }
 
-    Ok(StageOutcome {
+    StageOutcome {
         cli: Default::default(),
         artifact: StageArtifact {
             kind,
@@ -1140,7 +1268,7 @@ pub fn parse_cli_result(
         session_id: parsed.session_id.clone(),
         blocked: None,
                 blocked_transcript: None,
-    })
+    }
 }
 
 /// File-mutating Claude Code tools denied to a read-only (review) CLI stage.
@@ -3288,9 +3416,18 @@ impl CliRunner {
                 Ok(apply_question_guard(outcome))
             }
             CliDialect::Claude => match result_line {
-                Some(line) => match parse_cli_result(&line, exit_success, stage.artifact_kind.clone(), &stderr_out) {
+                Some(line) => match parse_cli_result_redacting(
+                    &line,
+                    exit_success,
+                    stage.artifact_kind.clone(),
+                    &stderr_out,
+                    &crate::secret_scan::known_secrets_from(&crate::settings::load_settings().unwrap_or_default()),
+                ) {
                     Ok(mut outcome) => {
                         outcome.cli.ran_model = ran_model.lock().clone();
+                        for call in &outcome.cli.refused_calls {
+                            emitter.notice(&refused_notice(call));
+                        }
                         Ok(apply_question_guard(apply_plan_limit(
                             with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
                             &plan_watch.lock(),

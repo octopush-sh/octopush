@@ -7,6 +7,7 @@ import { isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
 import { stageTitle, fmtTokens } from "../lib/stageMeta";
 import { formatUsd } from "../lib/cost";
+import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { DiffViewer } from "./DiffViewer";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -316,6 +317,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
     : artifact ? "artifact"
     : stage.status === "running" ? "running"
     : "idle";
+  // As on the stage card: a stage that is running again (a loop-back attempt)
+  // or that an abort cut still carries its previous attempt's count — hide it.
+  const refused = stage.status !== "running" && !stageCutByAbort ? stage.refusedCalls ?? 0 : 0;
   const swapKey = viewedRow ? `${stage.id}:attempt-${attemptN}` : `${stage.id}:${mode}`;
 
   return (
@@ -386,6 +390,15 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             </span>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-2.5 font-mono">
+            {refused > 0 && (
+              <span
+                className="octo-pop-in whitespace-nowrap text-[10px] text-octo-warning"
+                title={REFUSED_CALLS_TITLE}
+                data-tour="direct-focus-refused"
+              >
+                {refusedCallsNote(refused)}
+              </span>
+            )}
             {(stage.inputTokens > 0 || stage.outputTokens > 0) && (
               <span className="octo-tabular text-[10px] text-octo-mute" title="input / output tokens">
                 ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}

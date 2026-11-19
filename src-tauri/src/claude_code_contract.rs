@@ -541,6 +541,53 @@ fn stream_json_refused_settings_name_the_setting() {
     assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
 }
 
+const DENIALS_VERSION: &str = "2.1.326";
+const DENIALS_REL: &str = "stream-json/result-with-denials.jsonl";
+
+#[test]
+fn stream_json_permission_denials_are_journaled_and_handed_on() {
+    use crate::orchestrator::cli_runner::{refused_notice, refused_total};
+    // Synthetic fixture (see the README): Claude Code 2.1.326 refuses some
+    // calls in bypassPermissions mode and lists them on the `result` event.
+    let rec = synthesized(DENIALS_VERSION);
+    let fx = rec.label(DENIALS_REL);
+    let events = rec.jsonl(DENIALS_REL);
+    check_stream_shape(&fx, &events);
+    let r = result_event(&fx, &events);
+    for f in ["permission_denials.0.tool_name", "permission_denials.0.tool_use_id", "permission_denials.0.tool_input"] {
+        require(&fx, r, f);
+    }
+    let line = serde_json::to_string(r).unwrap();
+    let outcome = parse_cli_result(&line, true, ArtifactKind::Diff, "")
+        .unwrap_or_else(|e| panic!("[{fx}] parse_cli_result rejected the result event: {e}"));
+    // A writer stage that otherwise succeeded still settles done.
+    assert_eq!(outcome.status, StageStatus::Done, "[{fx}] {:?}", outcome.error);
+    let notices: Vec<String> = outcome.cli.refused_calls.iter().map(refused_notice).collect();
+    assert_eq!(notices, [
+        "refused · Bash · git push origin octo/fix-parser ×2",
+        "refused · Bash · NPM_TOKEN=[redacted] npm publish --access public",
+        "refused · Write · /Users/dev/.zshrc",
+    ], "[{fx}]");
+    assert_eq!(refused_total(&outcome.cli.refused_calls), 4, "[{fx}]");
+    // Its hand-off names them, after the agent's own summary.
+    let text = &outcome.artifact.text;
+    assert!(text.starts_with("Fixed the parser. The push was refused."), "[{fx}] {text}");
+    assert!(text.contains("Claude Code refused these tool calls"), "[{fx}] {text}");
+    assert!(text.contains("- Bash: git push origin octo/fix-parser (×2)"), "[{fx}] {text}");
+    assert!(!text.contains("fixture-npm-value-0403"), "[{fx}] the token never reaches the next stage");
+    // A plan or review stage's artifact is left as the agent wrote it.
+    let note = parse_cli_result(&line, true, ArtifactKind::Review, "").unwrap();
+    assert_eq!(note.artifact.text, "Fixed the parser. The push was refused.", "[{fx}]");
+    assert_eq!(refused_total(&note.cli.refused_calls), 4, "[{fx}]");
+    // Every recorded result without the field reads as nothing refused.
+    for rec in recordings() {
+        let fx = rec.label("stream-json/simple.jsonl");
+        let events = rec.jsonl("stream-json/simple.jsonl");
+        let (_, _, outcome) = replay(&fx, &events);
+        assert!(outcome.cli.refused_calls.is_empty(), "[{fx}]");
+    }
+}
+
 #[test]
 fn recorded_failures_are_never_read_as_refused_settings() {
     use crate::orchestrator::cli_runner::is_settings_refused;

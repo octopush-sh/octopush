@@ -1285,6 +1285,12 @@ impl Orchestrator {
         // so the spend ledger attributes and prices it to what ran. `None`
         // clears an earlier attempt's.
         self.db.lock().set_run_stage_ran_model(&stage.id, outcome.cli.ran_model.as_deref())?;
+        // The tool calls Claude Code refused (journaled by the runner): the
+        // stage reads "N tool calls refused". `0` clears an earlier attempt's.
+        self.db.lock().set_run_stage_refused_calls(
+            &stage.id,
+            crate::orchestrator::cli_runner::refused_total(&outcome.cli.refused_calls),
+        )?;
         // Part of the spend is unknown even if the stage finished (a failed
         // Codex resume before its fresh fallback) — flag it like an error
         // that carries the marker (that path flags and journals it itself).

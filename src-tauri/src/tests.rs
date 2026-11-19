@@ -4297,6 +4297,28 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_stage_keeps_how_many_tool_calls_were_refused_until_it_reruns() {
+        // #893: the stage reads "N tool calls refused" from this count.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+
+        db.set_run_stage_refused_calls(&stage, 3).unwrap();
+        assert_eq!(db.refused_call_counts(&run).unwrap().get(&stage), Some(&3));
+        // A later attempt with nothing refused clears it; so does a re-run.
+        db.set_run_stage_refused_calls(&stage, 0).unwrap();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+        db.set_run_stage_refused_calls(&stage, 2).unwrap();
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.refused_call_counts(&run).unwrap().is_empty());
+    }
+
+    #[test]
     fn check_budget_blocks_only_when_over_a_configured_limit() {
         // Phase 3 backend gate: blocks only when a *configured* budget is at/over
         // its limit; no budget → always allow.
@@ -22869,6 +22891,130 @@ mod plan_wait_tests {
         orch.abort_run(&run_id).await.unwrap();
         assert!(db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.is_none());
         assert!(db.lock().list_due_plan_resumes(now() + 10 * 86_400).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refused_calls_tests {
+    use crate::orchestrator::cli_runner::{
+        parse_cli_result, parse_cli_result_redacting, refused_calls, refused_handoff, refused_notice, refused_total,
+        RefusedCall, REFUSED_NOTICE_PREFIX,
+    };
+    use crate::orchestrator::types::{ArtifactKind, StageStatus};
+    use crate::secret_scan::{redact_line, KnownSecret, REDACTED};
+    use serde_json::json;
+
+    fn result_with(denials: serde_json::Value) -> String {
+        json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "done",
+            "session_id": "s", "total_cost_usd": 0.01, "permission_denials": denials,
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn a_missing_or_malformed_list_reads_as_nothing_refused() {
+        for denials in [None, Some(json!(null)), Some(json!({"tool_name": "Bash"})), Some(json!("Bash")), Some(json!([]))] {
+            assert!(refused_calls(denials.as_ref(), &[]).is_empty(), "{denials:?}");
+        }
+        // An entry without a tool name is skipped; one without an input keeps the tool.
+        let calls = refused_calls(Some(&json!([{"tool_input": {"command": "ls"}}, 7, {"tool_name": "WebFetch"}])), &[]);
+        assert_eq!(calls, [RefusedCall { tool: "WebFetch".into(), hint: String::new(), count: 1 }]);
+        assert_eq!(refused_notice(&calls[0]), "refused · WebFetch");
+        // The result event without the field still parses as before.
+        let line = json!({"type": "result", "subtype": "success", "is_error": false, "result": "ok"}).to_string();
+        let out = parse_cli_result(&line, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(out.status, StageStatus::Done);
+        assert_eq!(out.artifact.text, "ok");
+        assert!(out.cli.refused_calls.is_empty());
+    }
+
+    #[test]
+    fn the_hint_is_the_command_then_file_path_then_path_on_one_line() {
+        let calls = refused_calls(
+            Some(&json!([
+                {"tool_name": "Bash", "tool_input": {"command": "npm\n   test  --  --run", "file_path": "x"}},
+                {"tool_name": "Edit", "tool_input": {"file_path": "/etc/hosts", "path": "y"}},
+                {"tool_name": "Glob", "tool_input": {"path": "/Users/dev", "pattern": "*"}},
+                {"tool_name": "Read", "tool_input": {"command": "   ", "path": "/tmp/a"}},
+            ])),
+            &[],
+        );
+        let hints: Vec<&str> = calls.iter().map(|c| c.hint.as_str()).collect();
+        assert_eq!(hints, ["npm test -- --run", "/etc/hosts", "/Users/dev", "/tmp/a"]);
+    }
+
+    #[test]
+    fn a_long_hint_is_cut_to_80_chars() {
+        let long = format!("echo {}", "word ".repeat(40));
+        let calls = refused_calls(Some(&json!([{"tool_name": "Bash", "tool_input": {"command": long}}])), &[]);
+        let hint = &calls[0].hint;
+        assert_eq!(hint.chars().count(), 80, "{hint}");
+        assert!(hint.ends_with('…') && hint.starts_with("echo word"), "{hint}");
+    }
+
+    #[test]
+    fn repeats_of_the_same_tool_and_hint_collapse() {
+        let push = json!({"tool_name": "Bash", "tool_input": {"command": "git push"}});
+        let calls = refused_calls(
+            Some(&json!([push, {"tool_name": "Bash", "tool_input": {"command": "npm test"}}, push, push,
+                {"tool_name": "Read", "tool_input": {"command": "git push"}}])),
+            &[],
+        );
+        let notices: Vec<String> = calls.iter().map(refused_notice).collect();
+        assert_eq!(notices, ["refused · Bash · git push ×3", "refused · Bash · npm test", "refused · Read · git push"]);
+        assert_eq!(refused_total(&calls), 5);
+        assert!(notices.iter().all(|n| n.starts_with(REFUSED_NOTICE_PREFIX)));
+    }
+
+    #[test]
+    fn hints_pass_through_the_secret_guard_redaction() {
+        // Built at run time so no token-shaped literal sits in the source.
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        let mine = format!("team-gateway-{}", "Zq81".repeat(5));
+        let known = [KnownSecret::new("your LiteLLM key", mine.clone())];
+        let calls = refused_calls(
+            Some(&json!([
+                {"tool_name": "Bash", "tool_input": {"command": format!("GH_TOKEN={gh} gh pr create")}},
+                {"tool_name": "Bash", "tool_input": {"command": format!("curl -H 'Authorization: Bearer {mine}' https://x")}},
+                {"tool_name": "Bash", "tool_input": {"command": "git push https://dev:hunter2pass@example.com/r.git"}},
+            ])),
+            &known,
+        );
+        let hints: Vec<&str> = calls.iter().map(|c| c.hint.as_str()).collect();
+        assert_eq!(hints, [
+            "GH_TOKEN=[redacted] gh pr create",
+            "curl -H 'Authorization: Bearer [redacted]' https://x",
+            "git push https://dev:[redacted]@example.com/r.git",
+        ]);
+        // Through the parser too, with your own key.
+        let line = result_with(json!([{"tool_name": "Bash", "tool_input": {"command": format!("echo {mine} | pbcopy")}}]));
+        let out = parse_cli_result_redacting(&line, true, ArtifactKind::Diff, "", &known).unwrap();
+        assert_eq!(refused_notice(&out.cli.refused_calls[0]), format!("refused · Bash · echo {REDACTED} | pbcopy"));
+        assert!(!out.artifact.text.contains(&mine));
+    }
+
+    #[test]
+    fn redaction_leaves_ordinary_commands_alone() {
+        for line in ["npm test", "git push origin main", "PATH=/opt/bin:$PATH make", "TOKEN=$GITHUB_TOKEN gh auth status"] {
+            assert_eq!(redact_line(line, &[]), line);
+        }
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        assert_eq!(redact_line(&format!("a {gh} b {gh}"), &[]), "a [redacted] b [redacted]");
+    }
+
+    #[test]
+    fn a_done_writer_stage_hands_its_refused_calls_on() {
+        let line = result_with(json!([{"tool_name": "Bash", "tool_input": {"command": "npm test"}}]));
+        let out = parse_cli_result(&line, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(out.status, StageStatus::Done);
+        assert_eq!(out.artifact.text, format!("done{}", refused_handoff(&out.cli.refused_calls)));
+        assert!(out.artifact.text.ends_with("\n- Bash: npm test"), "{}", out.artifact.text);
+        // A failed stage keeps the count but hands nothing on.
+        let failed = parse_cli_result(&line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(refused_total(&failed.cli.refused_calls), 1);
+        assert!(!failed.artifact.text.contains("refused"));
+        assert_eq!(refused_handoff(&[]), "");
     }
 }
 

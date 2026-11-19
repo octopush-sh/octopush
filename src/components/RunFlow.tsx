@@ -5,6 +5,7 @@ import { stageTitle, fmtTokens, fmtTokensShort, essenceShedsTokens } from "../li
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
 import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
+import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { effortApplies } from "../lib/claudeCli";
 import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
@@ -152,6 +153,9 @@ function StageCard({
     : verdict
       ? { node: verdict, cls: "text-octo-verdigris" }
       : { node: <MetaTokens stage={s} />, cls: "text-octo-mute" };
+  // Calls Claude Code refused ride the at-rest line in amber, after the
+  // verdict or tokens — a fact to check, not a gate (no brass).
+  const refused = !cut && !running ? s.refusedCalls ?? 0 : 0;
 
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
@@ -226,7 +230,20 @@ function StageCard({
             data-tour={live.tour}
             className={`octo-fade-in block h-4 truncate font-mono text-[10px] leading-4 ${live.cls}`}
           >
-            {live.node}
+            {refused > 0 ? (
+              <span className="flex w-full min-w-0 items-center gap-2">
+                <span className="min-w-0 truncate">{live.node}</span>
+                <span
+                  className="octo-pop-in shrink-0 text-octo-warning"
+                  title={REFUSED_CALLS_TITLE}
+                  data-tour="direct-stage-refused"
+                >
+                  {refusedCallsNote(refused)}
+                </span>
+              </span>
+            ) : (
+              live.node
+            )}
           </span>
 
           {/* Meta — discreet position · model · effort · substrate pill. */}

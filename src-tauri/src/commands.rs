@@ -2092,13 +2092,14 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages, unreported, ran) = {
+    let (run, stages, unreported, ran, refused) = {
         let db = state.db.lock();
         (
             db.get_run(&run_id)?,
             db.list_run_stages(&run_id)?,
             db.usage_unreported_stage_ids(&run_id)?,
             db.ran_models(&run_id)?,
+            db.refused_call_counts(&run_id)?,
         )
     };
     // Flag stages whose model has no price (resolved after the DB lock), and
@@ -2121,6 +2122,7 @@ pub async fn get_run(
                     "ranModel".into(),
                     ran.get(&s.id).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.clone())),
                 );
+                obj.insert("refusedCalls".into(), serde_json::Value::from(refused.get(&s.id).copied().unwrap_or(0)));
             }
         }
     }
