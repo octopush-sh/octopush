@@ -3,6 +3,8 @@
 **Issue:** #488
 **Status:** approved by the owner on 2026-11-03 (his answers are on #488)
 
+> **Amended on 2026-11-18, planned and not shipped yet.** [`2026-11-18-run-mode-and-rail-groups-design.md`](2026-11-18-run-mode-and-rail-groups-design.md) changes three things described below: every pane keeps its caption, even alone; leaving a split view becomes a minus and a pane has no `×`; and the orientation items move from the caption menu to a layout button in the mode band, where a session line replaces the session rail. Until those PRs merge, this document describes what the code does.
+
 ## Owner decisions
 
 1. **Panes.** One to four sessions on screen. The user can open a second, third or fourth; four is a 2×2 grid.

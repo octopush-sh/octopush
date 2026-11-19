@@ -197,6 +197,16 @@
   --talk-seat-min:   21rem;
   --talk-chat-floor: 18rem;
 
+  /* Shell spacing: the air between the app's standing surfaces. `<main>` is
+     inset `--shell-gutter` from the rail and from the Companion;
+     `--shell-stack` separates the ContextHeader, the mode band and the canvas
+     (and sits above the header); `--shell-foot` is the canvas's bottom
+     padding, above the status bar. The surfaces' own inner spacing is not
+     governed here. See docs/design-system.md, section 3. */
+  --shell-gutter: 8px;
+  --shell-stack:  8px;
+  --shell-foot:   8px;
+
   /* Motion */
   --ease-octo:    cubic-bezier(0.2, 0.8, 0.3, 1);
   --dur-quick:    220ms;

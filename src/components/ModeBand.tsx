@@ -34,7 +34,7 @@ interface Props {
  *  nowrap tail kept its full width and spilled left across the switcher. */
 export function ModeBand({ mode, onChange, workspaceId, meta }: Props) {
   return (
-    <div className="mb-3 grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
+    <div className="mb-[var(--shell-stack)] grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3">
       <span aria-hidden />
       <ModeSwitcher mode={mode} onChange={onChange} workspaceId={workspaceId} />
       {/* Keyed on the mode so the tail crossfades with the canvas instead of
