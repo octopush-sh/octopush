@@ -59,27 +59,73 @@ const isProject = (container: DroppableContainer) =>
 const isLooseProject = (container: DroppableContainer) =>
   isProject(container) && !(container.data.current as { sectionId?: string | null } | undefined)?.sectionId;
 
+const groupIdOf = (container: DroppableContainer) =>
+  (container.data.current as { groupId?: string } | undefined)?.groupId ?? null;
+const sectionIdOf = (data: unknown) => (data as { sectionId?: string | null } | undefined)?.sectionId ?? null;
+
+/** A drag's one target: `container`, whatever lies nearer. */
+const only = (container: DroppableContainer) => [{ id: container.id, data: { droppableContainer: container, value: 0 } }];
+
 /**
- * Each drag only sees its own targets. A project lands among projects (in
- * any section or none) and on section headers, never on a section as a
- * whole; a section lands among the top-level blocks, which are the loose
- * projects and the other sections. Either lands on the ungrouped area under
+ * Where a dragged PROJECT lands. Its block can be hundreds of pixels tall and
+ * is held by a grip at its top, so the block's centre says little about where
+ * the user is pointing: the POINTER decides which container the project is
+ * over, and only then does the block's centre pick a place inside it.
+ *
+ *  - Over another project group, anywhere on it (its eyebrow or its
+ *    projects; folded, that is the eyebrow alone): that group's header, which
+ *    means "join it, as its last project".
+ *  - Over its own group: the nearest of that group's projects (a reorder).
+ *  - Anywhere else, the ungrouped top level: the nearest top-level block, a
+ *    loose project or another group as a whole. A group's project leaves its
+ *    group for it.
+ *
+ * The keyboard has no pointer. Its steps are aimed at projects by
+ * `projectKeyboardCoordinates`, so the nearest project wins there, with the
+ * group headers kept as targets.
+ */
+function projectCollisions(args: Parameters<CollisionDetection>[0]) {
+  const all = args.droppableContainers;
+  const own = sectionIdOf(args.active.data.current);
+  if (args.pointerCoordinates === null) {
+    return closestCenter({ ...args, droppableContainers: all.filter((c) => isProject(c) || isSectionHead(c)) });
+  }
+  const others = all.filter((c) => isSection(c) && groupIdOf(c) !== own);
+  const [over] = pointerWithin({ ...args, droppableContainers: others });
+  if (over) {
+    const groupId = groupIdOf(over.data?.droppableContainer as DroppableContainer);
+    const head = all.find((c) => isSectionHead(c) && groupIdOf(c) === groupId);
+    if (head) return only(head);
+  }
+  const mine = own === null ? undefined : all.find((c) => isSection(c) && groupIdOf(c) === own);
+  if (mine && pointerWithin({ ...args, droppableContainers: [mine] }).length > 0) {
+    return closestCenter({
+      ...args,
+      droppableContainers: all.filter((c) => isProject(c) && sectionIdOf(c.data.current) === own),
+    });
+  }
+  return closestCenter({ ...args, droppableContainers: [...all.filter(isLooseProject), ...others] });
+}
+
+/**
+ * Each drag only sees its own targets. A project follows `projectCollisions`.
+ * A project group lands among the top-level blocks, which are the loose
+ * projects and the other groups. Either lands on the ungrouped area under
  * the last block only while the pointer is over it (a wide, empty target
  * would otherwise never be the nearest centre, or always). A mission or a
- * mission-group header lands
- * on what is under the pointer in its own project, a group first and the
- * project's loose area otherwise.
+ * mission-group header lands on what is under the pointer in its own project,
+ * a group first and the project's loose area otherwise.
  */
 export const railCollisions: CollisionDetection = (args) => {
   const subject = railSubjectOf(args.active.data.current);
   if (!subject) {
     const foot = pointerWithin({ ...args, droppableContainers: args.droppableContainers.filter(isTopLoose) });
     if (foot.length > 0) return foot;
-    const mine =
-      topTypeOf(args.active.data.current) === "section"
-        ? (c: DroppableContainer) => isSection(c) || isLooseProject(c)
-        : (c: DroppableContainer) => isProject(c) || isSectionHead(c);
-    return closestCenter({ ...args, droppableContainers: args.droppableContainers.filter(mine) });
+    if (topTypeOf(args.active.data.current) !== "section") return projectCollisions(args);
+    return closestCenter({
+      ...args,
+      droppableContainers: args.droppableContainers.filter((c) => isSection(c) || isLooseProject(c)),
+    });
   }
   const mine = args.droppableContainers.filter(
     (c) => railTargetOf(c.data.current)?.projectId === subject.projectId,
@@ -113,22 +159,52 @@ export const projectKeyboardCoordinates: KeyboardCoordinateGetter = (event, args
   });
 };
 
+/** A displacement of a block of the rail's top level: a translation, never a
+ *  scale. */
+export interface BlockShift {
+  x: number;
+  y: number;
+}
+
 /**
- * The transform that keeps a dragged block of the top level under the pointer
- * while it is over a target OUTSIDE its own sortable list.
+ * How far a block of the rail's top level (a project, or a project group) is
+ * shifted during a drag, as a pure rule.
  *
- * A sortable item is moved by its list only while the drag is over an item of
- * that same list. Over anything else (a project of another group, a group's
- * header, the ungrouped area) dnd-kit hands it no transform, and the dragged
- * block would snap back to where it started and sit there until the drop. The
- * rail draws no drag overlay for projects (one would stop the list moving
- * them at all), so the block follows the pointer by the drag's own delta
- * instead. `sorted` is the list's transform, which wins whenever it exists:
- * the two are the same displacement for the dragged block, so there is no
- * jump when the pointer crosses from one kind of target to the other.
+ *  - `sorted` is what its sortable list hands it: the room it makes for the
+ *    dragged block, or, for the dragged block itself, the pointer's travel.
+ *    Only the TRANSLATION is kept. dnd-kit also scales a dragged item to the
+ *    size of whatever it is over (`scaleY` 0.45 over a short project, 1.5 over
+ *    a tall group), which squashes or stretches the block and pulls it off
+ *    the pointer; the rail's blocks keep their own size.
+ *  - The list moves an item only while the drag is over an item of that same
+ *    list. Over anything else (another group's header, the ungrouped area) it
+ *    hands the dragged block nothing, and the block would snap back to where
+ *    it started. The rail draws no drag overlay for projects (one would stop
+ *    the list moving them at all), so there the block follows the pointer by
+ *    the drag's own `delta`. Both are the same travel for the dragged block,
+ *    so nothing jumps when the pointer crosses from one target to another.
  */
-export function useFollowPointer(id: UniqueIdentifier, isDragging: boolean, sorted: Transform | null): Transform | null {
-  const [delta, setDelta] = useState<{ x: number; y: number } | null>(null);
+export function blockShift(
+  sorted: Transform | null,
+  isDragging: boolean,
+  delta: BlockShift | null,
+): BlockShift | null {
+  if (sorted) return { x: sorted.x, y: sorted.y };
+  return isDragging && delta ? { x: delta.x, y: delta.y } : null;
+}
+
+/** `blockShift` as the inline `transform` of the block: a translation only. */
+export function blockTransform(shift: BlockShift | null): string | undefined {
+  return shift ? `translate3d(${Math.round(shift.x)}px, ${Math.round(shift.y)}px, 0)` : undefined;
+}
+
+/**
+ * The inline `transform` that keeps a block of the rail's top level where the
+ * drag puts it (`blockShift`): moved by its sortable list when the list moves
+ * it, and under the pointer otherwise.
+ */
+export function useFollowPointer(id: UniqueIdentifier, isDragging: boolean, sorted: Transform | null): string | undefined {
+  const [delta, setDelta] = useState<BlockShift | null>(null);
   useDndMonitor({
     onDragMove: (event) => {
       if (event.active.id === id) setDelta(event.delta);
@@ -136,6 +212,5 @@ export function useFollowPointer(id: UniqueIdentifier, isDragging: boolean, sort
     onDragEnd: () => setDelta(null),
     onDragCancel: () => setDelta(null),
   });
-  if (sorted) return sorted;
-  return isDragging && delta ? { x: delta.x, y: delta.y, scaleX: 1, scaleY: 1 } : null;
+  return blockTransform(blockShift(sorted, isDragging, delta));
 }

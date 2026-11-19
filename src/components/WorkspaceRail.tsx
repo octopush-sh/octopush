@@ -27,7 +27,6 @@ import {
   verticalListSortingStrategy,
   useSortable,
 } from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
 import { ACTIVE_ROW_SELECTOR, useScrollActiveIntoView } from "../hooks/useScrollActiveIntoView";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
@@ -36,6 +35,7 @@ import type { Group, TintName, Workspace, ProjectInfo, WorkspaceGitSummary, Pr }
 import { nearestVisibleAncestor } from "../lib/beacon";
 import { moveMissionToGroup, moveProjectToGroup, ungroupMissions, ungroupProjects } from "../lib/groupActions";
 import { prefersReducedMotion } from "../lib/motion";
+import { restoreProjectLineFocus } from "../lib/railFocus";
 import {
   projectKeyboardCoordinates,
   railCollisions,
@@ -118,6 +118,9 @@ export interface ProjectGroup {
   /** The project group (a section of the rail) this project sits in. Null,
    *  absent or an id that names no loaded group: a loose project. */
   groupId?: string | null;
+  /** Pinned projects are listed first; the rail needs it to know which
+   *  reorders the list would undo (`stepInRail`). */
+  pinned?: boolean;
   workspaces: Workspace[];
 }
 
@@ -370,6 +373,11 @@ export function WorkspaceRail({
     [projects, groups],
   );
   const sectionOfProject = useMemo(() => sectionByProject(topItems), [topItems]);
+  // A project line the keyboard holds keeps the focus when a move re-renders
+  // it under another parent (see `lib/railFocus.ts`).
+  useLayoutEffect(() => {
+    restoreProjectLineFocus();
+  }, [topItems]);
   const visibleTop = useMemo<VisibleTop[]>(() => {
     const whole = (project: ProjectGroup): VisibleProject => ({
       project,
@@ -532,10 +540,33 @@ export function WorkspaceRail({
   // Missions and group headers drag whenever the list is whole (no filter).
   const groupDragEnabled = !isCollapsed && q === "";
   const [dragging, setDragging] = useState<RailDragSubject | null>(null);
-  const handleDragStart = (e: DragStartEvent) => setDragging(railSubjectOf(e.active.data.current));
+  // How far the list could scroll when the drag began. A project or a group
+  // is dragged by a transform, and a transformed block that travels past the
+  // list's foot lengthens what the list can scroll: dnd-kit's auto-scroll
+  // then keeps scrolling after it, the block keeps its place under the
+  // pointer, and the list runs away from under the drag. The list is held to
+  // the room its own content gave it.
+  const scrollLimit = useRef<number | null>(null);
+  const holdScroll = (list: HTMLDivElement) => {
+    const max = scrollLimit.current;
+    if (max === null) return;
+    if (list.scrollTop > max) list.scrollTop = max;
+    if (list.scrollLeft !== 0) list.scrollLeft = 0;
+  };
+  const endDrag = () => {
+    scrollLimit.current = null;
+    setDragging(null);
+  };
+  const handleDragStart = (e: DragStartEvent) => {
+    const subject = railSubjectOf(e.active.data.current);
+    const list = listRef.current;
+    // A mission and a mission-group header ride in the overlay: they lengthen nothing.
+    scrollLimit.current = !subject && list ? Math.max(0, list.scrollHeight - list.clientHeight) : null;
+    setDragging(subject);
+  };
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
-    setDragging(null);
+    endDrag();
     const subject = railSubjectOf(active.data.current);
     if (subject) {
       const target = railTargetOf(over?.data.current);
@@ -560,12 +591,22 @@ export function WorkspaceRail({
     }
     if (action.order) onReorderProjects?.(action.order);
   };
-  // "Move up" / "Move down" in a project group's menu: one block at a time.
-  const stepSection = (groupId: string, direction: -1 | 1) =>
-    onReorderProjects ? stepInRail(topItems, sectionDragId(groupId), direction) : null;
+  // "Move up" / "Move down" in a project group's menu: one block at a time,
+  // as the order to persist, or null when the step would change nothing.
+  const stepSection = (direction: -1 | 1) =>
+    onReorderProjects && menuGroup?.scope === "project"
+      ? stepInRail(topItems, sectionDragId(menuGroup.id), direction)
+      : null;
+  const sectionUp = stepSection(-1);
+  const sectionDown = stepSection(1);
 
   // One project of the expanded rail, loose or in the project group `section`.
-  const renderProject = (entry: VisibleProject, lead: ProjectLead, section: Group | null) => {
+  const renderProject = (
+    entry: VisibleProject,
+    lead: ProjectLead,
+    section: Group | null,
+    sectionFolded = false,
+  ) => {
     const { project, items } = entry;
     return (
       <SortableProjectGroup
@@ -575,6 +616,7 @@ export function WorkspaceRail({
         lead={lead}
         sectionId={section?.id ?? null}
         sectionTint={section?.tint ?? null}
+        hidden={sectionFolded}
         collapsedGroups={collapsedGroups}
         attention={carriers.byProject[project.id] ?? null}
         groupAttention={carriers.byGroup}
@@ -669,13 +711,18 @@ export function WorkspaceRail({
             )}
           </div>
 
-          <div ref={listRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
+          <div
+            ref={listRef}
+            data-testid="rail-list"
+            className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2"
+            onScroll={(e) => holdScroll(e.currentTarget)}
+          >
             <DndContext
               sensors={sensors}
               collisionDetection={railCollisions}
               onDragStart={handleDragStart}
               onDragEnd={handleDragEnd}
-              onDragCancel={() => setDragging(null)}
+              onDragCancel={endDrag}
             >
               {/* The top level is one sortable list of blocks: loose projects
                   and project groups (each dragged as a unit). A group's
@@ -721,7 +768,7 @@ export function WorkspaceRail({
                         strategy={verticalListSortingStrategy}
                       >
                         {entries.map((entry, index) =>
-                          renderProject(entry, index === 0 ? "section-first" : "next", group),
+                          renderProject(entry, index === 0 ? "section-first" : "next", group, sectionFolded),
                         )}
                       </SortableContext>
                     </RailProjectSection>
@@ -771,16 +818,10 @@ export function WorkspaceRail({
             if (!isCollapsed) useRailGroupUi.getState().startRename(menuGroup.id);
           }}
           onTint={(tint) => void useGroupsStore.getState().setTint(menuGroup.id, tint)}
-          onMoveUp={
-            stepSection(menuGroup.id, -1)
-              ? () => onReorderProjects?.(stepSection(menuGroup.id, -1) ?? [])
-              : undefined
-          }
-          onMoveDown={
-            stepSection(menuGroup.id, 1)
-              ? () => onReorderProjects?.(stepSection(menuGroup.id, 1) ?? [])
-              : undefined
-          }
+          // Offered only where the step shows: an order the pinned-first
+          // rule would undo is no step (`stepInRail` answers null for it).
+          onMoveUp={sectionUp ? () => onReorderProjects?.(sectionUp) : undefined}
+          onMoveDown={sectionDown ? () => onReorderProjects?.(sectionDown) : undefined}
           onUngroup={() => void ungroupProjects(menuGroup.id)}
           onDismiss={closeGroupMenu}
         />
@@ -921,6 +962,9 @@ interface SortableProjectGroupProps {
   sectionId: string | null;
   /** That group's tint, which the hexagon takes when the project has none. */
   sectionTint: TintName | null;
+  /** Its project group is folded: the project is out of sight, so nothing
+   *  can be dropped on it (the group's header is the target). */
+  hidden: boolean;
   /** Folded mission groups by id (the stored state; a filter overrides it). */
   collapsedGroups: Record<string, boolean>;
   /** Set only while folded: the beacon or dot this line carries for the
@@ -953,7 +997,7 @@ interface SortableProjectGroupProps {
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
-    project, items, lead, sectionId, sectionTint,
+    project, items, lead, sectionId, sectionTint, hidden,
     collapsedGroups, attention, groupAttention, groupDragEnabled, dragging,
     onGroupContextMenu, onNewWorkspaceInGroup,
     q, folded, toggleProjectCollapsed, activeWorkspaceId,
@@ -966,10 +1010,11 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     useSortable({
       id: project.id,
       data: { type: "project", sectionId } satisfies RailTopData,
-      disabled: !dragEnabled,
+      disabled: { draggable: !dragEnabled, droppable: !dragEnabled || hidden },
     });
-  // Over a target outside its own list (another group, a group's header, the
-  // ungrouped area) the list moves nothing: the block still follows the pointer.
+  // A translation only (dnd-kit would also scale the block to whatever it is
+  // over), and under the pointer even where the list moves nothing: over
+  // another group's header or the ungrouped area.
   const shown = useFollowPointer(project.id, isDragging, transform);
 
   const workspaces = project?.workspaces || [];
@@ -1025,9 +1070,10 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     <div
       ref={setNodeRef}
       data-rail-project={project.id}
-      className={`flex flex-col ${PROJECT_LEAD[lead]}`}
+      // Dragged, it paints over the blocks it passes.
+      className={`flex flex-col ${PROJECT_LEAD[lead]} ${isDragging ? "relative z-10" : ""}`}
       style={{
-        transform: CSS.Transform.toString(shown),
+        transform: shown,
         transition,
         opacity: isDragging ? 0.6 : undefined,
       }}

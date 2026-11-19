@@ -92,6 +92,7 @@ import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
 import { useGroupsStore } from "./stores/groupsStore";
 import { layoutProjects, missionGroupsOf, projectGroupsOf, stepInRail } from "./lib/railGroups";
+import { holdProjectLineFocus } from "./lib/railFocus";
 import {
   createMissionGroup,
   createProjectGroup,
@@ -2228,8 +2229,10 @@ function App() {
     // just created this session). We deliberately do NOT hoist the active
     // project to the top — selecting a workspace must never reorder the rail,
     // and newly added projects stay at the end.
-    const byId: Record<string, { name: string; tint: string | null; groupId: string | null }> = {};
-    recentProjects.forEach((p) => { byId[p.id] = { name: p.name, tint: p.tint, groupId: p.groupId ?? null }; });
+    const byId: Record<string, { name: string; tint: string | null; groupId: string | null; pinned: boolean }> = {};
+    recentProjects.forEach((p) => {
+      byId[p.id] = { name: p.name, tint: p.tint, groupId: p.groupId ?? null, pinned: p.pinned };
+    });
     if (project) {
       // Membership is read from the listed row when there is one: the list is
       // reloaded often, the open project's own row only when it is opened.
@@ -2238,10 +2241,11 @@ function App() {
         name: project.name,
         tint: project.tint,
         groupId: listed ? listed.groupId : (project.groupId ?? null),
+        pinned: listed ? listed.pinned : project.pinned,
       };
     }
 
-    const ordered: { id: string; name: string; tint?: string; groupId: string | null }[] = [];
+    const ordered: { id: string; name: string; tint?: string; groupId: string | null; pinned: boolean }[] = [];
     const seen = new Set<string>();
     const pushProject = (id: string, fallbackName: string) => {
       if (seen.has(id)) return;
@@ -2253,6 +2257,7 @@ function App() {
         name: backend?.name || custom?.name || fallbackName,
         tint: backend?.tint ?? custom?.tint,
         groupId: backend?.groupId ?? null,
+        pinned: backend?.pinned ?? false,
       });
     };
     recentProjects.forEach((p) => pushProject(p.id, p.name));
@@ -2269,6 +2274,7 @@ function App() {
       name: p.name,
       tint: p.tint,
       groupId: p.groupId,
+      pinned: p.pinned,
       jiraProjectKey: jiraKeyById[p.id] ?? null,
       workspaces: workspacesByProjectId[p.id] || [],
     }));
@@ -2904,10 +2910,9 @@ function App() {
           setProjectContextMenu(null);
           // A menu the keyboard opened gives the focus back to its project
           // line, so Escape does not drop the keyboard out of the rail.
-          if (!closing.fromKeyboard) return;
-          Array.from(document.querySelectorAll<HTMLElement>("[data-rail-project-line]"))
-            .find((el) => el.dataset.railProjectLine === closing.projectId)
-            ?.focus({ preventScroll: true });
+          // Held, not only set: "Move to group" renders the line under another
+          // parent, and the focus has to follow it there.
+          if (closing.fromKeyboard) holdProjectLineFocus(closing.projectId);
         };
         return (
           <ErrorBoundary surface="Project menu" variant="overlay" onDismiss={() => setProjectContextMenu(null)}>

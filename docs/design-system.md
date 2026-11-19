@@ -694,17 +694,28 @@ a secondary cue (WCAG 1.4.1).
   groups' own `sortOrder` is not a law between them here (projects have a
   manual order, missions don't): it only orders the empty groups, which stand
   last.
-- **Drag.** A project dropped on a project takes its place and joins that
-  project's container (a group, or the loose top level). Dropped on a group's
-  header it becomes the group's last project; that header takes the
-  `--brass-ghost` wash. Dropped on the ungrouped area under the rail's last
-  block it leaves its group and goes last; that area draws nothing. A group dragged by its header moves as one unit, by
-  the sortable list's own transform: **no `<DragOverlay>`** for a project or a
-  group (it would stop the dragged block following the pointer). Over a
-  target outside its own list the block follows the pointer by the drag's
-  delta (`useFollowPointer`), so it never snaps back mid-drag. Keyboard: a
+- **Drag.** The pointer says which container a dragged project is over; the
+  block's centre only picks a place inside it (a block is tall and is held by
+  a grip at its top, so its centre is far from where the user points). Over
+  another group, anywhere on it, the project **joins as that group's last
+  project**, always, and that group's header takes the `--brass-ghost` wash.
+  Over its own group it is reordered. Anywhere else it is on the ungrouped
+  top level and leaves its group: beside the nearest top-level block, or last
+  when dropped on the ungrouped area under the rail's last block, which draws
+  nothing. A group dragged by its header moves as one unit, by the sortable
+  list's own transform: **no `<DragOverlay>`** for a project or a group (it
+  would stop the dragged block following the pointer).
+- **A dragged block is moved, never scaled.** Only the translation of
+  dnd-kit's transform is written (`blockShift` in `lib/railDnd.ts`); written
+  whole, it scales the block to the size of what it is over and pulls it off
+  the pointer. Over a target outside its own list the block follows the
+  pointer by the drag's delta (`useFollowPointer`), so it never snaps back
+  mid-drag; a group lifts its fold's clipping while one of its own projects
+  is dragged, so the block never vanishes at the group's edge; the list's
+  scroll is held to its own room for the length of the drag. Keyboard: a
   project's grip steps through projects in any group; a group moves with its
-  menu's **Move up** / **Move down**.
+  menu's **Move up** / **Move down**, each offered only when the step would
+  show (never one the pinned-first order would undo).
 - **One meaning for "New group" per menu.** In a project's menu the group
   action is **Move to group ›**, about project groups, and its **New group…**
   makes a group that already holds the project. The mission-group action in

@@ -322,15 +322,56 @@ describe("resolveTopDrop", () => {
     expect(resolveTopDrop(plain, "a", "b")).toEqual({ order: ["b", "a", "c"] });
   });
 
-  it("a loose project dropped on a group's project joins the group at that place", () => {
-    expect(resolveTopDrop(RAIL, "dotfiles", "web")).toEqual({
-      order: ["pinned", "api", "dotfiles", "web", "cli"],
-      move: { projectId: "dotfiles", groupId: "client" },
+  it("a project that joins a group always becomes its last project, whichever of its projects it was dropped on", () => {
+    // On the first project, on the last, from below, from above: last every time.
+    const fromBelow = { order: ["pinned", "api", "web", "dotfiles", "cli"], move: { projectId: "dotfiles", groupId: "client" } };
+    expect(resolveTopDrop(RAIL, "dotfiles", "api")).toEqual(fromBelow);
+    expect(resolveTopDrop(RAIL, "dotfiles", "web")).toEqual(fromBelow);
+    expect(resolveTopDrop(RAIL, "dotfiles", sectionHeadId("client"))).toEqual(fromBelow);
+    const fromAbove = { order: ["api", "web", "pinned", "cli", "dotfiles"], move: { projectId: "pinned", groupId: "client" } };
+    expect(resolveTopDrop(RAIL, "pinned", "api")).toEqual(fromAbove);
+    expect(resolveTopDrop(RAIL, "pinned", sectionHeadId("client"))).toEqual(fromAbove);
+  });
+
+  it("a project dropped on another group as a whole lands beside it, loose", () => {
+    // A loose project steps over the group: after it from above, before it from below.
+    expect(resolveTopDrop(RAIL, "pinned", sectionDragId("client"))).toEqual({
+      order: ["api", "web", "pinned", "cli", "dotfiles"],
     });
-    // From above it lands after the target, as in any sortable list.
-    expect(resolveTopDrop(RAIL, "pinned", "api")).toEqual({
-      order: ["api", "pinned", "web", "cli", "dotfiles"],
-      move: { projectId: "pinned", groupId: "client" },
+    expect(resolveTopDrop(RAIL, "dotfiles", sectionDragId("client"))).toEqual({
+      order: ["pinned", "dotfiles", "api", "web", "cli"],
+    });
+    // A group's project does the same, and leaves its group.
+    expect(resolveTopDrop(RAIL, "cli", sectionDragId("client"))).toEqual({
+      order: ["pinned", "cli", "api", "web", "dotfiles"],
+      move: { projectId: "cli", groupId: null },
+    });
+    expect(resolveTopDrop(RAIL, "api", sectionDragId("side"))).toEqual({
+      order: ["pinned", "web", "cli", "api", "dotfiles"],
+      move: { projectId: "api", groupId: null },
+    });
+    // Its own group as a whole is no target.
+    expect(resolveTopDrop(RAIL, "api", sectionDragId("client"))).toBeNull();
+  });
+
+  it("an order the pinned-first rule would undo is not a reorder", () => {
+    // p (pinned, loose) · [client: api* web] with api pinned · x
+    const rail = layoutProjects(
+      [{ id: "p", pinned: true }, { id: "api", groupId: "client", pinned: true }, proj("web", "client"), proj("x")],
+      [CLIENT],
+    );
+    // The group is up there because of its pinned project: it cannot go below x…
+    expect(resolveTopDrop(rail, sectionDragId("client"), "x")).toBeNull();
+    // …and x cannot go above a pinned block.
+    expect(resolveTopDrop(rail, "x", "p")).toBeNull();
+    // Inside the group the unpinned project cannot lead.
+    expect(resolveTopDrop(rail, "web", "api")).toBeNull();
+    // Among the pinned blocks a reorder does show.
+    expect(resolveTopDrop(rail, sectionDragId("client"), "p")).toEqual({ order: ["api", "web", "p", "x"] });
+    // A move of membership still happens, with whatever order comes of it.
+    expect(resolveTopDrop(rail, "x", sectionHeadId("client"))).toEqual({
+      order: null,
+      move: { projectId: "x", groupId: "client" },
     });
   });
 
@@ -414,8 +455,7 @@ describe("resolveTopDrop", () => {
     expect(resolveTopDrop(RAIL, sectionDragId("client"), "api")).toBeNull();
     expect(resolveTopDrop(RAIL, "ghost", "api")).toBeNull();
     expect(resolveTopDrop(RAIL, "api", "ghost")).toBeNull();
-    // A project never lands on a group as a whole, only on its header.
-    expect(resolveTopDrop(RAIL, "pinned", sectionDragId("client"))).toBeNull();
+    expect(resolveTopDrop(RAIL, "pinned", sectionDragId("ghost"))).toBeNull();
   });
 
   it("an empty group has no place to move to", () => {
@@ -450,6 +490,34 @@ describe("stepInRail", () => {
     const rail = layoutProjects([proj("a"), proj("b")], [CLIENT]);
     expect(stepInRail(rail, "b", 1)).toBeNull();
     expect(stepInRail(rail, sectionDragId("client"), -1)).toBeNull();
+  });
+
+  it("offers no step the pinned-first rule would undo", () => {
+    // p (pinned, loose) · [client: api* web] with api pinned · x · y
+    const rail = layoutProjects(
+      [
+        { id: "p", pinned: true },
+        { id: "api", groupId: "client", pinned: true },
+        proj("web", "client"),
+        proj("x"),
+        proj("y"),
+      ],
+      [CLIENT],
+    );
+    // The group raised by its pinned project has no way down past x, only up.
+    expect(stepInRail(rail, sectionDragId("client"), 1)).toBeNull();
+    expect(stepInRail(rail, sectionDragId("client"), -1)).toEqual(["api", "web", "p", "x", "y"]);
+    // An unpinned project has no way above a pinned block, and a pinned one none below.
+    expect(stepInRail(rail, "x", -1)).toBeNull();
+    expect(stepInRail(rail, "p", 1)).toEqual(["api", "web", "p", "x", "y"]);
+    expect(stepInRail(rail, "x", 1)).toEqual(["p", "api", "web", "y", "x"]);
+    // Inside the group: the pinned project leads, whatever is stored.
+    expect(stepInRail(rail, "web", -1)).toBeNull();
+    expect(stepInRail(rail, "api", 1)).toBeNull();
+    // Two loose projects, one pinned: neither can pass the other.
+    const two = layoutProjects([{ id: "a", pinned: true }, proj("b")], []);
+    expect(stepInRail(two, "a", 1)).toBeNull();
+    expect(stepInRail(two, "b", -1)).toBeNull();
   });
 
   it("with no groups it is the neighbour swap the menu always did", () => {

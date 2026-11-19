@@ -17,6 +17,8 @@ const mockIpc = vi.hoisted(() => ({
   setGroupOrder: vi.fn(),
   deleteGroup: vi.fn(),
   setItemGroup: vi.fn(),
+  setProjectOrder: vi.fn(),
+  listRecentProjects: vi.fn(),
 }));
 vi.mock("../lib/ipc", async (importOriginal) => {
   const original = await importOriginal<typeof import("../lib/ipc")>();
@@ -45,6 +47,8 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
 import { WorkspaceRail, projectMarkColor, resolveAttentionCarriers, type ProjectGroup } from "./WorkspaceRail";
 import { TINTS } from "../lib/monogram";
 import { sectionDragId, sectionHeadId, TOP_LOOSE_ID } from "../lib/railGroups";
+import { moveProjectToGroup } from "../lib/groupActions";
+import { holdProjectLineFocus, __releaseProjectLineFocus } from "../lib/railFocus";
 import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
 import { useGroupsStore, __resetGroupsStoreInFlight } from "../stores/groupsStore";
 import { useProjectStore } from "../stores/projectStore";
@@ -123,14 +127,26 @@ interface RailOptions {
   onProjectContextMenu?: (projectId: string, x: number, y: number, fromKeyboard?: boolean) => void;
 }
 
+/** The same rail, told which projects are pinned (as App tells it). */
+function PinnedRail(props: RailOptions) {
+  return <Rail {...props} withPinned />;
+}
+
 /** The rail over the project store's rows, so a store change re-renders it. */
-function Rail({ active = "w-dot", collapsed = false, onReorderProjects = vi.fn(), onProjectContextMenu }: RailOptions) {
+function Rail({
+  active = "w-dot",
+  collapsed = false,
+  onReorderProjects = vi.fn(),
+  onProjectContextMenu,
+  withPinned = false,
+}: RailOptions & { withPinned?: boolean }) {
   const rows = useProjectStore((s) => s.recent);
   const projects: ProjectGroup[] = rows.map((p) => ({
     id: p.id,
     name: p.name,
     tint: p.tint ?? undefined,
     groupId: p.groupId,
+    pinned: withPinned ? p.pinned : undefined,
     workspaces: MISSIONS[p.id] ?? [],
   }));
   return (
@@ -188,7 +204,10 @@ beforeEach(() => {
   __reloadRailGroupUi();
   useAttentionStore.setState({ flagsByWs: {} });
   useWorkspaceStore.setState({ launchRestoredId: null });
+  __releaseProjectLineFocus();
   seed();
+  // A reload after a persisted order answers with the rows as they stand.
+  mockIpc.listRecentProjects.mockImplementation(async () => useProjectStore.getState().recent);
 });
 afterEach(() => {
   useGroupsStore.setState({ groups: [], loaded: false });
@@ -381,6 +400,17 @@ describe("project group: folding", () => {
     expect(within(sectionEl(CLIENT.id)).getByTestId("rail-section-chevron")).toHaveAttribute("aria-hidden", "true");
   });
 
+  it("the chevron is a titled icon that folds and unfolds, like a project's", () => {
+    render(<Rail />);
+    const chevron = within(sectionEl(CLIENT.id)).getByTestId("rail-section-chevron");
+    expect(chevron).toHaveAttribute("title", "Collapse Client work");
+    fireEvent.click(chevron);
+    expect(header("Client work")).toHaveAttribute("aria-expanded", "false");
+    expect(chevron).toHaveAttribute("title", "Expand Client work");
+    fireEvent.click(chevron);
+    expect(header("Client work")).toHaveAttribute("aria-expanded", "true");
+  });
+
   it("folded over the active mission, the name reads in ivory; open, it stays mute", () => {
     render(<Rail active="w-api" />);
     const name = within(header("Client work")).getByTestId("rail-section-name");
@@ -558,6 +588,22 @@ describe("project group: the header menu", () => {
     expect(onReorderProjects).toHaveBeenLastCalledWith(["dotfiles", "notebook-cli", "acme-api", "acme-web", "scratch"]);
   });
 
+  it("offers no step the pinned-first order would undo, and never reports an empty order", () => {
+    // acme-api is pinned: its group stands first because of it, above dotfiles.
+    seed(
+      [CLIENT],
+      [info("acme-api", CLIENT.id, { pinned: true }), info("dotfiles"), info("acme-web", CLIENT.id), info("scratch")],
+    );
+    const onReorderProjects = vi.fn();
+    render(<PinnedRail onReorderProjects={onReorderProjects} />);
+    expect(railOrder()).toBe("[g-client: acme-api acme-web] dotfiles scratch");
+    fireEvent.contextMenu(header("Client work"));
+    // Down past dotfiles would be stored and then listed exactly as it is now.
+    expect(within(menu()).queryByRole("menuitem", { name: "Move down" })).toBeNull();
+    expect(within(menu()).queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    expect(onReorderProjects).not.toHaveBeenCalled();
+  });
+
   it("a group at the top of the rail has no Move up", () => {
     seed([CLIENT], [info("acme-api", CLIENT.id), info("scratch")]);
     render(<Rail active={null} />);
@@ -578,6 +624,45 @@ describe("project line: the menu from the keyboard", () => {
     // A plain F10 is not the menu key.
     fireEvent.keyDown(projectLine("dotfiles"), { key: "F10" });
     expect(onProjectContextMenu).toHaveBeenCalledTimes(2);
+  });
+
+  it("a line the keyboard holds keeps the focus when Move to group renders it under another parent", async () => {
+    render(<Rail />);
+    // What App does when a keyboard-opened project menu closes.
+    holdProjectLineFocus("dotfiles");
+    const before = projectLine("dotfiles");
+    expect(before).toHaveFocus();
+    await act(async () => {
+      await moveProjectToGroup("dotfiles", CLIENT.id);
+    });
+    // The project is in the group now: a new element, and it has the focus.
+    const after = projectLine("dotfiles");
+    expect(sectionEl(CLIENT.id)).toContainElement(after);
+    expect(after).not.toBe(before);
+    expect(after).toHaveFocus();
+    // Out of the group again: still on the line.
+    await act(async () => {
+      await moveProjectToGroup("dotfiles", null);
+    });
+    expect(projectLine("dotfiles")).toHaveFocus();
+  });
+
+  it("the hold ends with the user's next key or press, and never takes a focus that went somewhere real", async () => {
+    render(<Rail />);
+    holdProjectLineFocus("dotfiles");
+    // The focus went to a real control (a dialog, a rename input): left alone.
+    header("Side projects").focus();
+    await act(async () => {
+      await moveProjectToGroup("dotfiles", CLIENT.id);
+    });
+    expect(header("Side projects")).toHaveFocus();
+    // A key press ends the hold: a later move does not bring the focus back.
+    holdProjectLineFocus("scratch");
+    fireEvent.keyDown(window, { key: "Tab" });
+    await act(async () => {
+      await moveProjectToGroup("scratch", CLIENT.id);
+    });
+    expect(projectLine("scratch")).not.toHaveFocus();
   });
 
   it("right-click reports a pointer", () => {
@@ -605,12 +690,13 @@ describe("drops at the top level", () => {
     expect(onReorderProjects).toHaveBeenCalledWith(["c", "a", "b"]);
   });
 
-  it("a loose project dropped on a group's project joins the group there", async () => {
+  it("a loose project dropped on any project of a group joins the group as its last project", async () => {
     const onReorderProjects = vi.fn();
     render(<Rail onReorderProjects={onReorderProjects} />);
-    await drop(asProject("scratch", null), asProject("acme-web", CLIENT.id));
+    // On the group's FIRST project: still last.
+    await drop(asProject("scratch", null), asProject("acme-api", CLIENT.id));
     expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "scratch", CLIENT.id);
-    expect(onReorderProjects).toHaveBeenCalledWith(["dotfiles", "acme-api", "scratch", "acme-web", "notebook-cli"]);
+    expect(onReorderProjects).toHaveBeenCalledWith(["dotfiles", "acme-api", "acme-web", "scratch", "notebook-cli"]);
     // The membership is applied at once.
     expect(sectionEl(CLIENT.id).querySelector('[data-rail-project="scratch"]')).not.toBeNull();
   });
@@ -674,6 +760,43 @@ describe("drops at the top level", () => {
     await drop(asProject("scratch", null), asProject("scratch", null));
     expect(onReorderProjects).not.toHaveBeenCalled();
     expect(mockIpc.setItemGroup).not.toHaveBeenCalled();
+  });
+
+  it("holds the list to its own scroll room while a project or a group is dragged", () => {
+    // A block dragged by a transform past the list's foot lengthens what the
+    // list can scroll; auto-scroll would follow it down without end.
+    render(<Rail />);
+    const list = screen.getByTestId("rail-list");
+    const size = (scrollHeight: number, clientHeight: number) => {
+      Object.defineProperty(list, "scrollHeight", { configurable: true, value: scrollHeight });
+      Object.defineProperty(list, "clientHeight", { configurable: true, value: clientHeight });
+    };
+    const scrollTo = (top: number) => {
+      list.scrollTop = top;
+      fireEvent.scroll(list);
+      return list.scrollTop;
+    };
+    const { onDragStart, onDragCancel } = dnd.props as DndContextProps;
+    const start = (data: unknown) =>
+      act(() =>
+        onDragStart?.({ active: { id: "x", data: { current: data } } } as unknown as Parameters<
+          NonNullable<DndContextProps["onDragStart"]>
+        >[0]),
+      );
+    // At rest the list scrolls as far as it likes.
+    size(1000, 600);
+    expect(scrollTo(900)).toBe(900);
+    // A project drag starts: 400px of room, and no more however long the list grows.
+    start({ type: "project", sectionId: null, sortable: { index: 0 } });
+    size(2400, 600);
+    expect(scrollTo(380)).toBe(380);
+    expect(scrollTo(1500)).toBe(400);
+    // Dropped or cancelled: free again.
+    act(() => onDragCancel?.({} as Parameters<NonNullable<DndContextProps["onDragCancel"]>>[0]));
+    expect(scrollTo(1500)).toBe(1500);
+    // A mission rides in the overlay and lengthens nothing: it is not held.
+    start({ type: "mission", workspaceId: "w-api", projectId: "acme-api", groupId: null });
+    expect(scrollTo(1700)).toBe(1700);
   });
 
   it("mounts the drag overlay only for a mission or a mission-group header, never for a project or a group", () => {

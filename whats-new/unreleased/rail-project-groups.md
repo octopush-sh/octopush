@@ -13,4 +13,4 @@ steps:
     action: type
     text: client
 ---
-To group projects, right-click a project and choose **Move to group › New group…**: the new group already holds that project, under a foldable, optionally tinted heading. Drag a project by its grip onto a heading to add it, or out below the list to take it out. The project menu's mission-group action now reads **New mission group**.
+To group projects, right-click a project and choose **Move to group › New group…**: the new group already holds that project, under a foldable, optionally tinted heading. Drag a project by its grip onto a group to add it as the group's last project, or out of the group to take it out. The project menu's mission-group action now reads **New mission group**.
