@@ -692,13 +692,10 @@
               margin-left var(--dur-standard) var(--ease-octo),
               visibility 0s linear var(--demote-vis-delay, 0s);
 }
+/* One rung for every mode. With a second, later rung for the modes that
+   have no control tail, the switcher changed width as the mode changed, and
+   the segment under the pointer became another mode mid-click. */
 @container octo-modeband (max-width: 720px) {
-  .octo-modeband[data-tail="control"] .octo-mode-seg:not([aria-pressed="true"]) > .octo-demote-mode-label {
-    max-width: 0; opacity: 0; margin-left: -6px;
-    visibility: hidden; --demote-vis-delay: var(--dur-standard);
-  }
-}
-@container octo-modeband (max-width: 600px) {
   .octo-mode-seg:not([aria-pressed="true"]) > .octo-demote-mode-label {
     max-width: 0; opacity: 0; margin-left: -6px;
     visibility: hidden; --demote-vis-delay: var(--dur-standard);

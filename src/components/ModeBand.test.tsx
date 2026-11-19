@@ -54,7 +54,7 @@ describe("ModeBand", () => {
     expect(band.dataset.tail).toBeUndefined();
   });
 
-  it("is a ladder: labels shed at 720px beside a control and at 600px anywhere; a control tail goes whole at 334px", async () => {
+  it("is a ladder: inactive labels shed at 720px in every mode; a control tail goes whole at 334px", async () => {
     // jsdom runs no container queries, so this reads the rungs from the sheet.
     // @ts-expect-error node:fs is untyped in this project
     const fs = await import("node:fs");
@@ -62,16 +62,15 @@ describe("ModeBand", () => {
     expect(css).toMatch(/\.octo-modeband\s*\{[^}]*container-type:\s*inline-size;[^}]*container-name:\s*octo-modeband/);
     const rung = (px: number) =>
       css.match(new RegExp(`@container octo-modeband \\(max-width: ${px}px\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "";
-    // Beside a control tail the labels go first, before a session's cell does.
-    expect(rung(720)).toContain(
-      '.octo-modeband[data-tail="control"] .octo-mode-seg:not([aria-pressed="true"]) > .octo-demote-mode-label',
-    );
-    expect(rung(720)).toMatch(/max-width:\s*0;/);
+    // One rung for every mode: the switcher must not change width with the
+    // mode, or the segment under the pointer becomes another mode mid-click.
     // Only the modes that are not pressed lose their label, and they leave
     // the layout entirely (hidden, not just transparent).
-    expect(rung(600)).toMatch(/^\s*\.octo-mode-seg:not\(\[aria-pressed="true"\]\) > \.octo-demote-mode-label/);
-    expect(rung(600)).toMatch(/max-width:\s*0;/);
-    expect(rung(600)).toMatch(/visibility:\s*hidden;/);
+    expect(rung(720)).toMatch(/^\s*\.octo-mode-seg:not\(\[aria-pressed="true"\]\) > \.octo-demote-mode-label/);
+    expect(rung(720)).not.toContain("data-tail");
+    expect(rung(720)).toMatch(/max-width:\s*0;/);
+    expect(rung(720)).toMatch(/visibility:\s*hidden;/);
+    expect(rung(600)).toBe("");
     // A hidden control is out of the tab order, not merely out of sight.
     expect(rung(334)).toMatch(/\.octo-modeband-control\s*\{\s*visibility:\s*hidden;/);
   });

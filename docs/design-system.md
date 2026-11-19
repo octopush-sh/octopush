@@ -407,12 +407,11 @@ The dot-for-label swap at the last rung is §9's "a state shown by a dot does no
 
 | Rung | Sheds | Where it survives |
 |------|-------|-------------------|
-| ≤ 720px, beside a control tail (Run's session line) | the **inactive** modes' labels → their icon | each segment's `title` (`Review (⌘⇧3)`) and accessible name |
-| ≤ 600px, in every mode | the same labels | the same |
+| ≤ 720px, in every mode | the **inactive** modes' labels → their icon | each segment's `title` (`Review (⌘⇧3)`) and accessible name |
 | ≤ 334px | a control tail, whole (`visibility: hidden`, so nothing clipped stays in the tab order) | `⌘⌥K` and the session shortcuts |
 | floor | *nothing more* — the switcher, and the **active** mode's label: the band never stops naming where you are | — |
 
-A redundant word goes before a session's cell does: beside the session line the labels shed sooner (720px), because they buy the line about 73px, six cells instead of a fold; with a read-out tail they stay until a centred, fully labelled switcher would leave each side track under 120px (600px). The label is a rung inside a button (`.octo-demote-mode-label`): no gap or focus-ring room of its own, and a negative margin that eats the button's icon gap. The switcher's indicator re-measures as the segments resize.
+A redundant word goes before a session's cell does: the labels buy Run's session line about 73px, six cells instead of a fold. The rung is the same in every mode on purpose. If Talk, Review and Direct kept their labels longer than Run, the switcher would change width as the mode changed, and the segment under the pointer would become another mode mid-click. The label is a rung inside a button (`.octo-demote-mode-label`): no gap or focus-ring room of its own, and a negative margin that eats the button's icon gap. The switcher's indicator re-measures as the segments resize.
 
 The right track also has a **floor of its own** when the tail is a control: `ModeBand`'s `tailMin` (the session line's `LINE_FLOOR_PX`, 119px: the fold button, the focused session's cell, `+`, the hairline and the layout button). The grid is `minmax(0,1fr) auto minmax(tailMin,1fr)`, so when room runs short the empty left track gives up its share first and the switcher slides off centre rather than the control losing a button. A read-out tail (Talk, Review, Direct) has no floor and truncates in its track as before, with more room than it had.
 
