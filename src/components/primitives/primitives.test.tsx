@@ -239,8 +239,9 @@ describe("MidTruncate — review fixes (#807)", () => {
     const box = container.querySelector(".octo-midtrunc")!;
     const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
     expect(box).toHaveAttribute("data-elided");
-    // 70px of room, 9 of them reserved for the `…`: 8 glyphs (56px) fit.
-    expect(head.style.maxWidth).toBe("56px");
+    // 70px of room, 9 of them reserved for the `…`: 8 glyphs (56px) fit, and
+    // the head is sized to hold them and its own `…` (+ the rounding slack).
+    expect(head.style.maxWidth).toBe("65.5px");
 
     // The row widens until the whole head fits: the stale cut must go.
     room = (text.length - 14) * GLYPH;
@@ -305,13 +306,14 @@ describe("MidTruncate — review fixes (#807)", () => {
       act(flushFrames);
       const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
       expect(container.querySelector(".octo-midtrunc")).toHaveAttribute("data-elided");
-      const headPx = parseFloat(head.style.maxWidth);
+      // The head holds its kept glyphs, then its own `…` (and the slack).
+      const glyphsPx = parseFloat(head.style.maxWidth) - ELL - 0.5;
       // Whole glyphs only, so the head's last glyph is never clipped…
-      expect(headPx % GLYPH).toBe(0);
-      // …and with the `…` beside it, everything fits.
-      expect(headPx + ELL + tailPx).toBeLessThanOrEqual(boxPx);
+      expect(glyphsPx % GLYPH).toBe(0);
+      // …and with the `…` after them, everything fits.
+      expect(glyphsPx + ELL + tailPx).toBeLessThanOrEqual(boxPx);
       // As much head as fits: one more glyph would overflow.
-      expect(headPx + GLYPH + ELL + tailPx).toBeGreaterThan(boxPx);
+      expect(glyphsPx + GLYPH + ELL + tailPx).toBeGreaterThan(boxPx);
       unmount();
     }
   });
@@ -378,7 +380,7 @@ describe("MidTruncate — review fixes (#807)", () => {
     expect(screen.getByRole("button", { name: text })).toBeInTheDocument();
     act(flushFrames);
     expect(container.querySelector(".octo-midtrunc")).toHaveAttribute("data-elided");
-    // The ellipsis is a real glyph, hidden from assistive tech — not CSS content.
+    // The `…` ruler is a real glyph, hidden from assistive tech.
     const ell = container.querySelector(".octo-midtrunc-ell")!;
     expect(ell).toHaveAttribute("aria-hidden", "true");
     expect(ell.textContent).toBe("…");
@@ -506,5 +508,81 @@ describe("MidTruncate — follow-ups (#833)", () => {
     // Adding or dropping the lead still re-seats: it changes the box.
     rerender(<MidTruncate text={text} tail={14} />);
     expect(frames).toHaveLength(1);
+  });
+});
+
+/** The real stylesheet, comments stripped. Vitest blanks CSS imports, so read
+ *  the file (Vitest runs from the repo root); the app ships no @types/node. */
+async function stylesCss(): Promise<string> {
+  // @ts-expect-error node:fs is untyped in this project
+  const fs = await import("node:fs");
+  return (fs.readFileSync("src/styles.css", "utf8") as string).replace(/\/\*[\s\S]*?\*\//g, "");
+}
+
+describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
+  let frames: FrameRequestCallback[] = [];
+  const flushFrames = () => {
+    const run = frames;
+    frames = [];
+    run.forEach((cb) => cb(0));
+  };
+  const GLYPH = 7;
+  const ELL = 9;
+  let room = 0;
+  const realRangeRect = Range.prototype.getBoundingClientRect;
+
+  beforeEach(() => {
+    frames = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? room : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      const inEll = this.startContainer.parentElement?.classList.contains("octo-midtrunc-ell");
+      const w = (this.endOffset - this.startOffset) * (inEll ? ELL : GLYPH);
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    Range.prototype.getBoundingClientRect = realRangeRect;
+  });
+
+  it("holds the head at clip only while measuring, never once it is cut", async () => {
+    const css = await stylesCss();
+    const head = /([^{}]*\.octo-midtrunc-head[^{]*)\{([^}]*)\}/g;
+    const clips = Array.from(css.matchAll(head))
+      .filter((m) => /text-overflow\s*:\s*clip/.test(m[2]))
+      .map((m) => m[1].trim());
+    expect(clips).toEqual([".octo-midtrunc[data-measuring] .octo-midtrunc-head"]);
+    // The base head rule clips its overflow WITH an ellipsis.
+    expect(css).toMatch(/\.octo-midtrunc-head\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
+  });
+
+  it("never shows the `…` ruler: the head's ellipsis is the only one drawn", async () => {
+    const css = await stylesCss();
+    const rules = Array.from(css.matchAll(/([^{}]*\.octo-midtrunc-ell[^{]*)\{([^}]*)\}/g));
+    expect(rules.map((m) => m[1].trim())).toEqual([".octo-midtrunc-ell"]);
+    expect(rules[0][2]).toMatch(/width:\s*0;/);
+    expect(rules[0][2]).toMatch(/visibility:\s*hidden;/);
+    expect(css).not.toMatch(/\[data-elided\]/);
+  });
+
+  it("sizes the cut head to its kept glyphs plus its own `…`", () => {
+    // The top bar's long project name, in a box the head can't fill.
+    const name = "octopush-enterprise-monorepo-with-a-very-long-name";
+    room = 80;
+    const { container } = render(<MidTruncate text={name} tail={12} />);
+    act(flushFrames);
+    const box = container.querySelector(".octo-midtrunc")!;
+    const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
+    expect(box).toHaveAttribute("data-elided");
+    expect(box).not.toHaveAttribute("data-measuring");
+    // 80px less 9 for the `…`: 10 glyphs (70px) fit; the head holds them,
+    // then the engine's `…`, so it ends exactly where the tail starts.
+    expect(head.style.maxWidth).toBe(`${10 * GLYPH + ELL + 0.5}px`);
+    expect(readable(container)).toBe(name);
   });
 });

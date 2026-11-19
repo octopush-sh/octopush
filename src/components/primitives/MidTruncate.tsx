@@ -25,8 +25,8 @@ interface Props {
  *
  *  CSS does the layout (design-system §6, `.octo-midtrunc`): the head
  *  ellipsizes into whatever space is left over and the tail is pinned, so the
- *  elision point tracks the container's width. A layout pass then seats the
- *  `…` flush against the tail (`seatEllipsis`, #750), re-run whenever the
+ *  elision point tracks the container's width. A layout pass then sizes the
+ *  head so its `…` sits flush against the tail (`seatEllipsis`, #750), re-run whenever the
  *  nearest ancestor with a definite width resizes (`widthAnchor`).
  *  The parent should still give it a DEFINITE width — a `flex-1 min-w-0`
  *  item, as in the rail and the ContextHeader. Inside a shrink-to-fit parent
@@ -72,9 +72,10 @@ export function MidTruncate({ text, tail = 12, lead, className = "" }: Props) {
       <span ref={headRef} className="octo-midtrunc-head">
         {headText}
       </span>
-      {/* A real glyph, not CSS `content`: hidden from the accessibility tree
-          (the accessible name stays the clean full string) and from a copy,
-          and shown only once `seatEllipsis` has cut the head (`data-elided`). */}
+      {/* The ruler for the engine's `…`: a real glyph in the box's font,
+          zero-width and invisible, so `seatEllipsis` can reserve its width
+          beside the cut. Never shown — the head draws its own ellipsis — and
+          hidden from the accessibility tree and from a copy. */}
       <span className="octo-midtrunc-ell" aria-hidden="true">
         …
       </span>
@@ -230,15 +231,18 @@ function sizedByContent(el: HTMLElement): boolean {
  *  empty room AFTER the ellipsis — a gap between `…` and the tail that changes
  *  from row to row, and a visible space when the cut lands after a word. CSS
  *  can't shrink a box to its ellipsized text, so once the head overflows we
- *  cut it ourselves: `data-elided` swaps the head to `text-overflow: clip` and
- *  shows the real, `aria-hidden` `…` span before the tail, and the head's
- *  `max-width` is set to the last grapheme boundary that fits beside the
- *  `…` (its width is reserved; trailing whitespace dropped). Any slack then falls after the tail, where it is just
- *  row space. The full string stays in the DOM, so it is still selectable and
- *  copyable. Right-to-left text keeps the plain CSS ellipsis: the range maths
- *  below measures from the left edge. Without layout (tests, SSR) the CSS
- *  ellipsis is also the fallback. Synchronous; the component batches the
- *  same three steps across every instance (`flush`). */
+ *  size it ourselves: its `max-width` becomes the last grapheme boundary that
+ *  fits beside the `…` (trailing whitespace dropped) PLUS the `…`'s measured
+ *  width, so the engine's own ellipsis lands right after that glyph and the
+ *  box ends with it. The head never switches to `text-overflow: clip` once
+ *  cut (#864): a clip with a `…` drawn beside it reads, to WebKit and to the
+ *  visual audit alike, as text cut with no ellipsis. Any slack then falls
+ *  after the tail, where it is just row space. The full string stays in the
+ *  DOM, so it is still selectable and copyable. Right-to-left text keeps the
+ *  plain CSS ellipsis: the range maths below measures from the left edge.
+ *  Without layout (tests, SSR) the CSS ellipsis is also the fallback.
+ *  Synchronous; the component batches the same three steps across every
+ *  instance (`flush`). */
 export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
   reset(box, head);
   applyCut(box, head, measureCut(box, head, ellOf(box)));
@@ -250,6 +254,11 @@ function ellOf(box: HTMLElement): HTMLElement | null {
 
 /** Float noise in range maths, not a rounding allowance: the cut must fit. */
 const EPS = 0.01;
+/** Added to the head's width after the cut, so layout rounding (WebKit lays
+ *  out in 1/64px) can never drop the last fitting glyph before the engine's
+ *  `…`. Far narrower than any glyph, so it can never let one more in either;
+ *  flex-shrink still caps the head at the room it has. */
+const SEAT_SLACK = 0.5;
 
 /** `data-measuring` holds the head at `text-overflow: clip` until `applyCut`:
  *  WebKit clips a Range's rects at its own ellipsis point, so measuring under
@@ -262,13 +271,13 @@ function reset(box: HTMLElement, head: HTMLElement) {
   head.style.maxWidth = "";
 }
 
-/** The head's new `max-width` in px, or `null` to keep the CSS ellipsis
- *  (nothing to cut, RTL, or no layout). Reads only.
+/** The head's new `max-width` in px — the glyphs that fit, then room for the
+ *  engine's `…` — or `null` to keep the CSS ellipsis as laid out (nothing to
+ *  cut, RTL, or no layout). Reads only.
  *
- *  `room` is the head's own width, read while the `…` span takes no room
- *  (`.octo-midtrunc-ell` is zero-width until `data-elided`); the span's
- *  glyph is laid out all the same, so its width is measured in the same
- *  layout and subtracted — head + `…` + tail never exceed the box. */
+ *  `room` is the head's own width; the `…` is measured on the ruler span
+ *  (`.octo-midtrunc-ell`, zero-width and invisible, in the box's font) and
+ *  subtracted — kept glyphs + `…` + tail never exceed the box. */
 function measureCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null): number | null {
   if (getComputedStyle(box).direction === "rtl") return null;
   const node = head.firstChild;
@@ -286,10 +295,10 @@ function measureCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null
   };
   // The whole head fits: nothing is cut, so no `…` either.
   if (widthTo(node.length) <= full + EPS) return null;
-  const room = full - ellipsisWidth(ell, range);
-  const fit = lastFitting(graphemeBoundaries(node.data), widthTo, room);
+  const ellPx = ellipsisWidth(ell, range);
+  const fit = lastFitting(graphemeBoundaries(node.data), widthTo, full - ellPx);
   if (fit >= node.length) return null;
-  return widthTo(trimTrailingSpace(node.data, fit));
+  return widthTo(trimTrailingSpace(node.data, fit)) + ellPx + SEAT_SLACK;
 }
 
 function ellipsisWidth(ell: HTMLElement | null, range: Range): number {
