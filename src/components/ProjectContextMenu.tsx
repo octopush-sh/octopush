@@ -12,6 +12,7 @@ import {
   PinOff,
   ChevronUp,
   ChevronDown,
+  Group as GroupIcon,
 } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
 import { MENU_DANGER_MULTILINE, MENU_HEADER, MENU_ITEM, MENU_SEP } from "../lib/menuStyles";
@@ -29,6 +30,8 @@ interface Props {
   onChangeTint: () => void;
   onSetJiraProjectKey?: () => void;
   onViewArchived: () => void;
+  /** Create an empty mission group in this project (its name opens in edit). */
+  onNewGroup?: () => void;
   pinned: boolean;
   canMoveUp: boolean;
   canMoveDown: boolean;
@@ -58,6 +61,7 @@ export function ProjectContextMenu({
   onChangeTint,
   onSetJiraProjectKey,
   onViewArchived,
+  onNewGroup,
   pinned,
   canMoveUp,
   canMoveDown,
@@ -103,6 +107,11 @@ export function ProjectContextMenu({
       {onSetJiraProjectKey && (
         <button type="button" role="menuitem" className={ITEM} onClick={run(onSetJiraProjectKey)}>
           <Link2 size={12} className="shrink-0" /> Set Jira project key…
+        </button>
+      )}
+      {onNewGroup && (
+        <button type="button" role="menuitem" className={ITEM} onClick={run(onNewGroup)}>
+          <GroupIcon size={12} className="shrink-0" /> New group
         </button>
       )}
       <button type="button" role="menuitem" className={ITEM} onClick={run(onViewArchived)}>

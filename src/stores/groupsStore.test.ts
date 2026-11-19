@@ -7,6 +7,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { Group, ProjectInfo, Workspace } from "../lib/types";
 
 const mockIpc = {
+  listWorkspaces: vi.fn<(projectId: string) => Promise<Workspace[]>>(),
+  listRecentProjects: vi.fn<() => Promise<ProjectInfo[]>>(),
   listGroups: vi.fn<() => Promise<Group[]>>(),
   createGroup: vi.fn(),
   renameGroup: vi.fn(),
@@ -19,7 +21,9 @@ vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 const pushToast = vi.fn();
 vi.mock("../components/Toasts", () => ({ pushToast: (t: unknown) => pushToast(t) }));
 
-const { useGroupsStore, sortGroups } = await import("./groupsStore");
+const { useGroupsStore, sortGroups, __resetGroupsStoreInFlight } = await import("./groupsStore");
+const { __resetMembershipGuard } = await import("../lib/membershipGuard");
+const { useRailGroupUi, GROUP_COLLAPSE_KEY, __reloadRailGroupUi } = await import("./railGroupUiStore");
 const { useProjectStore } = await import("./projectStore");
 const { useWorkspaceStore } = await import("./workspaceStore");
 
@@ -96,6 +100,8 @@ const groupNames = () => useGroupsStore.getState().groups.map((g) => g.name);
 beforeEach(() => {
   for (const fn of Object.values(mockIpc)) fn.mockReset();
   pushToast.mockReset();
+  __resetGroupsStoreInFlight();
+  __resetMembershipGuard();
   useGroupsStore.setState({ groups: [], loaded: false });
   useProjectStore.setState({ current: null, recent: [], closed: [] });
   useWorkspaceStore.setState({ workspaces: [], workspacesByProjectId: {} });
@@ -380,5 +386,278 @@ describe("groupsStore: optimistic updates and rollback", () => {
     seedWorkspaces([workspace("w1", "a")]);
     expect(await useGroupsStore.getState().moveItem("workspace", "w1", "a")).toBe(true);
     expect(mockIpc.setItemGroup).not.toHaveBeenCalled();
+  });
+});
+
+describe("groupsStore: a reload never undoes a change it could not have seen", () => {
+  it("concurrent loads share one read, then read once more for the later caller", async () => {
+    const first = deferred<Group[]>();
+    mockIpc.listGroups.mockReturnValueOnce(first.promise).mockResolvedValue([group("a"), group("b", { sortOrder: 1 })]);
+    const one = useGroupsStore.getState().load();
+    const two = useGroupsStore.getState().load();
+    expect(mockIpc.listGroups).toHaveBeenCalledTimes(1);
+    first.resolve([group("a")]);
+    await Promise.all([one, two]);
+    // The second caller asked after the first read began, so it gets a fresh one.
+    expect(mockIpc.listGroups).toHaveBeenCalledTimes(2);
+    expect(groupNames()).toEqual(["a", "b"]);
+  });
+
+  it("a read that raced a create is thrown away and repeated, so the new group stays", async () => {
+    useGroupsStore.setState({ groups: [group("a")] });
+    const stale = deferred<Group[]>();
+    const created = group("made", { sortOrder: 1 });
+    mockIpc.listGroups.mockReturnValueOnce(stale.promise).mockResolvedValue([group("a"), created]);
+    mockIpc.createGroup.mockResolvedValue(created);
+
+    const loading = useGroupsStore.getState().load();
+    await useGroupsStore.getState().create({ scope: "workspace", projectId: "p1", name: "made" });
+    // The read began before the create: it does not know the new group.
+    stale.resolve([group("a")]);
+    await loading;
+
+    expect(groupNames()).toEqual(["a", "made"]);
+    expect(mockIpc.listGroups).toHaveBeenCalledTimes(2);
+  });
+
+  it("a read waits for a rename in flight instead of putting the old name back", async () => {
+    useGroupsStore.setState({ groups: [group("a", { name: "Old" })] });
+    const renaming = deferred();
+    mockIpc.renameGroup.mockReturnValue(renaming.promise);
+    mockIpc.listGroups.mockResolvedValue([group("a", { name: "New" })]);
+
+    const rename = useGroupsStore.getState().rename("a", "New");
+    const loading = useGroupsStore.getState().load();
+    await Promise.resolve();
+    expect(mockIpc.listGroups).not.toHaveBeenCalled();
+    renaming.resolve();
+    await Promise.all([rename, loading]);
+    expect(mockIpc.listGroups).toHaveBeenCalledTimes(1);
+    expect(groupNames()).toEqual(["New"]);
+  });
+
+  it("a move survives a loadAllWorkspaces that was already in flight", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1"), workspace("w2")]);
+    const staleRows = deferred<Workspace[]>();
+    mockIpc.listWorkspaces.mockReturnValueOnce(staleRows.promise);
+    mockIpc.setItemGroup.mockResolvedValue(undefined);
+
+    // The reload reads the rows, then the move lands, then the reload returns.
+    const reload = useWorkspaceStore.getState().loadAllWorkspaces(["p1"]);
+    await useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    staleRows.resolve([workspace("w1"), workspace("w2")]);
+    await reload;
+
+    expect(useWorkspaceStore.getState().workspacesByProjectId.p1.find((w) => w.id === "w1")?.groupId).toBe("g1");
+    expect(useWorkspaceStore.getState().workspacesByProjectId.p1.find((w) => w.id === "w2")?.groupId).toBeNull();
+  });
+
+  it("a move still in flight survives a reload that lands before the backend answers", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1")]);
+    const moving = deferred();
+    mockIpc.setItemGroup.mockReturnValue(moving.promise);
+    mockIpc.listWorkspaces.mockResolvedValue([workspace("w1")]);
+
+    const move = useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    await useWorkspaceStore.getState().load("p1");
+    expect(workspaceGroup("w1")).toBe("g1");
+    moving.resolve();
+    await move;
+    expect(workspaceGroup("w1")).toBe("g1");
+  });
+
+  it("a refused move is not kept alive by the guard", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1")]);
+    mockIpc.setItemGroup.mockRejectedValue("other: refused");
+    mockIpc.listWorkspaces.mockResolvedValue([workspace("w1")]);
+
+    await useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    await useWorkspaceStore.getState().load("p1");
+    expect(workspaceGroup("w1")).toBeNull();
+  });
+
+  it("a reload that began after the move settled is trusted", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1")]);
+    mockIpc.setItemGroup.mockResolvedValue(undefined);
+    await useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    // Something else (another window, a later action) moved it out again.
+    mockIpc.listWorkspaces.mockResolvedValue([workspace("w1")]);
+    await useWorkspaceStore.getState().load("p1");
+    expect(workspaceGroup("w1")).toBeNull();
+  });
+
+  it("a batch reload of two projects commits a move that started between its two reads", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1"), workspace("x1", null, "p2")]);
+    const slow = deferred<Workspace[]>();
+    mockIpc.listWorkspaces.mockImplementation((projectId) =>
+      projectId === "p1" ? Promise.resolve([workspace("w1")]) : slow.promise,
+    );
+    mockIpc.setItemGroup.mockResolvedValue(undefined);
+
+    // p1's rows come back at once; p2's read is still out, so nothing is
+    // committed yet. The move lands in between.
+    const reload = useWorkspaceStore.getState().loadAllWorkspaces(["p1", "p2"]);
+    await Promise.resolve();
+    await useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    slow.resolve([workspace("x1", null, "p2")]);
+    await reload;
+
+    expect(workspaceGroup("w1")).toBe("g1");
+    expect(useWorkspaceStore.getState().workspacesByProjectId.p2.map((w) => w.groupId)).toEqual([null]);
+  });
+
+  it("a batch reload of two projects does not bring back a move refused between its two reads", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seedWorkspaces([workspace("w1"), workspace("x1", null, "p2")]);
+    const slow = deferred<Workspace[]>();
+    const moving = deferred();
+    mockIpc.setItemGroup.mockReturnValue(moving.promise);
+    mockIpc.listWorkspaces.mockImplementation((projectId) =>
+      projectId === "p1" ? Promise.resolve([workspace("w1")]) : slow.promise,
+    );
+
+    // The move is in flight when p1's rows come back, and refused before the
+    // batch commits.
+    const move = useGroupsStore.getState().moveItem("workspace", "w1", "g1");
+    const reload = useWorkspaceStore.getState().loadAllWorkspaces(["p1", "p2"]);
+    await Promise.resolve();
+    moving.reject("other: refused");
+    expect(await move).toBe(false);
+    slow.resolve([workspace("x1", null, "p2")]);
+    await reload;
+
+    expect(workspaceGroup("w1")).toBeNull();
+  });
+
+  it("closing a project rereads both lists without undoing a project move made meanwhile", async () => {
+    useGroupsStore.setState({ groups: [group("top", { scope: "project", projectId: null })] });
+    useProjectStore.setState({ recent: [project("p1"), project("p2")], closed: [] });
+    const slowClosed = deferred<ProjectInfo[]>();
+    Object.assign(mockIpc, {
+      closeProject: vi.fn().mockResolvedValue(undefined),
+      listClosedProjects: vi.fn().mockReturnValue(slowClosed.promise),
+    });
+    mockIpc.listRecentProjects.mockResolvedValue([project("p1")]);
+    mockIpc.setItemGroup.mockResolvedValue(undefined);
+
+    const closing = useProjectStore.getState().closeProject("p2");
+    await Promise.resolve();
+    await Promise.resolve();
+    await useGroupsStore.getState().moveItem("project", "p1", "top");
+    slowClosed.resolve([project("p2")]);
+    await closing;
+
+    expect(projectGroup("p1")).toBe("top");
+  });
+
+  it("a project move survives a loadRecent that was already in flight", async () => {
+    useGroupsStore.setState({ groups: [group("top", { scope: "project", projectId: null })] });
+    useProjectStore.setState({ recent: [project("p1"), project("p2")] });
+    const staleRows = deferred<ProjectInfo[]>();
+    mockIpc.listRecentProjects.mockReturnValueOnce(staleRows.promise);
+    mockIpc.setItemGroup.mockResolvedValue(undefined);
+
+    const reload = useProjectStore.getState().loadRecent();
+    await useGroupsStore.getState().moveItem("project", "p1", "top");
+    staleRows.resolve([project("p1"), project("p2")]);
+    await reload;
+
+    expect(projectGroup("p1")).toBe("top");
+    expect(projectGroup("p2")).toBeNull();
+  });
+
+  it("the members of a new group survive a reload that began before it existed", async () => {
+    seedWorkspaces([workspace("w1")]);
+    const staleRows = deferred<Workspace[]>();
+    mockIpc.listWorkspaces.mockReturnValueOnce(staleRows.promise);
+    mockIpc.createGroup.mockResolvedValue(group("made"));
+
+    const reload = useWorkspaceStore.getState().load("p1");
+    await useGroupsStore.getState().create({ scope: "workspace", projectId: "p1", name: "made", memberIds: ["w1"] });
+    staleRows.resolve([workspace("w1")]);
+    await reload;
+    expect(workspaceGroup("w1")).toBe("made");
+  });
+});
+
+describe("groupsStore: order and pruning", () => {
+  it("setOrder always sends the complete run of siblings", async () => {
+    useGroupsStore.setState({
+      groups: sortGroups([
+        group("a", { sortOrder: 0 }),
+        group("b", { sortOrder: 1 }),
+        group("c", { sortOrder: 2 }),
+        group("other", { projectId: "p2", sortOrder: 0 }),
+      ]),
+    });
+    mockIpc.setGroupOrder.mockResolvedValue(undefined);
+    // Only the moved group is named: the rest follow in their current order.
+    await useGroupsStore.getState().setOrder(["c"]);
+    expect(mockIpc.setGroupOrder).toHaveBeenCalledWith(["c", "a", "b"]);
+    expect(groupNames()).toEqual(["c", "a", "b", "other"]);
+  });
+
+  it("setOrder ignores ids that are not siblings, and an unchanged order sends nothing", async () => {
+    useGroupsStore.setState({
+      groups: sortGroups([group("a", { sortOrder: 0 }), group("b", { sortOrder: 1 }), group("other", { projectId: "p2" })]),
+    });
+    mockIpc.setGroupOrder.mockResolvedValue(undefined);
+    expect(await useGroupsStore.getState().setOrder(["a", "b"])).toBe(true);
+    expect(mockIpc.setGroupOrder).not.toHaveBeenCalled();
+    await useGroupsStore.getState().setOrder(["b", "other", "a"]);
+    expect(mockIpc.setGroupOrder).toHaveBeenCalledWith(["b", "a"]);
+  });
+
+  it("a failed reorder doesn't undo a newer one", async () => {
+    useGroupsStore.setState({
+      groups: sortGroups([group("a", { sortOrder: 0 }), group("b", { sortOrder: 1 }), group("c", { sortOrder: 2 })]),
+    });
+    const first = deferred();
+    mockIpc.setGroupOrder.mockReturnValueOnce(first.promise).mockResolvedValueOnce(undefined);
+
+    const failing = useGroupsStore.getState().setOrder(["c", "a", "b"]);
+    await useGroupsStore.getState().setOrder(["b", "c", "a"]);
+    first.reject("other: locked");
+    expect(await failing).toBe(false);
+    // The newer order, which the backend accepted, stands.
+    expect(groupNames()).toEqual(["b", "c", "a"]);
+  });
+
+  it("a load prunes the stored folds of groups that no longer exist", async () => {
+    localStorage.setItem(GROUP_COLLAPSE_KEY, JSON.stringify({ kept: true, gone: true, "also-gone": true }));
+    __reloadRailGroupUi();
+    useRailGroupUi.getState().startRename("gone");
+    mockIpc.listGroups.mockResolvedValue([group("kept"), group("open")]);
+    await useGroupsStore.getState().load();
+    expect(useRailGroupUi.getState().collapsed).toEqual({ kept: true });
+    expect(JSON.parse(localStorage.getItem(GROUP_COLLAPSE_KEY)!)).toEqual({ kept: true });
+    expect(useRailGroupUi.getState().renamingId).toBeNull();
+  });
+
+  it("a failed load leaves the stored folds alone", async () => {
+    localStorage.setItem(GROUP_COLLAPSE_KEY, JSON.stringify({ a: true }));
+    __reloadRailGroupUi();
+    mockIpc.listGroups.mockRejectedValue("db error: locked");
+    await useGroupsStore.getState().load();
+    expect(JSON.parse(localStorage.getItem(GROUP_COLLAPSE_KEY)!)).toEqual({ a: true });
+    localStorage.removeItem(GROUP_COLLAPSE_KEY);
+    __reloadRailGroupUi();
+  });
+
+  it("pruneProject forgets a closed or deleted project's groups only", () => {
+    useGroupsStore.setState({
+      groups: sortGroups([
+        group("mine"),
+        group("theirs", { projectId: "p2" }),
+        group("top", { scope: "project", projectId: null }),
+      ]),
+    });
+    useGroupsStore.getState().pruneProject("p1");
+    expect(groupNames()).toEqual(["top", "theirs"]);
   });
 });

@@ -90,6 +90,13 @@ import { useShallow } from "zustand/react/shallow";
 import { hasActiveDirectRun } from "./lib/runningWorkspaces";
 import { useBudgetsStore } from "./stores/budgetsStore";
 import type { ProjectGroup } from "./components/WorkspaceRail";
+import { useGroupsStore } from "./stores/groupsStore";
+import { missionGroupsOf } from "./lib/railGroups";
+import { createMissionGroup, moveMissionToGroup } from "./lib/groupActions";
+import type { Group } from "./lib/types";
+
+/** What the mission menu's group selector returns while no menu is open. */
+const NO_GROUPS: Group[] = [];
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
@@ -403,6 +410,9 @@ function App() {
   const [searchMode, setSearchMode] = useState<"files" | "text">("files");
   const [showCreator, setShowCreator] = useState(false);
   const [creatorProjectId, setCreatorProjectId] = useState<string | null>(null);
+  // Set when the creator was opened from a mission group's "+": the new
+  // mission joins that group.
+  const [creatorGroupId, setCreatorGroupId] = useState<string | null>(null);
   const [customizingWorkspaceId, setCustomizingWorkspaceId] = useState<string | null>(null);
   const [renamingWorkspace, setRenamingWorkspace] = useState<{ id: string; name: string } | null>(null);
   // When the user opens NewProjectFlow from the switcher (not from the welcome
@@ -412,6 +422,20 @@ function App() {
   const [showAddProject, setShowAddProject] = useState(false);
   // Context menu: which workspace and where
   const [contextMenu, setContextMenu] = useState<{ workspaceId: string; x: number; y: number } | null>(null);
+  // The open mission menu lists its project's groups ("Move to group"). The
+  // selector is that narrow on purpose: with no menu open it returns one
+  // constant, so a group change elsewhere never re-renders the whole shell.
+  const contextMenuProjectId = useMemo(() => {
+    if (!contextMenu) return null;
+    for (const list of Object.values(workspacesByProjectId)) {
+      const hit = list.find((w) => w.id === contextMenu.workspaceId);
+      if (hit) return hit.projectId;
+    }
+    return null;
+  }, [contextMenu, workspacesByProjectId]);
+  const contextMenuGroups = useGroupsStore(
+    useShallow((s) => (contextMenuProjectId ? missionGroupsOf(s.groups, contextMenuProjectId) : NO_GROUPS)),
+  );
   // Jira ticket picker modal (from workspace context menu)
   const [jiraTicketPickerOpen, setJiraTicketPickerOpen] = useState<{ workspaceId: string; mode: "link" | "change" } | null>(null);
   // Jira project key editor modal (from project context menu)
@@ -508,6 +532,7 @@ function App() {
     (async () => {
       await loadRecentProjects();
       void loadClosedProjects();
+      void useGroupsStore.getState().load();
       // Check if we have projects stored and no current project
       const state = useProjectStore.getState();
       if (!state.current && state.recent.length > 0) {
@@ -652,6 +677,10 @@ function App() {
 
     const ids = Array.from(projectIds);
     loadAllWorkspaces(ids);
+    // Rail groups ride with the rows they group: reread them whenever the
+    // projects and workspaces are, so a group can never be missing for rows
+    // that already point at it.
+    void useGroupsStore.getState().load();
     void useMissionsStore.getState().loadAll(ids);
     const pathById = new Map<string, string>();
     recentProjects.forEach((p) => pathById.set(p.id, p.path));
@@ -694,6 +723,7 @@ function App() {
       if (project) byId.set(project.id, project.path);
       recentProjects.forEach((p) => byId.set(p.id, p.path));
       void loadAllWorkspaces([...byId.keys()]);
+      void useGroupsStore.getState().load();
       void useMissionsStore.getState().loadAll([...byId.keys()]);
       byId.forEach((path, id) => {
         void loadGitSummaries(id);
@@ -2015,6 +2045,7 @@ function App() {
       try {
         await closeProjectAction(projectId); // soft-close; clears current if active (C2)
         pruneProject(projectId); // drop its workspaces from the rail map (C8)
+        useGroupsStore.getState().pruneProject(projectId); // and its mission groups
         pushToast({
           level: "success",
           title: "Project closed",
@@ -2063,6 +2094,7 @@ function App() {
         await loadRecentProjects();
         await loadClosedProjects();
         pruneProject(projectId);
+        useGroupsStore.getState().pruneProject(projectId);
 
         // If current project was deleted, go to welcome screen
         if (project?.id === projectId) {
@@ -2273,6 +2305,12 @@ function App() {
         onContextMenu={(workspaceId, x, y) => setContextMenu({ workspaceId, x, y })}
         onNewWorkspaceForProject={(projectId) => {
           setCreatorProjectId(projectId);
+          setCreatorGroupId(null);
+          setShowCreator(true);
+        }}
+        onNewWorkspaceInGroup={(projectId, groupId) => {
+          setCreatorProjectId(projectId);
+          setCreatorGroupId(groupId);
           setShowCreator(true);
         }}
         onAddProject={() => setShowAddProject(true)}
@@ -2566,6 +2604,7 @@ function App() {
                   onDismiss={() => {
                     setShowCreator(false);
                     setCreatorProjectId(null);
+                    setCreatorGroupId(null);
                   }}
                 >
                 <div className="absolute inset-0 z-50 bg-octo-bg octo-fade-in">
@@ -2573,13 +2612,16 @@ function App() {
                     projectId={targetProject.id}
                     projectPath={targetProject.path}
                     projectJiraKey={targetProject.jiraProjectKey}
+                    groupId={creatorGroupId}
                     onCreated={() => {
                       setShowCreator(false);
                       setCreatorProjectId(null);
+                      setCreatorGroupId(null);
                     }}
                     onCancel={() => {
                       setShowCreator(false);
                       setCreatorProjectId(null);
+                      setCreatorGroupId(null);
                     }}
                   />
                 </div>
@@ -2868,6 +2910,7 @@ function App() {
               setArchivedForProject({ id: proj.id, name: proj.name, path: proj.path });
               setProjectContextMenu(null);
             }}
+            onNewGroup={() => void createMissionGroup(proj.id)}
             pinned={proj.pinned}
             canMoveUp={projectGroups.findIndex((g) => g.id === projectContextMenu.projectId) > 0}
             canMoveDown={(() => {
@@ -2913,6 +2956,7 @@ function App() {
             projectPath={archivedForProject.path}
             onRestored={(pid) => {
               void loadAllWorkspaces([pid]);
+              void useGroupsStore.getState().load();
               void loadGitSummaries(pid);
               const p = recentProjects.find((x) => x.id === pid)?.path ?? (project?.id === pid ? project.path : undefined);
               if (p) void loadProjectPrs(pid, p);
@@ -3000,6 +3044,7 @@ function App() {
           setContextMenu(null);
           await copyToClipboard(text, label);
         };
+        const wsGroups = contextMenuGroups;
         return (
           <ErrorBoundary surface="Workspace menu" variant="overlay" onDismiss={() => setContextMenu(null)}>
           <WorkspaceContextMenu
@@ -3062,6 +3107,11 @@ function App() {
               await useWorkspaceStore.getState().load(workspace.projectId);
               setContextMenu(null);
             }}
+            groups={wsGroups}
+            groupId={wsGroups.some((g) => g.id === workspace.groupId) ? workspace.groupId : null}
+            onMoveToGroup={(groupId) => void moveMissionToGroup(workspace.id, groupId)}
+            onNewGroup={() => void createMissionGroup(workspace.projectId, workspace.id)}
+            onRemoveFromGroup={() => void moveMissionToGroup(workspace.id, null)}
           />
           </ErrorBoundary>
         );

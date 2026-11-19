@@ -5,7 +5,13 @@ import { useTerminalsStore } from "./terminalsStore";
 import { useTerminalLayoutStore } from "./terminalLayoutStore";
 import { useCollisionStore } from "./collisionStore";
 import { pushToast } from "../components/Toasts";
+import { beginMembershipLoad } from "../lib/membershipGuard";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
+
+// `load` and `loadAllWorkspaces` run under the membership guard
+// (`lib/membershipGuard.ts`): a group move the read could have missed is laid
+// over the rows in the step that commits them, so a reload in flight never
+// undoes a move, and never brings back one the backend refused.
 
 interface WorkspaceState {
   workspaces: Workspace[];
@@ -18,6 +24,12 @@ interface WorkspaceState {
    * jumping to the first one in the list.
    */
   lastActiveByProject: Record<string, string>;
+  /** The workspace the app made active by itself when it launched (the
+   *  remembered one of the project it reopened, or that project's first), as
+   *  opposed to one somebody activated. `undefined` until the first project
+   *  has loaded; `null` when that project had none. The rail reads it to tell
+   *  a restore from an activation: only the latter unfolds a mission group. */
+  launchRestoredId?: string | null;
   /** Workspaces grouped by project ID for hierarchical display in the rail. */
   workspacesByProjectId: Record<string, Workspace[]>;
   /** Per-workspace git signal for the rail, keyed by workspace id. */
@@ -85,6 +97,13 @@ export const __resetPrFetchThrottle = (): void => {
   prFetchLastAt.clear();
 };
 
+/** Whether `load` has run once: its first pick is the launch restore. */
+let launchLoaded = false;
+/** Test-only: the next `load` is a launch again. */
+export const __resetLaunchRestore = (): void => {
+  launchLoaded = false;
+};
+
 const loadLastActiveFromStorage = (): Record<string, string> => {
   try {
     const stored = localStorage.getItem("lastActiveWorkspacePerProject");
@@ -106,40 +125,54 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   load: async (projectId) => {
     set({ loading: true });
-    const workspaces = await ipc.listWorkspaces(projectId);
-    // Atomic update: pick the activeId in the same set() call so React never
-    // sees a frame with `workspaces.find(activeId) === undefined`, which
-    // would briefly flip activeWorkspace to null and unmount all the
-    // TerminalPanes (killing their PTYs). Prefer the last-active for this
-    // project, fall back to the first workspace.
-    const remembered = get().lastActiveByProject[projectId];
-    const exists = remembered && workspaces.some((w) => w.id === remembered);
-    const nextActive = exists
-      ? remembered
-      : workspaces.length > 0
-        ? workspaces[0].id
-        : null;
-    set((s) => ({
-      workspaces,
-      loading: false,
-      activeId: nextActive,
-      workspacesByProjectId: {
-        ...s.workspacesByProjectId,
-        [projectId]: workspaces,
-      },
-    }));
+    const guard = beginMembershipLoad("workspace");
+    try {
+      const workspaces = guard.overlay(await ipc.listWorkspaces(projectId));
+      // Atomic update: pick the activeId in the same set() call so React never
+      // sees a frame with `workspaces.find(activeId) === undefined`, which
+      // would briefly flip activeWorkspace to null and unmount all the
+      // TerminalPanes (killing their PTYs). Prefer the last-active for this
+      // project, fall back to the first workspace.
+      const remembered = get().lastActiveByProject[projectId];
+      const exists = remembered && workspaces.some((w) => w.id === remembered);
+      const nextActive = exists
+        ? remembered
+        : workspaces.length > 0
+          ? workspaces[0].id
+          : null;
+      // The first project load of the session is the launch restore.
+      const atLaunch = !launchLoaded;
+      launchLoaded = true;
+      set((s) => ({
+        workspaces,
+        loading: false,
+        activeId: nextActive,
+        ...(atLaunch ? { launchRestoredId: nextActive } : {}),
+        workspacesByProjectId: {
+          ...s.workspacesByProjectId,
+          [projectId]: workspaces,
+        },
+      }));
+    } finally {
+      guard.end();
+    }
   },
 
   loadAllWorkspaces: async (projectIds) => {
     if (projectIds.length === 0) return;
     set({ loading: true });
+    const guard = beginMembershipLoad("workspace");
     try {
-      const results = await Promise.all(
+      const fetched = await Promise.all(
         projectIds.map(async (id) => {
           const wss = await ipc.listWorkspaces(id);
           return { projectId: id, workspaces: wss };
         })
       );
+      // One overlay for the whole batch, in the step that commits it: the
+      // batch is written after its slowest read, and a move may have started,
+      // settled or been refused since a faster one returned.
+      const results = fetched.map((r) => ({ ...r, workspaces: guard.overlay(r.workspaces) }));
       set((s) => {
         const newByProject = { ...s.workspacesByProjectId };
         results.forEach(({ projectId, workspaces }) => {
@@ -158,16 +191,22 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           return { workspacesByProjectId: newByProject, loading: false };
         }
         const activeStillExists = current.workspaces.some((w) => w.id === s.activeId);
+        const activeId = activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null);
         return {
           workspacesByProjectId: newByProject,
           loading: false,
           workspaces: current.workspaces,
-          activeId: activeStillExists ? s.activeId : (current.workspaces[0]?.id ?? null),
+          activeId,
+          // At launch this reload can land before `load` picks the remembered
+          // workspace: what it makes active meanwhile is no activation either.
+          ...(!launchLoaded && !activeStillExists ? { launchRestoredId: activeId } : {}),
         };
       });
     } catch (err) {
       console.error("loadAllWorkspaces failed:", err);
       set({ loading: false });
+    } finally {
+      guard.end();
     }
   },
 
