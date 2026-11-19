@@ -15,8 +15,10 @@ const logbookSummary = vi.fn();
 // and the mission's Logbook line both listen for an ingest pass).
 const ingestHandlers = new Set<() => void>();
 const settledHandlers = new Set<(terminalId: string) => void>();
+const sessionHandlers = new Set<(terminalId: string) => void>();
 const onIngested = () => ingestHandlers.forEach((h) => h());
 const onSettled = (terminalId: string) => settledHandlers.forEach((h) => h(terminalId));
+const onSessionChanged = (terminalId: string) => sessionHandlers.forEach((h) => h(terminalId));
 vi.mock("../lib/ipc", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/ipc")>();
   return {
@@ -33,13 +35,16 @@ vi.mock("../lib/ipc", async (importOriginal) => {
         settledHandlers.add(h);
         return Promise.resolve(() => void settledHandlers.delete(h));
       },
+      onClaudeSessionChanged: (h: (terminalId: string) => void) => {
+        sessionHandlers.add(h);
+        return Promise.resolve(() => void sessionHandlers.delete(h));
+      },
     },
   };
 });
 
 import { useTerminalsStore, type TerminalState } from "../stores/terminalsStore";
 import { useMissionsStore } from "../stores/missionsStore";
-import { useReviewSource } from "../stores/reviewSourceStore";
 import type { FileChange, GitStatus, LogbookMissionRow, Mission, SessionUsage } from "../lib/types";
 import type { SessionRole } from "../lib/sessionRole";
 import { changeStats } from "../lib/runChanges";
@@ -47,6 +52,7 @@ import { CompanionRun, spentLabel } from "./CompanionRun";
 
 const WS = "ws-1";
 
+/** A session; an agent one runs Claude Code unless `over.agentCli` says otherwise. */
 const term = (id: string, label: string, role: SessionRole, over: Partial<TerminalState> = {}): TerminalState => ({
   id,
   label,
@@ -55,6 +61,7 @@ const term = (id: string, label: string, role: SessionRole, over: Partial<Termin
   busy: role !== "shell",
   restored: false,
   role,
+  agentCli: role === "agent" ? "claude" : null,
   command: role === "shell" ? null : "cmd",
   ...over,
 });
@@ -123,11 +130,11 @@ beforeEach(() => {
   localStorage.clear();
   ingestHandlers.clear();
   settledHandlers.clear();
+  sessionHandlers.clear();
   getSessionUsage.mockReset().mockResolvedValue(null);
   logbookSummary.mockReset().mockResolvedValue([]);
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {} });
   useMissionsStore.setState({ missionsByProjectId: {}, missionByWorkspaceId: {} });
-  useReviewSource.setState({ committedByWs: {}, pickByWs: {}, pinnedByWs: {} });
 });
 
 describe("CompanionRun · Context", () => {
@@ -151,7 +158,7 @@ describe("CompanionRun · Context", () => {
     expect(within(ctx).getByTestId("run-context-warning").closest("[inert]")).not.toBeNull();
   });
 
-  it("is not drawn for a shell, a dev server or a failed session, and asks nothing about them", async () => {
+  it("is not drawn for a shell, a dev server, a failed or a stopped session, and asks nothing about them", async () => {
     sessions([term("t-shell", "zsh", "shell"), term("t-dev", "API", "dev")], "t-shell");
     getSessionUsage.mockResolvedValue(usage());
     render(<CompanionRun workspaceId={WS} gitStatus={status([])} />);
@@ -163,7 +170,37 @@ describe("CompanionRun · Context", () => {
     act(() => sessions([term("t-fail", "claude", "agent", { failed: true, running: false })], "t-fail"));
     await flush();
     expect(contextSection()).toBeNull();
+    // Its shell has exited: no Claude Code runs in a PTY that is gone.
+    act(() => sessions([term("t-stopped", "claude", "agent", { running: false })], "t-stopped"));
+    await flush();
+    expect(contextSection()).toBeNull();
     expect(getSessionUsage).not.toHaveBeenCalled();
+  });
+
+  it("is not drawn for another agent CLI, and asks nothing about it", async () => {
+    // Codex, aider and the rest share the agent role; only Claude Code has figures.
+    sessions([term("t-codex", "codex", "agent", { agentCli: "codex" }), term("t-old", "agent", "agent", { agentCli: null })], "t-codex");
+    getSessionUsage.mockResolvedValue(usage());
+    render(<CompanionRun workspaceId={WS} gitStatus={status([])} />);
+    await flush();
+    expect(contextSection()).toBeNull();
+    act(() => useTerminalsStore.setState({ activeByWs: { [WS]: "t-old" } }));
+    await flush();
+    expect(contextSection()).toBeNull();
+    expect(getSessionUsage).not.toHaveBeenCalled();
+  });
+
+  it("folds away when Codex takes over a pane that ran Claude Code", async () => {
+    sessions([term("t-a", "Agent", "agent")], "t-a");
+    getSessionUsage.mockResolvedValue(usage());
+    render(<CompanionRun workspaceId={WS} gitStatus={status([])} />);
+    await flush();
+    expect(contextSection()).not.toBeNull();
+    // The store's own rule: the command that replaces the role replaces the CLI.
+    act(() => useTerminalsStore.getState().setBusy(WS, "t-a", true, "codex"));
+    await flush();
+    expect(useTerminalsStore.getState().getTerminals(WS)[0].agentCli).toBe("codex");
+    expect(contextSection()).toBeNull();
   });
 
   it("is not drawn for an agent session with no usage yet, and never shows zeroes", async () => {
@@ -201,13 +238,15 @@ describe("CompanionRun · Context", () => {
     await flush();
     expect(contextSection()).toBeNull();
 
-    // Back on the first: its last answer shows at once, then refreshes.
+    // Back on the first: nothing is shown from memory; its figures return
+    // with a fresh answer.
     act(() => useTerminalsStore.setState({ activeByWs: { [WS]: "t-a" } }));
-    expect(within(contextSection()!).getByTestId("run-context-meter")).toHaveTextContent("148k / 1M");
+    expect(contextSection()).toBeNull();
     await flush();
+    expect(within(contextSection()!).getByTestId("run-context-meter")).toHaveTextContent("148k / 1M");
   });
 
-  it("re-reads on a transcript ingest and when a Claude Code turn ends, never on a timer", async () => {
+  it("re-reads on a session event, a turn ending and a transcript ingest, never on a timer", async () => {
     sessions([term("t-a", "claude", "agent")], "t-a");
     getSessionUsage.mockResolvedValue(usage());
     render(<CompanionRun workspaceId={WS} gitStatus={status([])} />);
@@ -229,16 +268,33 @@ describe("CompanionRun · Context", () => {
     act(() => onSettled("t-other"));
     await flush();
     expect(getSessionUsage).toHaveBeenCalledTimes(4);
+    // Claude Code's SessionStart / SessionEnd, in any terminal.
+    act(() => onSessionChanged("t-a"));
+    await flush();
+    expect(getSessionUsage).toHaveBeenCalledTimes(5);
     expect(getSessionUsage).toHaveBeenLastCalledWith("t-a");
   });
 
-  it("folds away when the backend withdraws the figures (the session may have changed)", async () => {
+  it("folds away the moment the session ends or is cleared, and when a read fails", async () => {
     sessions([term("t-a", "claude", "agent")], "t-a");
-    getSessionUsage.mockResolvedValue(usage());
+    getSessionUsage.mockResolvedValue(usage({ contextTokens: 900_000 }));
     render(<CompanionRun workspaceId={WS} gitStatus={status([])} />);
     await flush();
-    expect(contextSection()).not.toBeNull();
+    expect(within(contextSection()!).getByTestId("run-context-warning")).toHaveTextContent("Past 80%");
+
+    // `/clear` or `/exit`: the backend has no figures for the terminal now.
     getSessionUsage.mockResolvedValue(null);
+    act(() => onSessionChanged("t-a"));
+    await flush();
+    expect(contextSection()).toBeNull();
+
+    // A new conversation's first figures; then a read that fails: the
+    // figures are cleared, not kept from before.
+    getSessionUsage.mockResolvedValue(usage({ contextTokens: 4_000 }));
+    act(() => onIngested());
+    await flush();
+    expect(within(contextSection()!).getByTestId("run-context-meter")).toHaveTextContent("4k / 1M");
+    getSessionUsage.mockRejectedValue(new Error("db is locked"));
     act(() => onIngested());
     await flush();
     expect(contextSection()).toBeNull();
@@ -292,7 +348,8 @@ describe("CompanionRun · Context", () => {
 
   it("never prints an unpriced session's cost as $0.00", () => {
     expect(spentLabel({ spentUsd: 0, calls: 3, unpricedCalls: 3 })).toBe("unpriced");
-    expect(spentLabel({ spentUsd: 1.5, calls: 3, unpricedCalls: 1 })).toBe("$1.50");
+    expect(spentLabel({ spentUsd: 1.5, calls: 3, unpricedCalls: 1 })).toBe("$1.50 · partly unpriced");
+    expect(spentLabel({ spentUsd: 1.5, calls: 3, unpricedCalls: 0 })).toBe("$1.50");
     expect(spentLabel({ spentUsd: 0.004, calls: 1, unpricedCalls: 0 })).toBe("$0.004");
   });
 
@@ -373,14 +430,13 @@ describe("CompanionRun · Changes", () => {
     // Nothing to read in Review: no link.
     expect(screen.queryByRole("button", { name: "Read the diff" })).toBeNull();
 
-    act(() =>
-      useReviewSource.getState().setCommitted(WS, { base: "main", mergeBase: "abc1234", commits: 3, diff: "diff --git a/x b/x\n" }),
-    );
+    const ahead = { commits: 3, base: "main", mergeBase: "abc1234" };
+    rerender(<CompanionRun workspaceId={WS} gitStatus={status([])} ahead={ahead} onReadDiff={onReadDiff} />);
     expect(within(changes).getByTestId("run-changes-ahead")).toHaveTextContent("3 commits ahead of main");
     expect(screen.getByRole("button", { name: "Read the diff" })).toBeInTheDocument();
 
     // Dirty again: the list, not the clean line; the count ahead belongs to the clean state.
-    rerender(<CompanionRun workspaceId={WS} gitStatus={status([file("a.ts")])} onReadDiff={onReadDiff} />);
+    rerender(<CompanionRun workspaceId={WS} gitStatus={status([file("a.ts")])} ahead={ahead} onReadDiff={onReadDiff} />);
     expect(within(changes).queryByTestId("run-changes-clean")).toBeNull();
     expect(within(changes).queryByTestId("run-changes-ahead")).toBeNull();
   });

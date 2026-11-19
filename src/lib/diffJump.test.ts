@@ -107,6 +107,18 @@ describe("revealDiffTargetWhenReady", () => {
     expect(el.scrollIntoView).toHaveBeenCalledTimes(1);
   });
 
+  it("stops without an answer when the user has moved on, even if the section shows up later", async () => {
+    const f = frames();
+    const moved = new AbortController();
+    const found = revealDiffTargetWhenReady("src/a.ts", null, 2000, { signal: moved.signal });
+    f.step(3);
+    moved.abort();
+    const el = addSection("src/a.ts");
+    f.step(2);
+    expect(await found).toBeNull();
+    expect(el.scrollIntoView).not.toHaveBeenCalled();
+  });
+
   it("gives up once the wait has passed", async () => {
     const f = frames();
     const found = revealDiffTargetWhenReady("src/a.ts", null, 100);

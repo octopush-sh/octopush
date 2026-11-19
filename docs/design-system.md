@@ -707,7 +707,7 @@ follow rules 1 and 2; new Companion work follows all three.
 | Talk | The conversation | Which chats; how full the context is and what it cost |
 | Review | The diff | How the change was built; where the branch stands |
 | Direct | The run | The runs and the logbook |
-| Run | Terminals | **Context** (the focused agent session's context meter, spend, cache share and model; folds away for a non-agent session, and whenever the figures aren't certainly that session's) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (the mission's worked time, spend and savings) |
+| Run | Terminals | **Context** (the focused pane's Claude Code session: context meter, spend, cache share and model; not drawn for anything else in the pane, or when Octopush can't tell the figures are that pane's current session's) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (the mission's worked time, spend and savings) |
 
 Run's three sections (`CompanionRun`) follow the spec
 `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 4.
@@ -720,10 +720,12 @@ What they share, for any Companion section built after them:
 - **The eyebrow's `meta` says which one.** A section about one thing (a
   session) or one figure (`3 files · +84 −12`) puts it at the right of its
   eyebrow: mute, in its own case, and the part that truncates.
-- **Figures stay with their owner.** A section that follows the focus shows
-  the focused thing's own last answer or nothing, never another's figures
-  under its name; while it folds away it keeps what it showed until it has
-  left.
+- **Figures stay with their owner.** A section that follows the focus is
+  cleared when the focus moves and shows the newly focused thing's figures
+  only once its own answer arrives; an empty or failed read clears it too.
+  While it folds away it keeps what it showed until it has left. Where the
+  owner can't be established (Run's Context: see `docs/FEATURES.md`,
+  "Session usage"), the section is not drawn.
 - **Label and value rows** are a mono grid: a caps mute label, a sage value.
 - **Brass is spent twice in Run:** the context meter's fill and the serif
   link into Review. A file path keeps its file name whole (`MidTruncate`,

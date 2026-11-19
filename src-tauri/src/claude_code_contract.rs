@@ -1659,6 +1659,67 @@ fn notification_events_journal_their_message() {
     assert!(notes.iter().all(|e| th.allow(e, t0) && th.allow(e, t0)), "[{fx}]");
 }
 
+/// The version whose `SessionStart` / `SessionEnd` payloads were recorded
+/// live (see its README).
+const SESSION_HOOKS_VERSION: &str = "2.1.327";
+
+/// The session hooks (`SessionStart`, `SessionEnd`) say which Claude Code
+/// session a Run terminal runs. Recorded payloads, through the hook binary's
+/// path and the poller's bookkeeping, in the order Claude Code fired them.
+#[test]
+fn session_hook_payloads_move_the_terminal_between_sessions() {
+    use crate::agent_adapter::{parse_hook_event, HookSignal};
+    use crate::claude_hooks::{record_hook_from, remember_sessions};
+    let rec = synthesized(SESSION_HOOKS_VERSION);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db = crate::db::Db::open(tmp.path()).unwrap();
+    let current = || db.terminal_claude_session("term-1").unwrap().map(|(s, _)| s);
+    let session_in = |rel: &str| {
+        let payload = rec.json(rel);
+        require_str(&rec.label(rel), &payload, "transcript_path");
+        require_str(&rec.label(rel), &payload, "cwd");
+        require_str(&rec.label(rel), &payload, "session_id").to_string()
+    };
+    // `claude` starts, `/clear`, `/exit`: the terminal UI (`cli`).
+    let steps = [
+        ("hooks/session-start-startup.json", HookSignal::SessionStarted, "source", "startup"),
+        ("hooks/session-end-clear.json", HookSignal::SessionEnded, "reason", "clear"),
+        ("hooks/session-start-clear.json", HookSignal::SessionStarted, "source", "clear"),
+        ("hooks/session-end-exit.json", HookSignal::SessionEnded, "reason", "prompt_input_exit"),
+    ];
+    let first = session_in(steps[0].0);
+    let second = session_in(steps[2].0);
+    assert_ne!(first, second, "`/clear` gives the process a new session id");
+    assert_eq!(session_in(steps[1].0), first, "the end names the session that ended");
+    let mut seen = Vec::new();
+    for (rel, want, field, value) in steps {
+        let fx = rec.label(rel);
+        let payload = rec.json(rel);
+        assert_eq!(payload[field], value, "[{fx}] {field}");
+        let event = parse_hook_event(&payload, None).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
+        assert_eq!(event.signal, want, "[{fx}]");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(rows[0].signal, want.as_str(), "[{fx}]");
+        remember_sessions(&db, &rows);
+        seen.push(current());
+    }
+    assert_eq!(seen, [Some(first), None, Some(second), None], "start · /clear (end, start) · /exit");
+
+    // Print mode fires both events too, and inherits the terminal's id when
+    // an agent runs it. Its hook's environment says `sdk-cli`: never queued.
+    record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text("hooks/session-start-startup.json"));
+    remember_sessions(&db, &db.drain_hook_signals().unwrap());
+    for rel in ["hooks/session-start-print.json", "hooks/session-end-print.json"] {
+        let fx = rec.label(rel);
+        assert!(parse_hook_event(&rec.json(rel), None).is_some_and(|e| e.signal.is_session()), "[{fx}]");
+        assert!(!record_hook_from(&db, Some("term-1"), None, Some("sdk-cli"), &rec.text(rel)), "[{fx}] print mode is not queued");
+    }
+    assert!(db.drain_hook_signals().unwrap().is_empty());
+    assert_eq!(current(), Some(session_in("hooks/session-start-startup.json")), "the terminal keeps its own session");
+}
+
 #[test]
 fn hook_payloads_map_to_attention_signals() {
     use crate::agent_adapter::{parse_hook_event, HookSignal};

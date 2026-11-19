@@ -48,19 +48,24 @@ export const DIFF_ARRIVAL_WAIT_MS = 2000;
 /**
  * `revealDiffTarget`, tried on animation frames until the file's section
  * is rendered or `waitMs` has passed. The first try is one frame out, so the
- * canvas has switched modes; with `waitMs` 0 that is the only try. Resolves
- * with whether the section was found.
+ * canvas has switched modes; with `waitMs` 0 that is the only try.
+ *
+ * Resolves `true` when the section was found, `false` when the wait ran out,
+ * and `null` when `signal` aborted it first: the user moved on (another
+ * jump, another mode, another workspace), so there is nothing to scroll to
+ * and nothing to report.
  */
 export function revealDiffTargetWhenReady(
   file: string,
   line: number | null,
   waitMs: number,
-  opts?: { flash?: boolean },
-): Promise<boolean> {
+  opts?: { flash?: boolean; signal?: AbortSignal },
+): Promise<boolean | null> {
   return new Promise((resolve) => {
     const deadline = performance.now() + waitMs;
     const attempt = () => {
-      if (revealDiffTarget(file, line, opts)) resolve(true);
+      if (opts?.signal?.aborted) resolve(null);
+      else if (revealDiffTarget(file, line, opts)) resolve(true);
       else if (performance.now() >= deadline) resolve(false);
       else requestAnimationFrame(attempt);
     };

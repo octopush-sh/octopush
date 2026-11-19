@@ -713,6 +713,25 @@ describe("session roles", () => {
     expect(t.command).toBe("npm run dev");
   });
 
+  it("records which agent CLI set an agent role, and replaces it with the role", () => {
+    seed();
+    const cli = () => useTerminalsStore.getState().getTerminals(ws)[0].agentCli ?? null;
+    expect(cli()).toBeNull();
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "claude --resume");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["agent", "claude"]);
+    // Sticky with the role: back at the prompt, or under a command we can't
+    // place, it is still the terminal that ran Claude Code.
+    useTerminalsStore.getState().setBusy(ws, "t1", false);
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "./script.sh");
+    expect(cli()).toBe("claude");
+    // Another agent CLI in the same terminal: the role stays, the CLI doesn't.
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "codex");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["agent", "codex"]);
+    // A placeable non-agent command takes both.
+    useTerminalsStore.getState().setBusy(ws, "t1", true, "npm run dev");
+    expect([useTerminalsStore.getState().getTerminals(ws)[0].role, cli()]).toEqual(["dev", null]);
+  });
+
   it("keeps the role but drops the command when the shell returns", () => {
     seed();
     useTerminalsStore.getState().setBusy(ws, "t1", true, "npm run dev");

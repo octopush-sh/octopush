@@ -1076,6 +1076,11 @@ export const ipc = {
    *  The handler gets the terminal's id. */
   onPtySettled: (handler: (terminalId: string) => void) =>
     listen<PtySettledEvent>("pty://settled", (ev) => handler(ev.payload.sessionId)),
+  /** Claude Code's `SessionStart` or `SessionEnd` hook fired in a Run
+   *  terminal: the Claude Code session it runs started, changed (`/clear`,
+   *  a resume) or ended. The handler gets the terminal's id. */
+  onClaudeSessionChanged: (handler: (terminalId: string) => void) =>
+    listen<PtySettledEvent>("pty://claude-session", (ev) => handler(ev.payload.sessionId)),
   /** A transcript ingest pass changed the spend ledger (rows added or
    *  Direct-session duplicates removed). */
   onSpendIngested: (handler: () => void) =>

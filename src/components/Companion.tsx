@@ -7,7 +7,7 @@ import { CompanionContext } from "./CompanionContext";
 import { CompanionReview } from "./CompanionReview";
 import { CompanionHistory, type CompanionHistoryChat } from "./CompanionHistory";
 import { CompanionCrewJournal } from "./CompanionCrewJournal";
-import { CompanionRun } from "./CompanionRun";
+import { CompanionRun, type CommitsAhead } from "./CompanionRun";
 import { CompanionRuns } from "./CompanionRuns";
 import { LogbookCard } from "./LogbookCard";
 import { WorkContextPanel } from "./WorkContextPanel";
@@ -60,9 +60,10 @@ interface Props {
   onBacklogTicketContextMenu?: (issue: Issue, x: number, y: number) => void;
   /** Review-mode context for the companion cockpit (scope, provenance, sync). */
   reviewProps?: { gitStatus: GitStatus | null; workspacePath: string } | null;
-  /** Run-mode context: the workspace's git status and, per uncommitted file,
-   *  the lines its working diff adds and removes (the Changes section). */
-  runProps?: { gitStatus: GitStatus | null; changeStats: ChangeStats } | null;
+  /** Run-mode context for the Changes section: the workspace's git status,
+   *  the lines each uncommitted file's working diff adds and removes, and
+   *  the commits ahead of the base while the tree is clean. */
+  runProps?: { gitStatus: GitStatus | null; changeStats: ChangeStats; ahead: CommitsAhead | null } | null;
   /** Jump to a file in the diff from the companion (a provenance chip in
    *  Review, a changed file in Run). */
   onJumpToFile?: (file: string, line: number | null) => void;
@@ -242,6 +243,7 @@ export function Companion({
             workspaceId={workspaceId}
             gitStatus={runProps?.gitStatus ?? null}
             changeStats={runProps?.changeStats}
+            ahead={runProps?.ahead}
             onJumpToFile={onJumpToFile}
             onReadDiff={onOpenReview}
             onOpenLogbook={onOpenLogbook}

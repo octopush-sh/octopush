@@ -443,24 +443,35 @@ pub struct SessionUsage {
     pub as_of: String,
 }
 
-/// [`SessionUsage`] of the Claude Code session `session_id`, which the Run
-/// terminal `terminal_id` reported through a hook at `linked_at`
-/// (`claude_hooks::claude_session_for`). Spend and cache share come from the
-/// ledger rows the ingestor keyed `cc:<session id>`; the context size from
-/// the session's own transcript under `root`. Read-only.
+/// [`SessionUsage`] of the Claude Code session the Run terminal
+/// `terminal_id` runs now (`Db::terminal_claude_session`, kept by the hook
+/// poller). `None` when it runs none: a shell, another agent CLI, a session
+/// that ended. See [`session_usage`] for when a current session's figures
+/// are withheld.
+pub fn terminal_usage(db: &Mutex<Db>, root: &Path, terminal_id: &str) -> AppResult<Option<SessionUsage>> {
+    let Some((session, linked_at)) = db.lock().terminal_claude_session(terminal_id)? else { return Ok(None) };
+    session_usage(db, root, terminal_id, &session, &linked_at)
+}
+
+/// [`SessionUsage`] of the Claude Code session `session_id`, the current
+/// session of the Run terminal `terminal_id` since a hook said so at
+/// `linked_at`. Spend and cache share
+/// come from the ledger rows the ingestor keyed `cc:<session id>`; the
+/// context size from the session's own transcript under `root`. Read-only.
 ///
-/// `None`, so that nothing is shown rather than zeroes or another session's
-/// figures, when:
+/// `None`, so that nothing is shown rather than zeroes or figures that may
+/// be another session's, when:
 /// - the ledger has no row for the session (nothing metered yet; or its
 ///   rows are keyed by a legacy RUN session on the same root and can't be
 ///   told from another conversation's);
-/// - the terminal may have moved on: the ledger holds a Claude Code session
-///   in the same workspace that no terminal has claimed and that started
-///   after both the hook that named this pair and this session's last
-///   message. After `/clear`, or `claude` started again, the terminal runs a
-///   new session whose first hook has not fired yet; with several agents in
-///   one worktree that newcomer may be another terminal's, and there is no
-///   telling which until it reports.
+/// - the session has a rival (`Db::run_session_has_rival`): another Claude
+///   Code session was metered in the workspace after both the hook that
+///   named this pair and this session's last message, and it is neither
+///   over nor another terminal's. With `SessionStart` and `SessionEnd`
+///   hooks every session in a terminal is one or the other, so this only
+///   catches what those can't: a session whose hooks predate them, where
+///   `/clear`, a resume or a restart is silent until its next `Stop`, and a
+///   session started outside Octopush's terminals.
 pub fn session_usage(
     db: &Mutex<Db>,
     root: &Path,
@@ -470,10 +481,11 @@ pub fn session_usage(
 ) -> AppResult<Option<SessionUsage>> {
     let (ledger, cwd) = {
         let db = db.lock();
-        let Some(ledger) = db.run_session_ledger(&format!("cc:{session_id}"))? else { return Ok(None) };
+        let source = format!("cc:{session_id}");
+        let Some(ledger) = db.run_session_ledger(&source)? else { return Ok(None) };
         let Some(workspace) = db.terminal_workspace(terminal_id)? else { return Ok(None) };
         let since = linked_at.max(ledger.last_ts.as_str());
-        if db.unclaimed_run_session_started_after(&workspace, since)? {
+        if db.run_session_has_rival(&workspace, terminal_id, &source, since)? {
             return Ok(None);
         }
         (ledger, db.run_cwd_for_source(terminal_id)?)

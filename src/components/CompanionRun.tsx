@@ -2,7 +2,6 @@ import { useRef } from "react";
 import { GitCompare, Maximize2 } from "lucide-react";
 import type { FileChange, GitStatus, SessionUsage } from "../lib/types";
 import { useTerminalsStore } from "../stores/terminalsStore";
-import { useReviewSource } from "../stores/reviewSourceStore";
 import { useSessionUsage } from "../hooks/useSessionUsage";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
@@ -23,6 +22,14 @@ import { usd } from "./CompanionContext";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { Reveal } from "./primitives/Reveal";
 
+/** How far the branch is ahead of its base: the count and what it was
+ *  counted against. Never the committed diff itself. */
+export interface CommitsAhead {
+  commits: number;
+  base: string | null;
+  mergeBase: string | null;
+}
+
 interface Props {
   workspaceId: string;
   /** The workspace's git status, from App's own poll (Review reads the same). */
@@ -30,6 +37,9 @@ interface Props {
   /** Lines added and removed per uncommitted file, from the working diff App
    *  reads while this panel is open in Run. */
   changeStats?: ChangeStats;
+  /** Commits on the branch since its base, read while the tree is clean
+   *  (null: none, or not read). */
+  ahead?: CommitsAhead | null;
   /** Open Review at a file of the working diff. */
   onJumpToFile?: (file: string, line: number | null) => void;
   /** Switch to Review. */
@@ -48,14 +58,15 @@ interface Props {
  * spend of the mission this workspace serves. Nothing here repeats the
  * canvas: a session's name, state and controls live on its pane.
  *
- * A section with nothing to say is not drawn: Context folds away for a
- * shell, a dev server or a session Octopush has no usage for, and Mission
- * needs a mission.
+ * A section that doesn't apply is not drawn: Context folds away unless the
+ * focused pane runs a Claude Code session Octopush has figures for, and
+ * Mission needs a mission.
  */
 export function CompanionRun({
   workspaceId,
   gitStatus,
   changeStats = NO_CHANGE_STATS,
+  ahead = null,
   onJumpToFile,
   onReadDiff,
   onOpenLogbook,
@@ -67,9 +78,9 @@ export function CompanionRun({
           of its own: the one above it belongs to Context and folds with it. */}
       <div className="flex flex-col">
         <ChangesSection
-          workspaceId={workspaceId}
           gitStatus={gitStatus}
           stats={changeStats}
+          ahead={ahead}
           onJumpToFile={onJumpToFile}
           onReadDiff={onReadDiff}
         />
@@ -85,20 +96,25 @@ const LABEL = "pt-px text-[9px] uppercase tracking-[0.15em] text-octo-mute";
 const ROWS = "m-0 grid grid-cols-[auto_minmax(0,1fr)] gap-x-3 gap-y-1 font-mono text-[10px]";
 
 /** The session's spend as the Spent row prints it. Every call unpriced: the
- *  cost is unknown, never `$0.00` (the rule Talk's cost line follows). */
+ *  cost is unknown, never `$0.00` (the rule Talk's cost line follows). Some
+ *  unpriced: the figure is a floor, and the row says so itself. */
 export function spentLabel(usage: Pick<SessionUsage, "spentUsd" | "calls" | "unpricedCalls">): string {
-  return usage.unpricedCalls > 0 && usage.unpricedCalls >= usage.calls ? "unpriced" : usd(usage.spentUsd);
+  if (usage.unpricedCalls <= 0) return usd(usage.spentUsd);
+  return usage.unpricedCalls >= usage.calls ? "unpriced" : `${usd(usage.spentUsd)} · partly unpriced`;
 }
 
 function ContextSection({ workspaceId }: { workspaceId: string }) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
   const activeId = useTerminalsStore((s) => s.getActiveId(workspaceId));
   const session = terminals.find((t) => t.id === activeId) ?? null;
-  // Only an agent session has a context window and a ledger; a shell, a dev
-  // server or a log tail is never asked about.
-  const agent = !!session && session.role === "agent" && !session.failed;
-  const usage = useSessionUsage(agent ? session.id : null);
-  const open = agent && !!usage;
+  // Octopush can read context and spend for Claude Code only. A shell, a dev
+  // server, a log tail, or another agent CLI in the pane (Codex, aider, …,
+  // which share the agent role) is never asked about.
+  // Nor is a session whose PTY failed or is gone: nothing runs there.
+  const claude =
+    !!session && session.role === "agent" && session.agentCli === "claude" && session.running && !session.failed;
+  const usage = useSessionUsage(claude ? session.id : null);
+  const open = claude && !!usage;
 
   // What the section last showed, kept while it folds away so the figures
   // leave with it instead of blanking first. Always a session's own pair:
@@ -113,7 +129,7 @@ function ContextSection({ workspaceId }: { workspaceId: string }) {
         <CompanionSection
           title="Context"
           meta={view.label}
-          hint={`What ${view.label} has used: its last prompt against the model's context window, and its cost`}
+          hint={`What the Claude Code session in ${view.label} has used: its last prompt against the model's context window, and its cost`}
           storageKey="run-context"
           testId="companion-run-context"
           tourId={tourId("companion-run-context")}
@@ -189,24 +205,23 @@ function ContextBody({ usage }: { usage: SessionUsage }) {
 // ─── Changes ──────────────────────────────────────────────────────
 
 function ChangesSection({
-  workspaceId,
   gitStatus,
   stats,
+  ahead: aheadOfBase,
   onJumpToFile,
   onReadDiff,
 }: {
-  workspaceId: string;
   gitStatus: GitStatus | null;
   stats: ChangeStats;
+  ahead: CommitsAhead | null;
   onJumpToFile?: (file: string, line: number | null) => void;
   onReadDiff?: () => void;
 }) {
-  // Commits since the base, from the committed view App reads for Review
-  // and, while the tree is clean, for this line — no IPC of its own.
-  const committed = useReviewSource((s) => s.committedByWs[workspaceId] ?? null);
   const files = gitStatus?.changedFiles ?? [];
   const clean = !!gitStatus && files.length === 0;
-  const ahead = clean && committed && committed.commits > 0 ? committed : null;
+  // The count App read for this panel while the tree is clean. Only the
+  // count: the committed diff stays with Review.
+  const ahead = clean && aheadOfBase && aheadOfBase.commits > 0 ? aheadOfBase : null;
   const rows = files.slice(0, MAX_CHANGE_ROWS);
   const more = files.length - rows.length;
   // Review has something to read: the working diff, or what was committed.
@@ -230,15 +245,19 @@ function ChangesSection({
           </ul>
         )}
         {more > 0 && (
-          <p data-testid="run-changes-more" className="octo-tabular m-0 pt-1 font-mono text-[10px] text-octo-mute">
+          <p
+            data-testid="run-changes-more"
+            className="octo-rise-in octo-tabular m-0 pt-1 font-mono text-[10px] text-octo-mute"
+          >
             +{more} more
           </p>
         )}
         {/* A reserved line while the first status is on its way, so the
-            section never claims a clean tree it hasn't seen. */}
+            section never claims a clean tree it hasn't seen; the sentence
+            fades in once it has. */}
         {files.length === 0 && (
           <p data-testid="run-changes-clean" className="m-0 min-h-4 text-[11px] text-octo-mute">
-            {clean ? "The working tree is clean." : ""}
+            {clean && <span className="octo-fade-in">The working tree is clean.</span>}
           </p>
         )}
         {ahead && (
@@ -259,7 +278,7 @@ function ChangesSection({
             onClick={onReadDiff}
             data-tour="companion-run-read-diff"
             title="Open Review"
-            className="mt-2.5 rounded font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            className="octo-fade-in mt-2.5 rounded font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:text-octo-brass-hi focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
           >
             Read the diff
           </button>

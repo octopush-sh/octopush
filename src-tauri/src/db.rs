@@ -1191,22 +1191,27 @@ impl Db {
             );
             "#,
         )?;
-        // Which Run terminal each Claude Code session ran in, as that
-        // session's own hooks reported it (`claude_hooks::remember_sessions`):
-        // the hook's environment names the terminal, its payload the session.
-        // Kept for good, like `direct_cli_sessions`: a session someone has
-        // claimed is never taken for another terminal's, even after its own
-        // terminal is closed. The Run Companion's Context section reads one
-        // terminal's context and spend through it.
+        // Which Claude Code session each Run terminal runs, as that session's
+        // own hooks say (`claude_hooks::remember_sessions`): the hook's
+        // environment names the terminal, its payload the session. One
+        // current session per terminal; a terminal with none has no row. The
+        // Run Companion's Context section reads one terminal's context and
+        // spend through it. `ended_claude_sessions` remembers the sessions
+        // whose `SessionEnd` fired, so a late signal can't relink one and a
+        // finished conversation is never taken for a terminal's rival.
         self.conn.execute_batch(
             r#"
-            CREATE TABLE IF NOT EXISTS terminal_cc_sessions (
-                session_id  TEXT PRIMARY KEY,
-                terminal_id TEXT NOT NULL,
+            CREATE TABLE IF NOT EXISTS terminal_claude_session (
+                terminal_id TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL,
                 linked_at   TEXT NOT NULL   -- the last hook signal naming this pair
             );
-            CREATE INDEX IF NOT EXISTS idx_terminal_cc_sessions_terminal
-                ON terminal_cc_sessions(terminal_id, linked_at);
+            CREATE INDEX IF NOT EXISTS idx_terminal_claude_session_session
+                ON terminal_claude_session(session_id);
+            CREATE TABLE IF NOT EXISTS ended_claude_sessions (
+                session_id TEXT PRIMARY KEY,
+                ended_at   TEXT NOT NULL
+            );
             "#,
         )?;
         // One-time backfill from what the stage rows still remember: the last
@@ -3832,6 +3837,8 @@ impl Db {
             "DELETE FROM terminals WHERE id = ?1",
             params![id],
         )?;
+        // Whatever Claude Code session it ran is no terminal's any more.
+        self.conn.execute("DELETE FROM terminal_claude_session WHERE terminal_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -4366,31 +4373,76 @@ impl Db {
         Ok(out)
     }
 
-    /// Record that the Claude Code session `session_id` runs in `terminal_id`,
+    /// Make `session_id` the current Claude Code session of `terminal_id`,
     /// confirmed at `at` (RFC3339 UTC): what one of that session's hooks just
-    /// said. A session reported again keeps one row, with the newest terminal
-    /// and time.
-    pub fn link_terminal_cc_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
-        self.conn.execute(
-            "INSERT INTO terminal_cc_sessions (session_id, terminal_id, linked_at) VALUES (?1, ?2, ?3)
-             ON CONFLICT(session_id) DO UPDATE SET terminal_id = excluded.terminal_id, linked_at = excluded.linked_at",
-            params![session_id, terminal_id, at],
+    /// said. `started` is its `SessionStart`, which also revives a session
+    /// that had ended (a resume); any other signal of an ended session is
+    /// late and changes nothing (`false`). A session is current in one
+    /// terminal only: it leaves any other terminal, which then has none.
+    pub fn link_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str, started: bool) -> AppResult<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        if started {
+            tx.execute("DELETE FROM ended_claude_sessions WHERE session_id = ?1", params![session_id])?;
+        } else {
+            let ended: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM ended_claude_sessions WHERE session_id = ?1)",
+                params![session_id],
+                |r| r.get(0),
+            )?;
+            if ended {
+                return Ok(false);
+            }
+        }
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE session_id = ?1 AND terminal_id != ?2",
+            params![session_id, terminal_id],
         )?;
+        tx.execute(
+            "INSERT INTO terminal_claude_session (terminal_id, session_id, linked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(terminal_id) DO UPDATE SET session_id = excluded.session_id, linked_at = excluded.linked_at",
+            params![terminal_id, session_id, at],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The Claude Code session `session_id` ended at `at` (its `SessionEnd`):
+    /// it is remembered as ended, and `terminal_id` has no current session
+    /// if that was the one it ran (an end naming another session leaves the
+    /// terminal's own alone).
+    pub fn end_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO ended_claude_sessions (session_id, ended_at) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET ended_at = excluded.ended_at",
+            params![session_id, at],
+        )?;
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE terminal_id = ?1 AND session_id = ?2",
+            params![terminal_id, session_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// The Claude Code session `terminal_id` reported last, and when:
-    /// `(session id, linked_at)`.
-    pub fn terminal_cc_session(&self, terminal_id: &str) -> AppResult<Option<(String, String)>> {
+    /// The Claude Code session `terminal_id` runs, and when a hook last said
+    /// so: `(session id, linked_at)`. `None` when it has none.
+    pub fn terminal_claude_session(&self, terminal_id: &str) -> AppResult<Option<(String, String)>> {
         self.conn
             .query_row(
-                "SELECT session_id, linked_at FROM terminal_cc_sessions
-                 WHERE terminal_id = ?1 ORDER BY linked_at DESC, rowid DESC LIMIT 1",
+                "SELECT session_id, linked_at FROM terminal_claude_session WHERE terminal_id = ?1",
                 params![terminal_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Forget every terminal's current session (the hooks setting went off:
+    /// nothing confirms them any more).
+    pub fn clear_terminal_claude_sessions(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM terminal_claude_session", [])?;
+        Ok(())
     }
 
     /// The workspace a Run terminal belongs to.
@@ -4401,23 +4453,29 @@ impl Db {
             .map_err(Into::into)
     }
 
-    /// Whether the ledger holds a Claude Code session in `workspace_id` that
-    /// no terminal has claimed (`terminal_cc_sessions`) and whose first
-    /// message came after `since` (RFC3339 UTC). Such a session may be the
-    /// one a terminal runs now (after `/clear`, or `claude` started again)
-    /// before its first hook has said so.
-    pub fn unclaimed_run_session_started_after(&self, workspace_id: &str, since: &str) -> AppResult<bool> {
+    /// Whether `terminal_id`'s session (`source_id`, the ledger's
+    /// `cc:<session id>`) has a rival: another Claude Code session metered in
+    /// `workspace_id` after `since` (RFC3339 UTC) that is neither over (its
+    /// `SessionEnd` fired) nor the current session of another terminal. Such
+    /// a session may be the one this terminal runs now, with no hook having
+    /// said so yet: a session whose hooks predate `SessionStart`, or one
+    /// started outside Octopush's terminals.
+    pub fn run_session_has_rival(&self, workspace_id: &str, terminal_id: &str, source_id: &str, since: &str) -> AppResult<bool> {
+        // `substr(source_id, 4)` drops the `cc:` prefix, so both lookups go
+        // through an index on the session id (the ended table's key, and
+        // `idx_terminal_claude_session_session`).
         self.conn
             .query_row(
                 "SELECT EXISTS(
                      SELECT 1 FROM spend_events se
-                     WHERE se.surface = 'run' AND se.workspace_id = ?1 AND se.ts_utc > ?2
-                       AND se.source_id LIKE 'cc:%'
-                       AND NOT EXISTS (SELECT 1 FROM terminal_cc_sessions t WHERE se.source_id = 'cc:' || t.session_id)
-                       AND NOT EXISTS (SELECT 1 FROM spend_events o
-                                       WHERE o.source_id = se.source_id AND o.surface = 'run' AND o.ts_utc <= ?2)
+                     WHERE se.surface = 'run' AND se.workspace_id = ?1 AND se.ts_utc > ?4
+                       AND se.source_id LIKE 'cc:%' AND se.source_id != ?3
+                       AND NOT EXISTS (SELECT 1 FROM ended_claude_sessions e
+                                       WHERE e.session_id = substr(se.source_id, 4))
+                       AND NOT EXISTS (SELECT 1 FROM terminal_claude_session t
+                                       WHERE t.session_id = substr(se.source_id, 4) AND t.terminal_id != ?2)
                  )",
-                params![workspace_id, since],
+                params![workspace_id, terminal_id, source_id, since],
                 |r| r.get(0),
             )
             .map_err(Into::into)

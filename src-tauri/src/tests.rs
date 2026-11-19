@@ -15837,10 +15837,10 @@ mod transcript_tests {
             format!("{}\n", line_of("cc-b", "req_b1", m, 500_000, 0, 0, 9_000, "2026-11-18T10:03:00Z", cwd)),
         )
         .unwrap();
-        // Each terminal's hooks named its session when its last turn ended.
-        let (at_a, at_b) = ("2026-11-18T10:02:30+00:00", "2026-11-18T10:03:30+00:00");
-        db.lock().link_terminal_cc_session("term-a", "cc-a", at_a).unwrap();
-        db.lock().link_terminal_cc_session("term-b", "cc-b", at_b).unwrap();
+        // Each terminal's hooks named its session when it started.
+        let (at_a, at_b) = ("2026-11-18T09:59:00+00:00", "2026-11-18T10:02:30+00:00");
+        db.lock().link_terminal_claude_session("term-a", "cc-a", at_a, true).unwrap();
+        db.lock().link_terminal_claude_session("term-b", "cc-b", at_b, true).unwrap();
         // Nothing ingested yet: no row, so nothing to show (never zeroes).
         assert_eq!(session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap(), None);
 
@@ -15876,86 +15876,181 @@ mod transcript_tests {
         assert!(b.spent_usd > 0.0);
     }
 
-    /// The figures are shown only while they are certainly that terminal's:
-    /// a session nobody has claimed, started after the terminal's last
-    /// confirmed message, may be the one it runs now (`/clear`, `claude`
-    /// started again) or another agent's in the same worktree.
+    /// A workspace with two Run terminals, a transcript directory and an
+    /// ingestor: the stage for what a terminal's Context may show.
+    struct UsageStage {
+        db: Arc<Mutex<Db>>,
+        root: TempDir,
+        pdir: std::path::PathBuf,
+        cwd: &'static str,
+    }
+
+    impl UsageStage {
+        fn new(cwd: &'static str) -> Self {
+            let db = Arc::new(Mutex::new(test_db()));
+            let root = TempDir::new().unwrap();
+            {
+                let d = db.lock();
+                d.insert_project("p-st", "P", "/tmp/proj-stage").unwrap();
+                d.insert_workspace("w-st", "p-st", "ws", "", "b-st", Some(cwd), "", None).unwrap();
+                d.create_terminal("term-a", "w-st", "Agent", 0, 0).unwrap();
+                d.create_terminal("term-b", "w-st", "Other agent", 1, 0).unwrap();
+            }
+            let pdir = root.path().join(project_dir_name(cwd));
+            std::fs::create_dir_all(&pdir).unwrap();
+            Self { db, root, pdir, cwd }
+        }
+
+        /// The session's transcript holds these messages `(time, prompt tokens)`, and the ledger has read them.
+        fn says(&self, session: &str, messages: &[(&str, u64)]) {
+            let text: String = messages
+                .iter()
+                .enumerate()
+                .map(|(i, (ts, prompt))| format!("{}\n", line_of(session, &format!("req_{session}_{i}"), "claude-fable-5-2", *prompt, 0, 0, 5, ts, self.cwd)))
+                .collect();
+            std::fs::write(self.pdir.join(format!("{session}.jsonl")), text).unwrap();
+            TranscriptIngestor::with_root(Arc::clone(&self.db), self.root.path().to_path_buf()).ingest().unwrap();
+        }
+
+        fn start(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, true).unwrap();
+        }
+
+        /// A `Stop` or `Notification`: all a session whose hooks predate `SessionStart` ever says.
+        fn signal(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, false).unwrap();
+        }
+
+        fn end(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().end_terminal_claude_session(terminal, session, at).unwrap();
+        }
+
+        /// What the terminal's Context shows: its context size, or nothing.
+        fn shows(&self, terminal: &str) -> Option<u64> {
+            crate::transcripts::terminal_usage(&self.db, self.root.path(), terminal).unwrap().and_then(|u| u.context_tokens)
+        }
+    }
+
+    /// (c) `/clear` or a fresh `claude`: the terminal moves to the new
+    /// session the moment its `SessionStart` fires, so the old conversation's
+    /// figures are gone before a message is sent, and the meter can never
+    /// read "Past 80%" on an empty conversation.
     #[test]
     #[serial_test::serial(pricing_catalog)]
-    fn session_usage_is_withheld_while_an_unclaimed_newer_session_may_have_taken_the_terminal() {
-        use crate::transcripts::session_usage;
+    fn after_clear_the_old_conversations_figures_are_gone_at_once() {
         let _cfg = crate::provider_router::TestConfigDir::new();
-        let db = Arc::new(Mutex::new(test_db()));
-        let root = TempDir::new().unwrap();
-        let cwd = "/tmp/proj/session-guard";
-        {
-            let d = db.lock();
-            d.insert_project("p-g", "P", "/tmp/proj-g").unwrap();
-            d.insert_workspace("w-g", "p-g", "ws", "", "b-g", Some(cwd), "", None).unwrap();
-            d.create_terminal("term-a", "w-g", "Agent", 0, 0).unwrap();
-            d.create_terminal("term-b", "w-g", "Other agent", 1, 0).unwrap();
-        }
-        let pdir = root.path().join(project_dir_name(cwd));
-        std::fs::create_dir_all(&pdir).unwrap();
-        let m = "claude-fable-5-2";
-        let write = |session: &str, lines: &[String]| {
-            std::fs::write(pdir.join(format!("{session}.jsonl")), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
-        };
-        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
-        let shown = |session: &str, at: &str| session_usage(&db, root.path(), "term-a", session, at).unwrap().map(|u| u.context_tokens);
+        let st = UsageStage::new("/tmp/proj/usage-clear");
+        st.start("term-a", "cc-full", "2026-11-18T10:00:00+00:00");
+        st.says("cc-full", &[("2026-11-18T10:01:00Z", 900_000)]);
+        assert_eq!(st.shows("term-a"), Some(900_000));
 
-        // A session someone ran in this worktree outside Octopush, begun
-        // before the terminal's hook and still going: never a newcomer.
-        write("cc-outside", &[line_of("cc-outside", "req_o1", m, 10, 0, 0, 5, "2026-11-18T09:00:00Z", cwd)]);
-        // term-a's session, its turn over at 10:00.
-        write("cc-a", &[line_of("cc-a", "req_a1", m, 1_000, 0, 0, 5, "2026-11-18T09:59:00Z", cwd)]);
-        let at_a = "2026-11-18T10:00:00+00:00";
-        db.lock().link_terminal_cc_session("term-a", "cc-a", at_a).unwrap();
-        ing.ingest().unwrap();
-        assert_eq!(shown("cc-a", at_a), Some(Some(1_000)));
-        write(
-            "cc-outside",
-            &[
-                line_of("cc-outside", "req_o1", m, 10, 0, 0, 5, "2026-11-18T09:00:00Z", cwd),
-                line_of("cc-outside", "req_o2", m, 10, 0, 0, 5, "2026-11-18T10:30:00Z", cwd),
-            ],
-        );
-        ing.ingest().unwrap();
-        assert_eq!(shown("cc-a", at_a), Some(Some(1_000)), "an older unclaimed session stays out of it");
+        // `/clear`: the old session ends, the new one starts (30 ms apart).
+        st.end("term-a", "cc-full", "2026-11-18T10:10:00+00:00");
+        assert_eq!(st.shows("term-a"), None, "no current session");
+        st.start("term-a", "cc-fresh", "2026-11-18T10:10:00.030+00:00");
+        assert_eq!(st.shows("term-a"), None, "an empty conversation shows nothing, not the old 900k");
+        // Its first reply is what the meter then reads.
+        st.says("cc-fresh", &[("2026-11-18T10:12:00Z", 4_000)]);
+        assert_eq!(st.shows("term-a"), Some(4_000));
+        // The finished conversation is nobody's rival, here or next door.
+        // (term-b's last word is older than the cleared conversation's.)
+        st.start("term-b", "cc-b", "2026-11-18T10:00:30+00:00");
+        st.says("cc-b", &[("2026-11-18T10:00:45Z", 70_000)]);
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (Some(4_000), Some(70_000)));
+    }
 
-        // A new session appears at 10:40 and no hook has named its terminal:
-        // term-a may have been cleared into it, or it is term-b's. Withheld.
-        write("cc-new", &[line_of("cc-new", "req_n1", m, 50, 0, 0, 5, "2026-11-18T10:40:00Z", cwd)]);
-        ing.ingest().unwrap();
-        assert_eq!(shown("cc-a", at_a), None, "ambiguous: nothing rather than a guess");
+    /// (a) After `claude` exits the terminal has no session: a bare prompt,
+    /// or Codex started there, shows no Claude Code figures, however long
+    /// ago that was and whatever the ledger still holds.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn after_claude_exits_the_terminal_shows_nothing() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-exit");
+        st.start("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        st.says("cc-a", &[("2026-11-18T10:01:00Z", 120_000)]);
+        assert_eq!(st.shows("term-a"), Some(120_000));
+        st.end("term-a", "cc-a", "2026-11-18T10:20:00+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // Its last `Stop`, landing after the end, changes nothing.
+        st.signal("term-a", "cc-a", "2026-11-18T10:20:01+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // A closed terminal's session is no terminal's.
+        st.start("term-b", "cc-b", "2026-11-18T10:30:00+00:00");
+        st.says("cc-b", &[("2026-11-18T10:31:00Z", 50_000)]);
+        st.db.lock().delete_terminal("term-b").unwrap();
+        assert_eq!(st.db.lock().terminal_claude_session("term-b").unwrap(), None);
+    }
 
-        // term-a's own session speaks again after the newcomer began: it is
-        // still the one in term-a.
-        write(
-            "cc-a",
-            &[
-                line_of("cc-a", "req_a1", m, 1_000, 0, 0, 5, "2026-11-18T09:59:00Z", cwd),
-                line_of("cc-a", "req_a2", m, 2_000, 0, 0, 5, "2026-11-18T10:41:00Z", cwd),
-            ],
-        );
-        ing.ingest().unwrap();
-        assert_eq!(shown("cc-a", at_a), Some(Some(2_000)));
+    /// (b) `/resume`, `--resume` or `--continue` of an older conversation:
+    /// its `SessionStart` puts the terminal on it at once, and the figures
+    /// are the resumed conversation's own, never the one it replaced.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn resuming_an_older_session_shows_that_sessions_own_figures_at_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-resume");
+        // Yesterday's conversation, ended properly.
+        st.start("term-a", "cc-old", "2026-11-17T09:00:00+00:00");
+        st.says("cc-old", &[("2026-11-17T09:30:00Z", 300_000)]);
+        st.end("term-a", "cc-old", "2026-11-17T10:00:00+00:00");
+        // Today's.
+        st.start("term-a", "cc-today", "2026-11-18T10:00:00+00:00");
+        st.says("cc-today", &[("2026-11-18T10:01:00Z", 20_000)]);
+        assert_eq!(st.shows("term-a"), Some(20_000));
+        // `/resume` yesterday's: today's ends, yesterday's starts again.
+        st.end("term-a", "cc-today", "2026-11-18T10:05:00+00:00");
+        st.start("term-a", "cc-old", "2026-11-18T10:05:00.030+00:00");
+        assert_eq!(st.shows("term-a"), Some(300_000), "the resumed conversation's own context, before any new message");
 
-        // The newcomer goes on past it: withheld again, until term-b's hook claims it.
-        write(
-            "cc-newer",
-            &[line_of("cc-newer", "req_w1", m, 70, 0, 0, 5, "2026-11-18T10:50:00Z", cwd)],
-        );
-        ing.ingest().unwrap();
-        assert_eq!(shown("cc-a", at_a), None);
-        db.lock().link_terminal_cc_session("term-b", "cc-newer", "2026-11-18T10:55:00+00:00").unwrap();
-        assert_eq!(shown("cc-a", at_a), Some(Some(2_000)), "claimed by another terminal: no longer in doubt");
+        // The same conversation resumed in another terminal instead: it is
+        // that terminal's, and the first has none (not an older one).
+        st.end("term-a", "cc-old", "2026-11-18T10:20:00+00:00");
+        st.start("term-a", "cc-today", "2026-11-18T10:20:01+00:00");
+        st.start("term-b", "cc-today", "2026-11-18T10:25:00+00:00");
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (None, Some(20_000)));
+    }
 
-        // Had it been term-a's (cleared into it), its next hook says so and
-        // the terminal reads the new session.
-        db.lock().link_terminal_cc_session("term-a", "cc-new", "2026-11-18T10:56:00+00:00").unwrap();
-        assert_eq!(db.lock().terminal_cc_session("term-a").unwrap().map(|(s, _)| s).as_deref(), Some("cc-new"));
-        assert_eq!(shown("cc-new", "2026-11-18T10:56:00+00:00"), Some(Some(50)));
+    /// The fallback for a session whose hooks predate `SessionStart` and
+    /// `SessionEnd` (it was already running when they were installed): its
+    /// `Stop` links it, and `/clear`, a resume or a restart are silent until
+    /// the next one. Then a newer rival in the workspace means hide.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn without_session_events_a_newer_rival_hides_the_figures() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-rival");
+        // A session someone ran in this worktree before, outside Octopush.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10)]);
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000)]);
+        st.signal("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(1_000), "nothing newer than its own last word");
+
+        // A new conversation appears and no hook has named its terminal:
+        // term-a may have been cleared into it. Hidden, not guessed.
+        st.says("cc-new", &[("2026-11-18T10:40:00Z", 50)]);
+        assert_eq!(st.shows("term-a"), None);
+        // term-a's own session speaks after it: still the one in term-a.
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000), ("2026-11-18T10:41:00Z", 2_000)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // An OLDER conversation resumed without a word from the hooks (the
+        // case a "started after" test would miss): it has a newer message.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10), ("2026-11-18T10:50:00Z", 10)]);
+        assert_eq!(st.shows("term-a"), None);
+        // Once it is another terminal's, it is no rival.
+        st.signal("term-b", "cc-outside", "2026-11-18T10:55:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // Nor is a conversation that is over.
+        st.says("cc-gone", &[("2026-11-18T11:00:00Z", 5)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.end("term-b", "cc-gone", "2026-11-18T11:01:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        assert_eq!(st.shows("term-b"), Some(10), "an end naming another session leaves the terminal's own");
+        // And when the newcomer was term-a's after all, its `Stop` says so.
+        st.says("cc-next", &[("2026-11-18T11:10:00Z", 77)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.signal("term-a", "cc-next", "2026-11-18T11:15:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(77));
     }
 
     #[test]
@@ -15981,7 +16076,7 @@ mod transcript_tests {
         .unwrap();
         let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
         assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
-        db.lock().link_terminal_cc_session("term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap();
+        db.lock().link_terminal_claude_session("term-u", "cc-u", "2026-11-18T11:00:30+00:00", true).unwrap();
         let u = session_usage(&db, root.path(), "term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap().unwrap();
         assert_eq!((u.calls, u.unpriced_calls, u.spent_usd), (1, 1, 0.0));
         assert_eq!((u.context_tokens, u.max_context), (Some(3_000), None), "an unlisted model has no known window");

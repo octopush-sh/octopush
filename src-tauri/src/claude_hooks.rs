@@ -243,12 +243,33 @@ pub fn hook_kind(args: &[String]) -> Option<&str> {
 /// What `octopush-mcp hook` does with one payload: queue its signal for
 /// `terminal`. `kind` is the hook's `--kind` (see `parse_hook_event`).
 /// `false` (nothing written) outside an Octopush terminal or for a payload we
-/// don't map. Only the signal and `session_id` are stored.
+/// don't map. Only the signal and `session_id` are stored. Prints nothing.
 pub fn record_hook(db: &Db, terminal: Option<&str>, kind: Option<&str>, payload: &str) -> bool {
+    record_hook_from(db, terminal, kind, None, payload)
+}
+
+/// [`record_hook`], told how the hook's session was started (`entrypoint`:
+/// the hook's own `CLAUDE_CODE_ENTRYPOINT`). A print-mode or SDK session is
+/// not the one a person drives in the terminal, though a `claude -p` the
+/// agent runs inherits the terminal's id: its start and end are not queued,
+/// and its other signals are queued without its session id, so it changes
+/// attention exactly as before and never which session the terminal runs.
+pub fn record_hook_from(
+    db: &Db,
+    terminal: Option<&str>,
+    kind: Option<&str>,
+    entrypoint: Option<&str>,
+    payload: &str,
+) -> bool {
     let Some(terminal) = terminal.map(str::trim).filter(|t| !t.is_empty()) else { return false };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { return false };
     let Some(event) = agent_adapter::parse_hook_event(&value, kind) else { return false };
-    db.insert_hook_signal(terminal, event.signal.as_str(), event.session_id.as_deref()).is_ok()
+    let interactive = agent_adapter::interactive_entrypoint(entrypoint);
+    if !interactive && event.signal.is_session() {
+        return false;
+    }
+    let session = event.session_id.as_deref().filter(|_| interactive);
+    db.insert_hook_signal(terminal, event.signal.as_str(), session).is_ok()
 }
 
 // ─── App side: the poller ─────────────────────────────────────────
@@ -289,11 +310,15 @@ fn deliverable(rows: Vec<HookSignalRow>, enabled: bool, now: DateTime<Utc>) -> V
 /// One poll. The queue is drained with the toggle off too, and those rows are
 /// dropped: hooks still in a worktree keep queuing, and the table would
 /// otherwise grow without bound. With the toggle on, each row also says
-/// which Claude Code session its terminal runs ([`remember_sessions`]).
+/// which Claude Code session its terminal runs ([`remember_sessions`]); with
+/// it off, what was known is forgotten, since a session can then end or
+/// change with nothing to say so.
 fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(String, HookSignal)>> {
     let rows = db.drain_hook_signals()?;
     if enabled {
         remember_sessions(db, &rows);
+    } else if let Err(e) = db.clear_terminal_claude_sessions() {
+        tracing::warn!(error = %e, "could not forget the terminals' Claude Code sessions");
     }
     Ok(deliverable(rows, enabled, now))
 }
@@ -304,39 +329,56 @@ fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(Strin
 // session id meet: the terminal id comes from the hook's environment, the
 // session id from its payload. The transcript ledger is keyed by that session
 // id (`cc:<session id>`), so the pair is what lets the Run Companion show one
-// terminal's context and spend and never another's. Each pair is kept in
-// `terminal_cc_sessions` with the time of the signal that named it, because a
-// PTY, and the Claude Code session in it, outlives the app.
+// terminal's context and spend and not another's.
+//
+// A terminal has at most ONE current session (`terminal_claude_session`,
+// keyed by the terminal), kept in the database because a PTY, and the Claude
+// Code session in it, outlives the app:
+//
+// - `SessionStart` names the session the terminal runs from now on: `claude`
+//   started, or `/clear`, `/resume`, `--resume`, `--continue`, a fork or a
+//   compaction gave the process that session.
+// - `SessionEnd` ends it: the terminal then has no current session, and that
+//   session is remembered as ended, so a late signal of its own (an async
+//   `Stop` still in flight) can't bring it back. Only its `SessionStart` (a
+//   resume) can.
+// - Any other signal (`Stop`, a `Notification`) names its session too. That is
+//   the whole link for a session whose hooks predate the two above (it was
+//   already running when they were installed), and how a terminal comes back
+//   to its own session after anything else was taken for it.
+// - A session is current in one terminal only: named by another terminal (it
+//   was resumed there), it leaves the first, which then has none.
 
-/// Keep the terminal/session pair each of `rows` names. A row too old to
-/// deliver still counts: its prompt was answered long ago, but the session
-/// it names did run in that terminal at that time. A row without a session id
-/// says nothing. A failed write only costs the Companion its Context section,
-/// so it is logged and never fails the poll.
-fn remember_sessions(db: &Db, rows: &[HookSignalRow]) {
+/// Apply what each of `rows` says about its terminal's session, in order. A
+/// row too old to deliver still counts: its prompt was answered long ago, but
+/// the session it names did start, speak or end in that terminal at that
+/// time. A row without a session id says nothing. A failed write only costs
+/// the Companion its Context section, so it is logged and never fails the
+/// poll.
+pub(crate) fn remember_sessions(db: &Db, rows: &[HookSignalRow]) {
     for row in rows {
         let Some(session) = row.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        let Some(signal) = HookSignal::parse(&row.signal) else { continue };
         // Stored in one shape so the times compare as text; a row whose time
         // can't be read is not evidence of when.
         let Ok(at) = DateTime::parse_from_rfc3339(&row.created_at) else { continue };
         let at = at.with_timezone(&Utc).to_rfc3339();
-        if let Err(e) = db.link_terminal_cc_session(&row.terminal_id, session, &at) {
-            tracing::warn!(error = %e, "could not remember a terminal's Claude Code session");
+        let done = match signal {
+            HookSignal::SessionEnded => db.end_terminal_claude_session(&row.terminal_id, session, &at),
+            HookSignal::SessionStarted => db.link_terminal_claude_session(&row.terminal_id, session, &at, true).map(|_| ()),
+            _ => db.link_terminal_claude_session(&row.terminal_id, session, &at, false).map(|_| ()),
+        };
+        if let Err(e) = done {
+            tracing::warn!(error = %e, "could not record a terminal's Claude Code session");
         }
     }
 }
 
-/// The Claude Code session `terminal` reported last through a hook, and when
-/// (`(session id, RFC3339 UTC)`). `None` for a terminal that never delivered
-/// a hook signal with a session id (a shell, a dev server, another agent
-/// CLI, a worktree Octopush didn't create) and while the setting is off:
-/// without hooks nothing confirms the session is still the one in that
-/// terminal.
-pub fn claude_session_for(db: &Mutex<Db>, terminal: &str) -> Option<(String, String)> {
-    if !hooks_enabled() {
-        return None;
-    }
-    db.lock().terminal_cc_session(terminal).ok().flatten()
+/// Whether the terminals' recorded sessions can be relied on: only while the
+/// setting is on. Off, hooks no longer report, so a session can end or
+/// change unseen (and what was known is dropped at the next poll).
+pub fn sessions_known() -> bool {
+    hooks_enabled()
 }
 
 fn is_fresh(created_at: &str, now: DateTime<Utc>) -> bool {
@@ -351,11 +393,19 @@ enum HookEmit {
     Attention(&'static str),
     /// `pty://settled`.
     Settled,
+    /// `pty://claude-session`: the terminal's Claude Code session started,
+    /// changed or ended.
+    SessionChanged,
 }
 
-/// The poller's per-row step: `terminal` now reports through hooks, and
-/// `signal` becomes the event to emit.
+/// The poller's per-row step: `signal` becomes the event to emit. An
+/// attention signal also marks `terminal` as reporting through hooks; a
+/// session starting or ending says nothing about attention and leaves that
+/// as it was.
 fn deliver_one(hooked: &mut HashSet<String>, terminal: &str, signal: HookSignal) -> HookEmit {
+    if signal.is_session() {
+        return HookEmit::SessionChanged;
+    }
     hooked.insert(terminal.to_string());
     match signal {
         HookSignal::Settled => HookEmit::Settled,
@@ -399,6 +449,7 @@ pub fn spawn_poller(app: AppHandle, db: Arc<Mutex<Db>>) {
                 let emit = deliver_one(&mut hooked().lock(), &terminal, signal);
                 let _ = match emit {
                     HookEmit::Settled => app.emit("pty://settled", HookSettledEvent { session_id: terminal }),
+                    HookEmit::SessionChanged => app.emit("pty://claude-session", HookSettledEvent { session_id: terminal }),
                     HookEmit::Attention(reason) => {
                         app.emit("pty://attention", HookAttentionEvent { session_id: terminal, reason })
                     }
@@ -650,53 +701,157 @@ mod tests {
         assert!(sweeps.is_latest(on));
     }
 
-    #[test]
-    fn a_terminals_claude_session_is_remembered_from_its_hook_signals() {
-        let (_tmp, db) = test_db();
-        let stop = |session: &str| format!(r#"{{"hook_event_name":"Stop","session_id":"{session}","cwd":"/w"}}"#);
-        let session = |t: &str| db.terminal_cc_session(t).unwrap().map(|(s, _)| s);
-        assert_eq!(session("t1"), None, "a terminal that never ran a hook");
+    fn hook(event: &str, session: &str) -> String {
+        format!(r#"{{"hook_event_name":"{event}","session_id":"{session}","cwd":"/w"}}"#)
+    }
 
-        // The newest session a terminal reports is the one it runs; another
-        // terminal keeps its own.
-        assert!(record_hook(&db, Some("t1"), None, &stop("s1")));
-        assert!(record_hook(&db, Some("t2"), None, &stop("s9")));
-        poll_once(&db, true, Utc::now()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(record_hook(&db, Some("t1"), None, &stop("s2")));
-        poll_once(&db, true, Utc::now()).unwrap();
-        assert_eq!(session("t1").as_deref(), Some("s2"));
-        assert_eq!(session("t2").as_deref(), Some("s9"));
-        let (_, at) = db.terminal_cc_session("t1").unwrap().unwrap();
+    /// Queue one hook payload for `terminal` and run a poll, a moment after
+    /// the last one so the links order by time.
+    fn fire(db: &Db, terminal: &str, event: &str, session: &str) -> Vec<(String, HookSignal)> {
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        assert!(record_hook(db, Some(terminal), None, &hook(event, session)), "{event} {session}");
+        poll_once(db, true, Utc::now()).unwrap()
+    }
+
+    fn session_of(db: &Db, terminal: &str) -> Option<String> {
+        db.terminal_claude_session(terminal).unwrap().map(|(s, _)| s)
+    }
+
+    #[test]
+    fn a_session_start_links_the_terminal_at_once_and_its_end_unlinks_it() {
+        let (_tmp, db) = test_db();
+        assert_eq!(session_of(&db, "t1"), None, "a terminal that never ran a hook");
+
+        // `claude` starts: the terminal runs that session from this moment,
+        // and the Companion is told to look again.
+        assert_eq!(fire(&db, "t1", "SessionStart", "s1"), [("t1".to_string(), HookSignal::SessionStarted)]);
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s1"));
+        let (_, at) = db.terminal_claude_session("t1").unwrap().unwrap();
         assert!(at.ends_with("+00:00") && DateTime::parse_from_rfc3339(&at).is_ok(), "linked_at {at}");
-        // The earlier session stays claimed: it is never an unclaimed one.
-        let claimed: i64 = db.conn_ref().query_row("SELECT COUNT(*) FROM terminal_cc_sessions", [], |r| r.get(0)).unwrap();
-        assert_eq!(claimed, 3);
+        let mut hooked = HashSet::new();
+        assert_eq!(deliver_one(&mut hooked, "t1", HookSignal::SessionStarted), HookEmit::SessionChanged);
+        assert_eq!(deliver_one(&mut hooked, "t1", HookSignal::SessionEnded), HookEmit::SessionChanged);
+        assert!(hooked.is_empty(), "a session starting or ending is not an attention signal");
+
+        // `/exit`: no current session. A bare prompt, or another CLI in that
+        // terminal, has no Claude Code figures to show.
+        assert_eq!(fire(&db, "t1", "SessionEnd", "s1"), [("t1".to_string(), HookSignal::SessionEnded)]);
+        assert_eq!(session_of(&db, "t1"), None);
+        // Its own `Stop`, still in flight when it ended, can't bring it back.
+        fire(&db, "t1", "Stop", "s1");
+        assert_eq!(session_of(&db, "t1"), None, "an ended session stays ended");
+        // Resuming it can: its `SessionStart` says so.
+        fire(&db, "t1", "SessionStart", "s1");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s1"));
+        fire(&db, "t1", "Stop", "s1");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s1"));
+    }
+
+    #[test]
+    fn clear_and_resume_move_the_terminal_to_the_new_session_without_waiting_for_a_turn() {
+        let (_tmp, db) = test_db();
+        fire(&db, "t1", "SessionStart", "s1");
+        // `/clear`, in the order Claude Code fires them (recorded on 2.1.327):
+        // the old session ends, then the new one starts.
+        fire(&db, "t1", "SessionEnd", "s1");
+        assert_eq!(session_of(&db, "t1"), None, "between the two there is nothing to show");
+        fire(&db, "t1", "SessionStart", "s2");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s2"));
+        // `/resume` of an older conversation: the same two events.
+        fire(&db, "t1", "SessionEnd", "s2");
+        fire(&db, "t1", "SessionStart", "s0");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s0"));
+        // Both in one poll, as they arrive 30 ms apart: still in order.
+        assert!(record_hook(&db, Some("t1"), None, &hook("SessionEnd", "s0")));
+        assert!(record_hook(&db, Some("t1"), None, &hook("SessionStart", "s3")));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s3"));
+        // An end that names another session than the current one changes nothing.
+        fire(&db, "t1", "SessionEnd", "s1");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s3"));
+    }
+
+    #[test]
+    fn a_terminal_has_one_current_session_and_a_session_one_terminal() {
+        let (_tmp, db) = test_db();
+        // t1 ran s1, then (cleared) s2.
+        fire(&db, "t1", "SessionStart", "s1");
+        fire(&db, "t1", "SessionEnd", "s1");
+        fire(&db, "t1", "SessionStart", "s2");
+        fire(&db, "t2", "SessionStart", "s9");
+        let rows: i64 = db.conn_ref().query_row("SELECT COUNT(*) FROM terminal_claude_session", [], |r| r.get(0)).unwrap();
+        assert_eq!(rows, 2, "one row per terminal");
+
+        // s2 is resumed in t2 (t1's process was killed, so no end was said).
+        // t2 runs it now; t1 has no session, not its older one.
+        fire(&db, "t2", "SessionEnd", "s9");
+        fire(&db, "t2", "SessionStart", "s2");
+        assert_eq!(session_of(&db, "t2").as_deref(), Some("s2"));
+        assert_eq!(session_of(&db, "t1"), None, "never falls back to s1");
+    }
+
+    #[test]
+    fn a_session_whose_hooks_predate_session_start_is_linked_by_its_next_signal() {
+        let (_tmp, db) = test_db();
+        // Already running when the session hooks were installed: no start.
+        fire(&db, "t1", "Stop", "s1");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s1"));
+        // The newest signal names the terminal's session; another terminal keeps its own.
+        fire(&db, "t2", "Stop", "s9");
+        fire(&db, "t1", "Stop", "s2");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s2"));
+        assert_eq!(session_of(&db, "t2").as_deref(), Some("s9"));
 
         // A payload without a session id changes nothing.
         assert!(record_hook(&db, Some("t1"), None, r#"{"hook_event_name":"Stop"}"#));
         poll_once(&db, true, Utc::now()).unwrap();
-        assert_eq!(session("t1").as_deref(), Some("s2"));
-
-        // With the setting off the queue is drained and nothing is learned.
-        assert!(record_hook(&db, Some("t1"), None, &stop("s3")));
-        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
-        assert_eq!(session("t1").as_deref(), Some("s2"));
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("s2"));
 
         // A row queued while the app was closed is not delivered, but it
-        // still names the session that terminal ran.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(record_hook(&db, Some("t1"), None, &stop("s4")));
+        // still says what happened in that terminal: here, that s2 ended.
+        assert!(record_hook(&db, Some("t1"), None, &hook("SessionEnd", "s2")));
         let later = Utc::now() + chrono::Duration::seconds(STALE_AFTER_SECS + 60);
         assert!(poll_once(&db, true, later).unwrap().is_empty());
-        assert_eq!(session("t1").as_deref(), Some("s4"));
+        assert_eq!(session_of(&db, "t1"), None);
 
-        // A session resumed in another terminal moves there, with one row.
-        std::thread::sleep(std::time::Duration::from_millis(5));
-        assert!(record_hook(&db, Some("t2"), None, &stop("s4")));
-        poll_once(&db, true, Utc::now()).unwrap();
-        assert_eq!(session("t2").as_deref(), Some("s4"));
-        assert_eq!(session("t1").as_deref(), Some("s2"));
+        // With the setting off nothing confirms a session any more: what was
+        // known is forgotten, and nothing new is learned.
+        assert!(record_hook(&db, Some("t2"), None, &hook("SessionStart", "s10")));
+        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
+        assert_eq!(session_of(&db, "t2"), None);
+    }
+
+    /// A `claude -p` the agent runs inherits the terminal's id. Claude Code
+    /// says in the hook's environment that it is print mode (`sdk-cli`,
+    /// recorded on 2.1.327), so it never becomes the terminal's session.
+    #[test]
+    fn a_print_mode_session_in_the_terminal_never_takes_it_over() {
+        let (_tmp, db) = test_db();
+        fire(&db, "t1", "SessionStart", "parent");
+        let nested = |event: &str| record_hook_from(&db, Some("t1"), None, Some("sdk-cli"), &hook(event, "nested"));
+        assert!(!nested("SessionStart"), "not queued at all");
+        assert!(nested("Stop"), "its turn ending still settles the terminal's attention, as before");
+        assert!(!nested("SessionEnd"));
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].signal.as_str(), rows[0].session_id.as_deref()), ("settled", None), "without its session id");
+        remember_sessions(&db, &rows);
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
+
+        // A CLI that doesn't say how it was started: the nested session is
+        // taken for the terminal's while it runs, its end unlinks it, and the
+        // parent's next signal puts the terminal back on the parent.
+        let unsaid = |event: &str, session: &str| {
+            std::thread::sleep(std::time::Duration::from_millis(3));
+            assert!(record_hook_from(&db, Some("t1"), None, None, &hook(event, session)));
+            poll_once(&db, true, Utc::now()).unwrap();
+        };
+        unsaid("SessionStart", "nested-2");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("nested-2"));
+        unsaid("SessionEnd", "nested-2");
+        assert_eq!(session_of(&db, "t1"), None, "nothing is shown rather than the nested session");
+        unsaid("Stop", "parent");
+        assert_eq!(session_of(&db, "t1").as_deref(), Some("parent"));
     }
 
     #[test]

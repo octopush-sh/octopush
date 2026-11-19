@@ -48,7 +48,10 @@ Rules (enforced by `node scripts/whats-new.mjs check`, which CI runs):
 A tour or clip can only point at elements that carry a stable `data-tour="<id>"` attribute.
 Ids are kebab-case, scoped by surface (`settings-account-sync`, `direct-launcher-begin`,
 `review-ai-pass`). Adding an id to an element is cheap and encouraged; renaming one breaks
-changesets that use it, so `check` catches it. The registry of surfaces and the tour runner
+changesets that use it, so `check` catches it. Retiring an element whose id a **released**
+changeset points at: in the same PR, remove that step from the released changeset (its
+text stays as the record of what shipped) and the id's row from the table below, so `check`
+stays green and no tour points at an element that no longer exists. The registry of surfaces and the tour runner
 live in `src/lib/tour/`.
 
 An id assigned through a variable (one per mode, one per settings tab) is written as

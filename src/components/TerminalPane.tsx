@@ -73,7 +73,8 @@ interface Props {
   /**
    * Called when this terminal is successfully reattached to a surviving daemon
    * session (i.e. after an Octopush restart).  The parent uses this to mark
-   * the terminal as `restored` in the store so the Companion can show the badge.
+   * the terminal as `restored` in the store, for whatever surface shows the
+   * Restored badge (the Companion no longer does).
    */
   onReattach?: () => void;
   /**
