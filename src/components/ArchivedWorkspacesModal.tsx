@@ -23,9 +23,15 @@ export function ArchivedWorkspacesModal({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  // An archived mission keeps its group: restoring it returns it there.
+  // An archived mission keeps its group (`group_id` stays on its row), so
+  // restoring it returns it to that group if the group still exists. Removing
+  // a group clears its members' `group_id`, archived ones included, so a
+  // mission whose group is gone shows no group here and comes back loose. A
+  // group of another project, or one not loaded, counts as none (the rail's
+  // `ownGroupId` rule).
   const groups = useGroupsStore((s) => s.groups);
-  const groupNameOf = (w: Workspace) => groups.find((g) => g.id === w.groupId)?.name ?? null;
+  const groupNameOf = (w: Workspace) =>
+    groups.find((g) => g.id === w.groupId && g.scope === "workspace" && g.projectId === w.projectId)?.name ?? null;
 
   useEffect(() => {
     let alive = true;
@@ -72,7 +78,7 @@ export function ArchivedWorkspacesModal({
                 {groupNameOf(w) && (
                   <span
                     className="max-w-[90px] shrink-0 truncate font-mono text-[10px] text-octo-mute"
-                    title={`In the group "${groupNameOf(w)}"`}
+                    title={`In the group "${groupNameOf(w)}": restoring returns it there`}
                   >
                     {groupNameOf(w)} ·
                   </span>

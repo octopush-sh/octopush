@@ -46,6 +46,25 @@ export function ownGroupId(
   return groupId !== null && owners.get(groupId) === projectId ? groupId : null;
 }
 
+/** The name of the mission group a workspace sits in, looked up across every
+ *  loaded project, or null for a loose (or unloaded) one. Same rule as
+ *  `ownGroupId`: only a group of the workspace's own project counts. For the
+ *  surfaces outside the rail that name a mission's group (Mission Control's
+ *  `group · workspace` atom). */
+export function missionGroupNameOf(
+  workspacesByProjectId: Record<string, readonly Pick<Workspace, "id" | "projectId" | "groupId">[]>,
+  groups: readonly Group[],
+  workspaceId: string,
+): string | null {
+  for (const list of Object.values(workspacesByProjectId)) {
+    const ws = list.find((w) => w.id === workspaceId);
+    if (!ws) continue;
+    const g = ws.groupId ? groups.find((x) => x.id === ws.groupId) : undefined;
+    return g && g.scope === "workspace" && g.projectId === ws.projectId ? g.name : null;
+  }
+  return null;
+}
+
 /**
  * Interleave a project's groups with its loose missions.
  *

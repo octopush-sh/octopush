@@ -8,6 +8,7 @@ import { runTwoSessions } from "./run-two-sessions";
 import { runFourSessions } from "./run-four-sessions";
 import { railGroups } from "./rail-groups";
 import { railProjectGroups } from "./rail-project-groups";
+import { railGroupsEverywhere } from "./rail-groups-everywhere";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
@@ -17,4 +18,5 @@ export const SCENARIOS: Record<string, Scenario> = {
   "run-four-sessions": runFourSessions,
   "rail-groups": railGroups,
   "rail-project-groups": railProjectGroups,
+  "rail-groups-everywhere": railGroupsEverywhere,
 };

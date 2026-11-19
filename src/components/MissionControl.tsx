@@ -15,6 +15,8 @@ import { ArrowDownUp, ChevronRight, GitCompareArrows, Hammer, MessageSquare, Moo
 import type { DiffSize, Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore, findWorkspaceName } from "../stores/workspaceStore";
+import { useGroupsStore } from "../stores/groupsStore";
+import { missionGroupNameOf } from "../lib/railGroups";
 import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
@@ -434,6 +436,7 @@ function CrewCard({
   const stages = useRunsStore((s) => s.detailByRun[run.id]?.stages ?? EMPTY_STAGES);
   const statusSinceMs = useRunsStore((s) => s.statusSince[run.id]);
   const wsName = useWorkspaceName(run.workspaceId);
+  const groupName = useWorkspaceGroupName(run.workspaceId);
   const missionIntent = useMissionsStore(
     (s) => s.missionByWorkspaceId[run.workspaceId]?.intent ?? null,
   );
@@ -552,6 +555,21 @@ function CrewCard({
         {wsName && (
           <>
             <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+            {/* `group · workspace` for a mission in a group: the group's name
+                first, and the first to give way (shrink-[100] against the
+                workspace's own). Nothing for a loose mission. */}
+            {groupName && (
+              <>
+                <span
+                  data-testid="mission-control-card-group"
+                  className="min-w-0 shrink-[100] truncate text-octo-mute"
+                  title={`Group: ${groupName}`}
+                >
+                  {groupName}
+                </span>
+                <span aria-hidden className="shrink-0 text-octo-mute">·</span>
+              </>
+            )}
             <span
               data-tour="mission-control-card-workspace"
               className="min-w-0 truncate text-octo-mute"
@@ -1018,6 +1036,12 @@ function CollisionSegment({ workspaceId }: { workspaceId: string }) {
       </span>
     </>
   );
+}
+
+/** The name of the mission group the workspace sits in, or null. */
+function useWorkspaceGroupName(workspaceId: string): string | null {
+  const groups = useGroupsStore((s) => s.groups);
+  return useWorkspaceStore((s) => missionGroupNameOf(s.workspacesByProjectId, groups, workspaceId));
 }
 
 /** The workspace's display name — thin hook over the shared selector. */

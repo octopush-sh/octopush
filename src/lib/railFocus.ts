@@ -1,26 +1,43 @@
-// Keeping the keyboard on a project's line in the rail while the line moves.
+// Keeping the keyboard on a project's line, or on a mission's row, in the
+// rail while the line moves.
 //
-// A project's menu opened from the keyboard gives its line the focus back
-// when it closes. Some of the menu's actions then MOVE that line: "Move to
-// group" renders the project under another parent, which React can only do by
-// unmounting the line and mounting a new one, and a reorder moves its node.
-// Either way the focused element is gone and the focus falls to <body>, out
-// of the rail. So the wish is held for a moment and granted again after the
-// rail renders, until the user acts or the moment is over (`HOLD_MS`): a
-// reload long after the move (the window regaining focus) must not pull the
-// focus back to a line the user has left.
+// A project's (or a mission's) menu opened from the keyboard gives its line
+// the focus back when it closes. Some of the menu's actions then MOVE that
+// line: "Move to group" renders the project under another parent, which React
+// can only do by unmounting the line and mounting a new one, and a reorder
+// moves its node. Either way the focused element is gone and the focus falls
+// to <body>, out of the rail. So the wish is held for a moment and granted
+// again after the rail renders, until the user acts or the moment is over
+// (`HOLD_MS`): a reload long after the move (the window regaining focus) must
+// not pull the focus back to a line the user has left.
 
 /** How long a hold lasts: the move's own renders land well within it. */
 export const HOLD_MS = 1000;
 
-let wanted: string | null = null;
+/** A held line: a project's line or a mission row's name button. */
+interface Wish {
+  kind: "project" | "mission";
+  id: string;
+}
+
+let wanted: Wish | null = null;
 let listening = false;
 let timer: ReturnType<typeof setTimeout> | null = null;
 
-const line = (projectId: string) =>
-  Array.from(document.querySelectorAll<HTMLElement>("[data-rail-project-line]")).find(
-    (el) => el.dataset.railProjectLine === projectId,
-  );
+const line = ({ kind, id }: Wish) =>
+  kind === "project"
+    ? Array.from(document.querySelectorAll<HTMLElement>("[data-rail-project-line]")).find(
+        (el) => el.dataset.railProjectLine === id,
+      )
+    : Array.from(document.querySelectorAll<HTMLElement>("[data-rail-mission]")).find(
+        (el) => el.dataset.railMission === id,
+      );
+
+/** Nothing real holds the focus: it fell to <body> or to a removed node. */
+function focusIsLost(): boolean {
+  const active = document.activeElement;
+  return !active || active === document.body || !active.isConnected;
+}
 
 /** The user did something, or the time is up: the wish has been granted or overtaken. */
 function release() {
@@ -35,19 +52,35 @@ function release() {
   window.removeEventListener("pointerdown", release, true);
 }
 
+function hold(wish: Wish) {
+  release();
+  wanted = wish;
+  listening = true;
+  window.addEventListener("keydown", release, true);
+  window.addEventListener("pointerdown", release, true);
+  timer = setTimeout(release, HOLD_MS);
+}
+
 /**
  * Focus a project's line now, and keep it focused through the renders that
  * follow (`restoreProjectLineFocus`) until the next key or pointer press, for
  * `HOLD_MS` at most.
  */
 export function holdProjectLineFocus(projectId: string): void {
-  release();
-  wanted = projectId;
-  listening = true;
-  window.addEventListener("keydown", release, true);
-  window.addEventListener("pointerdown", release, true);
-  timer = setTimeout(release, HOLD_MS);
-  line(projectId)?.focus({ preventScroll: true });
+  hold({ kind: "project", id: projectId });
+  line({ kind: "project", id: projectId })?.focus({ preventScroll: true });
+}
+
+/**
+ * The same for a mission row (its name button, `data-rail-mission`), for a
+ * mission menu or a Move-to-group menu the keyboard opened. Unlike a project
+ * line it is focused only where the focus was lost: a menu action may have
+ * opened a dialog (Rename…, Customize…) that took the focus on purpose.
+ */
+export function holdMissionRowFocus(workspaceId: string): void {
+  const wish: Wish = { kind: "mission", id: workspaceId };
+  hold(wish);
+  if (focusIsLost()) line(wish)?.focus({ preventScroll: true });
 }
 
 /**
@@ -56,9 +89,7 @@ export function holdProjectLineFocus(projectId: string): void {
  * A focus that went somewhere real (a dialog, a rename input) is left alone.
  */
 export function restoreProjectLineFocus(): void {
-  if (!wanted) return;
-  const active = document.activeElement;
-  if (active && active !== document.body && active.isConnected) return;
+  if (!wanted || !focusIsLost()) return;
   line(wanted)?.focus({ preventScroll: true });
 }
 

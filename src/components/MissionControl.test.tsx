@@ -34,6 +34,7 @@ const { useRunsStore } = await import("../stores/runsStore");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
 const { useAttentionStore } = await import("../stores/attentionStore");
 const { useMissionsStore } = await import("../stores/missionsStore");
+const { useGroupsStore } = await import("../stores/groupsStore");
 const { ipc } = await import("../lib/ipc");
 const { useDiffSizeStore, resetDiffSizeQueueForTests } = await import("../stores/diffSizeStore");
 
@@ -195,6 +196,55 @@ describe("MissionControl", () => {
       expect(w.className).not.toContain("font-serif");
       expect(w.parentElement?.className).toContain("font-mono");
     }
+  });
+
+  it("reads `group · workspace` in the meta row for a mission in a group, the group giving way first", () => {
+    useRunsStore.setState({
+      runsByWs: {
+        "ws-a": [mkRun("a", "running")],
+        "ws-b": [mkRun("b", "running", { workspaceId: "ws-b" })],
+      },
+    });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: {
+        p1: [
+          { id: "ws-a", projectId: "p1", name: "fix-json-parser", groupId: "g-fixes" },
+          { id: "ws-b", projectId: "p1", name: "monthly-report", groupId: null },
+        ],
+      },
+    } as any);
+    useGroupsStore.setState({
+      groups: [{ id: "g-fixes", scope: "workspace", projectId: "p1", name: "Fixes", tint: "rouge", sortOrder: 0, createdAt: "" }],
+      loaded: true,
+    });
+    const { container } = renderRoom();
+    const atoms = [...container.querySelectorAll('[data-testid="mission-control-card-group"]')];
+    expect(atoms).toHaveLength(1);
+    const [atom] = atoms;
+    expect(atom.textContent).toBe("Fixes");
+    expect(atom.getAttribute("title")).toBe("Group: Fixes");
+    // Mute mono meta, never the tint and never brass: the group is a word here.
+    expect(atom.className).toContain("text-octo-mute");
+    expect(atom.className).toContain("shrink-[100]");
+    const row = atom.parentElement!;
+    expect(row.className).toContain("font-mono");
+    const order = [...row.children].map((el) => el.textContent);
+    expect(order.indexOf("Fixes")).toBeLessThan(order.indexOf("fix-json-parser"));
+    useGroupsStore.setState({ groups: [], loaded: true });
+  });
+
+  it("shows no group for a mission whose group is gone or belongs to another project", () => {
+    useRunsStore.setState({ runsByWs: { "ws-a": [mkRun("a", "running")] } });
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [{ id: "ws-a", projectId: "p1", name: "fix-json-parser", groupId: "g-other" }] },
+    } as any);
+    useGroupsStore.setState({
+      groups: [{ id: "g-other", scope: "workspace", projectId: "p2", name: "Fixes", tint: null, sortOrder: 0, createdAt: "" }],
+      loaded: true,
+    });
+    const { container } = renderRoom();
+    expect(container.querySelector('[data-testid="mission-control-card-group"]')).toBeNull();
+    useGroupsStore.setState({ groups: [], loaded: true });
   });
 
   it("a run in an UNLOADED workspace renders inert — no jump, but abort still works", () => {

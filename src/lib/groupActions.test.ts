@@ -17,7 +17,9 @@ const {
   createMissionGroup,
   createProjectGroup,
   moveMissionToGroup,
+  moveMissionsToGroup,
   moveProjectToGroup,
+  revealGroup,
   ungroupMissions,
   ungroupProjects,
 } = await import("./groupActions");
@@ -77,6 +79,32 @@ describe("groupActions", () => {
     );
     expect(useRailGroupUi.getState().renamingId).toBe("made");
     expect(groupOf("w1")).toBe("made");
+  });
+
+  it("createMissionGroup puts every selected mission in the one create_group call", async () => {
+    seed([ws("w1"), ws("w2"), ws("w3")]);
+    mockIpc.createGroup.mockResolvedValue(group("made", { name: NEW_GROUP_NAME }));
+    await createMissionGroup("p1", ["w1", "w3"]);
+    expect(mockIpc.createGroup).toHaveBeenCalledTimes(1);
+    expect(mockIpc.createGroup).toHaveBeenCalledWith(expect.objectContaining({ memberIds: ["w1", "w3"] }));
+    expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual(["made", null, "made"]);
+  });
+
+  it("moveMissionsToGroup moves each mission not already there, and unfolds the target", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seed([ws("w1", "g1"), ws("w2"), ws("w3")]);
+    useRailGroupUi.getState().setCollapsed("g1", true);
+    expect(await moveMissionsToGroup(["w1", "w2", "w3"], "g1")).toBe(true);
+    expect(mockIpc.setItemGroup).toHaveBeenCalledTimes(2);
+    expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual(["g1", "g1", "g1"]);
+    expect(useRailGroupUi.getState().collapsed).toEqual({});
+  });
+
+  it("revealGroup unfolds the group and asks the rail to show it", () => {
+    useRailGroupUi.getState().setCollapsed("g1", true);
+    revealGroup("g1");
+    expect(useRailGroupUi.getState().collapsed).toEqual({});
+    expect(useRailGroupUi.getState().revealId).toBe("g1");
   });
 
   it("createMissionGroup leaves the rail alone when the backend refuses", async () => {

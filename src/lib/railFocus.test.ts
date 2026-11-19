@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { HOLD_MS, holdProjectLineFocus, restoreProjectLineFocus, __releaseProjectLineFocus } from "./railFocus";
+import {
+  HOLD_MS,
+  holdMissionRowFocus,
+  holdProjectLineFocus,
+  restoreProjectLineFocus,
+  __releaseProjectLineFocus,
+} from "./railFocus";
 
 /** A project line as the rail draws it: replaced, as a move re-renders it. */
 function mountLine(projectId: string): HTMLButtonElement {
@@ -48,5 +54,50 @@ describe("holdProjectLineFocus", () => {
     const moved = mountLine("scratch");
     restoreProjectLineFocus();
     expect(moved).toHaveFocus();
+  });
+});
+
+function row(id: string) {
+  const el = document.createElement("button");
+  el.dataset.railMission = id;
+  document.body.appendChild(el);
+  return el;
+}
+
+describe("holdMissionRowFocus", () => {
+  it("gives a mission row the focus back when it was lost, and again when the row is replaced", () => {
+    const first = row("w-json");
+    holdMissionRowFocus("w-json");
+    expect(document.activeElement).toBe(first);
+    // "Move to group" renders the row under another parent: a new element.
+    first.remove();
+    const second = row("w-json");
+    restoreProjectLineFocus();
+    expect(document.activeElement).toBe(second);
+  });
+
+  it("leaves alone a focus a dialog took on purpose (Rename…)", () => {
+    row("w-json");
+    const input = document.createElement("input");
+    document.body.appendChild(input);
+    input.focus();
+    holdMissionRowFocus("w-json");
+    expect(document.activeElement).toBe(input);
+  });
+
+  it("is overtaken by the next key, and lets go after HOLD_MS", () => {
+    const first = row("w-json");
+    holdMissionRowFocus("w-json");
+    window.dispatchEvent(new KeyboardEvent("keydown", { key: "j" }));
+    first.remove();
+    const second = row("w-json");
+    restoreProjectLineFocus();
+    expect(document.activeElement).not.toBe(second);
+    holdMissionRowFocus("w-json");
+    vi.advanceTimersByTime(HOLD_MS);
+    second.remove();
+    const third = row("w-json");
+    restoreProjectLineFocus();
+    expect(document.activeElement).not.toBe(third);
   });
 });

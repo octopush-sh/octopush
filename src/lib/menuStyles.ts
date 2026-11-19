@@ -25,13 +25,14 @@ export const MENU_CHROME = `octo-menu-enter fixed z-[60] ${MENU_FRAME}`;
  *  outside-click and ↑/↓ handling see it as part of the menu). */
 export const SUBMENU_CHROME = `octo-menu-enter ${MENU_FRAME}`;
 
-/** Standard single-line menu row. */
+/** Standard single-line menu row. Keyboard focus (the ↑/↓ walk, the first
+ *  row a menu focuses) wears the hover's wash, never the browser's ring. */
 export const MENU_ITEM =
-  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
+  "flex w-full items-center gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:bg-[var(--brass-ghost)] focus-visible:text-octo-brass focus-visible:outline-none";
 
 /** Two-line menu row (label + muted hint) — icon aligns to the first line. */
 export const MENU_ITEM_MULTILINE =
-  "flex w-full items-start gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass";
+  "flex w-full items-start gap-2 px-3 py-2 font-mono text-[11px] text-octo-sage transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:bg-[var(--brass-ghost)] focus-visible:text-octo-brass focus-visible:outline-none";
 
 /** Destructive single-line row — rouge text, rouge-ghost hover. */
 export const MENU_DANGER =
