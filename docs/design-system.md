@@ -494,8 +494,8 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
 - **Run** — session rail (44px, canvas-left) + terminal. Companion: the active session's detail. *Approved 2026-11-18 and planned, not shipped:* panes that always carry their caption, the band's tail as the session line (the 44px rail goes), Companion: context · changes · mission.
-- **Review** — unified diff. Companion: Changed + commit.
-- **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
+- **Review** — unified diff. Companion: how the change was built + branch & publish.
+- **Direct** — horizontal assembly-line track + focus pane. Companion: runs + logbook. The 4th mode is per-workspace and optional; the trinity is always present.
 
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
 
@@ -513,7 +513,7 @@ The air between the standing surfaces is three tokens (section 3), all 8px, on t
 Three rules:
 
 1. **The shell is shared.** The same gaps hold in Run, Talk, Review and Direct, and with the rail or the Companion folded. A mode never adds its own outer margin to the canvas. If one mode needs air, it pads inside its own canvas.
-2. **Change the token, not the class.** A surface that sits in the shell reads these tokens; it doesn't restate `8px` or reach for `mx-4`. `shellSpacing.test.ts` fails if `<main>`, the ContextHeader, the mode band or the canvas column carry another outer margin.
+2. **Change the token, not the class.** A surface that sits in the shell reads these tokens; it doesn't restate `8px` or reach for `mx-4`. `shellSpacing.test.ts` checks that the CSS and TypeScript values agree and that these four elements read the tokens.
 3. **Inner spacing is the surface's own.** The tokens govern the gaps *between* surfaces. The rail's rows, the ContextHeader's padding (12px inline, 6px block) and the Companion's sections keep their own scale values.
 
 ### Workspace rail — the index (2026-09-20)
@@ -563,7 +563,8 @@ found-match tokens (§4). Nothing else in the rail carries a border.
 #### Rail groups (approved 2026-11-18 · planned, not shipped)
 
 Spec: `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`,
-Part 1. The rail has no groups yet; this is the record later PRs build to.
+Part 1. The groups' data layer has shipped (#909); the rail draws no groups
+yet. This is the record the rail PRs build to.
 
 A **group** is a named, optionally tinted, foldable run of items: one
 membership per item, no nesting, and it survives being emptied (it reads
@@ -688,15 +689,18 @@ actions also live in the rail flyout, the band anchor and the Companion.
 ### Companion grammar (2026-11-18)
 
 Three rules for the Companion in every mode. Talk, Review and Direct already
-follow them; new Companion work must.
+follow rules 1 and 2; new Companion work follows all three.
 
 1. **The Companion never repeats the canvas.** It shows what surrounds the
    work on the canvas: what the canvas can't say about itself.
 2. **It follows the focus.** Its content describes the focused thing (the open
    chat, the focused pane, the selected run), and says which one when more
    than one is on screen.
-3. **An empty section is not drawn.** A section with nothing to say folds
-   away through the grid-rows idiom; nothing is invented to fill it.
+3. **A section that doesn't apply is not drawn.** When a section has no
+   meaning for the focused thing (a context meter for a plain shell), it folds
+   away through the grid-rows idiom; nothing is invented to fill it. A section
+   that applies but is empty keeps its one calm line ("No runs yet", "The
+   working tree is clean."); those empty states stay.
 
 | Mode | Canvas | The Companion answers |
 |------|--------|-----------------------|

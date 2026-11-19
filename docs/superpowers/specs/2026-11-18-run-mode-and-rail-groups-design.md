@@ -1,7 +1,7 @@
 # Run mode and rail groups: one home per fact, a tighter shell
 
 **Status:** approved by the owner on 2026-11-18, in the PM chat.
-**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
+**Ships as:** eight small PRs (see "Implementation plan"). PR 1 ships the shell spacing and records this design. PR 5, the groups' data layer (storage, commands, IPC and store, with no rail UI), shipped first, in #909. Everything else in this document is **planned**: until its PR merges, the code still behaves as `docs/FEATURES.md` describes.
 
 The approved mockup isn't checked in, because it was built from private screenshots. This document is the record. Its examples use made-up names (`acme-api`, "Vulnerability fixes", "PR reviews").
 
@@ -235,7 +235,7 @@ Every pane has its caption, **even when it is alone**. The caption is the existi
 
 1. **The Companion never repeats the canvas.** It shows what surrounds the work on the canvas.
 2. **It follows the focus.**
-3. **An empty section is not drawn.** A section with nothing to say folds away (grid-rows); nothing is invented to fill it.
+3. **A section that doesn't apply is not drawn.** When a section has no meaning for the focused thing (a context meter for a plain shell), it folds away (grid-rows); nothing is invented to fill it. A section that applies but is empty keeps its one calm line ("The working tree is clean.", "No runs yet").
 
 | Mode | Canvas | The Companion answers |
 |---|---|---|
@@ -283,7 +283,7 @@ The Companion keeps whatever fold state the user last left it in.
 
 ## Part 5: Shell spacing
 
-All values are on the 4px scale.
+The gaps are on the 4px scale; the header's block padding is 6px.
 
 | Gap | Before | Now |
 |---|---|---|
@@ -312,7 +312,7 @@ Three layout tokens carry the gaps, in `src/styles.css` and mirrored as `shell` 
 
 ## Implementation plan
 
-Small PRs, each shippable alone. Each updates `docs/FEATURES.md`, adds a `whats-new` changeset when user-visible, and runs `npm run typecheck` and the Vitest suite. Run ships first (PRs 1 to 4), groups after (PRs 5 to 8).
+Small PRs, each shippable alone. Each updates `docs/FEATURES.md`, adds a `whats-new` changeset when user-visible, and runs `npm run typecheck` and the Vitest suite. Run ships first (PRs 1 to 4), groups after (PRs 6 to 8). PR 5 already shipped (#909), because it had no dependency on the others.
 
 | PR | Scope | Files and components | Data |
 |---|---|---|---|
@@ -320,7 +320,7 @@ Small PRs, each shippable alone. Each updates `docs/FEATURES.md`, adds a `whats-
 | 2 | Caption on every pane; the caption as the session's home | `run/RunPanes.tsx` (`PaneCaption`: always rendered, doing meta, `⌘⌥N` hint, ⋯ menu with Rename, Open beside and Close, the Restored badge, minus for Leave the view), `terminalsStore` (rename and close reused) | — |
 | 3 | The session line in the band | New `run/SessionLine.tsx` (from `SessionRail`'s logic: roving tabindex, ⌥ peek, bell dot, waits), replacing `SessionAnchor` in `App.tsx`'s `modeMeta`; the layout button and its menu (`RunPanes` layout operations, `terminalLayoutStore`); delete `SessionRail.tsx`, `SessionAnchor.tsx` and their tests; update the tour's `data-tour` ids | A command to reorder sessions, for drag (see the notes below) |
 | 4 | Run's Companion: Context · Changes · Mission | Delete `CompanionSession.tsx`. New `CompanionRun.tsx` built from `CompanionSection`: the context meter from `CompanionContext` fed by the focused session, a compact changes list from the workspace's git status (the data `ChangesPanel` uses), the existing mission line | A read-only command for one session's context size and ledger total, if the existing queries don't give it |
-| 5 | Groups: data and IPC | `db.rs` migration, `commands.rs` and `lib.rs` (`create_group`, `rename_group`, `set_group_tint`, `delete_group`, `set_item_group`), `types.ts`, `ipc.ts`, new `stores/groupsStore.ts`. Runs `cargo test`. | New `groups(id TEXT PK, scope TEXT CHECK IN ('project','workspace'), project_id TEXT NULL REFERENCES projects ON DELETE CASCADE, name TEXT NOT NULL, tint TEXT NULL, sort_order INTEGER, created_at TEXT)`; `ALTER TABLE projects ADD COLUMN group_id TEXT NULL`; `ALTER TABLE workspaces ADD COLUMN group_id TEXT NULL` (set NULL when the group is deleted; an emptied group stays until `delete_group`) |
+| 5 (shipped, #909) | Groups: data and IPC | `db.rs` migration, `commands.rs` and `lib.rs` (`list_groups`, `set_group_order`, `create_group`, `rename_group`, `set_group_tint`, `delete_group`, `set_item_group`), `types.ts`, `ipc.ts`, new `stores/groupsStore.ts`. Runs `cargo test`. | New `groups(id TEXT PK, scope TEXT CHECK IN ('project','workspace'), project_id TEXT NULL REFERENCES projects ON DELETE CASCADE, name TEXT NOT NULL, tint TEXT NULL, sort_order INTEGER, created_at TEXT)`; `ALTER TABLE projects ADD COLUMN group_id TEXT NULL`; `ALTER TABLE workspaces ADD COLUMN group_id TEXT NULL` (set NULL when the group is deleted; an emptied group stays until `delete_group`) |
 | 6 | Groups: mission groups in the rail | `WorkspaceRail.tsx` (a project's rows become rows or a `MissionGroup`: folder header, indented run with its guide, fold persisted under `railGroupCollapsed`, the ancestor step in `resolveAttention`, the filter matching group names), `WorkspaceContextMenu.tsx` (**Move to group ›**), new `GroupContextMenu.tsx`, drag onto a header | — |
 | 7 | Groups: project groups | `WorkspaceRail.tsx` top level, `ProjectContextMenu.tsx`, `ProjectMark` tint inheritance, dnd-kit unit drag, `CollapsedRail` sub-clusters and flyout eyebrow | — |
 | 8 | Groups everywhere else | `CommandPalette.tsx` (Groups section), `MissionControl.tsx` (`group · workspace` atom), `ArchivedWorkspacesModal.tsx` (group meta), ⌥⌘G in `useGlobalShortcuts.ts`, rail multi-select with **Group N missions…** | — |
@@ -328,6 +328,10 @@ Small PRs, each shippable alone. Each updates `docs/FEATURES.md`, adds a `whats-
 No new colours, fonts, glyphs or motion primitives. Everything reuses `TINTS`, `.rail-bar-running`, `.octo-menu-enter`, `.octo-rise-in`, `<Reveal>` and `<FadeSwap>`.
 
 ### Notes from the code, for the PRs that follow
+
+- **`⌥⌘G` is taken.** The editor and the scratchpad use it for "go to line". PR 8 must pick another shortcut for **Move to group…**, or bind it only while the rail has focus.
+- **The session line needs a horizontal marching variant.** `.rail-bar-running` is vertical only, so PR 3 adds a horizontal form of the same idiom to `src/styles.css` and documents it. That is a variant of an existing primitive, not a new one.
+- **Rail rules 1 and 3 need rewording when the rail UI ships** (PR 6): a group's hairline and tinted guide are new marks beside the rows, so "nothing else in the rail carries a border" and "nothing else on the row is coloured" must name them.
 
 Checked against `main` on 2026-11-18. These are implementation facts, not design changes; where one touches the design, the PR that meets it says so before building.
 
@@ -352,4 +356,4 @@ Checked against `main` on 2026-11-18. These are implementation facts, not design
 Left open at approval:
 
 1. **Batches that span repos.** A mission group lives in one project; across repos the answer here is a project group. A cross-project mission group would need its own design.
-2. **Order of work.** The plan ships Run first and groups after. The owner can swap them.
+2. **Order of work.** The plan ships Run first and the rail UI for groups after. The owner can swap them.
