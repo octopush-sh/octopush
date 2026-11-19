@@ -148,7 +148,9 @@ pub fn reasoning_effort_level(model_id: &str, effort: Effort) -> &'static str {
 /// What a Responses request sends for a stage with effort off. GPT-6 runs at
 /// its API default (`medium`) when `reasoning` is omitted, so off has to be
 /// `effort: "none"` — but only GPT-6 Sol, GPT-6 Luna and GPT-6.1 Terra accept
-/// it; GPT-6 Astra and GPT-6.1 Sol return a 400, so they (and any GPT-6 id
+/// it; GPT-6 Astra, GPT-6.1 Sol, GPT-6.2 Astra and GPT-6.2 Sol return a 400
+/// (the 6.2 model pages: "The API rejects requests that set reasoning effort
+/// to `none`"), so they (and any GPT-6 id
 /// not listed here) get no `reasoning` and keep that default. Matches the bare
 /// id or a dated snapshot (`gpt-6-sol-2026-08-01`) only: another variant
 /// (`gpt-6-sol-pro`) may not accept `none`, and `gpt-6-sol` is not a prefix

@@ -202,7 +202,7 @@ export function ContextHeader({
   };
 
   return (
-    <div className="octo-header my-4 flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-4 py-2">
+    <div className="octo-header my-[var(--shell-stack)] flex items-center gap-4 rounded-md border border-octo-hairline bg-octo-panel px-3 py-1.5">
       <div className="flex min-w-0 flex-1 flex-col gap-[3px]">
         {/* Eyebrow — all meta, mono, one line. The height is reserved in every
             state so nothing shifts while missions and issues load. */}

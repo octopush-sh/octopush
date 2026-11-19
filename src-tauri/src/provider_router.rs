@@ -754,6 +754,37 @@ pub(crate) fn builtin_providers() -> HashMap<String, ProviderConfig> {
             api_base: "https://api.openai.com/v1".into(),
             api_key_env: "OPENAI_API_KEY".into(),
             models: vec![
+                // OpenAI model and pricing pages (fetched 2026-11-17):
+                // 1,050,000-token context, 128,000 max output, short-context
+                // prices. Prices must match `token_engine::builtin_prices`.
+                // The per-request paths apply the >272K-input-token tier
+                // (`token_engine::request_prices`).
+                ModelInfo {
+                    id: "gpt-6.2-astra".into(),
+                    superseded_by: None,
+                    display_name: "GPT-6.2 Astra".into(),
+                    input_cost_per_m: 8.0,
+                    output_cost_per_m: 40.0,
+                    cache_read_cost_per_m: 0.40,
+                    cache_creation_cost_per_m: 10.0,
+                    max_context: 1_050_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                    tags: vec!["most capable".into()],
+                },
+                ModelInfo {
+                    id: "gpt-6.2-sol".into(),
+                    superseded_by: None,
+                    display_name: "GPT-6.2 Sol".into(),
+                    input_cost_per_m: 2.0,
+                    output_cost_per_m: 10.0,
+                    cache_read_cost_per_m: 0.10,
+                    cache_creation_cost_per_m: 2.50,
+                    max_context: 1_050_000,
+                    supports_vision: false,
+                    supports_tools: true,
+                    tags: vec!["coding".into()],
+                },
                 // OpenAI model page (fetched 2026-11-10): 1,050,000-token
                 // context, image input, cached input $0.05, 30-minute cache
                 // writes $1.25. Prices must match `token_engine::builtin_prices`.

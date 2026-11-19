@@ -233,9 +233,22 @@ pub fn builtin_prices(model: &str) -> Option<ModelPrices> {
         // GPT-6.1 Terra: OpenAI's model page and API pricing page (fetched
         // 2026-11-10): $1 input, $0.05 cached input, $5 output, and cache
         // writes $1.25 for the default 30-minute retention ($2.50 for 12-hour,
-        // which Octopush never requests). Prompts over 272K input tokens cost
-        // 2x input/cache and 1.5x output; that tier is not modelled yet.
+        // which Octopush never requests).
+        //
+        // Every GPT-6 price here is the <=272K-input-token tier; per-request
+        // paths (Talk director rounds, one-shot AI calls) apply the long tier
+        // via `request_prices`. Aggregated usage (Codex CLI stages, sub-agent
+        // attempts) keeps this tier — the size of each request inside it is
+        // unknown — so long-prompt requests there are under-counted.
         "gpt-6.1-terra" => (1.0, 1.25, 0.05, 5.0),
+        // The rest of GPT-6: API pricing page (fetched 2026-11-17), the
+        // short-context input / 30-minute write / cached input / output
+        // columns.
+        "gpt-6.2-astra" => (8.0, 10.0, 0.40, 40.0),
+        "gpt-6.2-sol" | "gpt-6.1-sol" => (2.0, 2.50, 0.10, 10.0),
+        "gpt-6-astra" => (10.0, 12.50, 1.0, 50.0),
+        "gpt-6-sol" => (2.0, 2.50, 0.20, 10.0),
+        "gpt-6-luna" => (0.10, 0.125, 0.01, 0.50),
         // GPT-4o family: no cache-write charge, so writes cost the input price.
         "gpt-4o" => (2.50, 2.50, 1.25, 10.0),
         "gpt-4o-mini" => (0.15, 0.15, 0.075, 0.60),
@@ -543,16 +556,38 @@ pub fn is_priced(model: &str) -> bool {
     prices_for(model).is_some()
 }
 
-/// Per-request price tiers: `(prompt-token threshold, multiplier)`. Above the
-/// threshold — prompt = input + cache reads + cache writes of ONE request —
-/// every column costs `multiplier`× the base price (official pricing,
-/// 2026-10-29: Haiku 5.5 prompts over 100K tokens cost 5× — 0.50 / 0.625 /
-/// 0.05 / 2.50). Applied as a multiplier so a user-edited base price scales.
-fn long_prompt_tier(model: &str) -> Option<(u64, f64)> {
-    match normalize_model_id(model).as_str() {
-        "claude-haiku-5-5" => Some((100_000, 5.0)),
-        _ => None,
-    }
+/// A per-request price tier: above `threshold` prompt tokens — input + cache
+/// reads + cache writes of ONE request — each column costs its multiplier ×
+/// the base price. Multipliers, so a user-edited base price scales.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LongPromptTier {
+    pub threshold: u64,
+    pub input: f64,
+    pub cache_read: f64,
+    /// Both write columns (5-minute and 1-hour).
+    pub cache_write: f64,
+    pub output: f64,
+}
+
+/// The long-prompt tier of `model`, if it has one.
+///
+/// - Haiku 5.5 (official pricing, 2026-10-29): prompts over 100K tokens cost
+///   5× on every column — 0.50 / 0.625 / 0.05 / 2.50.
+/// - GPT-6 (OpenAI's API pricing page, fetched 2026-11-17): "Long context:
+///   >272K input tokens" costs 2× input, cached input and cache writes, 1.5×
+///   output — input / write / hit / output: GPT-6.1 Terra 2.00 / 2.50 / 0.10
+///   / 7.50, GPT-6.2 Astra 16 / 20 / 0.80 / 60.
+///   OpenAI counts cached input and cache writes as input tokens, so the
+///   prompt total here matches its threshold.
+pub fn long_prompt_tier(model: &str) -> Option<LongPromptTier> {
+    // (threshold, input, cache hit, cache write, output) multipliers.
+    let (threshold, input, cache_read, cache_write, output) = match normalize_model_id(model).as_str() {
+        "claude-haiku-5-5" => (100_000, 5.0, 5.0, 5.0, 5.0),
+        "gpt-6.2-astra" | "gpt-6.2-sol" | "gpt-6.1-terra" | "gpt-6.1-sol" | "gpt-6-astra" | "gpt-6-sol"
+        | "gpt-6-luna" => (272_000, 2.0, 2.0, 2.0, 1.5),
+        _ => return None,
+    };
+    Some(LongPromptTier { threshold, input, cache_read, cache_write, output })
 }
 
 /// The prices that apply to ONE request of `prompt_tokens` (input + cache
@@ -561,12 +596,12 @@ fn long_prompt_tier(model: &str) -> Option<(u64, f64)> {
 /// size of each request inside the aggregate is unknown.
 pub fn request_prices(model: &str, base: ModelPrices, prompt_tokens: u64) -> ModelPrices {
     match long_prompt_tier(model) {
-        Some((threshold, k)) if prompt_tokens > threshold => ModelPrices {
-            input_per_m: base.input_per_m * k,
-            output_per_m: base.output_per_m * k,
-            cache_read_per_m: base.cache_read_per_m * k,
-            cache_creation_per_m: base.cache_creation_per_m * k,
-            cache_creation_1h_per_m: base.cache_creation_1h_per_m * k,
+        Some(t) if prompt_tokens > t.threshold => ModelPrices {
+            input_per_m: base.input_per_m * t.input,
+            output_per_m: base.output_per_m * t.output,
+            cache_read_per_m: base.cache_read_per_m * t.cache_read,
+            cache_creation_per_m: base.cache_creation_per_m * t.cache_write,
+            cache_creation_1h_per_m: base.cache_creation_1h_per_m * t.cache_write,
         },
         _ => base,
     }
