@@ -30,6 +30,10 @@ interface Props {
   title: string;
   /** A count or short figure after the title (`· 3`). */
   count?: number | string | null;
+  /** What the section is about right now, at the right of the eyebrow: a
+   *  session's name, `3 files · +84 −12`. Mute, in the text's own case, and
+   *  the part that truncates when the bar is short. */
+  meta?: string | null;
   /** Tooltip on the eyebrow. */
   hint?: string;
   /** A single control at the right of the eyebrow (a `+`, an open-room glyph). */
@@ -41,6 +45,8 @@ interface Props {
   accent?: boolean;
   children: ReactNode;
   testId?: string;
+  /** A `data-tour` id on the section (What's new tours point at it). */
+  tourId?: string;
   className?: string;
 }
 
@@ -54,6 +60,7 @@ interface Props {
 export function CompanionSection({
   title,
   count,
+  meta,
   hint,
   action,
   defaultOpen = true,
@@ -61,6 +68,7 @@ export function CompanionSection({
   accent = false,
   children,
   testId,
+  tourId,
   className = "",
 }: Props) {
   const [open, setOpen] = useState(() => readOpen(storageKey, defaultOpen));
@@ -74,6 +82,7 @@ export function CompanionSection({
   return (
     <section
       data-testid={testId}
+      data-tour={tourId}
       className={`border-t border-octo-hairline first:border-t-0 ${className}`}
     >
       <div className="flex h-9 shrink-0 items-center gap-1 pl-3 pr-2">
@@ -91,9 +100,17 @@ export function CompanionSection({
             aria-hidden
             className={`shrink-0 transition-transform duration-[220ms] ${open ? "rotate-90" : ""}`}
           />
-          <span className="truncate">{title}</span>
+          <span className={meta ? "shrink-0" : "truncate"}>{title}</span>
           {count != null && count !== "" && (
             <span className="octo-tabular tracking-normal text-octo-mute">· {count}</span>
+          )}
+          {meta && (
+            <span
+              data-testid="companion-section-meta"
+              className="octo-tabular ml-auto min-w-0 truncate pl-2 text-[10px] normal-case tracking-normal text-octo-mute"
+            >
+              {meta}
+            </span>
           )}
         </button>
         {action}

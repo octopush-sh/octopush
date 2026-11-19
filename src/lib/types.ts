@@ -394,6 +394,32 @@ export interface ThreadCost {
   unpricedModels?: string[];
 }
 
+/** What the Claude Code session in one Run terminal has used
+ *  (`transcripts::SessionUsage`, `get_session_usage`): the Run Companion's
+ *  Context section. Octopush knows a terminal's session from Claude Code's
+ *  hooks; spend and cache share come from the ledger, the context size from
+ *  the session's own transcript. */
+export interface SessionUsage {
+  /** The session's last prompt: input + cache read + cache write. Null when
+   *  the transcript can't say (gone, or compacted with no message since). */
+  contextTokens: number | null;
+  /** The model's context window from the provider catalog; null for a model
+   *  the catalog doesn't list. */
+  maxContext: number | null;
+  /** Priced spend of the session's ledger rows. */
+  spentUsd: number;
+  /** Ledger rows (billed API calls) of the session. */
+  calls: number;
+  /** Those of `calls` on a model without a price, left out of `spentUsd`. */
+  unpricedCalls: number;
+  /** Share of the session's prompt tokens read from the cache, 0–100. */
+  cacheHitPct: number | null;
+  /** The model of the last prompt, else of the newest ledger row. */
+  model: string;
+  /** When that last message was written (RFC3339 UTC). */
+  asOf: string;
+}
+
 export interface ChatStreamEvent {
   workspaceId: string;
   threadId?: string;

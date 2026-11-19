@@ -643,7 +643,8 @@ const NOTIFICATION_MATCHERS: [(&str, HookSignal); 4] = [
     ("elicitation_url_dialog", HookSignal::NeedsInput),
 ];
 
-/// What a hook payload means for the attention beacon.
+/// What a hook payload means: for the attention beacon, or for which Claude
+/// Code session a terminal runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookSignal {
     /// `Notification` / `permission_prompt` — waiting on permission.
@@ -653,6 +654,13 @@ pub enum HookSignal {
     NeedsInput,
     /// `Stop` — Claude finished its turn.
     Settled,
+    /// `SessionStart` — a session began in the terminal: `claude` started, or
+    /// `/clear`, `/resume`, `--resume`, `--continue`, a fork or a compaction
+    /// gave the process the session the payload names.
+    SessionStarted,
+    /// `SessionEnd` — the session the payload names is over: `/exit`,
+    /// `/clear`, `/resume` to another, logout, or the process was signalled.
+    SessionEnded,
 }
 
 impl HookSignal {
@@ -661,6 +669,8 @@ impl HookSignal {
             HookSignal::NeedsPermission => "permission",
             HookSignal::NeedsInput => "input",
             HookSignal::Settled => "settled",
+            HookSignal::SessionStarted => "session-start",
+            HookSignal::SessionEnded => "session-end",
         }
     }
 
@@ -669,9 +679,32 @@ impl HookSignal {
             "permission" => Some(HookSignal::NeedsPermission),
             "input" => Some(HookSignal::NeedsInput),
             "settled" => Some(HookSignal::Settled),
+            "session-start" => Some(HookSignal::SessionStarted),
+            "session-end" => Some(HookSignal::SessionEnded),
             _ => None,
         }
     }
+
+    /// The two signals that say which session a terminal runs, not that it
+    /// wants the user. Their hooks are installed silent ([`hook_command`]).
+    pub fn is_session(self) -> bool {
+        matches!(self, HookSignal::SessionStarted | HookSignal::SessionEnded)
+    }
+}
+
+/// The variable Claude Code sets in a hook's environment to say how the
+/// session was started: `cli` for the interactive terminal UI, `sdk-cli` for
+/// print mode (`claude -p`), other `sdk-…` values for the Agent SDKs (seen
+/// live on 2.1.327; fixtures `claude-code/2.1.327`).
+pub const ENTRYPOINT_ENV: &str = "CLAUDE_CODE_ENTRYPOINT";
+
+/// Whether a hook's session is the one a person drives in the terminal.
+/// Print mode and the SDKs are not: a `claude -p` the agent itself runs
+/// inherits the terminal's id, and must never be taken for the terminal's
+/// session. An unset or unknown value counts as interactive, which is what a
+/// CLI that doesn't set the variable was before.
+pub fn interactive_entrypoint(entrypoint: Option<&str>) -> bool {
+    !entrypoint.map(str::trim).is_some_and(|e| e.starts_with("sdk"))
 }
 
 /// A hook payload reduced to what Octopush keeps: never the message text or
@@ -696,6 +729,8 @@ pub fn parse_hook_event(payload: &serde_json::Value, kind: Option<&str>) -> Opti
             }
         },
         "Stop" => HookSignal::Settled,
+        "SessionStart" => HookSignal::SessionStarted,
+        "SessionEnd" => HookSignal::SessionEnded,
         _ => return None,
     };
     let text = |key: &str| payload.get(key).and_then(serde_json::Value::as_str).map(str::to_string);
@@ -710,6 +745,20 @@ pub fn hook_command(hook_bin: &Path, kind: Option<HookSignal>) -> String {
         Some(k) => format!("'{bin}' hook {HOOK_KIND_FLAG} {} {HOOK_MARKER}", k.as_str()),
         None => format!("'{bin}' hook {HOOK_MARKER}"),
     }
+}
+
+/// Sends a hook command's output nowhere. A redirection may stand anywhere
+/// in a simple command, so the marker still ends it.
+const SILENCE: &str = ">/dev/null 2>&1";
+
+/// The command the `SessionStart` and `SessionEnd` hooks run: the same
+/// binary, with stdout and stderr discarded by the shell itself. Claude Code
+/// adds a `SessionStart` hook's stdout to the conversation, so this command
+/// must not be able to print whatever the binary does; `octopush-mcp hook`
+/// prints nothing anyway.
+pub fn session_hook_command(hook_bin: &Path) -> String {
+    let bin = hook_bin.to_string_lossy().replace('\'', r"'\''");
+    format!("'{bin}' hook {SILENCE} {HOOK_MARKER}")
 }
 
 fn is_octopush_hook(hook: &serde_json::Value) -> bool {
@@ -752,6 +801,9 @@ pub fn strip_claude_hooks(mut settings: serde_json::Value) -> serde_json::Value 
 
 /// `settings` with Octopush's hooks (re)installed for `hook_bin`, or `None`
 /// when its shape isn't one we can merge into (then the file is left alone).
+/// Ours are stripped first, so re-installing brings a worktree hooked by an
+/// earlier version up to the current set (the launch sweep does this for
+/// every worktree it keeps hooked).
 pub fn merge_claude_hooks(settings: serde_json::Value, hook_bin: &Path) -> Option<serde_json::Value> {
     use serde_json::json;
     let mut settings = strip_claude_hooks(settings);
@@ -768,6 +820,15 @@ pub fn merge_claude_hooks(settings: serde_json::Value, hook_bin: &Path) -> Optio
         add("Notification", json!({ "matcher": matcher, "hooks": [ours(Some(kind))] }))?;
     }
     add("Stop", json!({ "hooks": [ours(None)] }))?;
+    // Which session the terminal runs. No matcher: every source (startup,
+    // resume, clear, compact, fork) and every reason counts. `SessionStart`
+    // is async like the rest, so it never delays the prompt. `SessionEnd` is
+    // not: an async hook can be dropped as the process exits, and this one
+    // must land (it takes a few milliseconds, inside Claude Code's 1.5 s
+    // budget for `SessionEnd` hooks).
+    let session = session_hook_command(hook_bin);
+    add("SessionStart", json!({ "hooks": [{ "type": "command", "command": session, "async": true }] }))?;
+    add("SessionEnd", json!({ "hooks": [{ "type": "command", "command": session }] }))?;
     Some(settings)
 }
 
@@ -977,15 +1038,28 @@ mod tests {
     }
 
     #[test]
-    fn merge_into_an_empty_file_registers_five_async_hooks() {
+    fn merge_into_an_empty_file_registers_the_attention_and_session_hooks() {
         let merged = merge_claude_hooks(serde_json::json!({}), Path::new(BIN)).unwrap();
-        assert_eq!(our_commands(&merged), [
-            ("Notification".to_string(), Some("permission_prompt".to_string())),
-            ("Notification".to_string(), Some("idle_prompt".to_string())),
+        let mut ours = our_commands(&merged);
+        ours.sort();
+        assert_eq!(ours, [
             ("Notification".to_string(), Some("elicitation_dialog".to_string())),
             ("Notification".to_string(), Some("elicitation_url_dialog".to_string())),
+            ("Notification".to_string(), Some("idle_prompt".to_string())),
+            ("Notification".to_string(), Some("permission_prompt".to_string())),
+            ("SessionEnd".to_string(), None),
+            ("SessionStart".to_string(), None),
             ("Stop".to_string(), None),
         ]);
+        // The session hooks run the silent command. SessionStart is async;
+        // SessionEnd is not, so it lands before the process is gone.
+        let start = &merged["hooks"]["SessionStart"][0]["hooks"][0];
+        let end = &merged["hooks"]["SessionEnd"][0]["hooks"][0];
+        assert_eq!(start["command"], session_hook_command(Path::new(BIN)));
+        assert_eq!(end["command"], session_hook_command(Path::new(BIN)));
+        assert_eq!((start["type"].as_str(), start["async"].as_bool()), (Some("command"), Some(true)));
+        assert_eq!((end["type"].as_str(), end.get("async")), (Some("command"), None));
+        assert!(merged["hooks"]["SessionStart"][0].get("matcher").is_none(), "every source");
         let notifications = merged["hooks"]["Notification"].as_array().unwrap();
         assert!(notifications.iter().all(|g| g["hooks"][0]["async"] == true));
         let hook = &merged["hooks"]["Stop"][0]["hooks"][0];
@@ -1028,7 +1102,11 @@ mod tests {
         // The launch sweep re-runs this install for every worktree it keeps hooked.
         assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
         let upgraded = read();
-        let matchers: Vec<_> = our_commands(&upgraded).into_iter().map(|(_, m)| m).collect();
+        let matchers: Vec<_> = our_commands(&upgraded)
+            .into_iter()
+            .filter(|(event, _)| event == "Notification" || event == "Stop")
+            .map(|(_, m)| m)
+            .collect();
         assert_eq!(matchers, [
             Some("permission_prompt".to_string()),
             Some("idle_prompt".to_string()),
@@ -1036,6 +1114,10 @@ mod tests {
             Some("elicitation_url_dialog".to_string()),
             None,
         ]);
+        // A worktree hooked before the session hooks existed gets them too,
+        // with nothing for the user to do.
+        let events: Vec<_> = our_commands(&upgraded).into_iter().map(|(event, _)| event).collect();
+        assert!(events.contains(&"SessionStart".to_string()) && events.contains(&"SessionEnd".to_string()), "{events:?}");
         assert_eq!(upgraded["permissions"], old["permissions"]);
         assert_eq!(upgraded["hooks"]["Notification"][0], user_hook, "the user's hook stays first");
         // Another sweep changes nothing; removal gives the user's settings back.
@@ -1060,7 +1142,7 @@ mod tests {
         let once = merge_claude_hooks(user.clone(), Path::new("/old/octopush-mcp")).unwrap();
         // Re-installing from a moved app replaces ours instead of adding more.
         let twice = merge_claude_hooks(once, Path::new(BIN)).unwrap();
-        assert_eq!(our_commands(&twice).len(), 5);
+        assert_eq!(our_commands(&twice).len(), 7);
         assert!(!twice.to_string().contains("/old/octopush-mcp"));
         assert_eq!(twice["permissions"], user["permissions"]);
         assert_eq!(twice["hooks"]["PreToolUse"], user["hooks"]["PreToolUse"]);
@@ -1087,6 +1169,82 @@ mod tests {
         // The user's own empty containers are theirs to keep.
         let empty = serde_json::json!({ "hooks": { "Stop": [] } });
         assert_eq!(strip_claude_hooks(empty.clone()), empty);
+    }
+
+    #[test]
+    fn the_session_hook_command_keeps_the_marker_last_and_discards_all_output() {
+        let cmd = session_hook_command(Path::new(BIN));
+        assert_eq!(cmd, format!("'{BIN}' hook >/dev/null 2>&1 --octopush-hook"));
+        // Still ours to re-install and to strip.
+        assert!(is_octopush_hook(&serde_json::json!({ "type": "command", "command": cmd })));
+        let merged = merge_claude_hooks(serde_json::json!({}), Path::new(BIN)).unwrap();
+        assert_eq!(strip_claude_hooks(merged), serde_json::json!({}));
+    }
+
+    /// Claude Code adds a `SessionStart` hook's stdout to the conversation.
+    /// Whatever the binary behind the command prints, to either stream, the
+    /// installed command lets none of it out, and still hands it the payload
+    /// and the arguments.
+    #[cfg(unix)]
+    #[test]
+    fn the_session_hook_command_is_silent_even_when_its_binary_prints() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A stand-in for `octopush-mcp` that is as loud as it can be. The
+        // path has a space and a quote, as an app bundle's can.
+        let bin = dir.path().join("it's a bin");
+        let seen = dir.path().join("seen");
+        std::fs::write(
+            &bin,
+            format!("#!/bin/sh\necho LOUD-STDOUT\necho LOUD-STDERR >&2\n{{ echo \"$@\"; cat; }} > '{}'\n", seen.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let run = |command: &str| {
+            let mut child = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            child.stdin.take().unwrap().write_all(br#"{"hook_event_name":"SessionStart"}"#).unwrap();
+            child.wait_with_output().unwrap()
+        };
+        let out = run(&session_hook_command(&bin));
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "", "nothing reaches the conversation");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), "");
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            "hook --octopush-hook\n{\"hook_event_name\":\"SessionStart\"}",
+            "the binary still gets its arguments and the payload",
+        );
+        // The stand-in really is loud: the other hooks' command shows it.
+        let loud = run(&hook_command(&bin, None));
+        assert!(String::from_utf8_lossy(&loud.stdout).contains("LOUD-STDOUT"));
+    }
+
+    #[test]
+    fn hook_payloads_for_a_session_start_and_end_map_to_session_signals() {
+        let p = |v: serde_json::Value| parse_hook_event(&v, None);
+        let start = p(serde_json::json!({ "hook_event_name": "SessionStart", "source": "clear", "session_id": "s2", "cwd": "/wt" })).unwrap();
+        assert_eq!((start.signal, start.session_id.as_deref()), (HookSignal::SessionStarted, Some("s2")));
+        let end = p(serde_json::json!({ "hook_event_name": "SessionEnd", "reason": "prompt_input_exit", "session_id": "s1" })).unwrap();
+        assert_eq!((end.signal, end.session_id.as_deref()), (HookSignal::SessionEnded, Some("s1")));
+        for s in [HookSignal::SessionStarted, HookSignal::SessionEnded] {
+            assert_eq!(HookSignal::parse(s.as_str()), Some(s));
+            assert!(s.is_session());
+        }
+        assert!(!HookSignal::Settled.is_session());
+        // Print mode and the SDKs are not the session a person drives.
+        assert!(interactive_entrypoint(Some("cli")));
+        assert!(interactive_entrypoint(None), "a CLI that doesn't say is taken as before");
+        assert!(interactive_entrypoint(Some("claude-vscode")));
+        assert!(!interactive_entrypoint(Some("sdk-cli")));
+        assert!(!interactive_entrypoint(Some("sdk-ts")));
     }
 
     #[test]
@@ -1154,7 +1312,7 @@ mod tests {
         // No file: created, then removed with its `.claude/` directory.
         assert!(install_claude_hooks(wt.path(), Path::new(BIN)).unwrap());
         let written: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-        assert_eq!(our_commands(&written).len(), 5);
+        assert_eq!(our_commands(&written).len(), 7);
         remove_claude_hooks(wt.path()).unwrap();
         assert!(!file.exists() && !wt.path().join(".claude").exists());
 

@@ -1659,6 +1659,78 @@ fn notification_events_journal_their_message() {
     assert!(notes.iter().all(|e| th.allow(e, t0) && th.allow(e, t0)), "[{fx}]");
 }
 
+/// The version whose `SessionStart` / `SessionEnd` payloads were recorded
+/// live (see its README).
+const SESSION_HOOKS_VERSION: &str = "2.1.327";
+
+/// The session hooks (`SessionStart`, `SessionEnd`) say which Claude Code
+/// session a Run terminal runs. Recorded payloads, through the hook binary's
+/// path and the poller's bookkeeping, in the order Claude Code fired them.
+#[test]
+fn session_hook_payloads_move_the_terminal_between_sessions() {
+    use crate::agent_adapter::{parse_hook_event, HookSignal};
+    use crate::claude_hooks::{record_hook_from, remember_sessions};
+    let rec = synthesized(SESSION_HOOKS_VERSION);
+    let tmp = tempfile::NamedTempFile::new().unwrap();
+    let db = crate::db::Db::open(tmp.path()).unwrap();
+    let current = || db.terminal_claude_session("term-1").unwrap().map(|(s, _)| s);
+    let session_in = |rel: &str| {
+        let payload = rec.json(rel);
+        require_str(&rec.label(rel), &payload, "transcript_path");
+        require_str(&rec.label(rel), &payload, "cwd");
+        require_str(&rec.label(rel), &payload, "session_id").to_string()
+    };
+    // `claude` starts, `/clear`, `/exit`: the terminal UI (`cli`).
+    let steps = [
+        ("hooks/session-start-startup.json", HookSignal::SessionStarted, "source", "startup"),
+        ("hooks/session-end-clear.json", HookSignal::SessionEnded, "reason", "clear"),
+        ("hooks/session-start-clear.json", HookSignal::SessionStarted, "source", "clear"),
+        ("hooks/session-end-exit.json", HookSignal::SessionEnded, "reason", "prompt_input_exit"),
+    ];
+    let first = session_in(steps[0].0);
+    let second = session_in(steps[2].0);
+    assert_ne!(first, second, "`/clear` gives the process a new session id");
+    assert_eq!(session_in(steps[1].0), first, "the end names the session that ended");
+    let mut seen = Vec::new();
+    for (rel, want, field, value) in steps {
+        let fx = rec.label(rel);
+        let payload = rec.json(rel);
+        assert_eq!(payload[field], value, "[{fx}] {field}");
+        let event = parse_hook_event(&payload, None).unwrap_or_else(|| panic!("[{fx}] maps to no signal"));
+        assert_eq!(event.signal, want, "[{fx}]");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(rows[0].signal, want.as_str(), "[{fx}]");
+        remember_sessions(&db, &rows);
+        seen.push(current());
+    }
+    assert_eq!(seen, [Some(first), None, Some(second), None], "start · /clear (end, start) · /exit");
+
+    // Print mode fires both events too, and inherits the terminal's id when
+    // an agent runs it. Its hook's environment says `sdk-cli`: both are
+    // queued as an end of that session, which sets it aside (never the
+    // terminal's session, never a rival of it) and links nothing.
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    record_hook_from(&db, Some("term-1"), None, Some("cli"), &rec.text("hooks/session-start-startup.json"));
+    remember_sessions(&db, &db.drain_hook_signals().unwrap());
+    let nested = session_in("hooks/session-start-print.json");
+    for rel in ["hooks/session-start-print.json", "hooks/session-end-print.json"] {
+        let fx = rec.label(rel);
+        assert!(parse_hook_event(&rec.json(rel), None).is_some_and(|e| e.signal.is_session()), "[{fx}]");
+        assert!(record_hook_from(&db, Some("term-1"), None, Some("sdk-cli"), &rec.text(rel)), "[{fx}]");
+        let rows = db.drain_hook_signals().unwrap();
+        assert_eq!(rows.len(), 1, "[{fx}]");
+        assert_eq!(
+            (rows[0].signal.as_str(), rows[0].session_id.as_deref()),
+            (HookSignal::SessionEnded.as_str(), Some(nested.as_str())),
+            "[{fx}] print mode is set aside, not linked",
+        );
+        remember_sessions(&db, &rows);
+        assert_eq!(current(), Some(session_in("hooks/session-start-startup.json")), "[{fx}] the terminal keeps its own session");
+    }
+}
+
 #[test]
 fn hook_payloads_map_to_attention_signals() {
     use crate::agent_adapter::{parse_hook_event, HookSignal};
@@ -1786,6 +1858,43 @@ fn transcript_jsonl_yields_one_ledger_row_per_api_call() {
         }
         // The recording's cwd maps to the directory name Claude Code uses.
         assert_eq!(crate::transcripts::project_dir_name("/Users/dev/project"), "-Users-dev-project");
+    }
+}
+
+/// The Run Companion's context meter reads a session's last main-thread
+/// prompt from the end of its transcript (`transcripts::last_prompt`): the
+/// recording's main-thread lines say `isSidechain: false`, and its last
+/// billed message is the one the reader returns.
+#[test]
+fn transcript_tail_gives_the_sessions_last_main_thread_prompt() {
+    for rec in recordings() {
+        let (rel, path) = transcript_file(&rec);
+        let fx = rec.label(&rel);
+        let lines = rec.jsonl(&rel);
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let mut expected: Option<u64> = None;
+        for l in of_type(&lines, "assistant") {
+            assert_eq!(l.get("isSidechain").and_then(Value::as_bool), Some(false), "[{fx}] a main-thread line says isSidechain: false");
+            let model = require_str(&fx, l, "message.model");
+            let total: u64 = USAGE_FIELDS.iter().map(|f| require_u64(&fx, l, &format!("message.usage.{f}"))).sum();
+            if model.starts_with('<') || total == 0 {
+                continue;
+            }
+            let prompt = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+                .iter()
+                .map(|f| require_u64(&fx, l, &format!("message.usage.{f}")))
+                .sum();
+            expected = Some(prompt);
+        }
+        // Laid out as Claude Code does: <projects>/<cwd, sanitized>/<session>.jsonl.
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/Users/dev/project";
+        let dir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&path, dir.join(format!("{stem}.jsonl"))).unwrap();
+        let got = crate::transcripts::last_prompt(root.path(), cwd, &stem);
+        assert_eq!(got.as_ref().map(|p| p.tokens), expected, "[{fx}] last prompt");
+        assert!(got.is_some_and(|p| p.model.starts_with("claude-")), "[{fx}] its model");
     }
 }
 

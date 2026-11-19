@@ -500,12 +500,12 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track; `--shell-stack` below it. In Run that track holds a control, the **session line** (see "Run mode — session navigation"), and keeps a floor for it. The band is its own `@container` and ladder: narrow, the switcher's inactive modes shed their labels (see "The mode band's ladder" under the elision doctrine). |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most; only a narrow band sheds them, and only on the inactive modes, which keep icon, tooltip and name. |
 | Canvas        | flex  | Active mode content (chat / terminal panes, each under its caption / diff / pipeline track+focus pane). Ends `--shell-foot` above the status bar. |
-| Companion     | 280px | Per-mode panels, under one grammar (see "Companion grammar" below): Context+History · the active session's detail · Changed+commit · Runs+Jira. Run's panel becomes Context · Changes · Mission (planned). |
+| Companion     | 280px | Per-mode panels, under one grammar (see "Companion grammar" below): Context+History · Context · Changes · Mission · Changed+commit · Runs+Jira. |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
-- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: the active session's detail. *Approved 2026-11-18 and planned, not shipped:* Companion: context · changes · mission.
+- **Run** — terminal panes, each under its caption; the band's right track is the session line. Companion: context · changes · mission.
 - **Review** — unified diff. Companion: how the change was built + branch & publish.
 - **Direct** — horizontal assembly-line track + focus pane. Companion: runs + logbook. The 4th mode is per-workspace and optional; the trinity is always present.
 
@@ -791,10 +791,29 @@ follow rules 1 and 2; new Companion work follows all three.
 | Talk | The conversation | Which chats; how full the context is and what it cost |
 | Review | The diff | How the change was built; where the branch stands |
 | Direct | The run | The runs and the logbook |
-| Run | Terminals | Today: the active session's detail, which repeats the canvas. *Planned:* **Context** (the focused agent session's context meter, spend, cache share and model; folds away for a non-agent session) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (intent, ticket, time and spend today) |
+| Run | Terminals | **Context** (the focused pane's Claude Code session: context meter, spend, cache share and model; not drawn for anything else in the pane, or when Octopush can't tell the figures are that pane's current session's) · **Changes** (the workspace's uncommitted files, each row opening Review) · **Mission** (the mission's worked time, spend and savings) |
 
-Run's three sections are approved and **planned, not shipped**: spec
+Run's three sections (`CompanionRun`) follow the spec
 `docs/superpowers/specs/2026-11-18-run-mode-and-rail-groups-design.md`, Part 4.
+What they share, for any Companion section built after them:
+
+- **One chrome.** Sections hang on `CompanionSection`: one eyebrow each, one
+  hairline between them, no framed cards inside the panel. A section that
+  folds away as a whole carries the hairline below it, so the rule leaves
+  with it and never doubles under the panel header.
+- **The eyebrow's `meta` says which one.** A section about one thing (a
+  session) or one figure (`3 files · +84 −12`) puts it at the right of its
+  eyebrow: mute, in its own case, and the part that truncates.
+- **Figures stay with their owner.** A section that follows the focus is
+  cleared when the focus moves and shows the newly focused thing's figures
+  only once its own answer arrives; an empty or failed read clears it too.
+  While it folds away it keeps what it showed until it has left. Where the
+  owner can't be established (Run's Context: see `docs/FEATURES.md`,
+  "Session usage"), the section is not drawn.
+- **Label and value rows** are a mono grid: a caps mute label, a sage value.
+- **Brass is spent twice in Run:** the context meter's fill and the serif
+  link into Review. A file path keeps its file name whole (`MidTruncate`,
+  the tail pinned to the name).
 
 ### Direct mode — canvas patterns
 

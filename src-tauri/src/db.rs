@@ -1191,6 +1191,32 @@ impl Db {
             );
             "#,
         )?;
+        // Which Claude Code session each Run terminal runs, as that session's
+        // own hooks say (`claude_hooks::remember_sessions`): the hook's
+        // environment names the terminal, its payload the session. One
+        // current session per terminal; a terminal with none has no row. The
+        // Run Companion's Context section reads one terminal's context and
+        // spend through it. `ended_claude_sessions` remembers the sessions
+        // whose `SessionEnd` fired, so a late signal can't relink one and a
+        // finished conversation is never taken for a terminal's rival.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS terminal_claude_session (
+                terminal_id TEXT PRIMARY KEY,
+                session_id  TEXT NOT NULL,
+                linked_at   TEXT NOT NULL   -- the last hook signal naming this pair
+            );
+            CREATE INDEX IF NOT EXISTS idx_terminal_claude_session_session
+                ON terminal_claude_session(session_id);
+            CREATE TABLE IF NOT EXISTS ended_claude_sessions (
+                session_id TEXT PRIMARY KEY,
+                ended_at   TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // Pruned as the app starts: 30 days is far past any message that
+        // could still be recent to a live session, or any late signal.
+        self.prune_ended_claude_sessions(&(Utc::now() - chrono::Duration::days(ENDED_SESSION_DAYS)).to_rfc3339())?;
         // One-time backfill from what the stage rows still remember: the last
         // attempt's session id, and the session its reported usage belongs to.
         // The ingestor then purges the duplicate `run` rows those sessions'
@@ -3710,11 +3736,20 @@ impl Db {
 
     // ─── Claude Code hook signals ──────────────────────────────────
 
-    /// Queue one hook signal for the app's poller (`claude_hooks`).
+    /// Queue one hook signal for the app's poller (`claude_hooks`), stamped now.
     pub fn insert_hook_signal(&self, terminal_id: &str, signal: &str, session_id: Option<&str>) -> AppResult<()> {
+        self.insert_hook_signal_at(terminal_id, signal, session_id, &Utc::now().to_rfc3339())
+    }
+
+    /// [`Self::insert_hook_signal`] stamped `at` (RFC3339 UTC): when the hook
+    /// fired, which the hook process notes as it starts. Rows are queued in
+    /// the order they are WRITTEN, and a hook that waited on the database
+    /// can be written after one that fired later; the stamp keeps the order
+    /// the events happened in.
+    pub fn insert_hook_signal_at(&self, terminal_id: &str, signal: &str, session_id: Option<&str>, at: &str) -> AppResult<()> {
         self.conn.execute(
             "INSERT INTO hook_signals (terminal_id, signal, session_id, created_at) VALUES (?1, ?2, ?3, ?4)",
-            params![terminal_id, signal, session_id, Utc::now().to_rfc3339()],
+            params![terminal_id, signal, session_id, at],
         )?;
         Ok(())
     }
@@ -3814,6 +3849,8 @@ impl Db {
             "DELETE FROM terminals WHERE id = ?1",
             params![id],
         )?;
+        // Whatever Claude Code session it ran is no terminal's any more.
+        self.conn.execute("DELETE FROM terminal_claude_session WHERE terminal_id = ?1", params![id])?;
         Ok(())
     }
 
@@ -4346,6 +4383,168 @@ impl Db {
         let (pct, _) = cache_hit_pct(input, read, create);
         out.cache_hit_pct = pct;
         Ok(out)
+    }
+
+    /// Make `session_id` the current Claude Code session of `terminal_id`,
+    /// confirmed at `at` (RFC3339 UTC, when the hook fired): what one of
+    /// that session's hooks just said. `started` is its `SessionStart`,
+    /// which also revives a session that had ended (a resume), but only when
+    /// it fired AFTER that end: `SessionStart` is asynchronous and
+    /// `SessionEnd` is not, so the start of a session that ended at once can
+    /// be written after its end, and must not link the terminal to a dead
+    /// session. Any other signal of an ended session is late and changes
+    /// nothing. `false` when nothing was linked. A session is current in one
+    /// terminal only: it leaves any other terminal, which then has none.
+    pub fn link_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str, started: bool) -> AppResult<bool> {
+        let tx = self.conn.unchecked_transaction()?;
+        let ended_at: Option<String> = tx
+            .query_row("SELECT ended_at FROM ended_claude_sessions WHERE session_id = ?1", params![session_id], |r| r.get(0))
+            .optional()?;
+        if let Some(ended_at) = ended_at {
+            // Both stamps are RFC3339 UTC in one shape, so they compare as text.
+            if !started || at <= ended_at.as_str() {
+                return Ok(false);
+            }
+            tx.execute("DELETE FROM ended_claude_sessions WHERE session_id = ?1", params![session_id])?;
+        }
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE session_id = ?1 AND terminal_id != ?2",
+            params![session_id, terminal_id],
+        )?;
+        tx.execute(
+            "INSERT INTO terminal_claude_session (terminal_id, session_id, linked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(terminal_id) DO UPDATE SET session_id = excluded.session_id, linked_at = excluded.linked_at",
+            params![terminal_id, session_id, at],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
+    /// The Claude Code session `session_id` ended at `at` (its `SessionEnd`):
+    /// it is remembered as ended, and `terminal_id` has no current session
+    /// if that was the one it ran (an end naming another session leaves the
+    /// terminal's own alone). Also how a print-mode session is set aside,
+    /// from its first moment: it is never a terminal's session, and recorded
+    /// here it is never taken for a rival either. The newest end is kept.
+    pub fn end_terminal_claude_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO ended_claude_sessions (session_id, ended_at) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET ended_at = MAX(ended_at, excluded.ended_at)",
+            params![session_id, at],
+        )?;
+        tx.execute(
+            "DELETE FROM terminal_claude_session WHERE terminal_id = ?1 AND session_id = ?2",
+            params![terminal_id, session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The Claude Code session `terminal_id` runs, and when a hook last said
+    /// so: `(session id, linked_at)`. `None` when it has none.
+    pub fn terminal_claude_session(&self, terminal_id: &str) -> AppResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, linked_at FROM terminal_claude_session WHERE terminal_id = ?1",
+                params![terminal_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Drop the ended sessions whose end is older than `cutoff` (RFC3339
+    /// UTC). An ended session only matters while its messages are recent
+    /// enough to be taken for a rival's, or a late signal of its own could
+    /// still arrive; the table would otherwise grow by one row per
+    /// conversation, for good. Returns the rows removed.
+    pub fn prune_ended_claude_sessions(&self, cutoff: &str) -> AppResult<usize> {
+        Ok(self.conn.execute("DELETE FROM ended_claude_sessions WHERE ended_at < ?1", params![cutoff])?)
+    }
+
+    /// Forget every terminal's current session (the hooks setting went off:
+    /// nothing confirms them any more).
+    pub fn clear_terminal_claude_sessions(&self) -> AppResult<()> {
+        self.conn.execute("DELETE FROM terminal_claude_session", [])?;
+        Ok(())
+    }
+
+    /// The workspace a Run terminal belongs to.
+    pub fn terminal_workspace(&self, terminal_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row("SELECT workspace_id FROM terminals WHERE id = ?1", params![terminal_id], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether `terminal_id`'s session (`source_id`, the ledger's
+    /// `cc:<session id>`) has a rival: another Claude Code session metered in
+    /// `workspace_id` after `since` (RFC3339 UTC) that is neither over (its
+    /// `SessionEnd` fired) nor the current session of another terminal. Such
+    /// a session may be the one this terminal runs now, with no hook having
+    /// said so yet: a session whose hooks predate `SessionStart`, or one
+    /// started outside Octopush's terminals.
+    pub fn run_session_has_rival(&self, workspace_id: &str, terminal_id: &str, source_id: &str, since: &str) -> AppResult<bool> {
+        // `substr(source_id, 4)` drops the `cc:` prefix, so both lookups go
+        // through an index on the session id (the ended table's key, and
+        // `idx_terminal_claude_session_session`).
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM spend_events se
+                     WHERE se.surface = 'run' AND se.workspace_id = ?1 AND se.ts_utc > ?4
+                       AND se.source_id LIKE 'cc:%' AND se.source_id != ?3
+                       AND NOT EXISTS (SELECT 1 FROM ended_claude_sessions e
+                                       WHERE e.session_id = substr(se.source_id, 4))
+                       AND NOT EXISTS (SELECT 1 FROM terminal_claude_session t
+                                       WHERE t.session_id = substr(se.source_id, 4) AND t.terminal_id != ?2)
+                 )",
+                params![workspace_id, terminal_id, source_id, since],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// One Claude Code session's RUN rows, folded for the Run Companion's
+    /// Context section: what it spent (unpriced calls aside, as in
+    /// [`Self::thread_cost`]), the share of its prompt tokens the cache
+    /// served, and the model and time of its newest row. `source_id` is the
+    /// ledger's own key for a transcript-metered session (`cc:<session id>`).
+    /// `None` when the ledger holds no such row.
+    pub fn run_session_ledger(&self, source_id: &str) -> AppResult<Option<RunSessionLedger>> {
+        let (calls, unpriced_calls, spent_usd, input, read, create) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cost_basis = 'unpriced'), 0),
+                    COALESCE(SUM(CASE WHEN cost_basis = 'unpriced' THEN 0.0 ELSE cost_usd END), 0.0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM spend_events WHERE surface = 'run' AND source_id = ?1",
+            params![source_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        if calls == 0 {
+            return Ok(None);
+        }
+        let (last_model, last_ts) = self.conn.query_row(
+            "SELECT model, ts_utc FROM spend_events
+             WHERE surface = 'run' AND source_id = ?1
+             ORDER BY ts_utc DESC, id DESC LIMIT 1",
+            params![source_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let (cache_hit_pct, _) = cache_hit_pct(input, read, create);
+        Ok(Some(RunSessionLedger { calls, unpriced_calls, spent_usd, cache_hit_pct, last_model, last_ts }))
     }
 
     /// Rows the re-pricer looks at: `'unpriced'` rows with tokens, plus —
@@ -7504,6 +7703,25 @@ pub struct ThreadCost {
     /// `baseline_usd` (so from the saving), counted and named here.
     pub unpriced_calls: i64,
     pub unpriced_models: Vec<String>,
+}
+
+/// How long an ended Claude Code session is remembered
+/// (`ended_claude_sessions`), in days.
+pub const ENDED_SESSION_DAYS: i64 = 30;
+
+/// One Claude Code session's RUN rows in the ledger (see
+/// `run_session_ledger`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunSessionLedger {
+    pub calls: i64,
+    /// Rows whose model had no price — left out of `spent_usd`.
+    pub unpriced_calls: i64,
+    pub spent_usd: f64,
+    /// See [`cache_hit_pct`].
+    pub cache_hit_pct: Option<f64>,
+    /// Model and timestamp of the newest row.
+    pub last_model: String,
+    pub last_ts: String,
 }
 
 // ─── Usage report types ────────────────────────────────────────────────

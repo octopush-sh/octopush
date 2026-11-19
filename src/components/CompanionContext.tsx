@@ -5,8 +5,9 @@ import { ipc } from "../lib/ipc";
 import { useChatStore } from "../stores/chatStore";
 import { useMissionLogbook } from "../hooks/useMissionLogbook";
 import { fmtHours } from "../lib/logbook";
-import { formatContextTokens, formatUsd, unpricedTitle } from "../lib/cost";
+import { formatUsd, unpricedTitle } from "../lib/cost";
 import { CompanionSection } from "./CompanionSection";
+import { ContextMeter, contextTone } from "./ContextMeter";
 
 interface Props {
   tokensUsed: number;
@@ -81,14 +82,9 @@ export function CompanionContext({
   onSettingsClick,
   onOpenLogbook,
 }: Props) {
-  const pct = tokensLimit > 0 ? Math.min(100, (tokensUsed / tokensLimit) * 100) : 0;
-  // Warn as the context window fills — amber past 80%, rouge past 95%.
-  const tokenColor =
-    pct >= 95
-      ? "var(--color-octo-rouge)"
-      : pct >= 80
-        ? "var(--color-octo-warning)"
-        : "var(--color-octo-brass)";
+  // The meter warns as the context window fills — amber past 80%, rouge
+  // past 95% (`ContextMeter`, shared with Run's Context section).
+  const { pct } = contextTone(tokensUsed, tokensLimit);
 
   const cost = useThreadCost(workspaceId ?? "");
   const logbook = useMissionLogbook(workspaceId ?? "");
@@ -101,22 +97,16 @@ export function CompanionContext({
     <CompanionSection title="Conversation" storageKey="conversation" testId="companion-conversation">
       <div className="px-4 pb-3 pt-1 text-[11px] text-octo-sage">
         {/* Context meter */}
-        <Row
+        <ContextMeter
           label="context"
-          value={`${formatContextTokens(tokensUsed)} / ${formatContextTokens(tokensLimit)}`}
-          valueColor={tokenColor}
+          used={tokensUsed}
+          limit={tokensLimit}
           title={
             pct >= 80
               ? `${Math.round(pct)}% of the context window used — consider a new conversation`
               : "The last prompt's size against the model's context window"
           }
         />
-        <div className="mt-1.5 h-[3px] rounded-sm" style={{ background: "var(--color-octo-hairline)" }}>
-          <div
-            className="h-full rounded-sm transition-[width] duration-[220ms]"
-            style={{ width: `${pct}%`, background: tokenColor }}
-          />
-        </div>
 
         {/* Cost — from the ledger, so it agrees with Settings › Usage. */}
         {lines.length > 0 && (

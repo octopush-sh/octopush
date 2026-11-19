@@ -1,0 +1,8 @@
+{
+  "session_id": "aaaaaaaa-0000-4000-8000-000000000012",
+  "transcript_path": "/Users/dev/.claude/projects/-Users-dev-project/aaaaaaaa-0000-4000-8000-000000000012.jsonl",
+  "cwd": "/Users/dev/project",
+  "prompt_id": "bbbbbbbb-0000-4000-8000-000000000001",
+  "hook_event_name": "SessionEnd",
+  "reason": "prompt_input_exit"
+}

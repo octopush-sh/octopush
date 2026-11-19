@@ -15712,6 +15712,383 @@ mod transcript_tests {
         v.to_string()
     }
 
+    // ── One session, read for the Run Companion (`get_session_usage`) ──
+
+    /// [`line`] written by the Claude Code session `session`.
+    fn line_of(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, model, i, cr, cc, o, ts, cwd)).unwrap();
+        v["sessionId"] = serde_json::json!(session);
+        v.to_string()
+    }
+
+    fn sidechain(l: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["isSidechain"] = serde_json::json!(true);
+        v.to_string()
+    }
+
+    #[test]
+    fn last_prompt_is_the_sessions_own_last_message_never_a_subagents() {
+        use crate::transcripts::{last_prompt, LastPrompt};
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/last-prompt";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                line_of("cc-a", "req_1", m, 10, 90_000, 2_000, 50, "2026-11-18T10:00:00Z", cwd),
+                line("user", "req_u", m, 0, 0, 0, 0, "2026-11-18T10:00:30Z", cwd),
+                // input 12 + cache read 140 000 + cache write 8 000: the whole prompt.
+                line_of("cc-a", "req_2", m, 12, 140_000, 8_000, 70, "2026-11-18T10:01:00Z", cwd),
+                // An inline sub-agent message (older Claude Code): its prompt is its own context.
+                sidechain(&line_of("cc-a", "req_side", m, 5, 3_000, 0, 9, "2026-11-18T10:02:00Z", cwd)),
+            ),
+        )
+        .unwrap();
+        // A sub-agent's own file is never the session's transcript.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_sub", m, 7, 1_000, 0, 9, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        assert_eq!(
+            last_prompt(root.path(), cwd, "cc-a"),
+            Some(LastPrompt { tokens: 148_012, model: m.into(), ts_utc: "2026-11-18T10:01:00+00:00".into() }),
+        );
+        // No transcript, another cwd, or an id that would leave the directory: nothing.
+        assert_eq!(last_prompt(root.path(), cwd, "cc-missing"), None);
+        assert_eq!(last_prompt(root.path(), "/tmp/proj/elsewhere", "cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "../cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a/subagents/agent-1"), None);
+        assert_eq!(last_prompt(root.path(), cwd, ""), None);
+
+        // A half-written last line (the CLI mid-write) is skipped, not fatal.
+        let mut text = std::fs::read_to_string(pdir.join("cc-a.jsonl")).unwrap();
+        text.push_str(&line_of("cc-a", "req_3", m, 1, 1, 1, 1, "2026-11-18T10:04:00Z", cwd)[..40]);
+        std::fs::write(pdir.join("cc-a.jsonl"), &text).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a").map(|p| p.tokens), Some(148_012));
+    }
+
+    #[test]
+    fn last_prompt_is_unknown_right_after_a_compaction_and_steps_over_a_large_line() {
+        use crate::transcripts::last_prompt;
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/compacted";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let m = "claude-fable-5-2";
+        let before = line_of("cc-c", "req_1", m, 10, 900_000, 0, 50, "2026-11-18T10:00:00Z", cwd);
+        let boundary = serde_json::json!({ "type": "system", "subtype": "compact_boundary", "sessionId": "cc-c" }).to_string();
+        // Compacted, no message since: the old prompt size no longer describes the context.
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c"), None);
+        // The first message after it says how large the compacted context is.
+        let after = line_of("cc-c", "req_2", m, 10, 0, 30_000, 50, "2026-11-18T10:05:00Z", cwd);
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+        // A user line larger than the first tail read (a pasted image) after
+        // the last message: the longer read finds the message behind it.
+        let image = serde_json::json!({ "type": "user", "message": { "content": "x".repeat(300 * 1024) } }).to_string();
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n{image}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_reads_one_terminals_claude_session_from_the_ledger_and_its_transcript() {
+        use crate::transcripts::session_usage;
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-usage";
+        {
+            let d = db.lock();
+            d.insert_project("p-su", "P", "/tmp/proj").unwrap();
+            d.insert_workspace("w-su", "p-su", "ws", "", "b-su", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-a", "w-su", "Agent", 0, 0).unwrap();
+            d.create_terminal("term-b", "w-su", "Other agent", 1, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        // Fable 5.2: $8/M input, $40/M output, $0.20/M cache read, $10/M cache write.
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line_of("cc-a", "req_a1", m, 1_000, 0, 100_000, 1_000, "2026-11-18T10:00:00Z", cwd),
+                line_of("cc-a", "req_a2", m, 2_000, 100_000, 46_000, 1_000, "2026-11-18T10:01:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        // Its sub-agent: billed to the session, newer than its last own message.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_a_sub", "claude-haiku-4-5", 4_000, 0, 0, 500, "2026-11-18T10:02:00Z", cwd)),
+        )
+        .unwrap();
+        // A second agent in the same worktree: never part of the first one's figures.
+        std::fs::write(
+            pdir.join("cc-b.jsonl"),
+            format!("{}\n", line_of("cc-b", "req_b1", m, 500_000, 0, 0, 9_000, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        // Each terminal's hooks named its session when it started.
+        let (at_a, at_b) = ("2026-11-18T09:59:00+00:00", "2026-11-18T10:02:30+00:00");
+        db.lock().link_terminal_claude_session("term-a", "cc-a", at_a, true).unwrap();
+        db.lock().link_terminal_claude_session("term-b", "cc-b", at_b, true).unwrap();
+        // Nothing ingested yet: no row, so nothing to show (never zeroes).
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap(), None);
+
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4);
+        let u = session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap().expect("the session's usage");
+        // The context is the session's own last prompt (2 000 + 100 000 + 46 000),
+        // not the sub-agent's newer, smaller one.
+        assert_eq!(u.context_tokens, Some(148_000));
+        assert_eq!(u.max_context, Some(1_000_000));
+        assert_eq!(u.model, m);
+        assert_eq!(u.as_of, "2026-11-18T10:01:00+00:00");
+        assert_eq!((u.calls, u.unpriced_calls), (3, 0));
+        let fable = (1_000.0 * 8.0 + 100_000.0 * 10.0 + 1_000.0 * 40.0 + 2_000.0 * 8.0 + 100_000.0 * 0.20 + 46_000.0 * 10.0 + 1_000.0 * 40.0) / 1e6;
+        let haiku = crate::token_engine::prices_for("claude-haiku-4-5").unwrap().cost(4_000, 500, 0, 0);
+        assert!((u.spent_usd - (fable + haiku)).abs() < 1e-9, "{} vs {}", u.spent_usd, fable + haiku);
+        // Cache share: 100 000 read of 253 000 prompt tokens (input + read + write).
+        let pct = u.cache_hit_pct.expect("cache share");
+        assert!((pct - 100_000.0 / 253_000.0 * 100.0).abs() < 1e-9, "{pct}");
+
+        // The other agent's session reads its own rows.
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.calls, b.context_tokens), (1, Some(500_000)));
+        // A session the ledger never saw, or a terminal that no longer exists: nothing.
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-unknown", at_a).unwrap(), None);
+        assert_eq!(session_usage(&db, root.path(), "term-gone", "cc-a", at_a).unwrap(), None);
+
+        // The transcript gone (Claude Code prunes old ones): spend, cache share
+        // and the model still come from the ledger; the context size does not.
+        std::fs::remove_file(pdir.join("cc-b.jsonl")).unwrap();
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.context_tokens, b.model.as_str(), b.as_of.as_str()), (None, m, "2026-11-18T10:03:00+00:00"));
+        assert!(b.spent_usd > 0.0);
+    }
+
+    /// A workspace with two Run terminals, a transcript directory and an
+    /// ingestor: the stage for what a terminal's Context may show.
+    struct UsageStage {
+        db: Arc<Mutex<Db>>,
+        root: TempDir,
+        pdir: std::path::PathBuf,
+        cwd: &'static str,
+    }
+
+    impl UsageStage {
+        fn new(cwd: &'static str) -> Self {
+            let db = Arc::new(Mutex::new(test_db()));
+            let root = TempDir::new().unwrap();
+            {
+                let d = db.lock();
+                d.insert_project("p-st", "P", "/tmp/proj-stage").unwrap();
+                d.insert_workspace("w-st", "p-st", "ws", "", "b-st", Some(cwd), "", None).unwrap();
+                d.create_terminal("term-a", "w-st", "Agent", 0, 0).unwrap();
+                d.create_terminal("term-b", "w-st", "Other agent", 1, 0).unwrap();
+            }
+            let pdir = root.path().join(project_dir_name(cwd));
+            std::fs::create_dir_all(&pdir).unwrap();
+            Self { db, root, pdir, cwd }
+        }
+
+        /// The session's transcript holds these messages `(time, prompt tokens)`, and the ledger has read them.
+        fn says(&self, session: &str, messages: &[(&str, u64)]) {
+            let text: String = messages
+                .iter()
+                .enumerate()
+                .map(|(i, (ts, prompt))| format!("{}\n", line_of(session, &format!("req_{session}_{i}"), "claude-fable-5-2", *prompt, 0, 0, 5, ts, self.cwd)))
+                .collect();
+            std::fs::write(self.pdir.join(format!("{session}.jsonl")), text).unwrap();
+            TranscriptIngestor::with_root(Arc::clone(&self.db), self.root.path().to_path_buf()).ingest().unwrap();
+        }
+
+        fn start(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, true).unwrap();
+        }
+
+        /// A `Stop` or `Notification`: all a session whose hooks predate `SessionStart` ever says.
+        fn signal(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().link_terminal_claude_session(terminal, session, at, false).unwrap();
+        }
+
+        fn end(&self, terminal: &str, session: &str, at: &str) {
+            self.db.lock().end_terminal_claude_session(terminal, session, at).unwrap();
+        }
+
+        /// What the terminal's Context shows: its context size, or nothing.
+        fn shows(&self, terminal: &str) -> Option<u64> {
+            crate::transcripts::terminal_usage(&self.db, self.root.path(), terminal).unwrap().and_then(|u| u.context_tokens)
+        }
+    }
+
+    /// (c) `/clear` or a fresh `claude`: the terminal moves to the new
+    /// session the moment its `SessionStart` fires, so the old conversation's
+    /// figures are gone before a message is sent, and the meter can never
+    /// read "Past 80%" on an empty conversation.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn after_clear_the_old_conversations_figures_are_gone_at_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-clear");
+        st.start("term-a", "cc-full", "2026-11-18T10:00:00+00:00");
+        st.says("cc-full", &[("2026-11-18T10:01:00Z", 900_000)]);
+        assert_eq!(st.shows("term-a"), Some(900_000));
+
+        // `/clear`: the old session ends, the new one starts (30 ms apart).
+        st.end("term-a", "cc-full", "2026-11-18T10:10:00+00:00");
+        assert_eq!(st.shows("term-a"), None, "no current session");
+        st.start("term-a", "cc-fresh", "2026-11-18T10:10:00.030+00:00");
+        assert_eq!(st.shows("term-a"), None, "an empty conversation shows nothing, not the old 900k");
+        // Its first reply is what the meter then reads.
+        st.says("cc-fresh", &[("2026-11-18T10:12:00Z", 4_000)]);
+        assert_eq!(st.shows("term-a"), Some(4_000));
+        // The finished conversation is nobody's rival, here or next door.
+        // (term-b's last word is older than the cleared conversation's.)
+        st.start("term-b", "cc-b", "2026-11-18T10:00:30+00:00");
+        st.says("cc-b", &[("2026-11-18T10:00:45Z", 70_000)]);
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (Some(4_000), Some(70_000)));
+    }
+
+    /// (a) After `claude` exits the terminal has no session: a bare prompt,
+    /// or Codex started there, shows no Claude Code figures, however long
+    /// ago that was and whatever the ledger still holds.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn after_claude_exits_the_terminal_shows_nothing() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-exit");
+        st.start("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        st.says("cc-a", &[("2026-11-18T10:01:00Z", 120_000)]);
+        assert_eq!(st.shows("term-a"), Some(120_000));
+        st.end("term-a", "cc-a", "2026-11-18T10:20:00+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // Its last `Stop`, landing after the end, changes nothing.
+        st.signal("term-a", "cc-a", "2026-11-18T10:20:01+00:00");
+        assert_eq!(st.shows("term-a"), None);
+        // A closed terminal's session is no terminal's.
+        st.start("term-b", "cc-b", "2026-11-18T10:30:00+00:00");
+        st.says("cc-b", &[("2026-11-18T10:31:00Z", 50_000)]);
+        st.db.lock().delete_terminal("term-b").unwrap();
+        assert_eq!(st.db.lock().terminal_claude_session("term-b").unwrap(), None);
+    }
+
+    /// (b) `/resume`, `--resume` or `--continue` of an older conversation:
+    /// its `SessionStart` puts the terminal on it at once, and the figures
+    /// are the resumed conversation's own, never the one it replaced.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn resuming_an_older_session_shows_that_sessions_own_figures_at_once() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-resume");
+        // Yesterday's conversation, ended properly.
+        st.start("term-a", "cc-old", "2026-11-17T09:00:00+00:00");
+        st.says("cc-old", &[("2026-11-17T09:30:00Z", 300_000)]);
+        st.end("term-a", "cc-old", "2026-11-17T10:00:00+00:00");
+        // Today's.
+        st.start("term-a", "cc-today", "2026-11-18T10:00:00+00:00");
+        st.says("cc-today", &[("2026-11-18T10:01:00Z", 20_000)]);
+        assert_eq!(st.shows("term-a"), Some(20_000));
+        // `/resume` yesterday's: today's ends, yesterday's starts again.
+        st.end("term-a", "cc-today", "2026-11-18T10:05:00+00:00");
+        st.start("term-a", "cc-old", "2026-11-18T10:05:00.030+00:00");
+        assert_eq!(st.shows("term-a"), Some(300_000), "the resumed conversation's own context, before any new message");
+
+        // The same conversation resumed in another terminal instead: it is
+        // that terminal's, and the first has none (not an older one).
+        st.end("term-a", "cc-old", "2026-11-18T10:20:00+00:00");
+        st.start("term-a", "cc-today", "2026-11-18T10:20:01+00:00");
+        st.start("term-b", "cc-today", "2026-11-18T10:25:00+00:00");
+        assert_eq!((st.shows("term-a"), st.shows("term-b")), (None, Some(20_000)));
+    }
+
+    /// The fallback for a session whose hooks predate `SessionStart` and
+    /// `SessionEnd` (it was already running when they were installed): its
+    /// `Stop` links it, and `/clear`, a resume or a restart are silent until
+    /// the next one. Then a newer rival in the workspace means hide.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn without_session_events_a_newer_rival_hides_the_figures() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let st = UsageStage::new("/tmp/proj/usage-rival");
+        // A session someone ran in this worktree before, outside Octopush.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10)]);
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000)]);
+        st.signal("term-a", "cc-a", "2026-11-18T10:00:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(1_000), "nothing newer than its own last word");
+
+        // A new conversation appears and no hook has named its terminal:
+        // term-a may have been cleared into it. Hidden, not guessed.
+        st.says("cc-new", &[("2026-11-18T10:40:00Z", 50)]);
+        assert_eq!(st.shows("term-a"), None);
+        // term-a's own session speaks after it: still the one in term-a.
+        st.says("cc-a", &[("2026-11-18T09:59:00Z", 1_000), ("2026-11-18T10:41:00Z", 2_000)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // An OLDER conversation resumed without a word from the hooks (the
+        // case a "started after" test would miss): it has a newer message.
+        st.says("cc-outside", &[("2026-11-18T09:00:00Z", 10), ("2026-11-18T10:50:00Z", 10)]);
+        assert_eq!(st.shows("term-a"), None);
+        // Once it is another terminal's, it is no rival.
+        st.signal("term-b", "cc-outside", "2026-11-18T10:55:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // Nor is a conversation that is over.
+        st.says("cc-gone", &[("2026-11-18T11:00:00Z", 5)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.end("term-b", "cc-gone", "2026-11-18T11:01:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        assert_eq!(st.shows("term-b"), Some(10), "an end naming another session leaves the terminal's own");
+        // A `claude -p` the agent ran from term-a: set aside when it starts
+        // (`record_hook_at` queues a print-mode start as an end), so its
+        // messages never hide the terminal's own figures.
+        st.end("term-a", "cc-print", "2026-11-18T11:02:00+00:00");
+        st.says("cc-print", &[("2026-11-18T11:03:00Z", 9)]);
+        assert_eq!(st.shows("term-a"), Some(2_000));
+        // And when the newcomer was term-a's after all, its `Stop` says so.
+        st.says("cc-next", &[("2026-11-18T11:10:00Z", 77)]);
+        assert_eq!(st.shows("term-a"), None);
+        st.signal("term-a", "cc-next", "2026-11-18T11:15:00+00:00");
+        assert_eq!(st.shows("term-a"), Some(77));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_leaves_unpriced_calls_out_of_the_spend_and_has_no_window_for_an_unlisted_model() {
+        use crate::transcripts::session_usage;
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-unpriced";
+        {
+            let d = db.lock();
+            d.insert_project("p-un", "P", "/tmp/proj-un").unwrap();
+            d.insert_workspace("w-un", "p-un", "ws", "", "b-un", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-u", "w-un", "Agent", 0, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("cc-u.jsonl"),
+            format!("{}\n", line_of("cc-u", "req_u1", "gateway-model-nobody-lists", 3_000, 0, 0, 100, "2026-11-18T11:00:00Z", cwd)),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        db.lock().link_terminal_claude_session("term-u", "cc-u", "2026-11-18T11:00:30+00:00", true).unwrap();
+        let u = session_usage(&db, root.path(), "term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap().unwrap();
+        assert_eq!((u.calls, u.unpriced_calls, u.spent_usd), (1, 1, 0.0));
+        assert_eq!((u.context_tokens, u.max_context), (Some(3_000), None), "an unlisted model has no known window");
+        assert_eq!(u.cache_hit_pct, None, "nothing about the cache was reported");
+    }
+
     #[test]
     fn parses_the_one_hour_cache_write_breakdown() {
         let u = parse_transcript_line(&line_1h("req_1", "claude-fable-5-1", 400, 600, "2026-10-31T10:00:00Z", "/w"), "f").unwrap();

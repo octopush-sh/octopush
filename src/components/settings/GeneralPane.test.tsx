@@ -64,6 +64,10 @@ describe("GeneralPane — Claude Code hooks (on by default)", () => {
     });
     expect(toggle()).toHaveAttribute("aria-checked", "true");
     expect(screen.getByText(/\.claude\/settings\.local\.json and keeps that file out of git/)).toBeInTheDocument();
+    // The same hooks feed Run's Context section, and the row says so, with
+    // where what they report goes.
+    expect(screen.getByText(/which Claude Code session each terminal runs.*Context section in Run reads/)).toBeInTheDocument();
+    expect(screen.getByText(/Nothing they report leaves this Mac\./)).toBeInTheDocument();
   });
 
   it("reads a saved false as off", async () => {

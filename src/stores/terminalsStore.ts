@@ -2,7 +2,7 @@ import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { isModalOpen } from "../components/ModalShell";
-import { roleForCommand, type SessionRole } from "../lib/sessionRole";
+import { agentCliForCommand, roleForCommand, type SessionRole } from "../lib/sessionRole";
 import type { SetupRun } from "../lib/setupRun";
 import { navigate } from "../lib/tour/surfaces";
 import { useAttentionStore } from "./attentionStore";
@@ -62,6 +62,13 @@ export interface TerminalState {
    * meaningful command replaces it.
    */
   role: SessionRole;
+  /**
+   * For an `agent` role, which CLI gave it (`claude`, `codex`, …); null
+   * otherwise. Sticky with the role, and set with it: the role alone can't
+   * tell Claude Code, whose context and spend Octopush can read, from another
+   * agent CLI in the same terminal. Absent is the same as null.
+   */
+  agentCli?: string | null;
   /** The command currently running, or null at the prompt. */
   command: string | null;
 }
@@ -250,6 +257,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           t.id,
           {
             role: t.role,
+            agentCli: t.agentCli ?? null,
             command: t.command,
             failed: t.failed ?? false,
             starting: t.starting ?? false,
@@ -289,6 +297,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
           busy: false,
           restored,
           role: live?.role ?? ("shell" as SessionRole),
+          agentCli: live?.agentCli ?? null,
           command: live?.command ?? null,
         };
       });
@@ -552,16 +561,29 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       // session's identity. "shell" and "unknown" leave it alone, so a dev
       // server keeps its icon through every quiet moment between rebuilds.
       const derived = busy && command ? roleForCommand(command) : null;
-      const nextRole =
-        derived && derived !== "shell" && derived !== "unknown" ? derived : target.role;
-      if (target.busy === busy && target.command === nextCommand && target.role === nextRole) {
+      const placed = !!derived && derived !== "shell" && derived !== "unknown";
+      const nextRole = placed ? derived : target.role;
+      // Which agent CLI set an agent role travels with the role: a command
+      // that replaces the role replaces it too (Codex after Claude Code, or a
+      // dev server after either).
+      const nextAgentCli = placed
+        ? derived === "agent"
+          ? agentCliForCommand(command)
+          : null
+        : (target.agentCli ?? null);
+      if (
+        target.busy === busy &&
+        target.command === nextCommand &&
+        target.role === nextRole &&
+        (target.agentCli ?? null) === nextAgentCli
+      ) {
         return s;
       }
       return {
         terminalsByWs: {
           ...s.terminalsByWs,
           [workspaceId]: prev.map((t) =>
-            t.id === id ? { ...t, busy, command: nextCommand, role: nextRole } : t,
+            t.id === id ? { ...t, busy, command: nextCommand, role: nextRole, agentCli: nextAgentCli } : t,
           ),
         },
       };

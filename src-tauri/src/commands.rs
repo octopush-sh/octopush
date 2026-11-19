@@ -1347,10 +1347,18 @@ pub async fn get_committed_diff(
     .flatten())
 }
 
+/// The working diff (index → working tree, untracked files included). Built
+/// on a blocking thread: reading every changed file is not work for the
+/// async runtime, and Run's Companion asks for it on the 3 s git poll.
 #[tauri::command]
 pub async fn get_git_diff(path: String, ignore_whitespace: Option<bool>) -> AppResult<String> {
     let path = expand_tilde(&path);
-    crate::git_ops::get_diff_text(std::path::Path::new(&path), ignore_whitespace.unwrap_or(false))
+    let ignore_whitespace = ignore_whitespace.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::git_ops::get_diff_text(std::path::Path::new(&path), ignore_whitespace)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("git diff: {e}")))?
 }
 
 // ─── Delete workspace ────────────────────────────────────────────
@@ -4399,6 +4407,30 @@ pub async fn get_thread_cost(
         .and_then(|s| s.model_tiers.get("strong").cloned())
         .and_then(|m| crate::token_engine::prices_for(&m));
     state.db.lock().thread_cost(&thread_id, strong.as_ref())
+}
+
+/// What the Claude Code session in one Run terminal has used: its last
+/// prompt against the model's context window, its spend and cache share from
+/// the ledger, and its model. For the Run Companion's Context section.
+/// `None` for a terminal with no current Claude Code session (a shell, a dev
+/// server, another agent CLI, a session that ended, hooks off), one the
+/// ledger holds no row for yet, and while another session may have taken its
+/// place (`transcripts::session_usage`). Read-only; the transcript is read on
+/// a blocking thread.
+#[tauri::command]
+pub async fn get_session_usage(
+    state: State<'_, AppState>,
+    terminal_id: String,
+) -> AppResult<Option<crate::transcripts::SessionUsage>> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        if !crate::claude_hooks::sessions_known() {
+            return Ok(None);
+        }
+        crate::transcripts::terminal_usage(&db, &crate::transcripts::projects_root(), &terminal_id)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("session usage: {e}")))?
 }
 
 /// Answer a turn-limit card: the extra turns to give the paused writing
