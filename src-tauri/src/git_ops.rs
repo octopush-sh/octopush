@@ -24,6 +24,10 @@ pub struct GitStatus {
     /// The in-progress multi-step operation, if any: "merge" or "rebase".
     /// None when the repo is in its normal state.
     pub operation: Option<String>,
+    /// The commit HEAD points at, as a hex oid. None on an unborn branch.
+    /// A commit, reset, merge or cherry-pick moves it even when the branch
+    /// has no upstream and the tree ends up clean again.
+    pub head: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -374,9 +378,10 @@ pub fn status_files(path: &Path) -> AppResult<GitStatus> {
         .map(|b| b.upstream().is_ok())
         .unwrap_or(false);
     let operation = state_to_operation(repo.state()).map(String::from);
+    let head = repo.head().ok().and_then(|h| h.target()).map(|oid| oid.to_string());
     Ok(GitStatus {
         branch, changed_files, ahead: 0, behind: 0, has_upstream, conflicted,
-        ahead_behind_known: false, operation,
+        ahead_behind_known: false, operation, head,
     })
 }
 

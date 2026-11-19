@@ -1,14 +1,19 @@
 import { describe, it, expect } from "vitest";
-import type { FileChange } from "./types";
+import type { FileChange, GitStatus } from "./types";
 import { DIFF_TRUNCATED_MARKER } from "./reviewSource";
 import {
   changeStats,
   changesMeta,
+  gitStatusSig,
+  NO_CHANGE_STATS,
   pathTail,
   runChangesReader,
+  runChangesTick,
   sameChangeStats,
   statLabel,
   STATUS_LETTER,
+  type ChangeStats,
+  type CommitsAhead,
 } from "./runChanges";
 
 const file = (path: string, status: FileChange["status"] = "modified"): FileChange => ({
@@ -164,5 +169,133 @@ describe("runChangesReader", () => {
     expect(r.next(CLEAN, false)).toBe("ahead");
     r.aheadRead(CLEAN);
     expect(r.next(CLEAN, false)).toBeNull();
+  });
+});
+
+/** A workspace branch with no upstream (ahead/behind stay 0/0), at `head`. */
+const status = (head: string | null, files: FileChange[] = []): GitStatus => ({
+  branch: "feat/x",
+  changedFiles: files,
+  ahead: 0,
+  behind: 0,
+  hasUpstream: false,
+  conflicted: 0,
+  aheadBehindKnown: true,
+  operation: null,
+  head,
+});
+
+describe("gitStatusSig", () => {
+  it("moves when HEAD does, though nothing else in the status changed", () => {
+    expect(gitStatusSig(status("aaa"))).not.toBe(gitStatusSig(status("bbb")));
+    expect(gitStatusSig(status("aaa"))).toBe(gitStatusSig(status("aaa")));
+  });
+
+  it("moves with the changed files", () => {
+    expect(gitStatusSig(status("aaa"))).not.toBe(gitStatusSig(status("aaa", [file("src/a.ts")])));
+  });
+});
+
+describe("runChangesTick (App's git poll, Run's Changes section)", () => {
+  /** App's side of the tick: the IPC reads it would make and the state it
+   *  would hold, counting the reads. */
+  function harness() {
+    const state = { stats: NO_CHANGE_STATS as ChangeStats, ahead: null as CommitsAhead | null };
+    const reads = { diff: 0, ahead: 0 };
+    let commits = 0;
+    let diff = "";
+    let cancelled = false;
+    const reader = runChangesReader();
+    const io = {
+      readDiff: async () => {
+        reads.diff++;
+        return diff;
+      },
+      readAhead: async (): Promise<CommitsAhead | null> => {
+        reads.ahead++;
+        return { commits, base: "main", mergeBase: "m0" };
+      },
+      setStats: (u: (p: ChangeStats) => ChangeStats) => {
+        state.stats = u(state.stats);
+      },
+      setAhead: (u: (p: CommitsAhead | null) => CommitsAhead | null) => {
+        state.ahead = u(state.ahead);
+      },
+      cancelled: () => cancelled,
+    };
+    return {
+      state,
+      reads,
+      io,
+      tick: (s: GitStatus | null) => runChangesTick(reader, s, io),
+      commit: () => commits++,
+      setDiff: (d: string) => {
+        diff = d;
+      },
+      cancel: () => {
+        cancelled = true;
+      },
+    };
+  }
+
+  it("counts the commits ahead once per clean state, and keeps the same state object on a quiet tick", async () => {
+    const h = harness();
+    await h.tick(status("h0"));
+    expect(h.state.ahead).toEqual({ commits: 0, base: "main", mergeBase: "m0" });
+    const before = h.state.ahead;
+    await h.tick(status("h0"));
+    await h.tick(status("h0"));
+    expect(h.reads.ahead).toBe(1);
+    expect(h.state.ahead).toBe(before);
+  });
+
+  it("recounts after a commit no dirty tick saw (made while the window was hidden, or within one tick)", async () => {
+    const h = harness();
+    await h.tick(status("h0"));
+    expect(h.state.ahead?.commits).toBe(0);
+    // The agent edits and commits while the poll skips ticks; the focus
+    // refresh then sees a clean tree again, at a new HEAD.
+    h.commit();
+    await h.tick(status("h1"));
+    expect(h.reads.ahead).toBe(2);
+    expect(h.state.ahead?.commits).toBe(1);
+    // `reset --hard` back: HEAD moves again, and so does the count.
+    h.commit();
+    await h.tick(status("h0"));
+    expect(h.reads.ahead).toBe(3);
+  });
+
+  it("reads the working diff while dirty, voids the count, and recounts once clean", async () => {
+    const h = harness();
+    await h.tick(status("h0"));
+    expect(h.state.ahead).not.toBeNull();
+    h.setDiff(["diff --git a/src/a.ts b/src/a.ts", "@@ -1 +1,2 @@", " keep", "+new"].join("\n"));
+    await h.tick(status("h0", [file("src/a.ts")]));
+    expect(h.state.ahead).toBeNull();
+    expect(h.state.stats.byFile["src/a.ts"]).toEqual({ added: 1, removed: 0 });
+    const stats = h.state.stats;
+    await h.tick(status("h0", [file("src/a.ts")]));
+    expect(h.reads.diff).toBe(2);
+    expect(h.state.stats).toBe(stats);
+    h.commit();
+    await h.tick(status("h1"));
+    expect(h.state.stats).toEqual(NO_CHANGE_STATS);
+    expect(h.state.ahead?.commits).toBe(1);
+  });
+
+  it("writes nothing once the poll went away mid-read, and asks again next time", async () => {
+    const h = harness();
+    const reader = runChangesReader();
+    h.cancel();
+    await runChangesTick(reader, status("h0"), h.io);
+    expect(h.state.ahead).toBeNull();
+    expect(reader.next(gitStatusSig(status("h0")), false)).toBe("ahead");
+  });
+
+  it("never asks for a count without a workspace", async () => {
+    const h = harness();
+    await runChangesTick(runChangesReader(), status("h0"), { ...h.io, readAhead: null });
+    expect(h.reads.ahead).toBe(0);
+    expect(h.state.ahead).toBeNull();
   });
 });

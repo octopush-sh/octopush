@@ -446,6 +446,9 @@ export interface GitStatus {
   aheadBehindKnown: boolean;
   /** The in-progress multi-step operation, if any. */
   operation: "merge" | "rebase" | "cherry-pick" | null;
+  /** The commit HEAD points at (hex oid); null on an unborn branch. Optional
+   *  so fixtures written before it still type-check. */
+  head?: string | null;
 }
 
 /** Branches offered as a base for new workspaces. Locals come repo-default

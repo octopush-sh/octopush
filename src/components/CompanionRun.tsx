@@ -14,6 +14,7 @@ import {
   STATUS_LETTER,
   STATUS_WORD,
   type ChangeStats,
+  type CommitsAhead,
 } from "../lib/runChanges";
 import { tourId } from "../lib/tour/ids";
 import { CompanionSection } from "./CompanionSection";
@@ -22,13 +23,7 @@ import { usd } from "./CompanionContext";
 import { MidTruncate } from "./primitives/MidTruncate";
 import { Reveal } from "./primitives/Reveal";
 
-/** How far the branch is ahead of its base: the count and what it was
- *  counted against. Never the committed diff itself. */
-export interface CommitsAhead {
-  commits: number;
-  base: string | null;
-  mergeBase: string | null;
-}
+export type { CommitsAhead };
 
 interface Props {
   workspaceId: string;
