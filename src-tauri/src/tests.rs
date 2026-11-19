@@ -16930,6 +16930,54 @@ mod pricing_table_tests {
     }
 
     #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn every_gpt_6_model_is_priced() {
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // OpenAI's API pricing page (2026-11-17), short context:
+        // (input, 30-minute write, cached input, output).
+        for (id, (input, write, hit, output)) in [
+            ("gpt-6.2-astra", (8.0, 10.0, 0.40, 40.0)),
+            ("gpt-6.2-sol", (2.0, 2.50, 0.10, 10.0)),
+            ("gpt-6-astra", (10.0, 12.50, 1.0, 50.0)),
+            ("gpt-6-sol", (2.0, 2.50, 0.20, 10.0)),
+            ("gpt-6-luna", (0.10, 0.125, 0.01, 0.50)),
+            ("gpt-6.1-sol", (2.0, 2.50, 0.10, 10.0)),
+        ] {
+            let want = ModelPrices {
+                input_per_m: input,
+                output_per_m: output,
+                cache_read_per_m: hit,
+                cache_creation_per_m: write,
+                // Not a Claude model: no 1-hour write tier.
+                cache_creation_1h_per_m: write,
+            };
+            assert_eq!(builtin_prices(id), Some(want), "{id}");
+            assert_eq!(builtin_prices(&format!("openai/{id}")), Some(want), "{id}");
+            assert_eq!(prices_for(id), Some(want), "{id}");
+            assert_eq!(ledger_cost_basis(id, 0.0, 1_000), "computed", "{id}");
+        }
+        // Only the bare ids: a similar id stays unpriced.
+        assert_eq!(builtin_prices("gpt-6.2-terra"), None);
+        assert_eq!(builtin_prices("gpt-6-sol-pro"), None);
+        // 1M fresh + 1M written + 1M cached + 1M output = 8 + 10 + 0.40 + 40.
+        let cost = crate::token_engine::request_cost_for("gpt-6.2-astra", 1_000_000, 1_000_000, 1_000_000, 1_000_000);
+        assert!((cost - 58.40).abs() < 1e-9, "astra request cost: {cost}");
+
+        // The two new models lead the OpenAI catalog.
+        let providers = crate::provider_router::builtin_providers();
+        let openai = &providers["openai"].models;
+        for (i, (id, name)) in [("gpt-6.2-astra", "GPT-6.2 Astra"), ("gpt-6.2-sol", "GPT-6.2 Sol")].into_iter().enumerate() {
+            let m = &openai[i];
+            assert_eq!(m.id, id);
+            assert_eq!(m.display_name, name);
+            assert_eq!(m.max_context, 1_050_000);
+            assert!(m.supports_tools);
+            assert!(crate::providers::openai_compat::uses_responses_api(id, &providers["openai"].api_base));
+            assert_eq!(crate::providers::openai_compat::effort_off_level(id), None, "{id} rejects effort none");
+        }
+    }
+
+    #[test]
     fn cache_write_unset_on_a_custom_model_bills_at_the_input_price() {
         use crate::provider_router::{builtin_providers, ProviderRouter};
         use crate::token_engine::prices_in;
