@@ -26,6 +26,27 @@ describe("CompanionSection", () => {
     expect(screen.getByText("add")).toBeInTheDocument();
   });
 
+  it("puts what the section is about at the right of the eyebrow, inside the fold control", () => {
+    const { rerender } = render(
+      <CompanionSection title="Changes" meta="3 files · +84 −12">
+        <div>body</div>
+      </CompanionSection>,
+    );
+    const fold = screen.getByRole("button", { name: /changes/i });
+    const meta = screen.getByTestId("companion-section-meta");
+    expect(fold).toContainElement(meta);
+    expect(meta).toHaveTextContent("3 files · +84 −12");
+    // The meta is the part that gives way; it keeps its own case.
+    expect(meta.className).toContain("truncate");
+    expect(meta.className).toContain("normal-case");
+    rerender(
+      <CompanionSection title="Changes" meta={null}>
+        <div>body</div>
+      </CompanionSection>,
+    );
+    expect(screen.queryByTestId("companion-section-meta")).toBeNull();
+  });
+
   it("remembers the folded state under its storage key", () => {
     const { unmount } = render(
       <CompanionSection title="Conversation" storageKey="conversation">

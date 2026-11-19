@@ -28,6 +28,7 @@ import { ipc } from "../lib/ipc";
 import { canOpenPrFrom } from "../lib/prDraft";
 import type { LastCommit } from "../lib/ipc";
 import type { FileChange, GitStatus } from "../lib/types";
+import { STATUS_LETTER } from "../lib/runChanges";
 import { pushToast } from "./Toasts";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { SecretGuardDialog } from "./SecretGuardDialog";
@@ -978,18 +979,17 @@ function FileStatusIcon({ status }: { status: FileChange["status"] }) {
 }
 
 function StatusGlyph({ status }: { status: FileChange["status"] }) {
-  const map: Record<FileChange["status"], { letter: string; color: string }> = {
-    new: { letter: "N", color: "text-octo-verdigris" },
-    modified: { letter: "M", color: "text-octo-brass" },
-    deleted: { letter: "D", color: "text-octo-rouge" },
-    renamed: { letter: "R", color: "text-octo-sage" },
-    unknown: { letter: "?", color: "text-octo-mute" },
-    conflicted: { letter: "!", color: "text-octo-rouge" },
+  const color: Record<FileChange["status"], string> = {
+    new: "text-octo-verdigris",
+    modified: "text-octo-brass",
+    deleted: "text-octo-rouge",
+    renamed: "text-octo-sage",
+    unknown: "text-octo-mute",
+    conflicted: "text-octo-rouge",
   };
-  const { letter, color } = map[status];
   return (
-    <span className={`font-mono text-[9px] uppercase tracking-[0.2em] ${color}`}>
-      {letter}
+    <span className={`font-mono text-[9px] uppercase tracking-[0.2em] ${color[status]}`}>
+      {STATUS_LETTER[status]}
     </span>
   );
 }

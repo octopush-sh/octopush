@@ -1152,6 +1152,24 @@ impl Db {
             );
             "#,
         )?;
+        // Which Run terminal each Claude Code session ran in, as that
+        // session's own hooks reported it (`claude_hooks::remember_sessions`):
+        // the hook's environment names the terminal, its payload the session.
+        // Kept for good, like `direct_cli_sessions`: a session someone has
+        // claimed is never taken for another terminal's, even after its own
+        // terminal is closed. The Run Companion's Context section reads one
+        // terminal's context and spend through it.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS terminal_cc_sessions (
+                session_id  TEXT PRIMARY KEY,
+                terminal_id TEXT NOT NULL,
+                linked_at   TEXT NOT NULL   -- the last hook signal naming this pair
+            );
+            CREATE INDEX IF NOT EXISTS idx_terminal_cc_sessions_terminal
+                ON terminal_cc_sessions(terminal_id, linked_at);
+            "#,
+        )?;
         // One-time backfill from what the stage rows still remember: the last
         // attempt's session id, and the session its reported usage belongs to.
         // The ingestor then purges the duplicate `run` rows those sessions'
@@ -3972,6 +3990,104 @@ impl Db {
         let (pct, _) = cache_hit_pct(input, read, create);
         out.cache_hit_pct = pct;
         Ok(out)
+    }
+
+    /// Record that the Claude Code session `session_id` runs in `terminal_id`,
+    /// confirmed at `at` (RFC3339 UTC): what one of that session's hooks just
+    /// said. A session reported again keeps one row, with the newest terminal
+    /// and time.
+    pub fn link_terminal_cc_session(&self, terminal_id: &str, session_id: &str, at: &str) -> AppResult<()> {
+        self.conn.execute(
+            "INSERT INTO terminal_cc_sessions (session_id, terminal_id, linked_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET terminal_id = excluded.terminal_id, linked_at = excluded.linked_at",
+            params![session_id, terminal_id, at],
+        )?;
+        Ok(())
+    }
+
+    /// The Claude Code session `terminal_id` reported last, and when:
+    /// `(session id, linked_at)`.
+    pub fn terminal_cc_session(&self, terminal_id: &str) -> AppResult<Option<(String, String)>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, linked_at FROM terminal_cc_sessions
+                 WHERE terminal_id = ?1 ORDER BY linked_at DESC, rowid DESC LIMIT 1",
+                params![terminal_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// The workspace a Run terminal belongs to.
+    pub fn terminal_workspace(&self, terminal_id: &str) -> AppResult<Option<String>> {
+        self.conn
+            .query_row("SELECT workspace_id FROM terminals WHERE id = ?1", params![terminal_id], |r| r.get(0))
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Whether the ledger holds a Claude Code session in `workspace_id` that
+    /// no terminal has claimed (`terminal_cc_sessions`) and whose first
+    /// message came after `since` (RFC3339 UTC). Such a session may be the
+    /// one a terminal runs now (after `/clear`, or `claude` started again)
+    /// before its first hook has said so.
+    pub fn unclaimed_run_session_started_after(&self, workspace_id: &str, since: &str) -> AppResult<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                     SELECT 1 FROM spend_events se
+                     WHERE se.surface = 'run' AND se.workspace_id = ?1 AND se.ts_utc > ?2
+                       AND se.source_id LIKE 'cc:%'
+                       AND NOT EXISTS (SELECT 1 FROM terminal_cc_sessions t WHERE se.source_id = 'cc:' || t.session_id)
+                       AND NOT EXISTS (SELECT 1 FROM spend_events o
+                                       WHERE o.source_id = se.source_id AND o.surface = 'run' AND o.ts_utc <= ?2)
+                 )",
+                params![workspace_id, since],
+                |r| r.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// One Claude Code session's RUN rows, folded for the Run Companion's
+    /// Context section: what it spent (unpriced calls aside, as in
+    /// [`Self::thread_cost`]), the share of its prompt tokens the cache
+    /// served, and the model and time of its newest row. `source_id` is the
+    /// ledger's own key for a transcript-metered session (`cc:<session id>`).
+    /// `None` when the ledger holds no such row.
+    pub fn run_session_ledger(&self, source_id: &str) -> AppResult<Option<RunSessionLedger>> {
+        let (calls, unpriced_calls, spent_usd, input, read, create) = self.conn.query_row(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(cost_basis = 'unpriced'), 0),
+                    COALESCE(SUM(CASE WHEN cost_basis = 'unpriced' THEN 0.0 ELSE cost_usd END), 0.0),
+                    COALESCE(SUM(input_tokens), 0),
+                    COALESCE(SUM(cache_read_tokens), 0),
+                    COALESCE(SUM(cache_creation_tokens), 0)
+             FROM spend_events WHERE surface = 'run' AND source_id = ?1",
+            params![source_id],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
+        if calls == 0 {
+            return Ok(None);
+        }
+        let (last_model, last_ts) = self.conn.query_row(
+            "SELECT model, ts_utc FROM spend_events
+             WHERE surface = 'run' AND source_id = ?1
+             ORDER BY ts_utc DESC, id DESC LIMIT 1",
+            params![source_id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )?;
+        let (cache_hit_pct, _) = cache_hit_pct(input, read, create);
+        Ok(Some(RunSessionLedger { calls, unpriced_calls, spent_usd, cache_hit_pct, last_model, last_ts }))
     }
 
     /// Rows the re-pricer looks at: `'unpriced'` rows with tokens, plus —
@@ -7099,6 +7215,21 @@ pub struct ThreadCost {
     /// `baseline_usd` (so from the saving), counted and named here.
     pub unpriced_calls: i64,
     pub unpriced_models: Vec<String>,
+}
+
+/// One Claude Code session's RUN rows in the ledger (see
+/// `run_session_ledger`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RunSessionLedger {
+    pub calls: i64,
+    /// Rows whose model had no price — left out of `spent_usd`.
+    pub unpriced_calls: i64,
+    pub spent_usd: f64,
+    /// See [`cache_hit_pct`].
+    pub cache_hit_pct: Option<f64>,
+    /// Model and timestamp of the newest row.
+    pub last_model: String,
+    pub last_ts: String,
 }
 
 // ─── Usage report types ────────────────────────────────────────────────

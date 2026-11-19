@@ -41,6 +41,33 @@ export function revealDiffTarget(
   return true;
 }
 
+/** How long a jump made from another mode waits for Review's diff to land
+ *  (the working diff is only read while Review is on screen). */
+export const DIFF_ARRIVAL_WAIT_MS = 2000;
+
+/**
+ * `revealDiffTarget`, tried on animation frames until the file's section
+ * is rendered or `waitMs` has passed. The first try is one frame out, so the
+ * canvas has switched modes; with `waitMs` 0 that is the only try. Resolves
+ * with whether the section was found.
+ */
+export function revealDiffTargetWhenReady(
+  file: string,
+  line: number | null,
+  waitMs: number,
+  opts?: { flash?: boolean },
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const deadline = performance.now() + waitMs;
+    const attempt = () => {
+      if (revealDiffTarget(file, line, opts)) resolve(true);
+      else if (performance.now() >= deadline) resolve(false);
+      else requestAnimationFrame(attempt);
+    };
+    requestAnimationFrame(attempt);
+  });
+}
+
 /** Strip git's `a/`/`b/` diff prefix from a (relative) path. Absolute paths
  *  are returned untouched. AI findings occasionally carry these prefixes. */
 export function stripDiffPrefix(path: string): string {

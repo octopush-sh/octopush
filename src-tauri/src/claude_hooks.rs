@@ -288,9 +288,55 @@ fn deliverable(rows: Vec<HookSignalRow>, enabled: bool, now: DateTime<Utc>) -> V
 
 /// One poll. The queue is drained with the toggle off too, and those rows are
 /// dropped: hooks still in a worktree keep queuing, and the table would
-/// otherwise grow without bound.
+/// otherwise grow without bound. With the toggle on, each row also says
+/// which Claude Code session its terminal runs ([`remember_sessions`]).
 fn poll_once(db: &Db, enabled: bool, now: DateTime<Utc>) -> AppResult<Vec<(String, HookSignal)>> {
-    Ok(deliverable(db.drain_hook_signals()?, enabled, now))
+    let rows = db.drain_hook_signals()?;
+    if enabled {
+        remember_sessions(db, &rows);
+    }
+    Ok(deliverable(rows, enabled, now))
+}
+
+// ─── Which Claude Code session a terminal runs ────────────────────
+//
+// A hook payload is the only place a Run terminal and Claude Code's own
+// session id meet: the terminal id comes from the hook's environment, the
+// session id from its payload. The transcript ledger is keyed by that session
+// id (`cc:<session id>`), so the pair is what lets the Run Companion show one
+// terminal's context and spend and never another's. Each pair is kept in
+// `terminal_cc_sessions` with the time of the signal that named it, because a
+// PTY, and the Claude Code session in it, outlives the app.
+
+/// Keep the terminal/session pair each of `rows` names. A row too old to
+/// deliver still counts: its prompt was answered long ago, but the session
+/// it names did run in that terminal at that time. A row without a session id
+/// says nothing. A failed write only costs the Companion its Context section,
+/// so it is logged and never fails the poll.
+fn remember_sessions(db: &Db, rows: &[HookSignalRow]) {
+    for row in rows {
+        let Some(session) = row.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) else { continue };
+        // Stored in one shape so the times compare as text; a row whose time
+        // can't be read is not evidence of when.
+        let Ok(at) = DateTime::parse_from_rfc3339(&row.created_at) else { continue };
+        let at = at.with_timezone(&Utc).to_rfc3339();
+        if let Err(e) = db.link_terminal_cc_session(&row.terminal_id, session, &at) {
+            tracing::warn!(error = %e, "could not remember a terminal's Claude Code session");
+        }
+    }
+}
+
+/// The Claude Code session `terminal` reported last through a hook, and when
+/// (`(session id, RFC3339 UTC)`). `None` for a terminal that never delivered
+/// a hook signal with a session id (a shell, a dev server, another agent
+/// CLI, a worktree Octopush didn't create) and while the setting is off:
+/// without hooks nothing confirms the session is still the one in that
+/// terminal.
+pub fn claude_session_for(db: &Mutex<Db>, terminal: &str) -> Option<(String, String)> {
+    if !hooks_enabled() {
+        return None;
+    }
+    db.lock().terminal_cc_session(terminal).ok().flatten()
 }
 
 fn is_fresh(created_at: &str, now: DateTime<Utc>) -> bool {
@@ -602,6 +648,55 @@ mod tests {
         let on = sweeps.begin();
         assert!(!sweeps.is_latest(off), "the older sweep is cancelled");
         assert!(sweeps.is_latest(on));
+    }
+
+    #[test]
+    fn a_terminals_claude_session_is_remembered_from_its_hook_signals() {
+        let (_tmp, db) = test_db();
+        let stop = |session: &str| format!(r#"{{"hook_event_name":"Stop","session_id":"{session}","cwd":"/w"}}"#);
+        let session = |t: &str| db.terminal_cc_session(t).unwrap().map(|(s, _)| s);
+        assert_eq!(session("t1"), None, "a terminal that never ran a hook");
+
+        // The newest session a terminal reports is the one it runs; another
+        // terminal keeps its own.
+        assert!(record_hook(&db, Some("t1"), None, &stop("s1")));
+        assert!(record_hook(&db, Some("t2"), None, &stop("s9")));
+        poll_once(&db, true, Utc::now()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(record_hook(&db, Some("t1"), None, &stop("s2")));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session("t1").as_deref(), Some("s2"));
+        assert_eq!(session("t2").as_deref(), Some("s9"));
+        let (_, at) = db.terminal_cc_session("t1").unwrap().unwrap();
+        assert!(at.ends_with("+00:00") && DateTime::parse_from_rfc3339(&at).is_ok(), "linked_at {at}");
+        // The earlier session stays claimed: it is never an unclaimed one.
+        let claimed: i64 = db.conn_ref().query_row("SELECT COUNT(*) FROM terminal_cc_sessions", [], |r| r.get(0)).unwrap();
+        assert_eq!(claimed, 3);
+
+        // A payload without a session id changes nothing.
+        assert!(record_hook(&db, Some("t1"), None, r#"{"hook_event_name":"Stop"}"#));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session("t1").as_deref(), Some("s2"));
+
+        // With the setting off the queue is drained and nothing is learned.
+        assert!(record_hook(&db, Some("t1"), None, &stop("s3")));
+        assert!(poll_once(&db, false, Utc::now()).unwrap().is_empty());
+        assert_eq!(session("t1").as_deref(), Some("s2"));
+
+        // A row queued while the app was closed is not delivered, but it
+        // still names the session that terminal ran.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(record_hook(&db, Some("t1"), None, &stop("s4")));
+        let later = Utc::now() + chrono::Duration::seconds(STALE_AFTER_SECS + 60);
+        assert!(poll_once(&db, true, later).unwrap().is_empty());
+        assert_eq!(session("t1").as_deref(), Some("s4"));
+
+        // A session resumed in another terminal moves there, with one row.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(record_hook(&db, Some("t2"), None, &stop("s4")));
+        poll_once(&db, true, Utc::now()).unwrap();
+        assert_eq!(session("t2").as_deref(), Some("s4"));
+        assert_eq!(session("t1").as_deref(), Some("s2"));
     }
 
     #[test]

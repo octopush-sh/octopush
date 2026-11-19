@@ -456,7 +456,7 @@ export function TerminalPane({
       if (hasOutputRef.current) return;
       hasOutputRef.current = true;
       setHasOutput(true);
-      // The Companion's State reads the same moment: "starting" until now.
+      // The store reads the same moment: the session is `starting` until now.
       onFirstOutputRef.current?.();
     };
 

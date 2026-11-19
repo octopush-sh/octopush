@@ -25,8 +25,8 @@ interface Props {
  *  1. **The icon is the identity, the number is the address.** A 32px cell
  *     holds one glyph well and two badly, so it shows the session's role icon
  *     at rest and flips to its ⌘⌥N number while ⌥/⌘ is held. Nothing lives
- *     only behind that gesture — the number is permanent in the flyout, the
- *     Companion inspector and the ⌘⌥K switcher.
+ *     only behind that gesture — the number is permanent in the flyout and
+ *     the ⌘⌥K switcher.
  *  2. **Roles are sticky** (see `terminalsStore.setBusy`).
  *  3. **One glyph, two facts:** the icon carries identity, its colour and edge
  *     carry state — brass active, marching brass while a command runs.

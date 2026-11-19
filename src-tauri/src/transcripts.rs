@@ -323,6 +323,182 @@ pub fn read_new_entries(path: &Path, offset: u64) -> std::io::Result<(Vec<Transc
     Ok((order, consumed))
 }
 
+// ─── One session, read for the Run Companion ──────────────────────
+
+/// The newest main-thread prompt of one Claude Code session, from its
+/// transcript: what the Run Companion's context meter shows.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LastPrompt {
+    /// Input + cache read + cache write of the session's last API message:
+    /// the whole prompt, which is how full the context window is.
+    pub tokens: u64,
+    pub model: String,
+    /// RFC3339 UTC.
+    pub ts_utc: String,
+}
+
+/// How far back from the end of a transcript [`last_prompt`] looks: a first
+/// short read, then one long enough to step over a pasted image.
+const TAIL_READS: [u64; 2] = [256 * 1024, 8 * 1024 * 1024];
+
+/// The session's transcript under `root` for a session started in `cwd`
+/// (as written or canonicalized, and under Claude Code's capped directory
+/// name for a long path). A session id that could leave its directory
+/// names no file.
+fn session_file(root: &Path, cwd: &str, session_id: &str) -> Option<PathBuf> {
+    if session_id.is_empty() || session_id.contains(['/', '\\']) || session_id.starts_with('.') {
+        return None;
+    }
+    let mut dirs = project_dirs_for(root, cwd);
+    if let Ok(c) = std::fs::canonicalize(cwd) {
+        for d in project_dirs_for(root, &c.to_string_lossy()) {
+            if !dirs.contains(&d) {
+                dirs.push(d);
+            }
+        }
+    }
+    dirs.into_iter()
+        .map(|d| root.join(d).join(format!("{session_id}.jsonl")))
+        .find(|f| f.is_file())
+}
+
+/// [`LastPrompt`] of the Claude Code session `session_id` started in `cwd`:
+/// the last `assistant` line of its own transcript that carries usage and is
+/// not a sub-agent's (`isSidechain`; a sub-agent's prompt is its own
+/// context, not the session's). Read from the end of the file, never the
+/// whole of it. `None` when there is no transcript, no such line within
+/// [`TAIL_READS`], or the conversation was compacted after that line (the
+/// next message will say how large the compacted context is; until then it
+/// is not known).
+pub fn last_prompt(root: &Path, cwd: &str, session_id: &str) -> Option<LastPrompt> {
+    use std::io::Read;
+    let path = session_file(root, cwd, session_id)?;
+    let mut file = std::fs::File::open(&path).ok()?;
+    let len = file.metadata().ok()?.len();
+    for reach in TAIL_READS {
+        let start = len.saturating_sub(reach);
+        file.seek(SeekFrom::Start(start)).ok()?;
+        let mut buf = Vec::new();
+        file.by_ref().take(len - start).read_to_end(&mut buf).ok()?;
+        let mut lines: Vec<&[u8]> = buf.split(|b| *b == b'\n').collect();
+        if start > 0 {
+            // The read began mid-line.
+            lines.remove(0);
+        }
+        for line in lines.into_iter().rev() {
+            if line.windows(18).any(|w| w == b"\"compact_boundary\"") {
+                let text = String::from_utf8_lossy(line);
+                let v: Option<serde_json::Value> = serde_json::from_str(text.trim()).ok();
+                if v.is_some_and(|v| v.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary")) {
+                    return None;
+                }
+            }
+            if !line.windows(11).any(|w| w == b"\"assistant\"") {
+                continue;
+            }
+            let text = String::from_utf8_lossy(line);
+            let Some(u) = parse_transcript_line(&text, session_id) else { continue };
+            let sidechain = serde_json::from_str::<serde_json::Value>(text.trim())
+                .ok()
+                .and_then(|v| v.get("isSidechain").and_then(|s| s.as_bool()))
+                .unwrap_or(false);
+            if sidechain {
+                continue;
+            }
+            return Some(LastPrompt {
+                tokens: u.input_tokens + u.cache_read_tokens + u.cache_creation_tokens,
+                model: u.model,
+                ts_utc: u.ts_utc,
+            });
+        }
+        if start == 0 {
+            break;
+        }
+    }
+    None
+}
+
+/// What the Run Companion's Context section shows for one terminal's Claude
+/// Code session (`get_session_usage`).
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionUsage {
+    /// The session's last prompt ([`LastPrompt::tokens`]); `None` when the
+    /// transcript can't say (see [`last_prompt`]).
+    pub context_tokens: Option<u64>,
+    /// The model's context window from the provider catalog; `None` for a
+    /// model the catalog doesn't list.
+    pub max_context: Option<u64>,
+    /// The session's priced spend in the ledger.
+    pub spent_usd: f64,
+    /// Ledger rows (billed API calls) of the session.
+    pub calls: i64,
+    /// Those of `calls` on a model without a price, left out of `spent_usd`.
+    pub unpriced_calls: i64,
+    /// The share of the session's prompt tokens read from the cache, 0–100.
+    pub cache_hit_pct: Option<f64>,
+    /// The model of the last prompt, else of the newest ledger row.
+    pub model: String,
+    /// When that last message was written (RFC3339 UTC).
+    pub as_of: String,
+}
+
+/// [`SessionUsage`] of the Claude Code session `session_id`, which the Run
+/// terminal `terminal_id` reported through a hook at `linked_at`
+/// (`claude_hooks::claude_session_for`). Spend and cache share come from the
+/// ledger rows the ingestor keyed `cc:<session id>`; the context size from
+/// the session's own transcript under `root`. Read-only.
+///
+/// `None`, so that nothing is shown rather than zeroes or another session's
+/// figures, when:
+/// - the ledger has no row for the session (nothing metered yet; or its
+///   rows are keyed by a legacy RUN session on the same root and can't be
+///   told from another conversation's);
+/// - the terminal may have moved on: the ledger holds a Claude Code session
+///   in the same workspace that no terminal has claimed and that started
+///   after both the hook that named this pair and this session's last
+///   message. After `/clear`, or `claude` started again, the terminal runs a
+///   new session whose first hook has not fired yet; with several agents in
+///   one worktree that newcomer may be another terminal's, and there is no
+///   telling which until it reports.
+pub fn session_usage(
+    db: &Mutex<Db>,
+    root: &Path,
+    terminal_id: &str,
+    session_id: &str,
+    linked_at: &str,
+) -> AppResult<Option<SessionUsage>> {
+    let (ledger, cwd) = {
+        let db = db.lock();
+        let Some(ledger) = db.run_session_ledger(&format!("cc:{session_id}"))? else { return Ok(None) };
+        let Some(workspace) = db.terminal_workspace(terminal_id)? else { return Ok(None) };
+        let since = linked_at.max(ledger.last_ts.as_str());
+        if db.unclaimed_run_session_started_after(&workspace, since)? {
+            return Ok(None);
+        }
+        (ledger, db.run_cwd_for_source(terminal_id)?)
+    };
+    // The transcript is read without the DB lock.
+    let prompt = cwd.and_then(|cwd| last_prompt(root, &cwd, session_id));
+    let (model, as_of) = match &prompt {
+        Some(p) => (p.model.clone(), p.ts_utc.clone()),
+        None => (ledger.last_model.clone(), ledger.last_ts.clone()),
+    };
+    let max_context = crate::token_engine::catalog()
+        .and_then(|c| c.find_model(&model).map(|(_, m)| m.max_context))
+        .filter(|w| *w > 0);
+    Ok(Some(SessionUsage {
+        context_tokens: prompt.map(|p| p.tokens),
+        max_context,
+        spent_usd: ledger.spent_usd,
+        calls: ledger.calls,
+        unpriced_calls: ledger.unpriced_calls,
+        cache_hit_pct: ledger.cache_hit_pct,
+        model,
+        as_of,
+    }))
+}
+
 /// Where a transcript's spend is attributed.
 #[derive(Clone, Debug, Default)]
 struct Target {

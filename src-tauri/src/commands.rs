@@ -4323,6 +4323,30 @@ pub async fn get_thread_cost(
     state.db.lock().thread_cost(&thread_id, strong.as_ref())
 }
 
+/// What the Claude Code session in one Run terminal has used: its last
+/// prompt against the model's context window, its spend and cache share from
+/// the ledger, and its model. For the Run Companion's Context section.
+/// `None` unless the figures are certainly that terminal's: for a terminal
+/// with no known Claude Code session (a shell, a dev server, another agent
+/// CLI, hooks off), one the ledger holds no row for yet, and while another
+/// session may have taken its place (`transcripts::session_usage`).
+/// Read-only; the transcript is read on a blocking thread.
+#[tauri::command]
+pub async fn get_session_usage(
+    state: State<'_, AppState>,
+    terminal_id: String,
+) -> AppResult<Option<crate::transcripts::SessionUsage>> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let Some((session, linked_at)) = crate::claude_hooks::claude_session_for(&db, &terminal_id) else {
+            return Ok(None);
+        };
+        crate::transcripts::session_usage(&db, &crate::transcripts::projects_root(), &terminal_id, &session, &linked_at)
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("session usage: {e}")))?
+}
+
 /// Answer a turn-limit card: the extra turns to give the paused writing
 /// sub-agent, or none to accept its partial report and let the director go on.
 #[tauri::command]

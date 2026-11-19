@@ -15712,6 +15712,282 @@ mod transcript_tests {
         v.to_string()
     }
 
+    // ── One session, read for the Run Companion (`get_session_usage`) ──
+
+    /// [`line`] written by the Claude Code session `session`.
+    fn line_of(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str, cwd: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&line("assistant", req, model, i, cr, cc, o, ts, cwd)).unwrap();
+        v["sessionId"] = serde_json::json!(session);
+        v.to_string()
+    }
+
+    fn sidechain(l: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+        v["isSidechain"] = serde_json::json!(true);
+        v.to_string()
+    }
+
+    #[test]
+    fn last_prompt_is_the_sessions_own_last_message_never_a_subagents() {
+        use crate::transcripts::{last_prompt, LastPrompt};
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/last-prompt";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                line_of("cc-a", "req_1", m, 10, 90_000, 2_000, 50, "2026-11-18T10:00:00Z", cwd),
+                line("user", "req_u", m, 0, 0, 0, 0, "2026-11-18T10:00:30Z", cwd),
+                // input 12 + cache read 140 000 + cache write 8 000: the whole prompt.
+                line_of("cc-a", "req_2", m, 12, 140_000, 8_000, 70, "2026-11-18T10:01:00Z", cwd),
+                // An inline sub-agent message (older Claude Code): its prompt is its own context.
+                sidechain(&line_of("cc-a", "req_side", m, 5, 3_000, 0, 9, "2026-11-18T10:02:00Z", cwd)),
+            ),
+        )
+        .unwrap();
+        // A sub-agent's own file is never the session's transcript.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_sub", m, 7, 1_000, 0, 9, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        assert_eq!(
+            last_prompt(root.path(), cwd, "cc-a"),
+            Some(LastPrompt { tokens: 148_012, model: m.into(), ts_utc: "2026-11-18T10:01:00+00:00".into() }),
+        );
+        // No transcript, another cwd, or an id that would leave the directory: nothing.
+        assert_eq!(last_prompt(root.path(), cwd, "cc-missing"), None);
+        assert_eq!(last_prompt(root.path(), "/tmp/proj/elsewhere", "cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "../cc-a"), None);
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a/subagents/agent-1"), None);
+        assert_eq!(last_prompt(root.path(), cwd, ""), None);
+
+        // A half-written last line (the CLI mid-write) is skipped, not fatal.
+        let mut text = std::fs::read_to_string(pdir.join("cc-a.jsonl")).unwrap();
+        text.push_str(&line_of("cc-a", "req_3", m, 1, 1, 1, 1, "2026-11-18T10:04:00Z", cwd)[..40]);
+        std::fs::write(pdir.join("cc-a.jsonl"), &text).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-a").map(|p| p.tokens), Some(148_012));
+    }
+
+    #[test]
+    fn last_prompt_is_unknown_right_after_a_compaction_and_steps_over_a_large_line() {
+        use crate::transcripts::last_prompt;
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/compacted";
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let m = "claude-fable-5-2";
+        let before = line_of("cc-c", "req_1", m, 10, 900_000, 0, 50, "2026-11-18T10:00:00Z", cwd);
+        let boundary = serde_json::json!({ "type": "system", "subtype": "compact_boundary", "sessionId": "cc-c" }).to_string();
+        // Compacted, no message since: the old prompt size no longer describes the context.
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c"), None);
+        // The first message after it says how large the compacted context is.
+        let after = line_of("cc-c", "req_2", m, 10, 0, 30_000, 50, "2026-11-18T10:05:00Z", cwd);
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+        // A user line larger than the first tail read (a pasted image) after
+        // the last message: the longer read finds the message behind it.
+        let image = serde_json::json!({ "type": "user", "message": { "content": "x".repeat(300 * 1024) } }).to_string();
+        std::fs::write(pdir.join("cc-c.jsonl"), format!("{before}\n{boundary}\n{after}\n{image}\n")).unwrap();
+        assert_eq!(last_prompt(root.path(), cwd, "cc-c").map(|p| p.tokens), Some(30_010));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_reads_one_terminals_claude_session_from_the_ledger_and_its_transcript() {
+        use crate::transcripts::session_usage;
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-usage";
+        {
+            let d = db.lock();
+            d.insert_project("p-su", "P", "/tmp/proj").unwrap();
+            d.insert_workspace("w-su", "p-su", "ws", "", "b-su", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-a", "w-su", "Agent", 0, 0).unwrap();
+            d.create_terminal("term-b", "w-su", "Other agent", 1, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(pdir.join("cc-a/subagents")).unwrap();
+        let m = "claude-fable-5-2";
+        // Fable 5.2: $8/M input, $40/M output, $0.20/M cache read, $10/M cache write.
+        std::fs::write(
+            pdir.join("cc-a.jsonl"),
+            format!(
+                "{}\n{}\n",
+                line_of("cc-a", "req_a1", m, 1_000, 0, 100_000, 1_000, "2026-11-18T10:00:00Z", cwd),
+                line_of("cc-a", "req_a2", m, 2_000, 100_000, 46_000, 1_000, "2026-11-18T10:01:00Z", cwd),
+            ),
+        )
+        .unwrap();
+        // Its sub-agent: billed to the session, newer than its last own message.
+        std::fs::write(
+            pdir.join("cc-a/subagents/agent-1.jsonl"),
+            format!("{}\n", line_of("cc-a", "req_a_sub", "claude-haiku-4-5", 4_000, 0, 0, 500, "2026-11-18T10:02:00Z", cwd)),
+        )
+        .unwrap();
+        // A second agent in the same worktree: never part of the first one's figures.
+        std::fs::write(
+            pdir.join("cc-b.jsonl"),
+            format!("{}\n", line_of("cc-b", "req_b1", m, 500_000, 0, 0, 9_000, "2026-11-18T10:03:00Z", cwd)),
+        )
+        .unwrap();
+        // Each terminal's hooks named its session when its last turn ended.
+        let (at_a, at_b) = ("2026-11-18T10:02:30+00:00", "2026-11-18T10:03:30+00:00");
+        db.lock().link_terminal_cc_session("term-a", "cc-a", at_a).unwrap();
+        db.lock().link_terminal_cc_session("term-b", "cc-b", at_b).unwrap();
+        // Nothing ingested yet: no row, so nothing to show (never zeroes).
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap(), None);
+
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 4);
+        let u = session_usage(&db, root.path(), "term-a", "cc-a", at_a).unwrap().expect("the session's usage");
+        // The context is the session's own last prompt (2 000 + 100 000 + 46 000),
+        // not the sub-agent's newer, smaller one.
+        assert_eq!(u.context_tokens, Some(148_000));
+        assert_eq!(u.max_context, Some(1_000_000));
+        assert_eq!(u.model, m);
+        assert_eq!(u.as_of, "2026-11-18T10:01:00+00:00");
+        assert_eq!((u.calls, u.unpriced_calls), (3, 0));
+        let fable = (1_000.0 * 8.0 + 100_000.0 * 10.0 + 1_000.0 * 40.0 + 2_000.0 * 8.0 + 100_000.0 * 0.20 + 46_000.0 * 10.0 + 1_000.0 * 40.0) / 1e6;
+        let haiku = crate::token_engine::prices_for("claude-haiku-4-5").unwrap().cost(4_000, 500, 0, 0);
+        assert!((u.spent_usd - (fable + haiku)).abs() < 1e-9, "{} vs {}", u.spent_usd, fable + haiku);
+        // Cache share: 100 000 read of 253 000 prompt tokens (input + read + write).
+        let pct = u.cache_hit_pct.expect("cache share");
+        assert!((pct - 100_000.0 / 253_000.0 * 100.0).abs() < 1e-9, "{pct}");
+
+        // The other agent's session reads its own rows.
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.calls, b.context_tokens), (1, Some(500_000)));
+        // A session the ledger never saw, or a terminal that no longer exists: nothing.
+        assert_eq!(session_usage(&db, root.path(), "term-a", "cc-unknown", at_a).unwrap(), None);
+        assert_eq!(session_usage(&db, root.path(), "term-gone", "cc-a", at_a).unwrap(), None);
+
+        // The transcript gone (Claude Code prunes old ones): spend, cache share
+        // and the model still come from the ledger; the context size does not.
+        std::fs::remove_file(pdir.join("cc-b.jsonl")).unwrap();
+        let b = session_usage(&db, root.path(), "term-b", "cc-b", at_b).unwrap().unwrap();
+        assert_eq!((b.context_tokens, b.model.as_str(), b.as_of.as_str()), (None, m, "2026-11-18T10:03:00+00:00"));
+        assert!(b.spent_usd > 0.0);
+    }
+
+    /// The figures are shown only while they are certainly that terminal's:
+    /// a session nobody has claimed, started after the terminal's last
+    /// confirmed message, may be the one it runs now (`/clear`, `claude`
+    /// started again) or another agent's in the same worktree.
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_is_withheld_while_an_unclaimed_newer_session_may_have_taken_the_terminal() {
+        use crate::transcripts::session_usage;
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-guard";
+        {
+            let d = db.lock();
+            d.insert_project("p-g", "P", "/tmp/proj-g").unwrap();
+            d.insert_workspace("w-g", "p-g", "ws", "", "b-g", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-a", "w-g", "Agent", 0, 0).unwrap();
+            d.create_terminal("term-b", "w-g", "Other agent", 1, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        let m = "claude-fable-5-2";
+        let write = |session: &str, lines: &[String]| {
+            std::fs::write(pdir.join(format!("{session}.jsonl")), lines.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+        };
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        let shown = |session: &str, at: &str| session_usage(&db, root.path(), "term-a", session, at).unwrap().map(|u| u.context_tokens);
+
+        // A session someone ran in this worktree outside Octopush, begun
+        // before the terminal's hook and still going: never a newcomer.
+        write("cc-outside", &[line_of("cc-outside", "req_o1", m, 10, 0, 0, 5, "2026-11-18T09:00:00Z", cwd)]);
+        // term-a's session, its turn over at 10:00.
+        write("cc-a", &[line_of("cc-a", "req_a1", m, 1_000, 0, 0, 5, "2026-11-18T09:59:00Z", cwd)]);
+        let at_a = "2026-11-18T10:00:00+00:00";
+        db.lock().link_terminal_cc_session("term-a", "cc-a", at_a).unwrap();
+        ing.ingest().unwrap();
+        assert_eq!(shown("cc-a", at_a), Some(Some(1_000)));
+        write(
+            "cc-outside",
+            &[
+                line_of("cc-outside", "req_o1", m, 10, 0, 0, 5, "2026-11-18T09:00:00Z", cwd),
+                line_of("cc-outside", "req_o2", m, 10, 0, 0, 5, "2026-11-18T10:30:00Z", cwd),
+            ],
+        );
+        ing.ingest().unwrap();
+        assert_eq!(shown("cc-a", at_a), Some(Some(1_000)), "an older unclaimed session stays out of it");
+
+        // A new session appears at 10:40 and no hook has named its terminal:
+        // term-a may have been cleared into it, or it is term-b's. Withheld.
+        write("cc-new", &[line_of("cc-new", "req_n1", m, 50, 0, 0, 5, "2026-11-18T10:40:00Z", cwd)]);
+        ing.ingest().unwrap();
+        assert_eq!(shown("cc-a", at_a), None, "ambiguous: nothing rather than a guess");
+
+        // term-a's own session speaks again after the newcomer began: it is
+        // still the one in term-a.
+        write(
+            "cc-a",
+            &[
+                line_of("cc-a", "req_a1", m, 1_000, 0, 0, 5, "2026-11-18T09:59:00Z", cwd),
+                line_of("cc-a", "req_a2", m, 2_000, 0, 0, 5, "2026-11-18T10:41:00Z", cwd),
+            ],
+        );
+        ing.ingest().unwrap();
+        assert_eq!(shown("cc-a", at_a), Some(Some(2_000)));
+
+        // The newcomer goes on past it: withheld again, until term-b's hook claims it.
+        write(
+            "cc-newer",
+            &[line_of("cc-newer", "req_w1", m, 70, 0, 0, 5, "2026-11-18T10:50:00Z", cwd)],
+        );
+        ing.ingest().unwrap();
+        assert_eq!(shown("cc-a", at_a), None);
+        db.lock().link_terminal_cc_session("term-b", "cc-newer", "2026-11-18T10:55:00+00:00").unwrap();
+        assert_eq!(shown("cc-a", at_a), Some(Some(2_000)), "claimed by another terminal: no longer in doubt");
+
+        // Had it been term-a's (cleared into it), its next hook says so and
+        // the terminal reads the new session.
+        db.lock().link_terminal_cc_session("term-a", "cc-new", "2026-11-18T10:56:00+00:00").unwrap();
+        assert_eq!(db.lock().terminal_cc_session("term-a").unwrap().map(|(s, _)| s).as_deref(), Some("cc-new"));
+        assert_eq!(shown("cc-new", "2026-11-18T10:56:00+00:00"), Some(Some(50)));
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn session_usage_leaves_unpriced_calls_out_of_the_spend_and_has_no_window_for_an_unlisted_model() {
+        use crate::transcripts::session_usage;
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let db = Arc::new(Mutex::new(test_db()));
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/session-unpriced";
+        {
+            let d = db.lock();
+            d.insert_project("p-un", "P", "/tmp/proj-un").unwrap();
+            d.insert_workspace("w-un", "p-un", "ws", "", "b-un", Some(cwd), "", None).unwrap();
+            d.create_terminal("term-u", "w-un", "Agent", 0, 0).unwrap();
+        }
+        let pdir = root.path().join(project_dir_name(cwd));
+        std::fs::create_dir_all(&pdir).unwrap();
+        std::fs::write(
+            pdir.join("cc-u.jsonl"),
+            format!("{}\n", line_of("cc-u", "req_u1", "gateway-model-nobody-lists", 3_000, 0, 0, 100, "2026-11-18T11:00:00Z", cwd)),
+        )
+        .unwrap();
+        let ing = TranscriptIngestor::with_root(Arc::clone(&db), root.path().to_path_buf());
+        assert_eq!(ing.ingest().unwrap().rows_inserted, 1);
+        db.lock().link_terminal_cc_session("term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap();
+        let u = session_usage(&db, root.path(), "term-u", "cc-u", "2026-11-18T11:00:30+00:00").unwrap().unwrap();
+        assert_eq!((u.calls, u.unpriced_calls, u.spent_usd), (1, 1, 0.0));
+        assert_eq!((u.context_tokens, u.max_context), (Some(3_000), None), "an unlisted model has no known window");
+        assert_eq!(u.cache_hit_pct, None, "nothing about the cache was reported");
+    }
+
     #[test]
     fn parses_the_one_hour_cache_write_breakdown() {
         let u = parse_transcript_line(&line_1h("req_1", "claude-fable-5-1", 400, 600, "2026-10-31T10:00:00Z", "/w"), "f").unwrap();

@@ -144,7 +144,7 @@ Current anchors:
 | `palette-workspaces` | Command palette: the Workspaces group (every open project's workspaces, needs-you first) | `CommandPalette.tsx` |
 | `file-finder-input` · `file-finder-results` | ⌘P / ⌘⇧F palette: the query input · the virtualized file list (files mode, with matches) | `WorkspaceSearchPalette.tsx` |
 | `file-finder-capped` | ⌘P mode bar: "Showing the first 20,000 files" (only when the listing hit the cap) | `WorkspaceSearchPalette.tsx` |
-| `companion-session-state` | Run Companion, session detail: the State value (`starting` / `shell idle` / `running` / `stopped` / `failed`) | `CompanionSession.tsx` |
+| `companion-run-context` · `companion-run-changes` · `companion-run-read-diff` · `companion-run-mission` | Run Companion: the Context section (only while the focused pane is an agent session Octopush has usage for) · the Changes section · its "Read the diff" link (only with something to read in Review) · the Mission section (only with a mission) | `CompanionRun.tsx` |
 | `companion-chats-list` | Companion › Chats: the conversation list | `CompanionHistory.tsx` |
 | `companion-claude-plan` | Direct Companion, current run: the Claude plan line (only once a Claude-plan stage reported) | `ClaudePlanLine.tsx` |
 | `usage-headline` | Settings › Usage: the headline stats row (Cost · Per active day · Last 24 hours · Cache hit), also while the ledger is read | `settings/UsagePane.tsx` |

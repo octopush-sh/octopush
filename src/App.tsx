@@ -104,6 +104,7 @@ import { useFoldSettle } from "./hooks/useFoldSettle";
 import { NAVIGATE_EVENT, type NavigateDetail } from "./lib/tour/surfaces";
 import { diffStat, modeMetaLabel, reviewTailParts, runTailState } from "./lib/modeMeta";
 import { diffFileCount, isDiffTruncated, resolveReviewSource } from "./lib/reviewSource";
+import { changeStats, NO_CHANGE_STATS, sameChangeStats, type ChangeStats } from "./lib/runChanges";
 import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -115,7 +116,7 @@ import type { GitStatus, TintName, Issue, ProjectInfo, Pr } from "./lib/types";
 import { prefillFixChecks } from "./lib/fixChecks";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
-import { revealDiffTarget, stripDiffPrefix } from "./lib/diffJump";
+import { DIFF_ARRIVAL_WAIT_MS, revealDiffTargetWhenReady, stripDiffPrefix } from "./lib/diffJump";
 
 
 type AppView = "project" | "new-project";
@@ -437,6 +438,11 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // Lines added and removed per uncommitted file, for Run's Companion
+  // (Changes). Counted from the working diff the poll below reads while that
+  // panel is open in Run; the diff itself is not kept, so the Review canvas
+  // (mounted but hidden outside Review) never renders it.
+  const [runChangeStats, setRunChangeStats] = useState<ChangeStats>(NO_CHANGE_STATS);
   // Live for the shortcut table, which doesn't re-register on every status poll.
   const gitStatusRef = useRef<GitStatus | null>(null);
   gitStatusRef.current = gitStatus;
@@ -760,6 +766,7 @@ function App() {
   );
   const panesFold = (activeMode === "run" && runPaneCount > 1) || (activeMode === "talk" && talkSeatOpen);
   const companionFold = useCompanionFold(panesFold, isCompanionCollapsed, setIsCompanionCollapsed);
+  const companionCollapsed = companionFold.collapsed;
   // A mode switch that glides the Companion to or from its strip holds every
   // PTY's size until the glide ends: one resize per visible session.
   const companionStrip = isCompanionCollapsed || panesFold;
@@ -786,6 +793,7 @@ function App() {
   useEffect(() => {
     setGitStatus(null);
     setGitDiff("");
+    setRunChangeStats(NO_CHANGE_STATS);
     setReviewAnswers(null);
     gitSigRef.current = "";
     gitDiffRef.current = "";
@@ -805,6 +813,14 @@ function App() {
       return;
     }
     let cancelled = false;
+    // Run's Companion lists the uncommitted files with their line counts, and
+    // the commits ahead once the tree is clean. Only while that panel is open
+    // in Run; a Companion folded for the panes shows neither.
+    const runChanges = activeMode === "run" && !companionCollapsed;
+    // The status signature the committed answer was last read at, in Run:
+    // it is re-read when the status moves (a commit lands, the branch
+    // changes), not on every tick. Review reads it every tick, as before.
+    let committedAtSig: string | null = null;
     const refresh = async () => {
       try {
         // The diff is only consumed by the review panel (ChangesPanel /
@@ -812,19 +828,45 @@ function App() {
         // skip the (non-trivial) diff build in talk/run. Entering review
         // re-runs this effect (activeMode is a dep), fetching the diff then.
         const needDiff = activeMode === "review";
-        const [s, d, c] = await Promise.all([
+        const [s, d, reviewCommitted] = await Promise.all([
           ipc.getGitStatus(path),
           needDiff ? ipc.getGitDiff(path, ignoreWs).catch(() => "") : Promise.resolve(""),
           // Review's "Since base" view (#851): what the workspace committed.
           needDiff && ws ? ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null) : Promise.resolve(undefined),
         ]);
         if (cancelled) return;
+        // Status change-detection (file metadata). hasUpstream is intentionally
+        // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
+        // its own git status). The diff is compared separately, by content.
+        const sig =
+          `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
+          `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`;
+        let c = reviewCommitted;
+        if (runChanges) {
+          if ((s?.changedFiles.length ?? 0) > 0) {
+            // A file gains lines without its status changing, so the working
+            // diff is read on every tick while there is something to count.
+            // Only the counts are kept (see `runChangeStats`).
+            const stats = changeStats(await ipc.getGitDiff(path, ignoreWs).catch(() => ""));
+            if (cancelled) return;
+            setRunChangeStats((prev) => (sameChangeStats(prev, stats) ? prev : stats));
+          } else {
+            setRunChangeStats((prev) => (sameChangeStats(prev, NO_CHANGE_STATS) ? prev : NO_CHANGE_STATS));
+            if (ws && sig !== committedAtSig) {
+              c = await ipc.getCommittedDiff(ws.id, ignoreWs).catch(() => null);
+              if (cancelled) return;
+              committedAtSig = sig;
+            }
+          }
+        }
         if (ws && c !== undefined) {
           useReviewSource.getState().setCommitted(ws.id, c);
+        }
+        if (ws && reviewCommitted !== undefined) {
           const fresh: ReviewAnswers = {
             workspaceId: ws.id,
             dirty: (s?.changedFiles.length ?? 0) > 0,
-            commitsAhead: c?.commits ?? 0,
+            commitsAhead: reviewCommitted?.commits ?? 0,
           };
           setReviewAnswers((prev) =>
             prev &&
@@ -835,12 +877,6 @@ function App() {
               : fresh,
           );
         }
-        // Status change-detection (file metadata). hasUpstream is intentionally
-        // omitted — no App-level gitStatus consumer reads it (ChangesPanel keeps
-        // its own git status). The diff is compared separately, by content.
-        const sig =
-          `${s?.branch ?? ""}|${s?.ahead ?? 0}|${s?.behind ?? 0}|` +
-          `${(s?.changedFiles ?? []).map((f) => `${f.path}:${f.status}:${f.staged ? 1 : 0}:${f.unstaged ? 1 : 0}`).join(",")}`;
         if (sig !== gitSigRef.current) {
           gitSigRef.current = sig;
           setGitStatus(s);
@@ -872,7 +908,7 @@ function App() {
       if (id) clearInterval(id);
       window.removeEventListener("focus", onFocus);
     };
-  }, [activeWorkspaceId, workspaces, project, activeMode, ignoreWs]);
+  }, [activeWorkspaceId, workspaces, project, activeMode, ignoreWs, companionCollapsed]);
 
   // ── Open-PR fetch ──
   // Fetch once per workspace switch and then every 60s. GitHub's
@@ -1493,8 +1529,12 @@ function App() {
       } else {
         // Diff view — scroll to the anchor for that file. Defer one frame so
         // the canvas has switched modes before we try to find the anchor.
-        requestAnimationFrame(() => {
-          if (!revealDiffTarget(relative, line ?? null)) {
+        // A jump from another mode (a changed file in Run's Companion) lands
+        // before Review has its diff, which is only read there: wait for the
+        // anchor instead of reporting a file that is about to appear.
+        const waitMs = activeMode === "review" ? 0 : DIFF_ARRIVAL_WAIT_MS;
+        void revealDiffTargetWhenReady(relative, line ?? null, waitMs).then((found) => {
+          if (!found) {
             // File isn't in the current diff (committed, reverted, or the
             // model hallucinated a path) — say so instead of doing nothing.
             pushToast({
@@ -1506,7 +1546,7 @@ function App() {
         });
       }
     },
-    [activeWorkspace, project, openFileAsJump, setMode, confirmLargeFile],
+    [activeWorkspace, project, openFileAsJump, setMode, confirmLargeFile, activeMode],
   );
 
   // ── Open With → "Continue in the workspace" (from a Quick View window) ──
@@ -2604,7 +2644,9 @@ function App() {
                   }
                 : null
             }
+            runProps={activeWorkspace ? { gitStatus, changeStats: runChangeStats } : null}
             onJumpToFile={handleJumpToFile}
+            onOpenReview={() => setMode("review")}
             collapsed={companionFold.collapsed}
             foldedForPanes={companionFold.folded}
             onToggleCollapsed={toggleCompanion}

@@ -583,6 +583,8 @@ import type {
   PtySession,
   RefreshPricingResult,
   ThreadCost,
+  SessionUsage,
+  PtySettledEvent,
   Session,
   SessionRecap,
   SearchHit,
@@ -875,6 +877,11 @@ export const ipc = {
   listChatMessages: (threadId: string) => invoke<ChatMessage[]>("list_chat_messages", { threadId }),
   /** What the thread has cost so far, from the ledger (Companion). */
   getThreadCost: (threadId: string) => invoke<ThreadCost>("get_thread_cost", { threadId }),
+  /** What the Claude Code session in a Run terminal has used (context size,
+   *  spend, cache share, model). Null for a terminal with no known Claude
+   *  Code session or no ledger row yet. Read-only. */
+  getSessionUsage: (terminalId: string) =>
+    invoke<SessionUsage | null>("get_session_usage", { terminalId }),
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */
@@ -1025,6 +1032,10 @@ export const ipc = {
   /** Rust asks this window to confirm closing (an app quit hit unsaved edits). */
   onConfirmCloseRequest: (handler: () => void) =>
     listen("octo://confirm-close", () => handler()),
+  /** Claude Code's `Stop` hook fired in a Run terminal: its turn is over.
+   *  The handler gets the terminal's id. */
+  onPtySettled: (handler: (terminalId: string) => void) =>
+    listen<PtySettledEvent>("pty://settled", (ev) => handler(ev.payload.sessionId)),
   /** A transcript ingest pass changed the spend ledger (rows added or
    *  Direct-session duplicates removed). */
   onSpendIngested: (handler: () => void) =>

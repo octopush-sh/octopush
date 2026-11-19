@@ -2,12 +2,12 @@
 // The helper is exercised against the REAL DiffLines markup (unified and
 // side-by-side) so a render change that breaks line matching fails here,
 // not silently in App.navigateToFile.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 import { createElement } from "react";
 import { render } from "@testing-library/react";
 import { DiffLines } from "../components/review/DiffLines";
 import type { DiffRow } from "./diffParser";
-import { findDiffRowByNewLine } from "./diffJump";
+import { findDiffRowByNewLine, revealDiffTargetWhenReady } from "./diffJump";
 
 const rows: DiffRow[] = [
   { kind: "context", text: "fn main() {", oldLine: 10, newLine: 10 },
@@ -57,5 +57,60 @@ describe("findDiffRowByNewLine", () => {
   it("returns null when the line is not in any visible hunk", () => {
     expect(findDiffRowByNewLine(renderMode("inline"), 999)).toBeNull();
     expect(findDiffRowByNewLine(renderMode("sbs"), 999)).toBeNull();
+  });
+});
+
+describe("revealDiffTargetWhenReady", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+  });
+
+  /** Frames run by hand; each one advances the clock 16ms. */
+  function frames() {
+    let now = 0;
+    const queue: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => queue.push(cb));
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    return {
+      step: (n = 1) => {
+        for (let i = 0; i < n; i++) {
+          now += 16;
+          queue.splice(0).forEach((cb) => cb(now));
+        }
+      },
+    };
+  }
+
+  function addSection(file: string) {
+    const el = document.createElement("div");
+    el.id = `review-file-${encodeURIComponent(file)}`;
+    el.scrollIntoView = vi.fn();
+    document.body.appendChild(el);
+    return el;
+  }
+
+  it("with no wait, tries once a frame later and reports a missing file", async () => {
+    const f = frames();
+    const found = revealDiffTargetWhenReady("src/a.ts", null, 0);
+    f.step();
+    expect(await found).toBe(false);
+  });
+
+  it("waits for the section to render, then scrolls to it", async () => {
+    const f = frames();
+    const found = revealDiffTargetWhenReady("src/a.ts", null, 2000);
+    f.step(5); // Review's diff has not landed yet
+    const el = addSection("src/a.ts");
+    f.step();
+    expect(await found).toBe(true);
+    expect(el.scrollIntoView).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives up once the wait has passed", async () => {
+    const f = frames();
+    const found = revealDiffTargetWhenReady("src/a.ts", null, 100);
+    f.step(10);
+    expect(await found).toBe(false);
   });
 });

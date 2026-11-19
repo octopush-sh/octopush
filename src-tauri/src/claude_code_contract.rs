@@ -1789,6 +1789,43 @@ fn transcript_jsonl_yields_one_ledger_row_per_api_call() {
     }
 }
 
+/// The Run Companion's context meter reads a session's last main-thread
+/// prompt from the end of its transcript (`transcripts::last_prompt`): the
+/// recording's main-thread lines say `isSidechain: false`, and its last
+/// billed message is the one the reader returns.
+#[test]
+fn transcript_tail_gives_the_sessions_last_main_thread_prompt() {
+    for rec in recordings() {
+        let (rel, path) = transcript_file(&rec);
+        let fx = rec.label(&rel);
+        let lines = rec.jsonl(&rel);
+        let stem = path.file_stem().unwrap().to_string_lossy().to_string();
+        let mut expected: Option<u64> = None;
+        for l in of_type(&lines, "assistant") {
+            assert_eq!(l.get("isSidechain").and_then(Value::as_bool), Some(false), "[{fx}] a main-thread line says isSidechain: false");
+            let model = require_str(&fx, l, "message.model");
+            let total: u64 = USAGE_FIELDS.iter().map(|f| require_u64(&fx, l, &format!("message.usage.{f}"))).sum();
+            if model.starts_with('<') || total == 0 {
+                continue;
+            }
+            let prompt = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+                .iter()
+                .map(|f| require_u64(&fx, l, &format!("message.usage.{f}")))
+                .sum();
+            expected = Some(prompt);
+        }
+        // Laid out as Claude Code does: <projects>/<cwd, sanitized>/<session>.jsonl.
+        let root = tempfile::tempdir().unwrap();
+        let cwd = "/Users/dev/project";
+        let dir = root.path().join(crate::transcripts::project_dir_name(cwd));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&path, dir.join(format!("{stem}.jsonl"))).unwrap();
+        let got = crate::transcripts::last_prompt(root.path(), cwd, &stem);
+        assert_eq!(got.as_ref().map(|p| p.tokens), expected, "[{fx}] last prompt");
+        assert!(got.is_some_and(|p| p.model.starts_with("claude-")), "[{fx}] its model");
+    }
+}
+
 #[test]
 fn transcript_line_missing_fields_is_skipped_not_a_panic() {
     let rec = recordings().pop().unwrap();

@@ -487,16 +487,39 @@ Binding norm: **reduce visual noise; give a sense of control and cleanliness —
 | ModeBand      | flex  | Its own line between the ContextHeader and the canvas, spanning the canvas column only (never over the Companion). `1fr/auto/1fr` grid: switcher centred on the canvas, the active mode's status tail (mono caps, mute) in the right track. |
 | ModeSwitcher  | auto  | A segmented control: pill on onyx bounded by `border-strong` (a control edge, not a panel divider — see §1), **lucide icon + mono/caps label** per segment, brass-ghost fill on the active mode with a brass indicator that glides *and* resizes to each segment. Four modes: Run (`SquareTerminal`) / Talk (`MessageSquare`) / Review (`GitCompare`) / Direct (`Waypoints`). Icons go on **all four** — iconising only one segment reads as a special case rather than a mode — and the labels stay, because mode navigation is where a wrong guess costs the most. |
 | Canvas        | flex  | Active mode content (chat / terminal / diff / pipeline track+focus pane). |
-| Companion     | 280px | Per-mode panels: Context+History · the active session's detail · Changed+commit · Runs+Jira. |
+| Companion     | 280px | Per-mode panels: Context+History · Context · Changes · Mission · Changed+commit · Runs+Jira. One grammar in every mode: see "Companion grammar" below. |
 | Input bar     | flex  | Serif placeholder, ⌘K kbd hint. |
 
 **Mode canvases at a glance:**
 - **Talk** — chat timeline. Companion: Context + History.
-- **Run** — session rail (44px, canvas-left) + terminal. Companion: the active session's detail.
+- **Run** — session rail (44px, canvas-left) + terminal. Companion: Context · Changes · Mission.
 - **Review** — unified diff. Companion: Changed + commit.
 - **Direct** — horizontal assembly-line track + focus pane. Companion: Runs + Jira. The 4th mode is per-workspace and optional; the trinity is always present.
 
 Don't add chrome outside these surfaces. If a feature needs something new, propose extending the grammar in the spec — don't add it ad-hoc.
+
+### Companion grammar (2026-11-18)
+
+Three rules hold in every mode, and Run follows them with its own content:
+
+1. **The Companion never repeats the canvas.** It shows what surrounds the
+   work on the canvas. Talk: which chats, how full the context is, what it
+   cost. Review: how the change was built, where the branch stands. Direct:
+   the runs and the logbook. Run: how much room and money the focused agent
+   has used, what the sessions changed, which mission this serves. A
+   session's name, state and controls belong to its pane.
+2. **It follows the focus.** A section about one thing (a conversation, a
+   session) names that thing at the right of its eyebrow when several are on
+   screen (`CompanionSection`'s `meta`: mute, its own case, truncating), and
+   never shows one thing's figures under another's name.
+3. **A section with nothing to say is not drawn.** It folds away on the
+   grid-rows idiom (`<Reveal>`), keeping its last content until it has left;
+   it never shows a zero, a placeholder or a guess in its place.
+
+Sections hang on `CompanionSection`: one eyebrow each, one hairline between
+them, no framed cards inside the panel. Label/value rows are a mono grid, a
+caps mute label over a sage value. In Run brass is spent twice: the context
+meter's fill and the serif link into Review.
 
 ### Workspace rail — the index (2026-09-20)
 
@@ -552,8 +575,8 @@ rules, reusable wherever a set of live things needs a compact switcher:
   (`useModifierPeek` — ⌥ only, or every plain ⌘ shortcut would flash the rail
   on its way past).
   The hint arrives when the hand is already on the modifier — and nothing lives
-  only behind the gesture: the number is permanent in the hover flyout, the
-  Companion inspector and the `⌘⌥K` switcher.
+  only behind the gesture: the number is permanent in the hover flyout and
+  the `⌘⌥K` switcher.
 - **An icon must encode difference.** A terminal glyph on every session says
   "this is a terminal" once per session — information the user already has. The
   session icon names what is *running* instead (`lib/sessionRole.ts` →
