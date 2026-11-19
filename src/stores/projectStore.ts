@@ -1,6 +1,12 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
+import { loadWithMembership } from "../lib/membershipGuard";
 import type { ProjectInfo } from "../lib/types";
+
+// Both lists are read under the membership guard, so a reload already in
+// flight never undoes a group move (see `lib/membershipGuard.ts`).
+const listRecent = () => loadWithMembership("project", () => ipc.listRecentProjects());
+const listClosed = () => loadWithMembership("project", () => ipc.listClosedProjects());
 
 interface ProjectState {
   current: ProjectInfo | null;
@@ -57,7 +63,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   loadRecent: async () => {
     try {
-      const recent = await ipc.listRecentProjects();
+      const recent = await listRecent();
       set({ recent });
     } catch {
       // Ignore — recent list is non-critical
@@ -66,7 +72,7 @@ export const useProjectStore = create<ProjectState>((set) => ({
 
   loadClosed: async () => {
     try {
-      const closed = await ipc.listClosedProjects();
+      const closed = await listClosed();
       set({ closed });
     } catch {
       // Ignore — closed list is non-critical.
@@ -76,8 +82,8 @@ export const useProjectStore = create<ProjectState>((set) => ({
   closeProject: async (id) => {
     await ipc.closeProject(id);
     const [recent, closed] = await Promise.all([
-      ipc.listRecentProjects(),
-      ipc.listClosedProjects(),
+      listRecent(),
+      listClosed(),
     ]);
     set((s) => ({
       recent,
@@ -91,21 +97,21 @@ export const useProjectStore = create<ProjectState>((set) => ({
   reopenProject: async (id) => {
     await ipc.reopenProject(id);
     const [recent, closed] = await Promise.all([
-      ipc.listRecentProjects(),
-      ipc.listClosedProjects(),
+      listRecent(),
+      listClosed(),
     ]);
     set({ recent, closed });
   },
 
   setPinned: async (id, pinned) => {
     await ipc.setProjectPinned(id, pinned);
-    const recent = await ipc.listRecentProjects();
+    const recent = await listRecent();
     set({ recent });
   },
 
   setOrder: async (ids) => {
     await ipc.setProjectOrder(ids);
-    const recent = await ipc.listRecentProjects();
+    const recent = await listRecent();
     set({ recent });
   },
 

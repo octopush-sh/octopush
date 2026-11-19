@@ -9,8 +9,13 @@
  *  are not menus (the rail's collapsed-cell flyout) share the look through
  *  this string so the two can never drift. Width and padding are the
  *  caller's. */
-export const MENU_CHROME =
-  "octo-menu-enter fixed z-[60] rounded-md border border-octo-hairline bg-octo-panel shadow-2xl";
+const MENU_FRAME = "rounded-md border border-octo-hairline bg-octo-panel shadow-2xl";
+export const MENU_CHROME = `octo-menu-enter fixed z-[60] ${MENU_FRAME}`;
+
+/** A submenu's panel: the same entrance and frame, without the positioning.
+ *  Its parent row places it (it is rendered inside the menu, so the menu's
+ *  outside-click and ↑/↓ handling see it as part of the menu). */
+export const SUBMENU_CHROME = `octo-menu-enter ${MENU_FRAME}`;
 
 /** Standard single-line menu row. */
 export const MENU_ITEM =

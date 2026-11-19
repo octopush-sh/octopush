@@ -5,7 +5,14 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
  *  - clamps the menu into the viewport after measuring it (B9),
  *  - focuses the first menu item on open and supports ↑/↓ nav (B10),
  *  - dismisses on Escape and on outside-click, ignoring right-click (B8).
+ *
+ * ↑/↓ walk the rows of the menu that holds the focus: a submenu rendered
+ * inside the panel (its own `role="menu"`) is walked on its own, and the
+ * parent's rows skip it. A control that is not a `menuitem` but belongs in the
+ * walk (the one tabbable swatch of a radio row) opts in with `data-menu-item`.
  */
+const MENU_ROW = '[role="menuitem"]:not([disabled]), [data-menu-item]:not([disabled])';
+
 export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: x, top: y });
@@ -38,8 +45,11 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
       }
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        const items = Array.from(
-          el.querySelectorAll<HTMLElement>('[role="menuitem"]:not([disabled])'),
+        const focused = document.activeElement as HTMLElement | null;
+        const inner = focused?.closest<HTMLElement>('[role="menu"]');
+        const scope = inner && el.contains(inner) ? inner : el;
+        const items = Array.from(scope.querySelectorAll<HTMLElement>(MENU_ROW)).filter(
+          (item) => (item.closest('[role="menu"]') ?? scope) === scope,
         );
         if (items.length === 0) return;
         const idx = items.indexOf(document.activeElement as HTMLElement);

@@ -521,7 +521,7 @@ describe("WorkspaceRail", () => {
     // Fold, then filter: the project is forced open for the hits.
     fireEvent.click(screen.getByRole("button", { name: "Project", expanded: true }));
     expect(screen.getByRole("button", { name: "Project", expanded: false })).toBeInTheDocument();
-    const input = screen.getByRole("textbox", { name: "Find a project or mission" });
+    const input = screen.getByRole("textbox", { name: "Find a project, group or mission" });
     fireEvent.change(input, { target: { value: "al" } });
     const header = screen.getByRole("button", { name: "Project" });
     expect(header).not.toHaveAttribute("aria-expanded");
@@ -829,8 +829,8 @@ describe("WorkspaceRail", () => {
         onCustomize={vi.fn()}
       />,
     );
-    const input = screen.getByRole("textbox", { name: "Find a project or mission" });
-    expect(input).toHaveAttribute("placeholder", "Find a project or mission");
+    const input = screen.getByRole("textbox", { name: "Find a project, group or mission" });
+    expect(input).toHaveAttribute("placeholder", "Find a project, group or mission");
 
     fireEvent.change(input, { target: { value: "amm" } });
     // Only Gamma survives; Backend (no hit anywhere) leaves the rail.

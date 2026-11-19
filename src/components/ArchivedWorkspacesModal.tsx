@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { ipc } from "../lib/ipc";
+import { useGroupsStore } from "../stores/groupsStore";
 import type { Workspace } from "../lib/types";
 
 interface Props {
@@ -22,6 +23,9 @@ export function ArchivedWorkspacesModal({
   const [busyId, setBusyId] = useState<string | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // An archived mission keeps its group: restoring it returns it there.
+  const groups = useGroupsStore((s) => s.groups);
+  const groupNameOf = (w: Workspace) => groups.find((g) => g.id === w.groupId)?.name ?? null;
 
   useEffect(() => {
     let alive = true;
@@ -65,6 +69,14 @@ export function ArchivedWorkspacesModal({
             {items.map((w) => (
               <li key={w.id} className="group flex items-center gap-2 rounded-md px-2 py-1.5 hover:bg-octo-panel-2">
                 <span className="flex-1 truncate text-[13px] text-octo-sage">{w.name}</span>
+                {groupNameOf(w) && (
+                  <span
+                    className="max-w-[90px] shrink-0 truncate font-mono text-[10px] text-octo-mute"
+                    title={`In the group "${groupNameOf(w)}"`}
+                  >
+                    {groupNameOf(w)} ·
+                  </span>
+                )}
                 <span className="truncate font-mono text-[10px] text-octo-mute">{w.branch}</span>
                 <button
                   type="button"

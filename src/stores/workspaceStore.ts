@@ -5,7 +5,14 @@ import { useTerminalsStore } from "./terminalsStore";
 import { useTerminalLayoutStore } from "./terminalLayoutStore";
 import { useCollisionStore } from "./collisionStore";
 import { pushToast } from "../components/Toasts";
+import { loadWithMembership } from "../lib/membershipGuard";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
+
+/** A project's workspaces, read under the membership guard: a group move that
+ *  this read could have missed is laid over the rows, so a reload in flight
+ *  never undoes it (see `lib/membershipGuard.ts`). */
+const listWorkspaces = (projectId: string) =>
+  loadWithMembership("workspace", () => ipc.listWorkspaces(projectId));
 
 interface WorkspaceState {
   workspaces: Workspace[];
@@ -106,7 +113,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
 
   load: async (projectId) => {
     set({ loading: true });
-    const workspaces = await ipc.listWorkspaces(projectId);
+    const workspaces = await listWorkspaces(projectId);
     // Atomic update: pick the activeId in the same set() call so React never
     // sees a frame with `workspaces.find(activeId) === undefined`, which
     // would briefly flip activeWorkspace to null and unmount all the
@@ -136,7 +143,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     try {
       const results = await Promise.all(
         projectIds.map(async (id) => {
-          const wss = await ipc.listWorkspaces(id);
+          const wss = await listWorkspaces(id);
           return { projectId: id, workspaces: wss };
         })
       );

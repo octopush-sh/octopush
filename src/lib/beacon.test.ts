@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { beaconAnchor } from "./beacon";
+import { nearestVisibleAncestor, beaconAnchor } from "./beacon";
 
 const running = { status: "running" } as any;
 
@@ -59,5 +59,24 @@ describe("beaconAnchor — exactly one brass beacon", () => {
     const gate = { id: "gate", error: null };
     expect(beaconAnchor({ run, blockedStage: halt, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
     expect(beaconAnchor({ run, blockedStage: gate, runningStage: null, launcherReady: false, planWaiting: true })).toEqual({ kind: "decision" });
+  });
+});
+
+describe("nearestVisibleAncestor", () => {
+  const project = (folded: boolean) => ({ id: "project", folded });
+  const group = (folded: boolean) => ({ id: "group", folded });
+
+  it("is null when nothing is folded: the owner carries its own signal", () => {
+    expect(nearestVisibleAncestor([project(false), group(false)])).toBeNull();
+    expect(nearestVisibleAncestor([])).toBeNull();
+  });
+
+  it("is the folded group inside an open project", () => {
+    expect(nearestVisibleAncestor([project(false), group(true)])?.id).toBe("group");
+  });
+
+  it("is the outermost folded container, the only one still on screen", () => {
+    expect(nearestVisibleAncestor([project(true), group(true)])?.id).toBe("project");
+    expect(nearestVisibleAncestor([project(true), group(false)])?.id).toBe("project");
   });
 });

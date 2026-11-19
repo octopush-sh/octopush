@@ -8,6 +8,7 @@ import { Listbox } from "./controls/Listbox";
 import type { PrInfo } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
+import { moveMissionToGroup } from "../lib/groupActions";
 import { useMissionsStore } from "../stores/missionsStore";
 import { BRANCH_NAME_MAX, branchFromTask, shortenSlug, uniqueBranch, worktreeSlugMax } from "../lib/branchName";
 import { useCompanionPrefs } from "../stores/companionPrefsStore";
@@ -28,6 +29,9 @@ interface Props {
   /** The project's Jira key: only a ticket of this project found in the task
    *  text leads the suggested branch (a bare `UTF-8` is never a ticket). */
   projectJiraKey?: string | null;
+  /** A mission group of this project the new mission joins (the creator was
+   *  opened from that group's "+" in the rail). */
+  groupId?: string | null;
 }
 
 type Step = 1 | 2 | 3;
@@ -87,7 +91,7 @@ const INTENT_META: Record<Intent, { icon: LucideIcon; title: string; desc: strin
   perf: { icon: Gauge, title: "Chase a regression", desc: "Profile & find what got slow. Read-only." },
 };
 
-export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey }: Props) {
+export function MissionCreator({ projectId, projectPath, onCreated, onCancel, initialTask, linkIssueKeyOnCreate, projectJiraKey, groupId }: Props) {
   const [step, setStep] = useState<Step>(1);
   const [intent, setIntent] = useState<Intent>("build");
   const [task, setTask] = useState(initialTask ?? "");
@@ -270,6 +274,11 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       setCreating(false);
       return;
     }
+    // Started from a mission group's "+": the mission joins that group. A
+    // workspace the backend adopted (the branch already had one) that sits in
+    // another group is left where it is. A refusal is reported by the store
+    // and never fails the creation.
+    if (groupId && !newWs.groupId) void moveMissionToGroup(newWs.id, groupId);
     // `create_workspace` creates the mission (intent) server-side as a side
     // effect but its response only carries the workspace — refresh
     // missionsStore so the rail resolves this workspace's intent icon right

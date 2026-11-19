@@ -50,3 +50,18 @@ export function beaconAnchor(opts: {
   if (!run && launcherReady) return { kind: "launcher" };
   return null;
 }
+
+/**
+ * Nearest visible ancestor: where a signal shows when its owner is folded
+ * away. `ancestors` are the foldable containers around the owner, outermost
+ * first (in the rail: the project, then the mission group). A folded container
+ * hides everything under it, so the signal rides on the OUTERMOST folded one,
+ * the only one of them still on screen. Null means none is folded and the
+ * owner carries its own signal.
+ *
+ * This is what keeps Law 2 true through a fold: the pulse moves to exactly one
+ * visible element and never disappears with a row that stopped being drawn.
+ */
+export function nearestVisibleAncestor<T extends { folded: boolean }>(ancestors: readonly T[]): T | null {
+  return ancestors.find((a) => a.folded) ?? null;
+}
