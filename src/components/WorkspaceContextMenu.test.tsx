@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from "vitest";
-import { render, screen, fireEvent } from "@testing-library/react";
+import { render, screen, fireEvent, within, act } from "@testing-library/react";
 import { WorkspaceContextMenu } from "./WorkspaceContextMenu";
 
 describe("WorkspaceContextMenu", () => {
@@ -171,6 +171,100 @@ describe("WorkspaceContextMenu", () => {
       expect(screen.queryByText(/Link Jira ticket/)).not.toBeInTheDocument();
       expect(screen.queryByText(/Change Jira ticket/)).not.toBeInTheDocument();
       expect(screen.queryByText(/Skip Jira here/)).not.toBeInTheDocument();
+    });
+  });
+
+  describe("Move to group", () => {
+    const groups = [
+      { id: "g1", name: "Vulnerability fixes", tint: "rouge" as const },
+      { id: "g2", name: "PR reviews", tint: null },
+    ];
+    const groupProps = { groups, onMoveToGroup: vi.fn(), onNewGroup: vi.fn(), onRemoveFromGroup: vi.fn() };
+    const row = () => screen.getByRole("menuitem", { name: "Move to group" });
+    const submenu = () => screen.getByRole("menu", { name: "Move to group" });
+
+    it("is absent until the group actions are wired", () => {
+      render(<WorkspaceContextMenu {...baseProps} />);
+      expect(screen.queryByRole("menuitem", { name: "Move to group" })).toBeNull();
+    });
+
+    it("opens a submenu listing the project's groups, the current one checked", () => {
+      render(<WorkspaceContextMenu {...baseProps} {...groupProps} groupId="g2" />);
+      expect(row()).toHaveAttribute("aria-haspopup", "menu");
+      expect(row()).toHaveAttribute("aria-expanded", "false");
+      fireEvent.click(row());
+      expect(row()).toHaveAttribute("aria-expanded", "true");
+      const items = within(submenu()).getAllByRole("menuitemradio");
+      expect(items.map((i) => i.textContent)).toEqual(["Vulnerability fixes", "PR reviews"]);
+      expect(items.map((i) => i.getAttribute("aria-checked"))).toEqual(["false", "true"]);
+      // Opened from the keyboard or a click, the checked group has the focus.
+      expect(items[1]).toHaveFocus();
+      expect(within(submenu()).getByRole("menuitem", { name: /New group…/ })).toBeInTheDocument();
+      expect(within(submenu()).getByRole("menuitem", { name: "Remove from group" })).toBeInTheDocument();
+      // The submenu lives inside the menu, so a click in it is not an outside click.
+      expect(screen.getByRole("menu", { name: "Workspace actions" })).toContainElement(submenu());
+    });
+
+    it("moves, creates and removes, closing the menu each time", () => {
+      const onMoveToGroup = vi.fn();
+      const onNewGroup = vi.fn();
+      const onRemoveFromGroup = vi.fn();
+      const onClose = vi.fn();
+      const props = { ...baseProps, ...groupProps, onMoveToGroup, onNewGroup, onRemoveFromGroup, onClose, groupId: "g1" };
+      render(<WorkspaceContextMenu {...props} />);
+      fireEvent.click(row());
+      fireEvent.click(within(submenu()).getByRole("menuitemradio", { name: "PR reviews" }));
+      expect(onMoveToGroup).toHaveBeenCalledWith("g2");
+      fireEvent.click(within(submenu()).getByRole("menuitem", { name: /New group…/ }));
+      expect(onNewGroup).toHaveBeenCalledTimes(1);
+      fireEvent.click(within(submenu()).getByRole("menuitem", { name: "Remove from group" }));
+      expect(onRemoveFromGroup).toHaveBeenCalledTimes(1);
+      expect(onClose).toHaveBeenCalledTimes(3);
+    });
+
+    it("a loose mission gets no Remove from group; a project with no group still offers New group…", () => {
+      render(<WorkspaceContextMenu {...baseProps} {...groupProps} groups={[]} groupId={null} />);
+      fireEvent.click(row());
+      expect(within(submenu()).queryByRole("menuitemradio")).toBeNull();
+      expect(within(submenu()).queryByRole("menuitem", { name: "Remove from group" })).toBeNull();
+      expect(within(submenu()).getByRole("menuitem", { name: /New group…/ })).toHaveFocus();
+    });
+
+    it("→ opens it, ↑/↓ walk the submenu alone, ← returns to the row", () => {
+      render(<WorkspaceContextMenu {...baseProps} {...groupProps} groupId={null} />);
+      row().focus();
+      fireEvent.keyDown(row(), { key: "ArrowRight" });
+      const items = within(submenu()).getAllByRole("menuitemradio");
+      expect(items[0]).toHaveFocus();
+      fireEvent.keyDown(window, { key: "ArrowDown" });
+      expect(items[1]).toHaveFocus();
+      fireEvent.keyDown(window, { key: "ArrowDown" });
+      expect(within(submenu()).getByRole("menuitem", { name: /New group…/ })).toHaveFocus();
+      fireEvent.keyDown(window, { key: "ArrowDown" });
+      expect(items[0]).toHaveFocus(); // wraps inside the submenu, never into the parent
+      fireEvent.keyDown(items[0], { key: "ArrowLeft" });
+      expect(screen.queryByRole("menu", { name: "Move to group" })).toBeNull();
+      expect(row()).toHaveFocus();
+      // The parent's walk skips nothing and never enters a closed submenu.
+      fireEvent.keyDown(window, { key: "ArrowUp" });
+      expect(screen.getByRole("menuitem", { name: /Customize/ })).toHaveFocus();
+    });
+
+    it("opens on hover and closes shortly after the pointer leaves", () => {
+      vi.useFakeTimers();
+      try {
+        render(<WorkspaceContextMenu {...baseProps} {...groupProps} />);
+        fireEvent.mouseEnter(row().parentElement!);
+        expect(submenu()).toBeInTheDocument();
+        fireEvent.mouseLeave(row().parentElement!);
+        expect(submenu()).toBeInTheDocument(); // a grace window to cross the gap
+        act(() => {
+          vi.advanceTimersByTime(200);
+        });
+        expect(screen.queryByRole("menu", { name: "Move to group" })).toBeNull();
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 });

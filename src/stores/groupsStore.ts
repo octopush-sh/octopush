@@ -3,6 +3,8 @@ import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
 import { useProjectStore } from "./projectStore";
 import { useWorkspaceStore } from "./workspaceStore";
+import { useRailGroupUi } from "./railGroupUiStore";
+import { beginMembershipChange } from "../lib/membershipGuard";
 import type { Group, GroupScope, ProjectInfo, TintName, Workspace } from "../lib/types";
 
 /** Rail groups: named, optionally tinted, one-level containers for projects
@@ -13,11 +15,19 @@ import type { Group, GroupScope, ProjectInfo, TintName, Workspace } from "../lib
  *  that change membership (`create`, `remove`, `moveItem`) patch those stores
  *  too. Every change but `create` is applied at once and rolled back if the
  *  backend refuses it; `create` waits for the backend, which mints the id and
- *  picks the position. */
+ *  picks the position.
+ *
+ *  Two things keep a reload from undoing a change it could not have seen:
+ *  `load` re-reads when a change started or settled while it was reading, and
+ *  the membership changes go through `lib/membershipGuard.ts`, which the
+ *  project and workspace loaders consult. */
 interface GroupsState {
   /** Every group, sorted like the backend lists them (see `sortGroups`). */
   groups: Group[];
   loaded: boolean;
+  /** Read the groups from the backend. Safe to call often: concurrent calls
+   *  share one read, and a read that raced a change is thrown away and
+   *  repeated instead of overwriting it. */
   load: () => Promise<void>;
   /** Create a group, optionally around existing items. Null when refused. */
   create: (input: {
@@ -31,12 +41,16 @@ interface GroupsState {
   /** Rename. A blank name is ignored (resolves false, nothing is sent). */
   rename: (groupId: string, name: string) => Promise<boolean>;
   setTint: (groupId: string, tint: TintName | null) => Promise<boolean>;
-  /** Persist the order of sibling groups: `ids` in their new order. */
+  /** Persist the order of sibling groups: `ids` in their new order. The
+   *  backend numbers exactly the ids it is sent, so siblings missing from
+   *  `ids` are appended in their current order: it always gets the full run. */
   setOrder: (ids: string[]) => Promise<boolean>;
   /** Delete a group; its members stay, ungrouped. */
   remove: (groupId: string) => Promise<boolean>;
   /** Move a project or workspace into a group, or out of any (`null`). */
   moveItem: (kind: GroupScope, itemId: string, groupId: string | null) => Promise<boolean>;
+  /** Forget a project's workspace groups: the project was closed or deleted. */
+  pruneProject: (projectId: string) => void;
 }
 
 /** The backend's listing order: project groups first, then workspace groups
@@ -106,22 +120,61 @@ const membersOf = (kind: GroupScope, groupId: string): string[] =>
 const assign = (ids: string[], groupId: string | null) =>
   new Map(ids.map((id) => [id, groupId] as const));
 
+// A group change in flight, for `load`: `epoch` moves when a change starts
+// and when it settles, so a read that spans either is known to be stale.
+let epoch = 0;
+const changesInFlight = new Set<Promise<unknown>>();
+function tracked<T>(request: () => Promise<T>): Promise<T> {
+  epoch++;
+  const settled = request().finally(() => {
+    epoch++;
+    changesInFlight.delete(settled);
+  });
+  changesInFlight.add(settled);
+  return settled;
+}
+
+let reading: Promise<void> | null = null;
+let readAgain = false;
+/** How often one `load` re-reads before it leaves the optimistic state alone. */
+const MAX_READS = 4;
+
 export const useGroupsStore = create<GroupsState>((set, get) => ({
   groups: [],
   loaded: false,
 
-  load: async () => {
-    try {
-      const groups = await ipc.listGroups();
-      set({ groups: sortGroups(groups), loaded: true });
-    } catch (e) {
-      refused("Couldn't load groups", e);
+  load: () => {
+    if (reading) {
+      // Whoever asked wants rows at least as fresh as now.
+      readAgain = true;
+      return reading;
     }
+    reading = (async () => {
+      try {
+        for (let attempt = 0; attempt < MAX_READS; attempt++) {
+          // A change still in flight may or may not be in the rows yet.
+          if (changesInFlight.size > 0) await Promise.allSettled([...changesInFlight]);
+          readAgain = false;
+          const startedAt = epoch;
+          const groups = await ipc.listGroups();
+          if (startedAt !== epoch) continue;
+          set({ groups: sortGroups(groups), loaded: true });
+          // The list is the truth now: folds of groups that are gone go too.
+          useRailGroupUi.getState().prune(new Set(groups.map((g) => g.id)));
+          if (!readAgain) return;
+        }
+      } catch (e) {
+        refused("Couldn't load groups", e);
+      } finally {
+        reading = null;
+      }
+    })();
+    return reading;
   },
 
   create: async (input) => {
     try {
-      const created = await ipc.createGroup(input);
+      const created = await tracked(() => ipc.createGroup(input));
       // The backend made room at the new group's position: its siblings from
       // there on moved down by one.
       set((s) => ({
@@ -136,7 +189,11 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
           created,
         ]),
       }));
-      patchMembership(created.scope, assign(input.memberIds ?? [], created.id));
+      const memberIds = input.memberIds ?? [];
+      // The id exists only now, so the change settles as it is recorded: a
+      // reload that began before this point still gets it laid over.
+      beginMembershipChange(created.scope, memberIds, created.id).settle();
+      patchMembership(created.scope, assign(memberIds, created.id));
       return created;
     } catch (e) {
       refused("Couldn't create the group", e);
@@ -153,7 +210,7 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
       set((s) => ({ groups: s.groups.map((g) => (g.id === groupId ? { ...g, name: value } : g)) }));
     withName(trimmed);
     try {
-      await ipc.renameGroup(groupId, trimmed);
+      await tracked(() => ipc.renameGroup(groupId, trimmed));
       return true;
     } catch (e) {
       // Leave a newer rename alone.
@@ -171,7 +228,7 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
       set((s) => ({ groups: s.groups.map((g) => (g.id === groupId ? { ...g, tint: value } : g)) }));
     withTint(tint);
     try {
-      await ipc.setGroupTint(groupId, tint);
+      await tracked(() => ipc.setGroupTint(groupId, tint));
       return true;
     } catch (e) {
       if (get().groups.find((g) => g.id === groupId)?.tint === tint) withTint(before.tint);
@@ -181,7 +238,15 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
   },
 
   setOrder: async (ids) => {
-    const before = new Map(get().groups.map((g) => [g.id, g.sortOrder] as const));
+    const first = get().groups.find((g) => g.id === ids[0]);
+    if (!first) return false;
+    const siblings = get().groups.filter((g) => isSibling(g, first));
+    const siblingIds = new Set(siblings.map((g) => g.id));
+    const asked = ids.filter((id, index) => siblingIds.has(id) && ids.indexOf(id) === index);
+    const full = [...asked, ...siblings.map((g) => g.id).filter((id) => !asked.includes(id))];
+    if (full.every((id, index) => siblings[index].id === id)) return true;
+    const before = new Map(siblings.map((g) => [g.id, g.sortOrder] as const));
+    const mine = new Map(full.map((id, index) => [id, index] as const));
     const withOrder = (orderById: Map<string, number>) =>
       set((s) => ({
         groups: sortGroups(
@@ -190,12 +255,17 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
           ),
         ),
       }));
-    withOrder(new Map(ids.map((id, index) => [id, index] as const)));
+    withOrder(mine);
     try {
-      await ipc.setGroupOrder(ids);
+      await tracked(() => ipc.setGroupOrder(full));
       return true;
     } catch (e) {
-      withOrder(new Map(ids.flatMap((id) => (before.has(id) ? [[id, before.get(id)!] as const] : []))));
+      // Leave a newer reorder alone: roll back only while every group still
+      // sits where this call put it.
+      const untouched = get()
+        .groups.filter((g) => mine.has(g.id))
+        .every((g) => g.sortOrder === mine.get(g.id));
+      if (untouched) withOrder(before);
       refused("Couldn't reorder the groups", e);
       return false;
     }
@@ -206,11 +276,14 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
     if (!group) return false;
     const members = membersOf(group.scope, groupId);
     set((s) => ({ groups: s.groups.filter((g) => g.id !== groupId) }));
+    const change = beginMembershipChange(group.scope, members, null);
     patchMembership(group.scope, assign(members, null));
     try {
-      await ipc.deleteGroup(groupId);
+      await tracked(() => ipc.deleteGroup(groupId));
+      change.settle();
       return true;
     } catch (e) {
+      change.drop();
       set((s) => ({
         groups: s.groups.some((g) => g.id === groupId) ? s.groups : sortGroups([...s.groups, group]),
       }));
@@ -227,15 +300,29 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
   moveItem: async (kind, itemId, groupId) => {
     const before = groupOf(kind, itemId);
     if (before === groupId) return true;
+    const change = beginMembershipChange(kind, [itemId], groupId);
     patchMembership(kind, assign([itemId], groupId));
     try {
       await ipc.setItemGroup(kind, itemId, groupId);
+      change.settle();
       return true;
     } catch (e) {
+      change.drop();
       // Leave a newer move alone.
       if (groupOf(kind, itemId) === groupId) patchMembership(kind, assign([itemId], before));
       refused(kind === "project" ? "Couldn't move the project" : "Couldn't move the workspace", e);
       return false;
     }
   },
+
+  pruneProject: (projectId) =>
+    set((s) => ({ groups: s.groups.filter((g) => g.projectId !== projectId) })),
 }));
+
+/** Test-only: forget the reads and changes in flight. */
+export function __resetGroupsStoreInFlight(): void {
+  epoch = 0;
+  changesInFlight.clear();
+  reading = null;
+  readAgain = false;
+}

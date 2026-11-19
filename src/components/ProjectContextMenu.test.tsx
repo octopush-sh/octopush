@@ -191,4 +191,16 @@ describe("ProjectContextMenu", () => {
     render(<ProjectContextMenu {...baseProps} />);
     expect(screen.queryByText(/Set Jira project key/)).not.toBeInTheDocument();
   });
+
+  it("offers New group only when wired, runs it and dismisses", () => {
+    const { unmount } = render(<ProjectContextMenu {...baseProps} />);
+    expect(screen.queryByRole("menuitem", { name: "New group" })).toBeNull();
+    unmount();
+    const onNewGroup = vi.fn();
+    const onDismiss = vi.fn();
+    render(<ProjectContextMenu {...baseProps} onNewGroup={onNewGroup} onDismiss={onDismiss} />);
+    fireEvent.click(screen.getByRole("menuitem", { name: "New group" }));
+    expect(onNewGroup).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
 });

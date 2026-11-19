@@ -1,14 +1,29 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
-/** Every kind of menu row the keyboard can land on: plain items, and the
- *  radio and checkbox rows of a menu that sets something. */
-const MENU_ROWS = '[role^="menuitem"]:not([disabled])';
+/**
+ * The rows the keyboard can land on, for the first focus and for the ↑/↓ walk
+ * alike:
+ *  - every kind of menu row: plain items, and the radio and checkbox rows of
+ *    a menu that sets something (`role^="menuitem"`);
+ *  - but not a row taken out of the tab order (`tabindex="-1"`): a row of
+ *    swatches is one stop of the walk, on the one swatch that is tabbable,
+ *    and ←/→ move along it (a roving tab stop);
+ *  - plus a control that is no menu row at all yet belongs in the walk, which
+ *    opts in with `data-menu-item`.
+ */
+const MENU_ROWS =
+  '[role^="menuitem"]:not([disabled]):not([tabindex="-1"]), [data-menu-item]:not([disabled])';
 
 /**
  * Shared chrome for the rail context menus:
  *  - clamps the menu into the viewport after measuring it (B9),
  *  - focuses the first menu item on open and supports ↑/↓ nav (B10),
  *  - dismisses on Escape and on outside-click, ignoring right-click (B8).
+ *
+ * ↑/↓ walk the rows of the menu that holds the focus: a submenu rendered
+ * inside the panel (its own `role="menu"`) is walked on its own, and the
+ * parent's rows skip it. When the focus sits in the menu on something outside
+ * the walk, they go on from where it stands.
  */
 export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
   const ref = useRef<HTMLDivElement>(null);
@@ -25,9 +40,7 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
   }, [x, y]);
 
   useLayoutEffect(() => {
-    const first = ref.current?.querySelector<HTMLElement>(
-      MENU_ROWS,
-    );
+    const first = ref.current?.querySelector<HTMLElement>(MENU_ROWS);
     first?.focus();
   }, []);
 
@@ -42,15 +55,29 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
       }
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
-        const items = Array.from(
-          el.querySelectorAll<HTMLElement>(MENU_ROWS),
+        const focused = document.activeElement as HTMLElement | null;
+        const inner = focused?.closest<HTMLElement>('[role="menu"]');
+        const scope = inner && el.contains(inner) ? inner : el;
+        const items = Array.from(scope.querySelectorAll<HTMLElement>(MENU_ROWS)).filter(
+          (item) => (item.closest('[role="menu"]') ?? scope) === scope,
         );
         if (items.length === 0) return;
-        const idx = items.indexOf(document.activeElement as HTMLElement);
-        const next =
-          e.key === "ArrowDown"
-            ? items[(idx + 1) % items.length]
-            : items[(idx - 1 + items.length) % items.length];
+        const down = e.key === "ArrowDown";
+        const idx = focused ? items.indexOf(focused) : -1;
+        if (idx === -1 && focused && scope.contains(focused)) {
+          // The focus is in the menu but on something outside the walk (a
+          // control reached with the pointer or Tab): go on from where it
+          // stands in the document, never back to the top.
+          const after = items.findIndex(
+            (item) => (focused.compareDocumentPosition(item) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+          );
+          const following = after === -1 ? items.length : after;
+          items[(down ? following : following - 1 + items.length) % items.length]?.focus();
+          return;
+        }
+        const next = down
+          ? items[(idx + 1) % items.length]
+          : items[(idx - 1 + items.length) % items.length];
         next?.focus();
       }
     };

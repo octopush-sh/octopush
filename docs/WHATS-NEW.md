@@ -59,7 +59,8 @@ Current anchors:
 | Id | Element | Where |
 |---|---|---|
 | `rail` | The workspace rail | `WorkspaceRail.tsx` |
-| `rail-search` | Rail search ("Find a project or mission") | `WorkspaceRail.tsx` |
+| `rail-search` | Rail search ("Find a project, group or mission") | `WorkspaceRail.tsx` |
+| `rail-group-header` · `rail-group-members` | Rail, only in a project with a mission group: the first group's header line (chevron, name; folded, its count) · its run of indented missions beside the guide (only while the group has missions) | `RailMissionGroup.tsx` via `WorkspaceRail.tsx` |
 | `rail-add-project` | Rail "Add project" button | `WorkspaceRail.tsx` |
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
@@ -193,6 +194,7 @@ cover.
 |---|---|
 | `default` | Signed-in Pro user, one project with two workspaces, a finished Direct run with stages and costs, a short Talk thread, three providers. |
 | `empty` | Fresh install: no projects, signed out, free plan. |
+| `rail-groups` | `default` with eight missions, two mission groups in the rail and a loose mission after them. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 

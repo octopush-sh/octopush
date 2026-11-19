@@ -71,6 +71,7 @@ with `scenario:` (default: `default`).
 | `empty` | Fresh install — no projects (Welcome screen), signed out, free plan. |
 | `run-two-sessions` | `default` with two sessions (`zsh`, `claude`) in the active workspace, so Run offers Open beside. |
 | `run-four-sessions` | `default` with four sessions (`zsh`, `claude`, `tests`, `dev`) in the active workspace, so Run can show three and four panes. |
+| `rail-groups` | `default` with eight missions and two mission groups in the rail ("Vulnerability fixes", "PR reviews"), a loose mission before them and one after. |
 
 Adding one: create `scenarios/<name>.ts` exporting a `Scenario` (`types.ts`), register
 it in `scenarios/index.ts`, and run a recording with `--verbose` to see which commands

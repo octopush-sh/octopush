@@ -12,6 +12,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
+import { MoveToGroupItem, type MoveTargetGroup } from "./MoveToGroupItem";
 import {
   MENU_DANGER,
   MENU_HEADER,
@@ -42,6 +43,14 @@ interface Props {
   onLinkJira?: () => void;
   onChangeJira?: () => void;
   onUnlinkJira?: () => void;
+  /** Mission groups. "Move to group ›" shows when `onMoveToGroup` and
+   *  `onNewGroup` are wired: `groups` are the groups of this workspace's
+   *  project and `groupId` the one it is in. */
+  groups?: MoveTargetGroup[];
+  groupId?: string | null;
+  onMoveToGroup?: (groupId: string) => void;
+  onNewGroup?: () => void;
+  onRemoveFromGroup?: () => void;
 }
 
 const ITEM = MENU_ITEM;
@@ -69,6 +78,11 @@ export function WorkspaceContextMenu({
   onLinkJira,
   onChangeJira,
   onUnlinkJira,
+  groups,
+  groupId,
+  onMoveToGroup,
+  onNewGroup,
+  onRemoveFromGroup,
 }: Props) {
   const run = (fn: () => void) => () => {
     fn();
@@ -106,6 +120,15 @@ export function WorkspaceContextMenu({
       <button type="button" role="menuitem" className={ITEM} onClick={run(onCustomize)}>
         <Palette size={12} className="shrink-0" /> Customize…
       </button>
+      {onMoveToGroup && onNewGroup && (
+        <MoveToGroupItem
+          groups={groups ?? []}
+          currentGroupId={groupId ?? null}
+          onMove={(id) => run(() => onMoveToGroup(id))()}
+          onNewGroup={run(onNewGroup)}
+          onRemoveFromGroup={groupId && onRemoveFromGroup ? run(onRemoveFromGroup) : undefined}
+        />
+      )}
 
       {linkageKind && (
         <>

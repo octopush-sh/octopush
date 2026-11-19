@@ -12,27 +12,49 @@ import {
 } from "lucide-react";
 import {
   DndContext,
-  closestCenter,
+  DragOverlay,
   PointerSensor,
   KeyboardSensor,
+  useDraggable,
+  useDroppable,
   useSensor,
   useSensors,
   type DragEndEvent,
+  type DragStartEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   verticalListSortingStrategy,
-  sortableKeyboardCoordinates,
   useSortable,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { resolveMonogram, TINTS } from "../lib/monogram";
-import { useScrollActiveIntoView } from "../hooks/useScrollActiveIntoView";
+import { ACTIVE_ROW_SELECTOR, useScrollActiveIntoView } from "../hooks/useScrollActiveIntoView";
 import { detectIssueKeyForProject } from "../lib/detectIssueKey";
 import { MENU_CHROME } from "../lib/menuStyles";
-import type { Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
+import type { Group, Workspace, ProjectInfo, WorkspaceGitSummary, Pr } from "../lib/types";
+import { nearestVisibleAncestor } from "../lib/beacon";
+import { moveMissionToGroup, ungroupMissions } from "../lib/groupActions";
+import { prefersReducedMotion } from "../lib/motion";
+import { projectKeyboardCoordinates, railCollisions, railSubjectOf, railTargetOf } from "../lib/railDnd";
+import {
+  filterRailItems,
+  layoutMissions,
+  missionGroupOwners,
+  missionGroupsOf,
+  ownGroupId,
+  resolveRailDrop,
+  type RailDragSubject,
+  type RailDropTarget,
+  type RailItem,
+} from "../lib/railGroups";
 import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
+import { useGroupsStore } from "../stores/groupsStore";
 import { useMissionsStore } from "../stores/missionsStore";
+import { useRailGroupUi } from "../stores/railGroupUiStore";
+import { useWorkspaceStore } from "../stores/workspaceStore";
+import { GroupContextMenu } from "./GroupContextMenu";
+import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
 import { ProjectMark } from "./icons/ProjectMark";
 import { HighlightedLabel, matchRange } from "./primitives/HighlightedLabel";
 import { MidTruncate } from "./primitives/MidTruncate";
@@ -58,6 +80,11 @@ import { collisionSegment, worstSeverity } from "../lib/collisions";
  *  - Collapsed, the rail is the slim-rail geometry of Review's collapsed
  *    navigator (44px, 32px cells, reserved edge) with a hover flyout for
  *    project · name · status.
+ *  - A mission group is a folder inside a project (`RailMissionGroup`): an
+ *    always-visible chevron and a 1px guide beside its indented members. Its
+ *    tint colours those two marks only; monograms are never recoloured. When
+ *    the beacon's workspace is folded away, the fold that hides it carries
+ *    the pulse (`resolveAttentionCarriers`).
  */
 
 /** Hierarchical project/workspace structure for the rail. */
@@ -78,6 +105,9 @@ interface Props {
   onContextMenu?: (workspaceId: string, x: number, y: number) => void;
   /** Called when user clicks to create a workspace for a specific project. */
   onNewWorkspaceForProject?: (projectId: string) => void;
+  /** Called from a mission group's "+": start a new mission that joins the
+   *  group. The "+" is not drawn when this is left out. */
+  onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   /** Called when user clicks to add a new project. */
   onAddProject?: () => void;
   /** Called when user right-clicks on a project header. */
@@ -168,16 +198,61 @@ export function resolveAttention(
   return out;
 }
 
+/** The beacon or dot each FOLDED container carries for the workspaces it
+ *  hides, by project id and by mission-group id. */
+export interface AttentionCarriers {
+  byProject: Record<string, Attention>;
+  byGroup: Record<string, Attention>;
+}
+
+/**
+ * The nearest-visible-ancestor step of the single beacon. A workspace's
+ * signal (`attentionByWs`, from `resolveAttention`) is drawn on its own row,
+ * unless a fold hides that row: then the outermost folded container around it
+ * (its project line, else its group header) carries it. One container hiding
+ * several signals shows the strongest, so the pulse still lands on exactly one
+ * visible element. `groupOwners` maps each mission group to its project
+ * (`missionGroupOwners`): a workspace is in a group only when the group is
+ * its own project's, the test the layout applies, so a header never carries a
+ * signal for a row that is drawn loose. Pure and exported, like
+ * `resolveAttention`.
+ */
+export function resolveAttentionCarriers(
+  projects: ProjectGroup[] | undefined,
+  attentionByWs: Record<string, Attention>,
+  groupOwners: ReadonlyMap<string, string>,
+  isProjectFolded: (projectId: string) => boolean,
+  isGroupFolded: (groupId: string) => boolean,
+): AttentionCarriers {
+  const out: AttentionCarriers = { byProject: {}, byGroup: {} };
+  for (const project of projects || []) {
+    for (const ws of project?.workspaces || []) {
+      const signal = ws?.id ? attentionByWs[ws.id] : undefined;
+      if (!signal) continue;
+      const groupId = ownGroupId(ws, project.id, groupOwners);
+      const carrier = nearestVisibleAncestor([
+        { map: out.byProject, id: project.id, folded: isProjectFolded(project.id) },
+        ...(groupId ? [{ map: out.byGroup, id: groupId, folded: isGroupFolded(groupId) }] : []),
+      ]);
+      if (!carrier) continue;
+      if (signal === "beacon" || !carrier.map[carrier.id]) carrier.map[carrier.id] = signal;
+    }
+  }
+  return out;
+}
+
 /** The linked ticket, or one detected from the branch under the project's key. */
 function ticketKeyFor(ws: Workspace, project: ProjectGroup): string | null {
   return ws?.linkedIssueKey ?? detectIssueKeyForProject(ws?.branch ?? "", project?.jiraProjectKey ?? null);
 }
 
-/** A project and the rows it shows: all of them at rest or on a project-name
- *  hit, only the hits otherwise; a project with nothing to show leaves the rail. */
+/** A project and what it shows: every item at rest or on a project-name hit,
+ *  only the hits otherwise (a group-name hit keeps the whole group); a project
+ *  with nothing to show leaves the rail. */
 interface VisibleProject {
   project: ProjectGroup;
-  visibleWs: Workspace[];
+  /** Loose missions and mission groups, interleaved in rail order. */
+  items: RailItem[];
 }
 
 export function WorkspaceRail({
@@ -187,6 +262,7 @@ export function WorkspaceRail({
   onCustomize,
   onContextMenu,
   onNewWorkspaceForProject,
+  onNewWorkspaceInGroup,
   onAddProject,
   onProjectContextMenu,
   closedProjects,
@@ -210,19 +286,49 @@ export function WorkspaceRail({
     () => resolveAttention(projects, flagsByWs, activeWorkspaceId, runningByWs),
     [projects, flagsByWs, activeWorkspaceId, runningByWs],
   );
+  // Mission groups: each project's groups interleaved with its loose missions.
+  const groups = useGroupsStore((s) => s.groups);
+  const collapsedGroups = useRailGroupUi((s) => s.collapsed);
+  const renamingGroupId = useRailGroupUi((s) => s.renamingId);
+  const groupOwners = useMemo(() => missionGroupOwners(groups), [groups]);
+  const itemsByProject = useMemo(() => {
+    const out: Record<string, RailItem[]> = {};
+    for (const project of projects || []) {
+      if (!project?.id) continue;
+      out[project.id] = layoutMissions(
+        (project.workspaces || []).filter((w) => !!w),
+        missionGroupsOf(groups, project.id),
+      );
+    }
+    return out;
+  }, [projects, groups]);
   const visibleProjects = useMemo<VisibleProject[]>(() => {
     const out: VisibleProject[] = [];
     for (const project of projects || []) {
-      const workspaces = project?.workspaces || [];
+      const items = itemsByProject[project?.id ?? ""] ?? [];
       if (q === "" || matchRange(project?.name ?? "", q)) {
-        out.push({ project, visibleWs: workspaces });
+        out.push({ project, items });
         continue;
       }
-      const hits = workspaces.filter((w) => matchRange(w?.name ?? "", q) !== null);
-      if (hits.length > 0) out.push({ project, visibleWs: hits });
+      const hits = filterRailItems(items, (name) => matchRange(name, q) !== null);
+      if (hits.length > 0) out.push({ project, items: hits });
     }
     return out;
-  }, [projects, q]);
+  }, [projects, itemsByProject, q]);
+  // Where the beacon and the dots show when a fold hides their rows. Folds
+  // are ignored while a filter holds everything open; the slim rail has no
+  // project fold.
+  const carriers = useMemo(
+    () =>
+      resolveAttentionCarriers(
+        projects,
+        attentionByWs,
+        groupOwners,
+        (id) => !isCollapsed && q === "" && !!collapsedProjects[id],
+        (id) => q === "" && !!collapsedGroups[id],
+      ),
+    [projects, attentionByWs, groupOwners, isCollapsed, q, collapsedProjects, collapsedGroups],
+  );
 
   const toggleProjectCollapsed = useCallback((projectId: string) => {
     setCollapsedProjects((prev) => {
@@ -238,14 +344,116 @@ export function WorkspaceRail({
   // #846: a newly active workspace (a project just opened, a jump key, a
   // palette pick) is scrolled into view, calmly, and only when off-screen.
   const listRef = useRef<HTMLDivElement | null>(null);
+  const asideRef = useRef<HTMLElement | null>(null);
   useScrollActiveIntoView(listRef, isCollapsed ? null : activeWorkspaceId, visibleProjects);
+
+  // Activating a mission that sits in a folded group unfolds the group, then
+  // brings the row into view: the hook above scrolled while the row still had
+  // no height, so the scroll is repeated once the fold has opened (at once,
+  // which is all reduced motion needs, and again after the 280ms transition).
+  // Only the workspace the app restored by itself at launch is not an
+  // activation (`workspaceStore.launchRestoredId`): a group folded on purpose
+  // stays folded across a restart. Every other first sight of an active id
+  // is one, also when the rail mounted with nothing active.
+  const seenActive = useRef<string | null>(null);
+  const keptForLaunch = useRef<string | null>(null);
+  const revealFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!activeWorkspaceId) return;
+    if (seenActive.current === activeWorkspaceId) return;
+    const all = (projects || []).flatMap((p) => p?.workspaces || []);
+    const ws = all.find((w) => w?.id === activeWorkspaceId);
+    if (!ws) return; // its row has not loaded yet: retry when the projects change
+    seenActive.current = activeWorkspaceId;
+    const restored = useWorkspaceStore.getState().launchRestoredId;
+    if (restored === activeWorkspaceId && keptForLaunch.current !== restored) {
+      // Once per restore: coming back to it later is an activation.
+      keptForLaunch.current = restored;
+      return;
+    }
+    const groupId = ownGroupId(ws, ws.projectId, groupOwners);
+    if (!groupId || !useRailGroupUi.getState().collapsed[groupId]) return;
+    revealFor.current = activeWorkspaceId;
+    useRailGroupUi.getState().setCollapsed(groupId, false);
+  }, [activeWorkspaceId, projects, groupOwners]);
+  useEffect(() => {
+    if (!revealFor.current || revealFor.current !== activeWorkspaceId) return;
+    revealFor.current = null;
+    const reveal = () =>
+      asideRef.current?.querySelector<HTMLElement>(ACTIVE_ROW_SELECTOR)?.scrollIntoView?.({
+        block: "nearest",
+        inline: "nearest",
+        behavior: prefersReducedMotion() ? "auto" : "smooth",
+      });
+    reveal();
+    const timer = setTimeout(reveal, 300);
+    return () => clearTimeout(timer);
+  }, [collapsedGroups, activeWorkspaceId]);
+
+  // A group whose name went into edit must be on screen: open its project.
+  // The slim rail has no room for the input, so the name stays as it is.
+  useEffect(() => {
+    if (!renamingGroupId) return;
+    if (isCollapsed) {
+      useRailGroupUi.getState().stopRename();
+      return;
+    }
+    const projectId = groups.find((g) => g.id === renamingGroupId)?.projectId;
+    if (projectId && collapsedProjects[projectId]) toggleProjectCollapsed(projectId);
+  }, [renamingGroupId, isCollapsed, groups, collapsedProjects, toggleProjectCollapsed]);
+
+  // The header menu of a mission group, owned by the rail.
+  const [groupMenu, setGroupMenu] = useState<{
+    groupId: string;
+    x: number;
+    y: number;
+    fromKeyboard: boolean;
+  } | null>(null);
+  const openGroupMenu = useCallback((groupId: string, x: number, y: number, fromKeyboard = false) => {
+    setGroupMenu({ groupId, x, y, fromKeyboard });
+  }, []);
+  // A menu the keyboard opened gives the focus back to its header when it
+  // closes (as `useAnchoredMenu` does for a button's menu), so Escape does
+  // not drop the keyboard out of the rail. A pointer-opened one does not
+  // move the focus. Rename then takes it for its input; a press elsewhere
+  // still lands where it was aimed, since the browser focuses that after.
+  const closeGroupMenu = () => {
+    const closing = groupMenu;
+    setGroupMenu(null);
+    if (!closing?.fromKeyboard) return;
+    Array.from(asideRef.current?.querySelectorAll<HTMLElement>("[data-rail-group-header]") ?? [])
+      .find((el) => el.dataset.railGroupHeader === closing.groupId)
+      ?.focus({ preventScroll: true });
+  };
+  const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.groupId) : undefined;
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+    // Only a project has a keyboard drag, and it must step from project to
+    // project, never onto a mission group's drop target.
+    useSensor(KeyboardSensor, { coordinateGetter: projectKeyboardCoordinates }),
   );
   const dragEnabled = !isCollapsed && q === "" && !!onReorderProjects;
+  // Missions and group headers drag whenever the list is whole (no filter).
+  const groupDragEnabled = !isCollapsed && q === "";
+  const [dragging, setDragging] = useState<RailDragSubject | null>(null);
+  const handleDragStart = (e: DragStartEvent) => setDragging(railSubjectOf(e.active.data.current));
   const handleDragEnd = (e: DragEndEvent) => {
     const { active, over } = e;
+    setDragging(null);
+    const subject = railSubjectOf(active.data.current);
+    if (subject) {
+      const target = railTargetOf(over?.data.current);
+      if (!target) return;
+      const action = resolveRailDrop(
+        subject,
+        target,
+        missionGroupsOf(groups, subject.projectId).map((g) => g.id),
+      );
+      if (action?.kind === "move") void moveMissionToGroup(action.workspaceId, action.groupId);
+      if (action?.kind === "reorder") void useGroupsStore.getState().setOrder(action.ids);
+      return;
+    }
     if (!over || active.id === over.id) return;
     const ids = (projects || []).map((p) => p.id);
     const from = ids.indexOf(String(active.id));
@@ -259,6 +467,7 @@ export function WorkspaceRail({
 
   return (
     <aside
+      ref={asideRef}
       data-tour="rail"
       className={`flex h-full shrink-0 flex-col border-r border-octo-hairline bg-octo-panel pt-2 transition-[width] duration-[220ms] ${EASE} ${
         isCollapsed ? RAIL_WIDTH_COLLAPSED : RAIL_WIDTH_EXPANDED
@@ -280,6 +489,10 @@ export function WorkspaceRail({
           attentionByWs={attentionByWs}
           flagsByWs={flagsByWs}
           shortcutByWs={shortcutByWs}
+          itemsByProject={itemsByProject}
+          collapsedGroups={collapsedGroups}
+          groupAttention={carriers.byGroup}
+          onGroupContextMenu={openGroupMenu}
         />
       ) : (
         <>
@@ -289,7 +502,7 @@ export function WorkspaceRail({
             <label
               data-tour="rail-search"
               className="flex h-[26px] min-w-0 flex-1 items-center gap-2 border-b border-transparent text-octo-mute transition-colors duration-[220ms] focus-within:border-octo-brass focus-within:text-octo-brass"
-              title="Find a project or mission"
+              title="Find a project, group or mission"
             >
               <Search size={12} aria-hidden className="shrink-0" />
               <input
@@ -298,9 +511,9 @@ export function WorkspaceRail({
                 onKeyDown={(e) => {
                   if (e.key === "Escape") setFilter("");
                 }}
-                placeholder="Find a project or mission"
+                placeholder="Find a project, group or mission"
                 spellCheck={false}
-                aria-label="Find a project or mission"
+                aria-label="Find a project, group or mission"
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
               />
             </label>
@@ -319,16 +532,29 @@ export function WorkspaceRail({
           </div>
 
           <div ref={listRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto pb-2">
-            <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={railCollisions}
+              onDragStart={handleDragStart}
+              onDragEnd={handleDragEnd}
+              onDragCancel={() => setDragging(null)}
+            >
               <SortableContext
                 items={visibleProjects.map(({ project }) => project.id)}
                 strategy={verticalListSortingStrategy}
               >
-                {visibleProjects.map(({ project, visibleWs }, projectIndex) => (
+                {visibleProjects.map(({ project, items }, projectIndex) => (
                   <SortableProjectGroup
                     key={project?.id || `project-${projectIndex}`}
                     project={project}
-                    visibleWs={visibleWs}
+                    items={items}
+                    collapsedGroups={collapsedGroups}
+                    attention={carriers.byProject[project.id] ?? null}
+                    groupAttention={carriers.byGroup}
+                    groupDragEnabled={groupDragEnabled}
+                    dragging={dragging}
+                    onGroupContextMenu={openGroupMenu}
+                    onNewWorkspaceInGroup={onNewWorkspaceInGroup}
                     projectIndex={projectIndex}
                     q={q}
                     folded={q === "" && !!collapsedProjects[project.id]}
@@ -349,6 +575,17 @@ export function WorkspaceRail({
                   />
                 ))}
               </SortableContext>
+              {/* The drag ghost of a mission or a group header, drawn outside
+                  the list so the folds' clipping never cuts it. It is mounted
+                  ONLY for those two drags: a mounted <DragOverlay> wraps any
+                  active drag, children or not, and the sortable list then
+                  takes the drag for an overlay-driven one and stops moving
+                  the dragged project with the pointer. */}
+              {dragging && (
+                <DragOverlay dropAnimation={null}>
+                  <RailDragGhost subject={dragging} projects={projects || []} groups={groups} />
+                </DragOverlay>
+              )}
             </DndContext>
             {q !== "" && visibleProjects.length === 0 && (
               <div className="octo-fade-in px-3.5 py-4 font-serif text-[13px] text-octo-mute">
@@ -363,7 +600,67 @@ export function WorkspaceRail({
           )}
         </>
       )}
+      {groupMenu && menuGroup && (
+        <GroupContextMenu
+          x={groupMenu.x}
+          y={groupMenu.y}
+          groupName={menuGroup.name}
+          tint={menuGroup.tint}
+          empty={
+            !(projects || [])
+              .find((p) => p.id === menuGroup.projectId)
+              ?.workspaces.some((w) => w?.groupId === menuGroup.id)
+          }
+          // The slim rail has no room for the inline input.
+          onRename={() => {
+            if (!isCollapsed) useRailGroupUi.getState().startRename(menuGroup.id);
+          }}
+          onTint={(tint) => void useGroupsStore.getState().setTint(menuGroup.id, tint)}
+          onNewMission={
+            onNewWorkspaceInGroup && menuGroup.projectId
+              ? () => onNewWorkspaceInGroup(menuGroup.projectId!, menuGroup.id)
+              : undefined
+          }
+          onUngroup={() => void ungroupMissions(menuGroup.id)}
+          onDismiss={closeGroupMenu}
+        />
+      )}
     </aside>
+  );
+}
+
+/** What follows the pointer while a mission or a group header is dragged. */
+function RailDragGhost({
+  subject,
+  projects,
+  groups,
+}: {
+  subject: RailDragSubject;
+  projects: ProjectGroup[];
+  groups: Group[];
+}) {
+  const box =
+    "flex h-7 w-[220px] items-center gap-2 rounded border border-octo-hairline bg-octo-panel-2 px-2 shadow-xl";
+  if (subject.type === "group") {
+    const group = groups.find((g) => g.id === subject.groupId);
+    if (!group) return null;
+    return (
+      <div className={box}>
+        <ChevronDown size={12} aria-hidden style={{ color: groupMarkColor(group, "var(--color-octo-mute)") }} />
+        <span className="truncate font-mono text-[11px] text-octo-ivory">{group.name}</span>
+      </div>
+    );
+  }
+  const ws = projects.flatMap((p) => p?.workspaces || []).find((w) => w?.id === subject.workspaceId);
+  if (!ws) return null;
+  const mono = resolveMonogram(ws);
+  return (
+    <div className={box}>
+      <span className="font-serif text-[12px] leading-none" style={{ color: TINTS[mono.tint]?.accent }}>
+        {mono.glyph}
+      </span>
+      <span className="truncate text-[13px] text-octo-ivory">{ws.name || "Mission"}</span>
+    </div>
   );
 }
 
@@ -409,8 +706,20 @@ function IdentityEdge({ active, running, inset = 0 }: { active: boolean; running
 
 interface SortableProjectGroupProps {
   project: ProjectGroup;
-  /** The rows to show — computed once by the rail (see `VisibleProject`). */
-  visibleWs: Workspace[];
+  /** What to show — computed once by the rail (see `VisibleProject`). */
+  items: RailItem[];
+  /** Folded mission groups by id (the stored state; a filter overrides it). */
+  collapsedGroups: Record<string, boolean>;
+  /** Set only while folded: the beacon or dot this line carries for the
+   *  workspaces it hides. */
+  attention: Attention | null;
+  /** The same, per folded mission group. */
+  groupAttention: Record<string, Attention>;
+  /** Missions and group headers can be dragged (the list is whole). */
+  groupDragEnabled: boolean;
+  dragging: RailDragSubject | null;
+  onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
+  onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   projectIndex: number;
   q: string;
   folded: boolean;
@@ -432,7 +741,9 @@ interface SortableProjectGroupProps {
 
 function SortableProjectGroup(props: SortableProjectGroupProps) {
   const {
-    project, visibleWs, projectIndex, q, folded, toggleProjectCollapsed, activeWorkspaceId,
+    project, items, collapsedGroups, attention, groupAttention, groupDragEnabled, dragging,
+    onGroupContextMenu, onNewWorkspaceInGroup,
+    projectIndex, q, folded, toggleProjectCollapsed, activeWorkspaceId,
     gitSummaryByWs, prByWs, runningByWs, attentionByWs, flagsByWs, shortcutByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
     dragEnabled,
@@ -442,6 +753,44 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     useSortable({ id: project.id, disabled: !dragEnabled });
 
   const workspaces = project?.workspaces || [];
+  // A project with no group has nothing to drag a mission onto: its rows stay
+  // plain, exactly as they were before groups existed.
+  const hasGroups = items.some((item) => item.kind === "group");
+  const missionDrag = groupDragEnabled && hasGroups;
+  // The part of the project that belongs to no group. A mission dropped here
+  // leaves its group; a group under the pointer wins (see `railCollisions`).
+  const loose = useDroppable({
+    id: `loose:${project.id}`,
+    data: { type: "loose", projectId: project.id } satisfies RailDropTarget,
+    disabled: !missionDrag,
+  });
+
+  const renderRow = (ws: Workspace, groupId: string | null) => (
+    <WorkspaceRow
+      key={ws?.id || `ws-${projectIndex}`}
+      workspace={ws}
+      active={ws?.id === activeWorkspaceId}
+      q={q}
+      grouped={groupId !== null}
+      drag={
+        missionDrag && ws?.id
+          ? { type: "mission", workspaceId: ws.id, projectId: project.id, groupId }
+          : null
+      }
+      ticketKey={ticketKeyFor(ws, project)}
+      dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
+      ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
+      behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
+      hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+      running={!!runningByWs?.[ws?.id ?? ""]}
+      attention={attentionByWs[ws?.id ?? ""] ?? null}
+      attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
+      shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
+      onSelect={() => ws?.id && onSelect(ws.id)}
+      onCustomize={() => ws?.id && onCustomize(ws.id)}
+      onContextMenu={onContextMenu && ws?.id ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
+    />
+  );
 
   // A live filter forces every project open, so folding is not offered while
   // one is typed: the stored fold state is left exactly as it was.
@@ -482,11 +831,15 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
           title={canFold ? `${verb} ${project.name}` : undefined}
           className="flex h-full min-w-0 flex-1 items-center gap-2 text-left focus-visible:outline-none"
         >
-          <ProjectMark
-            size={12}
-            className="shrink-0"
-            color={projectTint?.accent ?? "var(--color-octo-mute)"}
-          />
+          {/* Folded over the beacon's workspace, the mark carries the pulse
+              (nearest visible ancestor); the wrapper changes no geometry. */}
+          <span
+            className={`flex shrink-0 rounded-full ${
+              attention === "beacon" ? "rail-beacon animate-attention-pulse" : ""
+            }`}
+          >
+            <ProjectMark size={12} color={projectTint?.accent ?? "var(--color-octo-mute)"} />
+          </span>
           {/* Middle-truncated (E1): projects in one org share their head, so
               the tail is what tells them apart. `flex-1 min-w-0` gives the
               MidTruncate box the definite width it elides into. The button's
@@ -501,6 +854,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
           >
             <MidTruncate text={project.name} tail={RAIL_NAME_TAIL} />
           </span>
+          {attention && <span className="sr-only"> — needs attention</span>}
         </button>
 
         {/* Aggregates — visible only while folded. Kept mounted so folding
@@ -533,6 +887,14 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
               <GitPullRequest size={10} aria-hidden />
               {openPrCount}
             </span>
+          )}
+          {attention === "dot" && (
+            <span
+              role="img"
+              aria-label="Needs your attention"
+              title="Needs your attention"
+              className="h-[5px] w-[5px] shrink-0 rounded-full bg-octo-brass"
+            />
           )}
         </span>
 
@@ -610,30 +972,36 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
         }}
       >
         <div className="min-h-0 overflow-hidden">
-          <div className="flex flex-col py-0.5">
-            {visibleWs.map((ws) => (
-              <WorkspaceRow
-                key={ws?.id || `ws-${projectIndex}`}
-                workspace={ws}
-                active={ws?.id === activeWorkspaceId}
-                q={q}
-                ticketKey={ticketKeyFor(ws, project)}
-                dirty={gitSummaryByWs?.[ws?.id ?? ""]?.dirty}
-                ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
-                behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
-                hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
-                running={!!runningByWs?.[ws?.id ?? ""]}
-                attention={attentionByWs[ws?.id ?? ""] ?? null}
-                attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
-                shortcut={shortcutByWs?.[ws?.id ?? ""] ?? null}
-                onSelect={() => ws?.id && onSelect(ws.id)}
-                onCustomize={() => ws?.id && onCustomize(ws.id)}
-                onContextMenu={
-                  onContextMenu && ws?.id ? (x, y) => onContextMenu(ws.id, x, y) : undefined
-                }
-              />
-            ))}
-            {visibleWs.length === 0 && (
+          <div ref={loose.setNodeRef} className="flex flex-col py-0.5">
+            {items.map((item) => {
+              if (item.kind === "mission") return renderRow(item.workspace, null);
+              const { group, members, visible } = item;
+              const groupFolded = q === "" && !!collapsedGroups[group.id];
+              return (
+                <RailMissionGroup
+                  key={`group-${group.id}`}
+                  group={group}
+                  memberCount={members.length}
+                  folded={groupFolded}
+                  canFold={canFold}
+                  q={q}
+                  hasOpenPr={members.some((w) => !!prByWs?.[w.id])}
+                  holdsActive={members.some((w) => w.id === activeWorkspaceId)}
+                  attention={groupFolded ? (groupAttention[group.id] ?? null) : null}
+                  dragEnabled={groupDragEnabled}
+                  dragging={dragging}
+                  hitClassName={HIT_WASH}
+                  onToggle={() => useRailGroupUi.getState().toggle(group.id)}
+                  onContextMenu={(x, y, fromKeyboard) => onGroupContextMenu(group.id, x, y, fromKeyboard)}
+                  onNewMission={
+                    onNewWorkspaceInGroup ? () => onNewWorkspaceInGroup(project.id, group.id) : undefined
+                  }
+                >
+                  {visible.map((ws) => renderRow(ws, group.id))}
+                </RailMissionGroup>
+              );
+            })}
+            {items.length === 0 && (
               <div className="flex h-8 items-center pl-[42px] pr-3 text-[12px] text-octo-mute">
                 No missions yet
               </div>
@@ -655,6 +1023,8 @@ export const RAIL_NAME_TAIL = 14;
 /** The width a row's name and meta share at the 280px rail: the row minus its
  *  padding (14 + 12), the 20px monogram and the two 8px gaps. */
 const ROW_TEXT_PX = 218;
+/** How far a mission group's members are indented (the guide stands in it). */
+export const GROUP_INDENT_PX = 14;
 /** 13px system sans, rounded up on purpose: an over-estimate only sheds the
  *  ahead/behind rung a little early (it survives in the name's tooltip); an
  *  under-estimate is still caught by the name's middle truncation. */
@@ -680,7 +1050,7 @@ export interface RowMeta {
  *  rail has a fixed width — what varies is the name, not the band. One rung:
  *  the ahead/behind counts shed before the name loses its tail, and move into
  *  the name's tooltip. Floor: the ticket key, PR, dirty and attention marks. */
-export function shedsGitMeta(name: string, meta: RowMeta): boolean {
+export function shedsGitMeta(name: string, meta: RowMeta, textPx: number = ROW_TEXT_PX): boolean {
   const counts = [meta.ahead, meta.behind].filter((n): n is number => !!n);
   if (counts.length === 0) return false;
   const atoms: number[] = [];
@@ -695,7 +1065,7 @@ export function shedsGitMeta(name: string, meta: RowMeta): boolean {
     (sum, n) => sum + 12 + String(n).length * META_PX_PER_CHAR + META_GAP_PX,
     0,
   );
-  return name.length * NAME_PX_PER_CHAR > ROW_TEXT_PX - floor - rung;
+  return name.length * NAME_PX_PER_CHAR > textPx - floor - rung;
 }
 
 function gitCountsLabel(ahead?: number, behind?: number): string {
@@ -711,6 +1081,11 @@ interface WorkspaceRowProps {
   workspace: Workspace;
   active: boolean;
   q: string;
+  /** The row is a member of a mission group: indented beside the guide. */
+  grouped?: boolean;
+  /** What dragging this row carries, or null when rows do not drag (a
+   *  project with no group, a live filter). */
+  drag?: RailDragSubject | null;
   ticketKey?: string | null;
   dirty?: boolean;
   ahead?: number;
@@ -730,6 +1105,8 @@ function WorkspaceRow({
   workspace,
   active,
   q,
+  grouped = false,
+  drag = null,
   ticketKey,
   dirty,
   ahead,
@@ -756,6 +1133,13 @@ function WorkspaceRow({
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
   const collisions = useWorkspaceCollisions(workspace?.id);
+  // Pointer-only: the row is no extra tab stop, and the keyboard moves a
+  // mission through its menu ("Move to group").
+  const draggable = useDraggable({
+    id: `mission:${workspace?.id ?? ""}`,
+    data: drag ?? undefined,
+    disabled: !drag,
+  });
 
   if (!workspace) return null;
 
@@ -791,15 +1175,19 @@ function WorkspaceRow({
       : "";
   const hint = shortcut ? ` (${shortcut})` : "";
   const hit = matchRange(name, q);
-  const shedGit = shedsGitMeta(name, {
-    ticketKey,
-    ahead,
-    behind,
-    hasOpenPr,
-    dirty: dirty && !active,
-    collision: worstSeverity(collisions) !== null,
-    dot: attention === "dot",
-  });
+  const shedGit = shedsGitMeta(
+    name,
+    {
+      ticketKey,
+      ahead,
+      behind,
+      hasOpenPr,
+      dirty: dirty && !active,
+      collision: worstSeverity(collisions) !== null,
+      dot: attention === "dot",
+    },
+    grouped ? ROW_TEXT_PX - GROUP_INDENT_PX : ROW_TEXT_PX,
+  );
   const shedSuffix = shedGit ? ` · ${gitCountsLabel(ahead, behind)}` : "";
 
   const handleContextMenu = (e: React.MouseEvent<HTMLElement>) => {
@@ -814,8 +1202,15 @@ function WorkspaceRow({
 
   return (
     <div
-      className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pl-3.5 pr-3 transition-colors duration-[180ms] ${
-        active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"
+      ref={draggable.setNodeRef}
+      onPointerDown={draggable.listeners?.onPointerDown as React.PointerEventHandler<HTMLDivElement> | undefined}
+      data-rail-row={grouped ? "member" : "loose"}
+      // A member is indented 14px beside its group's guide. The row itself
+      // stays full width, so the state edge below remains at the rail's edge.
+      className={`group/row octo-fade-in relative flex h-8 items-center gap-2 pr-3 transition-colors duration-[180ms] ${
+        grouped ? "pl-7" : "pl-3.5"
+      } ${active ? "bg-[var(--brass-ghost)]" : "hover:bg-octo-panel-2"} ${
+        draggable.isDragging ? "opacity-40" : ""
       }`}
       onContextMenu={handleContextMenu}
     >
@@ -943,6 +1338,12 @@ interface CollapsedRailProps {
   attentionByWs: Record<string, Attention>;
   flagsByWs: Record<string, AttentionFlag>;
   shortcutByWs?: Record<string, string>;
+  /** Each project's loose missions and mission groups, in rail order. */
+  itemsByProject: Record<string, RailItem[]>;
+  collapsedGroups: Record<string, boolean>;
+  /** The beacon or dot a folded group's chevron carries. */
+  groupAttention: Record<string, Attention>;
+  onGroupContextMenu: (groupId: string, x: number, y: number) => void;
 }
 
 interface FlyoutAnchor {
@@ -957,6 +1358,11 @@ interface FlyoutAnchor {
  * focus flyout that carries what the width cannot — project, name, status and
  * the jump key. Positioned `fixed` against the measured cell, since the
  * scrolling list would clip an absolutely positioned popover.
+ *
+ * A mission group keeps its two marks at this width: a 12px chevron in the
+ * group's tint (its tooltip is the group's name, and it folds the group) and
+ * the 1px guide beside the members' monograms, with 6px of air above and
+ * below the group.
  */
 function CollapsedRail({
   projects,
@@ -972,6 +1378,10 @@ function CollapsedRail({
   attentionByWs,
   flagsByWs,
   shortcutByWs,
+  itemsByProject,
+  collapsedGroups,
+  groupAttention,
+  onGroupContextMenu,
 }: CollapsedRailProps) {
   const [flyout, setFlyout] = useState<FlyoutAnchor | null>(null);
   const closeTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
@@ -1005,6 +1415,34 @@ function CollapsedRail({
     [cancelClose, closeFlyout],
   );
   useEffect(() => () => cancelClose(), [cancelClose]);
+
+  const renderCell = (project: ProjectGroup, ws: Workspace, group: Group | null) => {
+    if (!ws?.id) return null;
+    return (
+      <CollapsedCell
+        key={ws.id}
+        workspace={ws}
+        projectName={project?.name || "Project"}
+        groupName={group?.name ?? null}
+        active={ws.id === activeWorkspaceId}
+        running={!!runningByWs?.[ws.id]}
+        attention={attentionByWs[ws.id] ?? null}
+        attentionKind={flagsByWs?.[ws.id]?.kind ?? null}
+        ticketKey={ticketKeyFor(ws, project)}
+        git={gitSummaryByWs?.[ws.id]}
+        hasOpenPr={!!prByWs?.[ws.id]}
+        shortcut={shortcutByWs?.[ws.id] ?? null}
+        flyout={flyout?.id === ws.id ? flyout : null}
+        onOpen={openFlyout}
+        onScheduleClose={scheduleClose}
+        onCancelClose={cancelClose}
+        onCloseNow={closeFlyout}
+        onSelect={() => onSelect(ws.id)}
+        onCustomize={() => onCustomize(ws.id)}
+        onContextMenu={onContextMenu ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
+      />
+    );
+  };
 
   return (
     <>
@@ -1045,30 +1483,74 @@ function CollapsedRail({
               >
                 <ProjectMark size={12} color={projectTint?.accent ?? "var(--color-octo-mute)"} />
               </span>
-              {(project?.workspaces || []).map((ws) => {
-                if (!ws?.id) return null;
+              {(itemsByProject[project?.id ?? ""] ?? []).map((item) => {
+                if (item.kind === "mission") return renderCell(project, item.workspace, null);
+                const { group, members } = item;
+                const groupFolded = !!collapsedGroups[group.id];
+                const carried = groupFolded ? (groupAttention[group.id] ?? null) : null;
                 return (
-                  <CollapsedCell
-                    key={ws.id}
-                    workspace={ws}
-                    projectName={project?.name || "Project"}
-                    active={ws.id === activeWorkspaceId}
-                    running={!!runningByWs?.[ws.id]}
-                    attention={attentionByWs[ws.id] ?? null}
-                    attentionKind={flagsByWs?.[ws.id]?.kind ?? null}
-                    ticketKey={ticketKeyFor(ws, project)}
-                    git={gitSummaryByWs?.[ws.id]}
-                    hasOpenPr={!!prByWs?.[ws.id]}
-                    shortcut={shortcutByWs?.[ws.id] ?? null}
-                    flyout={flyout?.id === ws.id ? flyout : null}
-                    onOpen={openFlyout}
-                    onScheduleClose={scheduleClose}
-                    onCancelClose={cancelClose}
-                    onCloseNow={closeFlyout}
-                    onSelect={() => onSelect(ws.id)}
-                    onCustomize={() => onCustomize(ws.id)}
-                    onContextMenu={onContextMenu ? (x, y) => onContextMenu(ws.id, x, y) : undefined}
-                  />
+                  <div
+                    key={`group-${group.id}`}
+                    data-testid={`rail-group-${group.id}`}
+                    className="my-1.5 flex w-full flex-col items-center"
+                  >
+                    <button
+                      type="button"
+                      onClick={() => useRailGroupUi.getState().toggle(group.id)}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        onGroupContextMenu(group.id, e.clientX, e.clientY);
+                      }}
+                      aria-expanded={!groupFolded}
+                      aria-label={carried ? `${group.name} — needs attention` : group.name}
+                      title={group.name}
+                      className="relative flex h-4 w-full items-center justify-center focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
+                    >
+                      <span
+                        className={`flex h-4 w-4 items-center justify-center rounded ${
+                          carried === "beacon" ? "rail-beacon animate-attention-pulse" : ""
+                        }`}
+                        style={{ color: groupMarkColor(group, "var(--color-octo-mute)") }}
+                      >
+                        <ChevronDown
+                          size={12}
+                          aria-hidden
+                          className={`transition-transform duration-[280ms] ${EASE} ${groupFolded ? "-rotate-90" : ""}`}
+                        />
+                      </span>
+                      {carried === "dot" && (
+                        <span
+                          aria-hidden
+                          className="octo-pop-in absolute right-[7px] top-[2px] h-[5px] w-[5px] rounded-full bg-octo-brass"
+                        />
+                      )}
+                    </button>
+                    <div
+                      aria-hidden={groupFolded}
+                      inert={groupFolded}
+                      className={`grid w-full overflow-hidden transition-[grid-template-rows,opacity] duration-[280ms] ${EASE}`}
+                      style={{
+                        gridTemplateColumns: "minmax(0, 1fr)",
+                        gridTemplateRows: groupFolded ? "0fr" : "1fr",
+                        opacity: groupFolded ? 0 : 1,
+                      }}
+                    >
+                      <div className="min-h-0 overflow-hidden">
+                        <div className="relative flex flex-col">
+                          {members.map((ws) => renderCell(project, ws, group))}
+                          {members.length > 0 && (
+                            <span
+                              aria-hidden
+                              data-testid="rail-group-guide"
+                              className="pointer-events-none absolute bottom-1 left-[6px] top-1 w-px opacity-50"
+                              style={{ backgroundColor: groupMarkColor(group, "var(--color-octo-border-strong)") }}
+                            />
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
                 );
               })}
             </div>
@@ -1082,6 +1564,8 @@ function CollapsedRail({
 interface CollapsedCellProps {
   workspace: Workspace;
   projectName: string;
+  /** The mission group the workspace sits in, for the flyout's eyebrow. */
+  groupName: string | null;
   active: boolean;
   running: boolean;
   attention: Attention | null;
@@ -1103,6 +1587,7 @@ interface CollapsedCellProps {
 function CollapsedCell({
   workspace,
   projectName,
+  groupName,
   active,
   running,
   attention,
@@ -1211,7 +1696,7 @@ function CollapsedCell({
         >
           <div className="flex items-baseline justify-between gap-2">
             <span className="truncate font-mono text-[9px] uppercase tracking-[0.18em] text-octo-mute">
-              {projectName}
+              {groupName ? `${projectName} · ${groupName}` : projectName}
             </span>
             {shortcut && (
               <span className="shrink-0 font-mono text-[9px] text-octo-mute">{shortcut}</span>

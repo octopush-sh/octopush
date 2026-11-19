@@ -19,8 +19,12 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
-const { mockPushToast } = vi.hoisted(() => ({ mockPushToast: vi.fn() }));
+const { mockPushToast, mockMoveToGroup } = vi.hoisted(() => ({
+  mockPushToast: vi.fn(),
+  mockMoveToGroup: vi.fn().mockResolvedValue(true),
+}));
 vi.mock("./Toasts", () => ({ pushToast: mockPushToast }));
+vi.mock("../lib/groupActions", () => ({ moveMissionToGroup: mockMoveToGroup }));
 
 // Mock workspaceStore
 vi.mock("../stores/workspaceStore", () => {
@@ -133,6 +137,39 @@ describe("MissionCreator", () => {
     await beginMission();
     await waitFor(() => expect(onCreated).toHaveBeenCalled());
     expect(vi.mocked(ipcModule.ipc.updateWorkspaceLink)).not.toHaveBeenCalled();
+  });
+
+  it("puts the new mission in the group it was started from", async () => {
+    vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
+    const onCreated = vi.fn();
+    render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" groupId="group-7" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalled());
+    expect(mockMoveToGroup).toHaveBeenCalledWith("ws-new-1", "group-7");
+  });
+
+  it("leaves groups alone without a target group, and never steals an adopted workspace from its group", async () => {
+    const onCreated = vi.fn();
+    const { unmount } = render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(1));
+    unmount();
+
+    // The branch already had a workspace, and it sits in another group.
+    vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue({ ...mockWorkspace, groupId: "group-1" }));
+    render(
+      <MissionCreator projectId="proj-1" projectPath="/home/user/proj" onCreated={onCreated} onCancel={vi.fn()} initialTask="Add dark mode" groupId="group-7" />,
+    );
+    await gotoTask();
+    await beginMission();
+    await waitFor(() => expect(onCreated).toHaveBeenCalledTimes(2));
+    expect(mockMoveToGroup).not.toHaveBeenCalled();
   });
 
   // ─── Step 1: intent ────────────────────────────────────────────────

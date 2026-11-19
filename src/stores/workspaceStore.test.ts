@@ -58,7 +58,7 @@ const mockIpc = {
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
-const { useWorkspaceStore, __resetPrFetchThrottle } = await import("./workspaceStore");
+const { useWorkspaceStore, __resetPrFetchThrottle, __resetLaunchRestore } = await import("./workspaceStore");
 const { useProjectStore } = await import("./projectStore");
 
 function resetStore() {
@@ -71,7 +71,9 @@ function resetStore() {
     workspacesByProjectId: {},
     gitSummaryByWs: {},
     prByWs: {},
+    launchRestoredId: undefined,
   });
+  __resetLaunchRestore();
   // The PR-fetch dedup Set + throttle Map live at module scope and persist
   // across tests; clear them so a shared projectId isn't throttled/blocked
   // between tests that each call loadProjectPrs once.
@@ -171,6 +173,55 @@ describe("workspaceStore — load activation", () => {
     await useWorkspaceStore.getState().load("proj-1");
 
     expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+  });
+});
+
+describe("workspaceStore — the launch restore", () => {
+  beforeEach(() => resetStore());
+
+  it("records what the first load of the session made active, and nothing later", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-1", "beta");
+    const c = makeWorkspace("proj-2", "gamma");
+    useWorkspaceStore.setState({ lastActiveByProject: { "proj-1": b.id } });
+    expect(useWorkspaceStore.getState().launchRestoredId).toBeUndefined();
+
+    mockIpc.listWorkspaces.mockResolvedValueOnce([a, b]);
+    await useWorkspaceStore.getState().load("proj-1");
+    expect(useWorkspaceStore.getState().launchRestoredId).toBe(b.id);
+
+    // Opening another project later is not the launch.
+    mockIpc.listWorkspaces.mockResolvedValueOnce([c]);
+    await useWorkspaceStore.getState().load("proj-2");
+    expect(useWorkspaceStore.getState().activeId).toBe(c.id);
+    expect(useWorkspaceStore.getState().launchRestoredId).toBe(b.id);
+  });
+
+  it("is null when the launch project has no workspace", async () => {
+    mockIpc.listWorkspaces.mockResolvedValueOnce([]);
+    await useWorkspaceStore.getState().load("proj-1");
+    expect(useWorkspaceStore.getState().launchRestoredId).toBeNull();
+  });
+
+  it("covers a batch reload that lands before the first load, then defers to the load", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    const b = makeWorkspace("proj-1", "beta");
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    useWorkspaceStore.setState({ lastActiveByProject: { "proj-1": b.id } });
+    mockIpc.listWorkspaces.mockResolvedValue([a, b]);
+
+    // The rail's reload wins the race and makes the first workspace active.
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+    expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+    expect(useWorkspaceStore.getState().launchRestoredId).toBe(a.id);
+    // Then the project's own load picks the remembered one: still the launch.
+    await useWorkspaceStore.getState().load("proj-1");
+    expect(useWorkspaceStore.getState().launchRestoredId).toBe(b.id);
+    // A later batch reload that has to pick again is not.
+    useWorkspaceStore.setState({ activeId: "gone" });
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+    expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+    expect(useWorkspaceStore.getState().launchRestoredId).toBe(b.id);
   });
 });
 
