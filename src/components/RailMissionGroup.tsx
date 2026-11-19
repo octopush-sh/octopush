@@ -36,6 +36,30 @@ export function groupMarkColor(group: Pick<Group, "tint">, fallback: string): st
 /** What a folded group's header says about the members it hides. */
 export type GroupAttention = "beacon" | "dot" | null;
 
+/**
+ * The keys a group header answers, at both scopes (a mission group's folder
+ * header and a project group's eyebrow): `F2` renames, `←` folds and `→`
+ * unfolds as in a tree, `⇧F10` or the context-menu key opens its menu.
+ */
+export function groupHeaderKeyDown(
+  e: React.KeyboardEvent,
+  header: { canFold: boolean; folded: boolean; onToggle: () => void; onRename: () => void; onMenu: () => void },
+) {
+  if (e.key === "F2") {
+    e.preventDefault();
+    header.onRename();
+  } else if (e.key === "ArrowLeft" && header.canFold && !header.folded) {
+    e.preventDefault();
+    header.onToggle();
+  } else if (e.key === "ArrowRight" && header.canFold && header.folded) {
+    e.preventDefault();
+    header.onToggle();
+  } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
+    e.preventDefault();
+    header.onMenu();
+  }
+}
+
 interface Props {
   group: Group;
   /** Every member of the group (not only the ones a filter shows). */
@@ -177,21 +201,9 @@ export function RailMissionGroup({
               if (canFold) onToggle();
             }}
             onDoubleClick={startRename}
-            onKeyDown={(e) => {
-              if (e.key === "F2") {
-                e.preventDefault();
-                startRename();
-              } else if (e.key === "ArrowLeft" && canFold && !folded) {
-                e.preventDefault();
-                onToggle();
-              } else if (e.key === "ArrowRight" && canFold && folded) {
-                e.preventDefault();
-                onToggle();
-              } else if (e.key === "ContextMenu" || (e.key === "F10" && e.shiftKey)) {
-                e.preventDefault();
-                openMenuAtHeader();
-              }
-            }}
+            onKeyDown={(e) =>
+              groupHeaderKeyDown(e, { canFold, folded, onToggle, onRename: startRename, onMenu: openMenuAtHeader })
+            }
             className="flex h-full min-w-0 flex-1 items-center gap-2 rounded-sm text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
           >
             {chevron}
@@ -310,9 +322,14 @@ export function RailMissionGroup({
   );
 }
 
+/** The type of a mission group's name in edit: its header's own mono line. */
+const NAME_INPUT = "font-mono text-[11px] leading-none";
+
 /** The header's name in inline edit: Enter and blur commit, Escape keeps the
- *  name as it was. A blank name is not a name, so it changes nothing. */
-function GroupNameInput({ group }: { group: Group }) {
+ *  name as it was. A blank name is not a name, so it changes nothing.
+ *  `typeClassName` sets the type the name is edited in: a header edits its
+ *  name in the type it is read in. */
+export function GroupNameInput({ group, typeClassName = NAME_INPUT }: { group: Group; typeClassName?: string }) {
   const [value, setValue] = useState(group.name);
   const ref = useRef<HTMLInputElement>(null);
   const done = useRef(false);
@@ -350,7 +367,7 @@ function GroupNameInput({ group }: { group: Group }) {
       aria-label="Group name"
       spellCheck={false}
       maxLength={80}
-      className="h-5 min-w-0 flex-1 border-b border-octo-brass bg-transparent font-mono text-[11px] leading-none text-octo-ivory outline-none"
+      className={`h-5 min-w-0 flex-1 border-b border-octo-brass bg-transparent text-octo-ivory outline-none ${typeClassName}`}
     />
   );
 }

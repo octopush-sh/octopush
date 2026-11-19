@@ -128,4 +128,25 @@ describe("GroupContextMenu", () => {
     fireEvent.click(screen.getByRole("menuitem", { name: "New mission in this group" }));
     expect(onNewMission).toHaveBeenCalledTimes(1);
   });
+
+  it("a project group's Ungroup says it keeps the projects", () => {
+    render(<GroupContextMenu {...base} groupName="Client work" holds="projects" />);
+    expect(screen.getByRole("menuitem", { name: /Ungroup/ })).toHaveTextContent("Keeps the projects");
+    expect(screen.queryByRole("menuitem", { name: /New mission/ })).toBeNull();
+  });
+
+  it("offers Move up and Move down only where they are wired, runs them and closes", () => {
+    const { unmount } = render(<GroupContextMenu {...base} />);
+    expect(screen.queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Move down" })).toBeNull();
+    unmount();
+    const onMoveDown = vi.fn();
+    const onDismiss = vi.fn();
+    render(<GroupContextMenu {...base} holds="projects" onMoveDown={onMoveDown} onDismiss={onDismiss} />);
+    // At the top of the rail there is no way up.
+    expect(screen.queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Move down" }));
+    expect(onMoveDown).toHaveBeenCalledTimes(1);
+    expect(onDismiss).toHaveBeenCalledTimes(1);
+  });
 });

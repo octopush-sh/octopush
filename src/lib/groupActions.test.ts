@@ -1,16 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { Group, Workspace } from "./types";
+import type { Group, ProjectInfo, Workspace } from "./types";
 
 const mockIpc = vi.hoisted(() => ({
   createGroup: vi.fn(),
   deleteGroup: vi.fn(),
   setItemGroup: vi.fn(),
+  setProjectOrder: vi.fn(),
+  listRecentProjects: vi.fn(),
 }));
 vi.mock("./ipc", () => ({ ipc: mockIpc }));
 const pushToast = vi.hoisted(() => vi.fn());
 vi.mock("../components/Toasts", () => ({ pushToast }));
 
-const { NEW_GROUP_NAME, createMissionGroup, moveMissionToGroup, ungroupMissions } = await import("./groupActions");
+const {
+  NEW_GROUP_NAME,
+  createMissionGroup,
+  createProjectGroup,
+  moveMissionToGroup,
+  moveProjectToGroup,
+  ungroupMissions,
+  ungroupProjects,
+} = await import("./groupActions");
+const { useProjectStore } = await import("../stores/projectStore");
 const { useGroupsStore, __resetGroupsStoreInFlight } = await import("../stores/groupsStore");
 const { useRailGroupUi, __reloadRailGroupUi, GROUP_COLLAPSE_KEY } = await import("../stores/railGroupUiStore");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
@@ -53,6 +64,7 @@ beforeEach(() => {
   __reloadRailGroupUi();
   useGroupsStore.setState({ groups: [], loaded: true });
   seed([]);
+  useProjectStore.setState({ current: null, recent: [], closed: [] });
 });
 
 describe("groupActions", () => {
@@ -126,6 +138,168 @@ describe("groupActions", () => {
     useWorkspaceStore.getState().pruneProject("p1");
     toast.action.onClick();
     await Promise.resolve();
+    expect(mockIpc.createGroup).not.toHaveBeenCalled();
+  });
+});
+
+// ───────────────────────────── project groups ─────────────────────────────
+
+const section = (id: string, over: Partial<Group> = {}) => group(id, { scope: "project", projectId: null, ...over });
+const project = (id: string, groupId: string | null = null): ProjectInfo => ({
+  id,
+  name: id,
+  path: `/code/${id}`,
+  jiraProjectKey: null,
+  pinned: false,
+  tint: null,
+  groupId,
+});
+/** The projects the rail lists; a reload after a reorder answers with the same rows. */
+const seedProjects = (rows: ProjectInfo[], current: ProjectInfo | null = null) => {
+  useProjectStore.setState({ recent: rows, current });
+  mockIpc.listRecentProjects.mockImplementation(async () => useProjectStore.getState().recent);
+};
+const sectionOf = (id: string) => useProjectStore.getState().recent.find((p) => p.id === id)?.groupId ?? null;
+const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("groupActions: project groups", () => {
+  it("createProjectGroup makes a project group around the project and opens its name in edit", async () => {
+    seedProjects([project("api"), project("web")]);
+    mockIpc.createGroup.mockResolvedValue(section("g-new", { name: NEW_GROUP_NAME }));
+
+    expect(await createProjectGroup("api")).toBe("g-new");
+
+    expect(mockIpc.createGroup).toHaveBeenCalledWith({
+      scope: "project",
+      name: NEW_GROUP_NAME,
+      memberIds: ["api"],
+    });
+    expect(sectionOf("api")).toBe("g-new");
+    expect(sectionOf("web")).toBeNull();
+    expect(useRailGroupUi.getState().renamingId).toBe("g-new");
+  });
+
+  it("createProjectGroup changes nothing when the backend refuses", async () => {
+    seedProjects([project("api")]);
+    mockIpc.createGroup.mockRejectedValue(new Error("other: no"));
+    expect(await createProjectGroup("api")).toBeNull();
+    expect(sectionOf("api")).toBeNull();
+    expect(useRailGroupUi.getState().renamingId).toBeNull();
+  });
+
+  it("moveProjectToGroup unfolds the group and makes the project its last one in the stored order", async () => {
+    // a · [client: api web] · dotfiles
+    seedProjects([project("a"), project("api", "g-client"), project("web", "g-client"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    useRailGroupUi.getState().setCollapsed("g-client", true);
+
+    expect(await moveProjectToGroup("a", "g-client")).toBe(true);
+    await settle();
+
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "a", "g-client");
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["api", "web", "a", "dotfiles"]);
+    expect(sectionOf("a")).toBe("g-client");
+    expect(useRailGroupUi.getState().collapsed["g-client"]).toBeUndefined();
+  });
+
+  it("joining a group whose last project it already follows persists no order", async () => {
+    seedProjects([project("api", "g-client"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    await moveProjectToGroup("dotfiles", "g-client");
+    await settle();
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "dotfiles", "g-client");
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+  });
+
+  it("leaving a group keeps the project's place: no order is written", async () => {
+    seedProjects([project("api", "g-client"), project("web", "g-client")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    expect(await moveProjectToGroup("api", null)).toBe(true);
+    await settle();
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "api", null);
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+    expect(sectionOf("api")).toBeNull();
+  });
+
+  it("a drag hands its own order over, or none", async () => {
+    seedProjects([project("a"), project("api", "g-client")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    await moveProjectToGroup("a", "g-client", null);
+    await settle();
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+  });
+
+  it("a refused move rolls back and persists no order", async () => {
+    seedProjects([project("a"), project("api", "g-client"), project("web", "g-client"), project("b")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    mockIpc.setItemGroup.mockRejectedValue(new Error("other: no"));
+    expect(await moveProjectToGroup("b", "g-client")).toBe(false);
+    await settle();
+    expect(sectionOf("b")).toBeNull();
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Couldn't move the project" }));
+  });
+
+  it("the open project counts even before the list has it", async () => {
+    const fresh = project("fresh");
+    seedProjects([project("api", "g-client")], fresh);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    // fresh stands last, right after the group's last project: nothing to reorder.
+    await moveProjectToGroup("fresh", "g-client");
+    await settle();
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "fresh", "g-client");
+    expect(useProjectStore.getState().current?.groupId).toBe("g-client");
+  });
+
+  it("ungroupProjects keeps the projects and offers Undo, which regroups the ones still loose", async () => {
+    seedProjects([project("api", "g-client"), project("web", "g-client"), project("other")]);
+    useGroupsStore.setState({ groups: [section("g-client", { name: "Client work", tint: "verdigris" })] });
+    useRailGroupUi.getState().setCollapsed("g-client", true);
+
+    await ungroupProjects("g-client");
+
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("g-client");
+    expect(useGroupsStore.getState().groups).toEqual([]);
+    expect(sectionOf("api")).toBeNull();
+    expect(sectionOf("web")).toBeNull();
+    expect(useRailGroupUi.getState().collapsed["g-client"]).toBeUndefined();
+    const toast = pushToast.mock.calls[0][0];
+    expect(toast.title).toBe('Ungrouped "Client work"');
+    expect(toast.body).toBe("Its projects are back in the list.");
+    expect(toast.action.label).toBe("Undo");
+
+    // `web` joined another group meanwhile: Undo leaves it there.
+    useGroupsStore.setState({ groups: [section("g-side")] });
+    useProjectStore.setState((s) => ({ recent: s.recent.map((p) => (p.id === "web" ? { ...p, groupId: "g-side" } : p)) }));
+    mockIpc.createGroup.mockResolvedValue(section("g-again", { name: "Client work", tint: "verdigris" }));
+    toast.action.onClick();
+    await settle();
+    expect(mockIpc.createGroup).toHaveBeenCalledWith({
+      scope: "project",
+      name: "Client work",
+      tint: "verdigris",
+      memberIds: ["api"],
+    });
+  });
+
+  it("one project reads in the singular; an empty group goes with no toast", async () => {
+    seedProjects([project("api", "g-one")]);
+    useGroupsStore.setState({ groups: [section("g-one"), section("g-empty")] });
+    await ungroupProjects("g-one");
+    expect(pushToast.mock.calls[0][0].body).toBe("Its project is back in the list.");
+    pushToast.mockReset();
+    await ungroupProjects("g-empty");
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("g-empty");
+    expect(pushToast).not.toHaveBeenCalled();
+  });
+
+  it("Undo makes no group when every project has gone or been grouped again", async () => {
+    seedProjects([project("api", "g-client")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    await ungroupProjects("g-client");
+    useProjectStore.setState({ recent: [] });
+    pushToast.mock.calls[0][0].action.onClick();
+    await settle();
     expect(mockIpc.createGroup).not.toHaveBeenCalled();
   });
 });

@@ -400,7 +400,7 @@ describe("mission group: rename in place", () => {
     expect(mockIpc.renameGroup).not.toHaveBeenCalled();
   });
 
-  it("New group from a project's menu makes an empty group, unfolding a folded project", async () => {
+  it("New mission group from a project's menu makes an empty mission group, unfolding a folded project", async () => {
     localStorage.setItem("railProjectCollapsed", JSON.stringify({ p1: true }));
     mockIpc.createGroup.mockResolvedValue(group("g-new", "New group", { sortOrder: 2 }));
     render(<Rail />);
@@ -631,17 +631,19 @@ describe("the beacon walks up to the fold that hides it", () => {
         (id) => foldedProjects.includes(id),
         (id) => foldedGroups.includes(id),
       );
-    expect(carriers([], [])).toEqual({ byProject: {}, byGroup: {} });
+    expect(carriers([], [])).toEqual({ byProject: {}, byGroup: {}, bySection: {} });
     expect(carriers([], [FIXES.id, REVIEWS.id])).toEqual({
       byProject: {},
       byGroup: { [FIXES.id]: "beacon", [REVIEWS.id]: "dot" },
+      bySection: {},
     });
-    expect(carriers(["p1"], [FIXES.id])).toEqual({ byProject: { p1: "beacon" }, byGroup: {} });
+    expect(carriers(["p1"], [FIXES.id])).toEqual({ byProject: { p1: "beacon" }, byGroup: {}, bySection: {} });
     // A group the store does not know cannot carry anything, and neither can
     // another project's group: the layout draws those missions loose.
     expect(resolveAttentionCarriers(p, attention, new Map(), () => false, () => true)).toEqual({
       byProject: {},
       byGroup: {},
+      bySection: {},
     });
     const foreign = new Map([
       [FIXES.id, "p2"],
@@ -650,6 +652,7 @@ describe("the beacon walks up to the fold that hides it", () => {
     expect(resolveAttentionCarriers(p, attention, foreign, () => false, () => true)).toEqual({
       byProject: {},
       byGroup: { [REVIEWS.id]: "dot" },
+      bySection: {},
     });
   });
 });
