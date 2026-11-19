@@ -77,8 +77,9 @@ import { collisionSegment, worstSeverity } from "../lib/collisions";
  *    the list is never repeated in its header).
  *  - Exactly one brass pulse per rail (the workspace waiting longest); every
  *    other workspace that needs you carries a static brass dot.
- *  - Collapsed, the rail is the Run session rail's geometry (44px, 32px
- *    cells, reserved edge) with a hover flyout for project · name · status.
+ *  - Collapsed, the rail is the slim-rail geometry of Review's collapsed
+ *    navigator (44px, 32px cells, reserved edge) with a hover flyout for
+ *    project · name · status.
  *  - A mission group is a folder inside a project (`RailMissionGroup`): an
  *    always-visible chevron and a 1px guide beside its indented members. Its
  *    tint colours those two marks only; monograms are never recoloured. When
@@ -402,10 +403,28 @@ export function WorkspaceRail({
   }, [renamingGroupId, isCollapsed, groups, collapsedProjects, toggleProjectCollapsed]);
 
   // The header menu of a mission group, owned by the rail.
-  const [groupMenu, setGroupMenu] = useState<{ groupId: string; x: number; y: number } | null>(null);
-  const openGroupMenu = useCallback((groupId: string, x: number, y: number) => {
-    setGroupMenu({ groupId, x, y });
+  const [groupMenu, setGroupMenu] = useState<{
+    groupId: string;
+    x: number;
+    y: number;
+    fromKeyboard: boolean;
+  } | null>(null);
+  const openGroupMenu = useCallback((groupId: string, x: number, y: number, fromKeyboard = false) => {
+    setGroupMenu({ groupId, x, y, fromKeyboard });
   }, []);
+  // A menu the keyboard opened gives the focus back to its header when it
+  // closes (as `useAnchoredMenu` does for a button's menu), so Escape does
+  // not drop the keyboard out of the rail. A pointer-opened one does not
+  // move the focus. Rename then takes it for its input; a press elsewhere
+  // still lands where it was aimed, since the browser focuses that after.
+  const closeGroupMenu = () => {
+    const closing = groupMenu;
+    setGroupMenu(null);
+    if (!closing?.fromKeyboard) return;
+    Array.from(asideRef.current?.querySelectorAll<HTMLElement>("[data-rail-group-header]") ?? [])
+      .find((el) => el.dataset.railGroupHeader === closing.groupId)
+      ?.focus({ preventScroll: true });
+  };
   const menuGroup = groupMenu ? groups.find((g) => g.id === groupMenu.groupId) : undefined;
 
   const sensors = useSensors(
@@ -603,7 +622,7 @@ export function WorkspaceRail({
               : undefined
           }
           onUngroup={() => void ungroupMissions(menuGroup.id)}
-          onDismiss={() => setGroupMenu(null)}
+          onDismiss={closeGroupMenu}
         />
       )}
     </aside>
@@ -699,7 +718,7 @@ interface SortableProjectGroupProps {
   /** Missions and group headers can be dragged (the list is whole). */
   groupDragEnabled: boolean;
   dragging: RailDragSubject | null;
-  onGroupContextMenu: (groupId: string, x: number, y: number) => void;
+  onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   projectIndex: number;
   q: string;
@@ -973,7 +992,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
                   dragging={dragging}
                   hitClassName={HIT_WASH}
                   onToggle={() => useRailGroupUi.getState().toggle(group.id)}
-                  onContextMenu={(x, y) => onGroupContextMenu(group.id, x, y)}
+                  onContextMenu={(x, y, fromKeyboard) => onGroupContextMenu(group.id, x, y, fromKeyboard)}
                   onNewMission={
                     onNewWorkspaceInGroup ? () => onNewWorkspaceInGroup(project.id, group.id) : undefined
                   }
@@ -1334,8 +1353,8 @@ interface FlyoutAnchor {
 }
 
 /**
- * The slim rail: the Run session rail's geometry (44px, 32px cells, a reserved
- * identity edge), one cluster per project headed by its mark, and a hover /
+ * The slim rail: the geometry of Review's collapsed navigator (44px, 32px
+ * cells, a reserved identity edge), one cluster per project headed by its mark, and a hover /
  * focus flyout that carries what the width cannot — project, name, status and
  * the jump key. Positioned `fixed` against the measured cell, since the
  * scrolling list would clip an absolutely positioned popover.

@@ -434,6 +434,33 @@ describe("mission group: the header menu", () => {
     expect(screen.getByRole("menu", { name: "Group actions" })).toBeInTheDocument();
   });
 
+  it("a menu opened from the keyboard gives the focus back to its header; a pointer-opened one moves none", () => {
+    render(<Rail />);
+    const h = header("Vulnerability fixes");
+    h.focus();
+    fireEvent.keyDown(h, { key: "F10", shiftKey: true });
+    expect(screen.getByRole("menuitem", { name: /Rename/ })).toHaveFocus();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(h).toHaveFocus();
+
+    // Opened with the pointer, closing leaves the focus where the menu left it.
+    h.blur();
+    openMenu("PR reviews");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(header("PR reviews")).not.toHaveFocus();
+    expect(h).not.toHaveFocus();
+  });
+
+  it("Rename from a keyboard-opened menu ends with the focus in the input", () => {
+    render(<Rail />);
+    const h = header("PR reviews");
+    h.focus();
+    fireEvent.keyDown(h, { key: "ContextMenu" });
+    fireEvent.click(screen.getByRole("menuitem", { name: /Rename/ }));
+    expect(screen.getByRole("textbox", { name: "Group name" })).toHaveFocus();
+  });
+
   it("Rename puts the header's name in edit", () => {
     render(<Rail />);
     fireEvent.click(within(openMenu("PR reviews")).getByRole("menuitem", { name: /Rename/ }));

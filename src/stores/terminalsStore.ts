@@ -590,7 +590,7 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
       },
     }));
     // Never replaces a session on screen: with more than one pane open it
-    // starts unseated, and its rail cell marks it as usual.
+    // starts unseated, and its cell on the session line marks it as usual.
     get().updateLayout(workspaceId, (layout) =>
       layout.slots.length > 1 ? layout : assign(layout, layout.focused, id),
     );

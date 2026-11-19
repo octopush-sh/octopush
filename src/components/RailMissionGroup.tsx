@@ -61,7 +61,9 @@ interface Props {
   dragging: RailDragSubject | null;
   hitClassName: string;
   onToggle: () => void;
-  onContextMenu: (x: number, y: number) => void;
+  /** Open the header's menu. `fromKeyboard`: it was asked for with ⇧F10 or
+   *  the context-menu key, so the header wants the focus back when it closes. */
+  onContextMenu: (x: number, y: number, fromKeyboard?: boolean) => void;
   /** Start a new mission in this group. Left out where the flow is not wired. */
   onNewMission?: () => void;
   /** The group's mission rows. */
@@ -121,7 +123,7 @@ export function RailMissionGroup({
   const startRename = () => useRailGroupUi.getState().startRename(group.id);
   const openMenuAtHeader = () => {
     const r = headerRef.current?.getBoundingClientRect();
-    if (r) onContextMenu(r.left + 24, r.bottom);
+    if (r) onContextMenu(r.left + 24, r.bottom, true);
   };
 
   const chevron = (

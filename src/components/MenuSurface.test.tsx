@@ -79,26 +79,50 @@ describe("MenuSurface", () => {
     expect(screen.getByRole("menuitem", { name: "One" })).toHaveFocus();
   });
 
-  it("walks a control that opts in with data-menu-item, and a nested menu on its own", () => {
+  it("walks radio and checkbox rows, skips rows out of the tab order, and takes an opted-in control", () => {
+    render(
+      <MenuSurface x={0} y={0} ariaLabel="Walk" onDismiss={vi.fn()}>
+        <button type="button" role="menuitemradio" aria-checked="false" tabIndex={-1}>Swatch a</button>
+        <button type="button" role="menuitemradio" aria-checked="true" tabIndex={0}>Swatch b</button>
+        <button type="button" role="menuitem">One</button>
+        <button type="button" role="menuitemcheckbox" aria-checked="false">Check</button>
+        <button type="button" data-menu-item="">Opted in</button>
+        <button type="button" role="menuitem" disabled>Off</button>
+      </MenuSurface>,
+    );
+    const focusedName = () => document.activeElement?.textContent;
+    // The first focus uses the same rule as the walk: not the row at -1.
+    expect(focusedName()).toBe("Swatch b");
+    const seen = [focusedName()];
+    for (let i = 0; i < 4; i++) {
+      fireEvent.keyDown(window, { key: "ArrowDown" });
+      seen.push(focusedName());
+    }
+    expect(seen).toEqual(["Swatch b", "One", "Check", "Opted in", "Swatch b"]);
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(focusedName()).toBe("Opted in");
+  });
+
+  it("walks a nested menu on its own", () => {
     render(
       <MenuSurface x={0} y={0} ariaLabel="Walk" onDismiss={vi.fn()}>
         <button type="button" role="menuitem">One</button>
-        <button type="button" role="menuitemradio" aria-checked="true" data-menu-item="">Swatch</button>
         <div role="menu" aria-label="Inner">
-          <button type="button" role="menuitem">Inner one</button>
+          <button type="button" role="menuitemradio" aria-checked="true">Inner one</button>
           <button type="button" role="menuitem">Inner two</button>
         </div>
         <button type="button" role="menuitem">Two</button>
       </MenuSurface>,
     );
     const item = (name: string) => screen.getByRole("menuitem", { name });
+    const inner = screen.getByRole("menuitemradio", { name: "Inner one" });
     expect(item("One")).toHaveFocus();
-    fireEvent.keyDown(window, { key: "ArrowDown" });
-    expect(screen.getByRole("menuitemradio", { name: "Swatch" })).toHaveFocus();
     fireEvent.keyDown(window, { key: "ArrowDown" });
     expect(item("Two")).toHaveFocus(); // the nested menu's rows are not the parent's
     item("Inner two").focus();
     fireEvent.keyDown(window, { key: "ArrowDown" });
-    expect(item("Inner one")).toHaveFocus(); // and it wraps inside itself
+    expect(inner).toHaveFocus(); // and it wraps inside itself
+    fireEvent.keyDown(window, { key: "ArrowUp" });
+    expect(item("Inner two")).toHaveFocus();
   });
 });

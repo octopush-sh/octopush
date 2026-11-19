@@ -160,7 +160,7 @@ describe("WorkspaceRail", () => {
     expect(onContextMenu).toHaveBeenCalledWith("a", 50, 80);
   });
 
-  it("renders at 280px expanded and at the Run session rail's 44px when collapsed", () => {
+  it("renders at 280px expanded and at the slim rail's 44px when collapsed", () => {
     const workspaces = [makeWorkspace({ id: "a", name: "Alpha" })];
     const projects: ProjectGroup[] = [
       { id: "proj-1", name: "Project", workspaces },

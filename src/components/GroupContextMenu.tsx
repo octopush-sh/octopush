@@ -57,7 +57,8 @@ export function GroupContextMenu({
 
   const options: Array<TintName | null> = [null, ...TINT_NAMES];
   // The swatch row is ONE stop of the menu's ↑/↓ walk, and ←/→ move along it
-  // (a roving tab stop). The stop starts on the current tint and follows the
+  // (a roving tab stop: the walk skips rows with tabindex -1, see
+  // `useMenuChrome`). The stop starts on the current tint and follows the
   // focus, so ↓ from any swatch goes on to the next row instead of finding
   // itself outside the walk and starting over at the top.
   const [stop, setStop] = useState<TintName | null>(tint);
@@ -109,7 +110,6 @@ export function GroupContextMenu({
               aria-label={label}
               title={label}
               tabIndex={name === stop ? 0 : -1}
-              data-menu-item={name === stop ? "" : undefined}
               onFocus={() => setStop(name)}
               onClick={() => onTint(name)}
               onKeyDown={onSwatchKey}

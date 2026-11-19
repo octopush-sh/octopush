@@ -2,7 +2,7 @@
 //
 // The daemon reports the foreground process's argv summary on every busy
 // transition (`pty://foreground`'s `command`); this module turns that string
-// into a role, which the rail, the switcher and the Companion render as a
+// into a role, which the session line, the pane caption and the switcher render as a
 // single icon. Kept pure and store-free so the vocabulary is unit-testable and
 // has exactly one definition.
 //

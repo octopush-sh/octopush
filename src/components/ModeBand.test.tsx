@@ -29,9 +29,50 @@ describe("ModeBand", () => {
       <ModeBand mode="review" onChange={vi.fn()} meta="7 files changed · +214 −61" />,
     );
     const band = container.firstElementChild as HTMLElement;
-    expect(band.className).toContain("grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)]");
+    // The right track's floor is a variable that is 0px unless the tail is a
+    // control (`tailMin`), so by default the two side tracks are equal.
+    expect(band.className).toContain("grid-cols-[minmax(0,1fr)_auto_minmax(var(--modeband-tail-min,0px),1fr)]");
+    expect(band.style.getPropertyValue("--modeband-tail-min")).toBe("");
     expect(band.children).toHaveLength(3);
     expect(band.children[1]).toContainElement(screen.getByRole("button", { name: /review/i }));
+  });
+
+  it("reserves a floor for a control tail, and marks it so the band can hide it whole", () => {
+    const { container, rerender } = render(
+      <ModeBand mode="run" onChange={vi.fn()} meta={<button type="button">a control</button>} tailMin={119} />,
+    );
+    const band = container.firstElementChild as HTMLElement;
+    expect(band.className).toContain("octo-modeband");
+    expect(band.style.getPropertyValue("--modeband-tail-min")).toBe("119px");
+    expect((band.children[2] as HTMLElement).className).toContain("octo-modeband-control");
+    expect(band.dataset.tail).toBe("control");
+
+    // A read-out tail keeps today's behaviour: no floor, no marker.
+    rerender(<ModeBand mode="run" onChange={vi.fn()} meta="No terminals" />);
+    expect(band.style.getPropertyValue("--modeband-tail-min")).toBe("");
+    expect((band.children[2] as HTMLElement).className).not.toContain("octo-modeband-control");
+    expect(band.dataset.tail).toBeUndefined();
+  });
+
+  it("is a ladder: inactive labels shed at 720px in every mode; a control tail goes whole at 334px", async () => {
+    // jsdom runs no container queries, so this reads the rungs from the sheet.
+    // @ts-expect-error node:fs is untyped in this project
+    const fs = await import("node:fs");
+    const css: string = fs.readFileSync("src/styles.css", "utf8");
+    expect(css).toMatch(/\.octo-modeband\s*\{[^}]*container-type:\s*inline-size;[^}]*container-name:\s*octo-modeband/);
+    const rung = (px: number) =>
+      css.match(new RegExp(`@container octo-modeband \\(max-width: ${px}px\\) \\{([\\s\\S]*?)\\n\\}`))?.[1] ?? "";
+    // One rung for every mode: the switcher must not change width with the
+    // mode, or the segment under the pointer becomes another mode mid-click.
+    // Only the modes that are not pressed lose their label, and they leave
+    // the layout entirely (hidden, not just transparent).
+    expect(rung(720)).toMatch(/^\s*\.octo-mode-seg:not\(\[aria-pressed="true"\]\) > \.octo-demote-mode-label/);
+    expect(rung(720)).not.toContain("data-tail");
+    expect(rung(720)).toMatch(/max-width:\s*0;/);
+    expect(rung(720)).toMatch(/visibility:\s*hidden;/);
+    expect(rung(600)).toBe("");
+    // A hidden control is out of the tab order, not merely out of sight.
+    expect(rung(334)).toMatch(/\.octo-modeband-control\s*\{\s*visibility:\s*hidden;/);
   });
 
   it("keeps the tail inside its track so it cannot overlap the switcher", () => {

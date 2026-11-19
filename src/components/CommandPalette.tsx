@@ -139,7 +139,7 @@ export function CommandPalette({
 
             {/* Sessions */}
             <Group heading="Sessions">
-              <Item glyph="+" label="New session" shortcut="⌘T" onSelect={() => run(onNewSession)} />
+              <Item glyph="+" label="New session" onSelect={() => run(onNewSession)} />
               {sessions.map((s) => (
                 <Item
                   key={s.id}

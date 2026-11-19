@@ -318,8 +318,10 @@
    the attention pulse (which means paused/finished).
    The colour comes from --rail-bar (brass on the active row / cell, sage on
    every other — never a status in brass, never the workspace tint). Consumers
-   size the edge inline (the workspace rail's 2px edge, the Run session rail's
-   3px one). Reduced motion falls back to a solid bar — never a frozen dash. */
+   size the edge inline (the workspace rail's 2px edge). Reduced motion falls
+   back to a solid bar — never a frozen dash.
+   `.rail-bar-running-x` is the same idiom laid horizontally: the Run session
+   line's 2px underline, which its cell positions and sizes. */
 @keyframes rail-march {
   to {
     background-position-y: -11px;
@@ -341,8 +343,25 @@
   animation: rail-march 1.2s linear infinite;
 }
 
+@keyframes rail-march-x {
+  to {
+    background-position-x: 14px;
+  }
+}
+
+.rail-bar-running-x {
+  background: repeating-linear-gradient(
+    to right,
+    var(--rail-bar) 0 4px,
+    transparent 4px 7px
+  );
+  background-size: 14px 100%;
+  animation: rail-march-x 1.2s linear infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .rail-bar-running {
+  .rail-bar-running,
+  .rail-bar-running-x {
     background: var(--rail-bar);
     animation: none;
   }
@@ -644,6 +663,46 @@
     max-width: 40ch; opacity: 1; margin-right: 0;
     visibility: visible; --demote-vis-delay: 0s;
   }
+}
+
+/* The mode band (ModeBand.tsx) is a ladder too. Its switcher is centred and
+   its tail sits in the right track, so on a narrow canvas the two compete for
+   the same pixels. As the band narrows it sheds:
+
+     ≤ 720px   with a control tail (Run's session line): the inactive modes'
+               labels → icon + tooltip. A redundant word goes before a
+               session's cell does; the labels buy the line about 73px
+     ≤ 600px   the same labels in every mode: a centred, fully labelled
+               switcher would leave each side track under 120px
+     ≤ 334px   a control tail, whole: its floor (LINE_FLOOR_PX,
+               SessionLine.tsx) no longer fits beside even the compact
+               switcher, and a control that is clipped must not stay in the
+               tab order
+     floor     the switcher, the active mode always with its label, so the
+               band never stops naming where you are
+
+   The label is a rung inside a button: no gap of its own to eat and no focus
+   ring to make room for (the button draws its own); the negative margin eats
+   the button's 6px icon gap instead. */
+.octo-modeband { container-type: inline-size; container-name: octo-modeband; }
+.octo-demote.octo-demote-mode-label {
+  gap: 0; padding: 0; margin-left: 0;
+  transition: max-width var(--dur-standard) var(--ease-octo),
+              opacity var(--dur-quick) var(--ease-octo),
+              margin-left var(--dur-standard) var(--ease-octo),
+              visibility 0s linear var(--demote-vis-delay, 0s);
+}
+/* One rung for every mode. With a second, later rung for the modes that
+   have no control tail, the switcher changed width as the mode changed, and
+   the segment under the pointer became another mode mid-click. */
+@container octo-modeband (max-width: 720px) {
+  .octo-mode-seg:not([aria-pressed="true"]) > .octo-demote-mode-label {
+    max-width: 0; opacity: 0; margin-left: -6px;
+    visibility: hidden; --demote-vis-delay: var(--dur-standard);
+  }
+}
+@container octo-modeband (max-width: 334px) {
+  .octo-modeband-control { visibility: hidden; }
 }
 
 /* The composer's cost estimate (ComposerEstimate.tsx) is a fixed slot on its

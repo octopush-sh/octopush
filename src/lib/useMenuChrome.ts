@@ -1,6 +1,20 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
+ * The rows the keyboard can land on, for the first focus and for the ↑/↓ walk
+ * alike:
+ *  - every kind of menu row: plain items, and the radio and checkbox rows of
+ *    a menu that sets something (`role^="menuitem"`);
+ *  - but not a row taken out of the tab order (`tabindex="-1"`): a row of
+ *    swatches is one stop of the walk, on the one swatch that is tabbable,
+ *    and ←/→ move along it (a roving tab stop);
+ *  - plus a control that is no menu row at all yet belongs in the walk, which
+ *    opts in with `data-menu-item`.
+ */
+const MENU_ROWS =
+  '[role^="menuitem"]:not([disabled]):not([tabindex="-1"]), [data-menu-item]:not([disabled])';
+
+/**
  * Shared chrome for the rail context menus:
  *  - clamps the menu into the viewport after measuring it (B9),
  *  - focuses the first menu item on open and supports ↑/↓ nav (B10),
@@ -8,11 +22,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
  *
  * ↑/↓ walk the rows of the menu that holds the focus: a submenu rendered
  * inside the panel (its own `role="menu"`) is walked on its own, and the
- * parent's rows skip it. A control that is not a `menuitem` but belongs in the
- * walk (the one tabbable swatch of a radio row) opts in with `data-menu-item`.
+ * parent's rows skip it. When the focus sits in the menu on something outside
+ * the walk, they go on from where it stands.
  */
-const MENU_ROW = '[role="menuitem"]:not([disabled]), [data-menu-item]:not([disabled])';
-
 export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
   const ref = useRef<HTMLDivElement>(null);
   const [pos, setPos] = useState({ left: x, top: y });
@@ -28,9 +40,7 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
   }, [x, y]);
 
   useLayoutEffect(() => {
-    const first = ref.current?.querySelector<HTMLElement>(
-      '[role="menuitem"]:not([disabled])',
-    );
+    const first = ref.current?.querySelector<HTMLElement>(MENU_ROWS);
     first?.focus();
   }, []);
 
@@ -48,7 +58,7 @@ export function useMenuChrome(x: number, y: number, onDismiss: () => void) {
         const focused = document.activeElement as HTMLElement | null;
         const inner = focused?.closest<HTMLElement>('[role="menu"]');
         const scope = inner && el.contains(inner) ? inner : el;
-        const items = Array.from(scope.querySelectorAll<HTMLElement>(MENU_ROW)).filter(
+        const items = Array.from(scope.querySelectorAll<HTMLElement>(MENU_ROWS)).filter(
           (item) => (item.closest('[role="menu"]') ?? scope) === scope,
         );
         if (items.length === 0) return;

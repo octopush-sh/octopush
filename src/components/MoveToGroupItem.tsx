@@ -143,7 +143,6 @@ export function MoveToGroupItem({ groups, currentGroupId, onMove, onNewGroup, on
                   type="button"
                   role="menuitemradio"
                   aria-checked={current}
-                  data-menu-item=""
                   className={MENU_ITEM}
                   title={group.name}
                   onClick={() => onMove(group.id)}
