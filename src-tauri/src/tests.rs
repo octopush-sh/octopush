@@ -1433,6 +1433,40 @@ mod terminal_tests {
         let max = db.max_terminal_position("ws-t5").unwrap();
         assert_eq!(max, Some(5));
     }
+
+    #[test]
+    fn set_terminal_order_renumbers_the_workspace_sessions() {
+        let db = test_db();
+        setup_workspace(&db, "proj-t6", "ws-t6");
+        setup_workspace(&db, "proj-t7", "ws-t7");
+
+        let ts = chrono::Utc::now().timestamp();
+        db.create_terminal("term-o1", "ws-t6", "A", 0, ts).unwrap();
+        db.create_terminal("term-o2", "ws-t6", "B", 1, ts).unwrap();
+        db.create_terminal("term-o3", "ws-t6", "C", 2, ts).unwrap();
+        db.create_terminal("term-other", "ws-t7", "X", 0, ts).unwrap();
+
+        let ids = |ws: &str| -> Vec<String> {
+            db.list_terminals(ws).unwrap().into_iter().map(|t| t.id).collect()
+        };
+
+        db.set_terminal_order("ws-t6", &["term-o3".into(), "term-o1".into(), "term-o2".into()])
+            .unwrap();
+        assert_eq!(ids("ws-t6"), vec!["term-o3", "term-o1", "term-o2"]);
+        let positions: Vec<u32> = db.list_terminals("ws-t6").unwrap().iter().map(|t| t.position).collect();
+        assert_eq!(positions, vec![0, 1, 2]);
+
+        // Another workspace's id, an unknown id and a duplicate move nothing;
+        // a session left out goes last.
+        db.set_terminal_order(
+            "ws-t6",
+            &["term-other".into(), "term-o2".into(), "nope".into(), "term-o2".into(), "term-o3".into()],
+        )
+        .unwrap();
+        assert_eq!(ids("ws-t6"), vec!["term-o2", "term-o3", "term-o1"]);
+        assert_eq!(ids("ws-t7"), vec!["term-other"]);
+        assert_eq!(db.list_terminals("ws-t7").unwrap()[0].position, 0);
+    }
 }
 
 /// Tests for Feature 5 v2 — cache token tracking and LiteLLM pricing parse.

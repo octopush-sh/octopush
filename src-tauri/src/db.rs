@@ -3840,6 +3840,35 @@ impl Db {
         Ok(val.map(|v| v as u32))
     }
 
+    /// Persist the session line's order: `ids[i]` takes position `i`. Only
+    /// the workspace's own terminals move, so a stale or foreign id is a
+    /// no-op, and a session `ids` leaves out goes after the listed ones,
+    /// keeping its relative order.
+    pub fn set_terminal_order(&self, workspace_id: &str, ids: &[String]) -> AppResult<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let current: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM terminals WHERE workspace_id = ?1 ORDER BY position ASC, created_at ASC",
+            )?;
+            let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+            rows.collect::<Result<Vec<_>, _>>()?
+        };
+        let mut order: Vec<&String> = Vec::with_capacity(current.len());
+        for id in ids.iter().chain(current.iter()) {
+            if current.contains(id) && !order.contains(&id) {
+                order.push(id);
+            }
+        }
+        for (idx, id) in order.iter().enumerate() {
+            tx.execute(
+                "UPDATE terminals SET position = ?1 WHERE id = ?2 AND workspace_id = ?3",
+                params![idx as i64, id, workspace_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn rename_terminal(&self, id: &str, label: &str) -> AppResult<()> {
         self.conn.execute(
             "UPDATE terminals SET label = ?1 WHERE id = ?2",

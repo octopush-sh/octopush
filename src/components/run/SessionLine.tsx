@@ -1,7 +1,10 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { Check, List, Plus } from "lucide-react";
-import { RUN_PANES, useTerminalsStore } from "../../stores/terminalsStore";
+import { DndContext, PointerSensor, useSensor, useSensors, type DragEndEvent } from "@dnd-kit/core";
+import { SortableContext, horizontalListSortingStrategy, useSortable } from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+import { RUN_PANES, moveSession, useTerminalsStore } from "../../stores/terminalsStore";
 import {
   PANE_LAYOUT_COUNT,
   choosePaneLayout,
@@ -19,6 +22,7 @@ import { sessionDoing } from "../../lib/sessionDoing";
 import { describeSetup } from "../../lib/setupRun";
 import { MENU_HEADER, MENU_ITEM, MENU_SEP } from "../../lib/menuStyles";
 import { tourId } from "../../lib/tour/ids";
+import { dur, ease } from "../../lib/tokens";
 import { MenuSurface } from "../MenuSurface";
 import { PaneLayoutIcon } from "../icons/PaneLayoutIcon";
 
@@ -174,6 +178,49 @@ function useInstantLabel() {
   return { tip, leaving, show, hide, dismiss };
 }
 
+// ─── Drag to reorder ──────────────────────────────────────────────
+
+interface SortableCellProps {
+  id: string;
+  /** A folded line shows one cell, which has nowhere to go. */
+  disabled: boolean;
+  tour?: string;
+  onMouseEnter: (el: HTMLElement) => void;
+  onMouseLeave: () => void;
+  children: ReactNode;
+}
+
+/**
+ * A cell's 24px box, draggable along the line. It moves by a horizontal
+ * translation only, on the house curve; the cell it is dragged over makes
+ * room. A press that travels under 5px is still a click.
+ */
+function SortableCell({ id, disabled, tour, onMouseEnter, onMouseLeave, children }: SortableCellProps) {
+  const { setNodeRef, listeners, transform, transition, isDragging } = useSortable({
+    id,
+    disabled,
+    transition: { duration: dur.quick, easing: ease.octo },
+  });
+  return (
+    <div
+      ref={setNodeRef}
+      role="presentation"
+      data-tour={tour}
+      data-testid={`session-cell-box-${id}`}
+      data-dragging={isDragging ? "true" : undefined}
+      style={{ transform: CSS.Translate.toString(transform && { ...transform, y: 0 }), transition }}
+      className={`octo-fade-in relative h-6 w-6 shrink-0 ${
+        isDragging ? "z-[1] cursor-grabbing rounded bg-octo-panel" : ""
+      }`}
+      {...listeners}
+      onMouseEnter={(e) => onMouseEnter(e.currentTarget)}
+      onMouseLeave={onMouseLeave}
+    >
+      {children}
+    </div>
+  );
+}
+
 // ─── The line ─────────────────────────────────────────────────────
 
 const LAYOUTS: { value: PaneLayout; label: string; hint?: string }[] = [
@@ -211,7 +258,9 @@ const COUNTER =
  *
  * Hover or keyboard focus puts an instant label under a cell — name, what it
  * is doing, its jump key — with no actions: a session's actions live on its
- * pane's caption. After the cells: `+`, a hairline, and the layout button.
+ * pane's caption. Dragging a cell along the line reorders the sessions
+ * (`reorderTerminals`), and ⌘⌥N follows. After the cells: `+`, a hairline,
+ * and the layout button.
  */
 export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
@@ -220,6 +269,7 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const openBeside = useTerminalsStore((s) => s.openBeside);
   const createTerminal = useTerminalsStore((s) => s.createTerminal);
   const updateLayout = useTerminalsStore((s) => s.updateLayout);
+  const reorderTerminals = useTerminalsStore((s) => s.reorderTerminals);
   const setupByTerminal = useTerminalsStore((s) => s.setupByTerminal);
   const layout = useTerminalLayoutStore((s) => s.runByWs[workspaceId]);
   const split = useTerminalLayoutStore((s) => s.splitByWs[workspaceId]);
@@ -238,6 +288,8 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   // opens the label, and a label the keyboard opened outlives the pointer.
   const pressed = useRef(false);
   const keyboardId = useRef<string | null>(null);
+  // Past 5px a press is a drag; dnd-kit then swallows the click that ends it.
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
   // The track's width is set by the band's grid, never by this content, so
   // folding the cells can't feed back into the measurement. The root's 1px
@@ -286,6 +338,13 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const activate = (id: string, beside: boolean) => {
     if (beside) openBeside(workspaceId, id);
     else setActive(workspaceId, id);
+  };
+
+  /** A cell dropped on another takes its place in the session order, among
+   *  every session (cells or not), so ⌘⌥N follows what the line shows. */
+  const onDragEnd = ({ active, over }: DragEndEvent) => {
+    if (!over || active.id === over.id) return;
+    reorderTerminals(workspaceId, moveSession(ids, String(active.id), String(over.id))).catch(console.error);
   };
 
   /** Roving focus across every control of the line. */
@@ -377,6 +436,15 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
           `All ${terminals.length} sessions · ⌘⌥K`,
         )}
 
+      <DndContext
+        sensors={sensors}
+        onDragStart={() => {
+          pressed.current = false;
+          label.dismiss();
+        }}
+        onDragEnd={onDragEnd}
+      >
+      <SortableContext items={cells.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
       <div
         role="tablist"
         aria-label="Terminal sessions"
@@ -394,15 +462,12 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
           const name = `${t.label} — ${doingOf(t)}${jump ? ` · ${jump}` : ""}`;
 
           return (
-            <div
+            <SortableCell
               key={t.id}
-              role="presentation"
-              data-tour={setup ? tourId("run-setup-session") : undefined}
-              className="octo-fade-in relative h-6 w-6 shrink-0"
-              onPointerDown={() => {
-                pressed.current = true;
-              }}
-              onMouseEnter={(e) => label.show(t.id, e.currentTarget)}
+              id={t.id}
+              disabled={folded}
+              tour={setup ? tourId("run-setup-session") : undefined}
+              onMouseEnter={(el) => label.show(t.id, el)}
               onMouseLeave={() => {
                 if (keyboardId.current !== t.id) label.hide(t.id);
               }}
@@ -422,6 +487,9 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
                 // (and on keyboard focus) with the same text, and it is
                 // `aria-hidden` because this name already says it.
                 aria-label={name}
+                onPointerDown={() => {
+                  pressed.current = true;
+                }}
                 onClick={(e) => {
                   pressed.current = false;
                   activate(t.id, e.altKey);
@@ -496,10 +564,12 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
                   title={describeSetup(setup)}
                 />
               )}
-            </div>
+            </SortableCell>
           );
         })}
       </div>
+      </SortableContext>
+      </DndContext>
 
       {plan.counter === "more" &&
         counter(`+${all.more}`, `${all.more} more sessions`, `${all.more} more sessions · ⌘⌥K`)}

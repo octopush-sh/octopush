@@ -37,6 +37,7 @@ const mockIpc = {
     (workspaceId: string, label: string) => Promise<TerminalRecord>
   >(),
   renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
+  reorderTerminals: vi.fn<(workspaceId: string, ids: string[]) => Promise<void>>(),
   deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
   listPtySessions: vi.fn<() => Promise<PtySession[]>>(),
 };
@@ -331,6 +332,82 @@ describe("terminalsStore — renameTerminal", () => {
 
     // Should have reverted back to "Original"
     expect(useTerminalsStore.getState().getTerminals(ws)[0].label).toBe("Original");
+  });
+});
+
+describe("terminalsStore — reorderTerminals", () => {
+  beforeEach(() => resetStore());
+
+  const ws = "ws-order";
+  const seedOrder = (ids: string[]) =>
+    useTerminalsStore.setState({
+      terminalsByWs: {
+        [ws]: ids.map((id, position) => ({
+          id,
+          label: id,
+          position,
+          running: true,
+          busy: false,
+          restored: false,
+          role: "shell" as const,
+          command: null,
+        })),
+      },
+    });
+  const order = () => useTerminalsStore.getState().getTerminals(ws).map((t) => t.id);
+
+  it("puts the sessions in the new order at once, renumbered, and saves it", async () => {
+    seedOrder(["a", "b", "c"]);
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    const done = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    expect(order()).toEqual(["c", "a", "b"]);
+    expect(useTerminalsStore.getState().getTerminals(ws).map((t) => t.position)).toEqual([0, 1, 2]);
+    await done;
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(ws, ["c", "a", "b"]);
+    expect(order()).toEqual(["c", "a", "b"]);
+  });
+
+  it("puts the old order back and says so when the save fails", async () => {
+    seedOrder(["a", "b", "c"]);
+    mockIpc.reorderTerminals.mockRejectedValueOnce(new Error("db locked"));
+    await useTerminalsStore.getState().reorderTerminals(ws, ["b", "a", "c"]);
+    expect(order()).toEqual(["a", "b", "c"]);
+    expect(mockPushToast).toHaveBeenCalledWith(
+      expect.objectContaining({ level: "error", title: "Couldn't reorder sessions" }),
+    );
+  });
+
+  it("saves nothing when the order doesn't change", async () => {
+    seedOrder(["a", "b"]);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["a", "b"]);
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+  });
+
+  it("ignores unknown ids and keeps sessions left out after the listed ones", async () => {
+    seedOrder(["a", "b", "c", "d"]);
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["c", "gone", "a", "c"]);
+    expect(order()).toEqual(["c", "a", "b", "d"]);
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(ws, ["c", "a", "b", "d"]);
+  });
+
+  it("leaves the panes as they are", async () => {
+    seedOrder(["a", "b", "c"]);
+    useTerminalsStore.getState().updateLayout(ws, (l) => ({ ...l, slots: ["b", "c"], focused: 1, ratios: [0.5, 0.5] }));
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["c", "b", "a"]);
+    expect(useTerminalLayoutStore.getState().getRun(ws).slots).toEqual(["b", "c"]);
+    expect(useTerminalsStore.getState().getActiveId(ws)).toBe("c");
+  });
+});
+
+describe("moveSession", () => {
+  it("moves a session to where the one it is dropped on stands", async () => {
+    const { moveSession } = await import("./terminalsStore");
+    expect(moveSession(["a", "b", "c", "d"], "a", "c")).toEqual(["b", "c", "a", "d"]);
+    expect(moveSession(["a", "b", "c", "d"], "d", "b")).toEqual(["a", "d", "b", "c"]);
+    expect(moveSession(["a", "b"], "a", "a")).toEqual(["a", "b"]);
+    expect(moveSession(["a", "b"], "a", "zz")).toEqual(["a", "b"]);
   });
 });
 
