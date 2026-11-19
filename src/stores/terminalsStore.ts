@@ -431,10 +431,16 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
     try {
       await ipc.reorderTerminals(workspaceId, next.map((t) => t.id));
     } catch (e) {
-      // Put the old order back, unless something else changed the list since.
-      set((s) =>
-        s.terminalsByWs[workspaceId] === next ? { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev } } : s,
-      );
+      // Put the old order back. A list that changed since but still stands in
+      // this call's order (a busy tick) gets the old order over its live
+      // entries; a newer reorder, or a session opened or closed, is left be.
+      set((s) => {
+        const now = s.terminalsByWs[workspaceId];
+        if (now === next) return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev } };
+        if (!now || now.length !== next.length || now.some((t, i) => t.id !== next[i]?.id)) return s;
+        const restored = orderSessions(now, prev.map((t) => t.id));
+        return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: restored } };
+      });
       pushToast({ level: "error", title: "Couldn't reorder sessions", body: String(e) });
     }
   },

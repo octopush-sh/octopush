@@ -377,6 +377,34 @@ describe("terminalsStore — reorderTerminals", () => {
     );
   });
 
+  it("puts the old order back after a failed save even when a busy tick changed the list", async () => {
+    seedOrder(["a", "b", "c"]);
+    let fail!: (e: Error) => void;
+    mockIpc.reorderTerminals.mockReturnValueOnce(new Promise<void>((_, reject) => (fail = reject)));
+    const done = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    useTerminalsStore.setState((s) => ({
+      terminalsByWs: { [ws]: s.terminalsByWs[ws].map((t) => (t.id === "a" ? { ...t, busy: true } : t)) },
+    }));
+    fail(new Error("db locked"));
+    await done;
+    expect(order()).toEqual(["a", "b", "c"]);
+    expect(useTerminalsStore.getState().getTerminals(ws).map((t) => t.position)).toEqual([0, 1, 2]);
+    // The live change survives the rollback.
+    expect(useTerminalsStore.getState().getTerminals(ws)[0].busy).toBe(true);
+  });
+
+  it("leaves a newer order alone when an older save fails", async () => {
+    seedOrder(["a", "b", "c"]);
+    let fail!: (e: Error) => void;
+    mockIpc.reorderTerminals.mockReturnValueOnce(new Promise<void>((_, reject) => (fail = reject)));
+    mockIpc.reorderTerminals.mockResolvedValueOnce(undefined);
+    const first = useTerminalsStore.getState().reorderTerminals(ws, ["c", "a", "b"]);
+    await useTerminalsStore.getState().reorderTerminals(ws, ["b", "c", "a"]);
+    fail(new Error("db locked"));
+    await first;
+    expect(order()).toEqual(["b", "c", "a"]);
+  });
+
   it("saves nothing when the order doesn't change", async () => {
     seedOrder(["a", "b"]);
     await useTerminalsStore.getState().reorderTerminals(ws, ["a", "b"]);
