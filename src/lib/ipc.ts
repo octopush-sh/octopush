@@ -1175,6 +1175,9 @@ export const ipc = {
     invoke<TerminalRecord>("create_terminal", { workspaceId, label }),
   renameTerminal: (id: string, label: string) =>
     invoke<void>("rename_terminal", { id, label }),
+  /** Persist the session line's order: `ids[i]` takes position `i`. */
+  reorderTerminals: (workspaceId: string, ids: string[]) =>
+    invoke<void>("reorder_terminals", { workspaceId, ids }),
   deleteTerminal: (id: string) =>
     invoke<void>("delete_terminal", { id }),
 

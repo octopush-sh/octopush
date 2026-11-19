@@ -115,6 +115,35 @@ function saveSetupTerminals(ids: string[]) {
   }
 }
 
+/**
+ * `terminals` in `ids`' order, renumbered. Ids that aren't sessions of the
+ * list are ignored, and a session `ids` leaves out keeps its relative place
+ * after the listed ones (the backend's `set_terminal_order` does the same).
+ */
+export function orderSessions(terminals: readonly TerminalState[], ids: readonly string[]): TerminalState[] {
+  const byId = new Map(terminals.map((t) => [t.id, t]));
+  const seen = new Set<string>();
+  const ordered: TerminalState[] = [];
+  for (const id of [...ids, ...terminals.map((t) => t.id)]) {
+    const t = byId.get(id);
+    if (!t || seen.has(id)) continue;
+    seen.add(id);
+    ordered.push(t);
+  }
+  return ordered.map((t, position) => (t.position === position ? t : { ...t, position }));
+}
+
+/** `ids` with `id` moved to where `overId` stands, as a drop on it does. */
+export function moveSession(ids: readonly string[], id: string, overId: string): string[] {
+  const from = ids.indexOf(id);
+  const to = ids.indexOf(overId);
+  if (from === -1 || to === -1 || from === to) return [...ids];
+  const next = [...ids];
+  next.splice(from, 1);
+  next.splice(to, 0, id);
+  return next;
+}
+
 // ─── Store interface ──────────────────────────────────────────────
 
 interface TerminalsStore {
@@ -142,6 +171,10 @@ interface TerminalsStore {
     targetSlot?: (layout: RunLayout) => number,
   ) => Promise<TerminalState>;
   renameTerminal: (workspaceId: string, id: string, label: string) => Promise<void>;
+  /** Put the workspace's sessions in `ids`' order (the session line's drag),
+   *  so cells, ⌘⌥N and the switcher follow it. Optimistic; a failed save
+   *  puts the old order back and says so. */
+  reorderTerminals: (workspaceId: string, ids: string[]) => Promise<void>;
   deleteTerminal: (workspaceId: string, id: string) => Promise<void>;
   /** Focus `id`'s pane if it is on screen; otherwise put it in the focused pane. */
   setActive: (workspaceId: string, id: string | null) => void;
@@ -385,6 +418,30 @@ export const useTerminalsStore = create<TerminalsStore>((set, get) => ({
         terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev },
       }));
       throw err;
+    }
+  },
+
+  reorderTerminals: async (workspaceId, ids) => {
+    const prev = get().terminalsByWs[workspaceId] ?? EMPTY_TERMINALS;
+    const next = orderSessions(prev, ids);
+    if (next.every((t, i) => t.id === prev[i]?.id)) return;
+    bumpLoadGen(workspaceId); // a snapshot fetched before the move is stale
+    set((s) => ({ terminalsByWs: { ...s.terminalsByWs, [workspaceId]: next } }));
+
+    try {
+      await ipc.reorderTerminals(workspaceId, next.map((t) => t.id));
+    } catch (e) {
+      // Put the old order back. A list that changed since but still stands in
+      // this call's order (a busy tick) gets the old order over its live
+      // entries; a newer reorder, or a session opened or closed, is left be.
+      set((s) => {
+        const now = s.terminalsByWs[workspaceId];
+        if (now === next) return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: prev } };
+        if (!now || now.length !== next.length || now.some((t, i) => t.id !== next[i]?.id)) return s;
+        const restored = orderSessions(now, prev.map((t) => t.id));
+        return { terminalsByWs: { ...s.terminalsByWs, [workspaceId]: restored } };
+      });
+      pushToast({ level: "error", title: "Couldn't reorder sessions", body: String(e) });
     }
   },
 

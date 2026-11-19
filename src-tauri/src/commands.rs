@@ -3404,6 +3404,16 @@ pub async fn rename_terminal(
     state.db.lock().rename_terminal(&id, &label)
 }
 
+/// Persist the order of a workspace's sessions (the session line's drag).
+#[tauri::command]
+pub async fn reorder_terminals(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    ids: Vec<String>,
+) -> AppResult<()> {
+    state.db.lock().set_terminal_order(&workspace_id, &ids)
+}
+
 #[tauri::command]
 pub async fn delete_terminal(
     state: State<'_, AppState>,

@@ -15,6 +15,7 @@ const mockIpc = {
   createTerminal: vi.fn(),
   renameTerminal: vi.fn<(id: string, label: string) => Promise<void>>(),
   deleteTerminal: vi.fn<(id: string) => Promise<void>>(),
+  reorderTerminals: vi.fn<(workspaceId: string, ids: string[]) => Promise<void>>(),
   listPtySessions: vi.fn(),
 };
 vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
@@ -682,6 +683,160 @@ describe("SessionLine — a narrow band", () => {
     expect(all).toHaveAccessibleName("All 6 sessions");
     expect(all).toHaveAttribute("title", "All 6 sessions · ⌘⌥K");
     expect(all.querySelector("svg")).not.toBeNull();
+  });
+});
+
+describe("SessionLine — drag to reorder", () => {
+  /** Lay the cell boxes out as the band does: 24px apart, from x = 0. */
+  const layOut = (order: () => string[]) =>
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const id = (this as HTMLElement).dataset?.testid?.match(/^session-cell-box-(.+)$/)?.[1];
+      const at = id ? order().indexOf(id) : -1;
+      const left = at < 0 ? 0 : at * 26;
+      const width = at < 0 ? 0 : 24;
+      return { x: left, y: 0, left, top: 0, right: left + width, bottom: at < 0 ? 0 : 24, width, height: at < 0 ? 0 : 24, toJSON: () => ({}) } as DOMRect;
+    });
+  const order = () => useTerminalsStore.getState().getTerminals(WS).map((t) => t.id);
+  const box = (id: string) => screen.getByTestId(`session-cell-box-${id}`);
+  const pointer = { isPrimary: true, button: 0, pointerId: 1 };
+
+  /** Press a cell, travel `dx`, let go. */
+  async function drag(id: string, dx: number) {
+    const start = box(id).getBoundingClientRect().left + 12;
+    fireEvent.pointerDown(cell(id), { ...pointer, clientX: start, clientY: 12 });
+    // dnd-kit activates past 5px, then follows the pointer in steps.
+    for (const x of [start + 6, start + dx / 2, start + dx]) {
+      await act(async () => {
+        fireEvent.pointerMove(document, { ...pointer, clientX: x, clientY: 12 });
+      });
+    }
+    await act(async () => {
+      fireEvent.pointerUp(document, { ...pointer, clientX: start + dx, clientY: 12 });
+    });
+    // dnd-kit swallows the click that ends a drag, then lets clicks through
+    // again 50ms later.
+    await act(() => new Promise((resolve) => setTimeout(resolve, 60)));
+  }
+
+  it("moves a cell dropped on another to its place, saves it, and ⌘⌥N follows", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    seed([{ id: "a", label: "a" }, { id: "b", label: "b" }, { id: "c", label: "c" }]);
+    layOut(order);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    expect(cell("c").getAttribute("aria-label")).toContain("⌘⌥3");
+
+    await drag("c", -52);
+
+    expect(order()).toEqual(["c", "a", "b"]);
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(WS, ["c", "a", "b"]);
+    const cells = within(screen.getByRole("tablist", { name: "Terminal sessions" })).getAllByRole("tab");
+    expect(cells.map((c) => c.dataset.testid)).toEqual(["session-cell-c", "session-cell-a", "session-cell-b"]);
+    expect(cell("c").getAttribute("aria-label")).toContain("⌘⌥1");
+    expect(cell("a").getAttribute("aria-label")).toContain("⌘⌥2");
+    // Dragging is not choosing: the pane keeps its session.
+    expect(run().slots).toEqual(["a"]);
+  });
+
+  it("cancels a drag on Escape: the order stays, nothing is saved, the pane keeps its session", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    seed([{ id: "a", label: "a" }, { id: "b", label: "b" }, { id: "c", label: "c" }]);
+    layOut(order);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    const start = box("c").getBoundingClientRect().left + 12;
+    fireEvent.pointerDown(cell("c"), { ...pointer, clientX: start, clientY: 12 });
+    for (const x of [start - 6, start - 26, start - 52]) {
+      await act(async () => {
+        fireEvent.pointerMove(document, { ...pointer, clientX: x, clientY: 12 });
+      });
+    }
+    expect(box("c").dataset.dragging).toBe("true");
+
+    await act(async () => {
+      fireEvent.keyDown(document, { key: "Escape", code: "Escape" });
+    });
+    expect(box("c").dataset.dragging).toBeUndefined();
+    await act(async () => {
+      fireEvent.pointerUp(document, { ...pointer, clientX: start - 52, clientY: 12 });
+    });
+    await act(() => new Promise((resolve) => setTimeout(resolve, 60)));
+
+    expect(order()).toEqual(["a", "b", "c"]);
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+    expect(run().slots).toEqual(["a"]);
+  });
+
+  it("starts no drag on a folded line", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    track(200);
+    seed(many(6), ["s3"]);
+    layOut(order);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    expect(screen.getByTestId("session-line").dataset.folded).toBe("true");
+    const start = box("s3").getBoundingClientRect().left + 12;
+    fireEvent.pointerDown(cell("s3"), { ...pointer, clientX: start, clientY: 12 });
+    for (const x of [start - 6, start - 26, start - 52]) {
+      await act(async () => {
+        fireEvent.pointerMove(document, { ...pointer, clientX: x, clientY: 12 });
+      });
+      expect(box("s3").dataset.dragging).toBeUndefined();
+    }
+    await act(async () => {
+      fireEvent.pointerUp(document, { ...pointer, clientX: start - 52, clientY: 12 });
+    });
+    expect(order()).toEqual(["s1", "s2", "s3", "s4", "s5", "s6"]);
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+  });
+
+  it("changes nothing for a drop off the cells, or back on its own cell", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    seed([{ id: "a", label: "a" }, { id: "b", label: "b" }, { id: "c", label: "c" }]);
+    layOut(order);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+
+    // Far past the last cell: it is over nothing.
+    await drag("a", 400);
+    expect(order()).toEqual(["a", "b", "c"]);
+    // A short trip that ends on the cell it started from.
+    await drag("b", 8);
+    expect(order()).toEqual(["a", "b", "c"]);
+
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+    expect(run().slots).toEqual(["a"]);
+  });
+
+  it("places a cell dropped on a focused session past the cells at that session's place", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    seed(many(11), ["s10"]);
+    // The cells as drawn: the first six, then the focused session.
+    const drawn = ["s1", "s2", "s3", "s4", "s5", "s6", "s10"];
+    layOut(() => drawn);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+
+    await drag("s2", 5 * 26);
+
+    // Among every session, not only the cells: s2 takes s10's place in the
+    // full order, so it lands just after s10 and goes into +N.
+    const moved = ["s1", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s2", "s11"];
+    expect(order()).toEqual(moved);
+    expect(mockIpc.reorderTerminals).toHaveBeenCalledWith(WS, moved);
+    const cells = screen.getAllByRole("tab").map((c) => c.dataset.testid);
+    expect(cells).toEqual(["s1", "s3", "s4", "s5", "s6", "s7", "s10"].map((id) => `session-cell-${id}`));
+    expect(screen.getByTestId("session-more")).toHaveTextContent("+4");
+    expect(run().slots).toEqual(["s10"]);
+  });
+
+  it("keeps a press that barely moves a click", async () => {
+    mockIpc.reorderTerminals = vi.fn().mockResolvedValue(undefined);
+    seed([{ id: "a", label: "a" }, { id: "b", label: "b" }]);
+    layOut(order);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    fireEvent.pointerDown(cell("b"), { ...pointer, clientX: 38, clientY: 12 });
+    fireEvent.pointerMove(document, { ...pointer, clientX: 40, clientY: 12 });
+    fireEvent.pointerUp(document, { ...pointer, clientX: 40, clientY: 12 });
+    fireEvent.click(cell("b"));
+    expect(order()).toEqual(["a", "b"]);
+    expect(mockIpc.reorderTerminals).not.toHaveBeenCalled();
+    expect(run().slots).toEqual(["b"]);
   });
 });
 

@@ -344,6 +344,7 @@ pub fn run() {
             commands::list_terminals,
             commands::create_terminal,
             commands::rename_terminal,
+            commands::reorder_terminals,
             commands::delete_terminal,
             // PTY daemon
             commands::list_pty_sessions,
