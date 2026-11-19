@@ -386,6 +386,11 @@ pub struct CliOutcomeMeta {
     /// when they match or the init didn't say. The drive records it on the
     /// stage, so its spend is attributed and priced to what ran.
     pub ran_model: Option<String>,
+    /// The tool calls Claude Code refused in this attempt, from its result
+    /// event's `permission_denials` (`cli_runner::refused_calls`), repeats
+    /// collapsed. The runner journals each; the drive records the total so
+    /// the stage reads "N tool calls refused".
+    pub refused_calls: Vec<crate::orchestrator::cli_runner::RefusedCall>,
 }
 
 /// What a runner returns for one stage.

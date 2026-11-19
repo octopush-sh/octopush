@@ -341,6 +341,10 @@ export interface RunStage {
    *  `system/init` named another than `agentModel` (set by `get_run`; #791).
    *  null/absent = it ran on the model it asked for. */
   ranModel?: string | null;
+  /** How many tool calls Claude Code refused in the stage's last attempt
+   *  (its result event's `permission_denials`; set by `get_run`; #893).
+   *  0/absent = none. Each is in the stage's journal as "refused · …". */
+  refusedCalls?: number;
   artifact: string | null;
   feedback: string | null;
   error: string | null;

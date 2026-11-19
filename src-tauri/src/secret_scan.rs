@@ -959,6 +959,67 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
     out
 }
 
+// ─── Redaction (one line of text shown to people) ──────────────────────
+
+/// What a redacted value reads as.
+pub const REDACTED: &str = "[redacted]";
+
+/// `NAME=value` anywhere on a line (a command's inline env), quoted or not.
+static INLINE_ASSIGN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"\b([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|[^\s"']+)"#).unwrap()
+});
+/// A bearer token (`Authorization: Bearer …`, `curl -H "…Bearer …"`).
+static BEARER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=\-]{8,})").unwrap());
+/// The password of a URL's userinfo (`https://user:pass@host`).
+static URL_PASSWORD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"://[^/\s:@]+:([^@\s/]+)@").unwrap());
+
+/// `line` with every value the guard's rules would call a secret replaced by
+/// [`REDACTED`]: your own credentials, the prefixed provider tokens, AWS key
+/// ids, credential-named assignments (`TOKEN=…`, `api_key: "…"`), bearer
+/// tokens and URL passwords. Unlike a scan it leans to over-redacting (no
+/// entropy or placeholder filter): it guards text shown on screen, such as a
+/// refused command in the journal, not a commit. Pure.
+pub fn redact_line(line: &str, known: &[KnownSecret]) -> String {
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for k in known.iter().filter(|k| !k.value.is_empty()) {
+        spans.extend(line.match_indices(k.value.as_str()).map(|(at, v)| (at, at + v.len())));
+    }
+    for r in TOKEN_RULES.iter() {
+        spans.extend(r.re.find_iter(line).map(|m| (m.start(), m.end())));
+    }
+    spans.extend(AWS_KEY_ID.find_iter(line).map(|m| (m.start(), m.end())));
+    for c in INLINE_ASSIGN.captures_iter(line) {
+        let (Some(name), Some(v)) = (c.get(1), c.get(2)) else { continue };
+        let value = v.as_str().trim_matches(['"', '\'']);
+        if ENV_CREDENTIAL_NAME.is_match(name.as_str()) && !value.is_empty() && !value.starts_with('$') {
+            spans.push((v.start(), v.end()));
+        }
+    }
+    for re in [&*GENERIC_ASSIGN, &*BEARER, &*URL_PASSWORD] {
+        spans.extend(re.captures_iter(line).filter_map(|c| c.get(1)).map(|m| (m.start(), m.end())));
+    }
+    if spans.is_empty() {
+        return line.to_string();
+    }
+    spans.sort_unstable();
+    let mut out = String::with_capacity(line.len());
+    let mut at = 0;
+    for (start, end) in spans {
+        if end <= at {
+            continue;
+        }
+        if start >= at {
+            out.push_str(&line[at..start]);
+            out.push_str(REDACTED);
+        }
+        at = end;
+    }
+    out.push_str(&line[at..]);
+    out
+}
+
 /// Scan the added lines of `files` and return the first [`MAX_FINDINGS`]
 /// findings. `known` are the credentials Octopush holds; a hit on one of
 /// them is reported as "your … key" and wins over any pattern on the line.

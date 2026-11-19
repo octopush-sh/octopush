@@ -262,6 +262,34 @@ describe("RunFlow — a stage that ran on another model (#791)", () => {
   });
 });
 
+describe("RunFlow — tool calls Claude Code refused (#893)", () => {
+  it("adds the amber count to a done card's verdict, which stays the last non-refusal notice", () => {
+    live.liveByStage = {
+      a: [
+        { kind: "notice", text: "VERDICT: PASS" },
+        { kind: "notice", text: "refused · Bash · git push ×2" },
+      ],
+    };
+    const done = [mk({ id: "a", status: "done", substrate: "cli", refusedCalls: 2 })];
+    render(<RunFlow stages={done} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />);
+    expect(screen.getByText("VERDICT: PASS")).toBeInTheDocument();
+    const note = screen.getByText("2 tool calls refused");
+    expect(note).toHaveClass("text-octo-warning");
+    expect(note.className).not.toMatch(/brass/);
+    expect(note.getAttribute("data-tour")).toBe("direct-stage-refused");
+    live.liveByStage = {};
+  });
+
+  it("says nothing while running, or when nothing was refused", () => {
+    const quiet = [
+      mk({ id: "a", status: "done", refusedCalls: 0 }),
+      mk({ id: "b", position: 1, status: "running", startedAt: 1, refusedCalls: 3 }),
+    ];
+    render(<RunFlow stages={quiet} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />);
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+  });
+});
+
 
 describe("RunFlow — an aborted run (#891)", () => {
   it("reads the stage the abort froze at running as aborted, muted, without the waiting line", () => {

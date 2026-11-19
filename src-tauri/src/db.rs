@@ -840,6 +840,9 @@ impl Db {
         // Code's `system/init` named another than `agent_model` (its settings
         // blocked the requested one). NULL when they matched or nobody said.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN ran_model TEXT")?;
+        // #893: how many tool calls Claude Code refused in the stage's last
+        // attempt (its result event's `permission_denials`).
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN refused_calls INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -6551,6 +6554,26 @@ impl Db {
         rows.collect::<Result<_, _>>().map_err(Into::into)
     }
 
+    /// Record how many tool calls Claude Code refused in a stage's attempt
+    /// (`0` clears an earlier attempt's).
+    pub fn set_run_stage_refused_calls(&self, stage_id: &str, count: u32) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET refused_calls = ?2 WHERE id = ?1",
+            params![stage_id, count],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages whose last attempt had tool calls refused: stage id →
+    /// how many.
+    pub fn refused_call_counts(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, u32>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, refused_calls FROM run_stages WHERE run_id = ?1 AND refused_calls > 0")?;
+        let rows = stmt.query_map(params![run_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u32>(1)?)))?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
     /// Ids of the run's stages flagged `usage_unreported`.
     pub fn usage_unreported_stage_ids(&self, run_id: &str) -> AppResult<std::collections::HashSet<String>> {
         let mut stmt = self
@@ -6782,7 +6805,7 @@ impl Db {
             "UPDATE run_stages
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
-                 blocked_questions = NULL, secret_hold = NULL, ran_model = NULL,
+                 blocked_questions = NULL, secret_hold = NULL, ran_model = NULL, refused_calls = 0,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],

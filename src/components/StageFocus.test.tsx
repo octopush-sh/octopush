@@ -212,6 +212,18 @@ describe("StageFocus live journal", () => {
     render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
     expect(screen.queryByRole("button", { name: /work journal/i })).not.toBeInTheDocument();
   });
+
+  it("says in the header how many tool calls Claude Code refused, in amber (#893)", () => {
+    const artifact = JSON.stringify({ kind: "diff", text: "done" });
+    const { rerender } = render(
+      <StageFocus stage={{ ...baseStage, status: "done", artifact, refusedCalls: 1 }} workspacePath="/tmp" />,
+    );
+    const note = screen.getByText("1 tool call refused");
+    expect(note).toHaveClass("text-octo-warning");
+    expect(note.getAttribute("data-tour")).toBe("direct-focus-refused");
+    rerender(<StageFocus stage={{ ...baseStage, status: "done", artifact, refusedCalls: 0 }} workspacePath="/tmp" />);
+    expect(screen.queryByText(/tool calls? refused/)).not.toBeInTheDocument();
+  });
 });
 
 const archiveRow = {
