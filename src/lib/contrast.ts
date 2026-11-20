@@ -152,6 +152,30 @@ export function solveMatchWashAlpha(accent: string, bg: string): number {
   return solveTintAlpha(accent, bg, MATCH_WASH_TARGET, 0.04) ?? ATELIER_WASH_ALPHA;
 }
 
+/** Contrast a small mark (a group's chevron, its 1px guide) must clear against
+ *  the ground it sits on: WCAG 1.4.11's 3:1 for graphical objects. */
+export const MARK_INK_TARGET = 3;
+
+/**
+ * `color`, mixed toward `toward` (the theme's text) just far enough to reach
+ * `target` contrast against `bg`, as `#rrggbb`; `color` itself, normalised,
+ * when it already does. A pale tint (bone, smoke) reads on onyx but nearly
+ * vanishes on cream: mixing toward the text keeps its cast and gives it the
+ * weight the ground takes away. Null when a colour is unparseable.
+ */
+export function solveMarkInk(color: string, toward: string, bg: string, target = MARK_INK_TARGET): string | null {
+  const c = hexToRgb(color);
+  const t = hexToRgb(toward);
+  const b = hexToRgb(bg);
+  if (!c || !t || !b) return null;
+  let ink = c;
+  for (let mix = 0; mix <= 1 + 1e-9; mix += 0.02) {
+    ink = composite(t, Math.min(1, mix), c);
+    if (contrastRatio(ink, b) >= target) break;
+  }
+  return `#${ink.map((v) => v.toString(16).padStart(2, "0")).join("")}`;
+}
+
 /** True when `bg` is dark enough that CodeMirror should apply its dark-mode
  *  defaults. Feeds `EditorView.theme`'s `dark` flag, which used to be
  *  hardcoded to true — wrong for the vellum light theme.

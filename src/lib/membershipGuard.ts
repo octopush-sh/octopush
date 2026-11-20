@@ -24,7 +24,10 @@ interface Change {
 }
 
 let clock = 0;
-const changes = new Map<string, Change>();
+/** Per item, its live changes, oldest first. An older one is kept under a
+ *  newer one: if the newer is dropped, a reload that read before the older
+ *  settled must still show the older. */
+const changes = new Map<string, Change[]>();
 const loadsInFlight = new Set<number>();
 
 const keyOf = (kind: GroupScope, itemId: string) => `${kind}:${itemId}`;
@@ -32,8 +35,10 @@ const keyOf = (kind: GroupScope, itemId: string) => `${kind}:${itemId}`;
 /** Forget settled changes no reload in flight could still contradict. */
 function prune() {
   const oldestLoad = loadsInFlight.size > 0 ? Math.min(...loadsInFlight) : Infinity;
-  for (const [key, change] of changes) {
-    if (change.settledAt !== null && change.settledAt < oldestLoad) changes.delete(key);
+  for (const [key, list] of changes) {
+    const kept = list.filter((c) => c.settledAt === null || c.settledAt >= oldestLoad);
+    if (kept.length === 0) changes.delete(key);
+    else if (kept.length !== list.length) changes.set(key, kept);
   }
 }
 
@@ -48,16 +53,17 @@ export interface MembershipChange {
 
 /** Record that `itemIds` are being moved to `groupId` (null: out of any
  *  group). Call before the backend request; settle or drop it afterwards. A
- *  newer change to the same item replaces an older one. */
+ *  newer change to the same item wins over an older one while both live. */
 export function beginMembershipChange(
   kind: GroupScope,
   itemIds: string[],
   groupId: string | null,
 ): MembershipChange {
   const mine = itemIds.map((id) => {
+    const key = keyOf(kind, id);
     const change: Change = { groupId, settledAt: null };
-    changes.set(keyOf(kind, id), change);
-    return [keyOf(kind, id), change] as const;
+    changes.set(key, [...(changes.get(key) ?? []), change]);
+    return [key, change] as const;
   });
   return {
     settle: () => {
@@ -66,7 +72,11 @@ export function beginMembershipChange(
       prune();
     },
     drop: () => {
-      for (const [key, change] of mine) if (changes.get(key) === change) changes.delete(key);
+      for (const [key, change] of mine) {
+        const kept = (changes.get(key) ?? []).filter((c) => c !== change);
+        if (kept.length === 0) changes.delete(key);
+        else changes.set(key, kept);
+      }
     },
   };
 }
@@ -93,7 +103,9 @@ export function beginMembershipLoad(kind: GroupScope): MembershipLoad {
   return {
     overlay: (rows) =>
       rows.map((row) => {
-        const change = changes.get(keyOf(kind, row.id));
+        // The newest live change says where the item belongs; if the read
+        // already saw it, the read is the truth.
+        const change = changes.get(keyOf(kind, row.id))?.at(-1);
         if (!change) return row;
         const missed = change.settledAt === null || change.settledAt > startedAt;
         return missed && (row.groupId ?? null) !== change.groupId

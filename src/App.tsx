@@ -101,9 +101,6 @@ import {
   moveProjectToGroup,
 } from "./lib/groupActions";
 import type { Group } from "./lib/types";
-
-/** What the mission menu's group selector returns while no menu is open. */
-const NO_GROUPS: Group[] = [];
 import { modKeyLabel } from "./lib/platform";
 import { listen } from "@tauri-apps/api/event";
 import { deriveChatTitle, deriveChatMeta, formatRelTime } from "./lib/chatTitle";
@@ -140,6 +137,9 @@ import { DIFF_ARRIVAL_WAIT_MS, revealDiffTargetWhenReady, stripDiffPrefix } from
 
 
 type AppView = "project" | "new-project";
+
+/** What the group menus' selectors return while no menu is open. */
+const NO_GROUPS: Group[] = [];
 
 // Workspace ids whose terminal hydration is currently in flight. Guards the
 // "auto-create Main when empty" branch against double-creation: StrictMode's
@@ -585,11 +585,16 @@ function App() {
         // Try to restore last opened project
         const lastPath = getLastOpenedPath();
         if (lastPath) {
+          // What this reopening makes active is the launch restore: the rail
+          // leaves its groups folded for it (`workspaceStore.launchRestoredId`).
+          useWorkspaceStore.getState().beginLaunchRestore();
           try {
             await openProject(lastPath);
           } catch {
             // If last project can't be opened, leave the welcome screen
           }
+          // `open` reports a failure in the store rather than throwing.
+          if (!useProjectStore.getState().current) useWorkspaceStore.getState().cancelLaunchRestore();
         }
       }
     })();

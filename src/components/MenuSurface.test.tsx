@@ -79,14 +79,14 @@ describe("MenuSurface", () => {
     expect(screen.getByRole("menuitem", { name: "One" })).toHaveFocus();
   });
 
-  it("walks radio and checkbox rows, skips rows out of the tab order, and takes an opted-in control", () => {
+  it("walks radio and checkbox rows, and skips rows out of the tab order and plain controls", () => {
     render(
       <MenuSurface x={0} y={0} ariaLabel="Walk" onDismiss={vi.fn()}>
         <button type="button" role="menuitemradio" aria-checked="false" tabIndex={-1}>Swatch a</button>
         <button type="button" role="menuitemradio" aria-checked="true" tabIndex={0}>Swatch b</button>
         <button type="button" role="menuitem">One</button>
         <button type="button" role="menuitemcheckbox" aria-checked="false">Check</button>
-        <button type="button" data-menu-item="">Opted in</button>
+        <button type="button">Plain</button>
         <button type="button" role="menuitem" disabled>Off</button>
       </MenuSurface>,
     );
@@ -94,13 +94,13 @@ describe("MenuSurface", () => {
     // The first focus uses the same rule as the walk: not the row at -1.
     expect(focusedName()).toBe("Swatch b");
     const seen = [focusedName()];
-    for (let i = 0; i < 4; i++) {
+    for (let i = 0; i < 3; i++) {
       fireEvent.keyDown(window, { key: "ArrowDown" });
       seen.push(focusedName());
     }
-    expect(seen).toEqual(["Swatch b", "One", "Check", "Opted in", "Swatch b"]);
+    expect(seen).toEqual(["Swatch b", "One", "Check", "Swatch b"]);
     fireEvent.keyDown(window, { key: "ArrowUp" });
-    expect(focusedName()).toBe("Opted in");
+    expect(focusedName()).toBe("Check");
   });
 
   it("walks a nested menu on its own", () => {

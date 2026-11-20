@@ -179,13 +179,14 @@ describe("workspaceStore — load activation", () => {
 describe("workspaceStore — the launch restore", () => {
   beforeEach(() => resetStore());
 
-  it("records what the first load of the session made active, and nothing later", async () => {
+  it("records what the startup restore's load made active, and nothing later", async () => {
     const a = makeWorkspace("proj-1", "alpha");
     const b = makeWorkspace("proj-1", "beta");
     const c = makeWorkspace("proj-2", "gamma");
     useWorkspaceStore.setState({ lastActiveByProject: { "proj-1": b.id } });
     expect(useWorkspaceStore.getState().launchRestoredId).toBeUndefined();
 
+    useWorkspaceStore.getState().beginLaunchRestore();
     mockIpc.listWorkspaces.mockResolvedValueOnce([a, b]);
     await useWorkspaceStore.getState().load("proj-1");
     expect(useWorkspaceStore.getState().launchRestoredId).toBe(b.id);
@@ -198,9 +199,30 @@ describe("workspaceStore — the launch restore", () => {
   });
 
   it("is null when the launch project has no workspace", async () => {
+    useWorkspaceStore.getState().beginLaunchRestore();
     mockIpc.listWorkspaces.mockResolvedValueOnce([]);
     await useWorkspaceStore.getState().load("proj-1");
     expect(useWorkspaceStore.getState().launchRestoredId).toBeNull();
+  });
+
+  it("records nothing when the app launched with no project to reopen", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    mockIpc.listWorkspaces.mockResolvedValue([a]);
+    // The first project the user opens is an activation, not a restore.
+    await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);
+    await useWorkspaceStore.getState().load("proj-1");
+    expect(useWorkspaceStore.getState().activeId).toBe(a.id);
+    expect(useWorkspaceStore.getState().launchRestoredId).toBeUndefined();
+  });
+
+  it("records nothing once a restore that opened nothing is cancelled", async () => {
+    const a = makeWorkspace("proj-1", "alpha");
+    useWorkspaceStore.getState().beginLaunchRestore();
+    useWorkspaceStore.getState().cancelLaunchRestore();
+    mockIpc.listWorkspaces.mockResolvedValueOnce([a]);
+    await useWorkspaceStore.getState().load("proj-1");
+    expect(useWorkspaceStore.getState().launchRestoredId).toBeUndefined();
   });
 
   it("covers a batch reload that lands before the first load, then defers to the load", async () => {
@@ -209,6 +231,7 @@ describe("workspaceStore — the launch restore", () => {
     useProjectStore.setState({ current: makeProject("proj-1") });
     useWorkspaceStore.setState({ lastActiveByProject: { "proj-1": b.id } });
     mockIpc.listWorkspaces.mockResolvedValue([a, b]);
+    useWorkspaceStore.getState().beginLaunchRestore();
 
     // The rail's reload wins the race and makes the first workspace active.
     await useWorkspaceStore.getState().loadAllWorkspaces(["proj-1"]);

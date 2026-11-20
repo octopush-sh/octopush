@@ -1,7 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, GitPullRequest, Plus } from "lucide-react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
-import { TINTS } from "../lib/monogram";
+import { PALE_TINTS, TINTS } from "../lib/monogram";
 import { tourId } from "../lib/tour/ids";
 import type { Group } from "../lib/types";
 import type { RailDragSubject, RailDropTarget } from "../lib/railGroups";
@@ -28,9 +28,13 @@ const EASE = "ease-[cubic-bezier(0.2,0.8,0.3,1)]";
 const ICON_BTN =
   "flex shrink-0 items-center justify-center rounded text-octo-mute transition-[color,background-color,opacity] duration-[180ms] hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass";
 
-/** The colour of a group's two marks: its tint, or `fallback` when it has none. */
+/** The colour of a group's two marks: its tint, or `fallback` when it has none.
+ *  A pale tint goes through its per-theme ink, which stays visible on a light
+ *  ground (`PALE_TINTS`). */
 export function groupMarkColor(group: Pick<Group, "tint">, fallback: string): string {
-  return group.tint ? TINTS[group.tint].accent : fallback;
+  if (!group.tint) return fallback;
+  const { accent } = TINTS[group.tint];
+  return PALE_TINTS.includes(group.tint) ? `var(--tint-mark-${group.tint}, ${accent})` : accent;
 }
 
 /** What a folded group's header says about the members it hides. */

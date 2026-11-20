@@ -33,6 +33,11 @@ export const TINTS: Record<TintName, { accent: string; bg: string }> = {
   bone:      { accent: "#d8c9a8", bg: "rgba(216, 201, 168, 0.07)" },
 };
 
+/** The tints with almost no hue, which on a light ground sit nearly at the
+ *  ground's own lightness. A group's chevron and guide take them through
+ *  `--tint-mark-<name>`, solved per theme (`themeStore`, `solveMarkInk`). */
+export const PALE_TINTS: readonly TintName[] = ["smoke", "bone"];
+
 export function resolveMonogram(ws: Workspace): MonogramConfig {
   // One resolution for every surface (rail, collapsed rail, ⌘K, customize):
   // a stored glyph is honoured only if it normalizes to a real capital-form

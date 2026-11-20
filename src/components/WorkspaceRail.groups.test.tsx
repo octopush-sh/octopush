@@ -160,6 +160,17 @@ describe("mission group: the folder signature", () => {
     expect(header("PR reviews").querySelector("svg")!.parentElement!.style.color).toBe("var(--color-octo-mute)");
   });
 
+  it("inks a pale tint's chevron and guide through the theme's solved mark ink", () => {
+    seed([{ ...FIXES, tint: "bone" }, { ...REVIEWS, tint: "smoke" }]);
+    render(<Rail />);
+    const ink = (name: string) => `var(--tint-mark-${name}, ${TINTS[name as "bone" | "smoke"].accent})`;
+    expect(header("Vulnerability fixes").querySelector("svg")!.parentElement!.style.color).toBe(ink("bone"));
+    expect(within(groupEl(FIXES.id)).getByTestId("rail-group-guide").style.backgroundColor).toBe(ink("bone"));
+    expect(header("PR reviews").querySelector("svg")!.parentElement!.style.color).toBe(ink("smoke"));
+    // A mission's monogram keeps its own tint.
+    expect(glyph("fix-parser")).toHaveStyle({ color: TINTS.verdigris.accent });
+  });
+
   it("indents the members beside a guide, and returns the next loose mission to the outer level", () => {
     render(<Rail />);
     const fixes = groupEl(FIXES.id);

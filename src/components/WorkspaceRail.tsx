@@ -1836,8 +1836,9 @@ function WorkspaceRow({
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
   const collisions = useWorkspaceCollisions(workspace?.id);
-  // Pointer-only: the row is no extra tab stop, and the keyboard moves a
-  // mission with ⌘⌥G or through its menu ("Move to group").
+  // Pointer-only: the row is no extra tab stop. In this rail the keyboard
+  // moves a mission with ⌘⌥G, or with ⇧F10 into its menu ("Move to group");
+  // a slim rail's cell answers neither yet (#918).
   const draggable = useDraggable({
     id: `mission:${workspace?.id ?? ""}`,
     data: drag ?? undefined,
