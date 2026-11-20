@@ -861,7 +861,7 @@ The rules, reusable wherever a set of live things needs a compact switcher:
   and `×` reads as "close" everywhere else: a session that looks closed while
   its agent keeps spending is the worst outcome here. Leaving the view is a
   **minus** (*Leave the view · the session keeps running*), in a split view
-  only. Closing is by name, in the caption's `⋯` menu, sage until hovered
+  only; Talk's terminal seat closes with the same minus. Closing is by name, in the caption's `⋯` menu, sage until hovered
   (`MENU_ITEM_ROUGE`).
 - **The layout button shows the layout.** Its glyph is the panes on screen
   (`PaneLayoutIcon`: one frame and its dividers, a single family for one to

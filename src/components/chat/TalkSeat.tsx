@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { SquareTerminal, X } from "lucide-react";
+import { Minus, SquareTerminal } from "lucide-react";
 import { useTerminalsStore } from "../../stores/terminalsStore";
 import { EMPTY_TALK_SEAT, setTalkWidth, useTerminalLayoutStore } from "../../stores/terminalLayoutStore";
 import { iconForSessionRole } from "../../lib/roleIcons";
@@ -12,7 +12,7 @@ import { PaneWaiting } from "../run/PaneWaiting";
 
 interface Props {
   workspaceId: string;
-  /** Open the seat or close it (the icon, `×`, ⌘D). */
+  /** Open the seat or close it (the icon, the minus, ⌘D). */
   onToggle: () => void;
   /** Open the pairing switcher for the seat. */
   onPick: () => void;
@@ -200,10 +200,11 @@ export function TalkSeat({ workspaceId, onToggle, onPick, children }: Props) {
                   aria-label="Leave the view"
                   title="Leave the view · the session keeps running"
                   data-testid="talk-seat-leave"
+                  data-tour={tourId("talk-seat-leave")}
                   onClick={onToggle}
                   className={iconButton}
                 >
-                  <X size={14} strokeWidth={1.75} aria-hidden />
+                  <Minus size={14} strokeWidth={1.75} aria-hidden />
                 </button>
               </div>
               <div className="relative min-h-0 flex-1">
