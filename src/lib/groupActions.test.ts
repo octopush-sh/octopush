@@ -112,7 +112,7 @@ describe("groupActions", () => {
     expect(pushToast).toHaveBeenCalledTimes(1);
     expect(pushToast).toHaveBeenCalledWith({
       level: "error",
-      title: "Couldn't move the 3 workspaces",
+      title: "Couldn't move the 3 missions",
       body: "A workspace can only join a group in its own project.",
     });
   });

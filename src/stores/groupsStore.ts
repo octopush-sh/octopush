@@ -341,7 +341,7 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
         new Map(moving.filter((id) => groupOf(kind, id) === groupId).map((id) => [id, before.get(id) ?? null] as const)),
       );
       refused(
-        kind === "project" ? `Couldn't move the ${moving.length} projects` : `Couldn't move the ${moving.length} workspaces`,
+        kind === "project" ? `Couldn't move the ${moving.length} projects` : `Couldn't move the ${moving.length} missions`,
         e,
       );
       return false;
