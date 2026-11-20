@@ -2594,22 +2594,37 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
 pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     require_sync(crate::sync::SyncKind::Library)?;
     let pull = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
-    let applied = apply_pulled_library(&state.db, &pull.items);
+    let outcome = apply_pulled_library(&state.db, &pull.items);
     // Only once the items are applied: the next pull asks for what changed
-    // after this one (#823).
-    crate::sync::commit_library_pull(&pull);
-    Ok(applied)
+    // after this one (#823). An item skipped for a parse or DB error makes the
+    // next pull a full one instead, so it comes back once it can be applied.
+    crate::sync::commit_library_pull(&pull, outcome.skipped);
+    Ok(outcome.applied)
+}
+
+/// What [`apply_pulled_library`] did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LibraryApply {
+    /// Items written to the local library.
+    pub applied: usize,
+    /// Items not applied because their data couldn't be read or the local
+    /// write failed. Not counted: LWW losses (the local edit is newer), an
+    /// envelope/data id mismatch, a builtin id, a role kept because it is in
+    /// use — none of those would change on a later pull.
+    pub skipped: usize,
 }
 
 /// Merge pulled library items into the local DB by per-item LWW (the body of
 /// [`library_sync_pull`]). Only the items given are touched: after an
 /// incremental pull, an item that isn't among them is unchanged, never
-/// deleted — only a tombstone deletes. Returns the number applied.
+/// deleted — only a tombstone deletes. Returns how many were applied and how
+/// many were skipped for a parse or DB error.
 pub(crate) fn apply_pulled_library(
     store: &parking_lot::Mutex<crate::db::Db>,
     items: &[crate::sync::SyncLibraryItem],
-) -> usize {
+) -> LibraryApply {
     let mut applied = 0usize;
+    let mut skipped = 0usize;
 
     // Apply order matters (and each step takes its own SHORT lock — this is a
     // launch-time merge, but the mutex is shared with every live surface):
@@ -2618,22 +2633,27 @@ pub(crate) fn apply_pulled_library(
     //   3. role TOMBSTONES LAST — so a role referenced by a pipeline pulled in
     //      this very merge counts as in-use and survives its own tombstone.
     for item in items.iter().filter(|i| i.kind == "role" && !i.deleted) {
-        let Some(data) = &item.data else { continue };
+        let Some(data) = &item.data else {
+            skipped += 1; // an edit with no data: unreadable
+            continue;
+        };
         let Ok(mut role) =
             serde_json::from_value::<crate::orchestrator::roles::RoleDef>(data.clone())
         else {
-            continue; // unparseable → skip, never fatal
+            skipped += 1; // unparseable → skip, never fatal
+            continue;
         };
         if role.key != item.item_id {
             continue; // envelope/data identity mismatch — refuse quietly
         }
         role.is_builtin = false; // the wire never carries builtin authority
-        if store
-            .lock()
-            .upsert_role_from_sync(&role, &item.updated_at)
-            .unwrap_or(false)
-        {
-            applied += 1;
+        match store.lock().upsert_role_from_sync(&role, &item.updated_at) {
+            Ok(true) => applied += 1,
+            Ok(false) => {}
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(role = %role.key, "library pull: role skipped: {e}");
+            }
         }
     }
 
@@ -2644,14 +2664,21 @@ pub(crate) fn apply_pulled_library(
                 Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                     if db.delete_pipeline(&item.item_id).is_ok() {
                         applied += 1;
+                    } else {
+                        skipped += 1;
                     }
                 }
+                Err(_) => skipped += 1,
                 _ => {}
             }
             continue;
         }
-        let Some(data) = &item.data else { continue };
+        let Some(data) = &item.data else {
+            skipped += 1;
+            continue;
+        };
         let Ok(sp) = serde_json::from_value::<crate::sync::SyncPipeline>(data.clone()) else {
+            skipped += 1;
             continue;
         };
         if sp.id != item.item_id {
@@ -2660,7 +2687,10 @@ pub(crate) fn apply_pulled_library(
         match store.lock().upsert_pipeline_from_sync(&sp) {
             Ok(true) => applied += 1,
             Ok(false) => {}
-            Err(e) => tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}"),
+            Err(e) => {
+                skipped += 1;
+                tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}");
+            }
         }
     }
 
@@ -2677,12 +2707,15 @@ pub(crate) fn apply_pulled_library(
                 }
                 if db.delete_role(&item.item_id).is_ok() {
                     applied += 1;
+                } else {
+                    skipped += 1;
                 }
             }
+            Err(_) => skipped += 1,
             _ => {}
         }
     }
-    applied
+    LibraryApply { applied, skipped }
 }
 
 // ─── Accounts (P1) ─────────────────────────────────────────────

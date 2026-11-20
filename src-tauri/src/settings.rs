@@ -327,6 +327,15 @@ impl AppSettings {
             .then_some(stored.next_since.as_str())
     }
 
+    /// Store the library `next_since` for `owner`, only if `owner` still owns
+    /// the opt-ins and library sync is on; otherwise nothing changes (a pull
+    /// that began under another account never writes over this one's).
+    pub fn set_library_since_for(&mut self, owner: &str, value: String) {
+        if self.library_sync_enabled && !owner.is_empty() && self.sync_owner.as_deref() == Some(owner) {
+            self.library_pull_since = Some(LibraryPullSince { owner: owner.to_string(), next_since: value });
+        }
+    }
+
     /// Store (or drop) the library `next_since` for the account that owns the
     /// opt-ins. Nothing is stored while library sync is off or unowned.
     pub fn set_library_since(&mut self, value: Option<String>) {

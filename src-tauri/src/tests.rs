@@ -24480,13 +24480,13 @@ mod sync_contract_tests {
         assert!(!pull.incremental);
         assert_eq!(pull.items.len(), 3);
         assert_eq!(library_since::load(), None, "stored only after the caller applied it");
-        crate::sync::commit_library_pull(&pull);
+        crate::sync::commit_library_pull(&pull, 0);
         assert_eq!(library_since::load().as_deref(), Some(first.as_str()));
 
         let pull = crate::sync::pull_library(&client).await.unwrap();
         assert!(pull.incremental);
         assert_eq!(pull.items.len(), 1);
-        crate::sync::commit_library_pull(&pull);
+        crate::sync::commit_library_pull(&pull, 0);
         assert_eq!(library_since::load().as_deref(), Some(second.as_str()));
 
         let reqs = requests(&seen);
@@ -24516,7 +24516,7 @@ mod sync_contract_tests {
         assert_eq!(reqs.len(), 2);
         assert!(reqs[0].query("since").is_some());
         assert_eq!(reqs[1].path(), "/api/sync-library");
-        crate::sync::commit_library_pull(&pull);
+        crate::sync::commit_library_pull(&pull, 0);
         assert_eq!(library_since::load(), Some(next));
 
         // Any other 400 is an error, and keeps the stored value.
@@ -24561,7 +24561,7 @@ mod sync_contract_tests {
         let client = reqwest::Client::new();
         let pull = crate::sync::pull_library(&client).await.unwrap();
         assert_eq!(pull.items.len(), 3, "everything, applied by LWW as before");
-        crate::sync::commit_library_pull(&pull);
+        crate::sync::commit_library_pull(&pull, 0);
         assert_eq!(library_since::load(), None, "no next_since: the next pull is full");
         crate::sync::pull_library(&client).await.unwrap();
         let reqs = requests(&seen);
@@ -24652,10 +24652,172 @@ mod sync_contract_tests {
         // nothing about `kept`.
         let mut tomb = SyncLibraryItem::tombstone("pipeline", &gone);
         tomb.updated_at = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
-        assert_eq!(crate::commands::apply_pulled_library(&store, &[tomb]), 1);
-        assert_eq!(crate::commands::apply_pulled_library(&store, &[]), 0);
+        let done = crate::commands::apply_pulled_library(&store, &[tomb]);
+        assert_eq!((done.applied, done.skipped), (1, 0));
+        assert_eq!(crate::commands::apply_pulled_library(&store, &[]).applied, 0);
         let db = store.lock();
         assert!(db.pipeline_sync_state(&kept).unwrap().is_some(), "absent from the pull: unchanged");
         assert!(db.pipeline_sync_state(&gone).unwrap().is_none(), "only a tombstone deletes");
+    }
+
+    // ── Review follow-ups ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_item_this_build_cant_apply_makes_the_next_pull_full() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let store = parking_lot::Mutex::new(db);
+        // A pipeline whose data this build can't read (e.g. saved by a newer
+        // build), next to a readable role edit.
+        let body = serde_json::json!({
+            "items": [
+                { "kind": "pipeline", "item_id": "p-new", "updated_at": "2026-11-02T00:00:00Z",
+                  "deleted": false, "data": { "id": "p-new", "stages": "not a list" } },
+                fixture_json("sync-library.pull.since.response.json")["items"][0].clone(),
+            ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let done = crate::commands::apply_pulled_library(&store, &pull.items);
+        assert_eq!(done.skipped, 1, "the unreadable pipeline");
+        crate::sync::commit_library_pull(&pull, done.skipped);
+        assert_eq!(library_since::load(), None, "next pull is full, so the item comes back");
+
+        // An LWW loss is not a skip: applying the same role twice.
+        let again = crate::commands::apply_pulled_library(&store, &pull.items[1..]);
+        assert_eq!(again.skipped, 0);
+
+        // An envelope this build can't read counts too.
+        let body = serde_json::json!({
+            "items": [ { "item_id": "no kind" } ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!((pull.received, pull.unreadable, pull.items.len()), (1, 1, 0));
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_racing_an_account_switch_stores_nothing_for_the_new_account() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir); // user_a
+        let (base, _) = scripted(vec![(200, with_since("sync-library.pull.response.json", &fresh_since()))]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.owner.as_deref(), Some("user_a"));
+        // user_b turns library sync on before user_a's pull is committed.
+        crate::settings::update_settings(|s| s.set_sync_opted_in_by(SyncKind::Library, true, "user_b")).unwrap();
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        let on_disk = crate::settings::load_settings().unwrap();
+        assert_eq!(on_disk.library_pull_since, None, "nothing stored under user_b");
+
+        // The settings-level guard on its own.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        s.set_library_since_for("user_a", fresh_since());
+        assert_eq!(s.library_pull_since, None);
+        s.set_library_since_for("user_b", "x".into());
+        assert_eq!(s.library_since_for_owner(), Some("x"));
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_at_the_services_item_cap_keeps_no_next_since() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tomb = fixture_json("sync-library.pull.response.json")["items"][2].clone();
+        let items: Vec<serde_json::Value> = (0..crate::sync::LIBRARY_PULL_MAX_ITEMS)
+            .map(|i| {
+                let mut t = tomb.clone();
+                t["item_id"] = serde_json::Value::String(format!("p{i}"));
+                t
+            })
+            .collect();
+        let body = serde_json::json!({ "items": items, "next_since": fresh_since() });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.received, 2_000);
+        assert!(pull.next_since.is_some());
+        assert_eq!(crate::sync::library_since_to_keep(&pull, 0), None);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "the next pull is full");
+
+        // One under the cap keeps it.
+        let mut under = pull.clone();
+        under.received = crate::sync::LIBRARY_PULL_MAX_ITEMS - 1;
+        assert!(crate::sync::library_since_to_keep(&under, 0).is_some());
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_push_answer_keeps_items_unsent_and_refusals_listed() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let item = pipeline_of_size("p1", 100);
+        let (base, _) = scripted(vec![
+            (200, r#"{"ok":true,"count":0,"rejected":[{"id":"p1","kind":"pipeline","reason":"bad_stamp"}]}"#.into()),
+            (200, "not json".into()),
+            (200, r#"{"ok":true,"rejected":"oops"}"#.into()),
+            (200, String::new()),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        crate::sync::push_library_items(&client, vec![item.clone()]).await;
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+        for _ in 0..3 {
+            assert_eq!(crate::sync::push_library_items(&client, vec![item.clone()]).await, PushOutcome::Failed);
+            let snap = status::snapshot();
+            assert_eq!(snap.library_rejected.len(), 1, "the earlier refusal stays");
+            let rec = snap.library.unwrap();
+            assert_eq!((rec.count, rec.http_status), (1, None));
+        }
+        assert_eq!(crate::sync::read_library_push_answer(r#"{"ok":true,"count":2}"#), Some(vec![]));
+        assert_eq!(crate::sync::read_library_push_answer("[]"), None);
+    }
+
+    #[test]
+    fn dropped_stages_are_replaced_by_one_honest_summary_stage() {
+        let mut run = big_run("short".into());
+        let stage = |i: usize| crate::sync::SyncStage {
+            role: format!("role-{i}-{}", "r".repeat(200)),
+            model: Some("m".repeat(200)),
+            status: "completed".into(),
+            cost_usd: 0.5,
+        };
+        run.stages = (0..2_000).map(stage).collect();
+        let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!(cap_run_payload(&mut run));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        assert_eq!(run.task, "short", "a short task is never cut for the stages' sake");
+        let last = run.stages.last().unwrap();
+        let kept = run.stages.len() - 1;
+        let dropped = 2_000 - kept;
+        assert!(dropped > 0 && kept > 0);
+        assert_eq!(last.role, crate::sync::truncated_stages_label(dropped));
+        assert_eq!(last.role, format!("… ({dropped} stages truncated)"));
+        assert_eq!(last.status, crate::sync::TRUNCATED_STAGES_STATUS);
+        assert_eq!(last.model, None);
+        let after: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!((after - total).abs() < 1e-6, "stage costs still add up");
+        // Same keys as the contract fixture: no new field.
+        let v = serde_json::to_value(&run.stages[kept]).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["cost_usd", "model", "role", "status"]);
+        assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
     }
 }
