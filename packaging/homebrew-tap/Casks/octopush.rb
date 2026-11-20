@@ -1,29 +1,28 @@
 # Octopush — Homebrew cask.
 #
-# ✅ READY TO PUBLISH. As of v0.4.63 Octopush is signed with an Apple Developer ID
-# certificate and notarized by Apple (verified with `spctl -a -vv` on every
-# release build), so a cask install lands an app that opens cleanly — the
-# notarization gate that previously blocked this tap is cleared.
-#
-# This file lives at Casks/octopush.rb in the repo
-# github.com/octopush-sh/homebrew-tap, and users install with:
+# The template for Casks/octopush.rb in github.com/octopush-sh/homebrew-tap.
+# Users install with:
 #     brew install --cask octopush-sh/tap/octopush
 #
-# On each release, bump `version` and refresh `sha256` with the digest of that
-# release's Octopush.dmg:
-#     shasum -a 256 Octopush.dmg
-# (GitHub also reports it: the release asset's `digest` field.)
+# Edit the template (packaging/homebrew-tap/Casks/octopush.rb in
+# octopush-sh/octopush), never the copy in the tap: every promotion to stable
+# (.github/workflows/promote.yml, job `homebrew-tap`) renders this file with the
+# promoted version and the sha256 of that release's Octopush.dmg
+# (scripts/homebrew-cask.mjs), checks it with `brew style` + `brew audit`, and
+# pushes it to the tap. The `version` and `sha256` below are placeholders the
+# render replaces; CI runs the same checks on every pull request.
 
 cask "octopush" do
-  version "0.4.63"
-  sha256 "50d989d10c934fea87ce50e68336ed047e99d826570414791e1a8eef8a415f91"
+  version "0.0.0"
+  sha256 "0000000000000000000000000000000000000000000000000000000000000000"
 
   # Stable permalink asset published by scripts/release.mjs. `Octopush.dmg` is a
   # byte-copy of the versioned universal DMG, so this URL is arch-agnostic.
-  url "https://github.com/octopush-sh/octopush/releases/download/v#{version}/Octopush.dmg"
+  url "https://github.com/octopush-sh/octopush/releases/download/v#{version}/Octopush.dmg",
+      verified: "github.com/octopush-sh/octopush/"
   name "Octopush"
-  desc "The IDE for Agentic Developers — cost-conscious multi-agent orchestration"
-  homepage "https://octopush.sh"
+  desc "IDE for directing crews of AI coding agents"
+  homepage "https://octopush.sh/"
 
   # Track new releases automatically.
   livecheck do

@@ -93,7 +93,7 @@ jobs:
         # Pure parts only (selection, size fitting). Browser recording is not run in CI.
         run: node --test scripts/clips/lib.test.mjs
       - name: release helpers and the nightly beta routine
-        run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs scripts/web-version.test.mjs scripts/rerun-starved.test.mjs
+        run: node --test scripts/release.test.mjs scripts/release-beta.test.mjs scripts/web-version.test.mjs scripts/rerun-starved.test.mjs scripts/homebrew-cask.test.mjs
       - name: routine scripts
         run: node --test scripts/routines/routines.test.mjs scripts/routines/social.test.mjs
       - name: visual audit logic
@@ -105,13 +105,32 @@ jobs:
       - name: routine scripts parse
         run: for f in scripts/routines/*.sh; do bash -n "$f" || exit 1; done
 
+  homebrew-cask:
+    # promote.yml publishes packaging/homebrew-tap/Casks/octopush.rb to
+    # octopush-sh/homebrew-tap on every promotion. Render it here with dummy
+    # values and run the same Homebrew checks, so the template can't rot
+    # between promotions.
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: brew style + brew audit on the rendered cask
+        run: |
+          set -euo pipefail
+          node scripts/homebrew-cask.mjs render packaging/homebrew-tap/Casks/octopush.rb 0.0.1 \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/octopush.rb"
+          bash scripts/homebrew-cask-check.sh "$RUNNER_TEMP/octopush.rb"
+
   review-next:
     # The nightly builder dispatches CI on its agent/… branch with GITHUB_TOKEN,
     # and GitHub emits no workflow_run for such runs, so the reviewer never
     # heard about a green agent PR until its cron. Start it from here once every
     # check passed. Agents can't change .github/ (publish-build refuses it), so
     # this is main's job definition.
-    needs: [frontend, backend, repo-rules]
+    needs: [frontend, backend, repo-rules, homebrew-cask]
     if: github.event_name == 'workflow_dispatch' && startsWith(github.ref_name, 'agent/') && success()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

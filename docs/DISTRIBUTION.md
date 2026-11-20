@@ -9,7 +9,7 @@ How Octopush reaches users, and how each channel activates. For the mechanics of
 |---|---|---|
 | Direct download (`octopush.sh/download` → GitHub release `Octopush.dmg`) | **Live path, needs first release** | Publish `v<version>` |
 | In-app auto-update (Tauri updater) | **Live path, needs first release** | Publish `latest.json` |
-| Homebrew cask (`brew install --cask octopush-sh/tap/octopush`) | **Cleared to publish** | Create the `octopush-sh/homebrew-tap` repo |
+| Homebrew cask (`brew install --cask octopush-sh/tap/octopush`) | **Published on promotion** | The first promotion after the Octopush Cycle app can write to `octopush-sh/homebrew-tap` |
 
 ### 1. Direct download
 
@@ -26,20 +26,40 @@ Installed apps check `octopush.sh/update/latest.json` (redirect → the GitHub
 release `latest.json`), verify the Ed25519 signature, and update in place. See
 [`RELEASING.md`](RELEASING.md) → "The updater endpoint".
 
-### 3. Homebrew cask — cleared to publish
+### 3. Homebrew cask — published on every promotion
 
 The notarization gate is cleared (v0.4.63 onward is signed + notarized), so a
-cask install now lands an app that opens cleanly. A ready-to-publish tap is
-staged at [`packaging/homebrew-tap/`](../packaging/homebrew-tap/), with a real
-`version` and `sha256` already filled in.
+cask install lands an app that opens cleanly. The tap is the public repo
+[`octopush-sh/homebrew-tap`](https://github.com/octopush-sh/homebrew-tap) (the
+`homebrew-` prefix is what lets `brew tap octopush-sh/tap` resolve), with one
+file, `Casks/octopush.rb`. Nobody edits it by hand:
 
-**To ship it:**
-1. Create the public repo `octopush-sh/homebrew-tap` (the `homebrew-` prefix is
-   required for `brew tap octopush-sh/tap` to resolve).
-2. Copy `packaging/homebrew-tap/Casks/octopush.rb` to `Casks/octopush.rb` at its
-   root.
-3. Announce `brew install --cask octopush-sh/tap/octopush`.
-4. On each later release, refresh the cask's `version` + `sha256`.
+- **The template** is [`packaging/homebrew-tap/Casks/octopush.rb`](../packaging/homebrew-tap/Casks/octopush.rb)
+  in this repo, the one copy anyone edits. Its `version` and `sha256` are
+  placeholders.
+- **On promotion**, `.github/workflows/promote.yml`'s `homebrew-tap` job runs
+  after the `promote` job succeeded. It reads the promoted release's
+  `Octopush.dmg` sha256 (the asset's `digest`; if the release reports none, it
+  downloads the DMG and hashes it), renders the template with that version and
+  sha256 (`scripts/homebrew-cask.mjs`), checks the result with `brew style` and
+  an offline `brew audit --cask --strict` (`scripts/homebrew-cask-check.sh`),
+  and pushes it to the tap's `main` with an Octopush Cycle app token limited to
+  that one repo (contents: write). On the empty tap the push is the first
+  commit and creates `main`; after that it updates the cask in place, does
+  nothing when the cask is already current, and never moves the tap back to an
+  older version.
+- **Betas never touch the tap.** Tags publish prereleases; only a promotion
+  runs the job, and it refuses a release that is still a prerelease.
+- **A tap failure never undoes the promotion.** The release is already stable
+  when the job runs. A failure is marked in the run's summary ("Homebrew tap
+  NOT updated"); re-running the `homebrew-tap` job retries it.
+- **CI** renders the template with dummy values and runs the same checks on
+  every pull request (`ci.yml` → `homebrew-cask`, macOS), so the template
+  can't rot between promotions.
+
+**Owner prerequisite:** the Octopush Cycle GitHub App must be installed on
+`octopush-sh/homebrew-tap` with Contents read & write. Until then the job fails
+at "Tap token" and the summary says so.
 
 ## Platform scope
 
