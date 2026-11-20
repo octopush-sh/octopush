@@ -11,6 +11,7 @@ const {
   clampToListedLevels,
   codexClampTitle,
   codexCommitNote,
+  codexReadOnlySandboxNote,
   codexEffortLevel,
   codexEffortLevels,
   crewClaudeModels,
@@ -62,10 +63,10 @@ describe("codexCommitNote", () => {
 
   it("names each Action stage that runs on Codex outside a sandboxed mission", () => {
     expect(codexCommitNote(stages, {}, roles, "none")).toBe(
-      "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push. Run the mission sandboxed or pick a Claude model.",
+      "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push. Pick a Claude model for it.",
     );
     // A launcher override onto Codex counts; one onto Claude clears it.
-    expect(codexCommitNote(stages, { 2: "gpt-5" }, roles, null)).toMatch(/^Ship and Tag it run on Codex, .* so they can't commit/);
+    expect(codexCommitNote(stages, { 2: "gpt-5" }, roles, null)).toMatch(/^Ship and Tag it run on Codex, .* so they can't commit or push\. Pick a Claude model for them\.$/);
     expect(codexCommitNote(stages, { 1: "claude-opus-5-5" }, roles, "none")).toBeNull();
   });
 
@@ -252,5 +253,36 @@ describe("loadClaudeCliVersion", () => {
     cliVersionMock.mockResolvedValue({ version: "2.1.316", floor: "2.1.314", belowFloor: false });
     expect((await loadClaudeCliVersion())?.version).toBe("2.1.316");
     expect(cliVersionMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("codexReadOnlySandboxNote", () => {
+  const roles = [
+    { key: "code_review", artifactKind: "review", environment: "worktree" },
+    { key: "implement", artifactKind: "diff", environment: "worktree" },
+    { key: "ship", artifactKind: "note", environment: "action" },
+  ];
+  const note = "A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.";
+  const stages = [
+    { position: 0, role: "implement", substrate: "cli", agentModel: "gpt-5-codex" },
+    { position: 1, role: "code_review", substrate: "cli", agentModel: "gpt-5-codex" },
+  ];
+
+  it("warns for a read-only Codex stage in a sandboxed or readonly mission", () => {
+    expect(codexReadOnlySandboxNote(stages, {}, roles, "sandbox", "worktree")).toBe(note);
+    expect(codexReadOnlySandboxNote(stages, {}, roles, "none", "readonly")).toBe(note);
+    // A launcher override onto Codex counts.
+    const claudeReview = [stages[0], { ...stages[1], agentModel: "claude-sonnet-5-5" }];
+    expect(codexReadOnlySandboxNote(claudeReview, {}, roles, "sandbox", null)).toBeNull();
+    expect(codexReadOnlySandboxNote(claudeReview, { 1: "gpt-5" }, roles, "sandbox", null)).toBe(note);
+  });
+
+  it("stays quiet outside a sandboxed mission, for writers, API stages and Claude models", () => {
+    expect(codexReadOnlySandboxNote(stages, {}, roles, "none", "worktree")).toBeNull();
+    expect(codexReadOnlySandboxNote(stages, {}, roles, null, null)).toBeNull();
+    expect(codexReadOnlySandboxNote(stages.slice(0, 1), {}, roles, "sandbox", null)).toBeNull();
+    expect(codexReadOnlySandboxNote([{ ...stages[1], substrate: "api" }], {}, roles, "sandbox", null)).toBeNull();
+    expect(codexReadOnlySandboxNote(stages, { 1: "claude-opus-5-5" }, roles, "sandbox", null)).toBeNull();
+    expect(codexReadOnlySandboxNote(stages, {}, [], "sandbox", null)).toBeNull();
   });
 });

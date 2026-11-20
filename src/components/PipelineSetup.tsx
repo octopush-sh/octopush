@@ -3,7 +3,7 @@ import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type CodexTrustN
 import { dragHasFiles, openDroppedCrew } from "../lib/crew";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import {
-  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, crewClaudeModels, crewUsesClaudeCode, crewUsesCodex, loadClaudeCliVersion, modelFloorLabel,
+  CLAUDE_UPDATE_REASON, claudeSecurityLabel, claudeUpdateLabel, codexCommitNote, codexReadOnlySandboxNote, crewClaudeModels, crewUsesClaudeCode, crewUsesCodex, loadClaudeCliVersion, modelFloorLabel,
 } from "../lib/claudeCli";
 import { usePipelineStore } from "../stores/pipelineStore";
 import { useRolesStore } from "../stores/rolesStore";
@@ -100,6 +100,9 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   );
   const execIsolation = useMissionsStore((s) =>
     workspaceId ? s.missionByWorkspaceId[workspaceId]?.execIsolation ?? null : null,
+  );
+  const gitIsolation = useMissionsStore((s) =>
+    workspaceId ? s.missionByWorkspaceId[workspaceId]?.gitIsolation ?? null : null,
   );
   const roles = useRolesStore((s) => s.roles);
   const rolesLoaded = useRolesStore((s) => s.loaded);
@@ -260,6 +263,11 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
   }, [usesCodex, workspacePath]);
   // An Action stage on Codex outside a sandboxed mission can't commit.
   const codexCommitLine = selected ? codexCommitNote(selected.stages, overrides, roles, execIsolation) : null;
+  // A read-only Codex stage in a sandboxed (or readonly) mission is refused
+  // at launch: Codex's own read-only sandbox can't run inside Octopush's.
+  const codexReadOnlyLine = selected
+    ? codexReadOnlySandboxNote(selected.stages, overrides, roles, execIsolation, gitIsolation)
+    : null;
 
   const estimateRange = estimate ? estimateRangeText(estimate) : "";
   const estimateSavings = estimate ? estimateSavingsText(estimate) : "";
@@ -663,6 +671,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 className="octo-rise-in m-0 mt-3 font-mono text-[11px] text-octo-warning"
               >
                 {codexCommitLine}
+              </p>
+            )}
+            {codexReadOnlyLine && (
+              <p
+                data-tour="direct-launcher-codex-read-only"
+                data-testid="launcher-codex-read-only"
+                title="Codex's own read-only sandbox can't run inside Octopush's sandbox, so this stage would fail when it starts. The run can still begin."
+                className="octo-rise-in m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {codexReadOnlyLine}
               </p>
             )}
           </>

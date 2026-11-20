@@ -369,15 +369,34 @@ pub(crate) fn stage_dir_paths(
 }
 
 /// Remove every build cache of the workspace at `scope` (all its access
-/// modes). Called when the workspace is deleted. Never follows a symlink in
+/// modes), and its sandboxed Codex homes. Called when the workspace is deleted. Never follows a symlink in
 /// the workspace dir's place; a missing dir is fine.
 pub fn remove_workspace_build_caches(scope: &str) -> std::io::Result<()> {
-    let Some(base) = build_cache_base() else { return Ok(()) };
-    let ws_dir = workspace_cache_dir(&base, scope);
-    if let Some(tmp_base) = stage_tmp_base() {
-        remove_stage_tmps(&ws_dir, &tmp_base)?;
+    remove_workspace_dirs(build_cache_base().as_deref(), stage_tmp_base().as_deref(), codex_home_base().as_deref(), scope)
+}
+
+/// [`remove_workspace_build_caches`] under the given bases: each removal runs
+/// whether or not the one before it failed, so a build cache that can't be
+/// removed never keeps the workspace's Codex homes (its sessions and its
+/// sign-in copy) around; the first error is returned.
+fn remove_workspace_dirs(
+    cache_base: Option<&Path>,
+    tmp_base: Option<&Path>,
+    codex_base: Option<&Path>,
+    scope: &str,
+) -> std::io::Result<()> {
+    let mut results = Vec::new();
+    if let Some(base) = cache_base {
+        let ws_dir = workspace_cache_dir(base, scope);
+        if let Some(tmp_base) = tmp_base {
+            results.push(remove_stage_tmps(&ws_dir, tmp_base));
+        }
+        results.push(remove_cache_dir(&ws_dir));
     }
-    remove_cache_dir(&ws_dir)
+    if let Some(codex) = codex_base {
+        results.push(remove_cache_dir(&workspace_cache_dir(codex, scope)));
+    }
+    results.into_iter().collect::<std::io::Result<Vec<()>>>().map(drop)
 }
 
 /// Remove the stage temp dirs (`stage_tmp_dir`) of every cache root in the
@@ -404,13 +423,16 @@ fn remove_cache_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Remove the build caches unused for longer than `max_age`; returns how
-/// many cache roots went. Run once on launch, off the main thread.
+/// Remove the build caches, stage temp dirs and sandboxed Codex homes unused
+/// for longer than `max_age`; returns how many went. Run once on launch, off the main thread.
 pub fn prune_build_caches(max_age: std::time::Duration) -> usize {
     let now = std::time::SystemTime::now();
     let caches = build_cache_base().map_or(0, |base| prune_cache_base(&base, now, max_age));
     let tmps = stage_tmp_base().map_or(0, |base| prune_tmp_base(&base, now, max_age));
-    caches + tmps
+    // Codex homes are laid out like the build cache, and each launch marks
+    // its home as just used (`ensure_cache_root`).
+    let codex = codex_home_base().map_or(0, |base| prune_cache_base(&base, now, max_age));
+    caches + tmps + codex
 }
 
 /// `prune_build_caches` over the stage temp dirs in `base` (one level, each
@@ -553,6 +575,532 @@ pub fn codex_build_cache(scope: &str) -> std::io::Result<(String, Vec<(String, S
     Ok((root, env))
 }
 
+// ─── A sandboxed Codex stage's own CODEX_HOME (#784) ───────────────────────
+
+/// Where each sandboxed Codex stage's own `CODEX_HOME` lives:
+/// `~/Library/Caches/octopush/codex-home/<workspace>/<mode>`, laid out like
+/// the build cache (`codex_home_dir`). Not a write root: only the stage's own
+/// home is added to its profile, so a stage never writes another
+/// workspace's or access mode's Codex sessions. Codex writes its session
+/// rollouts, thread-writer locks, `.tmp`, logs and its state DB there, never
+/// in the user's `~/.codex`.
+fn codex_home_base() -> Option<PathBuf> {
+    dirs::cache_dir().map(|d| d.join("octopush").join("codex-home"))
+}
+
+/// The single files in a Codex home that Codex reads back as config,
+/// instructions, credentials, env, model metadata or managed config, denied
+/// in the stage's own home and in the user's Codex home (`codex_home_rules`),
+/// matched case-insensitively (`ci_regex`: the home sits on a
+/// case-insensitive volume, where `AGENTS.MD` is `AGENTS.md`). Every
+/// top-level `*.toml` and every `managed-config-<ns>.json` is denied too
+/// (`codex_home_patterns`). From an audit of openai/codex
+/// (`codex-rs`, Nov 2026): `.env` is loaded into Codex's env at start;
+/// `models_cache.json` carries each model's `base_instructions` (the system
+/// prompt) and a planted future `fetched_at` never goes stale;
+/// `cloud-config-bundle-cache.json` and `managed-config-<ns>.json` are
+/// cached managed config whose HMAC key ships in the binary. `config.toml`
+/// and `auth.json` in the stage's home are Octopush's read-only copies
+/// (`prepare_codex_home`).
+const CODEX_HOME_DENIED_FILES: &[&str] = &[
+    "auth.json",
+    "AGENTS.md",
+    "AGENTS.override.md",
+    "instructions.md",
+    "hooks.json",
+    ".env",
+    "models_cache.json",
+    "cloud-config-bundle-cache.json",
+    ".tmp/plugins.sha",
+    ".tmp/plugin-share-local-paths-v1.json",
+];
+
+/// The Codex home dirs Codex reads back as prompts, rules, skills, memories,
+/// plugins (and their marketplaces and curated copies under `.tmp`), hooks,
+/// agents, secrets, tool and plugin catalogs (`cache/`), installed packages
+/// or its network proxy's CA, denied as subtrees the same way. Codex's own
+/// writes there (installing its bundled skills into `skills/.system`,
+/// syncing curated plugins into `.tmp/plugins`, caching tool catalogs) fail,
+/// and Codex logs that and carries on (`ext/skills`
+/// `ensure_system_skills_installed`, `core-plugins` `startup_sync`).
+const CODEX_HOME_DENIED_DIRS: &[&str] = &[
+    "prompts",
+    "rules",
+    "skills",
+    "migrated-command-skills",
+    "memories",
+    "memories_v2",
+    "memories_extensions",
+    "plugins",
+    "hooks",
+    "agents",
+    "secrets",
+    "cache",
+    "packages",
+    "proxy",
+    ".tmp/marketplaces",
+    ".tmp/plugins",
+];
+
+/// The dirs Octopush creates in a stage's home and pins (denied as a path),
+/// because denied paths sit inside them: a stage that could swap `.tmp` for
+/// a link would move `.tmp/plugins` out from under its rule.
+const CODEX_HOME_PINNED_DIRS: &[&str] = &[".tmp"];
+
+/// The user's Codex config, copied read-only into the stage's home on every
+/// launch.
+const CODEX_CONFIG_FILE: &str = "config.toml";
+
+/// Codex's sign-in file: in the stage's home only as a read-only copy of a
+/// ChatGPT sign-in without its refresh token (`codex_auth_plan`).
+const CODEX_AUTH_FILE: &str = "auth.json";
+
+/// The largest `config.toml` or `auth.json` Octopush copies.
+const CODEX_SOURCE_MAX_BYTES: u64 = 1 << 20;
+
+/// A ChatGPT sign-in older than this (`last_refresh`) fails the stage before
+/// it starts. Codex refreshes the tokens itself once they are 8 days old
+/// (openai/codex `login/src/auth/manager.rs` `TOKEN_REFRESH_INTERVAL`), and a
+/// sandboxed stage must never attempt that rotating refresh.
+pub const CODEX_SIGN_IN_MAX_AGE_DAYS: i64 = 7;
+
+/// A ChatGPT access token that expires sooner than this also fails the stage
+/// before it starts: Codex refreshes 5 minutes before it expires.
+const CODEX_ACCESS_TOKEN_MIN_LEFT_HOURS: i64 = 24;
+
+/// The stage failure when the ChatGPT sign-in is too old for a sandboxed
+/// stage (the user's own Codex refreshes it).
+pub const CODEX_REFRESH_SIGN_IN: &str = "Open Codex once to refresh sign-in";
+
+/// The stage failure when Codex's sign-in can't be read or parsed.
+pub const CODEX_SIGN_IN_UNREADABLE: &str = "Octopush couldn't read Codex's sign-in (auth.json), so this sandboxed \
+     stage can't sign in. Open Codex once to check your sign-in.";
+
+/// The stage failure for a sign-in a sandboxed stage can't use.
+pub const CODEX_SIGN_IN_UNSUPPORTED: &str = "This sandboxed stage can't use Codex's saved sign-in. Sign in to Codex \
+     with ChatGPT or an API key, or give this stage a Claude model.";
+
+/// A sandboxed Codex stage's `CODEX_HOME` under `base`: one per workspace
+/// (`scope`), write roots and tenant, keyed exactly like the stage's build
+/// cache (`mission_cache_root`), so a readonly mission never shares the
+/// writer's sessions and a resumed stage finds its own. Pure.
+pub(crate) fn codex_home_dir(base: &Path, scope: &str, write_roots: &[String], tenant: CacheTenant) -> PathBuf {
+    mission_cache_root(base, scope, write_roots, tenant)
+}
+
+/// `s` as an SBPL regex that matches it case-insensitively, the way a
+/// case-insensitive APFS volume compares names: each ASCII letter as a class
+/// of both cases, and `k` and `s` also as the Kelvin sign and the long s,
+/// which fold to them. Anything else is escaped. Pure.
+fn ci_regex(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            'k' | 'K' => "(k|K|\u{212A})".to_string(),
+            's' | 'S' => "(s|S|\u{017F})".to_string(),
+            c if c.is_ascii_alphabetic() => format!("[{}{}]", c.to_ascii_lowercase(), c.to_ascii_uppercase()),
+            c => regex_escape(&c.to_string()),
+        })
+        .collect()
+}
+
+/// The deny regexes for the Codex home `base` (as given): every file of
+/// `CODEX_HOME_DENIED_FILES`, every dir of `CODEX_HOME_DENIED_DIRS` with
+/// everything under it, every top-level `*.toml` (`config.toml`,
+/// `managed_config.toml`, `requirements.toml`, `environments.toml`, a
+/// `<profile>.config.toml`) and every `managed-config-<ns>.json`, all
+/// case-insensitive. Pure.
+fn codex_home_patterns(base: &str) -> Vec<String> {
+    let b = regex_escape(base.trim_end_matches('/'));
+    let mut v: Vec<String> = CODEX_HOME_DENIED_FILES.iter().map(|f| format!("^{b}/{}$", ci_regex(f))).collect();
+    v.extend(CODEX_HOME_DENIED_DIRS.iter().map(|d| format!("^{b}/{}(/|$)", ci_regex(d))));
+    v.push(format!("^{b}/[^/]*{}$", ci_regex(".toml")));
+    v.push(format!("^{b}/{}[^/]*{}$", ci_regex("managed-config-"), ci_regex(".json")));
+    v
+}
+
+/// The write rules for a sandboxed Codex stage: its own home `home` (a
+/// realpath) is writable; the home dir itself is denied as a literal (so it
+/// can't be renamed or swapped for a link that would widen the next stage's
+/// profile) and its pinned dirs (`CODEX_HOME_PINNED_DIRS`) as paths; and in
+/// it and in each of `user_homes` (the user's Codex home, as given and as its
+/// realpath) every entry of `codex_home_patterns` is denied, the user's home
+/// dir itself too. Pure.
+fn codex_home_rules(home: &str, user_homes: &[String]) -> WriteRules {
+    let home = home.trim_end_matches('/').to_string();
+    let mut rules = WriteRules { subpaths: vec![home.clone()], ..WriteRules::default() };
+    let pinned = regex_escape(&home);
+    rules.deny_regexes.extend(CODEX_HOME_PINNED_DIRS.iter().map(|d| format!("^{pinned}/{}$", ci_regex(d))));
+    let bases = std::iter::once(home).chain(user_homes.iter().map(|u| u.trim_end_matches('/').to_string()));
+    for b in bases.filter(|b| !b.is_empty()) {
+        rules.deny_regexes.extend(codex_home_patterns(&b));
+        rules.deny_literals.push(b);
+    }
+    rules.dedup();
+    rules
+}
+
+/// Whether `name` (one entry of a stage's Codex home, lower-cased) is one the
+/// profile denies, other than Octopush's own copies: those go before each
+/// launch (`purge_denied_entries`). Pure.
+fn is_denied_top_level(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    if n == CODEX_CONFIG_FILE || n == CODEX_AUTH_FILE {
+        return false;
+    }
+    let listed = |list: &[&str]| list.iter().any(|e| !e.contains('/') && e.eq_ignore_ascii_case(&n));
+    listed(CODEX_HOME_DENIED_FILES)
+        || listed(CODEX_HOME_DENIED_DIRS)
+        || n.ends_with(".toml")
+        || (n.starts_with("managed-config-") && n.ends_with(".json"))
+}
+
+/// Remove `path` without following a link: a dir with everything in it,
+/// anything else as an entry. A missing one is fine.
+fn remove_entry(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Remove, outside the sandbox before each launch, every entry of the stage's
+/// Codex home `home` that the profile denies (bar Octopush's two copies, which
+/// are rewritten next): the top-level ones (`is_denied_top_level`) and the
+/// denied paths under the pinned dirs. The profile keeps a stage from
+/// creating any of them; this also clears one that got there some other way,
+/// so Codex never reads it. Each listed name is also looked up as written,
+/// so the volume's own case folding finds a variant the listing missed.
+fn purge_denied_entries(home: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(home)?.flatten() {
+        if is_denied_top_level(&entry.file_name().to_string_lossy()) {
+            remove_entry(&entry.path())?;
+        }
+    }
+    for name in CODEX_HOME_DENIED_FILES.iter().chain(CODEX_HOME_DENIED_DIRS) {
+        if *name != CODEX_AUTH_FILE {
+            remove_entry(&home.join(name))?;
+        }
+    }
+    Ok(())
+}
+
+/// How a sandboxed Codex stage signs in, decided before it starts
+/// (`codex_auth_plan`). Its `Debug` never shows a secret.
+#[derive(Clone, PartialEq, Eq)]
+pub enum CodexAuthPlan {
+    /// `CODEX_API_KEY` already reaches the stage (login shell or app env),
+    /// and `codex exec` prefers it to any saved sign-in: nothing is copied.
+    EnvKey,
+    /// No saved sign-in: nothing is copied. Codex says it isn't signed in,
+    /// unless the user's config points at a provider with its own env key.
+    Nothing,
+    /// An API-key sign-in: the key goes to the stage as `CODEX_API_KEY`,
+    /// never into a file.
+    ApiKey(String),
+    /// A ChatGPT sign-in: `auth.json` with its refresh token blanked, written
+    /// read-only into the stage's home, so Codex in the stage can never
+    /// perform a rotating refresh. Reads aren't confined: a process in the
+    /// stage can still read the user's own `auth.json`.
+    ChatGpt(String),
+}
+
+impl std::fmt::Debug for CodexAuthPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            CodexAuthPlan::EnvKey => "EnvKey",
+            CodexAuthPlan::Nothing => "Nothing",
+            CodexAuthPlan::ApiKey(_) => "ApiKey(<redacted>)",
+            CodexAuthPlan::ChatGpt(_) => "ChatGpt(<redacted>)",
+        })
+    }
+}
+
+/// The `exp` claim of a JWT, read without checking its signature (the token
+/// stays with Codex; this only decides whether a stage may start). `None`
+/// when it isn't a JWT with a numeric `exp`. Pure.
+fn jwt_expiry(token: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use base64::Engine;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload.trim_end_matches('=')).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    chrono::DateTime::from_timestamp(claims.get("exp")?.as_i64()?, 0)
+}
+
+/// The unsandboxed sign-in preflight of a sandboxed Codex stage: how it signs
+/// in, from whether `CODEX_API_KEY` reaches it (`env_key`) and the user's
+/// `auth.json` (`auth_json`, `None` when there is none) at `now`. Mirrors
+/// Codex's own mode resolution (`AuthDotJson::resolved_mode`): `auth_mode`
+/// when set, else a personal access token or Bedrock key, else
+/// `OPENAI_API_KEY`, else ChatGPT. Fails closed, with the stage's message:
+/// [`CODEX_REFRESH_SIGN_IN`] when a ChatGPT sign-in was last refreshed more
+/// than [`CODEX_SIGN_IN_MAX_AGE_DAYS`] ago (or not at all, or in an unknown
+/// format) or its access token expires within a day;
+/// [`CODEX_SIGN_IN_UNREADABLE`] for a file that isn't a JSON object;
+/// [`CODEX_SIGN_IN_UNSUPPORTED`] for any other sign-in (external tokens,
+/// agent identity, personal access tokens, Bedrock, an API-key mode with no
+/// key). Pure.
+pub fn codex_auth_plan(
+    env_key: bool,
+    auth_json: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CodexAuthPlan, &'static str> {
+    use serde_json::Value;
+    if env_key {
+        return Ok(CodexAuthPlan::EnvKey);
+    }
+    let Some(text) = auth_json else { return Ok(CodexAuthPlan::Nothing) };
+    let Ok(Value::Object(mut auth)) = serde_json::from_str::<Value>(text) else {
+        return Err(CODEX_SIGN_IN_UNREADABLE);
+    };
+    let present = |k: &str| auth.get(k).is_some_and(|v| !v.is_null());
+    let mode = match auth.get("auth_mode") {
+        Some(Value::String(m)) => m.clone(),
+        None | Some(Value::Null) if present("personal_access_token") || present("bedrock_api_key") || present("bedrock_access_keys") => {
+            return Err(CODEX_SIGN_IN_UNSUPPORTED)
+        }
+        None | Some(Value::Null) if present("OPENAI_API_KEY") => "apikey".to_string(),
+        None | Some(Value::Null) => "chatgpt".to_string(),
+        Some(_) => return Err(CODEX_SIGN_IN_UNREADABLE),
+    };
+    match mode.as_str() {
+        "apikey" => match auth.get("OPENAI_API_KEY").and_then(Value::as_str).map(str::trim) {
+            Some(key) if !key.is_empty() => Ok(CodexAuthPlan::ApiKey(key.to_string())),
+            _ => Err(CODEX_SIGN_IN_UNSUPPORTED),
+        },
+        "chatgpt" => {
+            let Some(tokens) = auth.get_mut("tokens").filter(|t| !t.is_null()) else {
+                return Ok(CodexAuthPlan::Nothing);
+            };
+            let Some(tokens) = tokens.as_object_mut() else { return Err(CODEX_SIGN_IN_UNREADABLE) };
+            let Some(access) = tokens.get("access_token").and_then(Value::as_str) else {
+                return Err(CODEX_SIGN_IN_UNREADABLE);
+            };
+            if jwt_expiry(access).is_some_and(|exp| exp <= now + chrono::Duration::hours(CODEX_ACCESS_TOKEN_MIN_LEFT_HOURS)) {
+                return Err(CODEX_REFRESH_SIGN_IN);
+            }
+            tokens.insert("refresh_token".to_string(), Value::String(String::new()));
+            let last = auth
+                .get("last_refresh")
+                .and_then(Value::as_str)
+                .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+                .map(|t| t.with_timezone(&chrono::Utc));
+            match last {
+                Some(t) if now - t <= chrono::Duration::days(CODEX_SIGN_IN_MAX_AGE_DAYS) => {
+                    Ok(CodexAuthPlan::ChatGpt(Value::Object(auth).to_string()))
+                }
+                _ => Err(CODEX_REFRESH_SIGN_IN),
+            }
+        }
+        _ => Err(CODEX_SIGN_IN_UNSUPPORTED),
+    }
+}
+
+/// A user file Octopush copies into a stage's Codex home (`config.toml`,
+/// `auth.json`): `None` when it doesn't exist. The checks and the read go
+/// through one handle, so the file read is the one checked: it must be a
+/// regular file (a link is followed, as Codex follows it) owned by `owner`
+/// (this user) and at most [`CODEX_SOURCE_MAX_BYTES`].
+fn read_user_file(path: &Path, owner: Option<u32>) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let mut file = match std::fs::File::open(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        other => other?,
+    };
+    let meta = file.metadata()?;
+    let refuse = |why: &str| std::io::Error::other(format!("{} {why}", path.display()));
+    if !meta.is_file() {
+        return Err(refuse("is not a regular file"));
+    }
+    if !owned_by(&meta, owner) {
+        return Err(refuse("is not owned by you"));
+    }
+    let mut bytes = Vec::new();
+    (&mut file).take(CODEX_SOURCE_MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > CODEX_SOURCE_MAX_BYTES {
+        return Err(refuse("is too large to copy"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Put `contents` at `<home>/<name>` as a read-only (0400) file, or remove
+/// what is there when `contents` is `None`. The copy is written in `staging`
+/// (the home's parent, which no stage can write, so no running stage can
+/// change it before it lands), created fresh with `O_EXCL | O_NOFOLLOW`, then
+/// renamed into place: a rename replaces a link at `name` instead of writing
+/// through it. Both dirs must be real directories owned by this user.
+#[cfg(unix)]
+fn install_read_only_copy(home: &Path, staging: &Path, name: &str, contents: Option<&[u8]>) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    check_own_dir(home)?;
+    check_own_dir(staging)?;
+    let dest = home.join(name);
+    let Some(bytes) = contents else {
+        return match std::fs::remove_file(&dest) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        };
+    };
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    let key = home.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = staging.join(format!(".{key}.{name}.{}-{nanos}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o400)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, &dest)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
+#[cfg(not(unix))]
+fn install_read_only_copy(_home: &Path, _staging: &Path, _name: &str, _contents: Option<&[u8]>) -> std::io::Result<()> {
+    Err(std::io::Error::other("a sandboxed Codex home needs macOS"))
+}
+
+/// A sandboxed Codex stage's own home, ready for its profile and env.
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexHome {
+    /// The stage's `CODEX_HOME`: a realpath `ensure_cache_root` checked.
+    pub dir: String,
+    /// The user's own Codex home, as given and as its realpath: its config,
+    /// instructions and credentials are denied in the profile too.
+    pub user_home: Vec<String>,
+    /// `CODEX_HOME` and `CODEX_SQLITE_HOME` (both the stage's home) and, for
+    /// an API-key sign-in, `CODEX_API_KEY`.
+    pub env: Vec<(String, String)>,
+    /// The `-c` overrides that keep the state DB and logs in the stage's
+    /// home even when the user's `config.toml` sets `sqlite_home` or
+    /// `log_dir` (`codex_home_overrides`).
+    pub args: Vec<String>,
+}
+
+/// The `-c` overrides for a stage's Codex home `dir`: `sqlite_home` and
+/// `log_dir`, which a user's `config.toml` would otherwise point at a dir
+/// shared by every workspace (a `-c` override wins over `config.toml`; Codex
+/// ignores keys it doesn't know, so an older Codex starts all the same). The
+/// values are TOML strings; a JSON string is one. Pure.
+pub fn codex_home_overrides(dir: &str) -> Vec<String> {
+    let toml = |p: &str| serde_json::to_string(p).unwrap_or_else(|_| "\"\"".to_string());
+    let dir = dir.trim_end_matches('/');
+    vec![
+        "-c".to_string(),
+        format!("sqlite_home={}", toml(dir)),
+        "-c".to_string(),
+        format!("log_dir={}", toml(&format!("{dir}/log"))),
+    ]
+}
+
+impl std::fmt::Debug for CodexHome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let names: Vec<&str> = self.env.iter().map(|(k, _)| k.as_str()).collect();
+        f.debug_struct("CodexHome")
+            .field("dir", &self.dir)
+            .field("user_home", &self.user_home)
+            .field("env", &names)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+/// Why a sandboxed Codex stage's home couldn't be prepared.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CodexHomeError {
+    /// The sign-in preflight failed: the stage's whole failure message.
+    SignIn(&'static str),
+    /// The home or a copy couldn't be made safely.
+    Setup(String),
+}
+
+/// Prepare a sandboxed Codex stage's own `CODEX_HOME`, outside the sandbox
+/// and before its profile is built: run the sign-in preflight
+/// (`codex_auth_plan`, on the user's `auth.json` in `user_home`, the user's
+/// Codex home, which must be absolute), create the home (`codex_home_dir`,
+/// with `ensure_cache_root`'s `O_NOFOLLOW`, owner and 0700 checks), copy the
+/// user's `config.toml` into it read-only (removing a stale copy when there
+/// is none), write or remove the sign-in copy, and return the env. `env_key`:
+/// `CODEX_API_KEY` already reaches the stage.
+pub fn prepare_codex_home(
+    scope: &str,
+    write_roots: &[String],
+    tenant: CacheTenant,
+    user_home: &Path,
+    env_key: bool,
+) -> Result<CodexHome, CodexHomeError> {
+    let base = codex_home_base().ok_or_else(|| CodexHomeError::Setup("no cache directory for Codex's home".into()))?;
+    prepare_codex_home_in(&base, scope, write_roots, tenant, user_home, env_key, chrono::Utc::now())
+}
+
+/// [`prepare_codex_home`] under `base` at `now`.
+fn prepare_codex_home_in(
+    base: &Path,
+    scope: &str,
+    write_roots: &[String],
+    tenant: CacheTenant,
+    user_home: &Path,
+    env_key: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<CodexHome, CodexHomeError> {
+    let setup = CodexHomeError::Setup;
+    if !user_home.is_absolute() {
+        return Err(setup(format!("CODEX_HOME {} is not an absolute path", user_home.display())));
+    }
+    let user_real = canonical_lenient(user_home);
+    if user_real.starts_with(canonical_lenient(base)) {
+        return Err(setup(format!("CODEX_HOME {} is inside Octopush's own Codex homes", user_home.display())));
+    }
+    // The preflight runs before anything is created or copied.
+    let auth = match env_key {
+        true => None,
+        false => read_user_file(&user_home.join(CODEX_AUTH_FILE), current_uid()).map_err(|_| CodexHomeError::SignIn(CODEX_SIGN_IN_UNREADABLE))?,
+    };
+    let auth_text = auth
+        .as_deref()
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(|_| CodexHomeError::SignIn(CODEX_SIGN_IN_UNREADABLE))?;
+    let plan = codex_auth_plan(env_key, auth_text, now).map_err(CodexHomeError::SignIn)?;
+    let config = read_user_file(&user_home.join(CODEX_CONFIG_FILE), current_uid())
+        .map_err(|e| setup(format!("couldn't read your Codex config: {e}")))?;
+    let home = ensure_cache_root(&codex_home_dir(base, scope, write_roots, tenant))
+        .map_err(|e| setup(format!("couldn't set up Codex's home for this stage: {e}")))?;
+    let staging = home.parent().ok_or_else(|| setup("Codex's home has no parent".into()))?;
+    for name in CODEX_HOME_PINNED_DIRS {
+        let dir = home.join(name);
+        create_dir_0700(&dir)
+            .and_then(|()| check_own_dir(&dir))
+            .map_err(|e| setup(format!("couldn't set up Codex's home for this stage: {e}")))?;
+    }
+    purge_denied_entries(&home).map_err(|e| setup(format!("couldn't clear Codex's home for this stage: {e}")))?;
+    install_read_only_copy(&home, staging, CODEX_CONFIG_FILE, config.as_deref())
+        .map_err(|e| setup(format!("couldn't copy your Codex config: {e}")))?;
+    let auth_copy = match &plan {
+        CodexAuthPlan::ChatGpt(json) => Some(json.as_bytes()),
+        _ => None,
+    };
+    install_read_only_copy(&home, staging, CODEX_AUTH_FILE, auth_copy)
+        .map_err(|e| setup(format!("couldn't copy Codex's sign-in: {e}")))?;
+    let dir = home.to_string_lossy().into_owned();
+    let mut env = vec![("CODEX_HOME".to_string(), dir.clone()), ("CODEX_SQLITE_HOME".to_string(), dir.clone())];
+    if let CodexAuthPlan::ApiKey(key) = plan {
+        env.push(("CODEX_API_KEY".to_string(), key));
+    }
+    let mut user = vec![user_home.to_string_lossy().into_owned(), user_real.to_string_lossy().into_owned()];
+    user.dedup();
+    let args = codex_home_overrides(&dir);
+    Ok(CodexHome { dir, user_home: user, env, args })
+}
+
 /// Writable individual *files* (as opposed to subtrees). Seatbelt's `subpath`
 /// won't cover a bare file sibling of an allowed dir, so the CLI's top-level
 /// `~/.claude.json` state file (`<CLAUDE_CONFIG_DIR>/.claude.json` when
@@ -612,11 +1160,12 @@ fn forbidden_root_targets(home: Option<&str>) -> Vec<PathBuf> {
 }
 
 /// The dirs only Octopush may hand out, which no system write root may hold:
-/// the build-cache base and the stage temp base, each as given and as its
-/// realpath. A stage must never write another stage's cache root or temp dir.
+/// the build-cache base, the stage temp base and the Codex home base, each as
+/// given and as its realpath. A stage must never write another stage's cache
+/// root, temp dir or Codex home.
 fn private_bases() -> Vec<PathBuf> {
     let mut v = Vec::new();
-    for base in [build_cache_base(), stage_tmp_base()].into_iter().flatten() {
+    for base in [build_cache_base(), stage_tmp_base(), codex_home_base()].into_iter().flatten() {
         v.push(canonical_lenient(&base));
         v.push(base);
     }
@@ -1310,7 +1859,7 @@ pub fn stage_isolation(git_isolation: &str, exec_choice: &str, workspace_path: &
 /// every allow (`claude_config_denies`). Errors when a workspace's git
 /// layout can't be resolved (fail closed).
 pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[String]) -> AppResult<String> {
-    seatbelt_profile_and_refusals(mission_write_roots, cache_roots, None).map(|(profile, _)| profile)
+    seatbelt_profile_and_refusals(mission_write_roots, cache_roots, None, None).map(|(profile, _)| profile)
 }
 
 /// [`build_seatbelt_profile`], plus why each system root or state file left
@@ -1318,27 +1867,30 @@ pub fn build_seatbelt_profile(mission_write_roots: &[String], cache_roots: &[Str
 /// The missing user-home roots are created only on macOS, the one platform
 /// that runs the sandbox, so a test elsewhere never writes the real `$HOME`.
 /// `claude_config` is a Claude stage's absolute `CLAUDE_CONFIG_DIR`
-/// (`claude_config_dir`), which takes `~/.claude`'s place.
+/// (`claude_config_dir`), which takes `~/.claude`'s place. `codex` is a Codex
+/// stage's own home (`prepare_codex_home`, `codex_home_rules`).
 fn seatbelt_profile_and_refusals(
     mission_write_roots: &[String],
     cache_roots: &[String],
     claude_config: Option<&str>,
+    codex: Option<&CodexHome>,
 ) -> AppResult<(String, Vec<String>)> {
     let home = std::env::var("HOME").ok();
     let tmpdir = std::env::var("TMPDIR").ok();
     if let (true, Some(h)) = (cfg!(target_os = "macos"), home.as_deref()) {
         ensure_home_roots(h, claude_config);
     }
-    profile_and_refusals_for(home.as_deref(), tmpdir.as_deref(), claude_config, mission_write_roots, cache_roots)
+    profile_and_refusals_for(home.as_deref(), tmpdir.as_deref(), claude_config, codex, mission_write_roots, cache_roots)
 }
 
-/// [`seatbelt_profile_and_refusals`] for the given `$HOME`, `$TMPDIR` and
-/// `CLAUDE_CONFIG_DIR`, without creating anything. Reads the filesystem
-/// (realpaths, git layouts).
+/// [`seatbelt_profile_and_refusals`] for the given `$HOME`, `$TMPDIR`,
+/// `CLAUDE_CONFIG_DIR` and Codex home, without creating anything. Reads the
+/// filesystem (realpaths, git layouts).
 fn profile_and_refusals_for(
     home: Option<&str>,
     tmpdir: Option<&str>,
     claude_config: Option<&str>,
+    codex: Option<&CodexHome>,
     mission_write_roots: &[String],
     cache_roots: &[String],
 ) -> AppResult<(String, Vec<String>)> {
@@ -1361,6 +1913,9 @@ fn profile_and_refusals_for(
     if let Some(h) = home {
         let projects = canonical_string(&Path::new(&claude_dir(h, claude_config)).join("projects"));
         rules.extend(claude_config_denies(&claude_deny_bases(h, claude_config), &[projects]));
+    }
+    if let Some(c) = codex {
+        rules.extend(codex_home_rules(&c.dir, &c.user_home));
     }
     let write_roots = rules.subpaths.clone();
     for root in mission_write_roots {
@@ -1617,7 +2172,7 @@ pub fn prepare(
     program: &OsStr,
     args: &[String],
 ) -> AppResult<Prepared> {
-    prepare_with(write_roots, cache_scope, CacheTenant::InProcess, program, args, false, None, |_| Vec::new())
+    prepare_with(write_roots, cache_scope, CacheTenant::InProcess, program, args, false, None, None, |_| Vec::new())
 }
 
 /// [`prepare`] for a CLI stage, whose dirs are keyed by `tenant`
@@ -1631,7 +2186,9 @@ pub fn prepare(
 /// the caches its builds write and its own temp files. `claude_config` is a
 /// Claude stage's absolute `CLAUDE_CONFIG_DIR` (`claude_config_dir`): the
 /// profile then grants that dir's state, not `~/.claude`'s (`None` keeps
-/// `~/.claude`).
+/// `~/.claude`). `codex` is a Codex stage's own home (`prepare_codex_home`):
+/// the profile grants it and denies its root and copies
+/// (`codex_home_rules`), and its env is added to the returned env.
 #[allow(clippy::too_many_arguments)]
 pub fn prepare_with(
     write_roots: &[String],
@@ -1641,6 +2198,7 @@ pub fn prepare_with(
     args: &[String],
     private_tmp: bool,
     claude_config: Option<&str>,
+    codex: Option<&CodexHome>,
     extra_args: impl FnOnce(&[String]) -> Vec<String>,
 ) -> AppResult<Prepared> {
     if !cfg!(target_os = "macos") {
@@ -1655,11 +2213,13 @@ pub fn prepare_with(
     }
     let stage_dirs = StageDirs::make(write_roots, cache_scope, tenant, private_tmp)?;
     let own_dirs = stage_dirs.dirs();
-    let (profile, left_out) = seatbelt_profile_and_refusals(write_roots, &own_dirs, claude_config)?;
+    let (profile, left_out) = seatbelt_profile_and_refusals(write_roots, &own_dirs, claude_config, codex)?;
     let mut args = args.to_vec();
     args.extend(extra_args(&own_dirs));
     let (prog, wrapped) = sandbox_argv(program, &args, &profile);
-    Ok(Prepared { program: prog, args: wrapped, env: stage_dirs.env(), left_out })
+    let mut env = stage_dirs.env();
+    env.extend(codex.map(|c| c.env.clone()).unwrap_or_default());
+    Ok(Prepared { program: prog, args: wrapped, env, left_out })
 }
 
 /// Collapse `.`/`..` components lexically (no filesystem access, so it works for
@@ -2364,7 +2924,7 @@ mod tests {
         let home = canonical_string(fake_home.path());
         ensure_home_roots(&home, None);
         let tmpdir = canonical_string(Path::new(&std::env::var("TMPDIR").unwrap()));
-        let (profile, _) = profile_and_refusals_for(Some(&home), Some(&tmpdir), None, &roots, &[]).unwrap();
+        let (profile, _) = profile_and_refusals_for(Some(&home), Some(&tmpdir), None, None, &roots, &[]).unwrap();
         let run = |script: &str| -> bool {
             let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script.to_string()], &profile);
             std::process::Command::new(prog).args(args).output().map(|o| o.status.success()).unwrap_or(false)
@@ -3251,7 +3811,7 @@ mod tests {
         let run = |script: &str| {
             let mut seen: Vec<String> = Vec::new();
             let args = vec!["-c".to_string(), script.to_string()];
-            let prepared = prepare_with(&roots, Some(scope.as_str()), RC, OsStr::new("bash"), &args, true, None, |dirs| {
+            let prepared = prepare_with(&roots, Some(scope.as_str()), RC, OsStr::new("bash"), &args, true, None, None, |dirs| {
                 seen = dirs.to_vec();
                 Vec::new()
             })
@@ -3288,7 +3848,7 @@ mod tests {
         let home = std::env::var("HOME").ok();
         let tmpdir = std::env::var("TMPDIR").ok();
         let shared = assemble_write_roots(&[], home.as_deref(), tmpdir.as_deref(), None, current_uid(), &private_bases()).subpaths;
-        for base in [base, stage_tmp_base().expect("a user cache dir")] {
+        for base in [base, stage_tmp_base().expect("a user cache dir"), codex_home_base().expect("a user cache dir")] {
             let real = canonical_lenient(&base);
             for r in &shared {
                 assert!(!base.starts_with(r) && !real.starts_with(r), "{} is inside {r}", base.display());
@@ -3379,7 +3939,7 @@ mod tests {
         std::fs::write(format!("{c}/skills/existing/SKILL.md"), "original\n").unwrap();
         std::fs::write(format!("{c}/settings.json"), "{}\n").unwrap();
         std::fs::create_dir(format!("{c}/agents")).unwrap();
-        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, &[], &[]).unwrap();
+        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, None, &[], &[]).unwrap();
         assert!(refused.is_empty(), "{refused:?}");
         let sandboxed = |script: String| -> bool {
             let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
@@ -3454,7 +4014,7 @@ mod tests {
         ensure_home_roots(&h, None);
         let creds = format!("{c}/.credentials.json");
         std::fs::write(&creds, "{\"old\":1}\n").unwrap();
-        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, &[], &[]).unwrap();
+        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, None, &[], &[]).unwrap();
         assert!(refused.is_empty(), "{refused:?}");
         let sandboxed = |script: String| -> bool {
             let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
@@ -3468,7 +4028,7 @@ mod tests {
         assert!(!sandboxed(format!("echo x > '{c}/.credentials.json.new'")));
         // A login file with a second hard link is left out, and named.
         std::fs::hard_link(&creds, format!("{h}/copy")).unwrap();
-        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, &[], &[]).unwrap();
+        let (profile, refused) = profile_and_refusals_for(Some(&h), None, None, None, &[], &[]).unwrap();
         assert!(refused.iter().any(|w| w.contains(".credentials.json")), "{refused:?}");
         let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), format!("echo x > '{creds}'")], &profile);
         assert!(!std::process::Command::new(prog).args(args).output().unwrap().status.success());
@@ -3482,7 +4042,7 @@ mod tests {
         let cfg = format!("{h}/alt-claude");
         ensure_home_roots(&h, Some(&cfg));
         std::fs::create_dir(format!("{h}/.claude")).unwrap();
-        let (profile, refused) = profile_and_refusals_for(Some(&h), None, Some(&cfg), &[], &[]).unwrap();
+        let (profile, refused) = profile_and_refusals_for(Some(&h), None, Some(&cfg), None, &[], &[]).unwrap();
         assert!(refused.is_empty(), "{refused:?}");
         let sandboxed = |script: String| -> bool {
             let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script], &profile);
@@ -3550,7 +4110,7 @@ mod tests {
         let roots = vec![ws.path().to_string_lossy().into_owned()];
         let scope = format!("{}-claude-version-test", roots[0]);
         let args = vec!["--version".to_string()];
-        let prepared = prepare_with(&roots, Some(scope.as_str()), RC, claude.as_os_str(), &args, true, None, |_| Vec::new()).unwrap();
+        let prepared = prepare_with(&roots, Some(scope.as_str()), RC, claude.as_os_str(), &args, true, None, None, |_| Vec::new()).unwrap();
         let out = std::process::Command::new(&prepared.program)
             .args(&prepared.args)
             .envs(prepared.env.iter().cloned())
@@ -3673,7 +4233,7 @@ mod tests {
         assert_eq!(roots.files, vec![format!("{cfg}/.claude.json")]);
         // Config entries are denied under both dirs, auto memory in the
         // config dir's projects.
-        let (profile, refused) = profile_and_refusals_for(Some(&h), None, Some(&cfg), &[], &[]).unwrap();
+        let (profile, refused) = profile_and_refusals_for(Some(&h), None, Some(&cfg), None, &[], &[]).unwrap();
         assert!(refused.is_empty(), "{refused:?}");
         let deny = profile.find("(deny file-write*\n").unwrap();
         for f in [format!("{h}/.claude/settings.json"), format!("{cfg}/settings.json"), format!("{cfg}/mcp.json")] {
@@ -3771,5 +4331,618 @@ mod tests {
                 OsString::from("hi"),
             ]
         );
+    }
+
+    // ─── A sandboxed Codex stage's own CODEX_HOME (#784) ───────────────────
+
+    /// A Codex stage's tenant in a `sandbox` mission (reads open).
+    const CT: CacheTenant<'static> = CacheTenant::Cli { exec_choice: "sandbox", reads_confined: false };
+
+    fn utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        s.parse().unwrap()
+    }
+
+    /// A JWT-shaped token whose payload carries `exp` (unsigned; only the
+    /// claim is read).
+    fn token_expiring(exp: chrono::DateTime<chrono::Utc>) -> String {
+        use base64::Engine;
+        let claims = serde_json::json!({ "exp": exp.timestamp() }).to_string();
+        format!("e30.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims))
+    }
+
+    /// A ChatGPT sign-in as Codex saves it.
+    fn chatgpt_auth(last_refresh: &str, access_token: &str) -> String {
+        serde_json::json!({
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "id-token-value",
+                "access_token": access_token,
+                "refresh_token": "rt-secret-value",
+                "account_id": "acct"
+            },
+            "last_refresh": last_refresh
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn each_workspace_and_access_mode_gets_its_own_codex_home() {
+        let base = Path::new("/c/octopush/codex-home");
+        let roots = vec!["/ws".to_string()];
+        let home = codex_home_dir(base, "/ws", &roots, CT);
+        assert_eq!(home, codex_home_dir(base, "/ws/", &roots, CT), "a trailing / is the same workspace");
+        assert_eq!(home.parent().unwrap(), workspace_cache_dir(base, "/ws"), "in the workspace's dir, removed with it");
+        assert_eq!(home.parent().unwrap().parent().unwrap(), base);
+        assert_ne!(home, codex_home_dir(base, "/other", &roots, CT));
+        // A readonly mission, or a read-only stage (no write roots), never
+        // shares the writer's sessions; nor does another exec choice.
+        assert_ne!(home, codex_home_dir(base, "/ws", &[], CT));
+        assert_ne!(home, codex_home_dir(base, "/ws", &roots, CacheTenant::Cli { exec_choice: "none", reads_confined: false }));
+        // Keyed exactly like the stage's build-cache root, under its own base.
+        let cache = mission_cache_root(Path::new("/b"), "/ws", &roots, CT);
+        assert_eq!(home.strip_prefix(base).unwrap(), cache.strip_prefix("/b").unwrap());
+    }
+
+    /// Whether `rules` deny writing `path` (a literal, a subtree or a regex).
+    fn codex_denies(rules: &WriteRules, path: &str) -> bool {
+        rules.deny_literals.iter().any(|l| l == path)
+            || rules.deny_subpaths.iter().any(|d| Path::new(path).starts_with(d))
+            || regex_denies(rules, path)
+    }
+
+    /// Case variants of `name` as a case-insensitive volume sees them.
+    fn case_variants(name: &str) -> Vec<String> {
+        let upper = name.to_ascii_uppercase();
+        let mut title = name.to_string();
+        if let Some(i) = title.find(|c: char| c.is_ascii_alphabetic()) {
+            title.replace_range(i..=i, &title[i..=i].to_ascii_uppercase());
+        }
+        let mut v = vec![name.to_string(), upper, title, name.to_ascii_lowercase()];
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn a_codex_home_is_writable_but_what_codex_reads_back_is_not() {
+        let user = vec!["/u/.codex".to_string(), "/real/u/.codex/".to_string()];
+        let rules = codex_home_rules("/c/h/", &user);
+        assert_eq!(rules.subpaths, vec!["/c/h".to_string()], "only the stage's own home");
+        assert!(rules.literals.is_empty() && rules.regexes.is_empty());
+        for b in ["/c/h", "/u/.codex", "/real/u/.codex"] {
+            assert!(rules.deny_literals.contains(&b.to_string()), "{b} itself is pinned");
+            let files = [
+                "config.toml", "managed_config.toml", "requirements.toml", "environments.toml", "work.config.toml",
+                "auth.json", "AGENTS.md", "AGENTS.override.md", "instructions.md", ".env", "hooks.json",
+                "models_cache.json", "cloud-config-bundle-cache.json", "managed-config-acme.json", "managed-config-.json",
+                ".tmp/plugins.sha", ".tmp/plugin-share-local-paths-v1.json",
+            ];
+            for f in files {
+                for v in case_variants(f) {
+                    assert!(codex_denies(&rules, &format!("{b}/{v}")), "{b}/{v}");
+                }
+            }
+            let dirs = [
+                "prompts", "rules", "skills", "migrated-command-skills", "memories", "memories_v2", "memories_extensions",
+                "plugins", "hooks", "agents", "secrets", "cache", "packages", "proxy", ".tmp/marketplaces", ".tmp/plugins",
+            ];
+            for d in dirs {
+                for v in case_variants(d) {
+                    assert!(codex_denies(&rules, &format!("{b}/{v}")), "{b}/{v} itself");
+                    assert!(codex_denies(&rules, &format!("{b}/{v}/x/y.md")), "{b}/{v}/x/y.md");
+                }
+            }
+            // The Kelvin sign and the long s fold to `k` and `s` on APFS.
+            assert!(codex_denies(&rules, &format!("{b}/\u{17F}kills/x/SKILL.md")));
+            assert!(codex_denies(&rules, &format!("{b}/s\u{212A}ills/x/SKILL.md")));
+            assert!(codex_denies(&rules, &format!("{b}/.tmp/plugin\u{17F}/p")));
+        }
+        // `.tmp` is pinned in the stage's own home, not its contents.
+        assert!(codex_denies(&rules, "/c/h/.tmp") && codex_denies(&rules, "/c/h/.TMP"));
+        // What `codex exec` writes stays writable.
+        for w in [
+            "sessions/2026/11/20/rollout-x.jsonl", "archived_sessions/x", "thread-writer-locks/t.lock", ".tmp/x", "tmp/arg0/x",
+            "log/codex-tui.log", "state_5.sqlite", "state_5.sqlite-wal", "logs_2.sqlite", "memories_1.sqlite",
+            "goals_1.sqlite", "history.jsonl", "session_index.jsonl", "shell_snapshots/s.sh", "version.json",
+            "installation_id", ".tmp/plugins.sync.lock", "plugins.toml.bak", "skills-old",
+        ] {
+            assert!(!codex_denies(&rules, &format!("/c/h/{w}")), "/c/h/{w}");
+        }
+        // The denies come after the allow, so they win.
+        let profile = render_profile(&rules);
+        let allow = profile.find("(allow file-write*").unwrap();
+        let deny = profile.rfind("(regex \"^/c/h/").unwrap();
+        assert!(allow < deny, "{profile}");
+        assert!(profile.contains("(deny file-link"), "hard links of the copies are denied too");
+    }
+
+    #[test]
+    fn only_what_the_profile_denies_is_cleared_from_a_codex_home() {
+        for denied in ["AGENTS.md", "agents.MD", ".env", "models_cache.json", "Models_Cache.json", "managed-config-acme.json", "environments.toml", "x.config.toml", "Config.TOML.bak.toml", "skills", "Secrets", "cache", "packages", "proxy"] {
+            assert!(is_denied_top_level(denied), "{denied}");
+        }
+        for kept in ["config.toml", "CONFIG.toml", "auth.json", "sessions", "log", ".tmp", "tmp", "state_5.sqlite", "history.jsonl", "version.json", "installation_id"] {
+            assert!(!is_denied_top_level(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_codex_home_is_cleared_of_denied_entries_before_each_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = canonical_lenient(dir.path());
+        for d in ["sessions/2026", "skills/x", "secrets", ".tmp/plugins/p", ".tmp/marketplaces/m", ".tmp/keep", "cache/codex_apps_tools"] {
+            std::fs::create_dir_all(home.join(d)).unwrap();
+        }
+        for f in ["sessions/2026/r.jsonl", "skills/x/SKILL.md", "AGENTS.md", ".env", "models_cache.json", "managed-config-ns.json", "environments.toml", ".tmp/plugins.sha", ".tmp/keep/k", "state_5.sqlite", "config.toml"] {
+            std::fs::write(home.join(f), "x").unwrap();
+        }
+        // A link is removed, never followed.
+        let outside = home.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("keep"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, home.join("prompts")).unwrap();
+        purge_denied_entries(&home).unwrap();
+        for gone in ["skills", "secrets", ".tmp/plugins", ".tmp/marketplaces", "cache", "AGENTS.md", ".env", "models_cache.json", "managed-config-ns.json", "environments.toml", ".tmp/plugins.sha", "prompts"] {
+            assert!(std::fs::symlink_metadata(home.join(gone)).is_err(), "{gone} is still there");
+        }
+        for kept in ["sessions/2026/r.jsonl", ".tmp/keep/k", "state_5.sqlite", "config.toml", "outside/keep"] {
+            assert!(home.join(kept).exists(), "{kept} was removed");
+        }
+    }
+
+    #[test]
+    fn a_codex_stage_keeps_its_state_db_and_logs_in_its_own_home() {
+        assert_eq!(
+            codex_home_overrides("/c/h/"),
+            vec!["-c".to_string(), "sqlite_home=\"/c/h\"".to_string(), "-c".to_string(), "log_dir=\"/c/h/log\"".to_string()]
+        );
+        // A quote in the path stays inside the TOML string.
+        assert_eq!(codex_home_overrides("/c/a\"b")[1], "sqlite_home=\"/c/a\\\"b\"");
+    }
+
+    #[test]
+    fn removing_a_workspace_takes_its_codex_homes_even_when_its_build_cache_cant_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cache, tmp, codex) = (dir.path().join("build-cache"), dir.path().join("tmp"), dir.path().join("codex-home"));
+        let home = codex_home_dir(&codex, "/ws", &[], CT);
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("auth.json"), "{}").unwrap();
+        // The build cache's workspace dir can't be listed: its removal fails.
+        let ws_cache = workspace_cache_dir(&cache, "/ws");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(&ws_cache, "not a dir").unwrap();
+        let other = codex_home_dir(&codex, "/other", &[], CT);
+        std::fs::create_dir_all(&other).unwrap();
+        let _ = remove_workspace_dirs(Some(&cache), Some(&tmp), Some(&codex), "/ws");
+        assert!(!home.exists(), "the workspace's Codex home is gone");
+        assert!(other.exists(), "another workspace's is kept");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A build cache that can't be removed (an unwritable workspace dir).
+            std::fs::remove_file(&ws_cache).unwrap();
+            std::fs::create_dir_all(ws_cache.join("root/sub")).unwrap();
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::set_permissions(&ws_cache, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let got = remove_workspace_dirs(Some(&cache), None, Some(&codex), "/ws");
+            std::fs::set_permissions(&ws_cache, std::fs::Permissions::from_mode(0o700)).unwrap();
+            // (Root removes it anyway, so only a normal user sees the failure.)
+            assert!(got.is_err() || current_uid() == Some(0), "the build cache's failure is reported");
+            assert!(!home.exists(), "and the Codex home went all the same");
+        }
+    }
+
+    #[test]
+    fn the_codex_sign_in_preflight_passes_keys_by_env_and_never_hands_out_a_refresh_token() {
+        let now = utc("2026-11-20T12:00:00Z");
+        let fresh = token_expiring(utc("2026-11-28T12:00:00Z"));
+        // `CODEX_API_KEY` already reaches the stage: the file isn't even parsed.
+        assert_eq!(codex_auth_plan(true, Some("not json"), now), Ok(CodexAuthPlan::EnvKey));
+        assert_eq!(codex_auth_plan(false, None, now), Ok(CodexAuthPlan::Nothing));
+        // An API-key sign-in goes by env, never by file.
+        assert_eq!(codex_auth_plan(false, Some(r#"{"OPENAI_API_KEY":" sk-test "}"#), now), Ok(CodexAuthPlan::ApiKey("sk-test".into())));
+        assert_eq!(
+            codex_auth_plan(false, Some(r#"{"auth_mode":"apikey","OPENAI_API_KEY":"sk-test"}"#), now),
+            Ok(CodexAuthPlan::ApiKey("sk-test".into()))
+        );
+        // A fresh ChatGPT sign-in: a copy without the refresh token.
+        let text = chatgpt_auth("2026-11-18T09:30:00.123Z", &fresh);
+        let Ok(CodexAuthPlan::ChatGpt(copy)) = codex_auth_plan(false, Some(&text), now) else { panic!("a fresh sign-in passes") };
+        let v: serde_json::Value = serde_json::from_str(&copy).unwrap();
+        assert_eq!(v["tokens"]["refresh_token"], "");
+        assert_eq!(v["tokens"]["access_token"], fresh.as_str());
+        assert_eq!(v["tokens"]["id_token"], "id-token-value");
+        assert_eq!(v["last_refresh"], "2026-11-18T09:30:00.123Z");
+        assert!(!copy.contains("rt-secret-value"));
+        let explicit = text.replacen('{', r#"{"auth_mode":"chatgpt","#, 1);
+        assert!(matches!(codex_auth_plan(false, Some(&explicit), now), Ok(CodexAuthPlan::ChatGpt(_))));
+        // Exactly 7 days old still passes; any older fails closed.
+        assert!(matches!(codex_auth_plan(false, Some(&chatgpt_auth("2026-11-13T12:00:00Z", &fresh)), now), Ok(CodexAuthPlan::ChatGpt(_))));
+        for stale in ["2026-11-13T11:59:59Z", "2026-11-01T00:00:00Z", "yesterday"] {
+            assert_eq!(codex_auth_plan(false, Some(&chatgpt_auth(stale, &fresh)), now), Err("Open Codex once to refresh sign-in"), "{stale}");
+        }
+        let no_refresh = serde_json::json!({ "tokens": { "access_token": fresh, "refresh_token": "r" } }).to_string();
+        assert_eq!(codex_auth_plan(false, Some(&no_refresh), now), Err(CODEX_REFRESH_SIGN_IN));
+        // An access token expiring within a day fails closed too, however
+        // fresh `last_refresh` says it is; an opaque one is judged by
+        // `last_refresh` alone, as Codex does.
+        let soon = token_expiring(utc("2026-11-21T06:00:00Z"));
+        assert_eq!(codex_auth_plan(false, Some(&chatgpt_auth("2026-11-20T11:00:00Z", &soon)), now), Err(CODEX_REFRESH_SIGN_IN));
+        assert!(matches!(codex_auth_plan(false, Some(&chatgpt_auth("2026-11-20T11:00:00Z", "opaque")), now), Ok(CodexAuthPlan::ChatGpt(_))));
+        // No tokens saved: nothing to copy.
+        assert_eq!(codex_auth_plan(false, Some(r#"{"OPENAI_API_KEY":null}"#), now), Ok(CodexAuthPlan::Nothing));
+        // Unreadable shapes and other sign-ins fail closed.
+        for bad in ["", "[]", "not json", r#"{"auth_mode":3}"#, r#"{"tokens":"x"}"#, r#"{"tokens":{"refresh_token":"r"}}"#] {
+            assert_eq!(codex_auth_plan(false, Some(bad), now), Err(CODEX_SIGN_IN_UNREADABLE), "{bad}");
+        }
+        for other in [
+            r#"{"auth_mode":"chatgptAuthTokens","tokens":{"access_token":"a"}}"#,
+            r#"{"auth_mode":"agentIdentity"}"#,
+            r#"{"auth_mode":"headers"}"#,
+            r#"{"personal_access_token":"at-x"}"#,
+            r#"{"bedrock_api_key":{"key":"k"}}"#,
+            r#"{"auth_mode":"apikey","OPENAI_API_KEY":""}"#,
+        ] {
+            assert_eq!(codex_auth_plan(false, Some(other), now), Err(CODEX_SIGN_IN_UNSUPPORTED), "{other}");
+        }
+        // Never a secret in a log line.
+        for plan in [CodexAuthPlan::ApiKey("sk-test".into()), CodexAuthPlan::ChatGpt(copy)] {
+            let shown = format!("{plan:?}");
+            assert!(!shown.contains("sk-test") && !shown.contains("access_token"), "{shown}");
+        }
+    }
+
+    #[test]
+    fn a_users_codex_file_is_copied_only_as_a_small_regular_file_of_theirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        assert!(read_user_file(&file, current_uid()).unwrap().is_none(), "a missing file is no copy");
+        std::fs::write(&file, "model = \"gpt-5\"\n").unwrap();
+        assert_eq!(read_user_file(&file, current_uid()).unwrap().as_deref(), Some(&b"model = \"gpt-5\"\n"[..]));
+        assert!(read_user_file(dir.path(), current_uid()).is_err(), "a dir");
+        let big = dir.path().join("big.toml");
+        std::fs::write(&big, vec![b'#'; (CODEX_SOURCE_MAX_BYTES + 1) as usize]).unwrap();
+        assert!(read_user_file(&big, current_uid()).is_err(), "too large");
+        #[cfg(unix)]
+        {
+            // A dotfiles link is followed, as Codex follows it.
+            let link = dir.path().join("linked.toml");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert!(read_user_file(&link, current_uid()).unwrap().is_some());
+            let someone_else = current_uid().map(|u| u.wrapping_add(1));
+            let err = read_user_file(&file, someone_else).unwrap_err();
+            assert!(err.to_string().contains("not owned by you"), "{err}");
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_read_only_copy_lands_as_a_fresh_file_and_never_writes_through_a_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = canonical_lenient(dir.path());
+        let home = staging.join("home");
+        create_dir_0700(&home).unwrap();
+        install_read_only_copy(&home, &staging, "config.toml", Some(b"a = 1\n")).unwrap();
+        let copy = home.join("config.toml");
+        assert_eq!(std::fs::read(&copy).unwrap(), b"a = 1\n");
+        assert_eq!(std::fs::metadata(&copy).unwrap().permissions().mode() & 0o777, 0o400);
+        // Replaced on the next launch, read-only as it is.
+        install_read_only_copy(&home, &staging, "config.toml", Some(b"a = 2\n")).unwrap();
+        assert_eq!(std::fs::read(&copy).unwrap(), b"a = 2\n");
+        // Nothing is left behind in the staging dir.
+        let left: Vec<_> = std::fs::read_dir(&staging).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("home")], "{left:?}");
+        // A link at the name is replaced, never written through.
+        let outside = staging.join("outside.toml");
+        std::fs::write(&outside, "original\n").unwrap();
+        std::fs::remove_file(&copy).unwrap();
+        std::os::unix::fs::symlink(&outside, &copy).unwrap();
+        install_read_only_copy(&home, &staging, "config.toml", Some(b"a = 3\n")).unwrap();
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "original\n");
+        let meta = std::fs::symlink_metadata(&copy).unwrap();
+        assert!(meta.is_file() && !meta.file_type().is_symlink());
+        // No copy: what is there goes; nothing there is fine.
+        install_read_only_copy(&home, &staging, "config.toml", None).unwrap();
+        assert!(std::fs::symlink_metadata(&copy).is_err());
+        install_read_only_copy(&home, &staging, "config.toml", None).unwrap();
+        // A home or staging dir that is a link is refused (O_NOFOLLOW), and
+        // nothing lands where it points.
+        let target = staging.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let linked = staging.join("linked-home");
+        std::os::unix::fs::symlink(&target, &linked).unwrap();
+        assert!(install_read_only_copy(&linked, &staging, "config.toml", Some(b"x")).is_err());
+        assert!(install_read_only_copy(&home, &linked, "config.toml", Some(b"x")).is_err());
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none(), "nothing written through the link");
+    }
+
+    /// A stand-in user Codex home in `dir` with a config, a fresh ChatGPT
+    /// sign-in, instructions and a prompt.
+    #[cfg(unix)]
+    fn user_codex_home(dir: &Path) -> PathBuf {
+        let user = dir.join(".codex");
+        std::fs::create_dir_all(user.join("prompts")).unwrap();
+        std::fs::create_dir_all(user.join("sessions")).unwrap();
+        std::fs::write(user.join("config.toml"), "model = \"gpt-5\"\n").unwrap();
+        let now = chrono::Utc::now();
+        let auth = chatgpt_auth(&(now - chrono::Duration::days(1)).to_rfc3339(), &token_expiring(now + chrono::Duration::days(9)));
+        std::fs::write(user.join("auth.json"), auth).unwrap();
+        std::fs::write(user.join("AGENTS.md"), "original\n").unwrap();
+        std::fs::write(user.join("prompts/p.md"), "original\n").unwrap();
+        user
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn preparing_a_codex_home_copies_the_config_and_sign_in_read_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_lenient(dir.path());
+        let base = root.join("codex-home");
+        let user = user_codex_home(&root);
+        let roots = vec!["/ws".to_string()];
+        let now = chrono::Utc::now();
+        let home = prepare_codex_home_in(&base, "/ws", &roots, CT, &user, false, now).unwrap();
+        let h = PathBuf::from(&home.dir);
+        assert_eq!(h, codex_home_dir(&base, "/ws", &roots, CT));
+        assert_eq!(std::fs::metadata(&h).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read(h.join("config.toml")).unwrap(), std::fs::read(user.join("config.toml")).unwrap());
+        for f in ["config.toml", "auth.json"] {
+            assert_eq!(std::fs::metadata(h.join(f)).unwrap().permissions().mode() & 0o777, 0o400, "{f}");
+        }
+        let auth: serde_json::Value = serde_json::from_slice(&std::fs::read(h.join("auth.json")).unwrap()).unwrap();
+        assert_eq!(auth["tokens"]["refresh_token"], "", "the stage never holds the refresh token");
+        assert_eq!(home.env, vec![("CODEX_HOME".to_string(), home.dir.clone()), ("CODEX_SQLITE_HOME".to_string(), home.dir.clone())]);
+        assert_eq!(home.args, codex_home_overrides(&home.dir));
+        let tmp = std::fs::symlink_metadata(h.join(".tmp")).unwrap();
+        assert!(tmp.is_dir() && !tmp.file_type().is_symlink(), "the pinned .tmp is made as a real dir");
+        assert_eq!(tmp.permissions().mode() & 0o777, 0o700);
+        assert_eq!(home.user_home, vec![user.to_string_lossy().into_owned()]);
+        assert!(!format!("{home:?}").contains("rt-secret"));
+        // The user's own files are untouched.
+        assert!(std::fs::read_to_string(user.join("auth.json")).unwrap().contains("rt-secret-value"));
+
+        // An API-key sign-in: the key by env, and the old sign-in copy goes.
+        std::fs::write(user.join("auth.json"), r#"{"OPENAI_API_KEY":"sk-test"}"#).unwrap();
+        let keyed = prepare_codex_home_in(&base, "/ws", &roots, CT, &user, false, now).unwrap();
+        assert!(keyed.env.contains(&("CODEX_API_KEY".to_string(), "sk-test".to_string())));
+        assert!(!format!("{keyed:?}").contains("sk-test"), "{keyed:?}");
+        assert!(std::fs::symlink_metadata(h.join("auth.json")).is_err());
+        // `CODEX_API_KEY` in the stage's env: auth.json isn't read at all.
+        std::fs::remove_file(user.join("auth.json")).unwrap();
+        std::fs::create_dir(user.join("auth.json")).unwrap();
+        let env = prepare_codex_home_in(&base, "/ws", &roots, CT, &user, true, now).unwrap();
+        assert!(!env.env.iter().any(|(k, _)| k == "CODEX_API_KEY"));
+        assert_eq!(
+            prepare_codex_home_in(&base, "/ws", &roots, CT, &user, false, now),
+            Err(CodexHomeError::SignIn(CODEX_SIGN_IN_UNREADABLE))
+        );
+        // A config the user removed is removed from the copy too.
+        std::fs::remove_file(user.join("config.toml")).unwrap();
+        prepare_codex_home_in(&base, "/ws", &roots, CT, &user, true, now).unwrap();
+        assert!(std::fs::symlink_metadata(h.join("config.toml")).is_err());
+        // A relative CODEX_HOME is refused.
+        assert!(matches!(
+            prepare_codex_home_in(&base, "/ws", &roots, CT, Path::new("rel/.codex"), true, now),
+            Err(CodexHomeError::Setup(_))
+        ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_stale_sign_in_fails_the_stage_before_anything_is_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_lenient(dir.path());
+        let base = root.join("codex-home");
+        let user = user_codex_home(&root);
+        let now = chrono::Utc::now();
+        let stale = chatgpt_auth(&(now - chrono::Duration::days(8)).to_rfc3339(), &token_expiring(now + chrono::Duration::days(2)));
+        std::fs::write(user.join("auth.json"), stale).unwrap();
+        let got = prepare_codex_home_in(&base, "/ws", &[], CT, &user, false, now);
+        assert_eq!(got, Err(CodexHomeError::SignIn("Open Codex once to refresh sign-in")));
+        assert!(!base.exists(), "the preflight runs before the home is made");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_codex_home_swapped_for_a_link_is_refused_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical_lenient(dir.path());
+        let base = root.join("codex-home");
+        let user = user_codex_home(&root);
+        let now = chrono::Utc::now();
+        let home = prepare_codex_home_in(&base, "/ws", &[], CT, &user, true, now).unwrap();
+        let target = root.join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(&home.dir).unwrap();
+        std::os::unix::fs::symlink(&target, &home.dir).unwrap();
+        assert!(matches!(prepare_codex_home_in(&base, "/ws", &[], CT, &user, true, now), Err(CodexHomeError::Setup(_))));
+        assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755, "not chmodded");
+        assert!(std::fs::read_dir(&target).unwrap().next().is_none(), "no copy landed in the target");
+    }
+
+    /// The full profile of a Codex stage for a stand-in `$HOME` (so the real
+    /// `~/.codex` is never touched), built the way a stage's is: its home
+    /// prepared outside the sandbox first. The stand-in sits in the user
+    /// cache dir, not in `$TMPDIR` (a system root).
+    #[cfg(target_os = "macos")]
+    fn codex_stage(roots: &[String]) -> (tempfile::TempDir, String, PathBuf, CodexHome, String) {
+        let caches = dirs::cache_dir().unwrap();
+        std::fs::create_dir_all(&caches).unwrap();
+        let fake = tempfile::Builder::new().prefix("octopush-codex-test-").tempdir_in(&caches).unwrap();
+        let h = canonical_string(fake.path());
+        let user = user_codex_home(Path::new(&h));
+        let base = PathBuf::from(format!("{h}/codex-home"));
+        let scope = roots.first().cloned().unwrap_or_else(|| format!("{h}/ws"));
+        let codex = prepare_codex_home_in(&base, &scope, roots, CT, &user, false, chrono::Utc::now()).unwrap();
+        let (profile, _) = profile_and_refusals_for(Some(&h), None, None, Some(&codex), roots, &[]).unwrap();
+        (fake, h, user, codex, profile)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn run_codex_stub(profile: &str, codex: &CodexHome, script: &str) -> bool {
+        let (prog, args) = sandbox_argv(OsStr::new("bash"), &["-c".to_string(), script.to_string()], profile);
+        std::process::Command::new(prog)
+            .args(args)
+            .envs(codex.env.iter().cloned())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_lets_a_codex_stage_write_its_own_home_but_never_codex_config() {
+        // A writer stage (the workspace writable) and one with no workspace
+        // write root (a readonly mission's writer role).
+        let ws = tempfile::tempdir().unwrap();
+        let w = canonical_string(ws.path());
+        assert!(std::process::Command::new("git").args(["init", "-q", w.as_str()]).status().unwrap().success());
+        for (roots, ws_writable) in [(vec![w.clone()], true), (Vec::new(), false)] {
+            let (_fake, _h, user, codex, profile) = codex_stage(&roots);
+            let run = |script: String| run_codex_stub(&profile, &codex, &script);
+            let c = codex.dir.clone();
+            let u = user.to_string_lossy().into_owned();
+            // What `codex exec` writes: its session rollout, thread-writer
+            // lock, `.tmp`, arg0 helpers, log, history and state DBs.
+            assert!(run(r#"set -e
+                mkdir -p "$CODEX_HOME/sessions/2026/11/20" && echo '{}' >> "$CODEX_HOME/sessions/2026/11/20/rollout-x.jsonl"
+                mkdir -p "$CODEX_HOME/thread-writer-locks" && echo 1 > "$CODEX_HOME/thread-writer-locks/t.lock"
+                mkdir -p "$CODEX_HOME/.tmp/arg0" "$CODEX_HOME/tmp/arg0" "$CODEX_HOME/log" "$CODEX_HOME/shell_snapshots"
+                echo l >> "$CODEX_HOME/log/codex-tui.log" && echo h >> "$CODEX_HOME/history.jsonl"
+                for db in state_5 logs_2 goals_1 memories_1 queue_1 thread_history_1; do
+                  echo s > "$CODEX_SQLITE_HOME/$db.sqlite" && echo w > "$CODEX_SQLITE_HOME/$db.sqlite-wal"
+                done
+                echo 1 > "$CODEX_HOME/.tmp/plugins.sync.lock"
+                echo t > "$CODEX_HOME/.tmp/x.tmp" && mv "$CODEX_HOME/.tmp/x.tmp" "$CODEX_HOME/version.json"
+                echo r > "$CODEX_HOME/sessions/ro.txt" && chmod 400 "$CODEX_HOME/sessions/ro.txt" && chmod u+w "$CODEX_HOME/sessions/ro.txt" && echo w > "$CODEX_HOME/sessions/ro.txt""#.to_string()), "codex's own writes work");
+            assert_eq!(run(format!("echo x > '{w}/probe'")), ws_writable, "the workspace is writable only for a writer");
+            // Git's hooks and config stay shut either way; with no workspace
+            // write root nothing in the repo's git dir is writable at all.
+            for git in [format!("echo x > '{w}/.git/hooks/pre-commit'"), format!("echo x >> '{w}/.git/config'")] {
+                assert!(!run(git.clone()), "must be denied: {git}");
+            }
+            assert_eq!(run(format!("echo x > '{w}/.git/objects/probe'")), ws_writable, "git objects follow the workspace");
+            let mut denied = vec![
+                // The read-only config copy: not modified, replaced, removed or linked.
+                format!("chmod u+w '{c}/config.toml' && echo 'model = \"x\"' > '{c}/config.toml'"),
+                format!("echo 'model = \"x\"' > '{c}/sessions/new.toml' && mv -f '{c}/sessions/new.toml' '{c}/config.toml'"),
+                format!("rm -f '{c}/config.toml'"),
+                format!("mv '{c}/config.toml' '{c}/sessions/moved.toml'"),
+                format!("ln -sf /dev/null '{c}/config.toml'"),
+                format!("ln '{c}/config.toml' '{c}/sessions/hard.toml'"),
+                // Nor the sign-in copy.
+                format!("chmod u+w '{c}/auth.json' && echo '{{}}' > '{c}/auth.json'"),
+                format!("echo '{{}}' > '{c}/sessions/a.json' && mv -f '{c}/sessions/a.json' '{c}/auth.json'"),
+                // The pinned `.tmp` can't be swapped for a link that would move
+                // `.tmp/plugins` out from under its rule.
+                format!("mv '{c}/.tmp' '{c}/sessions/tmp-old'"),
+                format!("rm -rf '{c}/.tmp' && ln -s '{c}/sessions' '{c}/.tmp'"),
+                // Through a link planted in the writable home.
+                format!("ln -s '{u}' '{c}/sessions/to-user' && echo x >> '{c}/sessions/to-user/config.toml'"),
+                // The user's own ~/.codex: config, sign-in, instructions, prompts, sessions.
+                format!("echo x >> '{u}/config.toml'"),
+                format!("echo '{{}}' > '{u}/auth.json'"),
+                format!("echo x >> '{u}/AGENTS.md'"),
+                format!("echo x > '{u}/prompts/p.md'"),
+                format!("echo x > '{u}/prompts/new.md'"),
+                format!("echo x > '{u}/sessions/rollout.jsonl'"),
+                format!("echo x > '{u}/anything-new'"),
+            ];
+            // Everything Codex reads back, as written and in other cases (the
+            // volume is case-insensitive), plus the Kelvin sign and long s.
+            let plants = [
+                "AGENTS.md", "AGENTS.MD", "agents.md", "AGENTS.override.md", "instructions.md", ".env", ".ENV",
+                "hooks.json", "Hooks.json", "models_cache.json", "MODELS_CACHE.JSON", "cloud-config-bundle-cache.json",
+                "managed-config-acme.json", "Managed-Config-acme.JSON", "managed_config.toml", "requirements.toml",
+                "environments.toml", "work.config.toml", "Config.toml", "CONFIG.TOML", ".tmp/plugins.sha",
+                ".tmp/plugin-share-local-paths-v1.json", ".TMP/plugins.sha",
+            ];
+            for f in plants {
+                denied.push(format!("echo x > '{c}/{f}'"));
+            }
+            let dirs = [
+                "prompts/p.md", "Prompts/p.md", "skills/x/SKILL.md", "Skills/x/SKILL.md", "\u{17F}kills/x/SKILL.md",
+                "s\u{212A}ills/x/SKILL.md", "migrated-command-skills/x/SKILL.md", "rules/r.rules", "RULES/r.rules",
+                "memories/m.md", "memories_v2/m.md", "memories_extensions/m.md", "plugins/p/plugin.json",
+                "Plugins/p/plugin.json", "hooks/hooks.json", "HOOKS/hooks.json", "agents/a.toml", "Agents/a.toml",
+                "secrets/local.age", "cache/codex_apps_tools/t.json", "packages/standalone/x", "proxy/ca.pem",
+                ".tmp/marketplaces/m/marketplace.json", ".tmp/plugins/p/plugin.json", ".TMP/Plugins/p/plugin.json",
+            ];
+            for d in dirs {
+                let parent = Path::new(d).parent().unwrap().display().to_string();
+                denied.push(format!("mkdir -p '{c}/{parent}' && echo x > '{c}/{d}'"));
+            }
+            for script in &denied {
+                assert!(!run(script.clone()), "must be denied: {script}");
+            }
+            // With no sign-in copy, `auth.json` can't be created in any case.
+            std::fs::remove_file(format!("{c}/auth.json")).unwrap();
+            for a in ["auth.json", "AUTH.JSON", "Auth.json"] {
+                assert!(!run(format!("echo '{{}}' > '{c}/{a}'")), "must be denied: {a}");
+            }
+            assert_eq!(std::fs::read_to_string(format!("{c}/config.toml")).unwrap(), "model = \"gpt-5\"\n");
+            let left: Vec<String> = std::fs::read_dir(&c).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            for name in &left {
+                assert!(!is_denied_top_level(name), "{name} was planted in the home: {left:?}");
+            }
+            let tmp = std::fs::symlink_metadata(format!("{c}/.tmp")).unwrap();
+            assert!(tmp.is_dir() && !tmp.file_type().is_symlink(), ".tmp is still the real dir");
+            for f in ["plugins", "marketplaces", "plugins.sha", "plugin-share-local-paths-v1.json"] {
+                assert!(std::fs::symlink_metadata(format!("{c}/.tmp/{f}")).is_err(), ".tmp/{f} was created");
+            }
+            assert_eq!(std::fs::read_to_string(user.join("config.toml")).unwrap(), "model = \"gpt-5\"\n");
+            assert!(std::fs::read_to_string(user.join("auth.json")).unwrap().contains("rt-secret-value"));
+            assert_eq!(std::fs::read_to_string(user.join("AGENTS.md")).unwrap(), "original\n");
+            assert_eq!(std::fs::read_to_string(user.join("prompts/p.md")).unwrap(), "original\n");
+            for f in ["prompts/new.md", "sessions/rollout.jsonl", "anything-new"] {
+                assert!(!user.join(f).exists(), "{f} was created in the user's Codex home");
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_stops_a_codex_stage_swapping_its_home() {
+        let (_fake, h, user, codex, profile) = codex_stage(&[]);
+        let run = |script: &str| run_codex_stub(&profile, &codex, script);
+        let c = codex.dir.clone();
+        let ws_dir = Path::new(&c).parent().unwrap().to_path_buf();
+        assert!(!run(r#"mv "$CODEX_HOME" "$CODEX_HOME.old""#), "the home can't be renamed");
+        assert!(!run(r#"rm -rf "$CODEX_HOME""#), "the home can't be removed");
+        assert!(!run(r#"rmdir "$CODEX_HOME"; ln -s / "$CODEX_HOME" && test -L "$CODEX_HOME""#), "the home can't be swapped for a link");
+        assert!(!run(&format!("ln -s '{h}' '{}/planted'", ws_dir.display())), "nothing new beside it");
+        assert!(!run(&format!("mkdir '{}/other-mode'", ws_dir.display())), "no other mode's home");
+        let meta = std::fs::symlink_metadata(&c).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink(), "still the real home");
+        assert!(Path::new(&c).join("config.toml").is_file(), "its config copy survived the rm -rf");
+        assert!(std::fs::symlink_metadata(ws_dir.join("planted")).is_err() && !ws_dir.join("other-mode").exists());
+        // The next launch still prepares the same, real home.
+        let again = prepare_codex_home_in(&PathBuf::from(format!("{h}/codex-home")), &format!("{h}/ws"), &[], CT, &user, false, chrono::Utc::now()).unwrap();
+        assert_eq!(again.dir, c);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn seatbelt_refuses_a_nested_sandbox() {
+        // Why a read-only Codex stage is refused in a sandboxed mission
+        // (`cli_runner::codex_read_only_refusal`): Codex runs each command of
+        // a `--sandbox read-only` stage under `sandbox-exec`, and inside the
+        // mission profile applying that nested profile fails with EPERM.
+        let (_fake, _h, _user, codex, profile) = codex_stage(&[]);
+        let inner = "(version 1)\n(allow default)\n".to_string();
+        let nested = ["-p".to_string(), inner, "/usr/bin/true".into()];
+        let (prog, args) = sandbox_argv(OsStr::new(SANDBOX_EXEC), &nested, &profile);
+        let out = std::process::Command::new(prog).args(args).envs(codex.env.iter().cloned()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "a nested sandbox must not start: {stderr}");
+        assert!(stderr.contains("sandbox_apply"), "applying the nested profile is what fails: {stderr}");
+        assert!(stderr.contains("Operation not permitted"), "EPERM, as Codex would get it: {stderr}");
+        // The same command runs outside the mission profile.
+        let plain = ["-p".to_string(), "(version 1)\n(allow default)\n".to_string(), "/usr/bin/true".to_string()];
+        assert!(std::process::Command::new(SANDBOX_EXEC).args(&plain).status().unwrap().success());
     }
 }

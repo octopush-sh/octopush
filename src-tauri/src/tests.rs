@@ -11038,10 +11038,43 @@ mod cli_dialect_tests {
         let ws = CodexWriteScope::Workspace;
         let note = codex_git_notice(CliDialect::Codex, false, ws, Action).unwrap();
         assert!(note.contains("can't commit"), "{note}");
+        // Only a Claude model is recommended until a sandboxed Codex mission
+        // is checked on a Mac (#784).
+        assert!(note.ends_with("Give this stage a Claude model."), "{note}");
+        assert!(!note.contains("sandboxed"), "{note}");
         assert!(codex_git_notice(CliDialect::Codex, false, ws, Worktree).is_none());
         assert!(codex_git_notice(CliDialect::Codex, false, CodexWriteScope::MissionSandbox, Action).is_none());
         assert!(codex_git_notice(CliDialect::Codex, true, ws, Action).is_none());
         assert!(codex_git_notice(CliDialect::Claude, false, ws, Action).is_none());
+    }
+
+    #[test]
+    fn a_read_only_codex_stage_in_a_sandboxed_mission_is_refused() {
+        use crate::orchestrator::cli_runner::{codex_read_only_refusal, codex_write_scope, CODEX_READ_ONLY_SANDBOX_REFUSAL};
+        use crate::orchestrator::sandbox::stage_isolation;
+        let sandboxed = CodexWriteScope::MissionSandbox;
+        assert_eq!(
+            codex_read_only_refusal(CliDialect::Codex, true, sandboxed),
+            Some("A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.")
+        );
+        assert_eq!(CODEX_READ_ONLY_SANDBOX_REFUSAL, codex_read_only_refusal(CliDialect::Codex, true, sandboxed).unwrap());
+        // A writer in a sandboxed mission runs; so does a read-only stage in
+        // Codex's own sandbox, and any Claude stage.
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, false, sandboxed), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, true, CodexWriteScope::Workspace), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Claude, true, sandboxed), None);
+        // A readonly mission forces the sandbox on, so it is refused there too.
+        assert_eq!(codex_write_scope(&stage_isolation("readonly", "none", "/ws").exec_isolation), sandboxed);
+    }
+
+    #[test]
+    fn a_codex_home_failure_is_the_preflights_message_or_a_fail_closed_line() {
+        use crate::orchestrator::cli_runner::codex_home_failure;
+        use crate::orchestrator::sandbox::{CodexHomeError, CODEX_REFRESH_SIGN_IN};
+        assert_eq!(codex_home_failure(&CodexHomeError::SignIn(CODEX_REFRESH_SIGN_IN)), "Open Codex once to refresh sign-in");
+        let setup = codex_home_failure(&CodexHomeError::Setup("x is not a directory you own".into()));
+        assert!(setup.starts_with("Sandbox setup failed — refusing to run the stage"), "{setup}");
+        assert!(setup.ends_with("x is not a directory you own"), "{setup}");
     }
 
     #[test]
@@ -11085,6 +11118,8 @@ mod cli_dialect_tests {
         // System prompt never appears in argv (codex has no flag for it).
         assert!(!rw.iter().any(|a| a.contains("system prompt")));
 
+        // Read-only never bypasses Codex's sandbox (inside a sandboxed mission
+        // such a stage is refused before launch, `codex_read_only_refusal`).
         for scope in [ws, CodexWriteScope::MissionSandbox] {
             let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope);
             assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");

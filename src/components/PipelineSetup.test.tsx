@@ -579,6 +579,29 @@ describe("PipelineSetup Claude Code version preflight", () => {
     expect(screen.queryByTestId("launcher-codex-commit")).not.toBeInTheDocument();
   });
 
+  it("warns before the run that a read-only Codex stage can't run in a sandboxed mission, and still lets it begin", async () => {
+    const { useRolesStore } = await import("../stores/rolesStore");
+    useRolesStore.setState({
+      roles: [{ key: "code_review", label: "Code review", artifactKind: "review", environment: "worktree" } as any],
+      loaded: true,
+    });
+    const pipe = cliPipe("gpt-5-codex");
+    pipe.stages[0] = { ...pipe.stages[0], role: "code_review" };
+    storeState.pipelines = [pipe];
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    expect(screen.queryByTestId("launcher-codex-read-only")).not.toBeInTheDocument();
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "sandbox", gitIsolation: "worktree" } as any } }));
+    const line = screen.getByTestId("launcher-codex-read-only");
+    expect(line).toHaveTextContent("A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.");
+    expect(line).toHaveClass("text-octo-warning");
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+    // A readonly mission forces the sandbox on: the same warning.
+    act(() => useMissionsStore.setState({ missionByWorkspaceId: { w1: { execIsolation: "none", gitIsolation: "readonly" } as any } }));
+    expect(screen.getByTestId("launcher-codex-read-only")).toBeInTheDocument();
+  });
+
   it("says when Codex will skip the repo's .codex/ config, and still lets the run begin", async () => {
     codexTrustMock.mockResolvedValue({
       line: "Codex will ignore this repo's .codex/ settings and MCP servers: the project isn't trusted in Codex.",
