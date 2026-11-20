@@ -321,7 +321,12 @@ function App() {
   const closeProjectAction = useProjectStore((s) => s.closeProject);
   const reopenProjectAction = useProjectStore((s) => s.reopenProject);
   const setProjectPinnedAction = useProjectStore((s) => s.setPinned);
-  const setProjectOrderAction = useProjectStore((s) => s.setOrder);
+  const storeProjectOrder = useProjectStore((s) => s.setOrder);
+  // A refused reorder is already undone in the store: say so.
+  const setProjectOrderAction = (ids: string[]) =>
+    storeProjectOrder(ids).catch(() =>
+      pushToast({ level: "error", title: "Couldn't reorder the projects", body: "Your rail is back as it was." }),
+    );
   const openProject = useProjectStore((s) => s.open);
   const getLastOpenedPath = useProjectStore((s) => s.getLastOpenedPath);
   const saveLastOpenedPath = useProjectStore((s) => s.saveLastOpenedPath);

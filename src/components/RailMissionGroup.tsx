@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, GitPullRequest, Plus } from "lucide-react";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { cancelNewGroup } from "../lib/groupActions";
 import { PALE_TINTS, TINTS } from "../lib/monogram";
 import { tourId } from "../lib/tour/ids";
 import type { Group } from "../lib/types";
@@ -330,7 +331,10 @@ export function RailMissionGroup({
 const NAME_INPUT = "font-mono text-[11px] leading-none";
 
 /** The header's name in inline edit: Enter and blur commit, Escape keeps the
- *  name as it was. A blank name is not a name, so it changes nothing.
+ *  name as it was. Escape on the first name of a group just made around a
+ *  project, a mission or a selection cancels the group instead
+ *  (`cancelNewGroup`): it goes, and its members return to where they were.
+ *  A blank name is not a name, so it changes nothing.
  *  `typeClassName` sets the type the name is edited in: a header edits its
  *  name in the type it is read in. */
 export function GroupNameInput({ group, typeClassName = NAME_INPUT }: { group: Group; typeClassName?: string }) {
@@ -347,6 +351,7 @@ export function GroupNameInput({ group, typeClassName = NAME_INPUT }: { group: G
     if (done.current) return;
     done.current = true;
     if (commit) void useGroupsStore.getState().rename(group.id, value);
+    else void cancelNewGroup(group.id);
     useRailGroupUi.getState().stopRename();
   };
 

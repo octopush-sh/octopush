@@ -14,6 +14,7 @@ import {
   sectionByProject,
   sectionDragId,
   sectionHeadId,
+  stepEmptySection,
   stepInRail,
   TOP_LOOSE_ID,
   type RailItem,
@@ -462,6 +463,44 @@ describe("resolveTopDrop", () => {
   it("an empty group has no place to move to", () => {
     const rail = layoutProjects([proj("a"), proj("b")], [CLIENT]);
     expect(resolveTopDrop(rail, sectionDragId("client"), "a")).toBeNull();
+  });
+});
+
+describe("stepEmptySection", () => {
+  // Stored: empty-a 0 · client 1 · empty-b 2 · side 3 · empty-c 4. The empty
+  // ones stand last, in that order: a b c.
+  const groups = [
+    section("empty-a", { sortOrder: 0 }),
+    section("client", { sortOrder: 1 }),
+    section("empty-b", { sortOrder: 2 }),
+    section("side", { sortOrder: 3 }),
+    section("empty-c", { sortOrder: 4 }),
+  ];
+  const items = layoutProjects([proj("api", "client"), proj("dotfiles"), proj("cli", "side")], projectGroupsOf(groups));
+
+  it("trades places with its neighbour in the empty run; the other groups keep their slots", () => {
+    expect(stepEmptySection(items, "empty-a", 1)).toEqual(["empty-b", "client", "empty-a", "side", "empty-c"]);
+    expect(stepEmptySection(items, "empty-c", -1)).toEqual(["empty-a", "client", "empty-c", "side", "empty-b"]);
+  });
+
+  it("stops at the ends of the run: never above a group with projects", () => {
+    expect(stepEmptySection(items, "empty-a", -1)).toBeNull();
+    expect(stepEmptySection(items, "empty-c", 1)).toBeNull();
+  });
+
+  it("answers null for a group with projects (stepInRail moves those)", () => {
+    expect(stepEmptySection(items, "client", 1)).toBeNull();
+  });
+
+  it("the result lays the run out in its new order", () => {
+    const next = stepEmptySection(items, "empty-a", 1)!;
+    const reordered = groups.map((g) => ({ ...g, sortOrder: next.indexOf(g.id) }));
+    const after = layoutProjects([proj("api", "client"), proj("dotfiles"), proj("cli", "side")], projectGroupsOf(reordered));
+    expect(after.filter((i) => i.kind === "section" && i.projects.length === 0).map((i) => (i.kind === "section" ? i.group.id : ""))).toEqual([
+      "empty-b",
+      "empty-a",
+      "empty-c",
+    ]);
   });
 });
 

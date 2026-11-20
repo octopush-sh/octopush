@@ -405,9 +405,27 @@ describe("mission group: rename in place", () => {
     expect([input.selectionStart, input.selectionEnd]).toEqual([0, "New group".length]);
     // The mission moved in.
     expect(groupEl("g-new")).toContainElement(rowOf("release-notes"));
-    // Escape keeps "New group".
-    fireEvent.keyDown(input, { key: "Escape" });
+    // Enter keeps it, named "New group".
+    fireEvent.keyDown(input, { key: "Enter" });
     expect(header("New group")).toBeInTheDocument();
+    expect(mockIpc.renameGroup).not.toHaveBeenCalled();
+  });
+
+  it("Escape on the new group's name cancels it: the group goes and the mission is back where it was", async () => {
+    mockIpc.createGroup.mockResolvedValue(group("g-new", "New group", { sortOrder: 2 }));
+    render(<Rail />);
+    await act(async () => {
+      await createMissionGroup("p1", "w-notes");
+    });
+    expect(groupEl("g-new")).toContainElement(rowOf("release-notes"));
+
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("textbox", { name: "Group name" }), { key: "Escape" });
+    });
+
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("g-new");
+    expect(screen.queryByTestId("rail-group-g-new")).toBeNull();
+    expect(rowOf("release-notes")).toBeInTheDocument();
     expect(mockIpc.renameGroup).not.toHaveBeenCalled();
   });
 
