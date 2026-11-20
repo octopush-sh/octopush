@@ -1,0 +1,84 @@
+{
+  "items": [
+    {
+      "kind": "pipeline",
+      "item_id": "00000000-0000-4000-8000-0000000b0001",
+      "updated_at": "2026-11-01T12:00:00.123456789+00:00",
+      "deleted": false,
+      "data": {
+        "id": "00000000-0000-4000-8000-0000000b0001",
+        "name": "Fixture pipeline",
+        "description": "Plan, build, review",
+        "updated_at": "2026-11-01T12:00:00.123456789+00:00",
+        "stages": [
+          {
+            "role": "planner",
+            "agentModel": "claude-sonnet-4-5",
+            "substrate": "api",
+            "checkpoint": true,
+            "loopTargetPosition": null,
+            "loopMaxIterations": 0,
+            "loopMode": null,
+            "maxIterations": 25,
+            "posX": 120.0,
+            "posY": 80.0,
+            "parents": [],
+            "tools": null,
+            "customName": null,
+            "instructions": null,
+            "effort": "high",
+            "escalateModel": null,
+            "escalateEffort": null
+          },
+          {
+            "role": "reviewer",
+            "agentModel": "claude-sonnet-4-5",
+            "substrate": "cli",
+            "checkpoint": false,
+            "loopTargetPosition": 0,
+            "loopMaxIterations": 3,
+            "loopMode": "auto",
+            "maxIterations": 25,
+            "posX": 360.0,
+            "posY": 80.0,
+            "parents": [0],
+            "tools": ["read_file", "grep"],
+            "customName": "Strict reviewer",
+            "instructions": "Be strict.",
+            "effort": null,
+            "escalateModel": "claude-opus-4-1",
+            "escalateEffort": "max"
+          }
+        ]
+      }
+    },
+    {
+      "kind": "role",
+      "item_id": "fixture-role",
+      "updated_at": "2026-11-01T12:00:00+00:00",
+      "deleted": false,
+      "data": {
+        "key": "fixture-role",
+        "label": "Fixture role",
+        "description": "A custom role used only by tests",
+        "promptBody": "Do the fixture thing.",
+        "artifactKind": "note",
+        "environment": "worktree",
+        "canLoop": false,
+        "defaultTools": ["read_file"],
+        "defaultSubstrate": "api",
+        "defaultCheckpoint": false,
+        "tokenEstIn": 1000,
+        "tokenEstOut": 500,
+        "isBuiltin": false
+      }
+    },
+    {
+      "kind": "pipeline",
+      "item_id": "00000000-0000-4000-8000-0000000b0002",
+      "updated_at": "2026-11-01T13:00:00.5+00:00",
+      "deleted": true,
+      "data": null
+    }
+  ]
+}

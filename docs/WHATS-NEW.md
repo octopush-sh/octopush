@@ -140,6 +140,7 @@ Current anchors:
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-models` | Settings › General, Readiness card: the Crew models row (only while a saved crew or Routine uses a model within 30 days of its retirement, or past it) | `settings/ReadinessCard.tsx` |
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
+| `settings-account-sync-library-unsent` | Settings › Account › Sync: the amber line under the library toggle naming the items the sync service refused (only while library sync is on and an item is unsent) | `settings/AccountPane.tsx` |
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-quiet-claude-code` | Settings › Privacy: the "Quiet Claude Code in crews and Routines" toggle | `settings/PrivacyPane.tsx` |
 | `settings-secret-guard` | Settings › General › Safety: "Guard commits against secrets" | `settings/GeneralPane.tsx` |

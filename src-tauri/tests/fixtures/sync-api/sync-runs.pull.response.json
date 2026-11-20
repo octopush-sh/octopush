@@ -1,0 +1,23 @@
+{
+  "runs": [
+    {
+      "run_id": "00000000-0000-4000-8000-0000000f0001",
+      "machine_id": "00000000-0000-4000-8000-00000000a001",
+      "machine_name": "Fixture MacBook",
+      "workspace_name": "fixture-workspace",
+      "task": "Add a fixture-only test for the sync contract",
+      "status": "completed",
+      "cost_usd": 0.4213,
+      "input_tokens": 120345,
+      "output_tokens": 8123,
+      "created_at": "2026-11-01T12:00:00.123456789+00:00",
+      "finished_at": "2026-11-01T12:09:41.5+00:00",
+      "stages": [
+        { "role": "planner", "model": "claude-sonnet-4-5", "status": "completed", "cost_usd": 0.0812 },
+        { "role": "builder", "model": "claude-sonnet-4-5", "status": "completed", "cost_usd": 0.3001 },
+        { "role": "reviewer", "model": null, "status": "skipped", "cost_usd": 0.04 }
+      ]
+    }
+  ],
+  "next_cursor": null
+}

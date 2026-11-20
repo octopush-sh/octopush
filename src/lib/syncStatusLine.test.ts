@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatAttemptTime, syncStatusLine } from "./syncStatusLine";
+import { formatAttemptTime, rejectionReason, syncStatusLine, syncUnsentLine } from "./syncStatusLine";
 import type { SyncAttempt } from "./types";
 
 // Local times, so the assertions hold in any time zone.
@@ -74,5 +74,43 @@ describe("syncStatusLine (#518, PM-approved strings)", () => {
 
   it("formatAttemptTime pads hours and minutes", () => {
     expect(formatAttemptTime(new Date(2026, 10, 9, 7, 4), NOW)).toBe("07:04");
+  });
+});
+
+describe("syncUnsentLine (#799)", () => {
+  const r = (kind: string, id: string, reason: string, name?: string | null) => ({ kind, id, reason, name });
+
+  it("names up to two items with the reason, then counts the rest", () => {
+    expect(syncUnsentLine(true, [r("pipeline", "p1", "oversize", "Big crew")])).toEqual({
+      text: 'Not synced · pipeline "Big crew" (over the 64,000-byte limit)',
+      tone: "warning",
+    });
+    const line = syncUnsentLine(true, [
+      r("role", "my-role", "bad_stamp", "Mine"),
+      r("pipeline", "p1", "future_stamp", "Big crew"),
+      r("pipeline", "p2", "oversize", "A"),
+      r("pipeline", "p3", "oversize", "B"),
+    ]);
+    expect(line?.text).toBe(
+      'Not synced · role "Mine" (unreadable edit time) · pipeline "Big crew" (edit time over a day ahead of the sync service) · +2 more',
+    );
+  });
+
+  it("falls back to the id, and to a plain reason for codes it doesn't know", () => {
+    expect(syncUnsentLine(true, [r("role", "my-role", "something_new", null)])?.text).toBe(
+      'Not synced · role "my-role" (refused by the sync service)',
+    );
+  });
+
+  it("shows nothing when off or empty", () => {
+    expect(syncUnsentLine(false, [r("pipeline", "p1", "oversize", "X")])).toBeNull();
+    expect(syncUnsentLine(true, [])).toBeNull();
+    expect(syncUnsentLine(true, undefined)).toBeNull();
+  });
+
+  it("reasons", () => {
+    expect(rejectionReason("oversize")).toBe("over the 64,000-byte limit");
+    expect(rejectionReason("bad_stamp")).toBe("unreadable edit time");
+    expect(rejectionReason("future_stamp")).toBe("edit time over a day ahead of the sync service");
   });
 });

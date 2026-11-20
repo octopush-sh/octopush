@@ -121,6 +121,15 @@ pub struct AppSettings {
     )]
     pub last_sync_attempt: crate::sync::SyncStatus,
 
+    /// The library pull's `next_since` (#823): a server time, sent as
+    /// `?since=` on the next library pull so only what changed comes back.
+    /// Bound to the account that owns the opt-ins (`owner` must equal
+    /// `sync_owner`); dropped with the library opt-in, on an owner change and
+    /// on sign-out, so those start with a full pull. Owned by
+    /// `sync::library_since`; whole-file saves carry it over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_pull_since: Option<LibraryPullSince>,
+
     /// Update channel (Settings › About): `stable` (default) or `beta`.
     /// Owned by `set_update_channel` — whole-file saves carry it over.
     #[serde(default)]
@@ -240,6 +249,16 @@ pub(crate) fn save_settings(settings: &AppSettings) -> AppResult<()> {
     Ok(())
 }
 
+/// A stored library-pull `next_since` and the account it belongs to.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryPullSince {
+    /// The Clerk `sub` that owned the opt-ins when it was stored.
+    pub owner: String,
+    /// The service's `next_since` (RFC 3339, server clock).
+    pub next_since: String,
+}
+
 /// The two cloud-sync opt-ins as one value — the wire shape of
 /// `get_sync_prefs` / `set_sync_pref`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -291,8 +310,32 @@ impl AppSettings {
             self.history_sync_enabled = false;
             self.library_sync_enabled = false;
             self.sync_owner = Some(sub.to_string());
+            self.library_pull_since = None; // another account: full pull
         }
         self.set_flag(kind, enabled);
+        if kind == crate::sync::SyncKind::Library && !enabled {
+            self.library_pull_since = None;
+        }
+    }
+
+    /// The stored library `next_since`, only while library sync is on and it
+    /// was stored for the account that owns the opt-ins.
+    pub fn library_since_for_owner(&self) -> Option<&str> {
+        let stored = self.library_pull_since.as_ref()?;
+        let owner = self.sync_owner.as_deref()?;
+        (self.library_sync_enabled && !owner.is_empty() && stored.owner == owner)
+            .then_some(stored.next_since.as_str())
+    }
+
+    /// Store (or drop) the library `next_since` for the account that owns the
+    /// opt-ins. Nothing is stored while library sync is off or unowned.
+    pub fn set_library_since(&mut self, value: Option<String>) {
+        self.library_pull_since = match (value, self.sync_owner.as_deref()) {
+            (Some(v), Some(owner)) if self.library_sync_enabled && !owner.is_empty() => {
+                Some(LibraryPullSince { owner: owner.to_string(), next_since: v })
+            }
+            _ => None,
+        };
     }
 
     fn set_flag(&mut self, kind: crate::sync::SyncKind, enabled: bool) {
@@ -308,6 +351,7 @@ impl AppSettings {
         self.library_sync_enabled = false;
         self.sync_owner = None;
         self.last_sync_attempt = crate::sync::SyncStatus::default();
+        self.library_pull_since = None;
     }
 
     /// After a toggle change, drop the last-attempt record of every kind that
@@ -328,7 +372,11 @@ impl AppSettings {
         ] {
             let on = self.flag(kind);
             if !on || !was_on || owner_changed {
-                self.last_sync_attempt.set(kind, None);
+                self.last_sync_attempt.clear(kind);
+                if kind == crate::sync::SyncKind::Library {
+                    // Turned on again or another account: start with a full pull.
+                    self.library_pull_since = None;
+                }
                 dropped.push(kind);
             }
         }
@@ -343,6 +391,7 @@ impl AppSettings {
         self.library_sync_enabled = on_disk.library_sync_enabled;
         self.sync_owner = on_disk.sync_owner.clone();
         self.last_sync_attempt = on_disk.last_sync_attempt.clone();
+        self.library_pull_since = on_disk.library_pull_since.clone();
     }
 
     /// Same rule for the updater prefs: `set_update_channel` /

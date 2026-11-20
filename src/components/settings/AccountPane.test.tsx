@@ -51,7 +51,7 @@ beforeEach(() => {
     loaded: false,
     saving: null,
     error: null,
-    status: { history: null, library: null },
+    status: { history: null, library: null, libraryRejected: [] },
   });
   // A user who never chose: the backend answers off/off.
   getSyncPrefs.mockReset().mockResolvedValue({ historySync: false, librarySync: false });
@@ -299,5 +299,42 @@ describe("AccountPane — last sync attempt under each toggle (#518)", () => {
       expect(screen.getByTestId("sync-history-toggle")).toHaveAttribute("aria-checked", "true"),
     );
     expect(screen.queryByTestId("sync-history-status")).toBeNull();
+  });
+});
+
+describe("AccountPane — library items the sync service refused (#799)", () => {
+  it("names the unsent items and why, in one amber line under the library toggle", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: false, librarySync: true });
+    getSyncStatus.mockResolvedValue({
+      history: null,
+      library: null,
+      libraryRejected: [
+        { kind: "pipeline", id: "p1", reason: "oversize", name: "Big crew" },
+        { kind: "role", id: "r1", reason: "future_stamp", name: "Strict reviewer" },
+        { kind: "pipeline", id: "p2", reason: "bad_stamp", name: "Third" },
+      ],
+    });
+    render(<AccountPane />);
+    const line = await screen.findByTestId("sync-library-unsent");
+    expect(line).toHaveTextContent(
+      'Not synced · pipeline "Big crew" (over the 64,000-byte limit) · role "Strict reviewer" (edit time over a day ahead of the sync service) · +1 more',
+    );
+    expect(line).toHaveClass("font-mono", "text-octo-warning", "octo-fade-in");
+    expect(line).toHaveAttribute("data-tour", "settings-account-sync-library-unsent");
+    expect(line.getAttribute("title")).toContain('Pipeline "Third": unreadable edit time');
+  });
+
+  it("shows nothing when nothing is unsent, or when library sync is off", async () => {
+    setup("pro");
+    getSyncPrefs.mockResolvedValue({ historySync: false, librarySync: false });
+    getSyncStatus.mockResolvedValue({
+      history: null,
+      library: null,
+      libraryRejected: [{ kind: "pipeline", id: "p1", reason: "oversize", name: "Big crew" }],
+    });
+    render(<AccountPane />);
+    await waitFor(() => expect(getSyncStatus).toHaveBeenCalled());
+    expect(screen.queryByTestId("sync-library-unsent")).toBeNull();
   });
 });

@@ -2358,9 +2358,12 @@ pub async fn get_sync_prefs() -> AppResult<crate::settings::SyncPrefs> {
 
 /// The last push attempt per sync kind (time, outcome, count, HTTP status) for
 /// the status line under each Settings › Account › Sync toggle. A kind whose
-/// opt-in doesn't apply to the signed-in user answers `None`. Local read only.
+/// opt-in doesn't apply to the signed-in user answers `None`. With library sync
+/// on, it also lists the library items still unsent because the sync service
+/// refused them (#799), each with its local name; an item no longer in the
+/// local library is left out. Local read only.
 #[tauri::command]
-pub async fn get_sync_status() -> AppResult<crate::sync::SyncStatus> {
+pub async fn get_sync_status(state: State<'_, AppState>) -> AppResult<crate::sync::SyncStatus> {
     let prefs = crate::settings::current_sync_prefs()?;
     let mut status = crate::sync::status::snapshot();
     if !prefs.history_sync {
@@ -2368,8 +2371,34 @@ pub async fn get_sync_status() -> AppResult<crate::sync::SyncStatus> {
     }
     if !prefs.library_sync {
         status.library = None;
+        status.library_rejected.clear();
+    }
+    if !status.library_rejected.is_empty() {
+        name_library_rejections(&state.db.lock(), &mut status.library_rejected);
     }
     Ok(status)
+}
+
+/// Give each unsent library item its local display name (a pipeline's name, a
+/// role's label), and drop the ones no longer in the local library.
+pub(crate) fn name_library_rejections(
+    db: &crate::db::Db,
+    rejected: &mut Vec<crate::sync::LibraryRejection>,
+) {
+    let pipelines = db.list_pipelines().unwrap_or_default();
+    rejected.retain_mut(|r| {
+        r.name = match r.kind.as_str() {
+            "pipeline" => pipelines.iter().find(|p| p.id == r.id && !p.is_builtin).map(|p| p.name.clone()),
+            "role" => db
+                .get_role(&r.id)
+                .ok()
+                .flatten()
+                .filter(|role| !role.is_builtin)
+                .map(|role| role.label),
+            _ => None,
+        };
+        r.name.is_some()
+    });
 }
 
 /// Turn one cloud sync (`kind`: `"history"` | `"library"`) on or off and return
@@ -2413,6 +2442,8 @@ pub async fn history_list(state: State<'_, AppState>) -> AppResult<Vec<crate::sy
 /// mirror, and return it. Pro-gated (`history.sync`). Best-effort refresh: on a
 /// network/transient error it falls back to the current local mirror rather than
 /// failing (so opening History offline still shows the last-known data).
+/// `pull_runs` answers only once it has every page, so the mirror is never
+/// replaced with a partial set: a failed page lands in the fallback (#799).
 #[tauri::command]
 pub async fn history_sync_pull(
     state: State<'_, AppState>,
@@ -2562,7 +2593,22 @@ pub async fn library_sync_push_all(state: State<'_, AppState>) -> AppResult<usiz
 #[tauri::command]
 pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     require_sync(crate::sync::SyncKind::Library)?;
-    let items = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
+    let pull = crate::sync::pull_library(crate::chat_engine::shared_http_client()).await?;
+    let applied = apply_pulled_library(&state.db, &pull.items);
+    // Only once the items are applied: the next pull asks for what changed
+    // after this one (#823).
+    crate::sync::commit_library_pull(&pull);
+    Ok(applied)
+}
+
+/// Merge pulled library items into the local DB by per-item LWW (the body of
+/// [`library_sync_pull`]). Only the items given are touched: after an
+/// incremental pull, an item that isn't among them is unchanged, never
+/// deleted — only a tombstone deletes. Returns the number applied.
+pub(crate) fn apply_pulled_library(
+    store: &parking_lot::Mutex<crate::db::Db>,
+    items: &[crate::sync::SyncLibraryItem],
+) -> usize {
     let mut applied = 0usize;
 
     // Apply order matters (and each step takes its own SHORT lock — this is a
@@ -2582,8 +2628,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
             continue; // envelope/data identity mismatch — refuse quietly
         }
         role.is_builtin = false; // the wire never carries builtin authority
-        if state
-            .db
+        if store
             .lock()
             .upsert_role_from_sync(&role, &item.updated_at)
             .unwrap_or(false)
@@ -2594,7 +2639,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
 
     for item in items.iter().filter(|i| i.kind == "pipeline") {
         if item.deleted {
-            let db = state.db.lock();
+            let db = store.lock();
             match db.pipeline_sync_state(&item.item_id) {
                 Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                     if db.delete_pipeline(&item.item_id).is_ok() {
@@ -2612,7 +2657,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
         if sp.id != item.item_id {
             continue; // envelope/data mismatch — refuse quietly
         }
-        match state.db.lock().upsert_pipeline_from_sync(&sp) {
+        match store.lock().upsert_pipeline_from_sync(&sp) {
             Ok(true) => applied += 1,
             Ok(false) => {}
             Err(e) => tracing::warn!(pipeline = %sp.id, "library pull: pipeline skipped: {e}"),
@@ -2620,7 +2665,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
     }
 
     for item in items.iter().filter(|i| i.kind == "role" && i.deleted) {
-        let db = state.db.lock();
+        let db = store.lock();
         match db.role_sync_state(&item.item_id) {
             Ok(Some((local, false))) if local.as_str() < item.updated_at.as_str() => {
                 if db.role_in_use(&item.item_id).unwrap_or(true) {
@@ -2637,7 +2682,7 @@ pub async fn library_sync_pull(state: State<'_, AppState>) -> AppResult<usize> {
             _ => {}
         }
     }
-    Ok(applied)
+    applied
 }
 
 // ─── Accounts (P1) ─────────────────────────────────────────────

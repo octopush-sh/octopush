@@ -27,12 +27,13 @@ interface SyncPrefsState extends SyncPrefs {
   /** Read-and-clear the "just turned on" mark for `kind`. */
   consumeJustEnabled: (kind: SyncKind) => boolean;
   /** The last push attempt per kind (`get_sync_status`), for the line under
-   *  each toggle. Unreadable ⇒ nothing recorded (the line stays hidden). */
+   *  each toggle, and the library items the service refused (#799).
+   *  Unreadable ⇒ nothing recorded (the lines stay hidden). */
   status: SyncStatus;
   loadStatus: () => Promise<void>;
 }
 
-const NO_STATUS: SyncStatus = { history: null, library: null };
+const NO_STATUS: SyncStatus = { history: null, library: null, libraryRejected: [] };
 
 /** Bumped by every status load, so an older, slower answer never overwrites
  *  a newer one. */
@@ -57,7 +58,11 @@ export const useSyncPrefsStore = create<SyncPrefsState>((set, get) => ({
     let status: SyncStatus;
     try {
       const s = await ipc.getSyncStatus();
-      status = { history: s?.history ?? null, library: s?.library ?? null };
+      status = {
+        history: s?.history ?? null,
+        library: s?.library ?? null,
+        libraryRejected: Array.isArray(s?.libraryRejected) ? s.libraryRejected : [],
+      };
     } catch {
       status = NO_STATUS;
     }

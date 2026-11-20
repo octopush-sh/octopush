@@ -9,9 +9,9 @@ import { ipc } from "../../lib/ipc";
 import { awaitProAfterCheckout } from "../../lib/awaitPro";
 import { pushToast } from "../Toasts";
 import { useSyncPrefsStore } from "../../stores/syncPrefsStore";
-import { syncStatusLine } from "../../lib/syncStatusLine";
+import { syncStatusLine, syncUnsentLine, rejectionReason } from "../../lib/syncStatusLine";
 import { tourId } from "../../lib/tour/ids";
-import type { SyncAttempt, SyncKind } from "../../lib/types";
+import type { LibraryRejection, SyncAttempt, SyncKind } from "../../lib/types";
 import { PaneHeader, SectionLabel, ToggleRow } from "./shared";
 
 /** Toggle + helper copy for the two cloud syncs. Exported so the website and
@@ -80,6 +80,34 @@ export function SyncStatusNote({
           ? tourId("settings-account-sync-history-status")
           : tourId("settings-account-sync-library-status")
       }
+    >
+      {line.text}
+    </p>
+  );
+}
+
+/** The amber line under the library toggle naming the items the sync service
+ *  refused, and why (#799). Nothing when off or when everything was stored.
+ *  The tooltip lists every unsent item. */
+export function SyncUnsentNote({
+  enabled,
+  rejected,
+}: {
+  enabled: boolean;
+  rejected: LibraryRejection[] | null | undefined;
+}) {
+  const line = syncUnsentLine(enabled, rejected);
+  if (!line || !rejected) return null;
+  const title = rejected
+    .map((r) => `${r.kind === "role" ? "Role" : "Pipeline"} "${r.name?.trim() || r.id}": ${rejectionReason(r.reason)}`)
+    .join("\n");
+  return (
+    <p
+      key={line.text}
+      className="octo-fade-in px-4 pt-1 font-mono text-[11px] leading-[1.5] text-octo-warning"
+      title={title}
+      data-testid="sync-library-unsent"
+      data-tour="settings-account-sync-library-unsent"
     >
       {line.text}
     </p>
@@ -274,6 +302,7 @@ export function AccountPane() {
               testId="sync-library-toggle"
             />
             <SyncStatusNote kind="library" enabled={librarySync} attempt={syncStatus.library} />
+            <SyncUnsentNote enabled={librarySync} rejected={syncStatus.libraryRejected} />
           </div>
           <p className="pt-1 text-[12px] leading-[1.55] text-octo-mute" data-testid="sync-note">
             {SYNC_COPY.note}
