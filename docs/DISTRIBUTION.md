@@ -53,9 +53,10 @@ file, `Casks/octopush.rb`. Nobody edits it by hand:
 - **A tap failure never undoes the promotion.** The release is already stable
   when the job runs. A failure is marked in the run's summary ("Homebrew tap
   NOT updated"); re-running the `homebrew-tap` job retries it.
-- **CI** renders the template with dummy values and runs the same checks on
-  every pull request (`ci.yml` → `homebrew-cask`, macOS), so the template
-  can't rot between promotions.
+- **CI** renders the template with dummy values and runs the same checks
+  whenever the cask or its scripts change, on pull requests and on `main`
+  (`homebrew-cask.yml`, macOS), so the template can't rot between promotions.
+  It is its own workflow so a flaky Homebrew run never blocks unrelated PRs.
 
 **Owner prerequisite:** the Octopush Cycle GitHub App must be installed on
 `octopush-sh/homebrew-tap` with Contents read & write. Until then the job fails

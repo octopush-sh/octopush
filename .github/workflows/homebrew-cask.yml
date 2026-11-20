@@ -1,0 +1,43 @@
+name: Homebrew cask
+
+# promote.yml publishes packaging/homebrew-tap/Casks/octopush.rb to
+# octopush-sh/homebrew-tap on every promotion. Render it here with dummy
+# values and run the same Homebrew checks, so the template can't rot between
+# promotions. Its own workflow, run only when the cask or its scripts change,
+# so a flaky brew or rubygems run never blocks unrelated PRs (automerge reads
+# the CI workflow's conclusion).
+
+on:
+  pull_request:
+    paths:
+      - packaging/homebrew-tap/**
+      - scripts/homebrew-cask*
+      - .github/workflows/homebrew-cask.yml
+  push:
+    branches: [main]
+    paths:
+      - packaging/homebrew-tap/**
+      - scripts/homebrew-cask*
+      - .github/workflows/homebrew-cask.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: brew style + brew audit on the rendered cask
+        run: |
+          set -euo pipefail
+          node scripts/homebrew-cask.mjs render packaging/homebrew-tap/Casks/octopush.rb 0.0.1 \
+            aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa > "$RUNNER_TEMP/octopush.rb"
+          bash scripts/homebrew-cask-check.sh "$RUNNER_TEMP/octopush.rb"
