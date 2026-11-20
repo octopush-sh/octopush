@@ -4,7 +4,17 @@ vi.mock("../stores/rolesStore", () => ({
   useRolesStore: { getState: () => ({ roles: [] }) },
 }));
 
-const { fmtTokensShort, essenceShedsTokens } = await import("./stageMeta");
+const { fmtTokensFull, fmtTokensShort, essenceShedsTokens } = await import("./stageMeta");
+
+describe("fmtTokensFull", () => {
+  it("keeps fmtTokens below a million and reads millions as M (#937)", () => {
+    expect(fmtTokensFull(700)).toBe("700");
+    expect(fmtTokensFull(18_412)).toBe("18.4k");
+    expect(fmtTokensFull(999_949)).toBe("999.9k");
+    expect(fmtTokensFull(999_950)).toBe("1.00M");
+    expect(fmtTokensFull(1_240_000)).toBe("1.24M");
+  });
+});
 
 describe("fmtTokensShort", () => {
   it("drops the decimal from 10k up and reads millions as M", () => {

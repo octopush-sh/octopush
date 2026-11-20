@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt, runStatusMeta } from "../lib/runStatus";
-import { stageTitle, fmtTokens, fmtTokensShort, essenceShedsTokens } from "../lib/stageMeta";
+import { stageTitle, fmtTokens, fmtTokensFull, fmtTokensShort, essenceShedsTokens } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
 import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
@@ -11,7 +11,7 @@ import { useRunsStore } from "../stores/runsStore";
 import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
 import { tourId } from "../lib/tour/ids";
-import { formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
+import { formatEstimateUsd, formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
 import { RunFlowNav } from "./RunFlowNav";
 
 interface Props {
@@ -311,26 +311,28 @@ function StageCard({
 
 /** Essence meta — discreet position · cost · tokens, on ONE nowrap line (S1).
  *  When the three don't fit the card, the token pair sheds (E2); it stays in
- *  the line's tooltip and in the focus pane one click away. An unknown cost
- *  reads "usage not reported" / "unpriced" in mute, never "$0.00". */
+ *  the line's tooltip, in sr-only text (a shed pair is `visibility:hidden`) and
+ *  in the focus pane one click away. An unknown cost reads "unreported" /
+ *  "unpriced" in mute, never "$0.00"; under a cent reads "<$0.01". */
 function EssenceMeta({ stage: s, position }: { stage: RunStage; position: string }) {
   const hasTokens = s.inputTokens > 0 || s.outputTokens > 0;
   const unreported = s.usageUnreported && s.costUsd === 0;
   const unpriced = !unreported && s.unpricedModel && s.costUsd === 0 && hasTokens;
   const hasMeta = s.costUsd > 0 || hasTokens || unreported;
-  const cost = unreported ? "usage not reported" : unpriced ? "unpriced" : formatUsd(s.costUsd);
+  // "usage not reported" (18ch) never fits the 17ch line; the card says "unreported".
+  const cost = unreported ? "unreported" : unpriced ? "unpriced" : formatEstimateUsd(s.costUsd);
   const tokens = hasTokens ? `↑${fmtTokensShort(s.inputTokens)} ↓${fmtTokensShort(s.outputTokens)}` : "";
   const shed = hasTokens && essenceShedsTokens(position, cost, tokens);
+  const fullTokens = `↑${fmtTokensFull(s.inputTokens)} ↓${fmtTokensFull(s.outputTokens)} tokens`;
   return (
     <span
       className="octo-fade-in flex h-4 w-full min-w-0 items-center gap-2 overflow-hidden whitespace-nowrap font-mono text-[10px] text-octo-mute"
-      title={shed ? `${cost} · ↑${fmtTokens(s.inputTokens)} ↓${fmtTokens(s.outputTokens)} tokens` : undefined}
+      title={shed ? `${unreported ? "usage not reported" : cost} · ${fullTokens}` : undefined}
     >
       <span className="octo-tabular shrink-0">{position}</span>
       {hasMeta &&
         (unreported ? (
-          // 18ch on its own: the one label that can outgrow the line, so it truncates.
-          <span className="min-w-0 truncate text-octo-mute" title={USAGE_UNREPORTED_TITLE}>
+          <span className="shrink-0 text-octo-mute" title={`Usage not reported. ${USAGE_UNREPORTED_TITLE}`}>
             {cost}
           </span>
         ) : unpriced ? (
@@ -346,6 +348,12 @@ function EssenceMeta({ stage: s, position }: { stage: RunStage; position: string
           title="input / output tokens"
         >
           {tokens}
+        </span>
+      )}
+      {/* A shed pair is hidden from screen readers too; they get the full figures. */}
+      {shed && (
+        <span className="sr-only">
+          {`${fmtTokensFull(s.inputTokens)} input, ${fmtTokensFull(s.outputTokens)} output tokens`}
         </span>
       )}
     </span>

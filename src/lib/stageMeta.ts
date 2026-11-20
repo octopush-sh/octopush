@@ -21,6 +21,14 @@ export function fmtTokensShort(n: number): string {
   return fmtTokens(n);
 }
 
+/** `fmtTokens` that reads millions as millions, for the full figures behind a
+ *  shed token pair: 1 240 000 → "1.24M" (never "1240.0k"), 18 412 → "18.4k". */
+export function fmtTokensFull(n: number): string {
+  // From 999 950 up, since `fmtTokens` would round those to "1000.0k".
+  if (n >= 999_950) return `${(n / 1_000_000).toFixed(2)}M`;
+  return fmtTokens(n);
+}
+
 /** Characters of meta that fit on the essence card's one line: 150px less
  *  padding and border is 120px, 20ch of 10px mono, minus the row's two 8px gaps. */
 export const ESSENCE_META_CH = 17;
