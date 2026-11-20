@@ -143,8 +143,17 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
                 assert!(help_lists(&resume, f), "[{}] `codex exec resume` doesn't list {f}", r.label("exec-resume-help.txt"));
             }
             assert!(a.windows(2).any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"high\""), "{a:?}");
-            if read_only {
-                assert!(a[..at].windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{a:?}");
+            match (read_only, scope) {
+                (true, CodexWriteScope::Workspace) => {
+                    assert!(a[..at].windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{a:?}")
+                }
+                // Inside a sandboxed mission Codex's own sandbox can't nest;
+                // Octopush's profile confines a read-only stage instead.
+                (_, CodexWriteScope::MissionSandbox) => {
+                    assert!(a[..at].contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{a:?}");
+                    assert!(!a.contains(&"--sandbox".to_string()), "{a:?}");
+                }
+                (false, CodexWriteScope::Workspace) => {}
             }
         }
     }
