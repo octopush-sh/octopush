@@ -68,6 +68,7 @@ import {
   resolveTopDropWithCue,
   sectionByProject,
   sectionDragId,
+  stepEmptySection,
   stepInRail,
   TOP_LOOSE_ID,
   type RailDragSubject,
@@ -822,17 +823,23 @@ export function WorkspaceRail({
     const { action } = dropAt(active, over);
     if (!action) return;
     if (action.move) {
-      // The order travels with the owner's callback, so the move persists none.
-      void moveProjectToGroup(action.move.projectId, action.move.groupId, null);
+      // The order travels with the move: both land in the rail at once.
+      void moveProjectToGroup(action.move.projectId, action.move.groupId, action.order);
+      return;
     }
     if (action.order) onReorderProjects?.(action.order);
   };
   // "Move up" / "Move down" in a project group's menu: one block at a time,
-  // as the order to persist, or null when the step would change nothing.
-  const stepSection = (direction: -1 | 1) =>
-    onReorderProjects && menuGroup?.scope === "project"
-      ? stepInRail(topItems, sectionDragId(menuGroup.id), direction)
-      : null;
+  // as the step to take, or null when it would change nothing. A group with
+  // projects steps through the project order; an empty one steps among the
+  // empty groups at the foot, through the groups' own order.
+  const stepSection = (direction: -1 | 1): (() => void) | null => {
+    if (menuGroup?.scope !== "project") return null;
+    const groupIds = stepEmptySection(topItems, menuGroup.id, direction);
+    if (groupIds) return () => void useGroupsStore.getState().setOrder(groupIds);
+    const order = onReorderProjects ? stepInRail(topItems, sectionDragId(menuGroup.id), direction) : null;
+    return order ? () => onReorderProjects?.(order) : null;
+  };
   const sectionUp = stepSection(-1);
   const sectionDown = stepSection(1);
 
@@ -1062,8 +1069,8 @@ export function WorkspaceRail({
           onTint={(tint) => void useGroupsStore.getState().setTint(menuGroup.id, tint)}
           // Offered only where the step shows: an order the pinned-first
           // rule would undo is no step (`stepInRail` answers null for it).
-          onMoveUp={sectionUp ? () => onReorderProjects?.(sectionUp) : undefined}
-          onMoveDown={sectionDown ? () => onReorderProjects?.(sectionDown) : undefined}
+          onMoveUp={sectionUp ?? undefined}
+          onMoveDown={sectionDown ?? undefined}
           onUngroup={() => void ungroupProjects(menuGroup.id)}
           onDismiss={closeGroupMenu}
         />

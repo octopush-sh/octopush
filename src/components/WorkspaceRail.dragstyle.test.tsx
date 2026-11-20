@@ -283,8 +283,9 @@ describe("the drop cue on the dragged block", () => {
     const expected = resolveTopDropWithCue(items(), "dotfiles", sectionHeadId(CLIENT.id));
     expect(cue()).toHaveTextContent(dropCueText(expected.cue!));
     await drop(event);
-    expect(mockMove).toHaveBeenCalledWith("dotfiles", expected.action!.move!.groupId, null);
-    expect(onReorderProjects).toHaveBeenCalledWith(expected.action!.order);
+    // The order goes with the move, in the one call.
+    expect(mockMove).toHaveBeenCalledWith("dotfiles", expected.action!.move!.groupId, expected.action!.order);
+    expect(onReorderProjects).not.toHaveBeenCalled();
     // The drag is over: the cue goes.
     expect(cue()).toBeNull();
   });

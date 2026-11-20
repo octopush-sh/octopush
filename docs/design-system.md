@@ -737,13 +737,25 @@ a secondary cue (WCAG 1.4.1).
   scroll is held to its own room for the length of the drag. Keyboard: a
   project's grip steps through projects in any group; a group moves with its
   menu's **Move up** / **Move down**, each offered only when the step would
-  show (never one the pinned-first order would undo).
+  show (never one the pinned-first order would undo). An empty group has no
+  project to drag: its **Move up** / **Move down** trade places with its
+  neighbour among the empty groups at the foot, and it never steps above a
+  group with projects (`stepEmptySection`).
+- **A move draws once.** A project's new group and its new place reach the
+  rail in one update, before the backend answers: the group never jumps to
+  an in-between layout. A refused move puts both back with one toast,
+  `Couldn't move {project}` / `Your rail is back as it was.`; nothing fails
+  silently.
 - **One meaning for "New group" per menu.** In a project's menu the group
   action is **Move to group ›**, about project groups, and its **New group…**
   makes a group that already holds the project. The mission-group action in
   that menu reads **New mission group** (`FolderPlus`) and sits with the
   project's missions, a block away. A group made from an item never starts
   empty.
+- **Escape takes a new group back.** A group made from a project, a mission
+  or a selection opens with its name in edit; Escape there deletes it and
+  returns each member to where it was, so the gesture leaves no trace. Once
+  that first name is in, Escape on a rename only keeps the old name.
 - **Collapsed (44px).** A sub-cluster: the group's project clusters between
   two hairlines that span the rail (`w-full`), where the hairline between two
   projects is 20px. No name, no fold and no header control at this width; a
