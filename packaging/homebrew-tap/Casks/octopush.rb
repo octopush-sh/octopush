@@ -31,7 +31,7 @@ cask "octopush" do
   end
 
   auto_updates true # Octopush updates itself via the built-in Tauri updater.
-  depends_on macos: ">= :monterey"
+  depends_on macos: :monterey
 
   app "Octopush.app"
 
