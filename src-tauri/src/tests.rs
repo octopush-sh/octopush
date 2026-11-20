@@ -11038,10 +11038,36 @@ mod cli_dialect_tests {
         let ws = CodexWriteScope::Workspace;
         let note = codex_git_notice(CliDialect::Codex, false, ws, Action).unwrap();
         assert!(note.contains("can't commit"), "{note}");
+        // Only a Claude model is recommended until a sandboxed Codex mission
+        // is checked on a Mac (#784).
+        assert!(note.ends_with("Give this stage a Claude model."), "{note}");
+        assert!(!note.contains("sandboxed"), "{note}");
         assert!(codex_git_notice(CliDialect::Codex, false, ws, Worktree).is_none());
         assert!(codex_git_notice(CliDialect::Codex, false, CodexWriteScope::MissionSandbox, Action).is_none());
         assert!(codex_git_notice(CliDialect::Codex, true, ws, Action).is_none());
         assert!(codex_git_notice(CliDialect::Claude, false, ws, Action).is_none());
+    }
+
+    #[test]
+    fn a_read_only_codex_stage_in_a_sandboxed_mission_gets_no_workspace_write_root() {
+        use crate::orchestrator::cli_runner::sandboxed_write_roots;
+        let roots = vec!["/ws".to_string()];
+        assert!(sandboxed_write_roots(CliDialect::Codex, true, &roots).is_empty());
+        assert_eq!(sandboxed_write_roots(CliDialect::Codex, false, &roots), roots);
+        // Claude stages keep the mission's roots (their read-only guard is the
+        // CLI's own).
+        assert_eq!(sandboxed_write_roots(CliDialect::Claude, true, &roots), roots);
+        assert_eq!(sandboxed_write_roots(CliDialect::Claude, false, &roots), roots);
+    }
+
+    #[test]
+    fn a_codex_home_failure_is_the_preflights_message_or_a_fail_closed_line() {
+        use crate::orchestrator::cli_runner::codex_home_failure;
+        use crate::orchestrator::sandbox::{CodexHomeError, CODEX_REFRESH_SIGN_IN};
+        assert_eq!(codex_home_failure(&CodexHomeError::SignIn(CODEX_REFRESH_SIGN_IN)), "Open Codex once to refresh sign-in");
+        let setup = codex_home_failure(&CodexHomeError::Setup("x is not a directory you own".into()));
+        assert!(setup.starts_with("Sandbox setup failed — refusing to run the stage"), "{setup}");
+        assert!(setup.ends_with("x is not a directory you own"), "{setup}");
     }
 
     #[test]
@@ -11085,12 +11111,16 @@ mod cli_dialect_tests {
         // System prompt never appears in argv (codex has no flag for it).
         assert!(!rw.iter().any(|a| a.contains("system prompt")));
 
-        for scope in [ws, CodexWriteScope::MissionSandbox] {
-            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope);
-            assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
-            assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
-            assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
-        }
+        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, ws);
+        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+        assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
+        // Inside a sandboxed mission Codex's own sandbox can't nest (a nested
+        // `sandbox-exec` gets EPERM): a read-only stage bypasses it too, and
+        // its profile gets no workspace write root.
+        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, CodexWriteScope::MissionSandbox);
+        assert!(ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{ro:?}");
+        assert!(!ro.contains(&"--sandbox".to_string()), "{ro:?}");
 
         // Inside a sandboxed mission, Octopush's Seatbelt profile confines it.
         let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox);

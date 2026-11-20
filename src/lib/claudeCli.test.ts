@@ -62,10 +62,10 @@ describe("codexCommitNote", () => {
 
   it("names each Action stage that runs on Codex outside a sandboxed mission", () => {
     expect(codexCommitNote(stages, {}, roles, "none")).toBe(
-      "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push. Run the mission sandboxed or pick a Claude model.",
+      "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push. Pick a Claude model for it.",
     );
     // A launcher override onto Codex counts; one onto Claude clears it.
-    expect(codexCommitNote(stages, { 2: "gpt-5" }, roles, null)).toMatch(/^Ship and Tag it run on Codex, .* so they can't commit/);
+    expect(codexCommitNote(stages, { 2: "gpt-5" }, roles, null)).toMatch(/^Ship and Tag it run on Codex, .* so they can't commit or push\. Pick a Claude model for them\.$/);
     expect(codexCommitNote(stages, { 1: "claude-opus-5-5" }, roles, "none")).toBeNull();
   });
 

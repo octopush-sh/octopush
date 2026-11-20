@@ -128,9 +128,11 @@ export function crewClaudeModels(
 }
 
 /** "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't
- *  commit or push. …" — for the crew's Action-role CLI stages (they may commit
- *  and push) that will run on Codex outside a sandboxed mission; null when
- *  there are none. Mirrors `cli_runner::codex_git_notice`. */
+ *  commit or push. Pick a Claude model for it." — for the crew's Action-role
+ *  CLI stages (they may commit and push) that will run on Codex outside a
+ *  sandboxed mission; null when there are none. Only a Claude model is
+ *  recommended until a sandboxed Codex mission is checked on a Mac (#784).
+ *  Mirrors `cli_runner::codex_git_notice`. */
 export function codexCommitNote(
   stages: { position: number; role: string; substrate: string; agentModel: string; customName?: string | null }[],
   overrides: Record<number, string>,
@@ -148,7 +150,7 @@ export function codexCommitNote(
   if (names.length === 0) return null;
   const one = names.length === 1;
   const who = one ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
-  return `${who} ${one ? "runs" : "run"} on Codex, whose sandbox keeps .git read-only, so ${one ? "it" : "they"} can't commit or push. Run the mission sandboxed or pick a Claude model.`;
+  return `${who} ${one ? "runs" : "run"} on Codex, whose sandbox keeps .git read-only, so ${one ? "it" : "they"} can't commit or push. Pick a Claude model for ${one ? "it" : "them"}.`;
 }
 
 /** "Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316." */

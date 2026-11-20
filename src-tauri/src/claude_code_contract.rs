@@ -1200,11 +1200,13 @@ fn codex_writer_runs_in_its_workspace_write_sandbox() {
     // Inside a sandboxed mission the bypass flag stays (Seatbelt confines it).
     let mission = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, false, CodexWriteScope::MissionSandbox);
     assert_eq!(mission, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{mission:?}");
-    // Read-only is unchanged, in or out of a sandboxed mission.
-    for scope in [CODEX_WS, CodexWriteScope::MissionSandbox] {
-        let ro = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, true, scope);
-        assert_eq!(ro, [&head[..], &["--sandbox", "read-only", "-"][..]].concat(), "{ro:?}");
-    }
+    // Read-only keeps Codex's own sandbox outside a sandboxed mission. Inside
+    // one that sandbox can't nest (EPERM), so the stage bypasses it and
+    // Octopush's profile, with no workspace write root, confines it.
+    let ro = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, true, CODEX_WS);
+    assert_eq!(ro, [&head[..], &["--sandbox", "read-only", "-"][..]].concat(), "{ro:?}");
+    let ro = CliDialect::Codex.argv("gpt-6.1-terra", "system", 25, true, CodexWriteScope::MissionSandbox);
+    assert_eq!(ro, [&head[..], &["--dangerously-bypass-approvals-and-sandbox", "-"][..]].concat(), "{ro:?}");
 }
 
 #[test]

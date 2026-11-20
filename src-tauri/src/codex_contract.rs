@@ -119,6 +119,7 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
         for (read_only, scope) in [
             (true, CodexWriteScope::Workspace),
             (false, CodexWriteScope::Workspace),
+            (true, CodexWriteScope::MissionSandbox),
             (false, CodexWriteScope::MissionSandbox),
         ] {
             let d = CliDialect::Codex;

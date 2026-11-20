@@ -121,8 +121,10 @@ fn lookup_keys(dirs: &[&Path]) -> Vec<String> {
 }
 
 /// Codex's home: `CODEX_HOME` from the login-shell environment (what a stage
-/// runs with), else the app's own, else `~/.codex`.
-fn codex_home() -> Option<PathBuf> {
+/// runs with), else the app's own, else `~/.codex`. A sandboxed stage runs
+/// with its own `CODEX_HOME` instead, holding a copy of this home's
+/// `config.toml` (`sandbox::prepare_codex_home`).
+pub(crate) fn codex_home() -> Option<PathBuf> {
     let shell = crate::orchestrator::cli_runner::login_shell_env();
     let var = |name: &str| {
         shell
