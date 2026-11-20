@@ -3772,4 +3772,39 @@ mod tests {
             ]
         );
     }
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn zz_probe_nested_seatbelt() {
+        // TEMPORARY probe (removed before review): how a nested sandbox-exec
+        // behaves under the mission profile.
+        let ws = tempfile::tempdir().unwrap();
+        let w = canonical_string(ws.path());
+        let roots = vec![w.clone()];
+        let caches = dirs::cache_dir().unwrap();
+        std::fs::create_dir_all(&caches).unwrap();
+        let fake_home = tempfile::Builder::new().prefix("octopush-probe-").tempdir_in(&caches).unwrap();
+        let home = canonical_string(fake_home.path());
+        let (profile, _) = profile_and_refusals_for(Some(&home), None, None, &roots, &[]).unwrap();
+        let mut report = String::new();
+        for (name, inner, script) in [
+            ("allow-true", "(version 1)(allow default)", "true".to_string()),
+            ("deny-write", "(version 1)(allow default)(deny file-write*)", format!("echo x > '{w}/inner-probe'")),
+            ("allow-write", "(version 1)(allow default)", format!("echo y > '{w}/inner-ok'")),
+        ] {
+            let (prog, args) = sandbox_argv(
+                OsStr::new(SANDBOX_EXEC),
+                &["-p".to_string(), inner.to_string(), "/bin/sh".to_string(), "-c".to_string(), script],
+                &profile,
+            );
+            let out = std::process::Command::new(prog).args(args).output().unwrap();
+            report.push_str(&format!(
+                "[{name}: code={:?} stderr={:?} probe={} ok={}] ",
+                out.status.code(),
+                String::from_utf8_lossy(&out.stderr).trim(),
+                Path::new(&w).join("inner-probe").exists(),
+                Path::new(&w).join("inner-ok").exists()
+            ));
+        }
+        panic!("PROBE {report}");
+    }
 }
