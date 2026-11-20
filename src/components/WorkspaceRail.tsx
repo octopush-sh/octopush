@@ -1837,7 +1837,7 @@ function WorkspaceRow({
   );
   const collisions = useWorkspaceCollisions(workspace?.id);
   // Pointer-only: the row is no extra tab stop, and the keyboard moves a
-  // mission through its menu ("Move to group").
+  // mission with ⌘⌥G or through its menu ("Move to group").
   const draggable = useDraggable({
     id: `mission:${workspace?.id ?? ""}`,
     data: drag ?? undefined,
@@ -2075,7 +2075,9 @@ interface CollapsedRailProps {
   collapsedGroups: Record<string, boolean>;
   /** The beacon or dot a folded group's chevron carries. */
   groupAttention: Record<string, Attention>;
-  onGroupContextMenu: (groupId: string, x: number, y: number) => void;
+  /** `fromKeyboard`: asked for with ⇧F10 or the context-menu key on a group's
+   *  chevron, so the chevron gets the focus back when the menu closes. */
+  onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
 }
 
 interface FlyoutAnchor {
@@ -2092,7 +2094,8 @@ interface FlyoutAnchor {
  * scrolling list would clip an absolutely positioned popover.
  *
  * A mission group keeps its two marks at this width: a 12px chevron in the
- * group's tint (its tooltip is the group's name, and it folds the group) and
+ * group's tint (its tooltip is the group's name, it folds the group, and ⇧F10
+ * or the context-menu key opens the group's menu beside it) and
  * the 1px guide beside the members' monograms, with 6px of air above and
  * below the group.
  *
@@ -2225,11 +2228,22 @@ function CollapsedRail({
             >
               <button
                 type="button"
+                // The rail gives a keyboard-opened menu's focus back here.
+                data-rail-group-header={group.id}
                 onClick={() => useRailGroupUi.getState().toggle(group.id)}
                 onContextMenu={(e) => {
                   e.preventDefault();
                   e.stopPropagation();
                   onGroupContextMenu(group.id, e.clientX, e.clientY);
+                }}
+                // ⇧F10 or the context-menu key: the same menu, opened beside
+                // the chevron where the flyouts open (the rail is 44px wide).
+                onKeyDown={(e) => {
+                  if (e.key !== "ContextMenu" && !(e.key === "F10" && e.shiftKey)) return;
+                  e.preventDefault();
+                  e.stopPropagation();
+                  const r = e.currentTarget.getBoundingClientRect();
+                  onGroupContextMenu(group.id, r.right + 8, r.top, true);
                 }}
                 aria-expanded={!groupFolded}
                 aria-label={carried ? `${group.name} — needs attention` : group.name}

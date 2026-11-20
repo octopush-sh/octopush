@@ -700,6 +700,28 @@ describe("mission group: the slim rail (44px)", () => {
     fireEvent.contextMenu(screen.getByRole("button", { name: "PR reviews" }), { clientX: 10, clientY: 10 });
     expect(screen.getByRole("menu", { name: "Group actions" })).toBeInTheDocument();
   });
+
+  it("opens the group menu beside the chevron on ⇧F10 and the context-menu key, and gives the focus back", () => {
+    render(<Rail collapsed />);
+    const chevron = screen.getByRole("button", { name: "PR reviews" });
+    vi.spyOn(chevron, "getBoundingClientRect").mockReturnValue(
+      { left: 0, right: 44, top: 120, bottom: 136, width: 44, height: 16, x: 0, y: 120, toJSON: () => ({}) } as DOMRect,
+    );
+    chevron.focus();
+    fireEvent.keyDown(chevron, { key: "F10", shiftKey: true });
+    const menu = screen.getByRole("menu", { name: "Group actions" });
+    expect(menu).toHaveStyle({ left: "52px", top: "120px" });
+    expect(within(menu).getByRole("menuitem", { name: /Ungroup/ })).toBeInTheDocument();
+    expect(chevron).toHaveAttribute("aria-expanded", "true"); // the key did not fold it
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(chevron).toHaveFocus();
+
+    fireEvent.keyDown(chevron, { key: "ContextMenu" });
+    expect(screen.getByRole("menu", { name: "Group actions" })).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(chevron).toHaveFocus();
+  });
 });
 
 describe("activating a mission in a folded group", () => {

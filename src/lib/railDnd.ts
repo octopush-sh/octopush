@@ -158,7 +158,8 @@ export const railCollisions: CollisionDetection = (args) => {
  * whichever section they sit in: stepping onto a project of another section
  * (or onto a loose one) and dropping there moves the project into that
  * container, as the pointer does. Sections, missions and mission-group
- * headers have no keyboard drag (their menus move them).
+ * headers have no keyboard drag: a mission moves with ⌘⌥G or its menu's
+ * "Move to group", a section with its menu's Move up / Move down.
  */
 export const projectKeyboardCoordinates: KeyboardCoordinateGetter = (event, args) => {
   const all = args.context.droppableContainers;
