@@ -23,7 +23,9 @@ vi.mock("../../lib/ipc", () => ({ ipc: mockIpc }));
 const { useTerminalsStore } = await import("../../stores/terminalsStore");
 const { useAttentionStore } = await import("../../stores/attentionStore");
 const { useTerminalLayoutStore, evenRatios } = await import("../../stores/terminalLayoutStore");
-const { SessionLine, MAX_CELLS, LINE_FLOOR_PX, lineWidth, planLine, visibleSessions } = await import("./SessionLine");
+const { SessionLine, MAX_CELLS, LINE_FLOOR_PX, LINE_LAST_PX, lineWidth, planLine, visibleSessions } = await import(
+  "./SessionLine"
+);
 
 const WS = "ws-line";
 const noop = () => {};
@@ -533,13 +535,28 @@ describe("SessionLine — the layout button", () => {
     expect(button).toHaveAttribute("aria-expanded", "true");
     // A real press: the menu's outside-press closes it on mousedown, and the
     // click that completes the same press must not open it again.
+    // A pointer click carries its click count in `detail`.
     fireEvent.mouseDown(button);
     expect(screen.queryByRole("menu")).toBeNull();
-    fireEvent.click(button);
+    fireEvent.click(button, { detail: 1 });
     expect(screen.queryByRole("menu")).toBeNull();
     // The next press opens it as usual.
     fireEvent.mouseDown(button);
+    fireEvent.click(button, { detail: 1 });
+    expect(screen.getByRole("menu")).toBeInTheDocument();
+  });
+
+  it("opens from the keyboard after a press that closed the menu was dragged off the button", () => {
+    seed(many(4), ["s1"]);
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+    const button = screen.getByTestId("session-layout");
     fireEvent.click(button);
+    // The press closes the menu on mousedown, then is released elsewhere:
+    // the button never gets its click.
+    fireEvent.mouseDown(button);
+    expect(screen.queryByRole("menu")).toBeNull();
+    // Enter or Space on the button: a click with no click count.
+    fireEvent.click(button, { detail: 0 });
     expect(screen.getByRole("menu")).toBeInTheDocument();
   });
 
@@ -649,30 +666,90 @@ describe("SessionLine — a narrow band", () => {
     expect(screen.getByTestId("session-more-bell")).toBeInTheDocument();
   });
 
-  it("folds on a ladder that stops at its floor: the fold button, the focused cell, + and layout", () => {
+  it("folds on a ladder whose last rung is the list button alone", () => {
     const full = { cells: "all", counter: "none" };
     // Unmeasured (jsdom, a hidden canvas): nothing is decided.
     expect(planLine(0, 6, false)).toEqual(full);
     expect(planLine(lineWidth(6, false), 6, false)).toEqual(full);
     expect(planLine(lineWidth(7, true), 7, true)).toEqual({ ...full, counter: "more" });
     expect(planLine(lineWidth(6, false) - 1, 6, false)).toEqual({ cells: "focused", counter: "sessions" });
-    // Narrower: the button is an icon, and nothing else ever goes.
-    for (const width of [140, 117, 90, 60, 30, 1]) {
+    // Narrower: the button is an icon beside the focused cell, + and layout.
+    for (const width of [140, LINE_FLOOR_PX - 2]) {
       expect(planLine(width, 6, false)).toEqual({ cells: "focused", counter: "list" });
     }
-    // The floor the mode band reserves holds exactly that: four 24px controls,
-    // the 13px hairline, the gaps, and the root's 1px padding each side.
+    // Narrower than those: the list button alone, which never goes.
+    for (const width of [LINE_FLOOR_PX - 3, 90, 60, LINE_LAST_PX - 2, 1]) {
+      expect(planLine(width, 6, false)).toEqual({ cells: "none", counter: "list" });
+    }
+    // The floor the mode band reserves holds the focused rung exactly: four
+    // 24px controls, the 13px hairline, the gaps, and the root's 1px padding
+    // each side. The last rung's is one 24px button and that padding.
     expect(LINE_FLOOR_PX).toBe(24 * 4 + 13 + 2 * 4 + 2);
+    expect(LINE_LAST_PX).toBe(24 + 2);
   });
 
-  it("keeps the focused cell, + and the layout button however narrow the track", () => {
-    track(40);
+  it("keeps the focused cell, + and the layout button down to the floor", () => {
+    track(LINE_FLOOR_PX);
     seed(many(6), ["s3"]);
     render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
     expect(screen.getAllByRole("tab")).toEqual([cell("s3")]);
     expect(screen.getByTestId("session-more")).toHaveAccessibleName("All 6 sessions");
     expect(screen.getByTestId("session-new")).toBeInTheDocument();
     expect(screen.getByTestId("session-layout")).toBeInTheDocument();
+  });
+
+  it("below the floor, keeps the ⌘⌥K list button as the whole line, in the tab order", () => {
+    track(40);
+    seed(many(6), ["s3"]);
+    act(() => useAttentionStore.getState().ping(WS, "terminal", "s3", "permission"));
+    act(() => useAttentionStore.getState().ping(WS, "terminal", "s5", "permission"));
+    const onOpenSwitcher = vi.fn();
+    render(<SessionLine workspaceId={WS} onOpenSwitcher={onOpenSwitcher} />);
+    expect(screen.queryAllByRole("tab")).toEqual([]);
+    expect(screen.queryByTestId("session-new")).toBeNull();
+    expect(screen.queryByTestId("session-layout")).toBeNull();
+    const all = screen.getByTestId("session-more");
+    expect(screen.getByTestId("session-line").firstElementChild).toBe(all);
+    expect(all).toHaveAttribute("title", "All 6 sessions · ⌘⌥K");
+    expect(all).toHaveAttribute("tabindex", "0");
+    expect(all.querySelector("svg")).not.toBeNull();
+    // A waiting session still has a mark to carry it.
+    expect(all).toHaveAccessibleName("All 6 sessions — a session needs you");
+    fireEvent.click(all);
+    expect(onOpenSwitcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes the layout menu when its button sheds on the last rung", () => {
+    // An observer that reports when told to: the band narrowing under the line.
+    const resized: (() => void)[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(cb: (entries: unknown[]) => void) {
+          resized.push(() => cb([]));
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    try {
+      const width = track(LINE_FLOOR_PX);
+      seed(many(4), ["s1"]);
+      render(<SessionLine workspaceId={WS} onOpenSwitcher={noop} />);
+      fireEvent.click(screen.getByTestId("session-layout"));
+      expect(screen.getByRole("menu")).toBeInTheDocument();
+      width.mockReturnValue(40);
+      act(() => resized.forEach((cb) => cb()));
+      expect(screen.queryByTestId("session-layout")).toBeNull();
+      expect(screen.queryByRole("menu")).toBeNull();
+      // Wide again: the button is back, its menu stays closed.
+      width.mockReturnValue(LINE_FLOOR_PX);
+      act(() => resized.forEach((cb) => cb()));
+      expect(screen.getByTestId("session-layout")).toHaveAttribute("aria-expanded", "false");
+      expect(screen.queryByRole("menu")).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
   });
 
   it("names the icon-only sessions button", () => {

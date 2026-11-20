@@ -44,10 +44,13 @@ export function useAnchoredMenu(place: (rect: DOMRect) => { x: number; y: number
     },
     onClick: (e: React.MouseEvent<HTMLButtonElement>) => {
       e.stopPropagation();
-      if (closedByThisPress.current) {
-        closedByThisPress.current = false;
-        return;
-      }
+      // A press dragged off the button never clicks it, so the mark can
+      // outlive its press. Every pointer click starts with a mousedown here,
+      // which sets the mark afresh; a keyboard activation (`detail` 0) has
+      // none, and is never the press that closed the menu.
+      const swallow = closedByThisPress.current && e.detail !== 0;
+      closedByThisPress.current = false;
+      if (swallow) return;
       if (menu !== null) {
         close();
         return;

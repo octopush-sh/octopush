@@ -67,8 +67,9 @@ export function visibleSessions(
 
 /** What the line shows at a given width. `+` and the layout button always do. */
 export interface LinePlan {
-  /** Every session's cell, or only the focused session's. */
-  cells: "all" | "focused";
+  /** Every session's cell, only the focused session's, or none: the last
+   *  rung, where the list button is the whole line. */
+  cells: "all" | "focused" | "none";
   /** The button that opens ⌘⌥K: `+N` after the cells, or the folded line's
    *  `N sessions`, which becomes a list icon when that is all that fits. */
   counter: "none" | "more" | "sessions" | "list";
@@ -87,18 +88,26 @@ export function lineWidth(cells: number, hasMore: boolean): number {
  * The line's floor: the fold button as an icon, the focused session's cell,
  * `+`, the hairline and the layout button, plus the root's 1px padding each
  * side. The mode band keeps its right track at least this wide in Run
- * (`ModeBand`'s `tailMin`), so the floor always fits and switching is never
- * lost to a narrow window.
+ * (`ModeBand`'s `tailMin`) for as long as that fits beside the switcher.
  */
 export const LINE_FLOOR_PX = row(CELL_PX, CELL_PX, CELL_PX, RULE_PX, CELL_PX) + 2;
+
+/**
+ * The line's last rung: the list button alone, plus the root's padding. On a
+ * band too narrow for the floor (`ModeBand`'s `tailLastMin`), the track keeps
+ * this much, so switching is never lost to a narrow window: ⌘⌥K lists every
+ * session and opens a new one.
+ */
+export const LINE_LAST_PX = CELL_PX + 2;
 
 /**
  * The line on its demotion ladder: it sheds whole atoms, never half of one.
  * While the cells fit they all show. Too narrow, they fold from the left into
  * one `N sessions` button that opens ⌘⌥K; narrower still that button is a
- * list icon. That is the floor: the fold button, the focused session's cell,
- * `+` and the layout button never go. An unmeasured track (jsdom, a hidden
- * canvas) decides nothing, and the cells stay.
+ * list icon beside the focused session's cell, `+` and the layout button.
+ * Narrower than those, the list button is all that is left, and it never
+ * goes. An unmeasured track (jsdom, a hidden canvas) decides nothing, and
+ * the cells stay.
  */
 export function planLine(available: number, cells: number, hasMore: boolean): LinePlan {
   if (available <= 0 || lineWidth(cells, hasMore) <= available) {
@@ -107,7 +116,10 @@ export function planLine(available: number, cells: number, hasMore: boolean): Li
   if (row(SESSIONS_PX, CELL_PX, CELL_PX, RULE_PX, CELL_PX) <= available) {
     return { cells: "focused", counter: "sessions" };
   }
-  return { cells: "focused", counter: "list" };
+  if (LINE_FLOOR_PX - 2 <= available) {
+    return { cells: "focused", counter: "list" };
+  }
+  return { cells: "none", counter: "list" };
 }
 
 // ─── The instant label ────────────────────────────────────────────
@@ -314,7 +326,10 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const all = visibleSessions(ids, focusedId);
   const plan = planLine(available, all.shown.length, all.more > 0);
   const folded = plan.cells !== "all";
-  const cellIds = plan.cells === "all" ? all.shown : all.shown.filter((id) => id === focusedId);
+  /** The last rung: the list button is the whole line. */
+  const bare = plan.cells === "none";
+  const cellIds =
+    plan.cells === "all" ? all.shown : plan.cells === "focused" ? all.shown.filter((id) => id === focusedId) : [];
   const cells = terminals.filter((t) => cellIds.includes(t.id));
   const uncelled = terminals.filter((t) => !cellIds.includes(t.id));
   const uncelledMarked = uncelled.some((t) => marked(t.id));
@@ -382,6 +397,14 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
   const dismissLabel = label.dismiss;
   const idsKey = ids.join("\n");
   useEffect(() => dismissLabel(), [dismissLabel, count, available, focusedId, idsKey]);
+
+  // The layout button sheds on the last rung: its menu goes with it rather
+  // than hang from nothing, and doesn't come back when the button does.
+  const layoutOpen = layoutMenu.menu !== null;
+  const closeLayout = layoutMenu.close;
+  useEffect(() => {
+    if (bare && layoutOpen) closeLayout();
+  }, [bare, layoutOpen, closeLayout]);
 
   // A cell that left the line under the pointer never reports the pointer
   // leaving, so the label goes with its cell.
@@ -574,36 +597,40 @@ export function SessionLine({ workspaceId, onOpenSwitcher }: Props) {
       {plan.counter === "more" &&
         counter(`+${all.more}`, `${all.more} more sessions`, `${all.more} more sessions · ⌘⌥K`)}
 
-      <button
-        type="button"
-        data-line-stop
-        tabIndex={stopsOnNew ? 0 : -1}
-        data-testid="session-new"
-        aria-label="Open a new session"
-        title="Open a new session"
-        onClick={() => createTerminal(workspaceId).catch(console.error)}
-        className={CONTROL}
-      >
-        <Plus size={13} strokeWidth={1.75} aria-hidden />
-      </button>
+      {!bare && (
+        <>
+          <button
+            type="button"
+            data-line-stop
+            tabIndex={stopsOnNew ? 0 : -1}
+            data-testid="session-new"
+            aria-label="Open a new session"
+            title="Open a new session"
+            onClick={() => createTerminal(workspaceId).catch(console.error)}
+            className={`octo-fade-in ${CONTROL}`}
+          >
+            <Plus size={13} strokeWidth={1.75} aria-hidden />
+          </button>
 
-      <span aria-hidden className="mx-1.5 h-3.5 w-px shrink-0 bg-octo-hairline" />
+          <span aria-hidden className="octo-fade-in mx-1.5 h-3.5 w-px shrink-0 bg-octo-hairline" />
 
-      <button
-        type="button"
-        data-line-stop
-        tabIndex={-1}
-        data-testid="session-layout"
-        data-tour={tourId("run-layout")}
-        aria-label="Layout"
-        title={`Layout · ${count} ${count === 1 ? "pane" : "panes"}`}
-        {...layoutMenu.buttonProps}
-        className={CONTROL}
-      >
-        <PaneLayoutIcon layout={current} orientation={orientation} />
-      </button>
+          <button
+            type="button"
+            data-line-stop
+            tabIndex={-1}
+            data-testid="session-layout"
+            data-tour={tourId("run-layout")}
+            aria-label="Layout"
+            title={`Layout · ${count} ${count === 1 ? "pane" : "panes"}`}
+            {...layoutMenu.buttonProps}
+            className={`octo-fade-in ${CONTROL}`}
+          >
+            <PaneLayoutIcon layout={current} orientation={orientation} />
+          </button>
+        </>
+      )}
 
-      {layoutMenu.menu && (
+      {layoutMenu.menu && !bare && (
         <MenuSurface x={layoutMenu.menu.x} y={layoutMenu.menu.y} ariaLabel="Layout" onDismiss={layoutMenu.close}>
           <div className={MENU_HEADER}>Layout</div>
           {LAYOUTS.map((l) => {

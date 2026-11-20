@@ -26,7 +26,7 @@ import { MenuSurface } from "../MenuSurface";
 import { TerminalSlot } from "../TerminalSlot";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { PaneWaiting } from "./PaneWaiting";
-import { closeAsksFirst, useCloseSession } from "./useCloseSession";
+import { closeAsksFirst, useCloseSession, useSessionWait } from "./useCloseSession";
 
 interface Props {
   workspaceId: string;
@@ -334,7 +334,9 @@ function PaneCaption({
 }: CaptionProps) {
   const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
   const renameTerminal = useTerminalsStore((s) => s.renameTerminal);
-  const [requestClose, closeConfirm] = useCloseSession(workspaceId);
+  // A question about the session this pane showed goes when it shows another.
+  const [requestClose, closeConfirm] = useCloseSession(workspaceId, undefined, terminalId);
+  const wait = useSessionWait(terminalId);
   const setup = useTerminalsStore((s) => (terminalId ? s.setupByTerminal[terminalId] : undefined));
   const actions = useAnchoredMenu((r) => ({ x: r.right - 224, y: r.bottom + 4 }));
   const [draft, setDraft] = useState<string | null>(null);
@@ -601,16 +603,18 @@ function PaneCaption({
             role="menuitem"
             data-testid={`run-pane-close-${slot}`}
             title={
-              closeAsksFirst(session)
+              session.busy
                 ? "Something is running in it: you are asked before it ends"
-                : "Ends the session; it can't be reopened"
+                : wait
+                  ? "Claude Code is waiting on you in it: you are asked before it ends"
+                  : "Ends the session; it can't be reopened"
             }
             className={MENU_ITEM_ROUGE}
             onClick={menuItem(() => requestClose(session))}
           >
             {/* The ellipsis is a promise of a second step, so it shows only
                 when there is one. */}
-            {closeAsksFirst(session) ? "Close session…" : "Close session"}
+            {closeAsksFirst(session, wait) ? "Close session…" : "Close session"}
           </button>
         </MenuSurface>
       )}

@@ -45,7 +45,7 @@ beforeEach(() => {
   useTerminalsStore.setState({ terminalsByWs: {}, activeByWs: {}, setupByTerminal: {} });
   useTerminalLayoutStore.setState({ runByWs: {}, mruByWs: {}, splitByWs: {}, resizing: false });
   useTerminalSlotsStore.setState({ slots: {}, origin: { left: 0, top: 0 } });
-  useAttentionStore.setState({ waitingByTerminal: {} });
+  useAttentionStore.setState({ flagsByWs: {}, waitsByTerminal: {}, waitingByTerminal: {}, soundEnabled: false });
   vi.clearAllMocks();
   mockIpc.renameTerminal.mockResolvedValue(undefined);
   mockIpc.deleteTerminal.mockResolvedValue(undefined);
@@ -240,6 +240,46 @@ describe("RunPanes", () => {
     expect(useTerminalsStore.getState().getTerminals(WS).map((t) => t.id)).toEqual(["a"]);
   });
 
+  it("asks before closing a session that waits on the user, though it prints nothing", () => {
+    seed(["a", "b"], ["a", "b"], 0);
+    // An agent parked on a permission prompt: quiet, so not busy.
+    patch("b", { command: "claude", role: "agent" });
+    act(() => useAttentionStore.getState().setShownWaiting("b", "permission"));
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-1"));
+    const item = screen.getByRole("menuitem", { name: "Close session…" });
+    expect(item).toHaveAttribute("title", "Claude Code is waiting on you in it: you are asked before it ends");
+    fireEvent.click(item);
+    const dialog = screen.getByRole("dialog", { name: "Confirm closing the session" });
+    expect(dialog).toHaveTextContent("Close this session while it waits on you?");
+    expect(dialog).toHaveTextContent("claude is waiting on permission in Label b.");
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+  });
+
+  it("asks for a session waiting off screen too", () => {
+    seed(["a", "b"], ["a"], 0);
+    act(() => useAttentionStore.getState().ping(WS, "terminal", "a", "input"));
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    expect(screen.getByRole("dialog")).toHaveTextContent("Claude Code is waiting on your input in Label a.");
+  });
+
+  it("drops the question when the pane moves on to another session", () => {
+    seed(["a", "b"], ["a"], 0);
+    patch("a", { busy: true, command: "npm test" });
+    render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
+    fireEvent.click(screen.getByTestId("run-pane-menu-0"));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Close session…" }));
+    expect(screen.getByRole("dialog")).toBeInTheDocument();
+    act(() => useTerminalsStore.getState().setActive(WS, "b"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    // And it does not come back with the session.
+    act(() => useTerminalsStore.getState().setActive(WS, "a"));
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+  });
+
   it("the ⋯ button toggles its menu, and gets the focus back when the menu closes", () => {
     seed(["a", "b"], ["a", "b"], 0);
     render(<RunPanes workspaceId={WS} onOpenBeside={noop} />);
@@ -249,11 +289,11 @@ describe("RunPanes", () => {
     // One real press on the open menu's button: closed on mousedown, and the
     // click that follows does not open it again.
     fireEvent.mouseDown(button);
-    fireEvent.click(button);
+    fireEvent.click(button, { detail: 1 });
     expect(screen.queryByRole("menu")).toBeNull();
 
     fireEvent.mouseDown(button);
-    fireEvent.click(button);
+    fireEvent.click(button, { detail: 1 });
     expect(screen.getByRole("menu")).toBeInTheDocument();
     fireEvent.keyDown(window, { key: "Escape" });
     expect(screen.queryByRole("menu")).toBeNull();

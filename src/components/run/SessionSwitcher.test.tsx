@@ -348,6 +348,21 @@ describe("SessionSwitcher", () => {
     expect(mockIpc.deleteTerminal).toHaveBeenCalledTimes(1);
   });
 
+  it("asks before ⌫ closes a quiet session that waits on the user", () => {
+    seed([
+      { id: "a", label: "main" },
+      { id: "b", label: "agent", command: "claude", role: "agent" },
+    ]);
+    act(() => useAttentionStore.getState().ping(WS, "terminal", "b", "permission"));
+    render(<SessionSwitcher workspaceId={WS} onClose={vi.fn()} />);
+    // The waiting session lists first, so ⌫ means it.
+    fireEvent.keyDown(screen.getByTestId("session-switcher-input"), { key: "Backspace" });
+    expect(mockIpc.deleteTerminal).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "Confirm closing the session" })).toHaveTextContent(
+      "claude is waiting on permission in agent.",
+    );
+  });
+
   it("opens a new session from the last row", () => {
     seed([{ id: "a", label: "main" }]);
     mockIpc.createTerminal.mockResolvedValue({ id: "new", label: "Terminal 2", position: 1 });
