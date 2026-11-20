@@ -244,6 +244,25 @@ describe("themeStore · applyThemeToDom", () => {
     expect(read("--onyx-40")).toBe("rgba(242, 236, 224, 0.4)");
   });
 
+  it("gives a group's pale tints an ink that reads on the rail's panel", async () => {
+    const { contrastRatio, hexToRgb } = await import("../lib/contrast");
+    const { TINTS } = await import("../lib/monogram");
+    const on = (ink: string, ground: string) => contrastRatio(hexToRgb(ink)!, hexToRgb(ground)!);
+    // On onyx they already read: the tint itself.
+    await useThemeStore.getState().apply(ATELIER);
+    expect(read("--tint-mark-bone")).toBe(TINTS.bone.accent);
+    expect(read("--tint-mark-smoke")).toBe(TINTS.smoke.accent);
+    // On cream bone sat near 1.4:1: deepened to clear 3:1, and no further.
+    expect(on(TINTS.bone.accent, VELLUM.panel)).toBeLessThan(2);
+    await useThemeStore.getState().apply(VELLUM);
+    for (const name of ["bone", "smoke"] as const) {
+      const ink = read(`--tint-mark-${name}`);
+      expect(ink).not.toBe(TINTS[name].accent);
+      expect(on(ink, VELLUM.panel)).toBeGreaterThanOrEqual(3);
+      expect(on(ink, VELLUM.panel)).toBeLessThan(3.5);
+    }
+  });
+
   it("switches the state hues (editor types and constants) with the ground", async () => {
     // They have no ThemeConfig field; the Onyx values sat at ~2.5:1 on cream.
     await useThemeStore.getState().apply(VELLUM);

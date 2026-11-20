@@ -7,12 +7,9 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
  *    a menu that sets something (`role^="menuitem"`);
  *  - but not a row taken out of the tab order (`tabindex="-1"`): a row of
  *    swatches is one stop of the walk, on the one swatch that is tabbable,
- *    and ←/→ move along it (a roving tab stop);
- *  - plus a control that is no menu row at all yet belongs in the walk, which
- *    opts in with `data-menu-item`.
+ *    and ←/→ move along it (a roving tab stop).
  */
-const MENU_ROWS =
-  '[role^="menuitem"]:not([disabled]):not([tabindex="-1"]), [data-menu-item]:not([disabled])';
+const MENU_ROWS = '[role^="menuitem"]:not([disabled]):not([tabindex="-1"])';
 
 /**
  * Shared chrome for the rail context menus:

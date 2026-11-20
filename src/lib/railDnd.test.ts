@@ -277,6 +277,20 @@ describe("project groups (sections)", () => {
     expect(detect(dragged("client"), rect(251, 300), null)[0]).toBe("acme-admin");
   });
 
+  it("the keyboard steps a tall project past a much shorter one, by the edge the step lined up", () => {
+    // Eight missions (300px) above a bare project (40px) in one list. ↓ lines
+    // the block's bottom up with the short one's: its centre is still 52px
+    // from its own place and 130px from the short project's centre.
+    const tall = project("tall", null, rect(0, 300));
+    const short = project("short", null, rect(312, 40));
+    const detectPair = detectIn([tall, short]);
+    expect(detectPair(dragged(null), rect(52, 300), null)[0]).toBe("short");
+    // Stepped back up, it is over its own place again.
+    expect(detectPair(dragged(null), rect(0, 300), null)[0]).toBe("tall");
+    // A short project stepped up onto the tall one lines up the tops.
+    expect(detectPair(dragged(null), rect(0, 40), null)[0]).toBe("tall");
+  });
+
   it("a keyboard step onto another group's project means that group's header: it joins last, not mid-group", () => {
     expect(detect(dragged(null), rect(143, 96), null)).toEqual(["section-head:client"]);
     expect(detect(dragged("side"), rect(251, 300), null)).toEqual(["section-head:client"]);

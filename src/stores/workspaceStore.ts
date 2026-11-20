@@ -26,9 +26,10 @@ interface WorkspaceState {
   lastActiveByProject: Record<string, string>;
   /** The workspace the app made active by itself when it launched (the
    *  remembered one of the project it reopened, or that project's first), as
-   *  opposed to one somebody activated. `undefined` until the first project
-   *  has loaded; `null` when that project had none. The rail reads it to tell
-   *  a restore from an activation: only the latter unfolds a mission group. */
+   *  opposed to one somebody activated. `undefined` until the startup restore
+   *  has loaded its project, and for good when the app launched with no
+   *  project to reopen; `null` when that project had none. The rail reads it
+   *  to tell a restore from an activation: only the latter unfolds a group. */
   launchRestoredId?: string | null;
   /** Workspaces grouped by project ID for hierarchical display in the rail. */
   workspacesByProjectId: Record<string, Workspace[]>;
@@ -38,6 +39,13 @@ interface WorkspaceState {
   prByWs: Record<string, Pr | null>;
 
   load: (projectId: string) => Promise<void>;
+  /** The startup restore is reopening the last project: what the loads make
+   *  active until its own `load` lands is the launch restore, not an
+   *  activation. Call it before opening the project. */
+  beginLaunchRestore: () => void;
+  /** The startup restore opened nothing (the project couldn't be opened):
+   *  the next project the user opens is an activation. */
+  cancelLaunchRestore: () => void;
   /** Fetches + replaces workspacesByProjectId for the given ids; also syncs
    *  the flat `workspaces` array (and reconciles `activeId`) when the
    *  currently-open project is among them, so `activeWorkspace` resolves
@@ -97,11 +105,12 @@ export const __resetPrFetchThrottle = (): void => {
   prFetchLastAt.clear();
 };
 
-/** Whether `load` has run once: its first pick is the launch restore. */
-let launchLoaded = false;
-/** Test-only: the next `load` is a launch again. */
+/** Whether the startup restore is reopening a project whose `load` has not
+ *  landed yet: that load's pick is the launch restore. */
+let launchPending = false;
+/** Test-only: no launch restore in flight. */
 export const __resetLaunchRestore = (): void => {
-  launchLoaded = false;
+  launchPending = false;
 };
 
 const loadLastActiveFromStorage = (): Record<string, string> => {
@@ -140,9 +149,9 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         : workspaces.length > 0
           ? workspaces[0].id
           : null;
-      // The first project load of the session is the launch restore.
-      const atLaunch = !launchLoaded;
-      launchLoaded = true;
+      // The load the startup restore is waiting for is the launch restore.
+      const atLaunch = launchPending;
+      launchPending = false;
       set((s) => ({
         workspaces,
         loading: false,
@@ -156,6 +165,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     } finally {
       guard.end();
     }
+  },
+
+  beginLaunchRestore: () => {
+    launchPending = true;
+  },
+
+  cancelLaunchRestore: () => {
+    launchPending = false;
   },
 
   loadAllWorkspaces: async (projectIds) => {
@@ -199,7 +216,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           activeId,
           // At launch this reload can land before `load` picks the remembered
           // workspace: what it makes active meanwhile is no activation either.
-          ...(!launchLoaded && !activeStillExists ? { launchRestoredId: activeId } : {}),
+          ...(launchPending && !activeStillExists ? { launchRestoredId: activeId } : {}),
         };
       });
     } catch (err) {

@@ -68,6 +68,25 @@ const sectionIdOf = (data: unknown) => (data as { sectionId?: string | null } | 
 const only = (container: DroppableContainer) => [{ id: container.id, data: { droppableContainer: container, value: 0 } }];
 
 /**
+ * The keyboard's nearest target: the droppable whose top or bottom edge lines
+ * up best with the moved block's. A keyboard step puts the block on its
+ * target by an edge (dnd-kit's sortable getter aligns the bottoms of a target
+ * after it in the list, the tops otherwise), so the edge says where the step
+ * went. The centre does not: a tall block stepped down onto a short project
+ * keeps its centre nearer its own place, and closest-centre would hold it
+ * over itself.
+ */
+const closestAlignedEdge: CollisionDetection = ({ collisionRect, droppableRects, droppableContainers }) =>
+  droppableContainers
+    .flatMap((container) => {
+      const r = droppableRects.get(container.id);
+      if (!r) return [];
+      const value = Math.min(Math.abs(r.top - collisionRect.top), Math.abs(r.bottom - collisionRect.bottom));
+      return [{ id: container.id, data: { droppableContainer: container, value } }];
+    })
+    .sort((a, b) => a.data.value - b.data.value);
+
+/**
  * Where a dragged PROJECT lands. Its block can be hundreds of pixels tall and
  * is held by a grip at its top, so the block's centre says little about where
  * the user is pointing: the POINTER decides which container the project is
@@ -84,16 +103,17 @@ const only = (container: DroppableContainer) => [{ id: container.id, data: { dro
  *    group for it.
  *
  * The keyboard has no pointer. Its steps are aimed at projects by
- * `projectKeyboardCoordinates`, so the nearest project wins there, with the
- * group headers kept as targets, and a project of another group stands for
- * that group's header (the drop joins it, last).
+ * `projectKeyboardCoordinates`, so the project the step lined the block up
+ * with wins there (`closestAlignedEdge`), with the group headers kept as
+ * targets, and a project of another group stands for that group's header
+ * (the drop joins it, last).
  */
 function projectCollisions(args: Parameters<CollisionDetection>[0]) {
   const all = args.droppableContainers;
   const own = sectionIdOf(args.active.data.current);
   const headOf = (groupId: string | null) => all.find((c) => isSectionHead(c) && groupIdOf(c) === groupId);
   if (args.pointerCoordinates === null) {
-    const met = closestCenter({ ...args, droppableContainers: all.filter((c) => isProject(c) || isSectionHead(c)) });
+    const met = closestAlignedEdge({ ...args, droppableContainers: all.filter((c) => isProject(c) || isSectionHead(c)) });
     // A step onto another group's project means that group's header, as the
     // pointer anywhere on it does: the drop joins it as its last project, so
     // the group is not opened around the block mid-way.
@@ -158,8 +178,10 @@ export const railCollisions: CollisionDetection = (args) => {
  * whichever section they sit in: stepping onto a project of another section
  * (or onto a loose one) and dropping there moves the project into that
  * container, as the pointer does. Sections, missions and mission-group
- * headers have no keyboard drag: a mission moves with ⌘⌥G or its menu's
- * "Move to group", a section with its menu's Move up / Move down.
+ * headers have no keyboard drag: a mission row of the expanded rail moves
+ * with ⌘⌥G or its menu's "Move to group" (⇧F10), a section with its menu's
+ * Move up / Move down. A mission's cell in the slim rail has no keyboard way
+ * to move yet (#918).
  */
 export const projectKeyboardCoordinates: KeyboardCoordinateGetter = (event, args) => {
   const all = args.context.droppableContainers;

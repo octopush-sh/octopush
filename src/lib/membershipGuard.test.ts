@@ -81,6 +81,29 @@ describe("membershipGuard", () => {
     ]);
   });
 
+  it("a newer move that is dropped leaves an older settled one protecting a read that missed it", async () => {
+    const old = read();
+    const oldLoad = loadWithMembership("workspace", old.fetch);
+    beginMembershipChange("workspace", ["a"], "g1").settle();
+    const newer = beginMembershipChange("workspace", ["a"], "g2");
+    newer.drop(); // the backend refused the newer move
+    old.resolve([{ id: "a", groupId: null }]); // read before g1 settled
+    expect(await oldLoad).toEqual([{ id: "a", groupId: "g1" }]);
+    // A read that began after g1 settled is trusted.
+    expect(await loadWithMembership("workspace", async () => [{ id: "a", groupId: "g1" }])).toEqual([
+      { id: "a", groupId: "g1" },
+    ]);
+  });
+
+  it("while two moves of an item are out, the newer one is laid over", () => {
+    const older = beginMembershipChange("workspace", ["a"], "g1");
+    const load = beginMembershipLoad("workspace");
+    beginMembershipChange("workspace", ["a"], "g2");
+    expect(load.overlay([{ id: "a", groupId: null }])).toEqual([{ id: "a", groupId: "g2" }]);
+    load.end();
+    older.drop();
+  });
+
   it("a failed read still ends, so later changes are not kept forever", async () => {
     await expect(loadWithMembership("workspace", () => Promise.reject(new Error("db")))).rejects.toThrow("db");
     beginMembershipChange("workspace", ["a"], "g").settle();

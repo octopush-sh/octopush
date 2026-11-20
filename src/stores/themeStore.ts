@@ -5,12 +5,14 @@ import {
   isDarkBackground,
   isHexColor,
   rgba,
+  solveMarkInk,
   solveMatchWashAlpha,
   solveTintAlpha,
   WORD_DIFF_ADD_ALPHA,
   WORD_DIFF_DEL_ALPHA,
 } from "../lib/contrast";
 import { stateInks } from "../lib/tokens";
+import { PALE_TINTS, TINTS } from "../lib/monogram";
 import type { ThemeConfig } from "../lib/types";
 
 /** localStorage key holding a mirror of the applied theme.
@@ -226,6 +228,15 @@ function applyThemeToDom(t: ThemeConfig, { following = false } = {}) {
   // Sticky rail backdrops composite over the canvas, so the scrim has to be
   // the theme's own background, not a fixed near-black.
   root.style.setProperty("--onyx-40", rgba(t.bg, 0.4));
+
+  // A group's chevron and guide in a pale tint (bone, smoke): the tint where
+  // it clears 3:1 on the rail's panel, as on onyx, and mixed toward the text
+  // just enough to clear it where it doesn't, as on cream. Consumed by
+  // `groupMarkColor` (RailMissionGroup.tsx).
+  for (const name of PALE_TINTS) {
+    const accent = TINTS[name].accent;
+    root.style.setProperty(`--tint-mark-${name}`, solveMarkInk(accent, t.text, t.panel) ?? accent);
+  }
 
   // Diff row tints. A flat 0.08 was correct only for atelier: the same alpha
   // is a different perceptual step on cream, so the alpha is solved per theme

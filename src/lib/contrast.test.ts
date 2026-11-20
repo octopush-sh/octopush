@@ -13,6 +13,7 @@ import {
   DIFF_TINT_TARGET,
   WORD_DIFF_ADD_ALPHA,
   WORD_DIFF_DEL_ALPHA,
+  solveMarkInk,
 } from "./contrast";
 import { tokens, vellumInks } from "./tokens";
 import { SYNTAX_KINDS } from "./syntaxPalette";
@@ -223,6 +224,24 @@ describe("isDarkBackground", () => {
     // there is nothing to measure — dark is the safer guess for a code editor.
     expect(isDarkBackground("")).toBe(true);
     expect(isDarkBackground("white")).toBe(true);
+  });
+});
+
+describe("solveMarkInk", () => {
+  it("keeps a colour that already clears the target, as #rrggbb", () => {
+    expect(solveMarkInk("#d8c9a8", "#f4ecdb", "#14110d")).toBe("#d8c9a8");
+    expect(solveMarkInk("#abc", "#fff", "#000")).toBe("#aabbcc");
+  });
+
+  it("mixes a pale colour toward the text until it clears 3:1 on a light ground", () => {
+    const ink = solveMarkInk("#a8a8a8", "#2a201a", "#faf6ec")!;
+    expect(contrastRatio(hexToRgb(ink)!, hexToRgb("#faf6ec")!)).toBeGreaterThanOrEqual(3);
+    // Still a mix, not the text itself.
+    expect(ink).not.toBe("#2a201a");
+  });
+
+  it("is null for an unparseable colour", () => {
+    expect(solveMarkInk("var(--x)", "#000", "#fff")).toBeNull();
   });
 });
 
