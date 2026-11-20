@@ -49,6 +49,9 @@ interface GroupsState {
   remove: (groupId: string) => Promise<boolean>;
   /** Move a project or workspace into a group, or out of any (`null`). */
   moveItem: (kind: GroupScope, itemId: string, groupId: string | null) => Promise<boolean>;
+  /** Move several items of one kind the same way, in one backend call: all
+   *  of them or none, with one toast when refused. */
+  moveItems: (kind: GroupScope, itemIds: readonly string[], groupId: string | null) => Promise<boolean>;
   /** Move a project into a project group, or out of any (`null`), together
    *  with the project order that goes with it (null: the order stands). Both
    *  land in the store in one step, then both are written; if either write is
@@ -334,6 +337,36 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
       // Leave a newer move alone.
       if (groupOf(kind, itemId) === groupId) patchMembership(kind, assign([itemId], before));
       refused(kind === "project" ? "Couldn't move the project" : "Couldn't move the workspace", e);
+      return false;
+    }
+  },
+
+  moveItems: async (kind, itemIds, groupId) => {
+    const before = new Map<string, string | null>();
+    for (const id of itemIds) {
+      const from = groupOf(kind, id);
+      if (from !== groupId) before.set(id, from);
+    }
+    const moving = [...before.keys()];
+    if (moving.length === 0) return true;
+    if (moving.length === 1) return get().moveItem(kind, moving[0], groupId);
+    const change = beginMembershipChange(kind, moving, groupId);
+    patchMembership(kind, assign(moving, groupId));
+    try {
+      await ipc.setItemsGroup(kind, moving, groupId);
+      change.settle();
+      return true;
+    } catch (e) {
+      change.drop();
+      // Leave newer moves alone.
+      patchMembership(
+        kind,
+        new Map(moving.filter((id) => groupOf(kind, id) === groupId).map((id) => [id, before.get(id) ?? null] as const)),
+      );
+      refused(
+        kind === "project" ? `Couldn't move the ${moving.length} projects` : `Couldn't move the ${moving.length} missions`,
+        e,
+      );
       return false;
     }
   },

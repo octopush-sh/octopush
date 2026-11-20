@@ -113,9 +113,20 @@ export function CommandPalette({
   // ⇧F10, ←/→) take over: the palette is navigation only, it renames and
   // moves nothing itself.
   const groupsSection = groupRows.length > 0 && onRevealGroup && (
-    <Group heading="Groups" tour={tourId("palette-groups")}>
+    <Group key="groups" heading="Groups" tour={tourId("palette-groups")}>
       {groupRows.map((g) => (
         <GroupItem key={g.id} row={g} onSelect={() => run(() => onRevealGroup(g.id))} />
+      ))}
+    </Group>
+  );
+
+  // Workspaces — every open project's, needs-you first, then running, then
+  // most recently active. Typing part of a branch or a project name finds
+  // the row.
+  const workspacesSection = workspaceRows.length > 0 && onSelectWorkspace && (
+    <Group key="workspaces" heading="Workspaces" tour={tourId("palette-workspaces")}>
+      {workspaceRows.map((w) => (
+        <WorkspaceItem key={w.id} row={w} onSelect={() => run(() => onSelectWorkspace(w.id))} />
       ))}
     </Group>
   );
@@ -187,23 +198,13 @@ export function CommandPalette({
               )}
             </Group>
 
-            {/* With a query, Groups come before Workspaces: a group's name
-                also finds its missions, and the group itself is the likelier
-                target. At rest the Workspaces, by recency, lead. */}
-            {search.trim() !== "" && groupsSection}
-
-            {/* Workspaces — every open project's, needs-you first, then
-                running, then most recently active. Typing part of a branch
-                or a project name finds the row. */}
-            {workspaceRows.length > 0 && onSelectWorkspace && (
-              <Group heading="Workspaces" tour={tourId("palette-workspaces")}>
-                {workspaceRows.map((w) => (
-                  <WorkspaceItem key={w.id} row={w} onSelect={() => run(() => onSelectWorkspace(w.id))} />
-                ))}
-              </Group>
-            )}
-
-            {search.trim() === "" && groupsSection}
+            {/* At rest the Workspaces, by recency, lead. With a query, Groups
+                come before them: a group's name also finds its missions, and
+                the group itself is the likelier target. The order is the
+                JSX's (cmdk 1.1 keeps sections where they are drawn), and the
+                two are one keyed list, so React moves a section instead of
+                remounting it on the first keystroke. */}
+            {search.trim() === "" ? [workspacesSection, groupsSection] : [groupsSection, workspacesSection]}
 
             {/* Models */}
             {/* The heading already says "Models", so rows carry the bare name.

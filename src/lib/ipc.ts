@@ -839,6 +839,10 @@ export const ipc = {
    *  another project. */
   setItemGroup: (kind: GroupScope, itemId: string, groupId: string | null) =>
     invoke<void>("set_item_group", { kind, itemId, groupId }),
+  /** Move several items of one kind the same way, in one transaction: one
+   *  refusal leaves them all where they were. */
+  setItemsGroup: (kind: GroupScope, itemIds: string[], groupId: string | null) =>
+    invoke<void>("set_items_group", { kind, itemIds, groupId }),
 
   // ─── Workspaces ─────────────────────────────────────────────────
   createWorkspace: (projectId: string, projectPath: string, name: string, task: string,

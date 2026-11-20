@@ -4015,6 +4015,18 @@ pub async fn set_item_group(
     state.db.lock().set_item_group(&kind, &item_id, group_id.as_deref())
 }
 
+/// Move several items of one `kind` into a group, or out of any group
+/// (`group_id` null), all or none.
+#[tauri::command]
+pub async fn set_items_group(
+    state: State<'_, AppState>,
+    kind: String,
+    item_ids: Vec<String>,
+    group_id: Option<String>,
+) -> AppResult<()> {
+    state.db.lock().set_items_group(&kind, &item_ids, group_id.as_deref())
+}
+
 #[tauri::command]
 pub async fn close_project(
     state: State<'_, AppState>,

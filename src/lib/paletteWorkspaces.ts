@@ -77,8 +77,9 @@ export function paletteWorkspaces(
 ): PaletteWorkspace[] {
   // A mission is in a group only when the group is its own project's (the
   // rail's `ownGroupId` rule): a stale id means loose here too.
+  const groupById = new Map(groups.map((g) => [g.id, g] as const));
   const groupName = (ws: Workspace) => {
-    const g = ws.groupId ? groups.find((x) => x.id === ws.groupId) : undefined;
+    const g = ws.groupId ? groupById.get(ws.groupId) : undefined;
     return g && g.scope === "workspace" && g.projectId === ws.projectId ? g.name : null;
   };
   const rows: (PaletteWorkspace & { waitingSince: number; lastActive: number })[] = [];

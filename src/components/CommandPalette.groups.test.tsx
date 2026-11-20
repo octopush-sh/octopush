@@ -5,6 +5,7 @@
  */
 import { describe, it, expect, vi, afterAll, beforeEach } from "vitest";
 import { render, screen, act, fireEvent } from "@testing-library/react";
+import { Command } from "cmdk";
 import type { Group, Workspace } from "../lib/types";
 import type { ProjectGroup } from "./WorkspaceRail";
 
@@ -20,6 +21,7 @@ import { CommandPalette } from "./CommandPalette";
 import { useRunsStore } from "../stores/runsStore";
 import { useGroupsStore } from "../stores/groupsStore";
 import { paletteGroups } from "../lib/paletteGroups";
+import { paletteFilter, paletteWorkspaces } from "../lib/paletteWorkspaces";
 
 class ResizeObserverMock {
   observe() {}
@@ -69,7 +71,11 @@ const projects: ProjectGroup[] = [
   },
 ];
 
-async function renderPalette(onRevealGroup: ((id: string) => void) | null = vi.fn(), onClose = vi.fn()) {
+async function renderPalette(
+  onRevealGroup: ((id: string) => void) | null = vi.fn(),
+  onClose = vi.fn(),
+  rail: ProjectGroup[] = projects,
+) {
   await act(async () => {
     render(
       <CommandPalette
@@ -77,7 +83,7 @@ async function renderPalette(onRevealGroup: ((id: string) => void) | null = vi.f
         onClose={onClose}
         onNewSession={vi.fn()}
         onToggleTokens={vi.fn()}
-        projects={projects}
+        projects={rail}
         runningByWs={{}}
         onSelectWorkspace={vi.fn()}
         onRevealGroup={onRevealGroup ?? undefined}
@@ -122,14 +128,34 @@ describe("CommandPalette · Groups section", () => {
     expect(groupNames()).toEqual(["Mission group: Fixes"]);
   });
 
+  const headings = () =>
+    [...document.querySelectorAll("[cmdk-group]")]
+      .filter((g) => !(g as HTMLElement).hidden)
+      .map((g) => g.querySelector("[cmdk-group-heading]")?.textContent);
+
   it("comes after Workspaces at rest, and before them once a query is typed", async () => {
     await renderPalette();
-    const headings = () =>
-      [...document.querySelectorAll("[cmdk-group]")]
-        .filter((g) => !(g as HTMLElement).hidden)
-        .map((g) => g.querySelector("[cmdk-group-heading]")?.textContent);
     expect(headings().indexOf("Workspaces")).toBeLessThan(headings().indexOf("Groups"));
+    const section = document.querySelector('[data-tour="palette-groups"]');
     await type("Fixes");
+    expect(headings().slice(0, 2)).toEqual(["Groups", "Workspaces"]);
+    // The same section, moved: typing does not remount it.
+    expect(document.querySelector('[data-tour="palette-groups"]')).toBe(section);
+  });
+
+  it("stays before Workspaces when a mission matches the query better than any group", async () => {
+    const rail: ProjectGroup[] = [
+      { ...projects[0], workspaces: [...projects[0].workspaces, ws("w-notes", "p-web", "notes")] },
+      projects[1],
+    ];
+    // The premise: on its own score, the mission beats the group.
+    const mission = paletteWorkspaces(rail, {}, {}, {}, GROUPS).find((r) => r.id === "w-notes")!;
+    const notes = paletteGroups(rail, GROUPS).find((r) => r.id === "mg-notes")!;
+    expect(paletteFilter(`ws:${mission.id}`, "notes", mission.keywords)).toBeGreaterThan(
+      paletteFilter(`group:${notes.id}`, "notes", notes.keywords),
+    );
+    await renderPalette(vi.fn(), vi.fn(), rail);
+    await type("notes");
     expect(headings().slice(0, 2)).toEqual(["Groups", "Workspaces"]);
   });
 
@@ -156,6 +182,39 @@ describe("CommandPalette · Groups section", () => {
     await type("Fixes");
     const missions = screen.getAllByTestId("palette-workspace").map((r) => r.querySelector("[title]")?.getAttribute("title"));
     expect(missions.sort()).toEqual(["fix-json-parser", "fix-netty-codec"]);
+  });
+});
+
+/**
+ * The premise of the palette's section order: cmdk 1.1 scores and sorts the
+ * rows inside a section, but keeps the sections where they are drawn (its
+ * section sort looks a section up by its id in `data-value`, which holds the
+ * heading, and finds nothing). So `CommandPalette` decides the order of its
+ * sections in its JSX. If a cmdk upgrade makes this fail, sections start
+ * moving by score and the palette must pin Groups before Workspaces itself.
+ */
+describe("cmdk section order", () => {
+  it("keeps sections in the order they are drawn, whatever their rows score", async () => {
+    await act(async () => {
+      render(
+        <Command filter={(value) => (value.startsWith("strong") ? 1 : 0.1)}>
+          <Command.Input placeholder="query" />
+          <Command.List>
+            <Command.Group heading="First">
+              <Command.Item value="weak">weak</Command.Item>
+            </Command.Group>
+            <Command.Group heading="Second">
+              <Command.Item value="strong">strong</Command.Item>
+            </Command.Group>
+          </Command.List>
+        </Command>,
+      );
+    });
+    await act(async () => {
+      fireEvent.change(screen.getByPlaceholderText("query"), { target: { value: "s" } });
+    });
+    const sections = [...document.querySelectorAll("[cmdk-group-heading]")].map((h) => h.textContent);
+    expect(sections).toEqual(["First", "Second"]);
   });
 });
 

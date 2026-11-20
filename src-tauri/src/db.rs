@@ -2863,6 +2863,42 @@ impl Db {
         Ok(())
     }
 
+    /// Move several projects or workspaces (one `kind`) into a group, or out of
+    /// any, in one transaction: every item is checked like [`Self::set_item_group`]
+    /// checks one, and a single refusal leaves them all where they were.
+    pub fn set_items_group(&self, kind: &str, item_ids: &[String], group_id: Option<&str>) -> AppResult<()> {
+        if !matches!(kind, "project" | "workspace") {
+            return Err(unknown_group_item_kind(kind));
+        }
+        // IMMEDIATE, like `create_group`: the checks read before the writes.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let group = match group_id {
+            Some(gid) => Some(self.get_group(gid)?.ok_or_else(|| group_error("Group not found."))?),
+            None => None,
+        };
+        for item_id in item_ids {
+            match &group {
+                Some(g) => self.ensure_item_fits_group(kind, item_id, &g.scope, g.project_id.as_deref())?,
+                None => {
+                    self.ensure_group_item_exists(kind, item_id)?;
+                }
+            }
+        }
+        let sql = if kind == "project" {
+            "UPDATE projects SET group_id = ?1 WHERE id = ?2"
+        } else {
+            "UPDATE workspaces SET group_id = ?1 WHERE id = ?2"
+        };
+        for item_id in item_ids {
+            tx.execute(sql, params![group_id, item_id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     // ─── Workspaces ───────────────────────────────────────────────
 
     pub fn insert_workspace(
