@@ -5,6 +5,7 @@ const mockIpc = vi.hoisted(() => ({
   createGroup: vi.fn(),
   deleteGroup: vi.fn(),
   setItemGroup: vi.fn(),
+  setItemsGroup: vi.fn(),
   setProjectOrder: vi.fn(),
   listRecentProjects: vi.fn(),
 }));
@@ -90,14 +91,42 @@ describe("groupActions", () => {
     expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual(["made", null, "made"]);
   });
 
-  it("moveMissionsToGroup moves each mission not already there, and unfolds the target", async () => {
+  it("moveMissionsToGroup moves the missions not already there in one call, and unfolds the target", async () => {
     useGroupsStore.setState({ groups: [group("g1")] });
     seed([ws("w1", "g1"), ws("w2"), ws("w3")]);
     useRailGroupUi.getState().setCollapsed("g1", true);
     expect(await moveMissionsToGroup(["w1", "w2", "w3"], "g1")).toBe(true);
-    expect(mockIpc.setItemGroup).toHaveBeenCalledTimes(2);
+    expect(mockIpc.setItemsGroup).toHaveBeenCalledTimes(1);
+    expect(mockIpc.setItemsGroup).toHaveBeenCalledWith("workspace", ["w2", "w3"], "g1");
+    expect(mockIpc.setItemGroup).not.toHaveBeenCalled();
     expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual(["g1", "g1", "g1"]);
     expect(useRailGroupUi.getState().collapsed).toEqual({});
+  });
+
+  it("moveMissionsToGroup puts every mission back and shows one toast when refused", async () => {
+    useGroupsStore.setState({ groups: [group("g1"), group("g2", { sortOrder: 1 })] });
+    seed([ws("w1", "g2"), ws("w2"), ws("w3")]);
+    mockIpc.setItemsGroup.mockRejectedValue("other: A workspace can only join a group in its own project.");
+    expect(await moveMissionsToGroup(["w1", "w2", "w3"], "g1")).toBe(false);
+    expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual(["g2", null, null]);
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast).toHaveBeenCalledWith({
+      level: "error",
+      title: "Couldn't move the 3 workspaces",
+      body: "A workspace can only join a group in its own project.",
+    });
+  });
+
+  it("moveMissionsToGroup leaves a mission moved meanwhile where it went", async () => {
+    useGroupsStore.setState({ groups: [group("g1"), group("g2", { sortOrder: 1 })] });
+    seed([ws("w1"), ws("w2")]);
+    let reject: (e: unknown) => void = () => {};
+    mockIpc.setItemsGroup.mockReturnValue(new Promise((_, r) => (reject = r)));
+    const moving = moveMissionsToGroup(["w1", "w2"], "g1");
+    await moveMissionToGroup("w2", "g2");
+    reject("other: refused");
+    expect(await moving).toBe(false);
+    expect([groupOf("w1"), groupOf("w2")]).toEqual([null, "g2"]);
   });
 
   it("revealGroup unfolds the group and asks the rail to show it", () => {

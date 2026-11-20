@@ -226,6 +226,7 @@ pub fn run() {
             commands::set_group_order,
             commands::delete_group,
             commands::set_item_group,
+            commands::set_items_group,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,

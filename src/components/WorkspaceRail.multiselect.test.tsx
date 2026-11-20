@@ -16,6 +16,7 @@ const mockIpc = vi.hoisted(() => ({
   setGroupOrder: vi.fn(),
   deleteGroup: vi.fn(),
   setItemGroup: vi.fn(),
+  setItemsGroup: vi.fn(),
   setProjectOrder: vi.fn(),
 }));
 vi.mock("../lib/ipc", async (importOriginal) => {
@@ -271,7 +272,9 @@ describe("rail multi-select", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("menuitemradio", { name: "Fixes" }));
     });
-    expect(mockIpc.setItemGroup).toHaveBeenCalledTimes(2);
+    // One call for the whole selection: all of it moves, or none.
+    expect(mockIpc.setItemsGroup).toHaveBeenCalledTimes(1);
+    expect(mockIpc.setItemGroup).not.toHaveBeenCalled();
     const rows = useWorkspaceStore.getState().workspacesByProjectId["p-api"];
     expect(rows.filter((w) => w.groupId === FIXES.id).map((w) => w.id).sort()).toEqual(["w-auth", "w-json", "w-report"]);
   });
@@ -464,8 +467,9 @@ describe("Move to group… from the keyboard (⌘⌥G, rail-scoped)", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("menuitemradio", { name: "Fixes" }));
     });
-    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("workspace", "w-auth", FIXES.id);
-    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("workspace", "w-report", FIXES.id);
+    expect(mockIpc.setItemsGroup).toHaveBeenCalledTimes(1);
+    const [kind, ids, groupId] = mockIpc.setItemsGroup.mock.calls[0];
+    expect([kind, [...ids].sort(), groupId]).toEqual(["workspace", ["w-auth", "w-report"], FIXES.id]);
     expect(selected()).toEqual([]);
   });
 

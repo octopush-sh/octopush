@@ -45,15 +45,12 @@ export function moveMissionToGroup(workspaceId: string, groupId: string | null):
 }
 
 /** Move several missions (a rail selection) into one group, or out of any
- *  (`null`). Missions already where they are going are left alone. */
-export async function moveMissionsToGroup(workspaceIds: readonly string[], groupId: string | null): Promise<boolean> {
+ *  (`null`), all in one backend call: a refusal leaves every one where it
+ *  was and shows one toast. Missions already where they are going are left
+ *  alone. */
+export function moveMissionsToGroup(workspaceIds: readonly string[], groupId: string | null): Promise<boolean> {
   if (groupId) useRailGroupUi.getState().setCollapsed(groupId, false);
-  const rows = Object.values(useWorkspaceStore.getState().workspacesByProjectId).flat();
-  const moving = workspaceIds.filter((id) => (rows.find((w) => w.id === id)?.groupId ?? null) !== groupId);
-  const results = await Promise.all(
-    moving.map((id) => useGroupsStore.getState().moveItem("workspace", id, groupId)),
-  );
-  return results.every(Boolean);
+  return useGroupsStore.getState().moveItems("workspace", workspaceIds, groupId);
 }
 
 /**

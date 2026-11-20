@@ -23702,6 +23702,43 @@ mod group_tests {
     }
 
     #[test]
+    fn set_items_group_moves_all_or_none() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        let fixes = workspace_group(&db, "p1", "Fixes", &["w1"]);
+        let ids = |items: &[&str]| items.iter().map(|i| i.to_string()).collect::<Vec<_>>();
+
+        db.set_items_group("workspace", &ids(&["w1", "w2", "w3"]), Some(&fixes.id)).unwrap();
+        for ws in ["w1", "w2", "w3"] {
+            assert_eq!(group_of_workspace(&db, ws), Some(fixes.id.clone()));
+        }
+
+        // One mission of another project refuses the whole move.
+        let later = workspace_group(&db, "p1", "Later", &[]);
+        assert_eq!(
+            refusal(db.set_items_group("workspace", &ids(&["w1", "x1", "w2"]), Some(&later.id))),
+            "other: A workspace can only join a group in its own project."
+        );
+        assert_eq!(
+            refusal(db.set_items_group("workspace", &ids(&["w1", "nope"]), None)),
+            "other: Workspace not found."
+        );
+        assert_eq!(
+            refusal(db.set_items_group("mission", &ids(&["w1"]), None)),
+            "other: Unknown item kind 'mission'. Use 'project' or 'workspace'."
+        );
+        for ws in ["w1", "w2", "w3"] {
+            assert_eq!(group_of_workspace(&db, ws), Some(fixes.id.clone()));
+        }
+
+        db.set_items_group("workspace", &ids(&["w1", "w3"]), None).unwrap();
+        assert_eq!(group_of_workspace(&db, "w1"), None);
+        assert_eq!(group_of_workspace(&db, "w2"), Some(fixes.id));
+        assert_eq!(group_of_workspace(&db, "w3"), None);
+    }
+
+    #[test]
     fn rename_group_trims_and_refuses_an_empty_name() {
         let db = seeded();
         let group = workspace_group(&db, "p1", "PR reviews", &[]);
