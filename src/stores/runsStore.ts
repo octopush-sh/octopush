@@ -164,6 +164,10 @@ interface RunsState {
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
+  /** Patch one stage's context reading (`run://context`, #895) into the
+   *  loaded detail. A run whose detail isn't loaded reads it from `get_run`
+   *  when it is. */
+  applyContext: (runId: string, stageId: string, contextTokens: number | null, contextWindow: number | null) => void;
 }
 
 function replaceRunInList(list: Run[], run: Run): Run[] {
@@ -587,11 +591,31 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return {};
     });
   },
+
+  applyContext: (runId, stageId, contextTokens, contextWindow) => {
+    set((s) => {
+      const prev = s.detailByRun[runId];
+      const idx = prev?.stages.findIndex((st) => st.id === stageId) ?? -1;
+      if (!prev || idx === -1) return {};
+      const cur = prev.stages[idx];
+      if (cur.contextTokens === contextTokens && cur.contextWindow === contextWindow) return {};
+      const stages = prev.stages.slice();
+      stages[idx] = { ...cur, contextTokens, contextWindow };
+      return { detailByRun: { ...s.detailByRun, [runId]: { ...prev, stages } } };
+    });
+  },
 }));
 
 void listen<{ runId: string; run: Run }>(RUN_EVENTS.stageUpdate, (ev) => {
   useRunsStore.getState().applyStageUpdate(ev.payload.runId, ev.payload.run);
 });
+void listen<{ runId: string; stageId: string; contextTokens: number | null; contextWindow: number | null }>(
+  RUN_EVENTS.context,
+  (ev) =>
+    useRunsStore
+      .getState()
+      .applyContext(ev.payload.runId, ev.payload.stageId, ev.payload.contextTokens, ev.payload.contextWindow),
+);
 void listen<{ runId: string; costUsd: number; baselineUsd: number }>(
   RUN_EVENTS.cost,
   (ev) =>

@@ -2092,7 +2092,7 @@ pub async fn get_run(
     state: State<'_, AppState>,
     run_id: String,
 ) -> AppResult<serde_json::Value> {
-    let (run, stages, unreported, ran, refused) = {
+    let (run, stages, unreported, ran, refused, contexts) = {
         let db = state.db.lock();
         (
             db.get_run(&run_id)?,
@@ -2100,6 +2100,7 @@ pub async fn get_run(
             db.usage_unreported_stage_ids(&run_id)?,
             db.ran_models(&run_id)?,
             db.refused_call_counts(&run_id)?,
+            db.stage_contexts(&run_id)?,
         )
     };
     // Flag stages whose model has no price (resolved after the DB lock), and
@@ -2123,6 +2124,12 @@ pub async fn get_run(
                     ran.get(&s.id).map_or(serde_json::Value::Null, |m| serde_json::Value::String(m.clone())),
                 );
                 obj.insert("refusedCalls".into(), serde_json::Value::from(refused.get(&s.id).copied().unwrap_or(0)));
+                // A Claude CLI stage's latest context reading (#895); null
+                // before its first message, for Codex/API stages, and (window)
+                // for a model the catalog doesn't list.
+                let ctx = contexts.get(&s.id);
+                obj.insert("contextTokens".into(), ctx.map_or(serde_json::Value::Null, |c| c.0.into()));
+                obj.insert("contextWindow".into(), ctx.and_then(|c| c.1).map_or(serde_json::Value::Null, Into::into));
             }
         }
     }

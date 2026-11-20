@@ -1,7 +1,16 @@
 import { useEffect, useRef } from "react";
 import type { LiveEntry, RunStage } from "../lib/ipc";
 import { stageStatusGlyph, stageStatusWord, isTransientHalt, runStatusMeta } from "../lib/runStatus";
-import { stageTitle, fmtTokens, fmtTokensFull, fmtTokensShort, essenceShedsTokens } from "../lib/stageMeta";
+import {
+  stageTitle,
+  fmtTokens,
+  fmtTokensFull,
+  fmtTokensShort,
+  essenceShedsTokens,
+  stageContextReading,
+  contextToneClass,
+  subjectShedsContext,
+} from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
 import { ranOnNote, ranOnTitle, shortModel } from "../lib/modelLabel";
@@ -157,6 +166,16 @@ function StageCard({
   // verdict or tokens — a fact to check, not a gate (no brass).
   const refused = !cut && !running ? s.refusedCalls ?? 0 : 0;
 
+  // The meta line's shrink-0 notes, and the context reading (#895): only
+  // while the stage runs (a finished stage's final reading is in the focus
+  // pane), and only when it fits beside them (`subjectShedsContext`).
+  const shownModel = s.escalated && s.escalateModel ? s.escalateModel : s.agentModel;
+  const effortShown = !!s.effort && effortApplies(s.substrate, shownModel);
+  const escalatedNote = s.escalated ? `↑ ${s.escalateModel ? shortModel(s.escalateModel) : "retry"}` : "";
+  const ctx = running ? stageContextReading(s) : null;
+  const metaNotes = [s.ranModel ? ranOnNote(s.ranModel) : "", effortShown ? s.effort ?? "" : "", escalatedNote].filter(Boolean);
+  const ctxShed = ctx ? subjectShedsContext(String(index + 1), ctx.label, metaNotes) : false;
+
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
 
@@ -249,7 +268,26 @@ function StageCard({
           {/* Meta — discreet position · model · effort · substrate pill. */}
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
-            <span className="min-w-0 flex-1 truncate">{s.agentModel}</span>
+            <span className="min-w-0 flex-1 truncate" title={s.agentModel}>
+              {s.agentModel}
+            </span>
+            {/* Mounted for the whole run of the stage, shed until a reading
+                arrives, so it grows in through the demote rung's own motion. */}
+            {running && (
+              <span
+                className={`octo-demote octo-tabular ${ctx ? contextToneClass(ctx.tone) : "text-octo-mute"}${
+                  !ctx || ctxShed ? " octo-demote-shed" : ""
+                }`}
+                title={ctx?.title}
+                data-tour="direct-stage-context"
+                data-tone={ctx?.tone}
+                aria-hidden={ctx ? undefined : true}
+              >
+                {ctx?.label ?? ""}
+              </span>
+            )}
+            {/* A shed reading is hidden from screen readers too; they get the figures. */}
+            {ctx && ctxShed && <span className="sr-only">{ctx.title}</span>}
             {s.ranModel && (
               <span
                 className="octo-pop-in shrink-0 text-octo-warning"
@@ -259,7 +297,7 @@ function StageCard({
                 {ranOnNote(s.ranModel)}
               </span>
             )}
-            {s.effort && effortApplies(s.substrate, s.escalated && s.escalateModel ? s.escalateModel : s.agentModel) && (
+            {effortShown && (
               <span className="shrink-0 text-octo-brass" title="Reasoning effort for this stage">
                 {s.effort}
               </span>
@@ -269,7 +307,7 @@ function StageCard({
                 className="shrink-0 text-octo-brass"
                 title={`Escalated${s.escalateModel ? ` to ${s.escalateModel}` : ""} after a failed attempt`}
               >
-                ↑ {s.escalateModel ? shortModel(s.escalateModel) : "retry"}
+                {escalatedNote}
               </span>
             )}
             <span

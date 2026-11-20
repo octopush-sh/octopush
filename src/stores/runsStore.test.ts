@@ -183,6 +183,23 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().getRuns("w1")[0].costUsd).toBe(0.05);
   });
 
+  it("applyContext patches one stage's context reading and clears it on null (#895)", () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } } });
+    useRunsStore.getState().applyContext("r1", STAGE.id, 142_000, 200_000);
+    let st = useRunsStore.getState().getDetail("r1")!.stages[0];
+    expect([st.contextTokens, st.contextWindow]).toEqual([142_000, 200_000]);
+    const before = useRunsStore.getState().detailByRun;
+    useRunsStore.getState().applyContext("r1", STAGE.id, 142_000, 200_000);
+    expect(useRunsStore.getState().detailByRun).toBe(before); // unchanged: no re-render
+    useRunsStore.getState().applyContext("r1", STAGE.id, null, null);
+    st = useRunsStore.getState().getDetail("r1")!.stages[0];
+    expect(st.contextTokens).toBeNull();
+    // An unloaded run or an unknown stage is a no-op.
+    useRunsStore.getState().applyContext("ghost", STAGE.id, 1, 2);
+    useRunsStore.getState().applyContext("r1", "ghost", 1, 2);
+    expect(useRunsStore.getState().getDetail("ghost")).toBeUndefined();
+  });
+
   it("loadRuns marks the workspace as loaded", async () => {
     (ipc.listRuns as any).mockResolvedValue([]);
     expect((useRunsStore.getState() as any).loadedByWs["w1"]).toBeUndefined();

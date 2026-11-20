@@ -4,7 +4,8 @@
 //! whose orchestrator has a null live sink: nothing it does reaches this
 //! app's WebView directly. But every meaningful signal is already PERSISTED
 //! before (or instead of) being emitted — status and stages by the drive,
-//! cost by `set_run_cost`, the journal by `PersistingSink` → `stage_log`.
+//! cost by `set_run_cost`, the journal by `PersistingSink` → `stage_log`,
+//! a Claude stage's context reading by `PersistingSink` → its stage row.
 //! This bridge watches leased runs on a ~1.2s tick and re-emits the exact
 //! `run://*` events the in-process drive would have emitted, so the entire
 //! frontend — runs tray, Mission Control, the live journal, crew
@@ -39,10 +40,33 @@ pub struct Watch {
     cost_usd: f64,
     baseline_usd: f64,
     stage_sig: String,
+    /// Last context reading emitted per stage (stage id → tokens, window):
+    /// a change is re-emitted as `run://context` (#895).
+    contexts: Contexts,
     /// Set on adoption (a lease discovered rather than spawned by this
     /// process): replay the current attempt's journal tail once, so the live
     /// pane isn't empty after a relaunch.
     replay: bool,
+}
+
+/// Stage id → (context tokens, window), as `Db::stage_contexts` reads them.
+type Contexts = std::collections::HashMap<String, (i64, Option<i64>)>;
+
+/// The `run://context` payloads that take the app from `old` to `new`: one
+/// per stage whose reading changed or appeared, and a cleared one (null
+/// tokens) per stage whose reading is gone (the stage restarted).
+fn context_changes(run_id: &str, old: &Contexts, new: &Contexts) -> Vec<serde_json::Value> {
+    let mut out: Vec<serde_json::Value> = new
+        .iter()
+        .filter(|(id, v)| old.get(*id) != Some(*v))
+        .map(|(id, (tokens, window))| {
+            serde_json::json!({ "runId": run_id, "stageId": id, "contextTokens": tokens, "contextWindow": window })
+        })
+        .collect();
+    out.extend(old.keys().filter(|id| !new.contains_key(*id)).map(|id| {
+        serde_json::json!({ "runId": run_id, "stageId": id, "contextTokens": null, "contextWindow": null })
+    }));
+    out
 }
 
 impl Orchestrator {
@@ -67,13 +91,14 @@ impl Orchestrator {
         let Some((status, cost_usd, baseline_usd, stage_sig)) = self.run_snapshot(run_id) else {
             return;
         };
+        let contexts = self.db.lock().stage_contexts(run_id).unwrap_or_default();
         self.bridge_watch.lock().insert(
             run_id.to_string(),
-            Watch { cursor, status, cost_usd, baseline_usd, stage_sig, replay: false },
+            Watch { cursor, status, cost_usd, baseline_usd, stage_sig, contexts, replay: false },
         );
     }
 
-    fn bridge_tick(&self) -> AppResult<()> {
+    pub(crate) fn bridge_tick(&self) -> AppResult<()> {
         // 1. Repair runs whose worker died mid-segment (stale heartbeat) —
         //    they land in the standard interrupted/Resume shape, and the
         //    checkpoint ping tells the director the crew stopped.
@@ -157,22 +182,29 @@ impl Orchestrator {
         let Some((status, cost_usd, baseline_usd, stage_sig)) = self.run_snapshot(run_id) else {
             return Ok(());
         };
-        let (state_changed, cost_changed) = {
+        let contexts = self.db.lock().stage_contexts(run_id)?;
+        let (state_changed, cost_changed, context_changes) = {
             let mut watches = self.bridge_watch.lock();
             let Some(w) = watches.get_mut(run_id) else { return Ok(()) };
             let state_changed = w.status != status || w.stage_sig != stage_sig;
             let cost_changed = w.cost_usd != cost_usd || w.baseline_usd != baseline_usd;
+            let context_changes = context_changes(run_id, &w.contexts, &contexts);
             w.status = status;
             w.stage_sig = stage_sig;
             w.cost_usd = cost_usd;
             w.baseline_usd = baseline_usd;
-            (state_changed, cost_changed)
+            w.contexts = contexts;
+            (state_changed, cost_changed, context_changes)
         };
         if state_changed {
             self.emit_run_update(run_id);
         }
         if cost_changed {
             self.emit_cost(run_id, cost_usd, baseline_usd);
+        }
+        // Raw sink: these readings were just read FROM the stage rows.
+        for payload in context_changes {
+            self.raw_events.emit(crate::orchestrator::live::RUN_CONTEXT_EVENT, payload);
         }
         Ok(())
     }
@@ -245,9 +277,12 @@ impl Orchestrator {
         let Some((status, cost_usd, baseline_usd, stage_sig)) = self.run_snapshot(run_id) else {
             return;
         };
+        // The app reads the current readings with the run (`get_run`); only
+        // later changes are re-emitted.
+        let contexts = self.db.lock().stage_contexts(run_id).unwrap_or_default();
         self.bridge_watch.lock().insert(
             run_id.to_string(),
-            Watch { cursor, status, cost_usd, baseline_usd, stage_sig, replay: true },
+            Watch { cursor, status, cost_usd, baseline_usd, stage_sig, contexts, replay: true },
         );
         tracing::info!(run_id = %run_id, "adopted a live detached run from a previous app session");
     }

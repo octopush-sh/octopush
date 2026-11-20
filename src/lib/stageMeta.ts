@@ -3,6 +3,8 @@
 // pulling in a heavy component module.
 
 import { useRolesStore } from "../stores/rolesStore";
+import { contextTone, type ContextTone } from "../components/ContextMeter";
+import { formatContextTokens } from "./cost";
 
 /** Compact token count — the single format across every Direct surface:
  *  1240 → "1.2k", 980 → "980". */
@@ -37,6 +39,65 @@ export const ESSENCE_META_CH = 17;
  *  token pair is the one rung, shed whole when the line would overflow. */
 export function essenceShedsTokens(position: string, cost: string, tokens: string): boolean {
   return position.length + cost.length + tokens.length > ESSENCE_META_CH;
+}
+
+/** A Claude CLI stage's context meter reading (#895): `ctx 142k / 200k`,
+ *  through the shared `formatContextTokens`, toned by Talk's thresholds
+ *  (`contextTone`: amber from 80%, rouge from 95%). `null` — the meter is
+ *  hidden — before the stage's first message, for a Codex/API stage, and
+ *  when the model's window is unknown: never drawn against a guessed 200k. */
+export interface StageContextReading {
+  label: string;
+  tone: ContextTone;
+  /** Share of the window used, 0–100. */
+  pct: number;
+  /** The exact figures, for the tooltip and screen readers. */
+  title: string;
+}
+
+export function stageContextReading(s: {
+  contextTokens?: number | null;
+  contextWindow?: number | null;
+}): StageContextReading | null {
+  const used = s.contextTokens;
+  const limit = s.contextWindow;
+  if (used == null || used <= 0 || limit == null || limit <= 0) return null;
+  const { pct, tone } = contextTone(used, limit);
+  return {
+    label: `ctx ${formatContextTokens(used)} / ${formatContextTokens(limit)}`,
+    tone,
+    pct,
+    title: `Context: ${used.toLocaleString("en-US")} of ${limit.toLocaleString("en-US")} tokens (${Math.round(pct)}%), the prompt of the stage's latest message`,
+  };
+}
+
+/** The Tailwind text class for a context tone on a meta line: mute while
+ *  calm (meta, not an accent), amber past 80%, rouge past 95%. */
+export function contextToneClass(tone: ContextTone): string {
+  return tone === "rouge" ? "text-octo-rouge" : tone === "warning" ? "text-octo-warning" : "text-octo-mute";
+}
+
+/** Characters of meta that fit on a SUBJECT card's meta line: 210px less
+ *  padding and border is 180px, 30ch of 10px mono. */
+export const SUBJECT_META_CH = 30;
+/** The substrate pill (8px caps, tracked, padded) in 10px-mono characters. */
+const SUBJECT_PILL_CH = 5;
+/** One 8px gap between atoms, in 10px-mono characters. */
+const META_GAP_CH = 8 / 6;
+/** The model id is the subject meta line's elastic atom: it truncates, but
+ *  keeps at least this many characters, so it never reads as a bare "…". */
+const SUBJECT_MODEL_FLOOR_CH = 4;
+
+/** The subject card's meta ladder (#895, same E2 shed as the essence line):
+ *  position, the model's floor, the shrink-0 notes (ran on · effort ·
+ *  escalation) and the substrate pill are the floor; the context reading is
+ *  the one rung, shed whole when it would not fit beside them. `notes` are
+ *  the texts of the notes the line shows. The focus pane always has it. */
+export function subjectShedsContext(position: string, context: string, notes: string[]): boolean {
+  const atoms = 4 + notes.length; // position · model · context · pill · notes
+  const fixed = position.length + SUBJECT_MODEL_FLOOR_CH + context.length + SUBJECT_PILL_CH;
+  const noteCh = notes.reduce((n, t) => n + t.length, 0);
+  return fixed + noteCh + (atoms - 1) * META_GAP_CH > SUBJECT_META_CH;
 }
 
 /** The role's display label — read from the loaded roles store (falls back to

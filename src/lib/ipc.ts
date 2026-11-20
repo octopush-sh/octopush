@@ -345,6 +345,16 @@ export interface RunStage {
    *  (its result event's `permission_denials`; set by `get_run`; #893).
    *  0/absent = none. Each is in the stage's journal as "refused · …". */
   refusedCalls?: number;
+  /** The context size of the stage's latest top-level assistant message —
+   *  input + cache read + cache write, Talk's `contextTokens` (set by
+   *  `get_run` and `run://context`; #895). Claude CLI stages only; null/absent
+   *  before the first message and for Codex/API stages. A finished stage
+   *  keeps its final value; a restart clears it. */
+  contextTokens?: number | null;
+  /** The context window of the model that answered that message, from the
+   *  provider catalog; null/absent when the catalog doesn't list it (the
+   *  meter is then hidden, never drawn against a guess). */
+  contextWindow?: number | null;
   artifact: string | null;
   feedback: string | null;
   error: string | null;
@@ -1886,4 +1896,8 @@ export const RUN_EVENTS = {
   /** Live per-stage activity, streamed by both substrates. Payload:
    *  `{ runId, stageId, entry: LiveEntry }` or `{ runId, stageId, reset: true }`. */
   log: "run://log",
+  /** A Claude CLI stage's latest context reading (#895), kept on its stage
+   *  row and re-emitted by the detached bridge. Payload:
+   *  `{ runId, stageId, contextTokens: number | null, contextWindow: number | null }`. */
+  context: "run://context",
 } as const;
