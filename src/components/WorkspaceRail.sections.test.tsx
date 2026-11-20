@@ -47,7 +47,7 @@ vi.mock("@dnd-kit/core", async (importOriginal) => {
 import { WorkspaceRail, projectMarkColor, resolveAttentionCarriers, type ProjectGroup } from "./WorkspaceRail";
 import { TINTS } from "../lib/monogram";
 import { sectionDragId, sectionHeadId, TOP_LOOSE_ID } from "../lib/railGroups";
-import { moveProjectToGroup } from "../lib/groupActions";
+import { createProjectGroup, moveProjectToGroup } from "../lib/groupActions";
 import { holdProjectLineFocus, __releaseProjectLineFocus } from "../lib/railFocus";
 import { useAttentionStore, type AttentionFlag } from "../stores/attentionStore";
 import { useGroupsStore, __resetGroupsStoreInFlight } from "../stores/groupsStore";
@@ -496,7 +496,30 @@ describe("project group: rename in place", () => {
     fireEvent.change(input, { target: { value: "Nope" } });
     fireEvent.keyDown(input, { key: "Escape" });
     expect(mockIpc.renameGroup).not.toHaveBeenCalled();
+    expect(mockIpc.deleteGroup).not.toHaveBeenCalled();
     expect(header("Side projects")).toBeInTheDocument();
+  });
+
+  it("Escape on a group just made from a project cancels it: the project is back where it was", async () => {
+    render(<Rail />);
+    const NEW = section("g-new", "New group", { sortOrder: 1 });
+    mockIpc.createGroup.mockResolvedValue(NEW);
+    await act(async () => {
+      await createProjectGroup("acme-web");
+    });
+    expect(railOrder()).toBe("dotfiles [g-client: acme-api] [g-new: acme-web] [g-side: notebook-cli] scratch");
+    const input = screen.getByLabelText("Group name");
+    expect(input).toHaveFocus();
+
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Escape" });
+    });
+
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("g-new");
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "acme-web", CLIENT.id);
+    expect(railOrder()).toBe("dotfiles [g-client: acme-api acme-web] [g-side: notebook-cli] scratch");
+    expect(screen.queryByLabelText("Group name")).toBeNull();
+    expect(mockIpc.renameGroup).not.toHaveBeenCalled();
   });
 });
 
@@ -604,6 +627,41 @@ describe("project group: the header menu", () => {
     expect(onReorderProjects).not.toHaveBeenCalled();
   });
 
+  it("an empty group steps among the empty groups at the foot, never above a group with projects", async () => {
+    const LATER = section("g-later", "Later", { sortOrder: 2 });
+    const SOMEDAY = section("g-someday", "Someday", { sortOrder: 3 });
+    seed([CLIENT, SIDE, LATER, SOMEDAY]);
+    const onReorderProjects = vi.fn();
+    render(<Rail onReorderProjects={onReorderProjects} />);
+    expect(railOrder()).toBe(
+      "dotfiles [g-client: acme-api acme-web] [g-side: notebook-cli] scratch [g-later: ] [g-someday: ]",
+    );
+    // The first empty group: down only.
+    fireEvent.contextMenu(header("Later"));
+    expect(within(menu()).queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(within(menu()).getByRole("menuitem", { name: "Move down" }));
+    });
+    expect(mockIpc.setGroupOrder).toHaveBeenCalledWith([CLIENT.id, SIDE.id, SOMEDAY.id, LATER.id]);
+    expect(railOrder()).toBe(
+      "dotfiles [g-client: acme-api acme-web] [g-side: notebook-cli] scratch [g-someday: ] [g-later: ]",
+    );
+    // Now the last: up only, and the project order is never touched.
+    fireEvent.contextMenu(header("Later"));
+    expect(within(menu()).queryByRole("menuitem", { name: "Move down" })).toBeNull();
+    expect(within(menu()).getByRole("menuitem", { name: "Move up" })).toBeInTheDocument();
+    expect(onReorderProjects).not.toHaveBeenCalled();
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+  });
+
+  it("a lone empty group has nowhere to step", () => {
+    seed([CLIENT, section("g-later", "Later", { sortOrder: 2 })]);
+    render(<Rail />);
+    fireEvent.contextMenu(header("Later"));
+    expect(within(menu()).queryByRole("menuitem", { name: "Move up" })).toBeNull();
+    expect(within(menu()).queryByRole("menuitem", { name: "Move down" })).toBeNull();
+  });
+
   it("a group at the top of the rail has no Move up", () => {
     seed([CLIENT], [info("acme-api", CLIENT.id), info("scratch")]);
     render(<Rail active={null} />);
@@ -696,9 +754,38 @@ describe("drops at the top level", () => {
     // On the group's FIRST project: still last.
     await drop(asProject("scratch", null), asProject("acme-api", CLIENT.id));
     expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "scratch", CLIENT.id);
-    expect(onReorderProjects).toHaveBeenCalledWith(["dotfiles", "acme-api", "acme-web", "scratch", "notebook-cli"]);
+    // The order travels with the move, not through the owner's reorder.
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["dotfiles", "acme-api", "acme-web", "scratch", "notebook-cli"]);
+    expect(onReorderProjects).not.toHaveBeenCalled();
     // The membership is applied at once.
     expect(sectionEl(CLIENT.id).querySelector('[data-rail-project="scratch"]')).not.toBeNull();
+  });
+
+  it("a drop that joins a group draws the project in its new place at once, with no step between", async () => {
+    let answer!: () => void;
+    mockIpc.setItemGroup.mockReturnValue(new Promise<void>((r) => (answer = r)));
+    render(<Rail />);
+    const seen: string[] = [];
+    const stop = useProjectStore.subscribe(() => seen.push(railOrder()));
+    await drop(asProject("scratch", null), asProject("acme-api", CLIENT.id));
+    // Still waiting on the backend, and already where it lands.
+    expect(railOrder()).toBe("dotfiles [g-client: acme-api acme-web scratch] [g-side: notebook-cli]");
+    expect(seen).toHaveLength(1);
+    await act(async () => answer());
+    stop();
+  });
+
+  it("a refused drop puts the project and the order back, with one toast", async () => {
+    mockIpc.setProjectOrder.mockRejectedValue(new Error("other: locked"));
+    render(<Rail />);
+    await drop(asProject("scratch", null), asProject("acme-api", CLIENT.id));
+    expect(railOrder()).toBe("dotfiles [g-client: acme-api acme-web] [g-side: notebook-cli] scratch");
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast).toHaveBeenCalledWith({
+      level: "error",
+      title: "Couldn't move scratch",
+      body: "Your rail is back as it was.",
+    });
   });
 
   it("a project dropped on a group's header joins it as its last project, unfolding it", async () => {
@@ -710,7 +797,8 @@ describe("drops at the top level", () => {
       data: { type: "section-head", groupId: CLIENT.id },
     });
     expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "dotfiles", CLIENT.id);
-    expect(onReorderProjects).toHaveBeenCalledWith(["acme-api", "acme-web", "dotfiles", "notebook-cli", "scratch"]);
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["acme-api", "acme-web", "dotfiles", "notebook-cli", "scratch"]);
+    expect(onReorderProjects).not.toHaveBeenCalled();
     expect(header("Client work")).toHaveAttribute("aria-expanded", "true");
   });
 
@@ -719,7 +807,8 @@ describe("drops at the top level", () => {
     render(<Rail onReorderProjects={onReorderProjects} />);
     await drop(asProject("acme-web", CLIENT.id), asProject("scratch", null));
     expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "acme-web", null);
-    expect(onReorderProjects).toHaveBeenCalledWith(["dotfiles", "acme-api", "notebook-cli", "scratch", "acme-web"]);
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["dotfiles", "acme-api", "notebook-cli", "scratch", "acme-web"]);
+    expect(onReorderProjects).not.toHaveBeenCalled();
     expect(sectionEl(CLIENT.id).querySelector('[data-rail-project="acme-web"]')).toBeNull();
   });
 
@@ -731,8 +820,10 @@ describe("drops at the top level", () => {
     expect(screen.getByTestId("rail-top-loose")).toBeInTheDocument();
     await drop(asProject("acme-api", CLIENT.id), { id: TOP_LOOSE_ID, data: { type: "top-loose" } });
     expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "acme-api", null);
-    expect(onReorderProjects).toHaveBeenCalledWith(["acme-web", "acme-api"]);
-    expect(railOrder()).toBe("acme-api [g-client: acme-web]");
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["acme-web", "acme-api"]);
+    expect(onReorderProjects).not.toHaveBeenCalled();
+    // It goes last, under the group it left.
+    expect(railOrder()).toBe("[g-client: acme-web] acme-api");
   });
 
   it("draws the ungrouped area only while there is a group to leave", () => {

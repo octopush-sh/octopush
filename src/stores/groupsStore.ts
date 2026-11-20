@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
-import { useProjectStore } from "./projectStore";
+import { arrangeProjects, beginProjectOrderChange, useProjectStore } from "./projectStore";
 import { useWorkspaceStore } from "./workspaceStore";
 import { useRailGroupUi } from "./railGroupUiStore";
 import { beginMembershipChange } from "../lib/membershipGuard";
@@ -52,6 +52,11 @@ interface GroupsState {
   /** Move several items of one kind the same way, in one backend call: all
    *  of them or none, with one toast when refused. */
   moveItems: (kind: GroupScope, itemIds: readonly string[], groupId: string | null) => Promise<boolean>;
+  /** Move a project into a project group, or out of any (`null`), together
+   *  with the project order that goes with it (null: the order stands). Both
+   *  land in the store in one step, then both are written; if either write is
+   *  refused, both come back as they were and one toast says so. */
+  moveProject: (projectId: string, groupId: string | null, order: string[] | null) => Promise<boolean>;
   /** Forget a project's workspace groups: the project was closed or deleted. */
   pruneProject: (projectId: string) => void;
 }
@@ -97,6 +102,24 @@ function patchMembership(kind: GroupScope, groupIdByItem: Map<string, string | n
     return { workspaces: s.workspaces.map(patch), workspacesByProjectId: byProject };
   });
 }
+
+/** Set `groupId` on the listed projects and lay `order` over the project
+ *  order (null: it stands), in one store update. */
+function setProjects(groupIdByItem: Map<string, string | null>, order: readonly string[] | null) {
+  const patch = (item: ProjectInfo): ProjectInfo =>
+    groupIdByItem.has(item.id) ? { ...item, groupId: groupIdByItem.get(item.id) ?? null } : item;
+  useProjectStore.setState((s) => {
+    const recent = s.recent.map(patch);
+    return {
+      current: s.current ? patch(s.current) : s.current,
+      recent: order ? arrangeProjects(recent, order) : recent,
+      closed: s.closed.map(patch),
+    };
+  });
+}
+
+const sameIds = (rows: readonly { id: string }[], ids: readonly string[]) =>
+  rows.length === ids.length && rows.every((p, index) => p.id === ids[index]);
 
 /** The loaded projects or workspaces, once each. */
 function loadedItems(kind: GroupScope): Array<ProjectInfo | Workspace> {
@@ -344,6 +367,55 @@ export const useGroupsStore = create<GroupsState>((set, get) => ({
         kind === "project" ? `Couldn't move the ${moving.length} projects` : `Couldn't move the ${moving.length} missions`,
         e,
       );
+      return false;
+    }
+  },
+
+  moveProject: async (projectId, groupId, order) => {
+    const before = groupOf("project", projectId);
+    const joins = before !== groupId;
+    if (!joins && !order) return true;
+    const name = (loadedItems("project").find((p) => p.id === projectId) as ProjectInfo | undefined)?.name;
+    const beforeOrder = useProjectStore.getState().recent.map((p) => p.id);
+    const change = joins ? beginMembershipChange("project", [projectId], groupId) : null;
+    const reorder = order ? beginProjectOrderChange(order) : null;
+    // One step, so the rail never draws the move without its order.
+    setProjects(assign(joins ? [projectId] : [], groupId), order);
+    const placed = useProjectStore.getState().recent.map((p) => p.id);
+    let joined = false;
+    try {
+      if (joins) {
+        await ipc.setItemGroup("project", projectId, groupId);
+        joined = true;
+      }
+      if (order) await ipc.setProjectOrder(order);
+      change?.settle();
+      reorder?.settle();
+      return true;
+    } catch {
+      change?.drop();
+      reorder?.drop();
+      // Leave a newer move, or a newer reorder, alone.
+      const stillMoved = joins && groupOf("project", projectId) === groupId;
+      const stillOrdered = order !== null && sameIds(useProjectStore.getState().recent, placed);
+      setProjects(assign(stillMoved ? [projectId] : [], before), stillOrdered ? beforeOrder : null);
+      pushToast({
+        level: "error",
+        title: `Couldn't move ${name ?? "the project"}`,
+        body: "Your rail is back as it was.",
+      });
+      // The membership landed and the order did not: take the membership
+      // back too, so the backend agrees with the rail.
+      if (joined && stillMoved) {
+        const back = beginMembershipChange("project", [projectId], before);
+        try {
+          await ipc.setItemGroup("project", projectId, before);
+          back.settle();
+        } catch (e) {
+          back.drop();
+          console.error("Failed to take back a project's group:", e);
+        }
+      }
       return false;
     }
   },

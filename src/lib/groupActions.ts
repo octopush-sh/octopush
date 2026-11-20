@@ -24,6 +24,8 @@ export async function createMissionGroup(
   workspaceIds?: string | readonly string[],
 ): Promise<string | null> {
   const memberIds = workspaceIds === undefined ? [] : typeof workspaceIds === "string" ? [workspaceIds] : [...workspaceIds];
+  const rows = useWorkspaceStore.getState().workspacesByProjectId[projectId] ?? [];
+  const before = new Map(memberIds.map((id) => [id, rows.find((w) => w.id === id)?.groupId ?? null] as const));
   const created = await useGroupsStore.getState().create({
     scope: "workspace",
     projectId,
@@ -31,6 +33,8 @@ export async function createMissionGroup(
     memberIds,
   });
   if (!created) return null;
+  // An empty group (the project's "New group") has nothing to put back.
+  if (memberIds.length > 0) justCreated.set(created.id, { scope: "workspace", before });
   const ui = useRailGroupUi.getState();
   ui.setCollapsed(created.id, false);
   ui.startRename(created.id);
@@ -142,24 +146,17 @@ function railLayout(): RailTopItem<ProjectInfo>[] {
   return layoutProjects(railProjects(), projectGroupsOf(useGroupsStore.getState().groups));
 }
 
-/** Persist a project order. A refusal is logged and the rail keeps the order
- *  it had: the membership change it came with has its own rollback. */
-function persistProjectOrder(ids: string[]) {
-  void useProjectStore
-    .getState()
-    .setOrder(ids)
-    .catch((e) => console.error("Failed to persist the project order:", e));
-}
-
 /** Create a project group around `projectId` and put its name into inline
  *  edit. It stands where the project stands. */
 export async function createProjectGroup(projectId: string): Promise<string | null> {
+  const before = new Map([[projectId, railProjects().find((p) => p.id === projectId)?.groupId ?? null]]);
   const created = await useGroupsStore.getState().create({
     scope: "project",
     name: NEW_GROUP_NAME,
     memberIds: [projectId],
   });
   if (!created) return null;
+  justCreated.set(created.id, { scope: "project", before });
   const ui = useRailGroupUi.getState();
   ui.setCollapsed(created.id, false);
   ui.startRename(created.id);
@@ -171,7 +168,9 @@ export async function createProjectGroup(projectId: string): Promise<string | nu
  * (the group unfolds so it stays in sight), or out of any group (`null`),
  * where it stays at its own place in the order. `order` is the project order
  * that goes with the move when the caller already knows it (a drag); left
- * out, joining a group persists the order that puts the project last in it.
+ * out, joining a group stores the order that puts the project last in it.
+ * The move and its order reach the rail together, and a refusal of either
+ * puts both back (`moveProject`).
  */
 export async function moveProjectToGroup(
   projectId: string,
@@ -185,9 +184,51 @@ export async function moveProjectToGroup(
       : groupId
         ? (resolveTopDrop(railLayout(), projectId, sectionHeadId(groupId))?.order ?? null)
         : null;
-  const ok = await useGroupsStore.getState().moveItem("project", projectId, groupId);
-  if (ok && next) persistProjectOrder(next);
-  return ok;
+  return useGroupsStore.getState().moveProject(projectId, groupId, next);
+}
+
+// ───────────────────────────── cancelling a new group ─────────────────────────────
+
+/** Groups made from a project, a mission or a selection whose name is still
+ *  in its first edit: where each member was before (its group, or null). */
+const justCreated = new Map<string, { scope: "project" | "workspace"; before: Map<string, string | null> }>();
+
+// The first edit ends however it ends (Enter, blur, the slim rail, the group
+// gone): from then on Escape on its name is a rename's Escape. A cancel reads
+// its entry before it stops the edit.
+useRailGroupUi.subscribe((state, prev) => {
+  if (prev.renamingId && state.renamingId !== prev.renamingId) justCreated.delete(prev.renamingId);
+});
+
+/**
+ * Escape on the name of a group that was just created around a project, a
+ * mission or a selection: delete it and put each member back in the group it
+ * came from (or none). The order never changed, so each lands where it was.
+ * False when the group is not a just-created one (a rename: the caller keeps
+ * the old name).
+ */
+export async function cancelNewGroup(groupId: string): Promise<boolean> {
+  const made = justCreated.get(groupId);
+  if (!made) return false;
+  justCreated.delete(groupId);
+  const store = useGroupsStore.getState();
+  if (!(await store.remove(groupId))) return true;
+  useRailGroupUi.getState().forget(groupId);
+  const exists = new Set(useGroupsStore.getState().groups.map((g) => g.id));
+  const back = [...made.before].filter(([, from]) => from !== null && exists.has(from));
+  await Promise.all(
+    back.map(([id, from]) =>
+      made.scope === "project"
+        ? useGroupsStore.getState().moveProject(id, from, null)
+        : useGroupsStore.getState().moveItem("workspace", id, from),
+    ),
+  );
+  return true;
+}
+
+/** Test-only: forget the groups still in their first edit. */
+export function __resetJustCreated(): void {
+  justCreated.clear();
 }
 
 /**

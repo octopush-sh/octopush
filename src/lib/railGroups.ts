@@ -497,3 +497,23 @@ export function stepInRail(items: readonly RailTopItem[], id: string, direction:
   if (at < 0 || !blocks[at + direction]) return null;
   return visibleReorder(items, flattenTop(moved(blocks, at, at + direction)));
 }
+
+/**
+ * The project groups' order after "Move up" / "Move down" on an EMPTY group,
+ * or null when there is nowhere to go. Empty groups have no project to stand
+ * by: they stand last, after every block with projects, in their own order
+ * (`layoutProjects`). One steps over its neighbour in that run and stops at
+ * its ends. The answer is every project group's id in the new `sortOrder`
+ * (what `set_group_order` takes): the empty groups trade places, the others
+ * keep theirs.
+ */
+export function stepEmptySection(items: readonly RailTopItem[], groupId: string, direction: -1 | 1): string[] | null {
+  const sections = items.flatMap((item) => (item.kind === "section" ? [item] : []));
+  const empty = sections.filter((s) => s.projects.length === 0).map((s) => s.group.id);
+  const at = empty.indexOf(groupId);
+  if (at < 0 || !empty[at + direction]) return null;
+  const run = moved(empty, at, at + direction);
+  const all = projectGroupsOf(sections.map((s) => s.group)).map((g) => g.id);
+  let next = 0;
+  return all.map((id) => (empty.includes(id) ? run[next++] : id));
+}

@@ -16,9 +16,10 @@ const mockIpc = {
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
 
-const { useProjectStore } = await import("./projectStore");
+const { useProjectStore, __resetProjectOrderInFlight } = await import("./projectStore");
 
 function resetStore() {
+  __resetProjectOrderInFlight();
   useProjectStore.setState({ current: null, recent: [], closed: [], loading: false, error: null });
   vi.clearAllMocks();
 }
@@ -90,16 +91,53 @@ describe("projectStore — pin & reorder", () => {
     expect(useProjectStore.getState().recent[0].pinned).toBe(true);
   });
 
-  it("setOrder calls ipc with the id sequence and reloads recent", async () => {
+  it("setOrder shows the order at once, then stores it", async () => {
     const a = proj("a");
     const b = proj("b");
     useProjectStore.setState({ recent: [a, b] });
     mockIpc.setProjectOrder.mockResolvedValueOnce(undefined);
-    mockIpc.listRecentProjects.mockResolvedValueOnce([b, a]);
 
-    await useProjectStore.getState().setOrder(["b", "a"]);
+    const done = useProjectStore.getState().setOrder(["b", "a"]);
+    expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["b", "a"]);
+    await done;
 
     expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["b", "a"]);
+    expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["b", "a"]);
+  });
+
+  it("setOrder keeps pinned projects first, as the backend lists them", async () => {
+    const pinned = { ...proj("p"), pinned: true };
+    useProjectStore.setState({ recent: [pinned, proj("a"), proj("b")] });
+    mockIpc.setProjectOrder.mockResolvedValueOnce(undefined);
+    await useProjectStore.getState().setOrder(["b", "a", "p"]);
+    expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["p", "b", "a"]);
+  });
+
+  it("a refused setOrder puts the old order back and rejects", async () => {
+    useProjectStore.setState({ recent: [proj("a"), proj("b"), proj("c")] });
+    mockIpc.setProjectOrder.mockRejectedValueOnce(new Error("other: locked"));
+
+    await expect(useProjectStore.getState().setOrder(["c", "a", "b"])).rejects.toThrow("locked");
+
+    expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["a", "b", "c"]);
+  });
+
+  it("a reload that read the old order while it was being written keeps the new one", async () => {
+    const rows = [proj("a"), proj("b")];
+    useProjectStore.setState({ recent: rows });
+    let answer!: () => void;
+    mockIpc.setProjectOrder.mockReturnValueOnce(new Promise<void>((r) => (answer = r)));
+    mockIpc.listRecentProjects.mockResolvedValueOnce(rows);
+
+    const done = useProjectStore.getState().setOrder(["b", "a"]);
+    await useProjectStore.getState().loadRecent();
+    expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["b", "a"]);
+    answer();
+    await done;
+
+    // A reload after it settled reads the truth.
+    mockIpc.listRecentProjects.mockResolvedValueOnce([rows[1], rows[0]]);
+    await useProjectStore.getState().loadRecent();
     expect(useProjectStore.getState().recent.map((p) => p.id)).toEqual(["b", "a"]);
   });
 });

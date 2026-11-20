@@ -4,6 +4,7 @@ import type { Group, ProjectInfo, Workspace } from "./types";
 const mockIpc = vi.hoisted(() => ({
   createGroup: vi.fn(),
   deleteGroup: vi.fn(),
+  setGroupOrder: vi.fn(),
   setItemGroup: vi.fn(),
   setItemsGroup: vi.fn(),
   setProjectOrder: vi.fn(),
@@ -15,6 +16,8 @@ vi.mock("../components/Toasts", () => ({ pushToast }));
 
 const {
   NEW_GROUP_NAME,
+  __resetJustCreated,
+  cancelNewGroup,
   createMissionGroup,
   createProjectGroup,
   moveMissionToGroup,
@@ -24,7 +27,9 @@ const {
   ungroupMissions,
   ungroupProjects,
 } = await import("./groupActions");
-const { useProjectStore } = await import("../stores/projectStore");
+const { useProjectStore, __resetProjectOrderInFlight } = await import("../stores/projectStore");
+const { __resetMembershipGuard } = await import("./membershipGuard");
+const { layoutProjects, projectGroupsOf, stepEmptySection } = await import("./railGroups");
 const { useGroupsStore, __resetGroupsStoreInFlight } = await import("../stores/groupsStore");
 const { useRailGroupUi, __reloadRailGroupUi, GROUP_COLLAPSE_KEY } = await import("../stores/railGroupUiStore");
 const { useWorkspaceStore } = await import("../stores/workspaceStore");
@@ -63,6 +68,9 @@ beforeEach(() => {
   for (const fn of Object.values(mockIpc)) fn.mockReset().mockResolvedValue(undefined);
   pushToast.mockReset();
   __resetGroupsStoreInFlight();
+  __resetProjectOrderInFlight();
+  __resetMembershipGuard();
+  __resetJustCreated();
   localStorage.removeItem(GROUP_COLLAPSE_KEY);
   __reloadRailGroupUi();
   useGroupsStore.setState({ groups: [], loaded: true });
@@ -217,7 +225,13 @@ const seedProjects = (rows: ProjectInfo[], current: ProjectInfo | null = null) =
   mockIpc.listRecentProjects.mockImplementation(async () => useProjectStore.getState().recent);
 };
 const sectionOf = (id: string) => useProjectStore.getState().recent.find((p) => p.id === id)?.groupId ?? null;
+const ids = () => useProjectStore.getState().recent.map((p) => p.id);
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+function deferred() {
+  let resolve!: (value: undefined) => void;
+  const promise = new Promise<undefined>((r) => (resolve = r));
+  return { promise, resolve };
+}
 
 describe("groupActions: project groups", () => {
   it("createProjectGroup makes a project group around the project and opens its name in edit", async () => {
@@ -294,7 +308,78 @@ describe("groupActions: project groups", () => {
     await settle();
     expect(sectionOf("b")).toBeNull();
     expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
-    expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: "Couldn't move the project" }));
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast).toHaveBeenCalledWith({
+      level: "error",
+      title: "Couldn't move b",
+      body: "Your rail is back as it was.",
+    });
+    expect(ids()).toEqual(["a", "api", "web", "b"]);
+  });
+
+  it("membership and order reach the store together, before the backend answers", async () => {
+    seedProjects([project("a"), project("api", "g-client"), project("web", "g-client"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    const moving = deferred();
+    mockIpc.setItemGroup.mockReturnValue(moving.promise);
+    const seen: Array<[string | null, string[]]> = [];
+    const stop = useProjectStore.subscribe(() => seen.push([sectionOf("a"), ids()]));
+
+    const done = moveProjectToGroup("a", "g-client");
+
+    // One store update, holding both: the group never draws a in the wrong place.
+    expect(seen).toEqual([["g-client", ["api", "web", "a", "dotfiles"]]]);
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+    moving.resolve(undefined);
+    expect(await done).toBe(true);
+    expect(mockIpc.setProjectOrder).toHaveBeenCalledWith(["api", "web", "a", "dotfiles"]);
+    stop();
+  });
+
+  it("a refused order puts back the order and the membership, in the store and the backend", async () => {
+    seedProjects([project("a"), project("api", "g-client"), project("web", "g-client"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    mockIpc.setProjectOrder.mockRejectedValue(new Error("other: database is locked"));
+
+    expect(await moveProjectToGroup("a", "g-client")).toBe(false);
+
+    expect(sectionOf("a")).toBeNull();
+    expect(ids()).toEqual(["a", "api", "web", "dotfiles"]);
+    expect(mockIpc.setItemGroup).toHaveBeenNthCalledWith(1, "project", "a", "g-client");
+    expect(mockIpc.setItemGroup).toHaveBeenNthCalledWith(2, "project", "a", null);
+    expect(pushToast).toHaveBeenCalledTimes(1);
+    expect(pushToast.mock.calls[0][0]).toMatchObject({ title: "Couldn't move a", body: "Your rail is back as it was." });
+  });
+
+  it("a dragged project leaving its group with a new order rolls both back when refused", async () => {
+    seedProjects([project("api", "g-client"), project("web", "g-client"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    mockIpc.setItemGroup.mockRejectedValue(new Error("other: no"));
+
+    expect(await moveProjectToGroup("web", null, ["api", "dotfiles", "web"])).toBe(false);
+
+    expect(sectionOf("web")).toBe("g-client");
+    expect(ids()).toEqual(["api", "web", "dotfiles"]);
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+    expect(pushToast).toHaveBeenCalledTimes(1);
+  });
+
+  it("a reload that read the old order while the move was in flight keeps the new one", async () => {
+    const rows = [project("a"), project("api", "g-client"), project("web", "g-client")];
+    seedProjects(rows);
+    useGroupsStore.setState({ groups: [section("g-client")] });
+    const ordering = deferred();
+    mockIpc.setProjectOrder.mockReturnValue(ordering.promise);
+    // The database still holds the old rows.
+    mockIpc.listRecentProjects.mockResolvedValue(rows);
+
+    const done = moveProjectToGroup("a", "g-client");
+    await useProjectStore.getState().loadRecent();
+
+    expect(ids()).toEqual(["api", "web", "a"]);
+    expect(sectionOf("a")).toBe("g-client");
+    ordering.resolve(undefined);
+    expect(await done).toBe(true);
   });
 
   it("the open project counts even before the list has it", async () => {
@@ -350,6 +435,27 @@ describe("groupActions: project groups", () => {
     expect(pushToast).not.toHaveBeenCalled();
   });
 
+  it("Move up / Move down on an empty project group trades places among the empty ones", async () => {
+    // [client: api] · [empty-a] · [empty-b], stored as client 0, empty-a 1, empty-b 2.
+    seedProjects([project("api", "g-client")]);
+    useGroupsStore.setState({
+      groups: [section("g-client"), section("g-empty-a", { sortOrder: 1 }), section("g-empty-b", { sortOrder: 2 })],
+    });
+    const layout = layoutProjects(useProjectStore.getState().recent, projectGroupsOf(useGroupsStore.getState().groups));
+    expect(stepEmptySection(layout, "g-empty-a", -1)).toBeNull();
+    const down = stepEmptySection(layout, "g-empty-a", 1);
+    expect(down).toEqual(["g-client", "g-empty-b", "g-empty-a"]);
+    mockIpc.setGroupOrder.mockResolvedValue(undefined);
+    await useGroupsStore.getState().setOrder(down!);
+    expect(mockIpc.setGroupOrder).toHaveBeenCalledWith(["g-client", "g-empty-b", "g-empty-a"]);
+    const after = layoutProjects(useProjectStore.getState().recent, projectGroupsOf(useGroupsStore.getState().groups));
+    expect(after.map((item) => (item.kind === "section" ? item.group.id : item.project.id))).toEqual([
+      "g-client",
+      "g-empty-b",
+      "g-empty-a",
+    ]);
+  });
+
   it("Undo makes no group when every project has gone or been grouped again", async () => {
     seedProjects([project("api", "g-client")]);
     useGroupsStore.setState({ groups: [section("g-client")] });
@@ -358,5 +464,60 @@ describe("groupActions: project groups", () => {
     pushToast.mock.calls[0][0].action.onClick();
     await settle();
     expect(mockIpc.createGroup).not.toHaveBeenCalled();
+  });
+});
+
+describe("groupActions: Escape on a new group's name", () => {
+  it("cancels a project group made from a project: it goes, and the project returns to its old group", async () => {
+    // a · [old: api web] · dotfiles; New group on web.
+    seedProjects([project("a"), project("api", "g-old"), project("web", "g-old"), project("dotfiles")]);
+    useGroupsStore.setState({ groups: [section("g-old")] });
+    mockIpc.createGroup.mockResolvedValue(section("g-new", { name: NEW_GROUP_NAME, sortOrder: 1 }));
+    await createProjectGroup("web");
+    expect(sectionOf("web")).toBe("g-new");
+
+    expect(await cancelNewGroup("g-new")).toBe(true);
+
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("g-new");
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("project", "web", "g-old");
+    expect(useGroupsStore.getState().groups.map((g) => g.id)).toEqual(["g-old"]);
+    expect(sectionOf("web")).toBe("g-old");
+    expect(ids()).toEqual(["a", "api", "web", "dotfiles"]);
+    expect(mockIpc.setProjectOrder).not.toHaveBeenCalled();
+    expect(pushToast).not.toHaveBeenCalled();
+  });
+
+  it("cancels a mission group made from a selection: each mission returns to where it was", async () => {
+    useGroupsStore.setState({ groups: [group("g1")] });
+    seed([ws("w1"), ws("w2", "g1"), ws("w3")]);
+    mockIpc.createGroup.mockResolvedValue(group("made", { name: NEW_GROUP_NAME, sortOrder: 1 }));
+    await createMissionGroup("p1", ["w1", "w2"]);
+    expect([groupOf("w1"), groupOf("w2")]).toEqual(["made", "made"]);
+
+    expect(await cancelNewGroup("made")).toBe(true);
+
+    expect(mockIpc.deleteGroup).toHaveBeenCalledWith("made");
+    expect([groupOf("w1"), groupOf("w2"), groupOf("w3")]).toEqual([null, "g1", null]);
+    expect(mockIpc.setItemGroup).toHaveBeenCalledTimes(1);
+    expect(mockIpc.setItemGroup).toHaveBeenCalledWith("workspace", "w2", "g1");
+  });
+
+  it("once the first name is in, Escape is a rename's Escape again", async () => {
+    seed([ws("w1")]);
+    mockIpc.createGroup.mockResolvedValue(group("made", { name: NEW_GROUP_NAME }));
+    await createMissionGroup("p1", "w1");
+    useRailGroupUi.getState().stopRename(); // Enter or blur
+    useRailGroupUi.getState().startRename("made"); // Rename… later
+
+    expect(await cancelNewGroup("made")).toBe(false);
+    expect(mockIpc.deleteGroup).not.toHaveBeenCalled();
+    expect(groupOf("w1")).toBe("made");
+  });
+
+  it("an empty group from the project menu is not undone by Escape", async () => {
+    mockIpc.createGroup.mockResolvedValue(group("made", { name: NEW_GROUP_NAME }));
+    await createMissionGroup("p1");
+    expect(await cancelNewGroup("made")).toBe(false);
+    expect(mockIpc.deleteGroup).not.toHaveBeenCalled();
   });
 });
