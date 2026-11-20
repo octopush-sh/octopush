@@ -11049,15 +11049,22 @@ mod cli_dialect_tests {
     }
 
     #[test]
-    fn a_read_only_codex_stage_in_a_sandboxed_mission_gets_no_workspace_write_root() {
-        use crate::orchestrator::cli_runner::sandboxed_write_roots;
-        let roots = vec!["/ws".to_string()];
-        assert!(sandboxed_write_roots(CliDialect::Codex, true, &roots).is_empty());
-        assert_eq!(sandboxed_write_roots(CliDialect::Codex, false, &roots), roots);
-        // Claude stages keep the mission's roots (their read-only guard is the
-        // CLI's own).
-        assert_eq!(sandboxed_write_roots(CliDialect::Claude, true, &roots), roots);
-        assert_eq!(sandboxed_write_roots(CliDialect::Claude, false, &roots), roots);
+    fn a_read_only_codex_stage_in_a_sandboxed_mission_is_refused() {
+        use crate::orchestrator::cli_runner::{codex_read_only_refusal, codex_write_scope, CODEX_READ_ONLY_SANDBOX_REFUSAL};
+        use crate::orchestrator::sandbox::stage_isolation;
+        let sandboxed = CodexWriteScope::MissionSandbox;
+        assert_eq!(
+            codex_read_only_refusal(CliDialect::Codex, true, sandboxed),
+            Some("A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.")
+        );
+        assert_eq!(CODEX_READ_ONLY_SANDBOX_REFUSAL, codex_read_only_refusal(CliDialect::Codex, true, sandboxed).unwrap());
+        // A writer in a sandboxed mission runs; so does a read-only stage in
+        // Codex's own sandbox, and any Claude stage.
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, false, sandboxed), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Codex, true, CodexWriteScope::Workspace), None);
+        assert_eq!(codex_read_only_refusal(CliDialect::Claude, true, sandboxed), None);
+        // A readonly mission forces the sandbox on, so it is refused there too.
+        assert_eq!(codex_write_scope(&stage_isolation("readonly", "none", "/ws").exec_isolation), sandboxed);
     }
 
     #[test]
@@ -11111,16 +11118,14 @@ mod cli_dialect_tests {
         // System prompt never appears in argv (codex has no flag for it).
         assert!(!rw.iter().any(|a| a.contains("system prompt")));
 
-        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, ws);
-        assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
-        assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
-        assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
-        // Inside a sandboxed mission Codex's own sandbox can't nest (a nested
-        // `sandbox-exec` gets EPERM): a read-only stage bypasses it too, and
-        // its profile gets no workspace write root.
-        let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, CodexWriteScope::MissionSandbox);
-        assert!(ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{ro:?}");
-        assert!(!ro.contains(&"--sandbox".to_string()), "{ro:?}");
+        // Read-only never bypasses Codex's sandbox (inside a sandboxed mission
+        // such a stage is refused before launch, `codex_read_only_refusal`).
+        for scope in [ws, CodexWriteScope::MissionSandbox] {
+            let ro = CliDialect::Codex.argv("gpt-5", "sys", 25, true, scope);
+            assert!(ro.windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{ro:?}");
+            assert!(!ro.contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()));
+            assert!(!ro.iter().any(|a| a.starts_with("sandbox_workspace_write.")), "{ro:?}");
+        }
 
         // Inside a sandboxed mission, Octopush's Seatbelt profile confines it.
         let mission = CliDialect::Codex.argv("gpt-5", "sys", 25, false, CodexWriteScope::MissionSandbox);

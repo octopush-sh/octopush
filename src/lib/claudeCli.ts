@@ -153,6 +153,33 @@ export function codexCommitNote(
   return `${who} ${one ? "runs" : "run"} on Codex, whose sandbox keeps .git read-only, so ${one ? "it" : "they"} can't commit or push. Pick a Claude model for ${one ? "it" : "them"}.`;
 }
 
+/** The launcher's warning, and the stage failure, for a read-only Codex
+ *  stage in a sandboxed mission. Mirrors
+ *  `cli_runner::CODEX_READ_ONLY_SANDBOX_REFUSAL`. */
+export const CODEX_READ_ONLY_SANDBOX_NOTE =
+  "A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.";
+
+/** The warning for a crew with a read-only CLI stage (a review role in the
+ *  worktree environment) on Codex, in a mission that runs sandboxed (its own
+ *  choice, or a readonly mission, which forces the sandbox on): Codex's own
+ *  read-only sandbox can't run inside Octopush's, so the stage is refused at
+ *  launch. Null otherwise. Mirrors `cli_runner::codex_read_only_refusal`. */
+export function codexReadOnlySandboxNote(
+  stages: { position: number; role: string; substrate: string; agentModel: string }[],
+  overrides: Record<number, string>,
+  roles: { key: string; artifactKind?: string; environment: string }[],
+  execIsolation: string | null,
+  gitIsolation: string | null,
+): string | null {
+  if (execIsolation !== "sandbox" && gitIsolation !== "readonly") return null;
+  const refused = stages.some((s) => {
+    if (s.substrate !== "cli" || runsOnClaudeCode(overrides[s.position] || s.agentModel)) return false;
+    const role = roles.find((r) => r.key === s.role);
+    return role?.artifactKind === "review" && role.environment === "worktree";
+  });
+  return refused ? CODEX_READ_ONLY_SANDBOX_NOTE : null;
+}
+
 /** "Fable 5.2 needs Claude Code 2.1.321 or newer — this Mac has 2.1.316." */
 export function modelFloorLabel(note: ClaudeModelFloorNote | null): string | null {
   if (!note) return null;

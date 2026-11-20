@@ -119,7 +119,6 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
         for (read_only, scope) in [
             (true, CodexWriteScope::Workspace),
             (false, CodexWriteScope::Workspace),
-            (true, CodexWriteScope::MissionSandbox),
             (false, CodexWriteScope::MissionSandbox),
         ] {
             let d = CliDialect::Codex;
@@ -143,17 +142,17 @@ fn resume_argv_flags_sit_where_the_recorded_help_accepts_them() {
                 assert!(help_lists(&resume, f), "[{}] `codex exec resume` doesn't list {f}", r.label("exec-resume-help.txt"));
             }
             assert!(a.windows(2).any(|w| w[0] == "-c" && w[1] == "model_reasoning_effort=\"high\""), "{a:?}");
-            match (read_only, scope) {
-                (true, CodexWriteScope::Workspace) => {
-                    assert!(a[..at].windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{a:?}")
-                }
-                // Inside a sandboxed mission Codex's own sandbox can't nest;
-                // Octopush's profile confines a read-only stage instead.
-                (_, CodexWriteScope::MissionSandbox) => {
-                    assert!(a[..at].contains(&"--dangerously-bypass-approvals-and-sandbox".to_string()), "{a:?}");
-                    assert!(!a.contains(&"--sandbox".to_string()), "{a:?}");
-                }
-                (false, CodexWriteScope::Workspace) => {}
+            if read_only {
+                assert!(a[..at].windows(2).any(|w| w[0] == "--sandbox" && w[1] == "read-only"), "{a:?}");
+            }
+            // A sandboxed writer's home overrides sit before the trailing `-`
+            // and are flags `codex exec` lists.
+            if scope == CodexWriteScope::MissionSandbox {
+                let mut h = a.clone();
+                d.push_flags(&mut h, crate::orchestrator::sandbox::codex_home_overrides("/tmp/codex-home"));
+                assert_eq!(h.last().map(String::as_str), Some("-"), "{h:?}");
+                assert!(h.windows(2).any(|w| w[0] == "-c" && w[1] == "sqlite_home=\"/tmp/codex-home\""), "{h:?}");
+                assert!(h.windows(2).any(|w| w[0] == "-c" && w[1] == "log_dir=\"/tmp/codex-home/log\""), "{h:?}");
             }
         }
     }

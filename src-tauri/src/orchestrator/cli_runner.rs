@@ -1512,15 +1512,14 @@ pub enum CodexWriteScope {
     /// planted config and hooks. The worktree's own `.git` entry is also
     /// checked after the stage ([`guards_git_entry`]).
     Workspace,
-    /// The mission runs sandboxed: Octopush's Seatbelt profile confines the
-    /// process, writers and read-only stages alike. Codex's own sandbox can't
-    /// run inside it: a nested `sandbox-exec` fails with `sandbox_apply:
-    /// Operation not permitted` (exit 71, pinned by
+    /// The mission runs sandboxed: Octopush's Seatbelt profile confines a
+    /// writer, which bypasses Codex's own sandbox and has its own
+    /// `CODEX_HOME` (`sandbox::prepare_codex_home`). Codex's sandbox can't
+    /// run inside the profile: a nested `sandbox-exec` fails with
+    /// `sandbox_apply: Operation not permitted` (pinned by
     /// `sandbox::tests::seatbelt_refuses_a_nested_sandbox`), so every command
-    /// of a `--sandbox read-only` stage would fail. A read-only stage
-    /// therefore bypasses Codex's sandbox too and gets a profile with no
-    /// workspace write root ([`sandboxed_write_roots`]). Each such stage
-    /// has its own `CODEX_HOME` (`sandbox::prepare_codex_home`).
+    /// of a `--sandbox read-only` stage would fail. A read-only stage is
+    /// refused here for now ([`codex_read_only_refusal`]).
     MissionSandbox,
 }
 
@@ -1534,16 +1533,18 @@ pub fn codex_write_scope(exec_isolation: &str) -> CodexWriteScope {
     }
 }
 
-/// The write roots of a stage's Seatbelt profile in a sandboxed mission: the
-/// mission's (`roots`), except for a read-only Codex stage, which gets none
-/// (temp-only, like a readonly mission). Codex's own `read-only` sandbox
-/// can't nest inside the profile ([`CodexWriteScope::MissionSandbox`]), so
-/// the profile is what keeps such a stage from writing the worktree. Pure.
-pub fn sandboxed_write_roots(dialect: CliDialect, read_only: bool, roots: &[String]) -> Vec<String> {
-    match (dialect, read_only) {
-        (CliDialect::Codex, true) => Vec::new(),
-        _ => roots.to_vec(),
-    }
+/// The stage failure, and the launcher's warning, for a read-only Codex
+/// stage in a sandboxed mission (a readonly mission included).
+pub const CODEX_READ_ONLY_SANDBOX_REFUSAL: &str =
+    "A read-only Codex stage can't run in a sandboxed mission yet. Give this stage a Claude model.";
+
+/// Why this stage is refused before anything is set up: a read-only Codex
+/// stage in a sandboxed mission, where Codex's own `read-only` sandbox can't
+/// nest inside Octopush's profile ([`CodexWriteScope::MissionSandbox`]).
+/// Mirrors `lib/claudeCli.ts::codexReadOnlySandboxNote`. Pure.
+pub fn codex_read_only_refusal(dialect: CliDialect, read_only: bool, scope: CodexWriteScope) -> Option<&'static str> {
+    (dialect == CliDialect::Codex && read_only && scope == CodexWriteScope::MissionSandbox)
+        .then_some(CODEX_READ_ONLY_SANDBOX_REFUSAL)
 }
 
 /// The `-c` override that adds `root` (the stage's build-cache root,
@@ -1686,11 +1687,11 @@ impl CliDialect {
     /// equivalent: the system prompt rides stdin (see [`CliDialect::stdin_payload`])
     /// and the turn budget is bounded by the runner's idle/absolute timeouts.
     /// `read_only` maps to each CLI's native mechanism: Claude denies the edit
-    /// tools; Codex runs in its own `read-only` sandbox, except inside a
-    /// sandboxed mission, where that sandbox can't nest and Octopush's
-    /// profile (with no workspace write root) confines it instead. A Codex
-    /// writer runs in its `workspace-write` sandbox, or bypasses it inside a
-    /// sandboxed mission (see [`CodexWriteScope`]); either way it never stops for approval,
+    /// tools; Codex runs in its own `read-only` sandbox (a read-only Codex
+    /// stage in a sandboxed mission is refused before it gets here,
+    /// [`codex_read_only_refusal`]). A Codex writer runs in its
+    /// `workspace-write` sandbox, or bypasses it inside a sandboxed mission
+    /// (see [`CodexWriteScope`]); either way it never stops for approval,
     /// which would hang a headless stage. The writer's settings are `-c`
     /// config overrides, the mechanism the effort already uses, not flags
     /// `codex exec` may not take: approval `never` and network on (Octopush's
@@ -1715,7 +1716,7 @@ impl CliDialect {
                     model.to_string(),
                 ];
                 match (read_only, scope) {
-                    (true, CodexWriteScope::Workspace) => a.extend(["--sandbox".to_string(), "read-only".to_string()]),
+                    (true, _) => a.extend(["--sandbox".to_string(), "read-only".to_string()]),
                     (false, CodexWriteScope::Workspace) => a.extend([
                         "--sandbox".to_string(),
                         "workspace-write".to_string(),
@@ -1724,7 +1725,7 @@ impl CliDialect {
                         "-c".to_string(),
                         "sandbox_workspace_write.network_access=true".to_string(),
                     ]),
-                    (_, CodexWriteScope::MissionSandbox) => {
+                    (false, CodexWriteScope::MissionSandbox) => {
                         a.push("--dangerously-bypass-approvals-and-sandbox".to_string())
                     }
                 }
@@ -3110,20 +3111,30 @@ impl CliRunner {
                     // keyed by the exec choice and the read guard too, so no
                     // stage with open reads (a Codex stage, an exec-`none`
                     // review) shares a read-confined stage's dirs.
-                    let write_roots = sandboxed_write_roots(dialect, read_only, &ctx.allowed_write_roots);
+                    // Codex's read-only sandbox can't nest in the profile:
+                    // refused before anything is set up (#784).
+                    if let Some(msg) = codex_read_only_refusal(dialect, read_only, write_scope) {
+                        return Ok(failed_stage(msg));
+                    }
+                    let write_roots = &ctx.allowed_write_roots;
                     let tenant = cli_cache_tenant(&ctx.exec_choice, reads_confined);
                     // A Codex stage gets its own CODEX_HOME, made outside the
                     // sandbox after an unsandboxed sign-in preflight; it never
                     // writes the user's ~/.codex (#784).
                     let codex_home = match dialect {
-                        CliDialect::Codex => match prepare_codex_stage_home(&scope, &write_roots, &ctx.exec_choice, reads_confined).await {
+                        CliDialect::Codex => match prepare_codex_stage_home(&scope, write_roots, &ctx.exec_choice, reads_confined).await {
                             Ok(home) => Some(home),
                             Err(msg) => return Ok(failed_stage(&msg)),
                         },
                         CliDialect::Claude => None,
                     };
+                    // Its state DB and logs stay in that home whatever the
+                    // user's config.toml says (fresh and resumed).
+                    if let Some(home) = &codex_home {
+                        dialect.push_flags(&mut args, home.args.clone());
+                    }
                     match crate::orchestrator::sandbox::prepare_with(
-                        &write_roots,
+                        write_roots,
                         Some(&*scope),
                         tenant,
                         &real_program,
