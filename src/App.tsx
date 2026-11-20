@@ -46,7 +46,7 @@ import { focus as focusGlobal } from "./lib/focus";
 import { TerminalPane } from "./components/TerminalPane";
 import { TerminalHost } from "./components/TerminalHost";
 import { RunPanes } from "./components/run/RunPanes";
-import { LINE_FLOOR_PX, SessionLine } from "./components/run/SessionLine";
+import { LINE_FLOOR_PX, LINE_LAST_PX, SessionLine } from "./components/run/SessionLine";
 import { SessionSwitcher } from "./components/run/SessionSwitcher";
 import { ReviewTail } from "./components/ReviewTail";
 import { CommandPalette } from "./components/CommandPalette";
@@ -2417,8 +2417,10 @@ function App() {
               onChange={setMode}
               workspaceId={activeWorkspaceId ?? undefined}
               meta={modeMeta}
-              // The session line never loses its floor to a narrow window.
+              // The session line keeps its floor while that fits beside the
+              // switcher, and its ⌘⌥K list button always.
               tailMin={activeMode === "run" && terminals.length > 0 ? LINE_FLOOR_PX : undefined}
+              tailLastMin={LINE_LAST_PX}
             />
           )}
           <CanvasSplit>

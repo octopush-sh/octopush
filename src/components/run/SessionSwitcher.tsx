@@ -119,7 +119,8 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
   // closed perfectly well.
   const deleting = useRef(new Set<string>());
   const inputRef = useRef<HTMLInputElement>(null);
-  // ⌫ closes the selected session; one with something running asks first.
+  // ⌫ closes the selected session; one with something running, or waiting on
+  // the user, asks first.
   const [requestClose, closeConfirm] = useCloseSession(workspaceId, (id) => {
     deleting.current.add(id);
     void deleteTerminal(workspaceId, id).finally(() => {
@@ -190,7 +191,7 @@ export function SessionSwitcher({ workspaceId, onClose, pairing: pairingProp = f
       const row = matches[selected];
       if (!row || deleting.current.has(row.t.id)) return;
       e.preventDefault();
-      // A busy session asks first (`useCloseSession`); an idle one goes now.
+      // A busy or waiting session asks first (`useCloseSession`); an idle one goes now.
       requestClose(row.t);
     }
   };

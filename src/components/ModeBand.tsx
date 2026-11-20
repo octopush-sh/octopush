@@ -18,6 +18,10 @@ interface Props {
    *  floor). The left track gives up its room first, so the switcher slides
    *  off centre rather than the control losing a button. */
   tailMin?: number;
+  /** The control tail's last rung, in px: the floor its track keeps once the
+   *  band is too narrow for `tailMin` beside the switcher (Run: the session
+   *  line's ⌘⌥K list button alone). */
+  tailLastMin?: number;
 }
 
 /** The mode band — the switcher's own line, directly above the canvas and
@@ -41,23 +45,33 @@ interface Props {
  *  The band is a container (`.octo-modeband`, styles.css) with a ladder of
  *  its own: on a narrow canvas the switcher's inactive modes shed their
  *  labels, which is what makes room for the tail (at 720px and under beside a
- *  control tail, at 600px and under in every mode); and a control tail whose
- *  floor (`tailMin`) no longer fits beside even that switcher is hidden
- *  whole, so it never sits clipped in the tab order. */
-export function ModeBand({ mode, onChange, workspaceId, meta, tailMin }: Props) {
+ *  control tail, at 600px and under in every mode); and once a control
+ *  tail's floor (`tailMin`) no longer fits beside even that switcher, its
+ *  track keeps only `tailLastMin`, and the control sheds down to fit it.
+ *
+ *  The container is a wrapper around the grid, not the grid itself: a
+ *  container query styles only what is inside the container, and that last
+ *  rung changes the grid's own columns. */
+export function ModeBand({ mode, onChange, workspaceId, meta, tailMin, tailLastMin }: Props) {
+  const vars = tailMin
+    ? ({
+        ["--modeband-tail-min" as string]: `${tailMin}px`,
+        ["--modeband-tail-last" as string]: `${tailLastMin ?? tailMin}px`,
+      } as React.CSSProperties)
+    : undefined;
   return (
+    <div className="octo-modeband" style={vars}>
     <div
-      className="octo-modeband mb-[var(--shell-stack)] grid grid-cols-[minmax(0,1fr)_auto_minmax(var(--modeband-tail-min,0px),1fr)] items-center gap-3"
-      // A control tail (Run's session line) sheds the switcher's labels
-      // sooner than a read-out does: the rungs in styles.css select on this.
+      className="octo-modeband-grid mb-[var(--shell-stack)] grid grid-cols-[minmax(0,1fr)_auto_minmax(var(--modeband-tail-min,0px),1fr)] items-center gap-3"
+      // A control tail (Run's session line) has a floor of its own, which
+      // the last rung in styles.css selects on.
       data-tail={tailMin ? "control" : undefined}
-      style={tailMin ? ({ ["--modeband-tail-min" as string]: `${tailMin}px` } as React.CSSProperties) : undefined}
     >
       <span aria-hidden />
       <ModeSwitcher mode={mode} onChange={onChange} workspaceId={workspaceId} />
       {/* Keyed on the mode so the tail crossfades with the canvas instead of
           snapping to the new mode's numbers (motion rule S3). */}
-      <FadeSwap swapKey={mode} className={`flex min-w-0 justify-end${tailMin ? " octo-modeband-control" : ""}`}>
+      <FadeSwap swapKey={mode} className="flex min-w-0 justify-end">
         {typeof meta === "string" ? (
           <span
             title={meta}
@@ -69,6 +83,7 @@ export function ModeBand({ mode, onChange, workspaceId, meta, tailMin }: Props) 
           meta
         )}
       </FadeSwap>
+    </div>
     </div>
   );
 }
