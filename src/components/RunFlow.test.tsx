@@ -121,18 +121,76 @@ describe("RunFlow — depth of field & the single beacon", () => {
     expect(container.textContent).not.toContain("$0.00");
   });
 
-  it("reads an unreported essence cost as mute 'usage not reported', never $0.00", () => {
+  it("reads an unreported essence cost as mute 'unreported', never truncated or $0.00 (#937)", () => {
     const unreported = [
-      mk({ id: "i", position: 0, status: "done", usageUnreported: true }),
-      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+      mk({ id: "i", position: 2, status: "done", usageUnreported: true }),
+      mk({ id: "s", position: 3, status: "running", startedAt: 1 }),
     ];
     const { container } = render(
       <RunFlow stages={unreported} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
     );
-    const label = screen.getByText("usage not reported");
-    expect(label).toHaveClass("text-octo-mute");
-    expect(label.getAttribute("title")).toMatch(/usage/);
+    const label = screen.getByText("unreported");
+    expect(label).toHaveClass("text-octo-mute", "shrink-0");
+    expect(label).not.toHaveClass("truncate");
+    expect(label.getAttribute("title")).toMatch(/^Usage not reported\./);
+    expect(container.textContent).not.toContain("usage not reported");
     expect(container.textContent).not.toContain("$0.00");
+  });
+
+  it("keeps 'usage not reported' in full in a shed line's tooltip (#937)", () => {
+    const unreported = [
+      mk({ id: "i", position: 2, status: "done", usageUnreported: true, inputTokens: 18_412, outputTokens: 3_100 }),
+      mk({ id: "s", position: 3, status: "running", startedAt: 1 }),
+    ];
+    render(<RunFlow stages={unreported} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />);
+    const tokens = screen.getByText("↑18k ↓3.1k");
+    expect(tokens).toHaveClass("octo-demote-shed");
+    expect(tokens.parentElement).toHaveAttribute("title", "usage not reported · ↑18.4k ↓3.1k tokens");
+  });
+
+  it("reads millions as M in a shed line's tooltip, never 1240.0k (#937)", () => {
+    const big = [
+      mk({ id: "i", position: 0, status: "done", costUsd: 123.45, inputTokens: 1_240_000, outputTokens: 31_000 }),
+      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+    ];
+    render(<RunFlow stages={big} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />);
+    const tokens = screen.getByText("↑1.2M ↓31k");
+    expect(tokens).toHaveClass("octo-demote-shed");
+    expect(tokens.parentElement).toHaveAttribute("title", "$123.45 · ↑1.24M ↓31.0k tokens");
+  });
+
+  it("reads a tiny positive essence cost as <$0.01, never $0.00 (#937)", () => {
+    const tiny = [
+      mk({ id: "i", position: 0, status: "done", costUsd: 0.001 }),
+      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+    ];
+    const { container } = render(
+      <RunFlow stages={tiny} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
+    );
+    expect(screen.getByText("<$0.01")).toHaveClass("text-octo-brass");
+    expect(container.textContent).not.toContain("$0.00");
+  });
+
+  it("gives screen readers the full figures of a shed token pair (#937)", () => {
+    const big = [
+      mk({ id: "i", position: 0, status: "done", costUsd: 123.45, inputTokens: 1_240_000, outputTokens: 31_000 }),
+      mk({ id: "s", position: 1, status: "running", startedAt: 1 }),
+    ];
+    render(<RunFlow stages={big} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />);
+    const sr = screen.getByText("1.24M input, 31.0k output tokens");
+    expect(sr).toHaveClass("sr-only");
+    expect(sr.closest("button")!.textContent).toContain("1.24M input, 31.0k output tokens");
+  });
+
+  it("adds no sr-only token text when the pair fits", () => {
+    const done = [
+      mk({ id: "i", position: 1, status: "done", costUsd: 0.3, inputTokens: 18_412, outputTokens: 3_100 }),
+      mk({ id: "s", position: 2, status: "running", startedAt: 1 }),
+    ];
+    const { container } = render(
+      <RunFlow stages={done} selectedStageId="s" beaconStageId="s" onSelectStage={() => {}} />,
+    );
+    expect(container.textContent).not.toContain("output tokens");
   });
 
   it("renders no connector for a single-stage run", () => {
