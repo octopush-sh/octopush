@@ -18,6 +18,8 @@ tap="octopush-ci/cask-check"
 brew untap "$tap" >/dev/null 2>&1 || true
 brew tap-new --no-git "$tap" >/dev/null
 trap 'brew untap "$tap" >/dev/null 2>&1 || true' EXIT
+# Recent Homebrew refuses to load casks from a tap nobody trusted; this one is ours.
+brew trust "$tap" >/dev/null 2>&1 || true
 dir="$(brew --repository "$tap")"
 mkdir -p "$dir/Casks"
 cp "$cask" "$dir/Casks/octopush.rb"
