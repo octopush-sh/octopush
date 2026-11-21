@@ -434,7 +434,8 @@ describe("MidTruncate — follow-ups (#833)", () => {
   const GLYPH = 7;
   let room = 0;
   const realRangeRect = Range.prototype.getBoundingClientRect;
-  // `data-measuring` on the box at each Range read of the head's text.
+  // The head held at clip — its own inline style, the box marked
+  // `data-measuring` — at each Range read of the head's text.
   let measuringAtRead: boolean[] = [];
 
   beforeEach(() => {
@@ -448,7 +449,7 @@ describe("MidTruncate — follow-ups (#833)", () => {
     Range.prototype.getBoundingClientRect = function (this: Range) {
       const parent = this.startContainer.parentElement;
       if (parent?.classList.contains("octo-midtrunc-head")) {
-        measuringAtRead.push(parent.parentElement!.hasAttribute("data-measuring"));
+        measuringAtRead.push(parent.parentElement!.hasAttribute("data-measuring") && parent.style.textOverflow === "clip");
       }
       const w = (this.endOffset - this.startOffset) * GLYPH;
       return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
@@ -471,6 +472,7 @@ describe("MidTruncate — follow-ups (#833)", () => {
       expect(measuringAtRead.length).toBeGreaterThan(0);
       expect(measuringAtRead.every(Boolean)).toBe(true);
       expect(box).not.toHaveAttribute("data-measuring");
+      expect(container.querySelector<HTMLElement>(".octo-midtrunc-head")!.style.textOverflow).toBe("");
       expect(box.hasAttribute("data-elided")).toBe(r === 70);
       measuringAtRead = [];
       unmount();
@@ -487,6 +489,7 @@ describe("MidTruncate — follow-ups (#833)", () => {
     expect(measuringAtRead.length).toBeGreaterThan(0);
     expect(measuringAtRead.every(Boolean)).toBe(true);
     expect(box).not.toHaveAttribute("data-measuring");
+    expect(head.style.textOverflow).toBe("");
     expect(box).toHaveAttribute("data-elided");
   });
 
@@ -551,13 +554,17 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
     Range.prototype.getBoundingClientRect = realRangeRect;
   });
 
-  it("holds the head at clip only while measuring, never once it is cut", async () => {
+  it("never clips the head from the stylesheet: the measuring hold is the head's own inline style (#872)", async () => {
+    // A rule keyed on the box (`.octo-midtrunc[data-measuring] .octo-midtrunc-head`)
+    // restyled the head only once the box's attribute change reached it; in
+    // Safari the Review file header's `src-tauri` head was left at clip.
     const css = await stylesCss();
     const head = /([^{}]*\.octo-midtrunc-head[^{]*)\{([^}]*)\}/g;
     const clips = Array.from(css.matchAll(head))
       .filter((m) => /text-overflow\s*:\s*clip/.test(m[2]))
       .map((m) => m[1].trim());
-    expect(clips).toEqual([".octo-midtrunc[data-measuring] .octo-midtrunc-head"]);
+    expect(clips).toEqual([]);
+    expect(css).not.toMatch(/\[data-measuring\]/);
     // The base head rule clips its overflow WITH an ellipsis.
     expect(css).toMatch(/\.octo-midtrunc-head\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
   });
@@ -594,7 +601,10 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
     const boxes = [...container.querySelectorAll(".octo-midtrunc")];
     expect(boxes).toHaveLength(3);
     // The hold is released everywhere, so every head is back on its ellipsis…
-    for (const box of boxes) expect(box).not.toHaveAttribute("data-measuring");
+    for (const box of boxes) {
+      expect(box).not.toHaveAttribute("data-measuring");
+      expect(box.querySelector<HTMLElement>(".octo-midtrunc-head")!.style.textOverflow).toBe("");
+    }
     // …the boxes measured around the broken one are still cut…
     expect(boxes.map((b) => b.hasAttribute("data-elided"))).toEqual([true, false, true]);
     // …and the broken one keeps the plain CSS ellipsis, uncut by hand.
@@ -612,6 +622,7 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
     };
     seatEllipsis(box, head);
     expect(box).not.toHaveAttribute("data-measuring");
+    expect(head.style.textOverflow).toBe("");
     expect(box).not.toHaveAttribute("data-elided");
     expect(head.style.maxWidth).toBe("");
   });

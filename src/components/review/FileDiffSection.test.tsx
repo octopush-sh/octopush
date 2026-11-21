@@ -50,6 +50,40 @@ describe("FileDiffSection", () => {
       unmount();
     }
   });
+  it("cuts the path's head on its own ellipsis, never left held at clip (#872)", () => {
+    // Safari's audit found the `src-tauri` head cut with no ellipsis. The head
+    // is `.octo-midtrunc-head` (ellipsis); the measuring hold is its inline
+    // style and must be gone once the pass ends.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    const rect = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? 30 : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    const realRange = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      const w = (this.endOffset - this.startOffset) * 7;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+    try {
+      const filePath = "src-tauri/src/sync.rs";
+      const { getByTitle } = render(<FileDiffSection file={{ ...file, filePath }} focusedHunk={-1} viewed={false} collapsed={false}
+        onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+      act(() => frames.splice(0).forEach((cb) => cb(0)));
+      const box = getByTitle(filePath).querySelector(":scope > .octo-midtrunc")!;
+      const head = box.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!;
+      expect(head).toHaveTextContent(/^src-tauri$/);
+      expect(head.className).toBe("octo-midtrunc-head");
+      expect(box).toHaveAttribute("data-elided");
+      expect(box).not.toHaveAttribute("data-measuring");
+      expect(head.style.textOverflow).toBe("");
+      expect(box.querySelector(":scope > .octo-midtrunc-tail")).toHaveTextContent("/src/sync.rs");
+    } finally {
+      Range.prototype.getBoundingClientRect = realRange;
+      rect.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
   it("renders a short path as one nowrap line, not a bare string in the flex row", () => {
     const { getByText } = render(<FileDiffSection file={{ ...file, filePath: "src-tauri/a.rs" }} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
