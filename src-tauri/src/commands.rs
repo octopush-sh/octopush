@@ -5381,6 +5381,15 @@ pub async fn secret_scan_staged(workspace_path: String) -> AppResult<Option<crat
     crate::secret_scan::preview(move || crate::secret_scan::staged_files(std::path::Path::new(&p))).await
 }
 
+/// "Scan this branch's commits" in Review (#820): the secret guard's rules
+/// over every commit since the merge base with `base`, on demand only, with
+/// the guard's switch on or off. Read-only: it changes and blocks nothing.
+#[tauri::command]
+pub async fn secret_scan_branch(workspace_path: String, base: String) -> AppResult<crate::secret_scan::ScanPreview> {
+    let p = expand_tilde(&workspace_path);
+    crate::secret_scan::scan_now(move || crate::secret_scan::branch_files(std::path::Path::new(&p), &base)).await
+}
+
 /// Commit the staged changes with `message`. Uses the user's login shell so
 /// `user.name`/`user.email` from gitconfig and any commit signing setup
 /// behave as if the user ran `git commit` in their own terminal.

@@ -2,8 +2,9 @@
  *  request whose change holds a possible credential — or that it couldn't
  *  scan to the end — with a structured error
  *  `{ kind: "SecretsFound", message, findings, total, partial, fingerprint }`.
- *  A finding names the file, the line and the kind — never any part of the
- *  value. `findings` is capped; `total` counts all of them. The override
+ *  A finding names the file, the line and the kind, and may carry a masked
+ *  `preview` (`sk-ant-…9fQ2`, #820) — never the value. `findings` is capped;
+ *  `total` counts all of them. The override
  *  echoes `fingerprint` back, so it covers exactly what the dialog showed:
  *  the core rescans and refuses again if anything changed. */
 export interface SecretFinding {
@@ -16,6 +17,11 @@ export interface SecretFinding {
   kind: string;
   /** Matched a credential configured in Octopush itself. */
   yours: boolean;
+  /** `sk-ant-…9fQ2`: the provider prefix and the last four characters, to
+   *  tell two keys apart. Absent for a whole-file finding, a private key, a
+   *  short value and a persisted Direct hold. Only the confirm dialog and
+   *  the branch scan show it; summaries never do. */
+  preview?: string | null;
 }
 
 /** The action the guard held: it names the confirm CTA and the copy. */
@@ -51,6 +57,9 @@ export function secretRefusal(err: unknown): SecretRefusal | null {
   const total = typeof e.total === "number" ? Math.max(e.total, findings.length) : findings.length;
   return { findings, total, partial: e.partial === true, fingerprint: e.fingerprint };
 }
+
+/** The masked preview's tooltip, wherever a finding shows one. */
+export const PREVIEW_TIP = "Its prefix and last four characters, to tell keys apart";
 
 /** Shown whenever a scan didn't reach the end of the change. */
 export const PARTIAL_NOTE = "Scanned the first 16 MB; the rest wasn't checked.";
@@ -110,6 +119,19 @@ export function previewSummary(p: SecretPreview | null): string | null {
   const total = Math.max(p.total, p.findings.length);
   if (total === 0 && !p.partial) return null;
   return holdSummary({ acknowledged: false, fingerprint: "", findings: p.findings, total, partial: p.partial });
+}
+
+/** The branch scan's verdict (#820): "No possible secrets in 3 commits.",
+ *  "2 possible secrets in this branch's commits.", or the partial note when
+ *  nothing was found in what was read. `commits` is how many were scanned. */
+export function branchScanSummary(p: SecretPreview, commits: number): string {
+  const total = Math.max(p.total, p.findings.length);
+  if (total === 0) {
+    return p.partial
+      ? "Nothing found in the first 16 MB; the rest wasn't checked."
+      : `No possible secrets in ${commits === 1 ? "1 commit" : `${commits} commits`}.`;
+  }
+  return `${total} possible secret${total === 1 ? "" : "s"} in this branch's commits.`;
 }
 
 /** A Direct stage's persisted hold (`run_stages.secret_hold`). */

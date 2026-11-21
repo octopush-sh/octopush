@@ -1239,6 +1239,12 @@ export const ipc = {
   secretScanStaged: (workspacePath: string) =>
     invoke<SecretPreview | null>("secret_scan_staged", { workspacePath }),
 
+  /** "Scan this branch's commits" (#820): the guard's rules over every commit
+   *  since the merge base with `base`, on demand, guard switch on or off.
+   *  Read-only; rejects when no merge base resolves. */
+  secretScanBranch: (workspacePath: string, base: string) =>
+    invoke<SecretPreview>("secret_scan_branch", { workspacePath, base }),
+
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
   amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>
     invoke<string>("amend_commit", { workspacePath, message, allowFindings: allowFindings ?? null }),

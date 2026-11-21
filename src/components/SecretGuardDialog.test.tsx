@@ -39,6 +39,24 @@ describe("SecretGuardDialog", () => {
     expect(screen.getByText("Scanned the first 16 MB; the rest wasn't checked.")).toBeInTheDocument();
   });
 
+  it("shows a masked preview to tell keys apart, never more (#820)", () => {
+    const one = { ...f(3), preview: "ghp_…WXYZ" };
+    const { unmount } = render(
+      <SecretGuardDialog action="commit" refusal={refusal([one])} onLeaveOut={() => {}} onOverride={() => {}} />,
+    );
+    expect(document.querySelector('[data-tour="secret-guard-preview"]')).toHaveTextContent("ghp_…WXYZ");
+    expect(screen.getByText(/shows at most its last four characters and never stores the value/)).toBeInTheDocument();
+    unmount();
+
+    const two = [{ ...f(1), preview: "ghp_…AAAA" }, { ...f(2), preview: "ghp_…BBBB" }, f(4)];
+    render(<SecretGuardDialog action="push" refusal={refusal(two)} onLeaveOut={() => {}} onOverride={() => {}} />);
+    const list = screen.getByRole("list", { name: "What was found" });
+    expect(list).toHaveTextContent("ghp_…AAAA");
+    expect(list).toHaveTextContent("ghp_…BBBB");
+    expect(screen.getByText("ghp_…AAAA")).toHaveAttribute("title", "Its prefix and last four characters, to tell keys apart");
+    expect(document.querySelector('[data-tour="secret-guard-preview"]')).toBeNull();
+  });
+
   it("asks even with nothing found when the scan was partial", () => {
     render(<SecretGuardDialog action="commit" refusal={refusal([], { partial: true })} onLeaveOut={() => {}} onOverride={() => {}} />);
     expect(screen.getByText("This change is too large to check in full.")).toBeInTheDocument();
