@@ -472,7 +472,7 @@ function BranchPublish({
       )}
       {sinceBase?.base && (
         <BranchSecretScan
-          key={`${workspacePath}|${sinceBase.base}|${sinceBase.mergeBase ?? ""}|${sinceBase.commits}`}
+          key={`${workspacePath}|${sinceBase.base}|${sinceBase.mergeBase ?? ""}|${sinceBase.head ?? ""}|${sinceBase.commits}`}
           workspacePath={workspacePath}
           base={sinceBase.base}
           commits={sinceBase.commits}
@@ -503,8 +503,8 @@ type BranchScan =
 
 /** "Scan this branch's commits": the secret guard's rules over every commit
  *  since the base, only when asked, never automatic. Read-only: it blocks
- *  nothing. The caller keys it on the branch's commits, so a new commit
- *  drops a result that no longer covers the branch. */
+ *  nothing. The caller keys it on the branch's commits and HEAD, so a new
+ *  commit or an amend drops a result that no longer covers the branch. */
 export function BranchSecretScan({ workspacePath, base, commits }: { workspacePath: string; base: string; commits: number }) {
   const [scan, setScan] = useState<BranchScan>({ state: "idle" });
   const alive = useRef(true);

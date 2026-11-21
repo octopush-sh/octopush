@@ -253,7 +253,8 @@ describe("CompanionReview — secret guard verdict (#835)", () => {
 });
 
 describe("CompanionReview — branch secret scan (#820)", () => {
-  const committed = (commits: number, mergeBase = "abc1234") => ({ base: "main", mergeBase, commits, diff: "" });
+  const committed = (commits: number, mergeBase = "abc1234", head: string | null = "def5678") =>
+    ({ base: "main", mergeBase, head, commits, diff: "" });
   const setCommitted = async (c: ReturnType<typeof committed> | null) => {
     const { useReviewSource } = await import("../stores/reviewSourceStore");
     useReviewSource.getState().setCommitted("w1", c);
@@ -303,6 +304,21 @@ describe("CompanionReview — branch secret scan (#820)", () => {
     secretScanBranch.mockRejectedValueOnce("secret scan: this branch shares no history with main");
     await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
     expect(await screen.findByText("Couldn't read this branch's commits.")).toBeInTheDocument();
+    await act(() => setCommitted(null));
+  });
+
+  it("drops a clean result after an amend that keeps the count and merge base", async () => {
+    await setCommitted(committed(3));
+    secretScanBranch.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    const { container } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
+    expect(await screen.findByText("No possible secrets in 3 commits.")).toBeInTheDocument();
+
+    // Same commits and merge base, new HEAD: those commits were never scanned.
+    await act(() => setCommitted(committed(3, "abc1234", "9a8b7c6")));
+    expect(screen.queryByText("No possible secrets in 3 commits.")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-tour="review-companion-scan-result"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Scan this branch's commits" })).toBeInTheDocument();
     await act(() => setCommitted(null));
   });
 

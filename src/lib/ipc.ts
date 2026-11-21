@@ -506,6 +506,9 @@ export interface CommittedDiff {
   base: string | null;
   /** Short SHA of the merge base, when one resolved. */
   mergeBase: string | null;
+  /** Short SHA of HEAD, when there is one: an amend that keeps the count and
+   *  merge base still moves it. */
+  head: string | null;
   /** Commits on HEAD since the merge base. */
   commits: number;
   /** Unified diff; "" when there are no commits ahead. */

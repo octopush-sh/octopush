@@ -19326,6 +19326,13 @@ mod open_pull_request_tests {
         let c3 = committed_diff(d, Some("main"), false).unwrap();
         assert_eq!(c3.commits, 3);
         assert!(c3.diff.contains("+dirty"), "{}", c3.diff);
+        assert_eq!(c3.head.as_ref().map(String::len), Some(7));
+        assert_ne!(c3.head, c.head);
+        // An amend keeps the count and merge base but still moves HEAD (#820).
+        git(d, &["commit", "-q", "--amend", "-m", "third, reworded"]);
+        let amended = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!((amended.commits, &amended.merge_base, &amended.diff), (c3.commits, &c3.merge_base, &c3.diff));
+        assert_ne!(amended.head, c3.head, "{amended:?}");
         // No base, or one that doesn't resolve: nothing to show.
         assert_eq!(committed_diff(d, None, false).unwrap().commits, 0);
         assert_eq!(committed_diff(d, Some("gone/branch"), false).unwrap().commits, 0);

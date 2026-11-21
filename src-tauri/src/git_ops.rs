@@ -993,6 +993,9 @@ pub struct CommittedDiff {
     pub base: Option<String>,
     /// Short SHA of the merge base, when one resolved.
     pub merge_base: Option<String>,
+    /// Short SHA of HEAD, when there is one: an amend or a rewrite that keeps
+    /// the commit count and merge base still moves it (#820).
+    pub head: Option<String>,
     /// Commits on HEAD since the merge base (capped at [`MAX_COMMITTED_COUNT`]).
     pub commits: usize,
     /// The unified diff, merge base tree → HEAD tree, renames paired. Empty
@@ -1024,21 +1027,23 @@ pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) 
     use crate::collisions::{find_renames, resolve_merge_base};
     let repo = open_repo(path)?;
     let base = base.map(str::trim).filter(|b| !b.is_empty()).map(str::to_string);
-    let empty = |base: Option<String>, mb: Option<git2::Oid>| CommittedDiff {
+    let short = |o: git2::Oid| o.to_string()[..7].to_string();
+    let empty = |base: Option<String>, mb: Option<git2::Oid>, head: Option<git2::Oid>| CommittedDiff {
         base,
-        merge_base: mb.map(|o| o.to_string()[..7].to_string()),
+        merge_base: mb.map(short),
+        head: head.map(short),
         commits: 0,
         diff: String::new(),
     };
     let Some(head) = repo.head().ok().and_then(|h| h.peel_to_commit().ok()) else {
-        return Ok(empty(base, None));
+        return Ok(empty(base, None, None));
     };
-    let Some(b) = base.as_deref() else { return Ok(empty(None, None)) };
+    let Some(b) = base.as_deref() else { return Ok(empty(None, None, Some(head.id()))) };
     let Some(mb) = resolve_merge_base(&repo, head.id(), b) else {
-        return Ok(empty(base, None));
+        return Ok(empty(base, None, Some(head.id())));
     };
     if mb == head.id() {
-        return Ok(empty(base, Some(mb)));
+        return Ok(empty(base, Some(mb), Some(head.id())));
     }
     let key: CommittedKey = (path.to_path_buf(), head.id(), mb, ignore_whitespace, b.to_string());
     if let Ok(cache) = committed_cache().lock() {
@@ -1067,7 +1072,8 @@ pub fn committed_diff(path: &Path, base: Option<&str>, ignore_whitespace: bool) 
     find_renames(&mut diff, false);
     let out = CommittedDiff {
         base,
-        merge_base: Some(mb.to_string()[..7].to_string()),
+        merge_base: Some(short(mb)),
+        head: Some(short(head.id())),
         commits,
         diff: diff_to_text(&diff)?,
     };
