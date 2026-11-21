@@ -14,8 +14,31 @@
 
 import type { ITheme } from "@xterm/xterm";
 
-export const XTERM_FONT_FAMILY =
-  '"JetBrains Mono", "Fira Code", "SF Mono", Menlo, Consolas, monospace';
+/** Installed Nerd Font faces, tried only for glyphs the mono faces before them
+ *  lack: prompt icons in the Private Use Area (starship's branch icon U+E0A0, powerline
+ *  separators) otherwise render as empty boxes. The DOM renderer falls back per
+ *  glyph, so letters keep JetBrains Mono's metrics. */
+export const NERD_FONT_FALLBACKS = [
+  '"Symbols Nerd Font Mono"',
+  '"Symbols Nerd Font"',
+  '"JetBrainsMono Nerd Font Mono"',
+  '"JetBrainsMono Nerd Font"',
+  '"JetBrainsMono NF"',
+  '"MesloLGS NF"',
+  '"MesloLGS Nerd Font Mono"',
+  '"FiraCode Nerd Font Mono"',
+  '"Hack Nerd Font Mono"',
+];
+
+export const XTERM_FONT_FAMILY = [
+  '"JetBrains Mono"',
+  '"Fira Code"',
+  '"SF Mono"',
+  "Menlo",
+  "Consolas",
+  ...NERD_FONT_FALLBACKS,
+  "monospace",
+].join(", ");
 
 /** The size a terminal opens at (⌘= / ⌘− zoom from there). */
 export const XTERM_FONT_SIZE = 13;
