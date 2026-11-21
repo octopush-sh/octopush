@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import { LogbookRoom, optionLabelFits } from "./LogbookRoom";
+import { MidTruncate } from "./primitives/MidTruncate";
 import type { ProjectInfo } from "../lib/types";
 import { useEntitlementStore } from "../stores/entitlementStore";
 
@@ -69,6 +70,53 @@ describe("LogbookRoom", () => {
     expect(option.querySelector(".octo-midtrunc-tail")).toHaveTextContent("e-monorepo");
     // Short labels keep the plain line.
     expect(screen.getByRole("button", { name: "All missions" })).toHaveClass("truncate");
+  });
+
+  it("leaves the long project option on its head's own ellipsis after a shared layout pass (#867)", () => {
+    // The audit's stress project name, in the same MidTruncate pass as a rail
+    // name the engine can't measure: the throw must not strand the option's
+    // head at `text-overflow: clip` (cut with no ellipsis, in WebKit).
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? 60 : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    const realRangeRect = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      if (this.startContainer.textContent?.startsWith("Ü/ñ")) throw new Error("no layout");
+      const w = (this.endOffset - this.startOffset) * 7.5;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+    try {
+      setPlan(["logbook.reports"]);
+      const name = "octopush-enterprise-monorepo-with-a-very-long-name";
+      const { container } = render(
+        <>
+          <MidTruncate text="Ü/ñ émojis 🐙 and CJK 長い名前のパイプライン-5" tail={14} />
+          <LogbookRoom open onClose={vi.fn()} project={{ id: "p1", name } as ProjectInfo} />
+        </>,
+      );
+      expect(frames).toHaveLength(1); // one shared pass for both
+      act(() => frames.splice(0).forEach((cb) => cb(0)));
+      for (const box of container.querySelectorAll(".octo-midtrunc")) {
+        expect(box).not.toHaveAttribute("data-measuring");
+      }
+      // The option is a definite-width box, so the head has room to elide into…
+      const option = screen.getByTitle(name);
+      expect(option).toHaveClass("flex", "w-[160px]", "min-w-0");
+      const box = option.querySelector(".octo-midtrunc")!;
+      // …and its head is the one clipping span, cut to its glyphs plus its own `…`.
+      expect(box).toHaveAttribute("data-elided");
+      const head = box.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!;
+      expect(head).toHaveTextContent("octopush-enterprise-monorepo-with-a-very");
+      expect(head.style.maxWidth).not.toBe("");
+      expect(box.querySelector(":scope > .octo-midtrunc-tail")).toHaveTextContent("-long-name");
+    } finally {
+      Range.prototype.getBoundingClientRect = realRangeRect;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
   });
 
   it("marks the active scope and period with a brass-ghost fill and ivory ink, not brass text", () => {
