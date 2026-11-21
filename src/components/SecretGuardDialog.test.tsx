@@ -45,7 +45,7 @@ describe("SecretGuardDialog", () => {
       <SecretGuardDialog action="commit" refusal={refusal([one])} onLeaveOut={() => {}} onOverride={() => {}} />,
     );
     expect(document.querySelector('[data-tour="secret-guard-preview"]')).toHaveTextContent("ghp_…WXYZ");
-    expect(screen.getByText(/shows at most its last four characters and never stores the value/)).toBeInTheDocument();
+    expect(screen.getByText(/shows only a provider's prefix and the last four characters, and never stores the value/)).toBeInTheDocument();
     unmount();
 
     const two = [{ ...f(1), preview: "ghp_…AAAA" }, { ...f(2), preview: "ghp_…BBBB" }, f(4)];
@@ -53,7 +53,7 @@ describe("SecretGuardDialog", () => {
     const list = screen.getByRole("list", { name: "What was found" });
     expect(list).toHaveTextContent("ghp_…AAAA");
     expect(list).toHaveTextContent("ghp_…BBBB");
-    expect(screen.getByText("ghp_…AAAA")).toHaveAttribute("title", "Its prefix and last four characters, to tell keys apart");
+    expect(screen.getByText("ghp_…AAAA")).toHaveAttribute("title", "Only a provider's prefix and the last four characters, to tell keys apart");
     expect(document.querySelector('[data-tour="secret-guard-preview"]')).toBeNull();
   });
 

@@ -21498,6 +21498,24 @@ mod secret_guard_tests {
         assert!(!p.contains(&secret[secret.len() - 4..]), "{p}");
         let new_pem = AddedFile { path: "deploy/key.pem".into(), is_new: true, lines: Vec::new() };
         assert_eq!(scan_added(&[new_pem], &[])[0].preview, None);
+
+        // A value no provider rule matched keeps none of its start, even one
+        // that happens to begin like a provider prefix: the tail alone.
+        assert_eq!(masked_tail("sk-mypassword2024tR7q").as_deref(), Some("…tR7q"));
+        assert_eq!(masked_tail("short-pass-123"), None);
+        let preview_of = |f: &[SecretFinding], rule: &str| {
+            f.iter().find(|f| f.rule == rule).and_then(|f| f.preview.clone()).unwrap_or_else(|| panic!("{rule}: {f:?}"))
+        };
+        let env = scan_one(".env", &["PASSWORD=sk-mypassword2024tR7q"]);
+        assert_eq!(preview_of(&env, "env-credential"), "…tR7q");
+        let mcp = scan_one(".mcp.json", &[r#""API_KEY": "AKIAmcpvalue9Zr2kLm0pXv7Nq""#]);
+        assert_eq!(preview_of(&mcp, "mcp-env-credential"), "…v7Nq");
+        let generic = scan_one("src/app.ts", &[r#"const secret = "sk-q8Zr2kLm0pXv7NcT4bYw";"#]);
+        assert_eq!(preview_of(&generic, "generic-secret"), "…4bYw");
+        let mine = format!("sk-ant-{}", rnd(81, 30, B62));
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let yours = scan_added(&[file("src/app.ts", &[&format!("k = {mine}")])], &known);
+        assert_eq!(preview_of(&yours, "your-credential"), format!("…{}", &mine[mine.len() - 4..]));
     }
 
     /// "Scan this branch's commits" (#820): every commit since the base,
@@ -21534,6 +21552,32 @@ mod secret_guard_tests {
         assert_eq!((clean.total, clean.partial), (0, false));
         // A base that doesn't resolve is an error, not a clean bill.
         assert!(crate::commands::secret_scan_branch(path, "no-such-branch".into()).await.is_err());
+    }
+
+    /// Past the push/PR scans' 200-commit cap the branch scan still reads
+    /// each commit on its own: a key added and removed again early in a long
+    /// branch is found, where a net diff would see nothing.
+    #[test]
+    fn the_branch_scan_reads_every_commit_past_two_hundred() {
+        let (dir, repo) = repo();
+        let (_, _, line) = true_positives().remove(5);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add a key");
+        std::fs::write(dir.path().join("cfg.ts"), "const token = process.env.TOKEN;\n").unwrap();
+        commit_all(&repo, "take it out again");
+        for i in 0..210 {
+            std::fs::write(dir.path().join("log.txt"), format!("{i}\n")).unwrap();
+            commit_all(&repo, "more");
+        }
+
+        let c = branch_files(dir.path(), "main").unwrap();
+        assert!(!c.partial);
+        let report = scan_collected(&c, &[]);
+        assert_eq!(report.total, 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].location(), "cfg.ts:1");
     }
 
     #[test]

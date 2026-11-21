@@ -17,8 +17,9 @@ export interface SecretFinding {
   kind: string;
   /** Matched a credential configured in Octopush itself. */
   yours: boolean;
-  /** `sk-ant-…9fQ2`: the provider prefix and the last four characters, to
-   *  tell two keys apart. Absent for a whole-file finding, a private key, a
+  /** `sk-ant-…9fQ2`: the provider prefix (provider token rules only; other
+   *  rules show `…4bYw`) and the last four characters, to tell two keys
+   *  apart. Absent for a whole-file finding, a private key, a
    *  short value and a persisted Direct hold. Only the confirm dialog and
    *  the branch scan show it; summaries never do. */
   preview?: string | null;
@@ -59,7 +60,7 @@ export function secretRefusal(err: unknown): SecretRefusal | null {
 }
 
 /** The masked preview's tooltip, wherever a finding shows one. */
-export const PREVIEW_TIP = "Its prefix and last four characters, to tell keys apart";
+export const PREVIEW_TIP = "Only a provider's prefix and the last four characters, to tell keys apart";
 
 /** Shown whenever a scan didn't reach the end of the change. */
 export const PARTIAL_NOTE = "Scanned the first 16 MB; the rest wasn't checked.";

@@ -46,7 +46,8 @@ use std::sync::LazyLock;
 /// At most this many findings are reported: enough to act on, never a wall.
 pub const MAX_FINDINGS: usize = 50;
 /// A push/PR range longer than this is scanned as one net diff instead of
-/// commit by commit (keeps a long-lived branch fast).
+/// commit by commit (keeps a long-lived branch fast). The on-demand branch
+/// scan has no cap: it promises every commit.
 const MAX_RANGE_COMMITS: usize = 200;
 /// The generic assignment rule looks at the first N bytes of a line only (a
 /// minified bundle line must never stall the commit button). Every other rule
@@ -74,7 +75,8 @@ pub struct SecretFinding {
     pub kind: String,
     /// True when it matched a credential the user configured in Octopush.
     pub yours: bool,
-    /// `sk-ant-…9fQ2`: the provider's public prefix and the last
+    /// `sk-ant-…9fQ2`: the provider's public prefix (prefixed token rules
+    /// and AWS key ids only; `…4bYw` for any other rule) and the last
     /// [`PREVIEW_TAIL`] characters, to tell two keys apart (#820). `None`
     /// for a whole-file finding, a private key or a short value. Never in a
     /// summary, the journal, a log line or a persisted hold.
@@ -99,10 +101,23 @@ static PUBLIC_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// `sk-ant-…9fQ2` for `value`, or `None` when it is too short to show any
-/// of it. Pure.
+/// of it. Only for a value a prefixed token rule (or the AWS key id rule)
+/// matched, where the prefix is the provider's: any other value gets
+/// [`masked_tail`]. Pure.
 pub fn masked_preview(value: &str) -> Option<String> {
     let prefix = PUBLIC_PREFIX.find(value).map(|m| m.as_str()).unwrap_or("");
-    let rest = &value[prefix.len()..];
+    masked(prefix, &value[prefix.len()..])
+}
+
+/// `…4bYw` for `value`: the last [`PREVIEW_TAIL`] characters alone, for a
+/// value no provider prefix vouches for (a `.env` password, an MCP env
+/// value, a generic assignment, one of your own keys), whose first
+/// characters are as secret as the rest. Pure.
+pub fn masked_tail(value: &str) -> Option<String> {
+    masked("", value)
+}
+
+fn masked(prefix: &str, rest: &str) -> Option<String> {
     let n = rest.chars().count();
     if n < MIN_PREVIEW_LEN {
         return None;
@@ -112,9 +127,15 @@ pub fn masked_preview(value: &str) -> Option<String> {
 }
 
 impl SecretFinding {
-    /// This finding with a masked preview of `value`.
+    /// This finding with a masked preview of `value`, provider prefix kept.
     fn masked(mut self, value: &str) -> Self {
         self.preview = masked_preview(value);
+        self
+    }
+
+    /// This finding with a tail-only preview of `value`.
+    fn masked_tail(mut self, value: &str) -> Self {
+        self.preview = masked_tail(value);
         self
     }
 
@@ -925,7 +946,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     claimed.claim(at_byte, at_byte + v.len());
                 }
                 if found {
-                    let f = at("your-credential", k.label.clone(), true).masked(&k.value);
+                    let f = at("your-credential", k.label.clone(), true).masked_tail(&k.value);
                     push_hit(&mut out, &mut seen, f, &k.value, true);
                 }
             }
@@ -975,7 +996,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     if !name.starts_with("NEXT_PUBLIC_") && ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(value) {
                         let (s0, e0) = raw.map(|m| (m.start(), m.end())).unwrap_or((0, line.len()));
                         let shown = claimed.claim(s0, e0);
-                        let f = at("env-credential", format!("credential in a .env file ({name})"), false).masked(value);
+                        let f = at("env-credential", format!("credential in a .env file ({name})"), false).masked_tail(value);
                         push_hit(&mut out, &mut seen, f, value, shown);
                     }
                 }
@@ -986,7 +1007,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     let name = name.as_str();
                     if ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(m.as_str()) {
                         let shown = claimed.claim(m.start(), m.end());
-                        let f = at("mcp-env-credential", format!("credential in an MCP config ({name})"), false).masked(m.as_str());
+                        let f = at("mcp-env-credential", format!("credential in an MCP config ({name})"), false).masked_tail(m.as_str());
                         push_hit(&mut out, &mut seen, f, m.as_str(), shown);
                     }
                 }
@@ -1005,7 +1026,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                         && !(doc_file && JWT.is_match(v));
                     if plausible {
                         let shown = claimed.claim(m.start(), m.end());
-                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false).masked(v), v, shown);
+                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false).masked_tail(v), v, shown);
                     }
                 }
             }
@@ -1330,8 +1351,17 @@ enum RangeBase {
 
 /// The added lines of every commit in the range (each against its first
 /// parent), so a secret added in one commit and removed in the next is still
-/// caught. A range longer than [`MAX_RANGE_COMMITS`] is scanned as one net diff.
-fn range_files(repo: &Repository, base: RangeBase, head: Oid, budget: &mut Budget) -> AppResult<Vec<AddedFile>> {
+/// caught. A range longer than `max_commits` (`Some(MAX_RANGE_COMMITS)` for a
+/// push, a PR or a crew's worktree) is scanned as one net diff; with `None`
+/// (the branch scan, which promises every commit) only the byte budget bounds
+/// it, and running out of it marks the scan partial.
+fn range_files(
+    repo: &Repository,
+    base: RangeBase,
+    head: Oid,
+    max_commits: Option<usize>,
+    budget: &mut Budget,
+) -> AppResult<Vec<AddedFile>> {
     let err = |e: git2::Error| AppError::Other(format!("secret scan: {e}"));
     let mut files = Vec::new();
     let mut walk = repo.revwalk().map_err(err)?;
@@ -1344,8 +1374,11 @@ fn range_files(repo: &Repository, base: RangeBase, head: Oid, budget: &mut Budge
             }
         }
     }
-    let commits: Vec<Oid> = walk.filter_map(|o| o.ok()).take(MAX_RANGE_COMMITS + 1).collect();
-    if commits.len() > MAX_RANGE_COMMITS {
+    let commits: Vec<Oid> = match max_commits {
+        Some(cap) => walk.filter_map(|o| o.ok()).take(cap + 1).collect(),
+        None => walk.filter_map(|o| o.ok()).collect(),
+    };
+    if max_commits.is_some_and(|cap| commits.len() > cap) {
         let from = match base {
             RangeBase::After(h) => Some(tree_of(repo, h)?),
             RangeBase::NotOnAnyRemote => None,
@@ -1406,7 +1439,7 @@ pub fn push_files(path: &Path) -> AppResult<Collected> {
     };
     let base = base_or_unpushed(push_base(&repo, head));
     let mut budget = Budget::new();
-    let files = range_files(&repo, base, head, &mut budget)?;
+    let files = range_files(&repo, base, head, Some(MAX_RANGE_COMMITS), &mut budget)?;
     Ok(budget.into_collected(files, "push"))
 }
 
@@ -1432,7 +1465,7 @@ pub fn pr_files(path: &Path, base: &str) -> AppResult<Collected> {
     };
     let mb = pr_merge_base(&repo, base, head).or_else(|| push_base(&repo, head));
     let mut budget = Budget::new();
-    let files = range_files(&repo, base_or_unpushed(mb), head, &mut budget)?;
+    let files = range_files(&repo, base_or_unpushed(mb), head, Some(MAX_RANGE_COMMITS), &mut budget)?;
     Ok(budget.into_collected(files, "pr"))
 }
 
@@ -1449,7 +1482,7 @@ pub fn branch_files(path: &Path, base: &str) -> AppResult<Collected> {
         return Err(AppError::Other(format!("secret scan: this branch shares no history with {base}")));
     };
     let mut budget = Budget::new();
-    let files = if mb == head { Vec::new() } else { range_files(&repo, RangeBase::After(mb), head, &mut budget)? };
+    let files = if mb == head { Vec::new() } else { range_files(&repo, RangeBase::After(mb), head, None, &mut budget)? };
     Ok(budget.into_collected(files, "history"))
 }
 
@@ -1465,7 +1498,7 @@ pub fn worktree_files(path: &Path, base: Option<&str>) -> AppResult<Collected> {
         Some(h) => {
             let mb = base.and_then(|b| pr_merge_base(&repo, b, h)).or_else(|| push_base(&repo, h));
             // HEAD's own commits only when they aren't on the base already.
-            if mb == Some(h) { Vec::new() } else { range_files(&repo, base_or_unpushed(mb), h, &mut budget)? }
+            if mb == Some(h) { Vec::new() } else { range_files(&repo, base_or_unpushed(mb), h, Some(MAX_RANGE_COMMITS), &mut budget)? }
         }
         None => Vec::new(),
     };

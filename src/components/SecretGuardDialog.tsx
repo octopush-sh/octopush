@@ -70,7 +70,7 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: P
         )}
         <p className="mt-3 text-[12px] leading-relaxed text-octo-sage">
           {yours ? "It matches a key you saved in Octopush. " : ""}
-          {total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one {action === "pr" ? "pull request" : action}. Octopush shows at most its last four characters and never stores the value.
+          {total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one {action === "pr" ? "pull request" : action}. Octopush shows only a provider's prefix and the last four characters, and never stores the value.
         </p>
         <div className="mt-6 flex items-center justify-end gap-3">
           <button
