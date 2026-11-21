@@ -843,6 +843,14 @@ impl Db {
         // #893: how many tool calls Claude Code refused in the stage's last
         // attempt (its result event's `permission_denials`).
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN refused_calls INTEGER NOT NULL DEFAULT 0")?;
+        // #895: the context size of the Claude CLI stage's latest top-level
+        // assistant message (input + cache read + cache write, Talk's
+        // `contextTokens`) and the window of the model that answered it, as
+        // `PersistingSink` last saw them — what the Direct context meter reads,
+        // detached runs included. NULL until the stage's first message, for
+        // Codex/API stages, and (window) when the catalog doesn't list the model.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_tokens INTEGER")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_window INTEGER")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -6619,6 +6627,30 @@ impl Db {
         rows.collect::<Result<_, _>>().map_err(Into::into)
     }
 
+    /// Record a Claude CLI stage's latest context reading (#895): the context
+    /// size of its latest top-level assistant message and the window of the
+    /// model that answered it (`None` when the catalog doesn't know it).
+    /// Written by `PersistingSink`, at most once per message.
+    pub fn set_run_stage_context(&self, stage_id: &str, tokens: i64, window: Option<i64>) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET context_tokens = ?2, context_window = ?3 WHERE id = ?1",
+            params![stage_id, tokens, window],
+        )?;
+        Ok(())
+    }
+
+    /// The run's stages with a context reading: stage id → (tokens, window).
+    pub fn stage_contexts(&self, run_id: &str) -> AppResult<std::collections::HashMap<String, (i64, Option<i64>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, context_tokens, context_window FROM run_stages
+             WHERE run_id = ?1 AND context_tokens IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![run_id], |r| {
+            Ok((r.get::<_, String>(0)?, (r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)))
+        })?;
+        rows.collect::<Result<_, _>>().map_err(Into::into)
+    }
+
     /// Record how many tool calls Claude Code refused in a stage's attempt
     /// (`0` clears an earlier attempt's).
     pub fn set_run_stage_refused_calls(&self, stage_id: &str, count: u32) -> AppResult<()> {
@@ -6650,10 +6682,14 @@ impl Db {
 
     pub fn set_run_stage_status(&self, stage_id: &str, status: &str) -> AppResult<()> {
         let now = Utc::now().to_rfc3339();
-        // Stamp started_at the first time it goes running.
+        // Stamp started_at the first time it goes running. A (re)start also
+        // forgets the last attempt's context reading (#895): the new attempt's
+        // first message brings its own.
         self.conn.execute(
             "UPDATE run_stages SET status = ?2,
-                started_at = COALESCE(started_at, CASE WHEN ?2 = 'running' THEN ?3 ELSE started_at END)
+                started_at = COALESCE(started_at, CASE WHEN ?2 = 'running' THEN ?3 ELSE started_at END),
+                context_tokens = CASE WHEN ?2 = 'running' THEN NULL ELSE context_tokens END,
+                context_window = CASE WHEN ?2 = 'running' THEN NULL ELSE context_window END
              WHERE id = ?1",
             params![stage_id, status, now],
         )?;
@@ -6871,6 +6907,7 @@ impl Db {
              SET status = 'pending', artifact = NULL, error = NULL,
                  started_at = NULL, finished_at = NULL, diff_snapshot = NULL,
                  blocked_questions = NULL, secret_hold = NULL, ran_model = NULL, refused_calls = 0,
+                 context_tokens = NULL, context_window = NULL,
                  input_tokens = 0, output_tokens = 0, cost_usd = 0, feedback = ?2
              WHERE id = ?1",
             params![stage_id, feedback],

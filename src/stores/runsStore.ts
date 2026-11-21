@@ -65,6 +65,11 @@ interface RunsState {
   selectedRunIdByWs: Record<string, string | null>;
   /** Structured live activity entries per stage id, streamed from both substrates. */
   liveByStage: Record<string, LiveEntry[]>;
+  /** The newest `run://context` reading heard per stage id this session
+   *  (#895), a cleared one included. It wins over the stage row's (see
+   *  `currentContext`): a `get_run` refresh can land after a newer event.
+   *  A stage's restart (`clearLog`) forgets it. */
+  liveContextByStage: Record<string, { contextTokens: number | null; contextWindow: number | null }>;
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
@@ -164,6 +169,8 @@ interface RunsState {
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
+  /** Keep one stage's newest context reading (`run://context`, #895). */
+  applyContext: (runId: string, stageId: string, contextTokens: number | null, contextWindow: number | null) => void;
 }
 
 function replaceRunInList(list: Run[], run: Run): Run[] {
@@ -217,6 +224,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   selectedStageByRun: {},
   selectedRunIdByWs: {},
   liveByStage: {},
+  liveContextByStage: {},
   launcherPrefill: null,
   settledAt: {},
   statusSince: {},
@@ -587,11 +595,26 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       return {};
     });
   },
+
+  applyContext: (_runId, stageId, contextTokens, contextWindow) => {
+    set((s) => {
+      const cur = s.liveContextByStage[stageId];
+      if (cur && cur.contextTokens === contextTokens && cur.contextWindow === contextWindow) return {};
+      return { liveContextByStage: { ...s.liveContextByStage, [stageId]: { contextTokens, contextWindow } } };
+    });
+  },
 }));
 
 void listen<{ runId: string; run: Run }>(RUN_EVENTS.stageUpdate, (ev) => {
   useRunsStore.getState().applyStageUpdate(ev.payload.runId, ev.payload.run);
 });
+void listen<{ runId: string; stageId: string; contextTokens: number | null; contextWindow: number | null }>(
+  RUN_EVENTS.context,
+  (ev) =>
+    useRunsStore
+      .getState()
+      .applyContext(ev.payload.runId, ev.payload.stageId, ev.payload.contextTokens, ev.payload.contextWindow),
+);
 void listen<{ runId: string; costUsd: number; baselineUsd: number }>(
   RUN_EVENTS.cost,
   (ev) =>

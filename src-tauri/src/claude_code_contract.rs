@@ -701,6 +701,121 @@ fn stream_json_stopped_stage_prices_a_subagent_at_its_own_model() {
     assert!((out.cost_usd - (opus + haiku)).abs() < 1e-12, "[{fx}] {}", out.cost_usd);
 }
 
+/// #895: the Direct context meter's reading, folded from each recorded
+/// stream exactly as `CliRunner::run` does — input + cache read + cache
+/// write of the latest top-level assistant message, handed on once per
+/// message (the CLI repeats a message's usage on every content block).
+#[test]
+fn stream_json_context_reading_is_the_latest_main_message_prompt() {
+    use crate::orchestrator::cli_runner::ContextWatch;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/tool-use.jsonl");
+        let events = rec.jsonl("stream-json/tool-use.jsonl");
+        let mut watch = ContextWatch::default();
+        let mut lookups: Vec<String> = Vec::new();
+        let mut readings = Vec::new();
+        for e in &events {
+            let window_of = |m: &str| {
+                lookups.push(m.to_string());
+                Some(200_000)
+            };
+            if let Some(r) = watch.observe(e, "claude-haiku-4-5", window_of) {
+                readings.push(r);
+            }
+        }
+        // One reading per distinct main-session message, the last one's prompt.
+        let mut expected: Vec<u64> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in of_type(&events, "assistant") {
+            if !e["parent_tool_use_id"].is_null() {
+                continue;
+            }
+            let id = require_str(&fx, e, "message.id").to_string();
+            let prompt = require_u64(&fx, e, "message.usage.input_tokens")
+                + require_u64(&fx, e, "message.usage.cache_read_input_tokens")
+                + require_u64(&fx, e, "message.usage.cache_creation_input_tokens");
+            if seen.insert(id) && expected.last() != Some(&prompt) {
+                expected.push(prompt);
+            }
+        }
+        assert!(!expected.is_empty(), "[{fx}] no main-session assistant message");
+        assert_eq!(readings.iter().map(|r| r.0).collect::<Vec<_>>(), expected, "[{fx}]");
+        assert!(readings.iter().all(|r| r.1 == Some(200_000)), "[{fx}] {readings:?}");
+        // The window is the stage model's, looked up once, never per event.
+        assert_eq!(lookups, vec!["claude-haiku-4-5".to_string()], "[{fx}]");
+    }
+}
+
+/// #895: a sub-agent's message is its own context, not the stage's; the
+/// CLI's synthetic notices and token-less messages read as no reading; a
+/// model the catalog doesn't list leaves the window unknown (the meter hides).
+#[test]
+fn stream_json_context_reading_skips_subagents_and_synthetic_messages() {
+    use crate::orchestrator::cli_runner::{context_from_stream_event, ContextWatch};
+    let rec = synthesized(SUBAGENT_MODEL_VERSION);
+    let rel = "stream-json/stopped-with-subagent.jsonl";
+    let fx = rec.label(rel);
+    let events = rec.jsonl(rel);
+    let mut watch = ContextWatch::default();
+    let readings: Vec<_> = events
+        .iter()
+        .filter_map(|e| watch.observe(e, "claude-opus-5", |m| (m == "claude-opus-5").then_some(1_000_000)))
+        .collect();
+    assert_eq!(readings, vec![(1_000, Some(1_000_000))], "[{fx}] the Haiku subagent's 20k prompt is not the stage's");
+
+    let synthetic = serde_json::json!({
+        "type": "assistant", "parent_tool_use_id": null,
+        "message": { "id": "m1", "model": "<synthetic>", "content": [],
+                     "usage": { "input_tokens": 5, "output_tokens": 0 } }
+    });
+    assert_eq!(context_from_stream_event(&synthetic), None);
+    let empty = serde_json::json!({
+        "type": "assistant", "message": { "id": "m2", "model": "claude-opus-5", "usage": { "input_tokens": 0 } }
+    });
+    assert_eq!(context_from_stream_event(&empty), None);
+    let unnamed = serde_json::json!({
+        "type": "assistant",
+        "message": { "id": "m3", "usage": { "input_tokens": 3, "cache_read_input_tokens": 40_000, "cache_creation_input_tokens": 2_000 } }
+    });
+    assert_eq!(context_from_stream_event(&unnamed), Some((42_003, None)));
+    let mut watch = ContextWatch::default();
+    assert_eq!(watch.observe(&unnamed, "gateway/unknown-model", |_| None), Some((42_003, None)));
+    assert_eq!(watch.observe(&unnamed, "gateway/unknown-model", |_| None), None, "unchanged: nothing to write");
+    let result = serde_json::json!({ "type": "result", "usage": { "input_tokens": 9 } });
+    assert_eq!(context_from_stream_event(&result), None);
+}
+
+/// #895: the window follows the stage's configured model. A `[1m]` stage is
+/// sized against 1M although its messages' `message.model` drops the suffix
+/// and the catalog lists the base id's window; any other id gets the
+/// catalog's, and an unlisted (or zero) window stays unknown.
+#[test]
+fn stream_json_context_window_follows_a_1m_stage_model() {
+    use crate::orchestrator::cli_runner::{stage_context_window, ContextWatch};
+    let catalog = |m: &str| (crate::token_engine::normalize_model_id(m) == "claude-opus-5-5").then_some(200_000);
+    assert_eq!(stage_context_window("claude-opus-5-5[1m]", catalog), Some(1_000_000));
+    assert_eq!(stage_context_window("sonnet[1M]", |_| None), Some(1_000_000));
+    assert_eq!(stage_context_window("claude-opus-5-5", catalog), Some(200_000));
+    assert_eq!(stage_context_window("claude-mystery-9", |_| None), None);
+    assert_eq!(stage_context_window("claude-zero", |_| Some(0)), None);
+    let message = serde_json::json!({
+        "type": "assistant", "parent_tool_use_id": null,
+        "message": { "id": "m1", "model": "claude-opus-5-5", "usage": { "input_tokens": 12, "cache_read_input_tokens": 399_988 } }
+    });
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5[1m]", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(1_000_000))),
+        "a [1m] stage past 200k is not over its window"
+    );
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(200_000))),
+        "the app hides a reading over its window rather than showing 400k / 200k"
+    );
+}
+
 #[test]
 fn stream_json_argv_flags_are_all_known_to_the_cli() {
     for rec in recordings() {

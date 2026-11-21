@@ -5,7 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
-import { stageTitle, fmtTokens } from "../lib/stageMeta";
+import { stageTitle, fmtTokens, stageContextReading, contextToneClass, currentContext } from "../lib/stageMeta";
 import { formatUsd } from "../lib/cost";
 import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { DiffViewer } from "./DiffViewer";
@@ -103,6 +103,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   /** 1-based archived attempt being viewed; null = the current attempt. */
   const [viewedAttempt, setViewedAttempt] = useState<number | null>(null);
   const liveEntries = useRunsStore((s) => s.liveByStage[stage?.id ?? ""] ?? EMPTY_ENTRIES);
+  const liveContext = useRunsStore((s) => s.liveContextByStage?.[stage?.id ?? ""]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ── Director controls: gate toggle, edit-stage modal, re-run confirm ──
@@ -320,6 +321,11 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // As on the stage card: a stage that is running again (a loop-back attempt)
   // or that an abort cut still carries its previous attempt's count — hide it.
   const refused = stage.status !== "running" && !stageCutByAbort ? stage.refusedCalls ?? 0 : 0;
+  // The context reading (#895) is the current attempt's: a running stage's
+  // live one, a finished stage's final one. Hidden while an archived attempt
+  // is on screen, on a pending stage (a re-run reset it), and whenever the
+  // window is unknown.
+  const ctx = viewedRow || stage.status === "pending" ? null : stageContextReading(currentContext(stage, liveContext));
   const swapKey = viewedRow ? `${stage.id}:attempt-${attemptN}` : `${stage.id}:${mode}`;
 
   return (
@@ -397,6 +403,16 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
                 data-tour="direct-focus-refused"
               >
                 {refusedCallsNote(refused)}
+              </span>
+            )}
+            {ctx && (
+              <span
+                className={`octo-pop-in octo-tabular whitespace-nowrap text-[10px] ${contextToneClass(ctx.tone)}`}
+                title={ctx.title}
+                data-tour="direct-focus-context"
+                data-tone={ctx.tone}
+              >
+                {ctx.label}
               </span>
             )}
             {(stage.inputTokens > 0 || stage.outputTokens > 0) && (

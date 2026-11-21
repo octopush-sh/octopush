@@ -413,3 +413,111 @@ describe("RunFlow — an aborted run (#891)", () => {
     expect(screen.getByTitle("running").textContent).toBe("●");
   });
 });
+
+describe("RunFlow — the running stage's context meter (#895)", () => {
+  const running = (over: Record<string, unknown>) => [
+    mk({ id: "a", status: "running", startedAt: 1, substrate: "cli", agentModel: "claude-opus-5-5", ...over }),
+  ];
+  const ctxEl = (c: HTMLElement) => c.querySelector('[data-tour="direct-stage-context"]')!;
+
+  it("reads ctx N% on the running card, beside the short model name", () => {
+    const { container } = render(
+      <RunFlow stages={running({ contextTokens: 142_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(ctxEl(container)).toHaveTextContent("ctx 71%");
+    expect(ctxEl(container)).toHaveClass("octo-demote", "text-octo-mute");
+    expect(ctxEl(container)).not.toHaveClass("octo-demote-shed");
+    expect(ctxEl(container).getAttribute("title")).toBe("Context: 142k of 200k tokens");
+    const model = screen.getByText("opus-5-5");
+    expect(model.getAttribute("title")).toBe("claude-opus-5-5");
+  });
+
+  it("rounds down on the card: 99.9% reads 99%", () => {
+    const { container } = render(
+      <RunFlow stages={running({ contextTokens: 199_800, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(ctxEl(container)).toHaveTextContent("ctx 99%");
+  });
+
+  it("keeps the full model id on a card that isn't running", () => {
+    const done = [mk({ id: "a", status: "done", substrate: "cli", agentModel: "claude-opus-5-5" })];
+    render(<RunFlow stages={done} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />);
+    expect(screen.getByText("claude-opus-5-5")).toBeInTheDocument();
+  });
+
+  it("turns amber past 80% and rouge past 95%, and a 97%-full reading still fits", () => {
+    const { container, rerender } = render(
+      <RunFlow stages={running({ contextTokens: 170_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(ctxEl(container)).toHaveClass("text-octo-warning");
+    rerender(
+      <RunFlow stages={running({ contextTokens: 194_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(ctxEl(container)).toHaveClass("text-octo-rouge");
+    expect(ctxEl(container)).toHaveAttribute("data-tone", "rouge");
+    expect(ctxEl(container)).toHaveTextContent("ctx 97%");
+    expect(ctxEl(container)).not.toHaveClass("octo-demote-shed");
+  });
+
+  it("stays shed while the window is unknown, the reading is over it, or no message has arrived", () => {
+    for (const over of [
+      { contextTokens: 142_000, contextWindow: null },
+      { contextTokens: 400_000, contextWindow: 200_000 },
+      { contextTokens: null, contextWindow: null },
+    ]) {
+      const { container, unmount } = render(
+        <RunFlow stages={running(over)} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+      );
+      expect(ctxEl(container)).toHaveClass("octo-demote-shed");
+      expect(ctxEl(container)).toHaveTextContent("");
+      expect(container.textContent).not.toMatch(/ctx /);
+      unmount();
+    }
+  });
+
+  it("sheds the reading first, never the short model name, effort or position", () => {
+    const { container } = render(
+      <RunFlow
+        stages={running({ contextTokens: 142_000, contextWindow: 200_000, effort: "high" })}
+        selectedStageId="a"
+        beaconStageId={null}
+        onSelectStage={() => {}}
+      />,
+    );
+    expect(ctxEl(container)).toHaveClass("octo-demote-shed");
+    expect(screen.getByText("high")).toBeInTheDocument();
+    expect(screen.getByText("opus-5-5")).toBeInTheDocument();
+    // Screen readers still get the figures.
+    expect(container.querySelector(".sr-only")?.textContent).toBe("Context: 142k of 200k tokens");
+  });
+
+  it("reads the newest live reading over a stale stage row", () => {
+    (live as any).liveContextByStage = { a: { contextTokens: 180_000, contextWindow: 200_000 } };
+    try {
+      const { container } = render(
+        <RunFlow stages={running({ contextTokens: 120_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+      );
+      expect(ctxEl(container)).toHaveTextContent("ctx 90%");
+    } finally {
+      delete (live as any).liveContextByStage;
+    }
+  });
+
+  it("is not on a finished card, nor on the stage an abort cut", () => {
+    const done = [mk({ id: "a", status: "done", substrate: "cli", contextTokens: 142_000, contextWindow: 200_000 })];
+    const { container, rerender } = render(
+      <RunFlow stages={done} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(container.querySelector('[data-tour="direct-stage-context"]')).toBeNull();
+    rerender(
+      <RunFlow
+        stages={running({ contextTokens: 142_000, contextWindow: 200_000 })}
+        selectedStageId="a"
+        beaconStageId={null}
+        runAborted
+        onSelectStage={() => {}}
+      />,
+    );
+    expect(container.querySelector('[data-tour="direct-stage-context"]')).toBeNull();
+  });
+});

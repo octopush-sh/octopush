@@ -4353,6 +4353,69 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_stage_keeps_its_last_context_reading_until_it_restarts() {
+        // #895: the Direct context meter reads these two columns.
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+            .unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.set_run_stage_context(&stage, 142_000, Some(200_000)).unwrap();
+        db.set_run_stage_context(&stage, 150_000, None).unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(150_000, None)), "the latest reading wins");
+        // Finishing keeps the final value (the focus pane shows it)…
+        db.complete_run_stage(&stage, "done", 1000, 500, 0, 0, 0.12, None).unwrap();
+        db.set_run_stage_status(&stage, "awaiting_checkpoint").unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(150_000, None)));
+        // …a restart forgets it, and so does a re-run's reset.
+        db.set_run_stage_status(&stage, "running").unwrap();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+        db.set_run_stage_context(&stage, 9_000, Some(1_000_000)).unwrap();
+        db.reset_run_stage(&stage, None, None).unwrap();
+        assert!(db.stage_contexts(&run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrate_adds_the_stage_context_columns_to_an_older_database() {
+        // #895: a database from before the context meter has neither column;
+        // opening it adds both, nullable, and its stages read as unknown.
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let (run, stage) = {
+            let db = Db::open(tmp.path()).unwrap();
+            let ws = seed_workspace(&db);
+            let pid = db.insert_pipeline("P", "d", false).unwrap();
+            db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25)
+                .unwrap();
+            let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+            let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+            db.conn_ref()
+                .execute_batch(
+                    "ALTER TABLE run_stages DROP COLUMN context_tokens;
+                     ALTER TABLE run_stages DROP COLUMN context_window;",
+                )
+                .unwrap();
+            (run, stage)
+        };
+        let db = Db::open(tmp.path()).unwrap();
+        let cols: Vec<(String, i64)> = {
+            let mut stmt = db.conn_ref().prepare("PRAGMA table_info(run_stages)").unwrap();
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?))).unwrap();
+            rows.map(Result::unwrap).collect()
+        };
+        for col in ["context_tokens", "context_window"] {
+            let notnull = cols.iter().find(|(n, _)| n == col).unwrap_or_else(|| panic!("{col} missing")).1;
+            assert_eq!(notnull, 0, "{col} must be nullable");
+        }
+        assert!(db.stage_contexts(&run).unwrap().is_empty(), "an older stage has no reading");
+        db.set_run_stage_context(&stage, 42_000, Some(200_000)).unwrap();
+        assert_eq!(db.stage_contexts(&run).unwrap().get(&stage), Some(&(42_000, Some(200_000))));
+    }
+
+    #[test]
     fn check_budget_blocks_only_when_over_a_configured_limit() {
         // Phase 3 backend gate: blocks only when a *configured* budget is at/over
         // its limit; no budget → always allow.
@@ -6908,6 +6971,116 @@ mod orchestrator_tests {
         assert_eq!(outcome, SegmentSpawn::AlreadyRunning);
         // The original lease is untouched — no clobber, no clear.
         assert!(db.lock().beat_worker_lease(&run_id, "w1").unwrap(), "w1 still owns the lease");
+    }
+
+    /// Records every (event, payload) pair a sink is handed.
+    #[derive(Default)]
+    struct PayloadSink {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+    impl EventSink for PayloadSink {
+        fn emit(&self, event: &str, payload: Value) {
+            self.events.lock().push((event.to_string(), payload));
+        }
+    }
+    impl PayloadSink {
+        fn take(&self, event: &str) -> Vec<Value> {
+            let mut all = self.events.lock();
+            let out = all.iter().filter(|(e, _)| e == event).map(|(_, p)| p.clone()).collect();
+            all.clear();
+            out
+        }
+    }
+
+    /// #895: a Claude stage's context reading goes through `PersistingSink`
+    /// onto its stage row (never the journal) and on to the app; for a
+    /// detached run, whose worker has a null live sink, the app's bridge
+    /// re-emits each change it reads back from the row — and a restart's
+    /// cleared reading too.
+    #[tokio::test]
+    async fn a_stage_context_reading_is_kept_on_its_row_and_relayed_for_a_detached_run() {
+        use crate::orchestrator::live::{LiveEmitter, RUN_CONTEXT_EVENT};
+        use crate::orchestrator::persist::PersistingSink;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PCTX", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "claude-opus-5-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        db.lock().set_run_status(&run_id, "running", false).unwrap();
+        assert!(db.lock().stage_contexts(&run_id).unwrap().is_empty(), "no reading before the first message");
+
+        // In process: the row keeps it, the app hears it, the journal doesn't.
+        let app = Arc::new(PayloadSink::default());
+        let in_process = PersistingSink::new(app.clone(), Arc::clone(&db));
+        LiveEmitter::new(&in_process, &run_id, &stage_id).context(142_000, Some(200_000));
+        assert_eq!(db.lock().stage_contexts(&run_id).unwrap().get(&stage_id), Some(&(142_000, Some(200_000))));
+        assert!(db.lock().list_stage_log(&stage_id).unwrap().is_empty(), "a reading is not a journal entry");
+        let fwd = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(fwd.len(), 1);
+        assert_eq!(fwd[0]["stageId"], stage_id.as_str());
+        assert_eq!(fwd[0]["contextTokens"], 142_000);
+        assert_eq!(fwd[0]["contextWindow"], 200_000);
+
+        // Detached: a live worker owns the run; its sink reaches nobody.
+        assert!(db.lock().reserve_worker_lease(&run_id, "w1").unwrap());
+        assert!(db.lock().confirm_worker_lease(&run_id, "w1", std::process::id() as i64).unwrap());
+        let orch = Orchestrator::new_with_runner(
+            Arc::clone(&db),
+            app.clone(),
+            Box::new(RecordingRunner { seen: Arc::new(Mutex::new(vec![])) }),
+        );
+        orch.prime_detached_watch(&run_id);
+        orch.bridge_tick().unwrap();
+        assert!(app.take(RUN_CONTEXT_EVENT).is_empty(), "the primed reading is already the app's (get_run)");
+
+        let worker = PersistingSink::new(Arc::new(PayloadSink::default()), Arc::clone(&db));
+        LiveEmitter::new(&worker, &run_id, &stage_id).context(190_000, Some(200_000));
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1, "{relayed:?}");
+        assert_eq!(relayed[0]["runId"], run_id.as_str());
+        assert_eq!(relayed[0]["stageId"], stage_id.as_str());
+        assert_eq!(relayed[0]["contextTokens"], 190_000);
+        assert_eq!(relayed[0]["contextWindow"], 200_000);
+        // Unchanged: nothing more. An unknown window relays as null.
+        orch.bridge_tick().unwrap();
+        assert!(app.take(RUN_CONTEXT_EVENT).is_empty());
+        LiveEmitter::new(&worker, &run_id, &stage_id).context(12_000, None);
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0]["contextTokens"], 12_000);
+        assert!(relayed[0]["contextWindow"].is_null());
+        // The stage restarts: its reading is gone, and the app is told.
+        db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+        orch.bridge_tick().unwrap();
+        let relayed = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(relayed.len(), 1);
+        assert!(relayed[0]["contextTokens"].is_null(), "{relayed:?}");
+    }
+
+    /// #895: a stage (re)start forgets the last attempt's reading on the row
+    /// AND tells the app so (a cleared `run://context`), so an in-process
+    /// run's newest reading is never the previous attempt's.
+    #[tokio::test]
+    async fn a_stage_start_clears_its_context_reading_and_tells_the_app() {
+        use crate::orchestrator::live::RUN_CONTEXT_EVENT;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PCTX2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_context(&stage_id, 150_000, Some(200_000)).unwrap();
+        let app = Arc::new(PayloadSink::default());
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(app.clone(), Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CostRunner { cost: 0.0 }));
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert!(db.lock().stage_contexts(&run_id).unwrap().is_empty());
+        let cleared = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0]["stageId"], stage_id.as_str());
+        assert!(cleared[0]["contextTokens"].is_null());
     }
 
     /// H4 guard: `rerun_from_stage` must refuse while a detached worker holds

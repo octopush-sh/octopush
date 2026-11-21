@@ -7,6 +7,12 @@ use serde_json::{json, Value};
 /// Frontend event name for live per-stage activity (mirrors `RUN_EVENTS.log`).
 pub const RUN_LOG_EVENT: &str = "run://log";
 
+/// Frontend event name for a Claude CLI stage's latest context reading
+/// (mirrors `RUN_EVENTS.context`, #895). Not a journal entry:
+/// `PersistingSink` keeps it on the stage row, and the detached bridge
+/// re-emits it from there.
+pub const RUN_CONTEXT_EVENT: &str = "run://context";
+
 /// Tool-input keys to surface as the one-line hint, in priority order.
 const TOOL_HINT_KEYS: &[&str] = &["command", "file_path", "path", "pattern", "query", "url", "prompt"];
 
@@ -53,6 +59,21 @@ impl<'a> LiveEmitter<'a> {
     /// entry: `PersistingSink` keeps them as the plan snapshot.
     pub fn plan_windows(&self, windows: &[crate::orchestrator::cli_runner::PlanWindow]) {
         self.events.emit(crate::claude_plan::PLAN_EVENT, json!({ "windows": windows }));
+    }
+    /// The stage's latest context reading: the context size of its latest
+    /// top-level assistant message and the window of the model that answered
+    /// (`None`: unknown, the meter stays hidden). Not a journal entry —
+    /// `PersistingSink` keeps it on the stage row (#895).
+    pub fn context(&self, tokens: u64, window: Option<u64>) {
+        self.events.emit(
+            RUN_CONTEXT_EVENT,
+            json!({
+                "runId": self.run_id,
+                "stageId": self.stage_id,
+                "contextTokens": tokens,
+                "contextWindow": window,
+            }),
+        );
     }
     /// When the claude.ai sign-in ends (a `result` event's
     /// `credential_expires_at`) — `PersistingSink` keeps it (`claude_login`).

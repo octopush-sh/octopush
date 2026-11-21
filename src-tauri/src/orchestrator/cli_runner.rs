@@ -162,6 +162,98 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
     ))
 }
 
+// ─── Context size (the Direct stage context meter, #895) ─────────────────
+
+/// The context size of one top-level `assistant` stream event: input + cache
+/// read + cache write — the size of the prompt that message answered, the
+/// same definition as Talk's `contextTokens` — with the message's own
+/// `message.model` (`None` when it names none). `None` for any other event,
+/// for a sub-agent's message (`parent_tool_use_id` set: its context is its
+/// own, not the stage's), for the CLI's synthetic notices
+/// (`model: "<synthetic>"`) and for a message with no prompt tokens.
+pub(crate) fn context_from_stream_event(v: &Value) -> Option<(u64, Option<String>)> {
+    if v.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    if v.get("parent_tool_use_id").is_some_and(|p| !p.is_null()) {
+        return None;
+    }
+    let msg = v.get("message")?;
+    let model = msg.get("model").and_then(Value::as_str).filter(|m| !m.is_empty());
+    if model == Some("<synthetic>") {
+        return None;
+    }
+    let u = msg.get("usage")?;
+    let g = |k: &str| u.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let tokens = g("input_tokens") + g("cache_read_input_tokens") + g("cache_creation_input_tokens");
+    (tokens > 0).then(|| (tokens, model.map(str::to_string)))
+}
+
+/// The window Claude Code gives a model id that carries the `[1m]`
+/// capability suffix (`claude-opus-5-5[1m]`, `sonnet[1m]`).
+const ONE_M_CONTEXT: u64 = 1_000_000;
+
+/// True when a model id asks for the 1M window (`[1m]`, any case).
+pub(crate) fn has_1m_suffix(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("[1m]")
+}
+
+/// The context window of the model a stage runs on (`model`: the stage's
+/// configured model, or the one Claude Code ran it on instead): 1M when the
+/// id carries `[1m]` — the catalog lists the base id's window, which that
+/// session doesn't have — else `catalog`'s window for it. `None` when
+/// unknown: the meter is then hidden, never drawn against a guessed 200k.
+/// Pure.
+pub(crate) fn stage_context_window(model: &str, catalog: impl FnOnce(&str) -> Option<u64>) -> Option<u64> {
+    if has_1m_suffix(model) {
+        return Some(ONE_M_CONTEXT);
+    }
+    catalog(model).filter(|w| *w > 0)
+}
+
+/// A model's context window from the provider catalog (the one Talk's meter
+/// and Run's Context section read, gateway and custom entries included),
+/// through [`stage_context_window`].
+pub(crate) fn catalog_context_window(model: &str) -> Option<u64> {
+    stage_context_window(model, |m| {
+        crate::token_engine::catalog().and_then(|r| r.find_model(m).map(|(_, info)| info.max_context))
+    })
+}
+
+/// Folds a Claude stage's stream into its latest context reading. The CLI
+/// sends one `assistant` event per content block, each repeating its
+/// message's usage, so a reading is handed on only when it CHANGED: at most
+/// one per message, never a DB write per block.
+#[derive(Default, Debug)]
+pub(crate) struct ContextWatch {
+    last: Option<(u64, Option<u64>)>,
+    windows: std::collections::HashMap<String, Option<u64>>,
+}
+
+impl ContextWatch {
+    /// Feed one stream event. `window_model` is the model whose window the
+    /// stage has — its configured model (a `[1m]` id included), or the one
+    /// Claude Code ran it on instead — never the message's `message.model`,
+    /// which drops the `[1m]` suffix. `window_of` looks a model's window up
+    /// (once per model). Returns the reading to persist — `(tokens, window)`
+    /// — when it changed.
+    pub(crate) fn observe(
+        &mut self,
+        v: &Value,
+        window_model: &str,
+        window_of: impl FnOnce(&str) -> Option<u64>,
+    ) -> Option<(u64, Option<u64>)> {
+        let (tokens, _) = context_from_stream_event(v)?;
+        let window = *self.windows.entry(window_model.to_string()).or_insert_with_key(|m| window_of(m));
+        let reading = (tokens, window);
+        if self.last == Some(reading) {
+            return None;
+        }
+        self.last = Some(reading);
+        Some(reading)
+    }
+}
+
 // ─── Claude plan windows (`rate_limit_event`) ────────────────────────────
 //
 // A subscription-authenticated (`claude login`, Pro/Max) CLI streams
@@ -3319,6 +3411,10 @@ impl CliRunner {
         let ran_model: std::sync::Arc<parking_lot::Mutex<Option<String>>> =
             std::sync::Arc::new(parking_lot::Mutex::new(None));
         let ran_in_loop = std::sync::Arc::clone(&ran_model);
+        // The stage's latest context reading, handed to `PersistingSink` once
+        // per message (#895). Claude only: Codex's stream has no per-message
+        // prompt size, so its meter stays hidden.
+        let mut context_watch = ContextWatch::default();
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
                 if let Some(ran) = substituted_model(&stage.agent_model, value) {
@@ -3330,6 +3426,12 @@ impl CliRunner {
                     let mut map = usage_in_loop.lock();
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
                     map.insert(key, u);
+                }
+                // The window follows the stage's configured model (its `[1m]`
+                // suffix included), or the model Claude Code ran it on instead.
+                let window_model = ran_in_loop.lock().clone().unwrap_or_else(|| stage.agent_model.clone());
+                if let Some((tokens, window)) = context_watch.observe(value, &window_model, catalog_context_window) {
+                    emitter.context(tokens, window);
                 }
                 if retry_throttle.allow(value, std::time::Instant::now()) {
                     for entry in crate::orchestrator::live::entries_from_stream_event(value) {

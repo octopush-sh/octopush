@@ -33,7 +33,7 @@ const baseStage = {
 
 describe("StageFocus live journal", () => {
   beforeEach(() => {
-    useRunsStore.setState({ liveByStage: {} });
+    useRunsStore.setState({ liveByStage: {}, liveContextByStage: {} });
     vi.mocked(ipc.getStageLog).mockResolvedValue([]);
     vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
   });
@@ -211,6 +211,50 @@ describe("StageFocus live journal", () => {
     const artifact = JSON.stringify({ kind: "note", text: "final artifact text" });
     render(<StageFocus stage={{ ...baseStage, status: "done", artifact }} workspacePath="/tmp" />);
     expect(screen.queryByRole("button", { name: /work journal/i })).not.toBeInTheDocument();
+  });
+
+  it("shows the stage's context reading in the header, toned, running or finished (#895)", () => {
+    const { container, rerender } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 142_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    const ctx = () => container.querySelector('[data-tour="direct-focus-context"]');
+    expect(ctx()).toHaveTextContent("ctx 142k / 200k");
+    expect(ctx()).toHaveClass("text-octo-mute");
+    rerender(
+      <StageFocus stage={{ ...baseStage, contextTokens: 194_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    expect(ctx()).toHaveClass("text-octo-rouge");
+    // A finished stage keeps its final reading here.
+    rerender(
+      <StageFocus
+        stage={{ ...baseStage, status: "done", artifact: JSON.stringify({ kind: "note", text: "ok" }), contextTokens: 170_000, contextWindow: 200_000 }}
+        workspacePath="/tmp"
+      />,
+    );
+    expect(ctx()).toHaveTextContent("ctx 170k / 200k");
+    expect(ctx()).toHaveClass("text-octo-warning");
+  });
+
+  it("prefers the newest live reading, and hides a pending stage's or an over-window one (#895)", () => {
+    useRunsStore.setState({ liveContextByStage: { st1: { contextTokens: 180_000, contextWindow: 200_000 } } });
+    const { container, rerender } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    const ctx = () => container.querySelector('[data-tour="direct-focus-context"]');
+    expect(ctx()).toHaveTextContent("ctx 180k / 200k");
+    useRunsStore.setState({ liveContextByStage: {} });
+    rerender(<StageFocus stage={{ ...baseStage, status: "pending", contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
+    rerender(<StageFocus stage={{ ...baseStage, contextTokens: 400_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
+  });
+
+  it("hides the context reading when the model's window is unknown (#895)", () => {
+    const { container } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 142_000, contextWindow: null }} workspacePath="/tmp" />,
+    );
+    expect(container.querySelector('[data-tour="direct-focus-context"]')).toBeNull();
+    expect(container.textContent).not.toMatch(/ctx /);
   });
 
   it("says in the header how many tool calls Claude Code refused, in amber (#893)", () => {

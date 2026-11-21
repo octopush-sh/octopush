@@ -183,6 +183,23 @@ describe("runsStore", () => {
     expect(useRunsStore.getState().getRuns("w1")[0].costUsd).toBe(0.05);
   });
 
+  it("applyContext keeps the newest reading, which a later get_run refresh can't undo (#895)", () => {
+    useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [STAGE] } }, liveContextByStage: {} });
+    useRunsStore.getState().applyContext("r1", STAGE.id, 142_000, 200_000);
+    expect(useRunsStore.getState().liveContextByStage[STAGE.id]).toEqual({ contextTokens: 142_000, contextWindow: 200_000 });
+    const before = useRunsStore.getState().liveContextByStage;
+    useRunsStore.getState().applyContext("r1", STAGE.id, 142_000, 200_000);
+    expect(useRunsStore.getState().liveContextByStage).toBe(before); // unchanged: no re-render
+    // A refresh landing late with the row's older value leaves the live reading alone.
+    useRunsStore.setState({
+      detailByRun: { r1: { run: RUN, stages: [{ ...STAGE, contextTokens: 100_000, contextWindow: 200_000 }] } },
+    });
+    expect(useRunsStore.getState().liveContextByStage[STAGE.id]?.contextTokens).toBe(142_000);
+    // A cleared reading (a stage start) is kept as cleared.
+    useRunsStore.getState().applyContext("r1", STAGE.id, null, null);
+    expect(useRunsStore.getState().liveContextByStage[STAGE.id]).toEqual({ contextTokens: null, contextWindow: null });
+  });
+
   it("loadRuns marks the workspace as loaded", async () => {
     (ipc.listRuns as any).mockResolvedValue([]);
     expect((useRunsStore.getState() as any).loadedByWs["w1"]).toBeUndefined();
