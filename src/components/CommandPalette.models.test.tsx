@@ -155,6 +155,43 @@ describe("CommandPalette · Models group", () => {
     expect(input).toHaveAttribute("aria-activedescendant", next!.id);
   });
 
+  it("ignores a held Enter's repeats after Show all models (#908)", async () => {
+    const { ipc } = await import("../lib/ipc");
+    const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>
+      model(`m${i}`, n, "openrouter"),
+    );
+    vi.mocked(ipc.listModels).mockResolvedValueOnce(many);
+    const onClose = vi.fn();
+    await act(async () => {
+      render(<CommandPalette open onClose={onClose} onNewSession={vi.fn()} onToggleTokens={vi.fn()} />);
+    });
+    const input = screen.getByPlaceholderText("Type a command, or search…");
+    for (let n = 0; n < 20; n++) {
+      const sel = document.querySelector('[cmdk-item][aria-selected="true"]');
+      if (sel?.textContent?.includes("Show all models")) break;
+      await act(async () => {
+        fireEvent.keyDown(input, { key: "ArrowDown" });
+      });
+    }
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    await act(async () => {});
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("DeepSeek V3");
+    // The key is still down: its repeats must not run the revealed model.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter", repeat: true });
+      fireEvent.keyDown(input, { key: "Enter", repeat: true });
+    });
+    expect(onClose).not.toHaveBeenCalled();
+    expect(document.querySelector('[cmdk-item][aria-selected="true"]')).toHaveTextContent("DeepSeek V3");
+    // A fresh press still picks it.
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter" });
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
   it("resets the query and the expanded list on close, before a reopen paints (#897)", async () => {
     const { ipc } = await import("../lib/ipc");
     const many = ["Llama 3", "Qwen 2.5", "GPT-4o mini", "DeepSeek V3", "Mistral Large"].map((n, i) =>

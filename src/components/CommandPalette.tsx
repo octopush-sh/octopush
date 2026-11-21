@@ -146,6 +146,13 @@ export function CommandPalette({
           filter={paletteFilter}
           value={selected}
           onValueChange={setSelected}
+          // A held Enter must act once. Every other row closes the palette,
+          // but "Show all models" hands the selection to the first revealed
+          // model, so a key repeat would switch to it (#908). cmdk skips a
+          // keydown whose default is prevented.
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && e.repeat) e.preventDefault();
+          }}
           className="overflow-hidden rounded-xl"
         >
           <div className="flex items-center gap-3 border-b border-octo-hairline px-4 py-3">
