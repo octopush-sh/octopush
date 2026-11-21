@@ -20335,7 +20335,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
         assert!(notes.is_empty());
     }
 
@@ -20353,7 +20353,7 @@ mod cli_command_idle_tests {
         let (end, _, took) = read(vec![Some(tool_use("toolu_1", "Read", ""))], Duration::ZERO, false, CliDialect::Claude).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(idle_timeout_message(&stall), "timed out — Read gave no result for 1 minute");
+        assert_eq!(idle_timeout_message(&stall, None), "timed out — Read gave no result for 1 minute");
     }
 
     #[tokio::test]
@@ -20362,7 +20362,7 @@ mod cli_command_idle_tests {
             read(vec![Some(tool_use("toolu_1", "Bash", "npm test"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < LIMITS.command_idle, "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
         assert!(notes.is_empty());
     }
 
@@ -20408,7 +20408,7 @@ mod cli_command_idle_tests {
         .await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < Duration::from_millis(1500), "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
     }
 
     #[tokio::test]
@@ -20417,7 +20417,7 @@ mod cli_command_idle_tests {
         let (end, _, took) = read(vec![Some(bare)], Duration::ZERO, false, CliDialect::Claude).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < Duration::from_millis(1500), "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
     }
 
     #[tokio::test]
@@ -20425,7 +20425,7 @@ mod cli_command_idle_tests {
         let (end, _, took) = read(vec![Some(api_retry(5000, "overloaded"))], Duration::ZERO, false, CliDialect::Codex).await;
         let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
         assert!(took < Duration::from_millis(1500), "{took:?}");
-        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None });
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: false });
     }
 
     #[test]
@@ -20443,12 +20443,17 @@ mod cli_command_idle_tests {
 
     #[test]
     fn a_stall_after_a_retry_names_it() {
-        let stall = |c: &str| IdleStall { tool: None, window: Duration::from_secs(600), after_retry: Some(c.into()) };
+        let stall = |c: &str| IdleStall {
+            tool: None,
+            window: Duration::from_secs(600),
+            after_retry: Some(c.into()),
+            before_first_request: false,
+        };
         assert_eq!(
-            idle_timeout_message(&stall("overloaded")),
+            idle_timeout_message(&stall("overloaded"), None),
             "timed out — no output for 10 minutes after an API retry (overloaded)"
         );
-        assert_eq!(idle_timeout_message(&stall("")), "timed out — no output for 10 minutes after an API retry");
+        assert_eq!(idle_timeout_message(&stall(""), None), "timed out — no output for 10 minutes after an API retry");
     }
 
     #[test]
@@ -20499,14 +20504,74 @@ mod cli_command_idle_tests {
     fn idle_messages_name_the_open_call() {
         let bash = OpenTool { id: "a".into(), name: "Bash".into(), command: Some("npm test".into()) };
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None }),
+            idle_timeout_message(
+                &IdleStall { tool: Some(bash), window: Duration::from_secs(660), after_retry: None, before_first_request: false },
+                None
+            ),
             "timed out — Bash `npm test` gave no result for 11 minutes"
         );
         assert_eq!(
-            idle_timeout_message(&IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None }),
-            "timed out — no output for 5 minutes"
+            idle_timeout_message(
+                &IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None, before_first_request: false },
+                Some("2.1.300")
+            ),
+            "timed out — no output for 5 minutes",
+            "a stall after start-up keeps its message on an old CLI"
         );
         assert_eq!(long_command_notice(Duration::from_secs(660)), "waiting on a long command (up to 11 min)");
+    }
+
+    fn init() -> Value {
+        json!({"type": "system", "subtype": "init", "session_id": "s", "model": "claude-sonnet-5-5"})
+    }
+
+    #[tokio::test]
+    async fn an_init_only_stream_stalls_before_the_first_request() {
+        let status = json!({"type": "system", "subtype": "status"});
+        let (end, _, _) = read(vec![Some(init()), Some(status)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert_eq!(stall, IdleStall { tool: None, window: LIMITS.idle, after_retry: None, before_first_request: true });
+    }
+
+    #[tokio::test]
+    async fn any_sign_of_a_request_after_init_ends_start_up() {
+        let text = json!({"type": "assistant", "message": {"id": "msg_1", "content": [{"type": "text", "text": "hi"}]}});
+        let delta = json!({"type": "stream_event", "event": {"type": "message_start"}});
+        let limits = json!({"type": "rate_limit_event", "session_id": "s"});
+        for line in [text, delta, limits, api_retry(0, "overloaded")] {
+            let (end, _, _) =
+                read(vec![Some(init()), Some(line.clone()), Some(init())], Duration::ZERO, false, CliDialect::Claude).await;
+            let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+            assert!(!stall.before_first_request, "{line}");
+        }
+    }
+
+    #[tokio::test]
+    async fn without_an_init_or_on_codex_a_stall_is_not_named_pre_request() {
+        let status = json!({"type": "system", "subtype": "status"});
+        let (end, _, _) = read(vec![Some(status)], Duration::ZERO, false, CliDialect::Claude).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(!stall.before_first_request);
+        let (end, _, _) = read(vec![Some(init())], Duration::ZERO, false, CliDialect::Codex).await;
+        let ReadEnd::Idle(_, _, stall) = end else { panic!("got {end:?}") };
+        assert!(!stall.before_first_request);
+    }
+
+    #[test]
+    fn a_stall_before_the_first_request_names_it_and_the_fix_on_an_old_cli() {
+        let stall = IdleStall { tool: None, window: Duration::from_secs(300), after_retry: None, before_first_request: true };
+        let plain = "timed out — Claude Code sent no request in 5 minutes";
+        assert_eq!(
+            idle_timeout_message(&stall, Some("2.1.326")),
+            format!(
+                "{plain}; Claude Code 2.1.327 fixes a hang before the first request when a model's settings fetch \
+                 stalls (for example at a proxy). Update Claude Code"
+            )
+        );
+        assert_eq!(idle_timeout_message(&stall, Some("2.1.327")), plain, "the fixed CLI");
+        assert_eq!(idle_timeout_message(&stall, Some("2.2.0")), plain, "a newer CLI");
+        assert_eq!(idle_timeout_message(&stall, None), plain, "an unknown version never names the update");
+        assert_eq!(idle_timeout_message(&stall, Some("garbage")), plain);
     }
 }
 
