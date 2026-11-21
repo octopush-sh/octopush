@@ -189,8 +189,20 @@ function flush() {
   const batch = [...dirty].filter((t) => t.box.isConnected);
   dirty.clear();
   for (const t of batch) reset(t.box, t.head); // writes
-  const cuts = batch.map((t) => measureCut(t.box, t.head, t.ell)); // reads
+  const cuts = batch.map((t) => safeCut(t.box, t.head, t.ell)); // reads
   batch.forEach((t, i) => applyCut(t.box, t.head, cuts[i])); // writes
+}
+
+/** `measureCut` that cannot strand the batch (#865): a throw from one box
+ *  would skip every `applyCut` after `reset`, leaving each head held at
+ *  `text-overflow: clip` — text cut with no ellipsis, row after row. A box
+ *  that can't be measured keeps the plain CSS ellipsis instead. */
+function safeCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null): number | null {
+  try {
+    return measureCut(box, head, ell);
+  } catch {
+    return null;
+  }
 }
 
 /** The element whose width actually bounds the box: the nearest ancestor
@@ -245,7 +257,7 @@ function sizedByContent(el: HTMLElement): boolean {
  *  instance (`flush`). */
 export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
   reset(box, head);
-  applyCut(box, head, measureCut(box, head, ellOf(box)));
+  applyCut(box, head, safeCut(box, head, ellOf(box)));
 }
 
 function ellOf(box: HTMLElement): HTMLElement | null {
