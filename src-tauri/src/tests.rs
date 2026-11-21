@@ -4252,6 +4252,34 @@ mod run_crud_tests {
     }
 
     #[test]
+    fn a_rerun_after_an_unreported_attempt_is_labelled_by_its_own_usage() {
+        // #860: the sticky flag from an earlier attempt must not label a later
+        // attempt's $0-with-tokens row "unpriced".
+        let db = test_db();
+        let ws = seed_workspace(&db);
+        let pid = db.insert_pipeline("P", "d", false).unwrap();
+        db.insert_pipeline_stage(&pid, 0, "implement", "claude-opus-4-6", "api", false, None, 0, None, 25).unwrap();
+        let run = db.create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage = db.list_run_stages(&run).unwrap()[0].id.clone();
+        let bases = || -> Vec<String> {
+            let conn = db.conn_ref();
+            let mut stmt = conn
+                .prepare("SELECT cost_basis FROM spend_events WHERE source_id = ?1 ORDER BY ts_utc")
+                .unwrap();
+            stmt.query_map([&stage], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+        };
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.set_run_stage_usage_unreported(&stage).unwrap();
+        db.complete_run_stage(&stage, "failed", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        // The re-run reports its usage: its row is labelled by its own model.
+        db.set_run_stage_status(&stage, "running").unwrap();
+        db.complete_run_stage(&stage, "done", 2_000, 200, 0, 0, 0.0, None).unwrap();
+        assert_eq!(bases(), vec!["unpriced".to_string(), "computed".to_string()]);
+        assert!(db.usage_unreported_stage_ids(&run).unwrap().contains(&stage), "the stage stays flagged");
+    }
+
+    #[test]
     fn retire_stage_cost_accumulates_on_the_run() {
         let db = test_db();
         let ws = seed_workspace(&db);
