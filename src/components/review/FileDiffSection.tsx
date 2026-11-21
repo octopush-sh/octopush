@@ -99,7 +99,10 @@ export function FileDiffSection({
       {/* ── File header row ─────────────────────────────────────────── */}
       {/* The path is the only elastic item (middle-truncated, tail pinned);
           every other atom is flex-none + nowrap, and the hunk count is the
-          first to go when the column narrows (`.octo-filehead`, styles.css). */}
+          first to go when the column narrows (`.octo-filehead`, styles.css).
+          Its cell is `flex-1 min-w-0`, so the box elides into a DEFINITE
+          width (design-system E1): a cell sized from its own text left
+          WebKit cutting the path's head with no ellipsis (#868). */}
       <div className="octo-filehead flex items-center gap-2 border-b border-octo-hairline pb-1.5">
         <span
           className={`flex-none whitespace-nowrap font-mono text-[9px] font-semibold uppercase tracking-[0.2em] ${typeColor}`}
@@ -109,7 +112,7 @@ export function FileDiffSection({
         <span className="flex-none text-octo-hairline">·</span>
         <span
           title={file.filePath}
-          className="flex min-w-0 font-mono text-[12.5px] text-octo-ivory"
+          className="flex min-w-0 flex-1 font-mono text-[12.5px] text-octo-ivory"
         >
           <MidTruncate text={file.filePath} tail={pathTail(file.filePath)} />
         </span>

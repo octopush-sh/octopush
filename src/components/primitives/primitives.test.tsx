@@ -220,7 +220,7 @@ describe("MidTruncate — review fixes (#807)", () => {
 
   const text = "Production deploy (octopush-web)-12345";
   const ROW = { display: "flex" } as const;
-  const SHRINK = { display: "flex", minWidth: 0 } as const; // FileDiffSection's path cell
+  const SHRINK = { display: "flex", minWidth: 0 } as const; // a cell that doesn't grow
   const fire = (target: Element, width: number) =>
     act(() => resize!([{ target, contentRect: { width } } as unknown as ResizeObserverEntry], {} as ResizeObserver));
 
