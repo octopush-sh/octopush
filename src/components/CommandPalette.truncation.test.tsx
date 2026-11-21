@@ -121,10 +121,26 @@ describe("CommandPalette · long names keep their ellipsis (#873)", () => {
       expect(head.style.textOverflow).toBe("");
       expect(head.style.maxWidth).toMatch(/px$/);
     }
-    // The meta line the audit flagged, head and pinned tail.
+    // The meta line the audit flagged, head and pinned tail. With one project
+    // open the line is the bare branch; the title still names the project (#935).
     const meta = document.querySelector<HTMLElement>(`[data-tour="palette-workspaces"] [title^="${PROJECT} · feature/settlement"]`)!;
-    expect(meta.querySelector(".octo-midtrunc-head")!.textContent).toMatch(new RegExp(`^${PROJECT} · `));
+    expect(meta.querySelector(".octo-midtrunc-head")!.textContent).toMatch(/^feature\/settlement/);
+    expect(meta.textContent).not.toContain(PROJECT);
     expect(meta.querySelector(".octo-midtrunc-tail")!.textContent!.length).toBe(16);
+  });
+
+  it("leaves the shared project out of every meta line, so similar branches stay apart (#935)", async () => {
+    await renderPalette();
+    const lines = Array.from(
+      document.querySelectorAll<HTMLElement>('[data-testid="palette-workspace"] span.flex-col > span:last-child'),
+    );
+    expect(lines).toHaveLength(2);
+    for (const line of lines) {
+      expect(line.getAttribute("title")).toMatch(new RegExp(`^${PROJECT} · `));
+      expect(line.textContent).not.toContain(PROJECT);
+    }
+    // A grouped mission keeps its group ahead of the branch.
+    expect(lines.map((l) => l.textContent!.startsWith("Fixes for"))).toContain(true);
   });
 
   it("gives every line a definite width to elide into", async () => {
