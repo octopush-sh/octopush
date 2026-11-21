@@ -11,7 +11,8 @@
 //! lengths, AWS access key ids only next to a secret key, PEM private keys
 //! only with key material under the header, `.env` files and MCP configs'
 //! `env` entries only for credential-named variables, a few files by name
-//! (`id_rsa`, `*.pem`, `.claude/settings.local.json`), an entropy-gated
+//! (`id_rsa`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `*.jks`,
+//! `.claude/settings.local.json`), an entropy-gated
 //! generic assignment rule (with its own path for 32+ char hex values) kept
 //! out of test paths, and an exact-value canary for the credentials Octopush
 //! itself holds (provider keys, git tokens, the Jira token).
@@ -665,8 +666,16 @@ fn sensitive_file(path: &str) -> Option<(&'static str, &'static str)> {
     if matches!(base, "id_rsa" | "id_dsa" | "id_ecdsa" | "id_ed25519" | "id_ecdsa_sk" | "id_ed25519_sk") {
         return Some(("ssh-private-key-file", "SSH private key file"));
     }
-    if base.to_ascii_lowercase().ends_with(".pem") {
+    let lower = base.to_ascii_lowercase();
+    if lower.ends_with(".pem") {
         return Some(("pem-file", "PEM file"));
+    }
+    if [".p12", ".pfx", ".jks"].iter().any(|e| lower.ends_with(e)) {
+        return Some(("keystore-file", "certificate or keystore file"));
+    }
+    // A zip `.key` is a Keynote document: `scan_hits` skips it.
+    if lower.ends_with(".key") {
+        return Some(("key-file", "private key file"));
     }
     if path == ".claude/settings.local.json" || path.ends_with("/.claude/settings.local.json") {
         return Some(("claude-local-settings", "Claude Code local settings"));
@@ -674,10 +683,16 @@ fn sensitive_file(path: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
-/// A project MCP config: Claude Code's `.mcp.json`, Cursor's `.cursor/mcp.json`.
+/// A project MCP config: Claude Code's `.mcp.json` or `.claude/mcp.json`,
+/// Cursor's `.cursor/mcp.json`, VS Code's `.vscode/mcp.json`.
 fn is_mcp_config(path: &str) -> bool {
-    [".mcp.json", ".cursor/mcp.json"].iter().any(|f| path == *f || path.ends_with(&format!("/{f}")))
+    [".mcp.json", ".claude/mcp.json", ".cursor/mcp.json", ".vscode/mcp.json"]
+        .iter()
+        .any(|f| path == *f || path.ends_with(&format!("/{f}")))
 }
+
+/// The zip local-file signature: a Keynote document (`.key`) starts with it.
+const ZIP_MAGIC: &[u8; 4] = b"PK\x03\x04";
 
 /// A hex value of 32+ characters: below the generic rule's 4 bits/char by
 /// construction, so it gets its own path.
@@ -742,6 +757,9 @@ pub struct AddedFile {
     /// read from the file's new side: the lines right after `lines[i]`,
     /// keyed by `i`.
     pub unchanged: BTreeMap<usize, Vec<String>>,
+    /// The new side starts like a zip archive ([`ZIP_MAGIC`]). Read only for
+    /// a `*.key` file: a zip one is a Keynote document, not a key.
+    pub zip: bool,
 }
 
 type SeenKey = (String, Option<u32>, String, [u8; 32]);
@@ -965,13 +983,30 @@ fn new_side(repo: &Repository, path: &str, id: Oid) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+/// Whether the new side of `path` starts with [`ZIP_MAGIC`]: its blob, or
+/// the worktree file when git holds no blob for it. Reads four bytes of a
+/// worktree file, never more.
+fn starts_like_zip(repo: &Repository, path: &str, id: Oid) -> bool {
+    if let Some(b) = (!id.is_zero()).then(|| repo.find_blob(id).ok()).flatten() {
+        return b.content().starts_with(ZIP_MAGIC);
+    }
+    let Some(p) = repo.workdir().map(|w| w.join(path)) else { return false };
+    if !std::fs::symlink_metadata(&p).map(|m| m.is_file()).unwrap_or(false) {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    std::fs::File::open(&p)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut head))
+        .is_ok_and(|()| &head == ZIP_MAGIC)
+}
+
 /// Every hit in `files`, uncapped (the fingerprint covers all of them).
 fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
     let mut out = Vec::new();
     let mut seen = HashSet::new();
     for file in files {
         let path = file.path.as_str();
-        if let Some((rule, kind)) = sensitive_file(path).filter(|_| file.is_new) {
+        if let Some((rule, kind)) = sensitive_file(path).filter(|(r, _)| file.is_new && !(*r == "key-file" && file.zip)) {
             let body: String = file.lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
             push_hit(&mut out, &mut seen, SecretFinding {
                 file: path.into(), line: None, rule: rule.into(), kind: kind.into(), yours: false, preview: None,
@@ -1319,13 +1354,18 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             order.push(None);
             continue;
         };
-        order.push(Some((path.clone(), delta.new_file().id())));
+        let id = delta.new_file().id();
+        order.push(Some((path.clone(), id)));
         let is_new = matches!(delta.status(), Delta::Added | Delta::Untracked);
+        let zip = is_new && path.to_ascii_lowercase().ends_with(".key") && starts_like_zip(repo, &path, id);
         match index.get(&path) {
-            Some(&i) => files[i].is_new |= is_new,
+            Some(&i) => {
+                files[i].is_new |= is_new;
+                files[i].zip |= zip;
+            }
             None => {
                 index.insert(path.clone(), files.len());
-                files.push(AddedFile { path, is_new, ..Default::default() });
+                files.push(AddedFile { path, is_new, zip, ..Default::default() });
             }
         }
     }

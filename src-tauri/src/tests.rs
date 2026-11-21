@@ -21428,6 +21428,50 @@ mod secret_guard_tests {
     }
 
     #[test]
+    fn a_newly_added_key_or_keystore_file_is_flagged_by_name() {
+        let new = |p: &str| AddedFile { path: p.into(), is_new: true, ..Default::default() };
+        for (path, rule, kind) in [
+            ("certs/server.p12", "keystore-file", "certificate or keystore file"),
+            ("certs/client.PFX", "keystore-file", "certificate or keystore file"),
+            ("android/release.jks", "keystore-file", "certificate or keystore file"),
+            ("tls/server.key", "key-file", "private key file"),
+        ] {
+            let f = scan_added(&[new(path)], &[]);
+            assert_eq!(f.len(), 1, "{path}: {f:?}");
+            assert_eq!((f[0].rule.as_str(), f[0].kind.as_str(), f[0].line), (rule, kind, None));
+            assert_eq!(f[0].preview, None);
+            // An edit to one already tracked is not.
+            let edited = AddedFile { is_new: false, lines: vec![(3, "x".into())], ..new(path) };
+            assert!(scan_added(&[edited], &[]).is_empty(), "{path}");
+        }
+        // A zip `.key` is a Keynote document; a zip keystore still counts.
+        assert!(scan_added(&[AddedFile { zip: true, ..new("slides/Pitch.key") }], &[]).is_empty());
+        assert_eq!(scan_added(&[AddedFile { zip: true, ..new("certs/a.p12") }], &[]).len(), 1);
+        for path in ["src/key.ts", "docs/p12.md", "certs/server.key.example", "a.keystore.md", "monkey"] {
+            assert!(scan_added(&[new(path)], &[]).is_empty(), "false positive on {path}");
+        }
+    }
+
+    #[test]
+    fn a_keynote_document_stays_quiet_but_a_key_file_asks() {
+        let (dir, git) = repo();
+        std::fs::write(dir.path().join("Pitch.key"), b"PK\x03\x04\x14\x00\x00\x00index.apxl").unwrap();
+        std::fs::write(dir.path().join("server.key"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+        std::fs::write(dir.path().join("tiny.key"), "PK").unwrap();
+        // Untracked (read from the worktree), then staged (read from the blob).
+        let rules = |c: &Collected| {
+            let mut v: Vec<String> = scan_added(c, &[]).iter().filter(|f| f.rule == "key-file").map(|f| f.file.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(rules(&worktree_files(dir.path(), Some("main")).unwrap()), ["server.key", "tiny.key"]);
+        for name in ["Pitch.key", "server.key", "tiny.key"] {
+            stage(&git, name);
+        }
+        assert_eq!(rules(&staged_files(dir.path()).unwrap()), ["server.key", "tiny.key"]);
+    }
+
+    #[test]
     fn mcp_configs_flag_credential_named_env_values() {
         let pw = rnd(300, 24, B62);
         let lines: Vec<String> = vec![
@@ -21458,7 +21502,15 @@ mod secret_guard_tests {
         assert!(!f[0].kind.contains(&pw));
         // Cursor's config, nested projects and a one-line config.
         let inline = format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"STRIPE_SECRET\":\"{pw}\"}}}}}}}}");
-        for path in [".cursor/mcp.json", "packages/api/.mcp.json", "packages/api/.cursor/mcp.json"] {
+        for path in [
+            ".cursor/mcp.json",
+            "packages/api/.mcp.json",
+            "packages/api/.cursor/mcp.json",
+            ".claude/mcp.json",
+            "apps/web/.claude/mcp.json",
+            ".vscode/mcp.json",
+            "apps/web/.vscode/mcp.json",
+        ] {
             let f = scan_one(path, &[&inline]);
             assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{path}: {f:?}");
         }
@@ -21467,8 +21519,16 @@ mod secret_guard_tests {
         let f = scan_one(".mcp.json", &[&format!("\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"{ghp}\"")]);
         let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
         assert_eq!(rules, ["github-token"]);
+        // VS Code's `servers` shape: a real value asks, `${VAR}` and an
+        // `${input:…}` reference don't.
+        let vscode = |v: &str| format!("{{\"servers\":{{\"gh\":{{\"type\":\"stdio\",\"env\":{{\"GITHUB_TOKEN\":\"{v}\"}}}}}}}}");
+        let f = scan_one(".vscode/mcp.json", &[&vscode(&pw)]);
+        assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{f:?}");
+        for v in ["${GITHUB_TOKEN}", "${env:GITHUB_TOKEN}", "${input:github-token}"] {
+            assert!(scan_one(".vscode/mcp.json", &[&vscode(v)]).is_empty(), "{v}");
+        }
         // Not an MCP config: the rule stays out.
-        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md"] {
+        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md", ".vscode/settings.json", ".claude/mcp.json.bak"] {
             let f = scan_one(path, &[&inline]);
             assert!(f.iter().all(|f| f.rule != "mcp-env-credential"), "{path}: {f:?}");
         }
@@ -22024,8 +22084,8 @@ mod secret_guard_tests {
     fn an_encrypted_pem_key_is_still_a_private_key() {
         let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
         let f = scan_one("deploy/key.key", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert_eq!(f[0].rule, "private-key");
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["key-file", "private-key"], "a new .key is also flagged by name");
         let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);
         assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
     }
