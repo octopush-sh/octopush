@@ -207,7 +207,7 @@ function safeCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null): 
 
 /** The element whose width actually bounds the box: the nearest ancestor
  *  whose width does NOT come from its own content. A shrink-to-fit parent
- *  (`FileDiffSection`'s `flex min-w-0` path cell, an inline wrapper) shrinks
+ *  (a `flex min-w-0` cell that doesn't grow, an inline wrapper) shrinks
  *  when the head is cut and never grows back when the row widens, so
  *  observing it leaves a stale cut; the row it sits in does resize. */
 export function widthAnchor(box: HTMLElement): Element {

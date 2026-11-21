@@ -35,6 +35,21 @@ describe("FileDiffSection", () => {
     expect(readable(getByTitle(long.filePath))).toBe(long.filePath);
     expect(container.querySelector(".octo-midtrunc-tail")?.textContent).toContain("/sync.rs");
   });
+  it("gives the path box a definite width to elide into, long or short (#868)", () => {
+    // A cell sized from its own text (`flex min-w-0` alone) left WebKit cutting
+    // the head (`src-tauri`) with no ellipsis; the cell must grow into the row.
+    for (const filePath of ["src-tauri/src/sync.rs", "src-tauri/a.rs"]) {
+      const { container, getByTitle, unmount } = render(<FileDiffSection file={{ ...file, filePath }} focusedHunk={-1} viewed={false} collapsed={false}
+        onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
+      const cell = getByTitle(filePath);
+      expect(cell).toHaveClass("flex", "min-w-0", "flex-1");
+      expect(cell.parentElement).toBe(container.querySelector(".octo-filehead"));
+      // The MidTruncate box is the cell's only child, so the cell is its width anchor.
+      expect(cell.children).toHaveLength(1);
+      expect(cell.firstElementChild!.className).toMatch(/^octo-midtrunc(-whole)?$/);
+      unmount();
+    }
+  });
   it("renders a short path as one nowrap line, not a bare string in the flex row", () => {
     const { getByText } = render(<FileDiffSection file={{ ...file, filePath: "src-tauri/a.rs" }} focusedHunk={-1} viewed={false} collapsed={false}
       onAccept={()=>{}} onReject={()=>{}} onWhy={()=>{}} onToggleViewed={()=>{}} onToggleCollapsed={()=>{}} />);
