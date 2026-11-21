@@ -831,6 +831,10 @@ impl Db {
         // usage (Codex) — its cost is unknown, not $0. Sticky across re-runs:
         // the unknown spend was burned all the same.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN usage_unreported INTEGER NOT NULL DEFAULT 0")?;
+        // #860: the same flag for the stage's current attempt only (cleared
+        // when an attempt starts), so the ledger labels each attempt's row by
+        // what that attempt did, not by an earlier one.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN attempt_usage_unreported INTEGER NOT NULL DEFAULT 0")?;
         // #682: the token totals the stage's CLI session had reported by the end
         // of its last attempt (JSON `{"session": id, "usage": SessionUsage}`,
         // Codex only) — the baseline a `codex exec resume` subtracts, since a
@@ -6631,10 +6635,10 @@ impl Db {
     }
 
     /// Mark a run-stage whose CLI stopped before reporting usage (sticky; see
-    /// the `usage_unreported` column).
+    /// the `usage_unreported` column), and its current attempt.
     pub fn set_run_stage_usage_unreported(&self, stage_id: &str) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE run_stages SET usage_unreported = 1 WHERE id = ?1",
+            "UPDATE run_stages SET usage_unreported = 1, attempt_usage_unreported = 1 WHERE id = ?1",
             params![stage_id],
         )?;
         Ok(())
@@ -6718,12 +6722,14 @@ impl Db {
         let now = Utc::now().to_rfc3339();
         // Stamp started_at the first time it goes running. A (re)start also
         // forgets the last attempt's context reading (#895): the new attempt's
-        // first message brings its own.
+        // first message brings its own, and the last attempt's unreported
+        // usage (#860): the sticky `usage_unreported` keeps it.
         self.conn.execute(
             "UPDATE run_stages SET status = ?2,
                 started_at = COALESCE(started_at, CASE WHEN ?2 = 'running' THEN ?3 ELSE started_at END),
                 context_tokens = CASE WHEN ?2 = 'running' THEN NULL ELSE context_tokens END,
-                context_window = CASE WHEN ?2 = 'running' THEN NULL ELSE context_window END
+                context_window = CASE WHEN ?2 = 'running' THEN NULL ELSE context_window END,
+                attempt_usage_unreported = CASE WHEN ?2 = 'running' THEN 0 ELSE attempt_usage_unreported END
              WHERE id = ?1",
             params![stage_id, status, now],
         )?;
@@ -6841,7 +6847,7 @@ impl Db {
         let attr: Option<(String, Option<String>, String, Option<String>, bool)> = self
             .conn
             .query_row(
-                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id, s.usage_unreported != 0
+                "SELECT r.workspace_id, w.project_id, COALESCE(s.ran_model, s.agent_model), r.mission_id, s.attempt_usage_unreported != 0
                  FROM run_stages s
                  JOIN runs r ON r.id = s.run_id
                  LEFT JOIN workspaces w ON w.id = r.workspace_id
@@ -6856,10 +6862,11 @@ impl Db {
         // Logbook: a stage that burned spend is active DIRECT work on the mission.
         let _ = self.record_activity(&workspace_id, "direct", "stage");
         let tokens = input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens;
-        // $0 with tokens on a stage flagged `usage_unreported` (its streamed
-        // tokens were all on message models with no price, e.g. an unknown
-        // subagent model under a priced stage model): unknown, never free —
-        // even though the stage's own model has a price.
+        // $0 with tokens on an attempt flagged `usage_unreported` (its
+        // streamed tokens were all on message models with no price, e.g. an
+        // unknown subagent model under a priced stage model): unknown, never
+        // free — even though the stage's own model has a price. An earlier
+        // attempt's flag doesn't count (#860).
         let cost_basis = if usage_unreported && cost_usd == 0.0 && tokens > 0 {
             "unpriced"
         } else {
