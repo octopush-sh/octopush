@@ -272,14 +272,19 @@ const EPS = 0.01;
  *  flex-shrink still caps the head at the room it has. */
 const SEAT_SLACK = 0.5;
 
-/** `data-measuring` holds the head at `text-overflow: clip` until `applyCut`:
- *  WebKit clips a Range's rects at its own ellipsis point, so measuring under
- *  `ellipsis` would cap every `widthTo` at the engine's cut and bypass the
- *  grapheme search and `trimTrailingSpace` (#833). Set and cleared in the
- *  same frame, so the clipped head is never painted. */
+/** Holds the head at `text-overflow: clip` until `applyCut`: WebKit clips a
+ *  Range's rects at its own ellipsis point, so measuring under `ellipsis`
+ *  would cap every `widthTo` at the engine's cut and bypass the grapheme
+ *  search and `trimTrailingSpace` (#833). Set and cleared in the same frame,
+ *  so the clipped head is never painted. The hold is the head's OWN inline
+ *  style, not a stylesheet rule keyed on the box (#872): releasing it then
+ *  restyles the head itself, and never waits on an ancestor's attribute
+ *  change reaching it — in Safari a head left at `clip` after the pass is
+ *  text cut with no ellipsis. `data-measuring` only marks the pass. */
 function reset(box: HTMLElement, head: HTMLElement) {
   box.removeAttribute("data-elided");
   box.setAttribute("data-measuring", "");
+  head.style.textOverflow = "clip";
   head.style.maxWidth = "";
 }
 
@@ -323,6 +328,7 @@ function ellipsisWidth(ell: HTMLElement | null, range: Range): number {
 
 function applyCut(box: HTMLElement, head: HTMLElement, px: number | null) {
   box.removeAttribute("data-measuring");
+  head.style.textOverflow = "";
   if (px === null) return;
   box.setAttribute("data-elided", "");
   head.style.maxWidth = `${px}px`;

@@ -532,10 +532,14 @@
    glyph can be measured in the same pass, but zero-width, invisible,
    `aria-hidden` and unselectable — never shown. */
 .octo-midtrunc-ell   { flex: none; width: 0; visibility: hidden; user-select: none; -webkit-user-select: none; }
-/* While MidTruncate measures (one frame, never painted): WebKit clips a
-   Range's rects at its own ellipsis point, which would hide every glyph past
-   it from the grapheme search (#833). */
-.octo-midtrunc[data-measuring] .octo-midtrunc-head { text-overflow: clip; }
+/* While MidTruncate measures (one frame, never painted) it holds the head at
+   `text-overflow: clip` — WebKit clips a Range's rects at its own ellipsis
+   point, which would hide every glyph past it from the grapheme search
+   (#833). That hold is the head's inline style, set and cleared in the same
+   pass, never a rule here (#872): a rule keyed on the box's `data-measuring`
+   left the head restyled only once the attribute change reached it, and in
+   Safari a head still at `clip` is text cut with no ellipsis. No rule in this
+   file clips the head. */
 /* The optional `lead` glyph. One rule serves both boxes: `align-self` centres
    it as a flex item in the split box, `vertical-align` as inline content in
    the whole one — each property is ignored by the box it doesn't apply to. */

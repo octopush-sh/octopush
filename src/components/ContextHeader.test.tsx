@@ -284,6 +284,7 @@ describe("ContextHeader", () => {
         expect(head).toHaveTextContent("feature/JIRA-1000-production-deploy-o");
         // Released, so the head is back on `.octo-midtrunc-head`'s ellipsis…
         expect(box).not.toHaveAttribute("data-measuring");
+        expect(head.style.textOverflow).toBe("");
         // …and cut by hand: 120px less the 9px `…` keeps 15 glyphs.
         expect(box).toHaveAttribute("data-elided");
         expect(head.style.maxWidth).toBe(`${15 * GLYPH + ELL + 0.5}px`);
@@ -291,14 +292,15 @@ describe("ContextHeader", () => {
         // The row that couldn't be measured is released too, on the CSS ellipsis.
         for (const b of document.querySelectorAll(".octo-midtrunc")) {
           expect(b).not.toHaveAttribute("data-measuring");
+          expect(b.querySelector<HTMLElement>(":scope > .octo-midtrunc-head")!.style.textOverflow).toBe("");
         }
       });
 
-      it("clips the head only under the measuring hold", async () => {
+      it("never clips the head from the stylesheet — the measuring hold is inline (#872)", async () => {
         const css = (await readStylesCss()).replace(/\/\*[\s\S]*?\*\//g, "");
         const rules = Array.from(css.matchAll(/([^{}]*\.octo-midtrunc-head[^{]*)\{([^}]*)\}/g));
         const clips = rules.filter((m) => /text-overflow\s*:\s*clip/.test(m[2])).map((m) => m[1].trim());
-        expect(clips).toEqual([".octo-midtrunc[data-measuring] .octo-midtrunc-head"]);
+        expect(clips).toEqual([]);
         expect(css).toMatch(/\.octo-midtrunc-head\s*\{[^}]*overflow:\s*hidden;[^}]*text-overflow:\s*ellipsis;/);
       });
     });
