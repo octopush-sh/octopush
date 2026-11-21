@@ -119,6 +119,59 @@ describe("LogbookRoom", () => {
     }
   });
 
+  it("leaves the project option's head on its own ellipsis after every pass, not held at clip (#871)", () => {
+    // Safari's audit found the head (`octopush-enterprise-monorepo-with-a-very`)
+    // cut with no ellipsis: the pass's measuring hold outlived it. The head must
+    // be the ellipsis class alone, and the hold its inline style, released after
+    // the first pass and after a re-cut alike.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? 60 : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    const realRangeRect = Range.prototype.getBoundingClientRect;
+    const heldAtRead: boolean[] = [];
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      const parent = this.startContainer.parentElement;
+      if (parent?.classList.contains("octo-midtrunc-head")) heldAtRead.push(parent.style.textOverflow === "clip");
+      const w = (this.endOffset - this.startOffset) * 7.5;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+    try {
+      setPlan(["logbook.reports"]);
+      const names = [
+        "octopush-enterprise-monorepo-with-a-very-long-name",
+        "octopush-enterprise-monorepo-with-a-very-long-name-2",
+      ];
+      const { container, rerender } = render(
+        <LogbookRoom open onClose={vi.fn()} project={{ id: "p1", name: names[0] } as ProjectInfo} />,
+      );
+      for (const name of names) {
+        rerender(<LogbookRoom open onClose={vi.fn()} project={{ id: "p1", name } as ProjectInfo} />);
+        act(() => frames.splice(0).forEach((cb) => cb(0)));
+        const header = container.querySelector("header")!;
+        const heads = header.querySelectorAll<HTMLElement>(".octo-midtrunc-head");
+        expect(heads).toHaveLength(1);
+        const head = heads[0];
+        expect(head.className).toBe("octo-midtrunc-head");
+        expect(head.style.textOverflow).toBe("");
+        expect(head.style.maxWidth).not.toBe("");
+        expect(head.closest(".octo-midtrunc")).toHaveAttribute("data-elided");
+        expect(head.closest(".octo-midtrunc")).not.toHaveAttribute("data-measuring");
+        // Its option is the definite-width box it elides into.
+        expect(screen.getByTitle(name)).toHaveClass("flex", "w-[160px]", "min-w-0");
+      }
+      // Measured under the hold (WebKit clips Range rects at its own ellipsis).
+      expect(heldAtRead.length).toBeGreaterThan(0);
+      expect(heldAtRead.every(Boolean)).toBe(true);
+    } finally {
+      Range.prototype.getBoundingClientRect = realRangeRect;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("marks the active scope and period with a brass-ghost fill and ivory ink, not brass text", () => {
     setPlan(["logbook.reports"]);
     render(
