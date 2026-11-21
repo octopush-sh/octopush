@@ -39,6 +39,7 @@ use crate::error::{AppError, AppResult};
 use git2::{Delta, Diff, DiffOptions, Oid, Repository};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
@@ -736,6 +737,11 @@ pub struct AddedFile {
     pub is_new: bool,
     /// (1-based new line number, content without the trailing newline).
     pub lines: Vec<(u32, String)>,
+    /// Lines the diff didn't add that continue a PEM block (an unchanged
+    /// line inside the key, or the block's rest after its last added line),
+    /// read from the file's new side: the lines right after `lines[i]`,
+    /// keyed by `i`.
+    pub unchanged: BTreeMap<usize, Vec<String>>,
 }
 
 type SeenKey = (String, Option<u32>, String, [u8; 32]);
@@ -842,11 +848,35 @@ const MAX_PEM_BYTES: usize = 64 * 1024;
 
 /// The whole PEM block whose header starts at byte `start` of `lines[idx]`:
 /// the header line from that offset through the line holding the matching
-/// `-----END …-----` (or through the end of the consecutive added lines,
-/// stopping before the next PEM header line), bounded to [`MAX_PEM_BYTES`]. Hashing only the
-/// header and the first body line would hash a constant for an unencrypted
-/// OpenSSH key (and the `Proc-Type:` line for a legacy encrypted one).
-pub(crate) fn pem_block(lines: &[(u32, String)], idx: usize, start: usize, header: &str) -> String {
+/// `-----END …-----` (or through the last line it can read, stopping before
+/// the next PEM header line), bounded to [`MAX_PEM_BYTES`]. A gap in the
+/// added lines' numbers is read from `unchanged` ([`AddedFile::unchanged`]),
+/// so two keys alike up to an unchanged line inside them don't hash alike.
+/// Hashing only the header and the first body line would hash a constant for
+/// an unencrypted OpenSSH key (and the `Proc-Type:` line for a legacy
+/// encrypted one).
+pub(crate) fn pem_block(
+    lines: &[(u32, String)],
+    unchanged: &BTreeMap<usize, Vec<String>>,
+    idx: usize,
+    start: usize,
+    header: &str,
+) -> String {
+    pem_walk(lines, idx, start, header, &mut |j, n| {
+        let off = n.checked_sub(lines[j].0.saturating_add(1))? as usize;
+        unchanged.get(&j)?.get(off).cloned()
+    })
+}
+
+/// The walk behind [`pem_block`]. `gap(j, n)` is line `n` of the file when
+/// the diff didn't add it, `j` the index of the last added line walked.
+fn pem_walk(
+    lines: &[(u32, String)],
+    idx: usize,
+    start: usize,
+    header: &str,
+    gap: &mut dyn FnMut(usize, u32) -> Option<String>,
+) -> String {
     let end_marker = header.replacen("-----BEGIN ", "-----END ", 1);
     let (first_n, line) = &lines[idx];
     // From the header on: on a long line the bytes before it are unrelated,
@@ -868,18 +898,71 @@ pub(crate) fn pem_block(lines: &[(u32, String)], idx: usize, start: usize, heade
     if !end_marker.is_empty() && first[after_header..].contains(&end_marker) {
         return v;
     }
-    for (expect, (n, l)) in (first_n + 1..).zip(&lines[idx + 1..]) {
+    // `j`: the last added line walked; `n`: the line number read next.
+    let (mut j, mut n) = (idx, first_n.saturating_add(1));
+    while v.len() < MAX_PEM_BYTES {
+        let l = if lines.get(j + 1).is_some_and(|(m, _)| *m == n) {
+            j += 1;
+            Cow::Borrowed(lines[j].1.as_str())
+        } else {
+            match gap(j, n) {
+                Some(l) => Cow::Owned(l),
+                None => break,
+            }
+        };
         // A new header starts its own block: repeated headers with no END
         // must not each walk the next MAX_PEM_BYTES.
-        if *n != expect || v.len() >= MAX_PEM_BYTES || PEM_HEADER.is_match(l) {
+        if PEM_HEADER.is_match(&l) {
             break;
         }
-        push(&mut v, l);
+        push(&mut v, &l);
         if !end_marker.is_empty() && l.contains(&end_marker) {
             break;
         }
+        n = n.saturating_add(1);
     }
     v
+}
+
+/// The unchanged lines [`pem_block`] needs for each PEM block among `lines`
+/// (one diff's added lines of a file), read from `new_side`, the file's
+/// content after the change, keyed like [`AddedFile::unchanged`].
+fn pem_unchanged(lines: &[(u32, String)], new_side: &str) -> BTreeMap<usize, Vec<String>> {
+    let text: Vec<&str> = new_side.lines().collect();
+    let mut out: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    for (idx, (_, line)) in lines.iter().enumerate() {
+        let Some(h) = PEM_HEADER.find(line) else { continue };
+        pem_walk(lines, idx, h.start(), h.as_str(), &mut |j, n| {
+            let l = text.get((n as usize).checked_sub(1)?)?.to_string();
+            let off = n.checked_sub(lines[j].0.saturating_add(1))? as usize;
+            let run = out.entry(j).or_default();
+            if run.len() == off {
+                run.push(l.clone());
+            }
+            Some(l)
+        });
+    }
+    out
+}
+
+/// The content of `path` after the change: its blob, or the worktree file
+/// when git holds no blob for it. `None` past [`MAX_SCAN_BYTES`] or for
+/// anything but a regular file.
+fn new_side(repo: &Repository, path: &str, id: Oid) -> Option<String> {
+    let blob = (!id.is_zero()).then(|| repo.find_blob(id).ok()).flatten();
+    let bytes = match blob {
+        Some(b) if b.size() > MAX_SCAN_BYTES => return None,
+        Some(b) => b.content().to_vec(),
+        None => {
+            let p = repo.workdir()?.join(path);
+            let meta = std::fs::symlink_metadata(&p).ok()?;
+            if !meta.is_file() || meta.len() > MAX_SCAN_BYTES as u64 {
+                return None;
+            }
+            std::fs::read(&p).ok()?
+        }
+    };
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Every hit in `files`, uncapped (the fingerprint covers all of them).
@@ -981,7 +1064,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     .filter(|(_, l)| PEM_BODY_LINE.is_match(l));
                 if inline || next.is_some() {
                     let h = PEM_HEADER.find(line);
-                    let v = pem_block(&file.lines, idx, h.map(|h| h.start()).unwrap_or(0), h.map(|h| h.as_str()).unwrap_or(""));
+                    let v = pem_block(&file.lines, &file.unchanged, idx, h.map(|h| h.start()).unwrap_or(0), h.map(|h| h.as_str()).unwrap_or(""));
                     if let Some(h) = h {
                         claimed.claim(h.start(), h.end());
                     }
@@ -1242,10 +1325,12 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             Some(&i) => files[i].is_new |= is_new,
             None => {
                 index.insert(path.clone(), files.len());
-                files.push(AddedFile { path, is_new, lines: Vec::new() });
+                files.push(AddedFile { path, is_new, ..Default::default() });
             }
         }
     }
+    // Where this diff's lines start in each file (`range_files` appends).
+    let starts: Vec<usize> = files.iter().map(|f| f.lines.len()).collect();
     let odb = repo.odb().ok();
     // How many file callbacks have run: the delta being read is `pos - 1`.
     let mut pos = 0usize;
@@ -1302,6 +1387,24 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             }),
         )
     };
+    // An unchanged line inside a PEM block (or the block's rest after its
+    // last added line) is not in a diff without context: read it from the
+    // file's new side, so the whole block is hashed.
+    let mut read = HashSet::new();
+    for (path, id) in order.iter().flatten() {
+        let Some(&i) = index.get(path) else { continue };
+        if !read.insert(i) {
+            continue;
+        }
+        let from = starts.get(i).copied().unwrap_or(0);
+        let added = &files[i].lines[from..];
+        if !added.iter().any(|(_, l)| PEM_HEADER.is_match(l)) {
+            continue;
+        }
+        let Some(content) = new_side(repo, path, *id) else { continue };
+        let fills = pem_unchanged(added, &content);
+        files[i].unchanged.extend(fills.into_iter().map(|(j, v)| (j + from, v)));
+    }
     if !oversized.is_empty() {
         budget.exhausted = true;
         budget.unscanned.extend(oversized);

@@ -21103,6 +21103,7 @@ mod secret_guard_tests {
             path: path.into(),
             is_new: true,
             lines: lines.iter().enumerate().map(|(i, l)| (i as u32 + 1, l.to_string())).collect(),
+            ..Default::default()
         }
     }
 
@@ -21295,16 +21296,16 @@ mod secret_guard_tests {
 
     #[test]
     fn a_newly_added_ssh_key_file_is_flagged_by_name() {
-        let f = scan_added(&[AddedFile { path: "deploy/id_rsa".into(), is_new: true, lines: vec![] }], &[]);
+        let f = scan_added(&[AddedFile { path: "deploy/id_rsa".into(), is_new: true, ..Default::default() }], &[]);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].rule, "ssh-private-key-file");
         assert_eq!(f[0].line, None);
-        assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, lines: vec![] }], &[]).is_empty());
+        assert!(scan_added(&[AddedFile { path: "deploy/id_rsa.pub".into(), is_new: true, ..Default::default() }], &[]).is_empty());
     }
 
     #[test]
     fn a_newly_added_pem_or_claude_local_settings_file_is_flagged_by_name() {
-        let new = |p: &str, lines: Vec<(u32, String)>| AddedFile { path: p.into(), is_new: true, lines };
+        let new = |p: &str, lines: Vec<(u32, String)>| AddedFile { path: p.into(), is_new: true, lines, ..Default::default() };
         for (path, rule) in [
             ("certs/server.pem", "pem-file"),
             ("deploy/CA.PEM", "pem-file"),
@@ -21321,7 +21322,7 @@ mod secret_guard_tests {
             }
         }
         // Only a newly added file: an edit to one already tracked is not.
-        let edited = AddedFile { path: "certs/server.pem".into(), is_new: false, lines: vec![(3, "x".into())] };
+        let edited = AddedFile { path: "certs/server.pem".into(), is_new: false, lines: vec![(3, "x".into())], ..Default::default() };
         assert!(scan_added(&[edited], &[]).is_empty());
         for path in ["certs/server.pem.example", "docs/pem.md", ".claude/settings.json", "settings.local.json", ".claude/settings.local.json.bak"] {
             assert!(scan_added(&[new(path, vec![])], &[]).is_empty(), "false positive on {path}");
@@ -21503,7 +21504,7 @@ mod secret_guard_tests {
         let p = aws.iter().find(|f| f.rule == "aws-access-key").and_then(|f| f.preview.clone()).expect("aws preview");
         assert!(p.starts_with("AKIA…"), "{p}");
         assert!(!p.contains(&secret[secret.len() - 4..]), "{p}");
-        let new_pem = AddedFile { path: "deploy/key.pem".into(), is_new: true, lines: Vec::new() };
+        let new_pem = AddedFile { path: "deploy/key.pem".into(), is_new: true, ..Default::default() };
         assert_eq!(scan_added(&[new_pem], &[])[0].preview, None);
 
         // A value no provider rule matched keeps none of its start, even one
@@ -22236,12 +22237,73 @@ mod secret_guard_tests {
         let (b1, b2) = (rnd(520, 64, B64), rnd(521, 64, B64));
         let lines: Vec<(u32, String)> =
             vec![(1, header.clone()), (2, b1.clone()), (3, header.clone()), (4, b2.clone())];
-        let v = pem_block(&lines, 0, 0, &header);
+        let v = pem_block(&lines, &Default::default(), 0, 0, &header);
         assert!(v.contains(&b1));
         assert!(!v.contains(&b2), "walked into the next block");
         let refs: Vec<&str> = lines.iter().map(|(_, l)| l.as_str()).collect();
         let r = scan_report(&[file("deploy/keys.pem", &refs)], &[], false);
         assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 2, "{:?}", r.findings);
+    }
+
+    /// A gap in the added lines' numbers is walked through the unchanged
+    /// lines read from the file, up to the END line.
+    #[test]
+    fn a_pem_walk_reads_through_unchanged_lines() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, mid, b2) = (rnd(540, 64, B64), rnd(541, 64, B64), rnd(542, 64, B64));
+        let lines: Vec<(u32, String)> =
+            vec![(1, header.clone()), (2, b1.clone()), (4, b2.clone()), (5, footer.clone()), (6, "after".into())];
+        let unchanged = std::collections::BTreeMap::from([(1, vec![mid.clone()])]);
+        let v = pem_block(&lines, &unchanged, 0, 0, &header);
+        for part in [&b1, &mid, &b2, &footer] {
+            assert!(v.contains(part.as_str()), "{part} missing from the block");
+        }
+        assert!(!v.contains("after"), "walked past the END line");
+        // Without the unchanged line the walk stops at the gap.
+        let v = pem_block(&lines, &Default::default(), 0, 0, &header);
+        assert!(v.contains(&b1) && !v.contains(&b2));
+    }
+
+    /// Two keys alike in their added lines but not in an unchanged line
+    /// inside them (or after their last added line) ask separately: the
+    /// block is hashed whole from the file, staged or not yet staged.
+    #[test]
+    fn a_pem_key_split_by_an_unchanged_line_is_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(550, 64, B64), rnd(551, 64, B64));
+        // `base` is the file's committed content, `key` its new one, `added`
+        // how many lines the staged diff adds.
+        let fp = |base: String, key: Vec<&str>, added: usize, staged: bool| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("deploy.txt"), base).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("deploy.txt"), key.join("\n") + "\n").unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                let c = staged_files(dir.path()).unwrap();
+                assert_eq!(c.files[0].lines.len(), added, "{:?}", c.files[0].lines);
+                c
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (m1, m2) = (rnd(552, 64, B64), rnd(553, 64, B64));
+        for staged in [true, false] {
+            // An unchanged line inside the key.
+            let inside =
+                |m: &str| fp(format!("{m}\n"), vec![header.as_str(), b1.as_str(), m, b2.as_str(), footer.as_str()], 4, staged);
+            assert_ne!(inside(&m1), inside(&m2), "an unchanged line inside the key (staged: {staged})");
+            // The key's rest after its last added line.
+            let tail = |m: &str| {
+                fp(format!("{m}\n{footer}\n"), vec![header.as_str(), b1.as_str(), b2.as_str(), m, footer.as_str()], 3, staged)
+            };
+            assert_ne!(tail(&m1), tail(&m2), "the key's unchanged rest (staged: {staged})");
+        }
     }
 
     /// A provider token that only partly overlaps one of your own keys is
