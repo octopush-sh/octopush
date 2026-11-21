@@ -7060,6 +7060,29 @@ mod orchestrator_tests {
         assert!(relayed[0]["contextTokens"].is_null(), "{relayed:?}");
     }
 
+    /// #895: a stage (re)start forgets the last attempt's reading on the row
+    /// AND tells the app so (a cleared `run://context`), so an in-process
+    /// run's newest reading is never the previous attempt's.
+    #[tokio::test]
+    async fn a_stage_start_clears_its_context_reading_and_tells_the_app() {
+        use crate::orchestrator::live::RUN_CONTEXT_EVENT;
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("PCTX2", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "implement", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        db.lock().set_run_stage_context(&stage_id, 150_000, Some(200_000)).unwrap();
+        let app = Arc::new(PayloadSink::default());
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(app.clone(), Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(CostRunner { cost: 0.0 }));
+        orch.run_to_pause(&run_id).await.unwrap();
+        assert!(db.lock().stage_contexts(&run_id).unwrap().is_empty());
+        let cleared = app.take(RUN_CONTEXT_EVENT);
+        assert_eq!(cleared.len(), 1, "{cleared:?}");
+        assert_eq!(cleared[0]["stageId"], stage_id.as_str());
+        assert!(cleared[0]["contextTokens"].is_null());
+    }
+
     /// H4 guard: `rerun_from_stage` must refuse while a detached worker holds
     /// a live lease. `claim_active` only excludes an IN-PROCESS drive; a
     /// cross-process worker never enters that set, so without the lease check

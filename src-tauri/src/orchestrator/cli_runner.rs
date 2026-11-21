@@ -189,14 +189,35 @@ pub(crate) fn context_from_stream_event(v: &Value) -> Option<(u64, Option<String
     (tokens > 0).then(|| (tokens, model.map(str::to_string)))
 }
 
+/// The window Claude Code gives a model id that carries the `[1m]`
+/// capability suffix (`claude-opus-5-5[1m]`, `sonnet[1m]`).
+const ONE_M_CONTEXT: u64 = 1_000_000;
+
+/// True when a model id asks for the 1M window (`[1m]`, any case).
+pub(crate) fn has_1m_suffix(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("[1m]")
+}
+
+/// The context window of the model a stage runs on (`model`: the stage's
+/// configured model, or the one Claude Code ran it on instead): 1M when the
+/// id carries `[1m]` — the catalog lists the base id's window, which that
+/// session doesn't have — else `catalog`'s window for it. `None` when
+/// unknown: the meter is then hidden, never drawn against a guessed 200k.
+/// Pure.
+pub(crate) fn stage_context_window(model: &str, catalog: impl FnOnce(&str) -> Option<u64>) -> Option<u64> {
+    if has_1m_suffix(model) {
+        return Some(ONE_M_CONTEXT);
+    }
+    catalog(model).filter(|w| *w > 0)
+}
+
 /// A model's context window from the provider catalog (the one Talk's meter
-/// and Run's Context section read, gateway and custom entries included);
-/// `None` when the catalog doesn't list it — the meter is then hidden, never
-/// drawn against a guessed 200k.
+/// and Run's Context section read, gateway and custom entries included),
+/// through [`stage_context_window`].
 pub(crate) fn catalog_context_window(model: &str) -> Option<u64> {
-    crate::token_engine::catalog()
-        .and_then(|r| r.find_model(model).map(|(_, m)| m.max_context))
-        .filter(|w| *w > 0)
+    stage_context_window(model, |m| {
+        crate::token_engine::catalog().and_then(|r| r.find_model(m).map(|(_, info)| info.max_context))
+    })
 }
 
 /// Folds a Claude stage's stream into its latest context reading. The CLI
@@ -210,19 +231,20 @@ pub(crate) struct ContextWatch {
 }
 
 impl ContextWatch {
-    /// Feed one stream event. `fallback_model` answers for a message that
-    /// names no model (the model the session ran on, else the stage's);
-    /// `window_of` looks a model's window up (once per model). Returns the
-    /// reading to persist — `(tokens, window)` — when it changed.
+    /// Feed one stream event. `window_model` is the model whose window the
+    /// stage has — its configured model (a `[1m]` id included), or the one
+    /// Claude Code ran it on instead — never the message's `message.model`,
+    /// which drops the `[1m]` suffix. `window_of` looks a model's window up
+    /// (once per model). Returns the reading to persist — `(tokens, window)`
+    /// — when it changed.
     pub(crate) fn observe(
         &mut self,
         v: &Value,
-        fallback_model: &str,
+        window_model: &str,
         window_of: impl FnOnce(&str) -> Option<u64>,
     ) -> Option<(u64, Option<u64>)> {
-        let (tokens, model) = context_from_stream_event(v)?;
-        let model = model.unwrap_or_else(|| fallback_model.to_string());
-        let window = *self.windows.entry(model).or_insert_with_key(|m| window_of(m));
+        let (tokens, _) = context_from_stream_event(v)?;
+        let window = *self.windows.entry(window_model.to_string()).or_insert_with_key(|m| window_of(m));
         let reading = (tokens, window);
         if self.last == Some(reading) {
             return None;
@@ -3405,8 +3427,10 @@ impl CliRunner {
                     let key = id.unwrap_or_else(|| format!("anon-{}", map.len()));
                     map.insert(key, u);
                 }
-                let fallback = ran_in_loop.lock().clone().unwrap_or_else(|| stage.agent_model.clone());
-                if let Some((tokens, window)) = context_watch.observe(value, &fallback, catalog_context_window) {
+                // The window follows the stage's configured model (its `[1m]`
+                // suffix included), or the model Claude Code ran it on instead.
+                let window_model = ran_in_loop.lock().clone().unwrap_or_else(|| stage.agent_model.clone());
+                if let Some((tokens, window)) = context_watch.observe(value, &window_model, catalog_context_window) {
                     emitter.context(tokens, window);
                 }
                 if retry_throttle.allow(value, std::time::Instant::now()) {

@@ -10,6 +10,7 @@ import {
   stageContextReading,
   contextToneClass,
   subjectShedsContext,
+  currentContext,
 } from "../lib/stageMeta";
 import { lastActivity, lastNotice } from "../lib/liveLine";
 import { iconForRole } from "../lib/roleIcons";
@@ -124,6 +125,7 @@ function StageCard({
   onSelect: () => void;
 }) {
   const entries = useRunsStore((st) => st.liveByStage[s.id] ?? EMPTY_ENTRIES);
+  const liveContext = useRunsStore((st) => st.liveContextByStage?.[s.id]);
   // An abort never rewrites the stage row: the stage it was on stays
   // `running` / `awaiting_checkpoint`. Read it as aborted, muted (#891).
   const cut = runAborted && (s.status === "running" || s.status === "awaiting_checkpoint");
@@ -168,13 +170,16 @@ function StageCard({
 
   // The meta line's shrink-0 notes, and the context reading (#895): only
   // while the stage runs (a finished stage's final reading is in the focus
-  // pane), and only when it fits beside them (`subjectShedsContext`).
+  // pane), and only when it fits beside the short model name, position,
+  // notes and pill (`subjectShedsContext`: the reading sheds first).
   const shownModel = s.escalated && s.escalateModel ? s.escalateModel : s.agentModel;
   const effortShown = !!s.effort && effortApplies(s.substrate, shownModel);
   const escalatedNote = s.escalated ? `↑ ${s.escalateModel ? shortModel(s.escalateModel) : "retry"}` : "";
-  const ctx = running ? stageContextReading(s) : null;
+  // A running card names its model short (`opus-5-5`), full id in the tooltip.
+  const modelLabel = running ? shortModel(s.agentModel) : s.agentModel;
+  const ctx = running ? stageContextReading(currentContext(s, liveContext)) : null;
   const metaNotes = [s.ranModel ? ranOnNote(s.ranModel) : "", effortShown ? s.effort ?? "" : "", escalatedNote].filter(Boolean);
-  const ctxShed = ctx ? subjectShedsContext(String(index + 1), ctx.label, metaNotes) : false;
+  const ctxShed = ctx ? subjectShedsContext(String(index + 1), modelLabel, ctx.label, metaNotes) : false;
 
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
@@ -269,7 +274,7 @@ function StageCard({
           <span className="flex h-4 w-full min-w-0 items-center gap-2 font-mono text-[10px] text-octo-mute">
             <span className="octo-tabular shrink-0">{index + 1}</span>
             <span className="min-w-0 flex-1 truncate" title={s.agentModel}>
-              {s.agentModel}
+              {modelLabel}
             </span>
             {/* Mounted for the whole run of the stage, shed until a reading
                 arrives, so it grows in through the demote rung's own motion. */}

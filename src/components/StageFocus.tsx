@@ -5,7 +5,7 @@ import { ipc } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
 import { isTransientHalt, runStatusMeta } from "../lib/runStatus";
 import { iconForRole } from "../lib/roleIcons";
-import { stageTitle, fmtTokens, stageContextReading, contextToneClass } from "../lib/stageMeta";
+import { stageTitle, fmtTokens, stageContextReading, contextToneClass, currentContext } from "../lib/stageMeta";
 import { formatUsd } from "../lib/cost";
 import { refusedCallsNote, REFUSED_CALLS_TITLE } from "../lib/refusedCalls";
 import { DiffViewer } from "./DiffViewer";
@@ -103,6 +103,7 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   /** 1-based archived attempt being viewed; null = the current attempt. */
   const [viewedAttempt, setViewedAttempt] = useState<number | null>(null);
   const liveEntries = useRunsStore((s) => s.liveByStage[stage?.id ?? ""] ?? EMPTY_ENTRIES);
+  const liveContext = useRunsStore((s) => s.liveContextByStage?.[stage?.id ?? ""]);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ── Director controls: gate toggle, edit-stage modal, re-run confirm ──
@@ -322,8 +323,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   const refused = stage.status !== "running" && !stageCutByAbort ? stage.refusedCalls ?? 0 : 0;
   // The context reading (#895) is the current attempt's: a running stage's
   // live one, a finished stage's final one. Hidden while an archived attempt
-  // is on screen, and whenever the window is unknown.
-  const ctx = viewedRow ? null : stageContextReading(stage);
+  // is on screen, on a pending stage (a re-run reset it), and whenever the
+  // window is unknown.
+  const ctx = viewedRow || stage.status === "pending" ? null : stageContextReading(currentContext(stage, liveContext));
   const swapKey = viewedRow ? `${stage.id}:attempt-${attemptN}` : `${stage.id}:${mode}`;
 
   return (

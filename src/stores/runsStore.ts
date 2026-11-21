@@ -65,6 +65,11 @@ interface RunsState {
   selectedRunIdByWs: Record<string, string | null>;
   /** Structured live activity entries per stage id, streamed from both substrates. */
   liveByStage: Record<string, LiveEntry[]>;
+  /** The newest `run://context` reading heard per stage id this session
+   *  (#895), a cleared one included. It wins over the stage row's (see
+   *  `currentContext`): a `get_run` refresh can land after a newer event.
+   *  A stage's restart (`clearLog`) forgets it. */
+  liveContextByStage: Record<string, { contextTokens: number | null; contextWindow: number | null }>;
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
@@ -164,9 +169,7 @@ interface RunsState {
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
-  /** Patch one stage's context reading (`run://context`, #895) into the
-   *  loaded detail. A run whose detail isn't loaded reads it from `get_run`
-   *  when it is. */
+  /** Keep one stage's newest context reading (`run://context`, #895). */
   applyContext: (runId: string, stageId: string, contextTokens: number | null, contextWindow: number | null) => void;
 }
 
@@ -221,6 +224,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   selectedStageByRun: {},
   selectedRunIdByWs: {},
   liveByStage: {},
+  liveContextByStage: {},
   launcherPrefill: null,
   settledAt: {},
   statusSince: {},
@@ -592,16 +596,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     });
   },
 
-  applyContext: (runId, stageId, contextTokens, contextWindow) => {
+  applyContext: (_runId, stageId, contextTokens, contextWindow) => {
     set((s) => {
-      const prev = s.detailByRun[runId];
-      const idx = prev?.stages.findIndex((st) => st.id === stageId) ?? -1;
-      if (!prev || idx === -1) return {};
-      const cur = prev.stages[idx];
-      if (cur.contextTokens === contextTokens && cur.contextWindow === contextWindow) return {};
-      const stages = prev.stages.slice();
-      stages[idx] = { ...cur, contextTokens, contextWindow };
-      return { detailByRun: { ...s.detailByRun, [runId]: { ...prev, stages } } };
+      const cur = s.liveContextByStage[stageId];
+      if (cur && cur.contextTokens === contextTokens && cur.contextWindow === contextWindow) return {};
+      return { liveContextByStage: { ...s.liveContextByStage, [stageId]: { contextTokens, contextWindow } } };
     });
   },
 }));

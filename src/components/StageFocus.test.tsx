@@ -33,7 +33,7 @@ const baseStage = {
 
 describe("StageFocus live journal", () => {
   beforeEach(() => {
-    useRunsStore.setState({ liveByStage: {} });
+    useRunsStore.setState({ liveByStage: {}, liveContextByStage: {} });
     vi.mocked(ipc.getStageLog).mockResolvedValue([]);
     vi.mocked(ipc.listStageIterations).mockResolvedValue([]);
   });
@@ -233,6 +233,20 @@ describe("StageFocus live journal", () => {
     );
     expect(ctx()).toHaveTextContent("ctx 170k / 200k");
     expect(ctx()).toHaveClass("text-octo-warning");
+  });
+
+  it("prefers the newest live reading, and hides a pending stage's or an over-window one (#895)", () => {
+    useRunsStore.setState({ liveContextByStage: { st1: { contextTokens: 180_000, contextWindow: 200_000 } } });
+    const { container, rerender } = render(
+      <StageFocus stage={{ ...baseStage, contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />,
+    );
+    const ctx = () => container.querySelector('[data-tour="direct-focus-context"]');
+    expect(ctx()).toHaveTextContent("ctx 180k / 200k");
+    useRunsStore.setState({ liveContextByStage: {} });
+    rerender(<StageFocus stage={{ ...baseStage, status: "pending", contextTokens: 120_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
+    rerender(<StageFocus stage={{ ...baseStage, contextTokens: 400_000, contextWindow: 200_000 }} workspacePath="/tmp" />);
+    expect(ctx()).toBeNull();
   });
 
   it("hides the context reading when the model's window is unknown (#895)", () => {

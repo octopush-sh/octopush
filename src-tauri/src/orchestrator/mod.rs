@@ -1140,6 +1140,12 @@ impl Orchestrator {
         };
 
         self.db.lock().set_run_stage_status(&stage.id, "running")?;
+        // That forgot the last attempt's context reading (#895): tell the app,
+        // so its newest reading for the stage is "none", not the old one.
+        self.events.emit(
+            crate::orchestrator::live::RUN_CONTEXT_EVENT,
+            serde_json::json!({ "runId": run.id, "stageId": stage.id, "contextTokens": null, "contextWindow": null }),
+        );
         // Reset any prior live log for this stage (re-runs reuse the same id).
         self.events.emit(
             crate::orchestrator::live::RUN_LOG_EVENT,

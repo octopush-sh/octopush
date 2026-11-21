@@ -719,7 +719,7 @@ fn stream_json_context_reading_is_the_latest_main_message_prompt() {
                 lookups.push(m.to_string());
                 Some(200_000)
             };
-            if let Some(r) = watch.observe(e, "claude-fallback", window_of) {
+            if let Some(r) = watch.observe(e, "claude-haiku-4-5", window_of) {
                 readings.push(r);
             }
         }
@@ -741,18 +741,14 @@ fn stream_json_context_reading_is_the_latest_main_message_prompt() {
         assert!(!expected.is_empty(), "[{fx}] no main-session assistant message");
         assert_eq!(readings.iter().map(|r| r.0).collect::<Vec<_>>(), expected, "[{fx}]");
         assert!(readings.iter().all(|r| r.1 == Some(200_000)), "[{fx}] {readings:?}");
-        // The window is looked up once per model, never per event.
-        let mut models: Vec<String> = lookups.clone();
-        models.dedup();
-        assert_eq!(lookups.len(), models.len(), "[{fx}] {lookups:?}");
-        assert!(!lookups.contains(&"claude-fallback".to_string()), "[{fx}] every recorded message names its model");
+        // The window is the stage model's, looked up once, never per event.
+        assert_eq!(lookups, vec!["claude-haiku-4-5".to_string()], "[{fx}]");
     }
 }
 
 /// #895: a sub-agent's message is its own context, not the stage's; the
 /// CLI's synthetic notices and token-less messages read as no reading; a
-/// message that names no model is sized against the fallback, and a model
-/// the catalog doesn't list leaves the window unknown (the meter hides).
+/// model the catalog doesn't list leaves the window unknown (the meter hides).
 #[test]
 fn stream_json_context_reading_skips_subagents_and_synthetic_messages() {
     use crate::orchestrator::cli_runner::{context_from_stream_event, ContextWatch};
@@ -787,6 +783,37 @@ fn stream_json_context_reading_skips_subagents_and_synthetic_messages() {
     assert_eq!(watch.observe(&unnamed, "gateway/unknown-model", |_| None), None, "unchanged: nothing to write");
     let result = serde_json::json!({ "type": "result", "usage": { "input_tokens": 9 } });
     assert_eq!(context_from_stream_event(&result), None);
+}
+
+/// #895: the window follows the stage's configured model. A `[1m]` stage is
+/// sized against 1M although its messages' `message.model` drops the suffix
+/// and the catalog lists the base id's window; any other id gets the
+/// catalog's, and an unlisted (or zero) window stays unknown.
+#[test]
+fn stream_json_context_window_follows_a_1m_stage_model() {
+    use crate::orchestrator::cli_runner::{stage_context_window, ContextWatch};
+    let catalog = |m: &str| (crate::token_engine::normalize_model_id(m) == "claude-opus-5-5").then_some(200_000);
+    assert_eq!(stage_context_window("claude-opus-5-5[1m]", catalog), Some(1_000_000));
+    assert_eq!(stage_context_window("sonnet[1M]", |_| None), Some(1_000_000));
+    assert_eq!(stage_context_window("claude-opus-5-5", catalog), Some(200_000));
+    assert_eq!(stage_context_window("claude-mystery-9", |_| None), None);
+    assert_eq!(stage_context_window("claude-zero", |_| Some(0)), None);
+    let message = serde_json::json!({
+        "type": "assistant", "parent_tool_use_id": null,
+        "message": { "id": "m1", "model": "claude-opus-5-5", "usage": { "input_tokens": 12, "cache_read_input_tokens": 399_988 } }
+    });
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5[1m]", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(1_000_000))),
+        "a [1m] stage past 200k is not over its window"
+    );
+    let mut watch = ContextWatch::default();
+    assert_eq!(
+        watch.observe(&message, "claude-opus-5-5", |m| stage_context_window(m, catalog)),
+        Some((400_000, Some(200_000))),
+        "the app hides a reading over its window rather than showing 400k / 200k"
+    );
 }
 
 #[test]

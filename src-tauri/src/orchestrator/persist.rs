@@ -45,7 +45,10 @@ impl EventSink for PersistingSink {
             }
         } else if event == RUN_CONTEXT_EVENT {
             // The stage row keeps the latest reading only; the stream sends
-            // one per message at most (`ContextWatch`). Never breaks the run.
+            // one per message at most (`ContextWatch`). A cleared reading
+            // (null tokens, at a stage start) is already cleared on the row
+            // (`set_run_stage_status`) and is only forwarded. Never breaks
+            // the run.
             let stage_id = payload.get("stageId").and_then(Value::as_str);
             let tokens = payload.get("contextTokens").and_then(Value::as_i64);
             if let (Some(stage_id), Some(tokens)) = (stage_id, tokens) {

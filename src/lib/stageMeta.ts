@@ -44,8 +44,10 @@ export function essenceShedsTokens(position: string, cost: string, tokens: strin
 /** A Claude CLI stage's context meter reading (#895): `ctx 142k / 200k`,
  *  through the shared `formatContextTokens`, toned by Talk's thresholds
  *  (`contextTone`: amber from 80%, rouge from 95%). `null` — the meter is
- *  hidden — before the stage's first message, for a Codex/API stage, and
- *  when the model's window is unknown: never drawn against a guessed 200k. */
+ *  hidden — before the stage's first message, for a Codex/API stage, when
+ *  the model's window is unknown (never drawn against a guessed 200k), and
+ *  when the reading is over the window (never `400k / 200k`: the window is
+ *  then not the one the session has). */
 export interface StageContextReading {
   label: string;
   tone: ContextTone;
@@ -61,7 +63,7 @@ export function stageContextReading(s: {
 }): StageContextReading | null {
   const used = s.contextTokens;
   const limit = s.contextWindow;
-  if (used == null || used <= 0 || limit == null || limit <= 0) return null;
+  if (used == null || used <= 0 || limit == null || limit <= 0 || used > limit) return null;
   const { pct, tone } = contextTone(used, limit);
   return {
     label: `ctx ${formatContextTokens(used)} / ${formatContextTokens(limit)}`,
@@ -84,20 +86,29 @@ export const SUBJECT_META_CH = 30;
 const SUBJECT_PILL_CH = 5;
 /** One 8px gap between atoms, in 10px-mono characters. */
 const META_GAP_CH = 8 / 6;
-/** The model id is the subject meta line's elastic atom: it truncates, but
- *  keeps at least this many characters, so it never reads as a bare "…". */
-const SUBJECT_MODEL_FLOOR_CH = 4;
-
-/** The subject card's meta ladder (#895, same E2 shed as the essence line):
- *  position, the model's floor, the shrink-0 notes (ran on · effort ·
- *  escalation) and the substrate pill are the floor; the context reading is
- *  the one rung, shed whole when it would not fit beside them. `notes` are
- *  the texts of the notes the line shows. The focus pane always has it. */
-export function subjectShedsContext(position: string, context: string, notes: string[]): boolean {
+/** The running card's meta ladder (#895, same E2 shed as the essence line):
+ *  position, the short model name (`shortModel`, in full), the shrink-0
+ *  notes (ran on · effort · escalation) and the substrate pill are the
+ *  floor; the context reading is the one rung, shed whole first when it
+ *  would not fit beside them — the model matters more on the card. `notes`
+ *  are the texts of the notes the line shows. The focus pane always has it. */
+export function subjectShedsContext(position: string, model: string, context: string, notes: string[]): boolean {
   const atoms = 4 + notes.length; // position · model · context · pill · notes
-  const fixed = position.length + SUBJECT_MODEL_FLOOR_CH + context.length + SUBJECT_PILL_CH;
+  const fixed = position.length + model.length + context.length + SUBJECT_PILL_CH;
   const noteCh = notes.reduce((n, t) => n + t.length, 0);
   return fixed + noteCh + (atoms - 1) * META_GAP_CH > SUBJECT_META_CH;
+}
+
+/** A stage's context reading as the app knows it now: the newest
+ *  `run://context` this session heard for it (`live`, a cleared one
+ *  included), else the stage row's from `get_run`. The live reading wins
+ *  because a `get_run` refresh can land after a newer event; a stage's
+ *  restart forgets it (`runsStore.clearLog`). */
+export function currentContext(
+  stage: { contextTokens?: number | null; contextWindow?: number | null },
+  live: { contextTokens: number | null; contextWindow: number | null } | undefined,
+): { contextTokens?: number | null; contextWindow?: number | null } {
+  return live ?? stage;
 }
 
 /** The role's display label — read from the loaded roles store (falls back to
