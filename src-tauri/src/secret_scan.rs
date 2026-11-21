@@ -758,7 +758,8 @@ pub struct AddedFile {
     /// keyed by `i`.
     pub unchanged: BTreeMap<usize, Vec<String>>,
     /// The new side starts like a zip archive ([`ZIP_MAGIC`]). Read only for
-    /// a `*.key` file: a zip one is a Keynote document, not a key.
+    /// a `*.key` file: a zip one is a Keynote document, not a key. Across a
+    /// range, set only when every add of the path was a zip.
     pub zip: bool,
 }
 
@@ -984,14 +985,37 @@ fn new_side(repo: &Repository, path: &str, id: Oid) -> Option<String> {
 }
 
 /// Whether the new side of `path` starts with [`ZIP_MAGIC`]: its blob, or
-/// the worktree file when git holds no blob for it. Reads four bytes of a
-/// worktree file, never more.
+/// the worktree file when git holds no blob for it. A blob past
+/// [`MAX_SCAN_BYTES`] (a Keynote document often is) is never loaded whole.
 fn starts_like_zip(repo: &Repository, path: &str, id: Oid) -> bool {
-    if let Some(b) = (!id.is_zero()).then(|| repo.find_blob(id).ok()).flatten() {
-        return b.content().starts_with(ZIP_MAGIC);
+    starts_like_zip_within(repo, path, id, MAX_SCAN_BYTES)
+}
+
+/// [`starts_like_zip`], loading a blob whole only up to `limit` bytes. Past
+/// it the first four bytes are streamed; libgit2 can't stream a packed
+/// object, so one is checked through the worktree file when that is exactly
+/// the blob's size, else it counts as no zip.
+pub(crate) fn starts_like_zip_within(repo: &Repository, path: &str, id: Oid, limit: usize) -> bool {
+    let odb = (!id.is_zero()).then(|| repo.odb().ok()).flatten();
+    let Some((size, _)) = odb.as_ref().and_then(|o| o.read_header(id).ok()) else {
+        return worktree_starts_like_zip(repo, path, None);
+    };
+    if size <= limit {
+        return repo.find_blob(id).is_ok_and(|b| b.content().starts_with(ZIP_MAGIC));
     }
+    let mut head = [0u8; 4];
+    match odb.as_ref().map(|o| o.reader(id)) {
+        Some(Ok((mut r, _, _))) => std::io::Read::read_exact(&mut r, &mut head).is_ok_and(|()| &head == ZIP_MAGIC),
+        _ => worktree_starts_like_zip(repo, path, Some(size as u64)),
+    }
+}
+
+/// Whether the worktree file `path` starts with [`ZIP_MAGIC`]. Reads four
+/// bytes, never more. With `size`, a file of any other length is no zip.
+fn worktree_starts_like_zip(repo: &Repository, path: &str, size: Option<u64>) -> bool {
     let Some(p) = repo.workdir().map(|w| w.join(path)) else { return false };
-    if !std::fs::symlink_metadata(&p).map(|m| m.is_file()).unwrap_or(false) {
+    let Ok(meta) = std::fs::symlink_metadata(&p) else { return false };
+    if !meta.is_file() || size.is_some_and(|s| s != meta.len()) {
         return false;
     }
     let mut head = [0u8; 4];
@@ -1360,8 +1384,12 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
         let zip = is_new && path.to_ascii_lowercase().ends_with(".key") && starts_like_zip(repo, &path, id);
         match index.get(&path) {
             Some(&i) => {
+                // Quiet by name only when every add in the range was a zip:
+                // a real key added, deleted, then a Keynote at its path asks.
+                if is_new {
+                    files[i].zip = zip && (!files[i].is_new || files[i].zip);
+                }
                 files[i].is_new |= is_new;
-                files[i].zip |= zip;
             }
             None => {
                 index.insert(path.clone(), files.len());

@@ -21472,6 +21472,49 @@ mod secret_guard_tests {
     }
 
     #[test]
+    fn a_large_keynote_blob_is_read_four_bytes_at_a_time() {
+        let (dir, git) = repo();
+        let mut keynote = b"PK\x03\x04".to_vec();
+        keynote.resize(4096, b'x');
+        std::fs::write(dir.path().join("Big.key"), &keynote).unwrap();
+        std::fs::write(dir.path().join("big.key"), vec![b'-'; 4096]).unwrap();
+        stage(&git, "Big.key");
+        stage(&git, "big.key");
+        let id = |rel: &str| git.index().unwrap().get_path(Path::new(rel), 0).unwrap().id;
+        // Past the limit the blob is streamed, so the worktree isn't needed.
+        std::fs::remove_file(dir.path().join("Big.key")).unwrap();
+        assert!(starts_like_zip_within(&git, "Big.key", id("Big.key"), 16));
+        assert!(!starts_like_zip_within(&git, "big.key", id("big.key"), 16));
+        // Under the limit the blob is read whole, with the same answer.
+        assert!(starts_like_zip_within(&git, "Big.key", id("Big.key"), 1 << 20));
+        assert!(!starts_like_zip_within(&git, "big.key", id("big.key"), 1 << 20));
+        // No blob in git: the worktree file's first bytes.
+        std::fs::write(dir.path().join("New.key"), &keynote).unwrap();
+        assert!(starts_like_zip_within(&git, "New.key", git2::Oid::zero(), 16));
+    }
+
+    #[test]
+    fn a_keynote_at_the_path_of_an_earlier_key_in_the_range_still_asks() {
+        let (dir, git) = repo();
+        let head = git.head().unwrap().peel_to_commit().unwrap();
+        git.branch("feature", &head, false).unwrap();
+        git.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("x.key"), "not a zip\n").unwrap();
+        commit_all(&git, "add a key");
+        std::fs::remove_file(dir.path().join("x.key")).unwrap();
+        {
+            let mut idx = git.index().unwrap();
+            idx.remove_path(Path::new("x.key")).unwrap();
+            idx.write().unwrap();
+        }
+        commit_all(&git, "take it out");
+        std::fs::write(dir.path().join("x.key"), b"PK\x03\x04index.apxl").unwrap();
+        commit_all(&git, "add a deck");
+        let f = scan_added(&branch_files(dir.path(), "main").unwrap(), &[]);
+        assert!(f.iter().any(|f| f.rule == "key-file" && f.file == "x.key"), "{f:?}");
+    }
+
+    #[test]
     fn mcp_configs_flag_credential_named_env_values() {
         let pw = rnd(300, 24, B62);
         let lines: Vec<String> = vec![
