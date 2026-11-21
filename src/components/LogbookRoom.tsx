@@ -199,7 +199,7 @@ export function optionLabelFits(label: string): boolean {
 }
 
 /** A small mono segmented control — a brass-ghost fill with ivory ink marks
- *  the active option (brass text stays for the eyebrow and the table). An
+ *  the active option (brass text stays for the eyebrow, never a figure). An
  *  `identifier` option (the project name) that can't fit is MIDDLE-truncated
  *  (E1) inside a fixed width — the header is shrink-to-fit, and the
  *  MidTruncate box needs a definite one — with the full label as its title. */
@@ -269,7 +269,7 @@ function LogbookTable({ rows }: { rows: LogbookMissionRow[] }) {
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-sage">
                 {fmtHours(r.hoursSecs)}
               </td>
-              <td className="octo-tabular py-2.5 pr-4 text-right text-octo-brass">
+              <td className="octo-tabular py-2.5 pr-4 text-right text-octo-sage">
                 {formatUsd(r.costUsd)}
               </td>
               <td className="octo-tabular py-2.5 pr-4 text-right text-octo-verdigris">

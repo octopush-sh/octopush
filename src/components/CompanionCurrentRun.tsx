@@ -60,7 +60,7 @@ export function CompanionCurrentRun({ workspaceId }: Props) {
       </div>
 
       <div className="flex items-center gap-2 font-mono text-[10px] text-octo-mute">
-        <span className="octo-tabular text-octo-brass">{formatUsd(run.costUsd)}</span>
+        <span className="octo-tabular text-octo-ivory">{formatUsd(run.costUsd)}</span>
         {(tokIn > 0 || tokOut > 0) && (
           <span className="octo-tabular" title="input / output tokens">↑{fmtTokens(tokIn)} ↓{fmtTokens(tokOut)}</span>
         )}

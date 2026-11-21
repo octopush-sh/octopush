@@ -228,7 +228,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
                     <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
                   </>
                 )}
-                <span className="octo-tabular text-octo-brass">spent {formatUsd(spent)}</span>
+                <span className="octo-tabular text-octo-ivory">spent {formatUsd(spent)}</span>
               </span>
             )}
             <button

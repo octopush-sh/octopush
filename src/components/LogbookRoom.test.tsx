@@ -188,7 +188,7 @@ describe("LogbookRoom", () => {
     expect(idle).not.toHaveClass("bg-[var(--brass-ghost)]");
   });
 
-  it("sets the header spent total in ivory so only the table's spent cells are brass", async () => {
+  it("keeps brass off spend: the header total is ivory, the table's spent cells sage", async () => {
     setPlan(["logbook.reports"]);
     logbookSummaryMock.mockResolvedValue([
       {
@@ -206,6 +206,9 @@ describe("LogbookRoom", () => {
     const total = await screen.findByTitle("Total spend");
     expect(total).toHaveClass("text-octo-ivory");
     expect(total).not.toHaveClass("text-octo-brass");
+    const cell = screen.getByRole("cell", { name: "$12.50" });
+    expect(cell).toHaveClass("octo-tabular", "text-octo-sage");
+    expect(cell.className).not.toContain("brass");
   });
 
   it("fits an option label by its mono character count", () => {
