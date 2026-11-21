@@ -17723,6 +17723,11 @@ mod pricing_table_tests {
             assert!(crate::providers::openai_compat::uses_responses_api(id, &providers["openai"].api_base));
             assert_eq!(crate::providers::openai_compat::effort_off_level(id), None, "{id} rejects effort none");
         }
+        // The older GPT-6 models are priced but not listed (#938): Talk uses
+        // them only once added in Settings › Models, as FEATURES.md says.
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol"] {
+            assert!(!openai.iter().any(|m| m.id == id), "{id} is not in the openai catalog");
+        }
     }
 
     #[test]
