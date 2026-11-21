@@ -415,36 +415,28 @@ describe("RunFlow — an aborted run (#891)", () => {
 });
 
 describe("RunFlow — the running stage's context meter (#895)", () => {
-  // `opus` is short enough to leave the reading room; real ids are not.
   const running = (over: Record<string, unknown>) => [
-    mk({ id: "a", status: "running", startedAt: 1, substrate: "cli", agentModel: "opus", ...over }),
+    mk({ id: "a", status: "running", startedAt: 1, substrate: "cli", agentModel: "claude-opus-5-5", ...over }),
   ];
   const ctxEl = (c: HTMLElement) => c.querySelector('[data-tour="direct-stage-context"]')!;
 
-  it("reads ctx used / window on the running card's meta line when it fits", () => {
+  it("reads ctx N% on the running card, beside the short model name", () => {
     const { container } = render(
       <RunFlow stages={running({ contextTokens: 142_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
     );
-    expect(ctxEl(container)).toHaveTextContent("ctx 142k / 200k");
+    expect(ctxEl(container)).toHaveTextContent("ctx 71%");
     expect(ctxEl(container)).toHaveClass("octo-demote", "text-octo-mute");
     expect(ctxEl(container)).not.toHaveClass("octo-demote-shed");
-    expect(ctxEl(container).getAttribute("title")).toContain("142,000 of 200,000 tokens (71%)");
-  });
-
-  it("names a running card's model short, full id in the tooltip, and sheds the reading first", () => {
-    const { container } = render(
-      <RunFlow
-        stages={running({ agentModel: "claude-opus-5-5", contextTokens: 194_000, contextWindow: 200_000 })}
-        selectedStageId="a"
-        beaconStageId={null}
-        onSelectStage={() => {}}
-      />,
-    );
+    expect(ctxEl(container).getAttribute("title")).toBe("Context: 142k of 200k tokens");
     const model = screen.getByText("opus-5-5");
     expect(model.getAttribute("title")).toBe("claude-opus-5-5");
-    expect(ctxEl(container)).toHaveClass("octo-demote-shed");
-    // Screen readers still get the figures.
-    expect(container.querySelector(".sr-only")?.textContent).toContain("194,000 of 200,000 tokens");
+  });
+
+  it("rounds down on the card: 99.9% reads 99%", () => {
+    const { container } = render(
+      <RunFlow stages={running({ contextTokens: 199_800, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
+    );
+    expect(ctxEl(container)).toHaveTextContent("ctx 99%");
   });
 
   it("keeps the full model id on a card that isn't running", () => {
@@ -463,7 +455,7 @@ describe("RunFlow — the running stage's context meter (#895)", () => {
     );
     expect(ctxEl(container)).toHaveClass("text-octo-rouge");
     expect(ctxEl(container)).toHaveAttribute("data-tone", "rouge");
-    expect(ctxEl(container)).toHaveTextContent("ctx 194k / 200k");
+    expect(ctxEl(container)).toHaveTextContent("ctx 97%");
     expect(ctxEl(container)).not.toHaveClass("octo-demote-shed");
   });
 
@@ -483,7 +475,7 @@ describe("RunFlow — the running stage's context meter (#895)", () => {
     }
   });
 
-  it("sheds the reading, never the effort or the position, when the line can't fit", () => {
+  it("sheds the reading first, never the short model name, effort or position", () => {
     const { container } = render(
       <RunFlow
         stages={running({ contextTokens: 142_000, contextWindow: 200_000, effort: "high" })}
@@ -494,6 +486,9 @@ describe("RunFlow — the running stage's context meter (#895)", () => {
     );
     expect(ctxEl(container)).toHaveClass("octo-demote-shed");
     expect(screen.getByText("high")).toBeInTheDocument();
+    expect(screen.getByText("opus-5-5")).toBeInTheDocument();
+    // Screen readers still get the figures.
+    expect(container.querySelector(".sr-only")?.textContent).toBe("Context: 142k of 200k tokens");
   });
 
   it("reads the newest live reading over a stale stage row", () => {
@@ -502,7 +497,7 @@ describe("RunFlow — the running stage's context meter (#895)", () => {
       const { container } = render(
         <RunFlow stages={running({ contextTokens: 120_000, contextWindow: 200_000 })} selectedStageId="a" beaconStageId={null} onSelectStage={() => {}} />,
       );
-      expect(ctxEl(container)).toHaveTextContent("ctx 180k / 200k");
+      expect(ctxEl(container)).toHaveTextContent("ctx 90%");
     } finally {
       delete (live as any).liveContextByStage;
     }

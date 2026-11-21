@@ -41,7 +41,8 @@ export function essenceShedsTokens(position: string, cost: string, tokens: strin
   return position.length + cost.length + tokens.length > ESSENCE_META_CH;
 }
 
-/** A Claude CLI stage's context meter reading (#895): `ctx 142k / 200k`,
+/** A Claude CLI stage's context meter reading (#895): `ctx 142k / 200k` in
+ *  the focus pane, `ctx 71%` on the running card,
  *  through the shared `formatContextTokens`, toned by Talk's thresholds
  *  (`contextTone`: amber from 80%, rouge from 95%). `null` — the meter is
  *  hidden — before the stage's first message, for a Codex/API stage, when
@@ -49,12 +50,23 @@ export function essenceShedsTokens(position: string, cost: string, tokens: strin
  *  when the reading is over the window (never `400k / 200k`: the window is
  *  then not the one the session has). */
 export interface StageContextReading {
+  /** The focus pane's reading: `ctx 142k / 200k`. */
   label: string;
+  /** The running card's shorter reading: `ctx 71%`, rounded down. */
+  cardLabel: string;
+  /** The card's tooltip: `Context: 142k of 200k tokens`. */
+  cardTitle: string;
   tone: ContextTone;
   /** Share of the window used, 0–100. */
   pct: number;
-  /** The exact figures, for the tooltip and screen readers. */
+  /** The exact figures, for the focus pane's tooltip. */
   title: string;
+}
+
+/** The share of the window used, rounded DOWN to a whole percent: 99.9% reads
+ *  99%, so "100%" only ever means a full window. */
+export function contextPercent(used: number, limit: number): number {
+  return limit > 0 ? Math.floor((Math.min(used, limit) / limit) * 100) : 0;
 }
 
 export function stageContextReading(s: {
@@ -65,11 +77,14 @@ export function stageContextReading(s: {
   const limit = s.contextWindow;
   if (used == null || used <= 0 || limit == null || limit <= 0 || used > limit) return null;
   const { pct, tone } = contextTone(used, limit);
+  const share = contextPercent(used, limit);
   return {
     label: `ctx ${formatContextTokens(used)} / ${formatContextTokens(limit)}`,
+    cardLabel: `ctx ${share}%`,
+    cardTitle: `Context: ${formatContextTokens(used)} of ${formatContextTokens(limit)} tokens`,
     tone,
     pct,
-    title: `Context: ${used.toLocaleString("en-US")} of ${limit.toLocaleString("en-US")} tokens (${Math.round(pct)}%), the prompt of the stage's latest message`,
+    title: `Context: ${used.toLocaleString("en-US")} of ${limit.toLocaleString("en-US")} tokens (${share}%), the prompt of the stage's latest message`,
   };
 }
 

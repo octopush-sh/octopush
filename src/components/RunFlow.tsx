@@ -179,7 +179,7 @@ function StageCard({
   const modelLabel = running ? shortModel(s.agentModel) : s.agentModel;
   const ctx = running ? stageContextReading(currentContext(s, liveContext)) : null;
   const metaNotes = [s.ranModel ? ranOnNote(s.ranModel) : "", effortShown ? s.effort ?? "" : "", escalatedNote].filter(Boolean);
-  const ctxShed = ctx ? subjectShedsContext(String(index + 1), modelLabel, ctx.label, metaNotes) : false;
+  const ctxShed = ctx ? subjectShedsContext(String(index + 1), modelLabel, ctx.cardLabel, metaNotes) : false;
 
   const looping = s.loopTargetPosition !== null;
   const target = looping ? stages.find((t) => t.position === s.loopTargetPosition) : undefined;
@@ -283,16 +283,16 @@ function StageCard({
                 className={`octo-demote octo-tabular ${ctx ? contextToneClass(ctx.tone) : "text-octo-mute"}${
                   !ctx || ctxShed ? " octo-demote-shed" : ""
                 }`}
-                title={ctx?.title}
+                title={ctx?.cardTitle}
                 data-tour="direct-stage-context"
                 data-tone={ctx?.tone}
                 aria-hidden={ctx ? undefined : true}
               >
-                {ctx?.label ?? ""}
+                {ctx?.cardLabel ?? ""}
               </span>
             )}
             {/* A shed reading is hidden from screen readers too; they get the figures. */}
-            {ctx && ctxShed && <span className="sr-only">{ctx.title}</span>}
+            {ctx && ctxShed && <span className="sr-only">{ctx.cardTitle}</span>}
             {s.ranModel && (
               <span
                 className="octo-pop-in shrink-0 text-octo-warning"
