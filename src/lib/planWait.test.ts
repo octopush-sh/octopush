@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { AUTO_RESUME_CAP, isPlanWaiting, pickBlockedStage, planWaitWhy } from "./planWait";
+import { AUTO_RESUME_CAP, isPlanWaiting, pickBlockedStage, planLimitedStage, planWaitWhy } from "./planWait";
 import { beaconAnchor } from "./beacon";
 import type { PlanWait } from "./ipc";
 
@@ -15,6 +15,14 @@ describe("planWait", () => {
     const m = rust.match(/pub const AUTO_RESUME_CAP: i64 = (\d+);/);
     expect(m, "AUTO_RESUME_CAP in plan_wait.rs").not.toBeNull();
     expect(Number(m![1])).toBe(AUTO_RESUME_CAP);
+  });
+
+  it("finds the plan-limited stage a Resume acts on, past a gate or a real halt", () => {
+    const plan = { id: "p", status: "failed", error: "Paused by your Claude plan.\n(plan_limit)" };
+    expect(planLimitedStage([{ id: "g", status: "awaiting_checkpoint" }, { id: "h", status: "failed", error: "the build broke" }, plan])).toBe(plan);
+    expect(planLimitedStage([{ id: "g", status: "awaiting_checkpoint" }])).toBeNull();
+    // A plan-limited stage that already re-runs is no longer one to resume.
+    expect(planLimitedStage([{ ...plan, status: "running" }])).toBeNull();
   });
 
   it("is calm only when the plan-limited stages are all that wait", () => {

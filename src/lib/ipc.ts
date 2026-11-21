@@ -422,6 +422,13 @@ function stagePatchArgs(patch?: RunStagePatch) {
 }
 export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
 
+/** What a checkpoint decision carries besides its stage and action. */
+export interface CheckpointOptions {
+  feedback?: string;
+  modelOverride?: string;
+  maxTurnsOverride?: number;
+}
+
 /** An archived stage attempt — a snapshot taken just before a loop-back /
  *  reject reset wiped the live stage row (matches Rust `StageIterationRow`). */
 export interface StageIteration {
@@ -1549,24 +1556,23 @@ export const ipc = {
 
   resolveCheckpoint: (
     runId: string,
+    /** The stage the director decided on. Required: a run can hold several
+     *  (a plan limit beside a gate), and the director decides on the one
+     *  they looked at, never "the first". A named stage that is no longer
+     *  waiting (decided elsewhere) is refused with "This stage was already
+     *  decided — refresh to see what's waiting.", never redirected to
+     *  another stage (Abort always goes through). */
+    stageId: string,
     action: CheckpointActionName,
-    feedback?: string,
-    modelOverride?: string,
-    maxTurnsOverride?: number,
-    /** The stage the director decided on. A run can hold several (a plan
-     *  limit beside a gate): without it the backend picks the first. A named
-     *  stage that is no longer waiting (decided elsewhere) is refused with
-     *  "This stage was already decided — refresh to see what's waiting.",
-     *  never redirected to another stage (Abort always goes through). */
-    stageId?: string,
+    opts: CheckpointOptions = {},
   ) =>
     invoke<void>("resolve_checkpoint", {
       runId,
       action,
-      feedback: feedback ?? null,
-      modelOverride: modelOverride ?? null,
-      maxTurnsOverride: maxTurnsOverride ?? null,
-      stageId: stageId ?? null,
+      feedback: opts.feedback ?? null,
+      modelOverride: opts.modelOverride ?? null,
+      maxTurnsOverride: opts.maxTurnsOverride ?? null,
+      stageId,
     }),
 
   /** Answer a stage that parked itself via the `ask_director` escape valve.
@@ -1582,7 +1588,8 @@ export const ipc = {
     invoke<void>("abort_run", { runId }),
 
   /** Turn off a plan-parked run's automatic resume: it waits for a manual
-   *  Resume. ("Resume now" is `resolveCheckpoint(runId, "resume")`.) */
+   *  Resume. ("Resume now" is `resolveCheckpoint(runId, stageId, "resume")`
+   *  on the plan-limited stage.) */
   cancelPlanResume: (runId: string) =>
     invoke<void>("cancel_plan_resume", { runId }),
 

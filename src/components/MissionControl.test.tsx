@@ -532,19 +532,63 @@ describe("MissionControl", () => {
     expect(container.textContent).not.toContain("○");
   });
 
-  it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", () => {
+  it("Resume now and Don't resume automatically act on the plan-waiting card without jumping", async () => {
     const resumeAt = Math.floor(Date.now() / 1000) + 3600;
     const run = mkRun("a", "paused", {
       planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
     });
+    const plan = { ...mkStage("s1", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
     const onJumpToRun = vi.fn();
-    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [] } } });
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [plan] } } });
     renderRoom({ onJumpToRun });
-    fireEvent.click(screen.getByLabelText("Resume now"));
-    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "resume", undefined, undefined, undefined, undefined);
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Resume now"));
+    });
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "s1", "resume", undefined);
     fireEvent.click(screen.getByLabelText("Don't resume automatically"));
     expect(ipc.cancelPlanResume).toHaveBeenCalledWith("a");
     expect(onJumpToRun).not.toHaveBeenCalled();
+  });
+
+  it("Resume now names the plan-limited stage, not a gate held before it", async () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
+    });
+    const gate = mkStage("s1", "a", 0, "awaiting_checkpoint");
+    const plan = { ...mkStage("s2", "a", 1, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: { a: { run, stages: [gate, plan] } } });
+    renderRoom();
+    (ipc.resolveCheckpoint as any).mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Resume now"));
+    });
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledTimes(1);
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "s2", "resume", undefined);
+  });
+
+  it("Resume now reads the run's stages when the card has none, and resolves nothing once no plan limit is left", async () => {
+    const resumeAt = Math.floor(Date.now() / 1000) + 3600;
+    const run = mkRun("a", "paused", {
+      planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: false },
+    });
+    const plan = { ...mkStage("s3", "a", 0, "failed"), error: "Paused by your Claude plan — the 5-hour window is used up until it resets.\n(plan_limit)" };
+    useRunsStore.setState({ runsByWs: { "ws-a": [run] }, detailByRun: {} });
+    (ipc.getRun as any).mockResolvedValueOnce({ run, stages: [plan] });
+    renderRoom();
+    (ipc.resolveCheckpoint as any).mockClear();
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Resume now"));
+    });
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("a", "s3", "resume", undefined);
+
+    (ipc.resolveCheckpoint as any).mockClear();
+    useRunsStore.setState({ detailByRun: { a: { run, stages: [mkStage("s1", "a", 0, "awaiting_checkpoint")] } } });
+    (ipc.getRun as any).mockResolvedValueOnce({ run, stages: [mkStage("s1", "a", 0, "awaiting_checkpoint")] });
+    await act(async () => {
+      fireEvent.click(screen.getByLabelText("Resume now"));
+    });
+    expect(ipc.resolveCheckpoint).not.toHaveBeenCalled();
   });
 
   it("a plan park beside a sibling's real halt is in Needs you", () => {

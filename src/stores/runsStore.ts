@@ -7,6 +7,7 @@ import {
   type Run,
   type RunDetail,
   type CheckpointActionName,
+  type CheckpointOptions,
   type RunStagePatch,
   type AnswerSource,
 } from "../lib/ipc";
@@ -129,13 +130,11 @@ interface RunsState {
   start: (runId: string) => Promise<void>;
   resolve: (
     runId: string,
-    action: CheckpointActionName,
-    feedback?: string,
-    modelOverride?: string,
-    maxTurnsOverride?: number,
     /** The stage decided on (see `ipc.resolveCheckpoint`). A refusal is
      *  toasted, never thrown, and the detail refreshes either way. */
-    stageId?: string,
+    stageId: string,
+    action: CheckpointActionName,
+    opts?: CheckpointOptions,
   ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
@@ -454,9 +453,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     }
   },
 
-  resolve: async (runId, action, feedback, modelOverride, maxTurnsOverride, stageId) => {
+  resolve: async (runId, stageId, action, opts) => {
     try {
-      await ipc.resolveCheckpoint(runId, action, feedback, modelOverride, maxTurnsOverride, stageId);
+      await ipc.resolveCheckpoint(runId, stageId, action, opts);
     } catch (e) {
       // A refusal (e.g. the stage was already decided elsewhere) is shown
       // calmly — the callers fire-and-forget — and the refresh below brings

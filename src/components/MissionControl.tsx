@@ -21,7 +21,7 @@ import { useAttentionStore } from "../stores/attentionStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { INTENT_ICON } from "../lib/missionIntent";
 import { runStatusMeta, isTransientHalt } from "../lib/runStatus";
-import { isPlanWaiting, planWaitLine } from "../lib/planWait";
+import { isPlanWaiting, planLimitedStage, planWaitLine } from "../lib/planWait";
 import { lastActivity } from "../lib/liveLine";
 import { claudeWaitReason, claudeWaitingCopy, type ClaudeWaitReason } from "../lib/claudeWaiting";
 import { stageTitle } from "../lib/stageMeta";
@@ -848,6 +848,7 @@ function AskPanel({
 function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | null }) {
   const abort = useRunsStore((s) => s.abort);
   const resolve = useRunsStore((s) => s.resolve);
+  const refreshDetail = useRunsStore((s) => s.refreshDetail);
   const cancelPlanResume = useRunsStore((s) => s.cancelPlanResume);
   const dismissSettled = useRunsStore((s) => s.dismissSettled);
   const planWaiting = isPlanWaiting(run);
@@ -863,6 +864,20 @@ function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | 
   // A completed crew's foot gets the one sanctioned ceremony: a single brass
   // sweep as it settles (only when it JUST settled — not on later re-opens).
   const settledJustNow = band === "settled" && run.status === "completed" && recentlySettled(run.id);
+
+  // Resume names the plan-limited stage, never "the first waiting stage": a
+  // run can also hold a gate the director hasn't looked at. The detail is
+  // read fresh when the card has none yet; no plan-limited stage left means
+  // nothing to resume (the refresh already updated the card).
+  const onResumeNow = async () => {
+    const stageOf = () => planLimitedStage(useRunsStore.getState().detailByRun[run.id]?.stages ?? []);
+    let stage = stageOf();
+    if (!stage) {
+      await refreshDetail(run.id);
+      stage = stageOf();
+    }
+    if (stage) await resolve(run.id, stage.id, "resume");
+  };
 
   const onAbort = (e: React.MouseEvent) => {
     e.stopPropagation(); // don't trigger the card's jump
@@ -906,7 +921,7 @@ function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | 
               type="button"
               onClick={(e) => {
                 e.stopPropagation(); // don't trigger the card's jump
-                void resolve(run.id, "resume").catch(console.error);
+                void onResumeNow().catch(console.error);
               }}
               aria-label="Resume now"
               title="Resume now — continue the same session before the plan's window resets"
