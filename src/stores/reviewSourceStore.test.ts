@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import { useReviewSource } from "./reviewSourceStore";
 
-const c = { base: "main", mergeBase: "abc1234", commits: 2, diff: "diff --git a/x b/x\n" };
+const c = { base: "main", mergeBase: "abc1234", head: "def5678", commits: 2, diff: "diff --git a/x b/x\n" };
 
 beforeEach(() => useReviewSource.setState({ committedByWs: {}, pickByWs: {}, pinnedByWs: {} }));
 
@@ -13,6 +13,9 @@ describe("reviewSourceStore", () => {
     expect(useReviewSource.getState().committedByWs).toBe(first);
     useReviewSource.getState().setCommitted("ws", { ...c, commits: 3 });
     expect(useReviewSource.getState().committedByWs.ws?.commits).toBe(3);
+    // A reword moves HEAD only: still a new answer (#820).
+    useReviewSource.getState().setCommitted("ws", { ...c, commits: 3, head: "9a8b7c6" });
+    expect(useReviewSource.getState().committedByWs.ws?.head).toBe("9a8b7c6");
   });
   it("stores a pick per workspace", () => {
     useReviewSource.getState().pick("a", "committed");

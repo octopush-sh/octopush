@@ -1,7 +1,8 @@
 /**
  * SecretGuardDialog — the secret guard's confirm (#730). Shown when a commit,
  * push or pull request is refused with `SecretsFound`. Lists what was found
- * (kind · file:line — never the value), and says so when the scan stopped
+ * (kind · file:line · masked preview like `sk-ant-…9fQ2` — never the value,
+ * #820), and says so when the scan stopped
  * at its 16 MB budget. "Leave it out" is the default focus and Escape's
  * action; the override is an explicit second choice that applies to this one
  * action and these exact findings only (the core rescans and checks the
@@ -9,7 +10,7 @@
  */
 import { ShieldAlert } from "lucide-react";
 import { ModalShell } from "./ModalShell";
-import { PARTIAL_NOTE, findingLocation, guardHeadline, overrideLabel, type GuardedAction, type SecretRefusal } from "../lib/secretGuard";
+import { PARTIAL_NOTE, PREVIEW_TIP, findingLocation, guardHeadline, overrideLabel, type GuardedAction, type SecretRefusal } from "../lib/secretGuard";
 
 const SHOWN = 5;
 
@@ -38,18 +39,29 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: P
         <h2 className="mt-2 font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory">
           {guardHeadline(action, findings, total)}
         </h2>
-        {(findings.length > 1 || total > findings.length) && (
+        {findings.length > 1 || total > findings.length ? (
           <ul className="mt-3 space-y-1" aria-label="What was found">
-            {shown.map((f) => (
-              <li key={`${f.file}:${f.line ?? 0}:${f.rule}`} className="flex min-w-0 items-baseline gap-2 font-mono text-[11px]">
+            {shown.map((f, i) => (
+              <li key={`${f.file}:${f.line ?? 0}:${f.rule}:${i}`} className="flex min-w-0 items-baseline gap-2 font-mono text-[11px]">
                 <span className="shrink-0 text-octo-sage">{f.kind}</span>
                 <span className="min-w-0 truncate text-octo-mute" title={findingLocation(f)}>
                   {findingLocation(f)}
                 </span>
+                {f.preview && (
+                  <span className="ml-auto shrink-0 text-octo-mute" title={PREVIEW_TIP}>
+                    {f.preview}
+                  </span>
+                )}
               </li>
             ))}
             {more > 0 && <li className="font-mono text-[11px] text-octo-mute">and {more} more</li>}
           </ul>
+        ) : (
+          findings[0]?.preview && (
+            <p data-tour="secret-guard-preview" className="mt-2 font-mono text-[11px] text-octo-mute" title={PREVIEW_TIP}>
+              {findings[0].preview}
+            </p>
+          )
         )}
         {partial && (
           <p data-tour="secret-guard-partial" className="mt-3 font-mono text-[11px] text-octo-mute">
@@ -58,7 +70,7 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: P
         )}
         <p className="mt-3 text-[12px] leading-relaxed text-octo-sage">
           {yours ? "It matches a key you saved in Octopush. " : ""}
-          {total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one {action === "pr" ? "pull request" : action}. Octopush never shows or stores the value.
+          {total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one {action === "pr" ? "pull request" : action}. Octopush shows only a provider's prefix and the last four characters, and never stores the value.
         </p>
         <div className="mt-6 flex items-center justify-end gap-3">
           <button

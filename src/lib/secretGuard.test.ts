@@ -1,11 +1,33 @@
 import { describe, it, expect } from "vitest";
-import { findingLocation, guardHeadline, holdSummary, overrideLabel, previewSummary, secretRefusal, secretSummary, type SecretFinding } from "./secretGuard";
+import { branchScanSummary, findingLocation, guardHeadline, holdSummary, overrideLabel, previewSummary, secretRefusal, secretSummary, type SecretFinding } from "./secretGuard";
 
 const f = (over: Partial<SecretFinding> = {}): SecretFinding => ({
   file: "tests/fixtures.ts", line: 12, rule: "anthropic-key", kind: "Anthropic API key", yours: false, ...over,
 });
 
 describe("secretGuard", () => {
+  it("keeps the masked preview out of every one-line summary (#820)", () => {
+    const withPreview = f({ preview: "sk-ant-…9fQ2" });
+    for (const text of [
+      secretSummary([withPreview]),
+      previewSummary({ findings: [withPreview], total: 1, partial: false }) ?? "",
+      holdSummary({ acknowledged: false, fingerprint: "x", findings: [withPreview] }),
+      guardHeadline("commit", [withPreview]),
+    ]) {
+      expect(text).not.toContain("9fQ2");
+    }
+  });
+
+  it("words the branch scan's verdict", () => {
+    expect(branchScanSummary({ findings: [], total: 0, partial: false }, 3)).toBe("No possible secrets in 3 commits.");
+    expect(branchScanSummary({ findings: [], total: 0, partial: false }, 1)).toBe("No possible secrets in 1 commit.");
+    expect(branchScanSummary({ findings: [], total: 0, partial: true }, 3)).toBe(
+      "Nothing found in the first 16 MB; the rest wasn't checked.",
+    );
+    expect(branchScanSummary({ findings: [f()], total: 1, partial: false }, 3)).toBe("1 possible secret in this branch's commits.");
+    expect(branchScanSummary({ findings: [f(), f()], total: 60, partial: true }, 3)).toBe("60 possible secrets in this branch's commits.");
+  });
+
   it("recognises the guard's structured refusal, as an object or a JSON string", () => {
     const err = { kind: "SecretsFound", message: "possible secret: …", findings: [f()], total: 3, partial: true, fingerprint: "abc" };
     const want = { findings: [f()], total: 3, partial: true, fingerprint: "abc" };

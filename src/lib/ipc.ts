@@ -506,6 +506,9 @@ export interface CommittedDiff {
   base: string | null;
   /** Short SHA of the merge base, when one resolved. */
   mergeBase: string | null;
+  /** Short SHA of HEAD, when there is one: an amend that keeps the count and
+   *  merge base still moves it. */
+  head: string | null;
   /** Commits on HEAD since the merge base. */
   commits: number;
   /** Unified diff; "" when there are no commits ahead. */
@@ -1238,6 +1241,12 @@ export const ipc = {
    *  blocks anything and carries no fingerprint: Commit rescans and asks. */
   secretScanStaged: (workspacePath: string) =>
     invoke<SecretPreview | null>("secret_scan_staged", { workspacePath }),
+
+  /** "Scan this branch's commits" (#820): the guard's rules over every commit
+   *  since the merge base with `base`, on demand, guard switch on or off.
+   *  Read-only; rejects when no merge base resolves. */
+  secretScanBranch: (workspacePath: string, base: string) =>
+    invoke<SecretPreview>("secret_scan_branch", { workspacePath, base }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
   amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>

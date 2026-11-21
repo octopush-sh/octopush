@@ -9,15 +9,16 @@
  *   1. Readiness — a one-line verdict synthesised from the working-tree state.
  *   2. Provenance — the agentic story of the diff: which agent turns shaped it,
  *      expandable to the turn's model + message. Octopush's signature.
- *   3. Branch & publish — upstream / ahead-behind / last commit at a glance.
+ *   3. Branch & publish — upstream / ahead-behind / last commit at a glance,
+ *      and the on-demand "Scan this branch's commits" for secrets.
  */
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, GitCompare, ShieldAlert } from "lucide-react";
+import { Sparkles, GitBranch, GitCompareArrows, Loader2, ChevronDown, GitCommit, GitCompare, ShieldAlert, ShieldCheck } from "lucide-react";
 import { ipc } from "../lib/ipc";
 import type { LastCommit } from "../lib/ipc";
 import type { GitStatus, FileEdit, ChatMessage } from "../lib/types";
-import { findingLocation, previewSummary, type SecretPreview } from "../lib/secretGuard";
+import { PARTIAL_NOTE, PREVIEW_TIP, branchScanSummary, findingLocation, previewSummary, type SecretPreview } from "../lib/secretGuard";
 import { formatRelTime } from "../lib/relTime";
 import { collisionTooltip, notable, shownCount } from "../lib/collisions";
 import { useCollisionStore } from "../stores/collisionStore";
@@ -469,6 +470,14 @@ function BranchPublish({
           </span>
         </div>
       )}
+      {sinceBase?.base && (
+        <BranchSecretScan
+          key={`${workspacePath}|${sinceBase.base}|${sinceBase.mergeBase ?? ""}|${sinceBase.head ?? ""}|${sinceBase.commits}`}
+          workspacePath={workspacePath}
+          base={sinceBase.base}
+          commits={sinceBase.commits}
+        />
+      )}
       {lastCommit && (
         <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-sage">
           <GitCommit size={12} className="mt-0.5 shrink-0 text-octo-mute" aria-hidden />
@@ -479,6 +488,99 @@ function BranchPublish({
         </div>
       )}
     </Section>
+  );
+}
+
+// ─── Branch secret scan (#820) ────────────────────────────────────
+
+const SCAN_SHOWN = 5;
+
+type BranchScan =
+  | { state: "idle" }
+  | { state: "scanning" }
+  | { state: "done"; result: SecretPreview }
+  | { state: "failed" };
+
+/** "Scan this branch's commits": the secret guard's rules over every commit
+ *  since the base, only when asked, never automatic. Read-only: it blocks
+ *  nothing. The caller keys it on the branch's commits and HEAD, so a new
+ *  commit or an amend drops a result that no longer covers the branch. */
+export function BranchSecretScan({ workspacePath, base, commits }: { workspacePath: string; base: string; commits: number }) {
+  const [scan, setScan] = useState<BranchScan>({ state: "idle" });
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
+  const run = () => {
+    setScan({ state: "scanning" });
+    ipc.secretScanBranch(workspacePath, base)
+      .then((result) => { if (alive.current) setScan({ state: "done", result }); })
+      .catch(() => { if (alive.current) setScan({ state: "failed" }); });
+  };
+
+  return (
+    <div className="mt-1.5 text-[11px]">
+      {scan.state === "scanning" ? (
+        <div className="octo-fade-in flex items-center gap-1.5 font-mono text-octo-sage">
+          <Loader2 size={12} aria-hidden className="shrink-0 animate-spin text-octo-mute" />
+          Scanning {commitCount(commits)}…
+        </div>
+      ) : (
+        <button
+          type="button"
+          data-tour="review-companion-scan-branch"
+          onClick={run}
+          title={`Check every commit since ${baseName(base)} for possible secrets. Changes nothing.`}
+          className="flex items-center gap-1.5 font-serif text-[12px] text-octo-sage underline decoration-octo-hairline underline-offset-2 transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:text-octo-brass hover:decoration-octo-brass-dim focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+        >
+          <ShieldCheck size={12} aria-hidden className="shrink-0 text-octo-mute" />
+          {scan.state === "idle" ? "Scan this branch's commits" : "Scan again"}
+        </button>
+      )}
+      {scan.state === "done" && <BranchScanResult result={scan.result} commits={commits} />}
+      {scan.state === "failed" && (
+        <p className="octo-fade-in mt-1 text-octo-mute">Couldn't read this branch's commits.</p>
+      )}
+    </div>
+  );
+}
+
+function BranchScanResult({ result, commits }: { result: SecretPreview; commits: number }) {
+  const total = Math.max(result.total, result.findings.length);
+  const shown = result.findings.slice(0, SCAN_SHOWN);
+  const more = total - shown.length;
+  return (
+    <div data-tour="review-companion-scan-result" className="octo-fade-in mt-1">
+      <div className="flex items-start gap-1.5 leading-snug text-octo-sage">
+        {total > 0 ? (
+          <ShieldAlert size={12} aria-hidden className="mt-[1px] shrink-0 text-octo-rouge" />
+        ) : (
+          <ShieldCheck size={12} aria-hidden className="mt-[1px] shrink-0 text-octo-verdigris" />
+        )}
+        <span className="min-w-0">{branchScanSummary(result, commits)}</span>
+      </div>
+      {total > 0 && (
+        <>
+          <ul aria-label="Found in this branch's commits" className="mt-1 space-y-0.5 pl-[18px]">
+            {shown.map((f, i) => (
+              <li key={`${f.file}:${f.line ?? 0}:${f.rule}:${i}`} className="flex min-w-0 items-baseline gap-2 font-mono text-[10px]">
+                <span className="shrink-0 text-octo-sage">{f.kind}</span>
+                <span className="min-w-0 truncate text-octo-mute" title={findingLocation(f)}>{findingLocation(f)}</span>
+                {f.preview && (
+                  <span className="ml-auto shrink-0 text-octo-mute" title={PREVIEW_TIP}>{f.preview}</span>
+                )}
+              </li>
+            ))}
+            {more > 0 && <li className="font-mono text-[10px] text-octo-mute">and {more} more</li>}
+          </ul>
+          {result.partial && <p className="mt-1 pl-[18px] text-octo-mute">{PARTIAL_NOTE}</p>}
+          <p className="mt-1 pl-[18px] leading-snug text-octo-mute">
+            A later commit that removes a key leaves it in the history: rotate a real one.
+          </p>
+        </>
+      )}
+    </div>
   );
 }
 

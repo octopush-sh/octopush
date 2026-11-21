@@ -31,7 +31,7 @@ interface ReviewSourceState {
 
 const same = (a: CommittedDiff | null | undefined, b: CommittedDiff | null) =>
   a === b ||
-  (!!a && !!b && a.commits === b.commits && a.mergeBase === b.mergeBase && a.base === b.base && a.diff === b.diff);
+  (!!a && !!b && a.commits === b.commits && a.mergeBase === b.mergeBase && a.head === b.head && a.base === b.base && a.diff === b.diff);
 
 export const useReviewSource = create<ReviewSourceState>((set, get) => ({
   committedByWs: {},

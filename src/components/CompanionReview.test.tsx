@@ -1,16 +1,17 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
-const { listFileEdits, getMessage, getLastCommit, secretScanStaged } = vi.hoisted(() => ({
+const { listFileEdits, getMessage, getLastCommit, secretScanStaged, secretScanBranch } = vi.hoisted(() => ({
   listFileEdits: vi.fn(),
   getMessage: vi.fn(),
   getLastCommit: vi.fn(),
   secretScanStaged: vi.fn(),
+  secretScanBranch: vi.fn(),
 }));
 
 vi.mock("../lib/ipc", () => ({
-  ipc: { listFileEdits, getMessage, getLastCommit, secretScanStaged },
+  ipc: { listFileEdits, getMessage, getLastCommit, secretScanStaged, secretScanBranch },
 }));
 
 import { CompanionReview, SECRET_RESCAN_MS } from "./CompanionReview";
@@ -248,6 +249,84 @@ describe("CompanionReview — secret guard verdict (#835)", () => {
     render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={stagedA} />);
     await waitFor(() => expect(secretScanStaged).toHaveBeenCalledTimes(2));
     expect(screen.getByText("1 staged · ready to commit.")).toBeInTheDocument();
+  });
+});
+
+describe("CompanionReview — branch secret scan (#820)", () => {
+  const committed = (commits: number, mergeBase = "abc1234", head: string | null = "def5678") =>
+    ({ base: "main", mergeBase, head, commits, diff: "" });
+  const setCommitted = async (c: ReturnType<typeof committed> | null) => {
+    const { useReviewSource } = await import("../stores/reviewSourceStore");
+    useReviewSource.getState().setCommitted("w1", c);
+  };
+
+  it("scans only when asked, and lists what it found with masked previews", async () => {
+    await setCommitted(committed(3));
+    let resolve: (v: unknown) => void = () => {};
+    secretScanBranch.mockImplementationOnce(() => new Promise((r) => { resolve = r; }));
+    const { container } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    expect(secretScanBranch).not.toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
+    expect(secretScanBranch).toHaveBeenCalledWith("/repo", "main");
+    expect(screen.getByText("Scanning 3 commits…")).toBeInTheDocument();
+    resolve({
+      findings: [{ file: "cfg.ts", line: 1, rule: "github-token", kind: "GitHub token", yours: false, preview: "gho_…Q2xz" }],
+      total: 1,
+      partial: false,
+    });
+    const result = await waitFor(() => {
+      const el = container.querySelector('[data-tour="review-companion-scan-result"]');
+      expect(el).not.toBeNull();
+      return el!;
+    });
+    expect(result).toHaveTextContent("1 possible secret in this branch's commits.");
+    expect(result).toHaveTextContent("GitHub token");
+    expect(result).toHaveTextContent("cfg.ts:1");
+    expect(result).toHaveTextContent("gho_…Q2xz");
+    expect(result).toHaveTextContent(/rotate a real one/);
+    expect(screen.getByRole("button", { name: "Scan again" })).toBeInTheDocument();
+    await act(() => setCommitted(null));
+  });
+
+  it("says a clean branch is clean, a failure plainly, and drops a result once the branch moves", async () => {
+    await setCommitted(committed(1));
+    secretScanBranch.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    const { container } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
+    expect(await screen.findByText("No possible secrets in 1 commit.")).toBeInTheDocument();
+
+    // A new commit: the old answer no longer covers the branch.
+    await act(() => setCommitted(committed(2)));
+    expect(container.querySelector('[data-tour="review-companion-scan-result"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Scan this branch's commits" })).toBeInTheDocument();
+
+    secretScanBranch.mockRejectedValueOnce("secret scan: this branch shares no history with main");
+    await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
+    expect(await screen.findByText("Couldn't read this branch's commits.")).toBeInTheDocument();
+    await act(() => setCommitted(null));
+  });
+
+  it("drops a clean result after an amend that keeps the count and merge base", async () => {
+    await setCommitted(committed(3));
+    secretScanBranch.mockResolvedValueOnce({ findings: [], total: 0, partial: false });
+    const { container } = render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    await userEvent.click(screen.getByRole("button", { name: "Scan this branch's commits" }));
+    expect(await screen.findByText("No possible secrets in 3 commits.")).toBeInTheDocument();
+
+    // Same commits and merge base, new HEAD: those commits were never scanned.
+    await act(() => setCommitted(committed(3, "abc1234", "9a8b7c6")));
+    expect(screen.queryByText("No possible secrets in 3 commits.")).not.toBeInTheDocument();
+    expect(container.querySelector('[data-tour="review-companion-scan-result"]')).toBeNull();
+    expect(screen.getByRole("button", { name: "Scan this branch's commits" })).toBeInTheDocument();
+    await act(() => setCommitted(null));
+  });
+
+  it("offers no scan without commits since the base", async () => {
+    await setCommitted(committed(0));
+    render(<CompanionReview workspaceId="w1" workspacePath="/repo" gitStatus={gitStatus()} />);
+    expect(screen.queryByRole("button", { name: "Scan this branch's commits" })).not.toBeInTheDocument();
+    await setCommitted(null);
   });
 });
 

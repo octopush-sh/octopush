@@ -3,7 +3,7 @@ import { renderHook } from "@testing-library/react";
 import { useReviewDefaultPin, type ReviewAnswers } from "./useReviewDefaultPin";
 import { useReviewSource } from "../stores/reviewSourceStore";
 
-const committed = { base: "main", mergeBase: "abc1234", commits: 2, diff: "diff --git a/x b/x\n" };
+const committed = { base: "main", mergeBase: "abc1234", head: "def5678", commits: 2, diff: "diff --git a/x b/x\n" };
 const fresh = (workspaceId: string, dirty: boolean, commitsAhead = 2): ReviewAnswers => ({
   workspaceId,
   dirty,

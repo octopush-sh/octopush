@@ -16,9 +16,11 @@
 //! out of test paths, and an exact-value canary for the credentials Octopush
 //! itself holds (provider keys, git tokens, the Jira token).
 //!
-//! **Privacy.** A finding carries the file, the line, a stable rule id and a
-//! human kind — never the value, a preview or a hash of it. Nothing here logs,
-//! persists or sends a candidate value. Known credentials live in memory only
+//! **Privacy.** A finding carries the file, the line, a stable rule id, a
+//! human kind and a masked preview (`sk-ant-…9fQ2`, #820) — never the value
+//! or a hash of it. The preview reaches the screen only: summaries, the
+//! journal and a persisted hold leave it out. Nothing here logs, persists or
+//! sends a candidate value. Known credentials live in memory only
 //! for the length of one scan and print as `[redacted]` in `Debug`.
 //!
 //! **Binding an override to what was shown.** A scan's [`ScanReport`] carries
@@ -44,7 +46,8 @@ use std::sync::LazyLock;
 /// At most this many findings are reported: enough to act on, never a wall.
 pub const MAX_FINDINGS: usize = 50;
 /// A push/PR range longer than this is scanned as one net diff instead of
-/// commit by commit (keeps a long-lived branch fast).
+/// commit by commit (keeps a long-lived branch fast). The on-demand branch
+/// scan has no cap: it promises every commit.
 const MAX_RANGE_COMMITS: usize = 200;
 /// The generic assignment rule looks at the first N bytes of a line only (a
 /// minified bundle line must never stall the commit button). Every other rule
@@ -57,7 +60,8 @@ const MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
 /// without false hits.
 const MIN_KNOWN_SECRET_LEN: usize = 12;
 
-/// One possible secret in a change. Deliberately carries no part of the value.
+/// One possible secret in a change. Carries no part of the value beyond its
+/// masked `preview`, which only the confirm dialog and the branch scan show.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SecretFinding {
@@ -71,9 +75,75 @@ pub struct SecretFinding {
     pub kind: String,
     /// True when it matched a credential the user configured in Octopush.
     pub yours: bool,
+    /// `sk-ant-…9fQ2`: the provider's public prefix (prefixed token rules
+    /// and AWS key ids only; `…4bYw` for any other rule) and the last
+    /// [`PREVIEW_TAIL`] characters, to tell two keys apart (#820). `None`
+    /// for a whole-file finding, a private key or a short value. Never in a
+    /// summary, the journal, a log line or a persisted hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<String>,
+}
+
+/// How many trailing characters a masked preview shows.
+pub const PREVIEW_TAIL: usize = 4;
+/// A value with fewer characters than this after its prefix gets no
+/// preview: four of them would be too large a part of it.
+const MIN_PREVIEW_LEN: usize = 16;
+
+/// The public prefixes a preview may keep, longest first (leftmost-first
+/// alternation): what tells an Anthropic key from an OpenAI one, never a
+/// character of the random part.
+static PUBLIC_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"^(?:sk-ant-|sk-(?:proj|svcacct|admin)-|sk-or-v1-|sk-|github_pat_|gh[pousr]_|(?:sk|rk)_live_|xox[abprs]-|xapp-|AIza|xai-|gsk_|hf_|glpat-|npm_|AKIA|ASIA)",
+    )
+    .unwrap()
+});
+
+/// `sk-ant-…9fQ2` for `value`, or `None` when it is too short to show any
+/// of it. Only for a value a prefixed token rule (or the AWS key id rule)
+/// matched, where the prefix is the provider's: any other value gets
+/// [`masked_tail`]. Pure.
+pub fn masked_preview(value: &str) -> Option<String> {
+    let prefix = PUBLIC_PREFIX.find(value).map(|m| m.as_str()).unwrap_or("");
+    masked(prefix, &value[prefix.len()..])
+}
+
+/// `…4bYw` for `value`: the last [`PREVIEW_TAIL`] characters alone, for a
+/// value no provider prefix vouches for (a `.env` password, an MCP env
+/// value, a generic assignment, one of your own keys), whose first
+/// characters are as secret as the rest. Pure.
+pub fn masked_tail(value: &str) -> Option<String> {
+    masked("", value)
+}
+
+fn masked(prefix: &str, rest: &str) -> Option<String> {
+    let n = rest.chars().count();
+    if n < MIN_PREVIEW_LEN {
+        return None;
+    }
+    let tail: String = rest.chars().skip(n - PREVIEW_TAIL).collect();
+    Some(format!("{prefix}…{tail}"))
 }
 
 impl SecretFinding {
+    /// This finding with a masked preview of `value`, provider prefix kept.
+    fn masked(mut self, value: &str) -> Self {
+        self.preview = masked_preview(value);
+        self
+    }
+
+    /// This finding with a tail-only preview of `value`.
+    fn masked_tail(mut self, value: &str) -> Self {
+        self.preview = masked_tail(value);
+        self
+    }
+
+    /// This finding without its preview (what a persisted hold keeps).
+    pub fn without_preview(self) -> Self {
+        SecretFinding { preview: None, ..self }
+    }
+
     /// `tests/fixtures.ts:12`, or just the file for a whole-file finding.
     pub fn location(&self) -> String {
         match self.line {
@@ -821,7 +891,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
         if let Some((rule, kind)) = sensitive_file(path).filter(|_| file.is_new) {
             let body: String = file.lines.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>().join("\n");
             push_hit(&mut out, &mut seen, SecretFinding {
-                file: path.into(), line: None, rule: rule.into(), kind: kind.into(), yours: false,
+                file: path.into(), line: None, rule: rule.into(), kind: kind.into(), yours: false, preview: None,
             }, &body, true);
         }
         let env_file = is_env_file(path);
@@ -858,7 +928,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                 line
             };
             let at = |rule: &str, kind: String, yours: bool| SecretFinding {
-                file: path.into(), line: Some(*n), rule: rule.into(), kind, yours,
+                file: path.into(), line: Some(*n), rule: rule.into(), kind, yours, preview: None,
             };
             let next_public = NEXT_PUBLIC_ASSIGN.is_match(line);
             let firebase_key = line.to_ascii_lowercase().contains("apikey")
@@ -876,11 +946,13 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     claimed.claim(at_byte, at_byte + v.len());
                 }
                 if found {
-                    push_hit(&mut out, &mut seen, at("your-credential", k.label.clone(), true), &k.value, true);
+                    let f = at("your-credential", k.label.clone(), true).masked_tail(&k.value);
+                    push_hit(&mut out, &mut seen, f, &k.value, true);
                 }
             }
             for (r, start, end, shown) in token_hits(line, public_web_value, &mut claimed) {
-                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false), &line[start..end], shown);
+                let token = &line[start..end];
+                push_hit(&mut out, &mut seen, at(r.id, r.kind.into(), false).masked(token), token, shown);
             }
             if let Some(m) = AWS_KEY_ID.find(line) {
                 let window = window_of(&aws_secret_lines, *n, 5);
@@ -895,7 +967,9 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     v.push('\u{0}');
                     v.push_str(line);
                     claimed.claim(m.start(), m.end());
-                    push_hit(&mut out, &mut seen, at("aws-access-key", "AWS access key".into(), false), &v, true);
+                    // The preview shows the key id, never the secret beside it.
+                    let f = at("aws-access-key", "AWS access key".into(), false).masked(m.as_str());
+                    push_hit(&mut out, &mut seen, f, &v, true);
                 }
             }
             if PEM_HEADER.is_match(line) {
@@ -922,7 +996,8 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     if !name.starts_with("NEXT_PUBLIC_") && ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(value) {
                         let (s0, e0) = raw.map(|m| (m.start(), m.end())).unwrap_or((0, line.len()));
                         let shown = claimed.claim(s0, e0);
-                        push_hit(&mut out, &mut seen, at("env-credential", format!("credential in a .env file ({name})"), false), value, shown);
+                        let f = at("env-credential", format!("credential in a .env file ({name})"), false).masked_tail(value);
+                        push_hit(&mut out, &mut seen, f, value, shown);
                     }
                 }
             }
@@ -932,7 +1007,8 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                     let name = name.as_str();
                     if ENV_CREDENTIAL_NAME.is_match(name) && env_value_is_credential(m.as_str()) {
                         let shown = claimed.claim(m.start(), m.end());
-                        push_hit(&mut out, &mut seen, at("mcp-env-credential", format!("credential in an MCP config ({name})"), false), m.as_str(), shown);
+                        let f = at("mcp-env-credential", format!("credential in an MCP config ({name})"), false).masked_tail(m.as_str());
+                        push_hit(&mut out, &mut seen, f, m.as_str(), shown);
                     }
                 }
             }
@@ -950,7 +1026,7 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
                         && !(doc_file && JWT.is_match(v));
                     if plausible {
                         let shown = claimed.claim(m.start(), m.end());
-                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false), v, shown);
+                        push_hit(&mut out, &mut seen, at("generic-secret", "hard-coded secret".into(), false).masked_tail(v), v, shown);
                     }
                 }
             }
@@ -1056,7 +1132,8 @@ fn report_of(files: &[AddedFile], known: &[KnownSecret], scope: &str, partial: b
 pub struct Collected {
     pub files: Vec<AddedFile>,
     pub partial: bool,
-    /// Which action this is for: `commit`, `push`, `pr` or `worktree`.
+    /// Which action this is for: `commit`, `push`, `pr`, `worktree` or
+    /// `history` (the on-demand branch scan).
     pub scope: &'static str,
     /// What a partial scan didn't read: `path@blob` for a file it couldn't
     /// (or only partly) read (`path@stat:size:mtime_ns:inode:ctime_ns` when git has no
@@ -1274,8 +1351,17 @@ enum RangeBase {
 
 /// The added lines of every commit in the range (each against its first
 /// parent), so a secret added in one commit and removed in the next is still
-/// caught. A range longer than [`MAX_RANGE_COMMITS`] is scanned as one net diff.
-fn range_files(repo: &Repository, base: RangeBase, head: Oid, budget: &mut Budget) -> AppResult<Vec<AddedFile>> {
+/// caught. A range longer than `max_commits` (`Some(MAX_RANGE_COMMITS)` for a
+/// push, a PR or a crew's worktree) is scanned as one net diff; with `None`
+/// (the branch scan, which promises every commit) only the byte budget bounds
+/// it, and running out of it marks the scan partial.
+fn range_files(
+    repo: &Repository,
+    base: RangeBase,
+    head: Oid,
+    max_commits: Option<usize>,
+    budget: &mut Budget,
+) -> AppResult<Vec<AddedFile>> {
     let err = |e: git2::Error| AppError::Other(format!("secret scan: {e}"));
     let mut files = Vec::new();
     let mut walk = repo.revwalk().map_err(err)?;
@@ -1288,8 +1374,11 @@ fn range_files(repo: &Repository, base: RangeBase, head: Oid, budget: &mut Budge
             }
         }
     }
-    let commits: Vec<Oid> = walk.filter_map(|o| o.ok()).take(MAX_RANGE_COMMITS + 1).collect();
-    if commits.len() > MAX_RANGE_COMMITS {
+    let commits: Vec<Oid> = match max_commits {
+        Some(cap) => walk.filter_map(|o| o.ok()).take(cap + 1).collect(),
+        None => walk.filter_map(|o| o.ok()).collect(),
+    };
+    if max_commits.is_some_and(|cap| commits.len() > cap) {
         let from = match base {
             RangeBase::After(h) => Some(tree_of(repo, h)?),
             RangeBase::NotOnAnyRemote => None,
@@ -1350,7 +1439,7 @@ pub fn push_files(path: &Path) -> AppResult<Collected> {
     };
     let base = base_or_unpushed(push_base(&repo, head));
     let mut budget = Budget::new();
-    let files = range_files(&repo, base, head, &mut budget)?;
+    let files = range_files(&repo, base, head, Some(MAX_RANGE_COMMITS), &mut budget)?;
     Ok(budget.into_collected(files, "push"))
 }
 
@@ -1376,8 +1465,25 @@ pub fn pr_files(path: &Path, base: &str) -> AppResult<Collected> {
     };
     let mb = pr_merge_base(&repo, base, head).or_else(|| push_base(&repo, head));
     let mut budget = Budget::new();
-    let files = range_files(&repo, base_or_unpushed(mb), head, &mut budget)?;
+    let files = range_files(&repo, base_or_unpushed(mb), head, Some(MAX_RANGE_COMMITS), &mut budget)?;
     Ok(budget.into_collected(files, "pr"))
+}
+
+/// Every commit on HEAD since its merge base with `base`, resolved like
+/// Review's "Since base" view: what "Scan this branch's commits" reads
+/// (#820). Each commit is scanned against its first parent, so a key added
+/// and removed again is still found. An error when no merge base resolves.
+pub fn branch_files(path: &Path, base: &str) -> AppResult<Collected> {
+    let repo = crate::git_ops::open_repo(path)?;
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Budget::new().into_collected(Vec::new(), "history"));
+    };
+    let Some(mb) = crate::collisions::resolve_merge_base(&repo, head, base) else {
+        return Err(AppError::Other(format!("secret scan: this branch shares no history with {base}")));
+    };
+    let mut budget = Budget::new();
+    let files = if mb == head { Vec::new() } else { range_files(&repo, RangeBase::After(mb), head, None, &mut budget)? };
+    Ok(budget.into_collected(files, "history"))
 }
 
 /// Everything a crew's Action stage could commit and push: the branch's
@@ -1392,7 +1498,7 @@ pub fn worktree_files(path: &Path, base: Option<&str>) -> AppResult<Collected> {
         Some(h) => {
             let mb = base.and_then(|b| pr_merge_base(&repo, b, h)).or_else(|| push_base(&repo, h));
             // HEAD's own commits only when they aren't on the base already.
-            if mb == Some(h) { Vec::new() } else { range_files(&repo, base_or_unpushed(mb), h, &mut budget)? }
+            if mb == Some(h) { Vec::new() } else { range_files(&repo, base_or_unpushed(mb), h, Some(MAX_RANGE_COMMITS), &mut budget)? }
         }
         None => Vec::new(),
     };
@@ -1474,15 +1580,23 @@ pub async fn preview<F>(collect: F) -> AppResult<Option<ScanPreview>>
 where
     F: FnOnce() -> AppResult<Collected> + Send + 'static,
 {
-    let settings = crate::settings::load_settings().unwrap_or_default();
-    if !guard_enabled(&settings) {
+    if !guard_enabled(&crate::settings::load_settings().unwrap_or_default()) {
         return Ok(None);
     }
-    let known = known_secrets_from(&settings);
+    scan_now(collect).await.map(Some)
+}
+
+/// Scan what `collect` gathers, on a blocking thread, whatever the guard's
+/// switch says: for a scan the user asked for (#820). Enforces nothing.
+pub async fn scan_now<F>(collect: F) -> AppResult<ScanPreview>
+where
+    F: FnOnce() -> AppResult<Collected> + Send + 'static,
+{
+    let known = known_secrets_from(&crate::settings::load_settings().unwrap_or_default());
     let report = tokio::task::spawn_blocking(move || collect().map(|c| scan_collected(&c, &known)))
         .await
         .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}"))))?;
-    Ok(Some(report.into()))
+    Ok(report.into())
 }
 
 /// A Direct stage held by the guard, persisted on `run_stages.secret_hold`.
@@ -1510,11 +1624,13 @@ pub struct SecretHold {
 pub const UNREADABLE_FINGERPRINT: &str = "unreadable";
 
 impl SecretHold {
+    /// The hold for `r`. It is persisted with the run, so its findings keep
+    /// no masked preview.
     pub fn from_report(r: ScanReport) -> Self {
         SecretHold {
             acknowledged: false,
             fingerprint: r.fingerprint,
-            findings: r.findings,
+            findings: r.findings.into_iter().map(SecretFinding::without_preview).collect(),
             total: r.total,
             partial: r.partial,
             unreadable: false,

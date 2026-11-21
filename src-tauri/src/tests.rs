@@ -19326,6 +19326,13 @@ mod open_pull_request_tests {
         let c3 = committed_diff(d, Some("main"), false).unwrap();
         assert_eq!(c3.commits, 3);
         assert!(c3.diff.contains("+dirty"), "{}", c3.diff);
+        assert_eq!(c3.head.as_ref().map(String::len), Some(7));
+        assert_ne!(c3.head, c.head);
+        // An amend keeps the count and merge base but still moves HEAD (#820).
+        git(d, &["commit", "-q", "--amend", "-m", "third, reworded"]);
+        let amended = committed_diff(d, Some("main"), false).unwrap();
+        assert_eq!((amended.commits, &amended.merge_base, &amended.diff), (c3.commits, &c3.merge_base, &c3.diff));
+        assert_ne!(amended.head, c3.head, "{amended:?}");
         // No base, or one that doesn't resolve: nothing to show.
         assert_eq!(committed_diff(d, None, false).unwrap().commits, 0);
         assert_eq!(committed_diff(d, Some("gone/branch"), false).unwrap().commits, 0);
@@ -21451,6 +21458,133 @@ mod secret_guard_tests {
         assert_eq!(ipc["total"], secrets.len());
         assert_eq!(ipc["partial"], false);
         assert_eq!(ipc["fingerprint"].as_str().unwrap().len(), 64);
+
+        // The dialog gets a masked preview of each (#820); the summary, the
+        // journal notice and the persisted hold never carry one.
+        assert!(findings.iter().all(|f| f.preview.is_some()), "{findings:?}");
+        assert!(ipc["findings"][0]["preview"].as_str().unwrap().contains('…'));
+        let tails: Vec<String> = findings.iter().filter_map(|f| f.preview.clone()).collect();
+        let quiet = [
+            err.to_string(),
+            refusal_summary(&findings, findings.len(), true),
+            hold_notice("the pull request", &hold),
+            serde_json::to_string(&hold).unwrap(),
+        ];
+        for out in &quiet {
+            for t in &tails {
+                assert!(!out.contains(t.as_str()), "a preview leaked into {out}");
+            }
+            assert!(!out.contains("preview"), "{out}");
+        }
+    }
+
+    #[test]
+    fn a_masked_preview_keeps_the_public_prefix_and_the_last_four() {
+        let ant = ["sk-", "ant-", "api03-"].concat() + &rnd(1, 93, B62) + "9fQ2";
+        assert_eq!(masked_preview(&ant).as_deref(), Some("sk-ant-…9fQ2"));
+        let ghp = ["gh", "p_"].concat() + &rnd(6, 32, B62) + "WXYZ";
+        assert_eq!(masked_preview(&ghp).as_deref(), Some("ghp_…WXYZ"));
+        assert_eq!(masked_preview("AKIAABCDEFGHIJKL1234").as_deref(), Some("AKIA…1234"));
+        // A separator inside the random part is never kept as "prefix".
+        let glpat = format!("glpat-Ab_{}", rnd(2, 24, B62));
+        assert!(masked_preview(&glpat).unwrap().starts_with("glpat-…"));
+        // A generic value gets the tail alone; a short one gets nothing.
+        assert_eq!(masked_preview("q8Zr2kLm0pXv7NcT4bYw").as_deref(), Some("…4bYw"));
+        assert_eq!(masked_preview("short-pass-123"), None);
+        assert_eq!(masked_preview("sk-ant-1234567890"), None);
+
+        // Per rule: the token's preview, the AWS key id (never its secret),
+        // and none for a private key or a file found by name.
+        let f = scan_one("src/config.ts", &[&true_positives()[0].2]);
+        assert_eq!(f[0].preview.as_deref(), Some(masked_preview(&true_positives()[0].1).unwrap().as_str()));
+        assert!(f[0].preview.as_deref().unwrap().starts_with("sk-ant-…"));
+        let secret = rnd(40, 40, B64);
+        let aws = scan_one("src/aws.ts", &[&format!("id = AKIA{}", rnd(41, 16, UPPER)), &format!("aws_secret_access_key = {secret}")]);
+        let p = aws.iter().find(|f| f.rule == "aws-access-key").and_then(|f| f.preview.clone()).expect("aws preview");
+        assert!(p.starts_with("AKIA…"), "{p}");
+        assert!(!p.contains(&secret[secret.len() - 4..]), "{p}");
+        let new_pem = AddedFile { path: "deploy/key.pem".into(), is_new: true, lines: Vec::new() };
+        assert_eq!(scan_added(&[new_pem], &[])[0].preview, None);
+
+        // A value no provider rule matched keeps none of its start, even one
+        // that happens to begin like a provider prefix: the tail alone.
+        assert_eq!(masked_tail("sk-mypassword2024tR7q").as_deref(), Some("…tR7q"));
+        assert_eq!(masked_tail("short-pass-123"), None);
+        let preview_of = |f: &[SecretFinding], rule: &str| {
+            f.iter().find(|f| f.rule == rule).and_then(|f| f.preview.clone()).unwrap_or_else(|| panic!("{rule}: {f:?}"))
+        };
+        let env = scan_one(".env", &["PASSWORD=sk-mypassword2024tR7q"]);
+        assert_eq!(preview_of(&env, "env-credential"), "…tR7q");
+        let mcp = scan_one(".mcp.json", &[r#""API_KEY": "AKIAmcpvalue9Zr2kLm0pXv7Nq""#]);
+        assert_eq!(preview_of(&mcp, "mcp-env-credential"), "…v7Nq");
+        let generic = scan_one("src/app.ts", &[r#"const secret = "sk-q8Zr2kLm0pXv7NcT4bYw";"#]);
+        assert_eq!(preview_of(&generic, "generic-secret"), "…4bYw");
+        let mine = format!("sk-ant-{}", rnd(81, 30, B62));
+        let known = vec![KnownSecret::new("your Anthropic API key", mine.clone())];
+        let yours = scan_added(&[file("src/app.ts", &[&format!("k = {mine}")])], &known);
+        assert_eq!(preview_of(&yours, "your-credential"), format!("…{}", &mine[mine.len() - 4..]));
+    }
+
+    /// "Scan this branch's commits" (#820): every commit since the base,
+    /// including a key added and removed again, read-only, guard on or off.
+    #[tokio::test]
+    async fn the_branch_scan_reads_every_commit_since_the_base() {
+        let (dir, repo) = repo();
+        let (_, secret, line) = true_positives().remove(5);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add a key");
+        std::fs::write(dir.path().join("cfg.ts"), "const token = process.env.TOKEN;\n").unwrap();
+        let tip = commit_all(&repo, "take it out again");
+        let path = dir.path().to_string_lossy().to_string();
+
+        for guard in [true, false] {
+            let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": guard }));
+            let p = crate::commands::secret_scan_branch(path.clone(), "main".into()).await.unwrap();
+            assert_eq!(p.total, 1, "{p:?}");
+            assert_eq!(p.findings[0].location(), "cfg.ts:1");
+            assert!(p.findings[0].preview.as_deref().unwrap().starts_with("gho_…"));
+            let json = serde_json::to_string(&p).unwrap();
+            assert!(!json.contains(&secret) && !json.contains("fingerprint"), "{json}");
+        }
+        // Read-only: the branch is where it was.
+        assert_eq!(repo.head().unwrap().target(), Some(tip));
+
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        // Nothing since the base: nothing to find.
+        repo.set_head("refs/heads/main").unwrap();
+        let clean = crate::commands::secret_scan_branch(path.clone(), "main".into()).await.unwrap();
+        assert_eq!((clean.total, clean.partial), (0, false));
+        // A base that doesn't resolve is an error, not a clean bill.
+        assert!(crate::commands::secret_scan_branch(path, "no-such-branch".into()).await.is_err());
+    }
+
+    /// Past the push/PR scans' 200-commit cap the branch scan still reads
+    /// each commit on its own: a key added and removed again early in a long
+    /// branch is found, where a net diff would see nothing.
+    #[test]
+    fn the_branch_scan_reads_every_commit_past_two_hundred() {
+        let (dir, repo) = repo();
+        let (_, _, line) = true_positives().remove(5);
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("cfg.ts"), format!("{line}\n")).unwrap();
+        commit_all(&repo, "add a key");
+        std::fs::write(dir.path().join("cfg.ts"), "const token = process.env.TOKEN;\n").unwrap();
+        commit_all(&repo, "take it out again");
+        for i in 0..210 {
+            std::fs::write(dir.path().join("log.txt"), format!("{i}\n")).unwrap();
+            commit_all(&repo, "more");
+        }
+
+        let c = branch_files(dir.path(), "main").unwrap();
+        assert!(!c.partial);
+        let report = scan_collected(&c, &[]);
+        assert_eq!(report.total, 1, "{:?}", report.findings);
+        assert_eq!(report.findings[0].location(), "cfg.ts:1");
     }
 
     #[test]
