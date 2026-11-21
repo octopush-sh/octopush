@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","session_id":"00000000-0000-4000-8000-000000000328","uuid":"00000000-0000-4000-8000-000000000329","cwd":"/Users/dev/project","model":"claude-sonnet-5-5","permissionMode":"bypassPermissions","apiKeySource":"ANTHROPIC_API_KEY","claude_code_version":"2.1.326","tools":["Bash","Edit","Read"],"mcp_servers":[],"slash_commands":[],"output_style":"default","agents":[],"skills":[],"plugins":[]}
+{"type":"system","subtype":"status","session_id":"00000000-0000-4000-8000-000000000328","uuid":"00000000-0000-4000-8000-000000000330"}

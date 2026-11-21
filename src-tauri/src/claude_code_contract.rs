@@ -541,6 +541,39 @@ fn stream_json_refused_settings_name_the_setting() {
     assert!(!is_settings_refused(outcome.error.as_deref().unwrap_or_default()), "[{fx}]");
 }
 
+const INIT_ONLY_VERSION: &str = "2.1.326";
+const INIT_ONLY_REL: &str = "stream-json/init-only.jsonl";
+
+#[tokio::test]
+async fn stream_json_a_hang_before_the_first_request_is_named() {
+    use crate::orchestrator::cli_runner::{idle_timeout_message, shows_a_request, CLAUDE_FIRST_REQUEST_HANG_FIX};
+    use tokio::io::AsyncReadExt;
+    // Synthetic (see the 2.1.326 README): `system/init`, then silence on an
+    // open stdout — the hang Claude Code 2.1.327 fixed.
+    let rec = synthesized(INIT_ONLY_VERSION);
+    let fx = rec.label(INIT_ONLY_REL);
+    let events = rec.jsonl(INIT_ONLY_REL);
+    let init = events.first().unwrap_or_else(|| panic!("[{fx}] empty"));
+    assert_eq!(require_str(&fx, init, "subtype"), "init", "[{fx}] the stream opens with system/init");
+    assert!(!events.iter().any(shows_a_request), "[{fx}] nothing shows a request went out");
+    let limits = ReadLimits { idle: std::time::Duration::from_millis(200), ..TEST_LIMITS };
+    let (_still_open, rx) = tokio::io::duplex(64);
+    let stream = stdout_bytes(&rec, INIT_ONLY_REL).chain(rx);
+    let read = read_stream(stream, CliDialect::Claude, limits, |_| {}, |_| {});
+    let end = tokio::time::timeout(std::time::Duration::from_secs(10), read).await.expect("read_stream never stalled");
+    let ReadEnd::Idle(None, _, stall) = end else { panic!("[{fx}] expected an idle stall, got {end:?}") };
+    assert!(stall.before_first_request, "[{fx}] {stall:?}");
+    let version = require_str(&fx, init, "claude_code_version");
+    let msg = idle_timeout_message(&stall, Some(version));
+    assert!(msg.starts_with("timed out — Claude Code sent no request in 1 minute; "), "[{fx}] {msg}");
+    assert!(msg.ends_with("Update Claude Code"), "[{fx}] the CLI that hung names the update: {msg}");
+    assert_eq!(
+        idle_timeout_message(&stall, Some(CLAUDE_FIRST_REQUEST_HANG_FIX)),
+        "timed out — Claude Code sent no request in 1 minute",
+        "[{fx}]"
+    );
+}
+
 const DENIALS_VERSION: &str = "2.1.326";
 const DENIALS_REL: &str = "stream-json/result-with-denials.jsonl";
 

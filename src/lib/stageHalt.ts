@@ -72,6 +72,18 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
       remedy: "Claude Code waited out its retry delay and the API still didn't answer. Check the provider, then resume or re-run.",
     };
   }
+  // "claude timed out — Claude Code sent no request in 5 minutes", and on a CLI
+  // before 2.1.327 "; Claude Code 2.1.327 fixes a hang … Update Claude Code".
+  const noRequest = /timed out — Claude Code sent no request in (\d+ minutes?)(?:; (.+))?/.exec(raw.split("\n")[0]);
+  if (noRequest) {
+    return {
+      title: `Claude Code sent no request in ${noRequest[1]}`,
+      remedy: noRequest[2]
+        ? `${noRequest[2]}, then re-run.`
+        : "It stalled at start-up, before talking to the API. Check any proxy between Claude Code and the API, then re-run.",
+      preferRerun: true,
+    };
+  }
   if (/no output for/i.test(raw)) {
     return { title: "Claude produced no output and timed out", remedy: "The CLI stalled — resume or re-run." };
   }

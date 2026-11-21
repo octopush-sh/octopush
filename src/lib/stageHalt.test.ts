@@ -69,6 +69,18 @@ describe("haltCause", () => {
       "No answer for 6 minutes after an API retry",
     );
   });
+  it("names a stall before the first request, and the update that fixes it", () => {
+    const hint =
+      "Claude Code 2.1.327 fixes a hang before the first request when a model's settings fetch stalls (for example at a proxy). Update Claude Code";
+    const old = haltCause(`claude timed out — Claude Code sent no request in 5 minutes; ${hint}\nlast lines…`, 25);
+    expect(old.title).toBe("Claude Code sent no request in 5 minutes");
+    expect(old.remedy).toBe(`${hint}, then re-run.`);
+    expect(old.preferRerun).toBe(true);
+    const current = haltCause("claude timed out — Claude Code sent no request in 5 minutes", 25);
+    expect(current.title).toBe("Claude Code sent no request in 5 minutes");
+    expect(current.remedy).toMatch(/proxy/);
+    expect(current.remedy).not.toMatch(/2\.1\.327/);
+  });
   it("falls back to the first line", () => {
     expect(haltCause("something weird\nsecond line", 25).title).toBe("something weird");
   });

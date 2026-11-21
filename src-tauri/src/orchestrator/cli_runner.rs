@@ -2724,13 +2724,38 @@ fn minutes(d: std::time::Duration) -> u64 {
 }
 
 /// What an idle stall found: the tool call still open when it tripped (if
-/// any), the silence it waited, and — when the last line was a Claude
-/// `system/api_retry` — that retry's cause ("" when it named none).
+/// any), the silence it waited, when the last line was a Claude
+/// `system/api_retry` that retry's cause ("" when it named none), and whether
+/// a Claude stage had sent its `system/init` but nothing since showed a
+/// request going out ([`shows_a_request`]).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct IdleStall {
     pub tool: Option<OpenTool>,
     pub window: std::time::Duration,
     pub after_retry: Option<String>,
+    pub before_first_request: bool,
+}
+
+/// The first Claude Code that doesn't hang `claude -p` before its first
+/// request when the fetch of a model's settings stalls (2.1.327: "Fixed
+/// `claude -p` hanging before its first request when the fetch of a model's
+/// settings stalled, such as at a proxy").
+pub const CLAUDE_FIRST_REQUEST_HANG_FIX: &str = "2.1.327";
+
+/// Whether a stream line is Claude's `system/init`.
+fn is_init_event(v: &Value) -> bool {
+    v.get("type").and_then(Value::as_str) == Some("system") && v.get("subtype").and_then(Value::as_str) == Some("init")
+}
+
+/// Whether a Claude stream line shows the session got past start-up and
+/// talked to the API: a model message (`assistant`, `stream_event`), a
+/// `system/api_retry`, or a `rate_limit_event` (read from a response).
+pub(crate) fn shows_a_request(v: &Value) -> bool {
+    match v.get("type").and_then(Value::as_str) {
+        Some("assistant" | "stream_event" | "rate_limit_event") => true,
+        Some("system") => v.get("subtype").and_then(Value::as_str) == Some("api_retry"),
+        _ => false,
+    }
 }
 
 /// The longest retry delay [`retry_idle_window`] waits out: 300s, the
@@ -2752,10 +2777,23 @@ pub(crate) fn retry_idle_window(idle: std::time::Duration, retry_delay: std::tim
 /// output for 5 minutes", naming the open call ("timed out — Bash `npm
 /// test` gave no result for 11 minutes"), or the API retry it was waiting
 /// out ("timed out — no output for 10 minutes after an API retry
-/// (overloaded)").
-pub(crate) fn idle_timeout_message(stall: &IdleStall) -> String {
+/// (overloaded)"). A Claude stage that never sent its first request says so
+/// ("timed out — Claude Code sent no request in 5 minutes"), and on a known
+/// CLI older than [`CLAUDE_FIRST_REQUEST_HANG_FIX`] names the update that
+/// fixes it (an unknown version never does).
+pub(crate) fn idle_timeout_message(stall: &IdleStall, cli_version: Option<&str>) -> String {
     let m = minutes(stall.window);
     let unit = if m == 1 { "minute" } else { "minutes" };
+    if stall.before_first_request && stall.tool.is_none() && stall.after_retry.is_none() {
+        let mut msg = format!("timed out — Claude Code sent no request in {m} {unit}");
+        if cli_version.is_some_and(|v| crate::agent_adapter::version_below(v, CLAUDE_FIRST_REQUEST_HANG_FIX)) {
+            msg.push_str(&format!(
+                "; Claude Code {CLAUDE_FIRST_REQUEST_HANG_FIX} fixes a hang before the first request when a model's \
+                 settings fetch stalls (for example at a proxy). Update Claude Code"
+            ));
+        }
+        return msg;
+    }
     match (&stall.tool, stall.after_retry.as_deref()) {
         (Some(t), _) => format!("timed out — {} gave no result for {m} {unit}", t.label()),
         (None, Some("")) => format!("timed out — no output for {m} {unit} after an API retry"),
@@ -2848,6 +2886,10 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
     // The last line was a Claude `system/api_retry`: its cause and the
     // silence it allows ([`retry_idle_window`]).
     let mut retry_wait: Option<(String, std::time::Duration)> = None;
+    // Claude: `system/init` arrived and no line since showed a request
+    // ([`shows_a_request`]) — a stall now is one before the first request.
+    let mut awaiting_request = false;
+    let mut past_start_up = false;
     loop {
         if settled(result_at) {
             if let Some(line) = result_line.take() {
@@ -2896,7 +2938,11 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                     return ReadEnd::AbsCap(result_line, tail);
                 }
                 let after_retry = retry_wait.map(|(cause, _)| cause);
-                return ReadEnd::Idle(result_line, tail, IdleStall { tool: open.latest().cloned(), window, after_retry });
+                return ReadEnd::Idle(
+                    result_line,
+                    tail,
+                    IdleStall { tool: open.latest().cloned(), window, after_retry, before_first_request: awaiting_request },
+                );
             }
             Ok(Ok(0)) => break,  // EOF
             Ok(Ok(_)) => {}
@@ -2919,6 +2965,10 @@ pub(crate) async fn read_stream<R: tokio::io::AsyncRead + Unpin>(
                 crate::orchestrator::live::api_retry_delay(&value).map(|d| retry_idle_window(limits.idle, d)),
             );
             open.observe(&value);
+            if shows_a_request(&value) || is_result_event(&value) {
+                past_start_up = true;
+            }
+            awaiting_request = !past_start_up && (awaiting_request || is_init_event(&value));
             if is_result_event(&value) {
                 result_line = Some(trimmed.to_string());
                 result_at.get_or_insert_with(std::time::Instant::now);
@@ -3517,7 +3567,10 @@ impl CliRunner {
         let bin = dialect.binary();
         let (result_line, tail, timeout_kind, settled) = match read_end {
             ReadEnd::Eof(r, t) => (r, t, None, false),
-            ReadEnd::Idle(r, t, stall) => (r, t, Some(idle_timeout_message(&stall)), false),
+            ReadEnd::Idle(r, t, stall) => {
+                let known = cli_version.as_ref().and_then(|v| v.version.as_deref());
+                (r, t, Some(idle_timeout_message(&stall, known)), false)
+            }
             ReadEnd::AbsCap(r, t) => (r, t, Some("exceeded the 60-minute cap".to_string()), false),
             ReadEnd::Settled(r, t) => (Some(r), t, None, true),
         };
