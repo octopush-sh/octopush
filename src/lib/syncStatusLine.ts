@@ -1,4 +1,4 @@
-import type { SyncAttempt, SyncKind } from "./types";
+import type { LibraryRejection, SyncAttempt, SyncKind } from "./types";
 
 /** The muted mono line under an enabled Settings › Account › Sync toggle
  *  (#518). Wording approved by the PM on the issue; keep it exact. */
@@ -53,4 +53,40 @@ export function syncStatusLine(
     return { text: `Last sent ${when} · ${count} ${noun}${count === 1 ? "" : "s"}`, tone: "mute" };
   }
   return null;
+}
+
+/** Why the sync service refused a library item, in a few words (#799).
+ *  `oversize` is the service's 64,000-byte limit, which this Mac also
+ *  enforces before sending. */
+export function rejectionReason(reason: string): string {
+  switch (reason) {
+    case "oversize":
+      return "over the 64,000-byte limit";
+    case "bad_stamp":
+      return "unreadable edit time";
+    case "future_stamp":
+      return "edit time over a day ahead of the sync service";
+    default:
+      return "refused by the sync service";
+  }
+}
+
+/** How many unsent items the line names before "+N more". */
+export const UNSENT_NAMED = 2;
+
+/** The amber line under the library toggle naming the items that are not
+ *  synced and why. `null` when the toggle is off or nothing is unsent. */
+export function syncUnsentLine(
+  enabled: boolean,
+  rejected: LibraryRejection[] | null | undefined,
+): SyncStatusLine | null {
+  if (!enabled || !rejected || rejected.length === 0) return null;
+  const named = rejected.slice(0, UNSENT_NAMED).map((r) => {
+    const noun = r.kind === "role" ? "role" : "pipeline";
+    const name = r.name?.trim() || r.id;
+    return `${noun} "${name}" (${rejectionReason(r.reason)})`;
+  });
+  const more = rejected.length - named.length;
+  const tail = more > 0 ? ` · +${more} more` : "";
+  return { text: `Not synced · ${named.join(" · ")}${tail}`, tone: "warning" };
 }

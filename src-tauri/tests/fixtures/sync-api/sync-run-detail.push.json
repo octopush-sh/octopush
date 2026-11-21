@@ -1,0 +1,36 @@
+{
+  "run_id": "00000000-0000-4000-8000-0000000f0001",
+  "data": {
+    "run_id": "00000000-0000-4000-8000-0000000f0001",
+    "stages": [
+      {
+        "position": 0,
+        "role": "planner",
+        "model": "claude-sonnet-4-5",
+        "status": "completed",
+        "cost_usd": 0.0812,
+        "error": null,
+        "artifact": "1. Read the handlers.\n2. Add fixtures.",
+        "journal": [
+          { "kind": "text", "text": "Reading api/sync-runs.ts" },
+          { "kind": "tool", "tool": "read_file", "hint": "api/sync-runs.ts" },
+          { "kind": "tool_result", "ok": true, "detail": "188 lines" },
+          { "kind": "reset" },
+          { "kind": "notice", "text": "Retrying after a transient error", "parent": "t1", "agentId": "a1" }
+        ],
+        "diff": "diff --git a/test/x.ts b/test/x.ts\n+// fixture\n"
+      },
+      {
+        "position": 1,
+        "role": "builder",
+        "model": "claude-sonnet-4-5",
+        "status": "failed",
+        "cost_usd": 0.3001,
+        "error": "Stage failed: fixture error",
+        "artifact": null,
+        "journal": [],
+        "diff": null
+      }
+    ]
+  }
+}

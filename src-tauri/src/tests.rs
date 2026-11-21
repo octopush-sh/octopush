@@ -18429,8 +18429,14 @@ mod sync_pull_tests {
         assert!(line.starts_with("GET /api/sync-run-detail?run_id=r1 "), "{line}");
         assert!(authed);
 
-        test_net::set(Some(serve(404, "{}").await.0), token());
-        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404: no detail");
+        test_net::set(Some(serve(404, r#"{"error":"no_detail"}"#).await.0), token());
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "404 no_detail: no detail");
+        // Any other 404 (a moved route, a proxy page) is an error, not "no detail".
+        for body in ["{}", r#"{"error":"no detail for this run"}"#, "<html>Not Found</html>"] {
+            test_net::set(Some(serve(404, body).await.0), token());
+            let err = crate::sync::pull_run_detail(&client, "r1").await.unwrap_err().to_string();
+            assert!(err.contains("history detail fetch failed: HTTP 404"), "{body}: {err}");
+        }
         test_net::set(Some(serve(200, r#"{"detail":{"stages":"not a list"}}"#).await.0), token());
         assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "unreadable: no detail");
     }
@@ -18461,8 +18467,9 @@ mod sync_pull_tests {
         ]}"#;
         let (base, seen) = serve(200, body).await;
         test_net::set(Some(base), token());
-        let items = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
-        let got: Vec<(&str, bool)> = items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental && pull.next_since.is_none(), "no stored since, no next_since");
+        let got: Vec<(&str, bool)> = pull.items.iter().map(|i| (i.item_id.as_str(), i.deleted)).collect();
         assert_eq!(got, [("p1", false), ("r1", true)], "the malformed item is skipped; tombstones stay");
         let (line, authed) = only_request(&seen);
         assert!(line.starts_with("GET /api/sync-library "), "{line}");
@@ -18730,6 +18737,7 @@ mod sync_status_tests {
                 http_status: Some(503),
             }),
             library: None,
+            ..Default::default()
         };
         let json = serde_json::to_value(&s).unwrap();
         let rec = &json["lastSyncAttempt"]["history"];
@@ -18764,7 +18772,7 @@ mod sync_status_tests {
         let mut s = AppSettings::default();
         toggle(&mut s, SyncKind::History, true, "user_1");
         toggle(&mut s, SyncKind::Library, true, "user_1");
-        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()), ..Default::default() };
         // Re-asserting an ON toggle keeps both records.
         toggle(&mut s, SyncKind::History, true, "user_1");
         assert!(s.last_sync_attempt.history.is_some() && s.last_sync_attempt.library.is_some());
@@ -18780,7 +18788,7 @@ mod sync_status_tests {
         assert!(s.last_sync_attempt.library.is_none());
 
         // Another account turning a sync on never inherits the first one's record.
-        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()) };
+        s.last_sync_attempt = SyncStatus { history: Some(rec.clone()), library: Some(rec.clone()), ..Default::default() };
         toggle(&mut s, SyncKind::History, true, "user_2");
         assert!(s.last_sync_attempt.is_empty());
     }
@@ -18860,7 +18868,7 @@ mod sync_status_tests {
         let rec = a_record();
         let mut s = AppSettings::default();
         toggle(&mut s, SyncKind::History, true, "user_1");
-        s.last_sync_attempt = SyncStatus { history: Some(rec), library: None };
+        s.last_sync_attempt = SyncStatus { history: Some(rec), library: None, ..Default::default() };
 
         // A stale whole-file save from a settings pane carries the record over.
         let mut incoming = AppSettings::default();
@@ -24121,5 +24129,903 @@ mod group_tests {
         // A group made afterwards still goes last.
         workspace_group(&db, "p1", "D", &[]);
         assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B", "D"]);
+    }
+}
+
+// ── Sync contract with octopush-api #24/#27/#28: run paging, run size cap,
+// library rejections, `no_detail`, library `?since=` (#799, #823) ─────────
+#[cfg(test)]
+mod sync_contract_tests {
+    use crate::settings::{test_settings_path, test_sync_override, AppSettings};
+    use crate::sync::{
+        apply_library_rejections, cap_run_payload, library_item_bytes, library_since,
+        library_since_usable, status, test_net, LibraryRejection, PushOutcome, SyncKind,
+        SyncLibraryItem, SyncRun, MAX_LIBRARY_ITEM_BYTES, MAX_RUN_PAYLOAD_BYTES, TRUNCATION_MARK,
+    };
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// The API's own fixtures (octopush-api `test/fixtures/sync/`), copied with
+    /// their invented data, plus the #27/#28 shapes.
+    fn fixture(name: &str) -> String {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/sync-api")
+            .join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    }
+
+    fn fixture_json(name: &str) -> serde_json::Value {
+        serde_json::from_str(&fixture(name)).unwrap()
+    }
+
+    /// A `next_since` an hour old (the fixtures' fixed dates age out of the
+    /// 90-day window).
+    fn fresh_since() -> String {
+        (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    /// The fixture with its `next_since` replaced by `since`.
+    fn with_since(name: &str, since: &str) -> String {
+        let mut v = fixture_json(name);
+        v["next_since"] = serde_json::Value::String(since.to_string());
+        v.to_string()
+    }
+
+    fn token() -> Option<Option<String>> {
+        Some(Some("test-token".into()))
+    }
+
+    fn reset(history: bool, library: bool) {
+        test_sync_override::set(SyncKind::History, Some(history));
+        test_sync_override::set(SyncKind::Library, Some(library));
+        test_net::set(None, None);
+        test_settings_path::set(None);
+        status::forget(SyncKind::History);
+        status::forget(SyncKind::Library);
+    }
+
+    /// One request as the server saw it.
+    #[derive(Clone, Debug)]
+    struct Seen {
+        line: String,
+        body: String,
+    }
+
+    impl Seen {
+        fn path(&self) -> String {
+            self.line.split_whitespace().nth(1).unwrap_or_default().to_string()
+        }
+        fn query(&self, key: &str) -> Option<String> {
+            let url = reqwest::Url::parse(&format!("http://x{}", self.path())).ok()?;
+            url.query_pairs().find(|(k, _)| k == key).map(|(_, v)| v.to_string())
+        }
+    }
+
+    /// An HTTP server answering requests in order from `script` (then 500).
+    async fn scripted(script: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<Seen>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let queue = Arc::new(Mutex::new(VecDeque::from(script)));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                let (log, queue) = (log.clone(), queue.clone());
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    let (head, body) = loop {
+                        let n = sock.read(&mut chunk).await.unwrap_or(0);
+                        if n == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                        let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else { continue };
+                        let head = String::from_utf8_lossy(&buf[..end]).to_string();
+                        let len = head
+                            .lines()
+                            .find_map(|l| {
+                                l.to_ascii_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|v| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                            .unwrap_or(0);
+                        if buf.len() >= end + 4 + len {
+                            let body = String::from_utf8_lossy(&buf[end + 4..end + 4 + len]).to_string();
+                            break (head, body);
+                        }
+                    };
+                    let line = head.lines().next().unwrap_or_default().to_string();
+                    let (code, answer) = {
+                        log.lock().unwrap().push(Seen { line, body });
+                        queue.lock().unwrap().pop_front().unwrap_or((500, "{}".into()))
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{answer}",
+                        answer.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (format!("http://{addr}"), seen)
+    }
+
+    fn requests(seen: &Arc<Mutex<Vec<Seen>>>) -> Vec<Seen> {
+        seen.lock().unwrap().clone()
+    }
+
+    // ── Contract: the shapes the app sends and parses ───────────────────
+
+    #[test]
+    fn contract_push_bodies_match_the_api_fixtures() {
+        // Runs: the app's SyncRun writes exactly the fixture's run.
+        let body = fixture_json("sync-runs.push.one.json");
+        let run: SyncRun = serde_json::from_value(body["runs"][0].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&run).unwrap(), body["runs"][0]);
+        // A fixture-sized run is far under the cap and left alone.
+        let mut capped = run.clone();
+        assert!(!cap_run_payload(&mut capped));
+
+        // Library: pipeline, role and tombstone round-trip to the same envelope.
+        let body = fixture_json("sync-library.push.json");
+        for item in body["items"].as_array().unwrap() {
+            let parsed: SyncLibraryItem = serde_json::from_value(item.clone()).unwrap();
+            assert_eq!(&serde_json::to_value(&parsed).unwrap(), item);
+            assert!(library_item_bytes(&parsed) <= MAX_LIBRARY_ITEM_BYTES);
+        }
+
+        // Detail: `{ run_id, data }` with data the app's SyncRunDetail.
+        let body = fixture_json("sync-run-detail.push.json");
+        let detail: crate::sync::SyncRunDetail = serde_json::from_value(body["data"].clone()).unwrap();
+        assert_eq!(serde_json::to_value(&detail).unwrap(), body["data"]);
+        assert_eq!(body["run_id"], body["data"]["run_id"]);
+    }
+
+    #[tokio::test]
+    async fn contract_pull_fixtures_parse_the_way_the_app_reads_them() {
+        reset(true, true);
+        let client = reqwest::Client::new();
+        let (base, _) = scripted(vec![
+            (200, fixture("sync-runs.pull.response.json")),
+            (200, fixture("sync-run-detail.pull.response.json")),
+            (404, fixture("sync-run-detail.pull.404.response.json")),
+            (200, fixture("sync-library.pull.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&client).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].stages.len(), 3);
+        let detail = crate::sync::pull_run_detail(&client, "r1").await.unwrap().expect("detail");
+        assert_eq!(detail.stages.len(), 2);
+        assert!(crate::sync::pull_run_detail(&client, "r1").await.unwrap().is_none(), "no_detail");
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        let got: Vec<(&str, &str, bool)> =
+            pull.items.iter().map(|i| (i.kind.as_str(), i.item_id.as_str(), i.deleted)).collect();
+        assert_eq!(
+            got,
+            [
+                ("pipeline", "00000000-0000-4000-8000-0000000b0001", false),
+                ("role", "fixture-role", false),
+                ("pipeline", "00000000-0000-4000-8000-0000000b0002", true),
+            ]
+        );
+        assert!(pull.next_since.is_none(), "this fixture predates next_since");
+    }
+
+    // ── Run pull paging (#799 item 3) ───────────────────────────────────
+
+    #[tokio::test]
+    async fn run_pull_follows_every_page_before_answering() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![
+            (200, fixture("sync-runs.pull.page1.response.json")),
+            (200, fixture("sync-runs.pull.page2.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        let ids: Vec<&str> = runs.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "00000000-0000-4000-8000-0000000f0003",
+                "00000000-0000-4000-8000-0000000f0002",
+                "00000000-0000-4000-8000-0000000f0001",
+            ]
+        );
+        let reqs = requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[0].path(), "/api/sync-runs", "the first page sends no query, as before");
+        assert_eq!(
+            reqs[1].query("cursor").as_deref(),
+            Some("WyIyMDI2LTExLTAyVDEyOjAwOjAwLjAwMFoiLCJmaXh0dXJlIl0")
+        );
+        assert_eq!(reqs[1].query("since"), None, "a full pull never sends since");
+    }
+
+    #[tokio::test]
+    async fn run_pull_with_a_failed_page_is_an_error_so_the_mirror_is_kept() {
+        reset(true, false);
+        let client = reqwest::Client::new();
+        // Page 2 fails with a status, then with an unreadable body.
+        for second in [(500, "{}".to_string()), (200, "not json".to_string())] {
+            let (base, seen) =
+                scripted(vec![(200, fixture("sync-runs.pull.page1.response.json")), second]).await;
+            test_net::set(Some(base), token());
+            assert!(crate::sync::pull_runs(&client).await.is_err(), "a partial set is never returned");
+            assert_eq!(requests(&seen).len(), 2);
+        }
+        // history_sync_pull replaces the mirror only on Ok; on Err it lists the
+        // existing mirror. The mirror itself is untouched by a failed pull:
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        let old: SyncRun = serde_json::from_value(fixture_json("sync-runs.push.one.json")["runs"][0].clone()).unwrap();
+        db.replace_synced_runs(std::slice::from_ref(&old)).unwrap();
+        let (base, _) = scripted(vec![(200, fixture("sync-runs.pull.page1.response.json")), (503, "{}".into())]).await;
+        test_net::set(Some(base), token());
+        if let Ok(runs) = crate::sync::pull_runs(&client).await {
+            db.replace_synced_runs(&runs).unwrap();
+        }
+        let kept = db.list_synced_runs().unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].run_id, old.run_id);
+    }
+
+    #[tokio::test]
+    async fn run_pull_against_an_older_server_is_one_page() {
+        reset(true, false);
+        // No next_cursor / next_since at all: the pre-#27 `{ runs }`.
+        let (base, seen) = scripted(vec![(200, fixture("sync-runs.push.one.json"))]).await;
+        test_net::set(Some(base), token());
+        let runs = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(requests(&seen).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn run_pull_stops_on_a_repeated_cursor() {
+        reset(true, false);
+        let page1 = fixture("sync-runs.pull.page1.response.json");
+        let (base, seen) = scripted(vec![(200, page1.clone()), (200, page1.clone()), (200, page1)]).await;
+        test_net::set(Some(base), token());
+        let err = crate::sync::pull_runs(&reqwest::Client::new()).await.unwrap_err().to_string();
+        assert!(err.contains("repeated a page"), "{err}");
+        assert_eq!(requests(&seen).len(), 2, "the loop ends at the first repeat");
+    }
+
+    // ── Run payload cap (#799 item 2) ───────────────────────────────────
+
+    fn big_run(task: String) -> SyncRun {
+        let mut run: SyncRun =
+            serde_json::from_value(fixture_json("sync-runs.push.one.json")["runs"][0].clone()).unwrap();
+        run.task = task;
+        run
+    }
+
+    fn json_len(run: &SyncRun) -> usize {
+        serde_json::to_string(run).unwrap().len()
+    }
+
+    #[test]
+    fn an_oversized_run_is_cut_under_the_limit_with_a_marker() {
+        for task in [
+            "x".repeat(300_000),
+            "é".repeat(200_000),   // multibyte: cuts on a char boundary
+            "\"".repeat(200_000),  // each byte serializes as two
+            "\u{1}".repeat(60_000), // each byte serializes as six
+        ] {
+            let mut run = big_run(task.clone());
+            let (id, created, stages) = (run.run_id.clone(), run.created_at.clone(), run.stages.len());
+            assert!(cap_run_payload(&mut run));
+            assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES, "{}", json_len(&run));
+            assert!(run.task.ends_with(TRUNCATION_MARK));
+            assert!(task.starts_with(run.task.trim_end_matches(TRUNCATION_MARK)));
+            assert_eq!((run.run_id, run.created_at, run.stages.len()), (id, created, stages));
+        }
+        // Long names are capped too, before the task.
+        let mut run = big_run("short".into());
+        run.workspace_name = Some("w".repeat(300_000));
+        assert!(cap_run_payload(&mut run));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        assert!(run.workspace_name.as_deref().unwrap().ends_with(TRUNCATION_MARK));
+        assert_eq!(run.task, "short");
+        // Just under the limit: untouched.
+        let mut run = big_run(String::new());
+        let room = MAX_RUN_PAYLOAD_BYTES - json_len(&run);
+        run.task = "y".repeat(room);
+        assert_eq!(json_len(&run), MAX_RUN_PAYLOAD_BYTES);
+        assert!(!cap_run_payload(&mut run));
+    }
+
+    #[tokio::test]
+    async fn push_runs_sends_every_run_under_the_server_limit() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![(200, r#"{"ok":true,"count":2,"skipped":0}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let small = big_run("small".into());
+        let mut huge = big_run("z".repeat(400_000));
+        huge.run_id = "00000000-0000-4000-8000-0000000f0009".into();
+        let out = crate::sync::push_runs(&reqwest::Client::new(), vec![small, huge]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let runs = body["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "the big run still travels, cut");
+        for run in runs {
+            assert!(serde_json::to_string(run).unwrap().len() <= 256 * 1024);
+        }
+        assert_eq!(runs[0]["task"], "small");
+        assert!(runs[1]["task"].as_str().unwrap().ends_with(TRUNCATION_MARK));
+        // Nothing new is sent: the same keys as the contract fixture.
+        let mut keys: Vec<_> = runs[1].as_object().unwrap().keys().cloned().collect();
+        let fixture = fixture_json("sync-runs.push.one.json");
+        let mut want: Vec<_> = fixture["runs"][0].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        want.sort();
+        assert_eq!(keys, want);
+    }
+
+    // ── Library rejections and the 64,000-byte limit (#799 item 1) ──────
+
+    /// A pipeline item whose `data` JSON is exactly `bytes` bytes.
+    fn pipeline_of_size(id: &str, bytes: usize) -> SyncLibraryItem {
+        let empty = serde_json::json!({ "p": "" }).to_string().len();
+        SyncLibraryItem {
+            kind: "pipeline".into(),
+            item_id: id.into(),
+            updated_at: "2026-11-01T12:00:00+00:00".into(),
+            deleted: false,
+            data: Some(serde_json::json!({ "p": "x".repeat(bytes - empty) })),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_item_over_64000_bytes_is_refused_locally_and_named() {
+        reset(false, true);
+        let (base, seen) =
+            scripted(vec![(200, r#"{"ok":true,"count":2,"rejected":[]}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let at_limit = pipeline_of_size("p-at-limit", MAX_LIBRARY_ITEM_BYTES);
+        let over = pipeline_of_size("p-over", MAX_LIBRARY_ITEM_BYTES + 1);
+        assert_eq!(library_item_bytes(&at_limit), 64_000);
+        let tomb = SyncLibraryItem::tombstone("role", "r-gone");
+        let out = crate::sync::push_library_items(&reqwest::Client::new(), vec![at_limit, over, tomb]).await;
+        assert_eq!(out, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let sent: Vec<&str> = body["items"].as_array().unwrap().iter().map(|i| i["item_id"].as_str().unwrap()).collect();
+        assert_eq!(sent, ["p-at-limit", "r-gone"], "the oversized item never leaves the Mac");
+        let snap = status::snapshot();
+        assert_eq!(
+            snap.library_rejected,
+            [LibraryRejection { kind: "pipeline".into(), id: "p-over".into(), reason: "oversize".into(), name: None }]
+        );
+        assert_eq!(snap.library.unwrap().count, 2, "Sent counts the items stored");
+
+        // Everything oversized: no request at all, still named.
+        reset(false, true);
+        let (base, seen) = scripted(vec![]).await;
+        test_net::set(Some(base), token());
+        let out = crate::sync::push_library_items(
+            &reqwest::Client::new(),
+            vec![pipeline_of_size("p-over", MAX_LIBRARY_ITEM_BYTES + 1)],
+        )
+        .await;
+        assert_eq!(out, PushOutcome::Empty);
+        assert!(requests(&seen).is_empty());
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn server_rejections_stay_unsent_until_a_push_is_stored() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let items: Vec<SyncLibraryItem> = serde_json::from_value(fixture_json("sync-library.push.json")["items"].clone()).unwrap();
+        let (base, _) = scripted(vec![
+            (200, fixture("sync-library.push.rejected.response.json")),
+            (503, "{}".into()),
+            (200, fixture("sync-library.push.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+
+        // 1. The service refuses the pipeline: it is listed, the other two count.
+        assert_eq!(crate::sync::push_library_items(&client, items.clone()).await, PushOutcome::Sent);
+        let snap = status::snapshot();
+        assert_eq!(snap.library.as_ref().unwrap().count, 2);
+        assert_eq!(snap.library_rejected.len(), 1);
+        assert_eq!(snap.library_rejected[0].id, "00000000-0000-4000-8000-0000000b0001");
+        assert_eq!(snap.library_rejected[0].kind, "pipeline");
+        assert_eq!(snap.library_rejected[0].reason, "future_stamp");
+
+        // 2. A failed retry changes nothing about it.
+        assert_eq!(crate::sync::push_library_items(&client, vec![items[0].clone()]).await, PushOutcome::Failed);
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+
+        // 3. A stored push clears it.
+        assert_eq!(crate::sync::push_library_items(&client, items).await, PushOutcome::Sent);
+        assert!(status::snapshot().library_rejected.is_empty());
+        assert_eq!(status::snapshot().library.unwrap().count, 3);
+    }
+
+    #[tokio::test]
+    async fn rejections_match_kind_and_an_older_server_reads_as_all_stored() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let pipeline = pipeline_of_size("shared", 100);
+        let mut role = pipeline_of_size("shared", 100);
+        role.kind = "role".into();
+        let (base, _) = scripted(vec![
+            (200, r#"{"ok":true,"count":1,"rejected":[{"id":"shared","kind":"role","reason":"bad_stamp"}]}"#.into()),
+            (200, r#"{"ok":true,"count":2}"#.into()),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        crate::sync::push_library_items(&client, vec![pipeline.clone(), role.clone()]).await;
+        let rejected = status::snapshot().library_rejected;
+        assert_eq!(rejected.len(), 1);
+        assert_eq!((rejected[0].kind.as_str(), rejected[0].reason.as_str()), ("role", "bad_stamp"));
+
+        // Pre-#27 answer `{ ok, count }`: every item stored.
+        crate::sync::push_library_items(&client, vec![pipeline, role]).await;
+        assert!(status::snapshot().library_rejected.is_empty());
+        assert_eq!(status::snapshot().library.unwrap().count, 2);
+    }
+
+    #[test]
+    fn rejection_list_merges_and_clears_with_its_toggle() {
+        let r = |id: &str, reason: &str| LibraryRejection {
+            kind: "pipeline".into(),
+            id: id.into(),
+            reason: reason.into(),
+            name: Some("never kept".into()),
+        };
+        let mut list = Vec::new();
+        assert!(apply_library_rejections(&mut list, &[], vec![r("a", "oversize"), r("b", "bad_stamp")]));
+        assert!(list.iter().all(|e| e.name.is_none()), "names are never recorded");
+        assert!(apply_library_rejections(&mut list, &[], vec![r("a", "future_stamp")]));
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].reason, "future_stamp");
+        assert!(!apply_library_rejections(&mut list, &[("role".into(), "a".into())], vec![]), "kind must match");
+        assert!(apply_library_rejections(&mut list, &[("pipeline".into(), "a".into())], vec![]));
+        assert_eq!(list.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["b"]);
+        // Bounded.
+        let many: Vec<_> = (0..80).map(|i| r(&format!("x{i}"), "oversize")).collect();
+        apply_library_rejections(&mut list, &[], many);
+        assert_eq!(list.len(), 50);
+        assert_eq!(list.last().unwrap().id, "x79", "the newest are kept");
+
+        // Clearing the library kind (toggle off, sign-out) drops the list.
+        let mut s = crate::sync::SyncStatus { library_rejected: list, ..Default::default() };
+        assert!(!s.is_empty());
+        s.clear(SyncKind::History);
+        assert!(!s.library_rejected.is_empty());
+        s.clear(SyncKind::Library);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn rejections_round_trip_in_settings_without_names() {
+        let mut s = AppSettings::default();
+        s.last_sync_attempt.library_rejected = vec![LibraryRejection {
+            kind: "role".into(),
+            id: "my-role".into(),
+            reason: "oversize".into(),
+            name: None,
+        }];
+        let json = serde_json::to_value(&s).unwrap();
+        let row = &json["lastSyncAttempt"]["libraryRejected"][0];
+        let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["id", "kind", "reason"]);
+        // A name that somehow reached disk is dropped on read; a bad row only
+        // drops itself.
+        let text = r#"{"lastSyncAttempt":{"libraryRejected":[
+            {"kind":"role","id":"my-role","reason":"oversize","name":"Leaked"},
+            {"kind":7}
+        ]}}"#;
+        let back: AppSettings = serde_json::from_str(text).unwrap();
+        assert_eq!(back.last_sync_attempt.library_rejected.len(), 1);
+        assert_eq!(back.last_sync_attempt.library_rejected[0].name, None);
+    }
+
+    #[test]
+    fn rejections_are_named_from_the_local_library_and_gone_items_dropped() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let pid = db.save_pipeline(None, "Big crew", "d", &[library_draft()]).unwrap();
+        let mut list = vec![
+            LibraryRejection { kind: "pipeline".into(), id: pid, reason: "oversize".into(), name: None },
+            LibraryRejection { kind: "pipeline".into(), id: "deleted-since".into(), reason: "oversize".into(), name: None },
+        ];
+        crate::commands::name_library_rejections(&db, &mut list);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some("Big crew"));
+    }
+
+    // ── 404 means "no detail" only with the service's body (#799 item 4) ─
+
+    #[test]
+    fn only_the_no_detail_body_means_no_detail() {
+        assert!(crate::sync::is_no_detail_body(&fixture("sync-run-detail.pull.404.response.json")));
+        for body in ["", "{}", r#"{"error":"no detail for this run"}"#, r#"{"error":"not_found"}"#, "<html/>"] {
+            assert!(!crate::sync::is_no_detail_body(body), "{body}");
+        }
+    }
+
+    // ── Library `?since=` (#823) ─────────────────────────────────────────
+
+    /// Point settings at a temp file where library sync is on for `user_a`.
+    fn library_settings(dir: &tempfile::TempDir) {
+        test_settings_path::set(Some(dir.path().join("settings.json")));
+        crate::settings::update_settings(|s| {
+            s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_full_first_pull_stores_next_since_and_the_next_pull_sends_it() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let client = reqwest::Client::new();
+        let (first, second) = (fresh_since(), fresh_since());
+        let (base, seen) = scripted(vec![
+            (200, with_since("sync-library.pull.response.json", &first)),
+            (200, with_since("sync-library.pull.since.response.json", &second)),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(pull.items.len(), 3);
+        assert_eq!(library_since::load(), None, "stored only after the caller applied it");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load().as_deref(), Some(first.as_str()));
+
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert!(pull.incremental);
+        assert_eq!(pull.items.len(), 1);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load().as_deref(), Some(second.as_str()));
+
+        let reqs = requests(&seen);
+        assert_eq!(reqs[0].path(), "/api/sync-library", "the first pull is full");
+        assert_eq!(reqs[1].query("since").as_deref(), Some(first.as_str()));
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn bad_since_drops_the_stored_value_and_does_a_full_pull() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        crate::settings::update_settings(|s| s.set_library_since(Some(fresh_since()))).unwrap();
+        let next = fresh_since();
+        let (base, seen) = scripted(vec![
+            (400, fixture("sync-library.pull.400.bad-since.response.json")),
+            (200, with_since("sync-library.pull.response.json", &next)),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(pull.items.len(), 3);
+        assert_eq!(library_since::load(), None, "the refused value is gone");
+        let reqs = requests(&seen);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].query("since").is_some());
+        assert_eq!(reqs[1].path(), "/api/sync-library");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), Some(next));
+
+        // Any other 400 is an error, and keeps the stored value.
+        let kept = library_since::load();
+        let (base, seen) = scripted(vec![(400, r#"{"error":"bad_cursor"}"#.into())]).await;
+        test_net::set(Some(base), token());
+        assert!(crate::sync::pull_library(&reqwest::Client::new()).await.is_err());
+        assert_eq!(requests(&seen).len(), 1);
+        assert_eq!(library_since::load(), kept);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_stored_value_older_than_90_days_means_a_full_pull() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let old = (chrono::Utc::now() - chrono::Duration::days(91)).to_rfc3339();
+        crate::settings::update_settings(|s| s.set_library_since(Some(old))).unwrap();
+        let (base, seen) = scripted(vec![(200, fixture("sync-library.pull.response.json"))]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert!(!pull.incremental);
+        assert_eq!(requests(&seen)[0].query("since"), None);
+        assert_eq!(library_since::load(), None);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_older_server_that_ignores_since_is_still_correct() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        crate::settings::update_settings(|s| s.set_library_since(Some(fresh_since()))).unwrap();
+        // The pre-#28 answer: the whole library, no next_since.
+        let (base, seen) = scripted(vec![
+            (200, fixture("sync-library.pull.response.json")),
+            (200, fixture("sync-library.pull.response.json")),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        let client = reqwest::Client::new();
+        let pull = crate::sync::pull_library(&client).await.unwrap();
+        assert_eq!(pull.items.len(), 3, "everything, applied by LWW as before");
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "no next_since: the next pull is full");
+        crate::sync::pull_library(&client).await.unwrap();
+        let reqs = requests(&seen);
+        assert!(reqs[0].query("since").is_some());
+        assert_eq!(reqs[1].query("since"), None);
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn next_since_is_per_account_and_reset_by_switch_sign_out_and_toggle() {
+        let since = fresh_since();
+        let mut s = AppSettings::default();
+        s.set_library_since(Some(since.clone()));
+        assert_eq!(s.library_pull_since, None, "nothing is stored while library sync is off");
+
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_a");
+        s.set_library_since(Some(since.clone()));
+        assert_eq!(s.library_since_for_owner(), Some(since.as_str()));
+        // Carried over a whole-file save from the UI.
+        let mut incoming = AppSettings::default();
+        incoming.preserve_sync_fields_from(&s);
+        assert_eq!(incoming.library_since_for_owner(), Some(since.as_str()));
+
+        // A value stored for another account is never used.
+        let mut other = s.clone();
+        other.sync_owner = Some("user_b".into());
+        assert_eq!(other.library_since_for_owner(), None);
+
+        // Account switch: another user turning sync on starts with a full pull.
+        let mut switched = s.clone();
+        switched.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        assert_eq!(switched.library_pull_since, None);
+
+        // Sign-out.
+        let mut out = s.clone();
+        out.clear_sync_opt_ins();
+        assert_eq!(out.library_pull_since, None);
+
+        // Turning library sync off (and on again).
+        let mut off = s.clone();
+        let before = off.sync_prefs();
+        off.set_sync_opted_in_by(SyncKind::Library, false, "user_a");
+        off.drop_stale_sync_attempts(before, Some("user_a"));
+        assert_eq!(off.library_pull_since, None);
+
+        // History toggles leave it alone.
+        let mut hist = s.clone();
+        let before = hist.sync_prefs();
+        hist.set_sync_opted_in_by(SyncKind::History, true, "user_a");
+        hist.drop_stale_sync_attempts(before, Some("user_a"));
+        assert_eq!(hist.library_since_for_owner(), Some(since.as_str()));
+    }
+
+    #[test]
+    fn since_usability_window() {
+        let now = chrono::Utc::now();
+        let at = |d: chrono::Duration| (now + d).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        assert!(library_since_usable(&at(chrono::Duration::minutes(-5)), now));
+        assert!(library_since_usable(&at(chrono::Duration::days(-89)), now));
+        assert!(!library_since_usable(&at(chrono::Duration::days(-91)), now));
+        assert!(!library_since_usable(&at(chrono::Duration::days(2)), now));
+        assert!(library_since_usable(&(now - chrono::Duration::hours(1)).to_rfc3339(), now), "9 fraction digits");
+        let long = "9".repeat(65);
+        for bad in ["", "yesterday", "2026-13-01T00:00:00Z", long.as_str()] {
+            assert!(!library_since_usable(bad, now), "{bad}");
+        }
+    }
+
+    fn library_draft() -> crate::db::StageDraft {
+        crate::db::StageDraft {
+            role: "plan".into(), agent_model: "m1".into(), substrate: "api".into(),
+            checkpoint: false, loop_target_position: None, loop_max_iterations: 0,
+            loop_mode: None, max_iterations: 30, pos_x: None, pos_y: None,
+            parents: vec![], tools: None, custom_name: None, instructions: None,
+            effort: None, escalate_model: None, escalate_effort: None,
+        }
+    }
+
+    #[test]
+    fn an_item_missing_from_an_incremental_pull_is_unchanged_never_deleted() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let kept = db.save_pipeline(None, "Kept", "d", &[library_draft()]).unwrap();
+        let gone = db.save_pipeline(None, "Gone", "d", &[library_draft()]).unwrap();
+        let store = parking_lot::Mutex::new(db);
+        // An incremental pull: one tombstone (newer than the local edit) and
+        // nothing about `kept`.
+        let mut tomb = SyncLibraryItem::tombstone("pipeline", &gone);
+        tomb.updated_at = (chrono::Utc::now() + chrono::Duration::minutes(1)).to_rfc3339();
+        let done = crate::commands::apply_pulled_library(&store, &[tomb]);
+        assert_eq!((done.applied, done.skipped), (1, 0));
+        assert_eq!(crate::commands::apply_pulled_library(&store, &[]).applied, 0);
+        let db = store.lock();
+        assert!(db.pipeline_sync_state(&kept).unwrap().is_some(), "absent from the pull: unchanged");
+        assert!(db.pipeline_sync_state(&gone).unwrap().is_none(), "only a tombstone deletes");
+    }
+
+    // ── Review follow-ups ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_item_this_build_cant_apply_makes_the_next_pull_full() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.seed_builtin_pipelines().unwrap();
+        let store = parking_lot::Mutex::new(db);
+        // A pipeline whose data this build can't read (e.g. saved by a newer
+        // build), next to a readable role edit.
+        let body = serde_json::json!({
+            "items": [
+                { "kind": "pipeline", "item_id": "p-new", "updated_at": "2026-11-02T00:00:00Z",
+                  "deleted": false, "data": { "id": "p-new", "stages": "not a list" } },
+                fixture_json("sync-library.pull.since.response.json")["items"][0].clone(),
+            ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        let done = crate::commands::apply_pulled_library(&store, &pull.items);
+        assert_eq!(done.skipped, 1, "the unreadable pipeline");
+        crate::sync::commit_library_pull(&pull, done.skipped);
+        assert_eq!(library_since::load(), None, "next pull is full, so the item comes back");
+
+        // An LWW loss is not a skip: applying the same role twice.
+        let again = crate::commands::apply_pulled_library(&store, &pull.items[1..]);
+        assert_eq!(again.skipped, 0);
+
+        // An envelope this build can't read counts too.
+        let body = serde_json::json!({
+            "items": [ { "item_id": "no kind" } ],
+            "next_since": fresh_since(),
+        });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!((pull.received, pull.unreadable, pull.items.len()), (1, 1, 0));
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_racing_an_account_switch_stores_nothing_for_the_new_account() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir); // user_a
+        let (base, _) = scripted(vec![(200, with_since("sync-library.pull.response.json", &fresh_since()))]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.owner.as_deref(), Some("user_a"));
+        // user_b turns library sync on before user_a's pull is committed.
+        crate::settings::update_settings(|s| s.set_sync_opted_in_by(SyncKind::Library, true, "user_b")).unwrap();
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None);
+        let on_disk = crate::settings::load_settings().unwrap();
+        assert_eq!(on_disk.library_pull_since, None, "nothing stored under user_b");
+
+        // The settings-level guard on its own.
+        let mut s = AppSettings::default();
+        s.set_sync_opted_in_by(SyncKind::Library, true, "user_b");
+        s.set_library_since_for("user_a", fresh_since());
+        assert_eq!(s.library_pull_since, None);
+        s.set_library_since_for("user_b", "x".into());
+        assert_eq!(s.library_since_for_owner(), Some("x"));
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn a_pull_at_the_services_item_cap_keeps_no_next_since() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let tomb = fixture_json("sync-library.pull.response.json")["items"][2].clone();
+        let items: Vec<serde_json::Value> = (0..crate::sync::LIBRARY_PULL_MAX_ITEMS)
+            .map(|i| {
+                let mut t = tomb.clone();
+                t["item_id"] = serde_json::Value::String(format!("p{i}"));
+                t
+            })
+            .collect();
+        let body = serde_json::json!({ "items": items, "next_since": fresh_since() });
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!(pull.received, 2_000);
+        assert!(pull.next_since.is_some());
+        assert_eq!(crate::sync::library_since_to_keep(&pull, 0), None);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "the next pull is full");
+
+        // One under the cap keeps it.
+        let mut under = pull.clone();
+        under.received = crate::sync::LIBRARY_PULL_MAX_ITEMS - 1;
+        assert!(crate::sync::library_since_to_keep(&under, 0).is_some());
+        test_settings_path::set(None);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_push_answer_keeps_items_unsent_and_refusals_listed() {
+        reset(false, true);
+        let client = reqwest::Client::new();
+        let item = pipeline_of_size("p1", 100);
+        let (base, _) = scripted(vec![
+            (200, r#"{"ok":true,"count":0,"rejected":[{"id":"p1","kind":"pipeline","reason":"bad_stamp"}]}"#.into()),
+            (200, "not json".into()),
+            (200, r#"{"ok":true,"rejected":"oops"}"#.into()),
+            (200, String::new()),
+        ])
+        .await;
+        test_net::set(Some(base), token());
+        crate::sync::push_library_items(&client, vec![item.clone()]).await;
+        assert_eq!(status::snapshot().library_rejected.len(), 1);
+        for _ in 0..3 {
+            assert_eq!(crate::sync::push_library_items(&client, vec![item.clone()]).await, PushOutcome::Failed);
+            let snap = status::snapshot();
+            assert_eq!(snap.library_rejected.len(), 1, "the earlier refusal stays");
+            let rec = snap.library.unwrap();
+            assert_eq!((rec.count, rec.http_status), (1, None));
+        }
+        assert_eq!(crate::sync::read_library_push_answer(r#"{"ok":true,"count":2}"#), Some(vec![]));
+        assert_eq!(crate::sync::read_library_push_answer("[]"), None);
+    }
+
+    #[test]
+    fn dropped_stages_are_replaced_by_one_honest_summary_stage() {
+        let mut run = big_run("short".into());
+        let stage = |i: usize| crate::sync::SyncStage {
+            role: format!("role-{i}-{}", "r".repeat(200)),
+            model: Some("m".repeat(200)),
+            status: "completed".into(),
+            cost_usd: 0.5,
+        };
+        run.stages = (0..2_000).map(stage).collect();
+        let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!(cap_run_payload(&mut run));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        assert_eq!(run.task, "short", "a short task is never cut for the stages' sake");
+        let last = run.stages.last().unwrap();
+        let kept = run.stages.len() - 1;
+        let dropped = 2_000 - kept;
+        assert!(dropped > 0 && kept > 0);
+        assert_eq!(last.role, crate::sync::truncated_stages_label(dropped));
+        assert_eq!(last.role, format!("… ({dropped} stages truncated)"));
+        assert_eq!(last.status, crate::sync::TRUNCATED_STAGES_STATUS);
+        assert_eq!(last.model, None);
+        let after: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!((after - total).abs() < 1e-6, "stage costs still add up");
+        // Same keys as the contract fixture: no new field.
+        let v = serde_json::to_value(&run.stages[kept]).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["cost_usd", "model", "role", "status"]);
+        assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
     }
 }

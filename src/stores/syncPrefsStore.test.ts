@@ -85,10 +85,10 @@ describe("syncPrefsStore", () => {
     const attempt = { at: "2026-11-09T14:02:00Z", outcome: "sent", count: 3 };
     getSyncStatus.mockResolvedValueOnce({ history: attempt, library: null });
     await useSyncPrefsStore.getState().loadStatus();
-    expect(useSyncPrefsStore.getState().status).toEqual({ history: attempt, library: null });
+    expect(useSyncPrefsStore.getState().status).toEqual({ history: attempt, library: null, libraryRejected: [] });
     getSyncStatus.mockRejectedValueOnce(new Error("boom"));
     await useSyncPrefsStore.getState().loadStatus();
-    expect(useSyncPrefsStore.getState().status).toEqual({ history: null, library: null });
+    expect(useSyncPrefsStore.getState().status).toEqual({ history: null, library: null, libraryRejected: [] });
   });
 
   it("a slower, older status load never overwrites a newer one", async () => {

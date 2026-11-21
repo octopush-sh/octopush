@@ -595,11 +595,25 @@ export interface SyncAttempt {
   httpStatus?: number | null;
 }
 
+/** A library item still unsent because the sync service refused it (or this
+ *  Mac refused to send it for the same reason), #799. */
+export interface LibraryRejection {
+  kind: "pipeline" | "role" | string;
+  /** Pipeline id or role key. */
+  id: string;
+  /** The service's reason code: `oversize`, `bad_stamp`, `future_stamp`, … */
+  reason: string;
+  /** The item's local name (filled in by `get_sync_status`). */
+  name?: string | null;
+}
+
 /** The last attempt per kind (`get_sync_status`); `null` = nothing recorded,
  *  or that sync doesn't apply to the signed-in account. */
 export interface SyncStatus {
   history: SyncAttempt | null;
   library: SyncAttempt | null;
+  /** Library items the service refused; empty or absent when none. */
+  libraryRejected?: LibraryRejection[];
 }
 
 export interface AppSettings {

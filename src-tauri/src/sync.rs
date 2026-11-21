@@ -141,6 +141,29 @@ pub struct SyncAttempt {
     pub http_status: Option<u16>,
 }
 
+/// One library item the sync service did not store (or that this Mac refused
+/// to send because the service would not store it). Kept until a later push
+/// of the same item is accepted, so the item stays **unsent** and Settings ›
+/// Sync can name it. Stored in `settings.json`: kind, local id and the
+/// service's reason code — never the item's data.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryRejection {
+    /// `"pipeline"` or `"role"`.
+    pub kind: String,
+    /// The pipeline id or role key (the push envelope's `item_id`).
+    pub id: String,
+    /// The service's reason code (`oversize`, `bad_stamp`, `future_stamp`, …).
+    pub reason: String,
+    /// The item's local display name. Filled in by `get_sync_status` from the
+    /// local library when it answers; never recorded or written to disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// At most this many rejected items are remembered (oldest dropped first).
+const MAX_LIBRARY_REJECTIONS_KEPT: usize = 50;
+
 /// The last attempt per kind — the wire shape of `get_sync_status` and the
 /// `lastSyncAttempt` field of `settings.json`.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -150,6 +173,9 @@ pub struct SyncStatus {
     pub history: Option<SyncAttempt>,
     #[serde(default)]
     pub library: Option<SyncAttempt>,
+    /// Library items still unsent because the service refused them (#799).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub library_rejected: Vec<LibraryRejection>,
 }
 
 impl SyncStatus {
@@ -163,11 +189,34 @@ impl SyncStatus {
                 .and_then(|e| serde_json::from_value::<Option<SyncAttempt>>(e).ok())
                 .flatten()
         };
-        Ok(SyncStatus { history: entry("history"), library: entry("library") })
+        let library_rejected = v
+            .get("libraryRejected")
+            .and_then(|r| r.as_array())
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|r| serde_json::from_value::<LibraryRejection>(r.clone()).ok())
+                    .map(|mut r| {
+                        r.name = None; // names are never kept on disk
+                        r
+                    })
+                    .take(MAX_LIBRARY_REJECTIONS_KEPT)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(SyncStatus { history: entry("history"), library: entry("library"), library_rejected })
     }
 
     pub fn is_empty(&self) -> bool {
-        self.history.is_none() && self.library.is_none()
+        self.history.is_none() && self.library.is_none() && self.library_rejected.is_empty()
+    }
+
+    /// Forget everything recorded for one kind (its last attempt and, for the
+    /// library, its unsent items).
+    pub fn clear(&mut self, kind: SyncKind) {
+        self.set(kind, None);
+        if kind == SyncKind::Library {
+            self.library_rejected.clear();
+        }
     }
     pub fn get(&self, kind: SyncKind) -> Option<&SyncAttempt> {
         match kind {
@@ -237,7 +286,43 @@ pub mod status {
     /// Drop one kind's record from memory (the caller clears disk, under the
     /// settings write lock).
     pub(crate) fn forget(kind: SyncKind) {
-        with(|s| s.set(kind, None));
+        with(|s| s.clear(kind));
+    }
+}
+
+/// Fold one push's results into the unsent list: every item the service
+/// accepted leaves it, every refused item joins it (or updates its reason).
+/// Returns whether the list changed. Pure, so the merge rule is testable.
+pub fn apply_library_rejections(
+    list: &mut Vec<LibraryRejection>,
+    accepted: &[(String, String)],
+    rejected: Vec<LibraryRejection>,
+) -> bool {
+    let before = list.clone();
+    list.retain(|r| !accepted.iter().any(|(k, i)| r.kind == *k && r.id == *i));
+    for mut r in rejected {
+        r.name = None;
+        match list.iter_mut().find(|e| e.kind == r.kind && e.id == r.id) {
+            Some(e) => e.reason = r.reason,
+            None => list.push(r),
+        }
+    }
+    if list.len() > MAX_LIBRARY_REJECTIONS_KEPT {
+        let drop = list.len() - MAX_LIBRARY_REJECTIONS_KEPT;
+        list.drain(..drop);
+    }
+    *list != before
+}
+
+/// Record which library items a push got stored and which were refused.
+/// Records nothing once the toggle is off (same rule as [`record_push`]).
+pub(crate) fn record_library_rejections(accepted: &[(String, String)], rejected: Vec<LibraryRejection>) {
+    if !crate::settings::sync_flag_on(SyncKind::Library) {
+        return;
+    }
+    let changed = status::with(|s| apply_library_rejections(&mut s.library_rejected, accepted, rejected));
+    if changed {
+        persist_status();
     }
 }
 
@@ -615,8 +700,17 @@ pub async fn push_run_detail(client: &reqwest::Client, detail: SyncRunDetail) ->
     outcome
 }
 
+/// Is this 404 body the service's `{"error":"no_detail"}`?
+pub fn is_no_detail_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| e == "no_detail"))
+        .unwrap_or(false)
+}
+
 /// GET one run's detail. `Ok(None)` when the server has none (a run synced
-/// before B2, or whose detail push failed) — the view says so honestly.
+/// before B2, or whose detail push failed) — the view says so honestly. Only a
+/// 404 whose body is `{"error":"no_detail"}` means that; any other 404 errors.
 pub async fn pull_run_detail(
     client: &reqwest::Client,
     run_id: &str,
@@ -636,7 +730,14 @@ pub async fn pull_run_detail(
         .await
         .map_err(|e| AppError::Other(format!("history detail fetch failed: {}", crate::tls::describe_request_error(&e))))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
+        // Only the service's own answer means "no detail for this run"
+        // (octopush-api#25). Any other 404 (a moved route, a proxy page) is
+        // an error, so it can't pass for an honest "no detail".
+        let body = resp.text().await.unwrap_or_default();
+        if is_no_detail_body(&body) {
+            return Ok(None);
+        }
+        return Err(AppError::Other("history detail fetch failed: HTTP 404 Not Found".into()));
     }
     if !resp.status().is_success() {
         return Err(AppError::Other(format!(
@@ -690,10 +791,139 @@ pub fn build_run_payload(db: &Db, run: &crate::db::RunRow, machine_id: &str) -> 
     }
 }
 
+/// The service refuses a whole run batch (413) when any one run's JSON is over
+/// 256 KiB (262,144 bytes). Each run is capped under this, with headroom.
+pub(crate) const MAX_RUN_PAYLOAD_BYTES: usize = 250_000;
+
+/// What a cut-short text field ends with.
+pub const TRUNCATION_MARK: &str = "… (truncated)";
+
+/// Caps for the short text fields, applied only to a run that is over budget.
+const RUN_NAME_CAP_BYTES: usize = 1_024;
+const RUN_STAGE_FIELD_CAP_BYTES: usize = 256;
+/// How much of the task survives while stage summaries can still be dropped.
+const TASK_FLOOR_BYTES: usize = 4_096;
+
+/// Cut `s` to at most `max_bytes` (on a char boundary) ending in
+/// [`TRUNCATION_MARK`]. Returns whether it changed.
+fn truncate_with_mark(s: &mut String, max_bytes: usize) -> bool {
+    if s.len() <= max_bytes {
+        return false;
+    }
+    let mut keep = max_bytes.saturating_sub(TRUNCATION_MARK.len());
+    while keep > 0 && !s.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    s.truncate(keep);
+    s.push_str(TRUNCATION_MARK);
+    true
+}
+
+fn run_json_len(run: &SyncRun) -> usize {
+    serde_json::to_string(run).map(|s| s.len()).unwrap_or(usize::MAX)
+}
+
+/// Keep one run's payload under [`MAX_RUN_PAYLOAD_BYTES`] so it can't make the
+/// service refuse the whole batch (octopush-api#25). A run already under it is
+/// untouched. Otherwise the short text fields are capped, then the `task` is
+/// cut to fit (but not below 4,096 bytes while stages remain), each cut field
+/// ending in "… (truncated)"; if that is not enough, trailing stage summaries
+/// are replaced by one `… (N stages truncated)` summary stage
+/// ([`drop_trailing_stages`]), and only then is the task cut further. Ids and timestamps are never
+/// changed. Returns whether anything was cut.
+pub fn cap_run_payload(run: &mut SyncRun) -> bool {
+    if run_json_len(run) <= MAX_RUN_PAYLOAD_BYTES {
+        return false;
+    }
+    for name in [&mut run.machine_name, &mut run.workspace_name].into_iter().flatten() {
+        truncate_with_mark(name, RUN_NAME_CAP_BYTES);
+    }
+    truncate_with_mark(&mut run.status, RUN_STAGE_FIELD_CAP_BYTES);
+    for stage in &mut run.stages {
+        truncate_with_mark(&mut stage.role, RUN_STAGE_FIELD_CAP_BYTES);
+        truncate_with_mark(&mut stage.status, RUN_STAGE_FIELD_CAP_BYTES);
+        if let Some(model) = stage.model.as_mut() {
+            truncate_with_mark(model, RUN_STAGE_FIELD_CAP_BYTES);
+        }
+    }
+    // The task is cut first, but not below TASK_FLOOR_BYTES while stage
+    // summaries can still go; only then is it cut further. Every raw byte cut
+    // takes at least one serialized byte with it, so one cut by the
+    // overshoot brings the run under budget when the task is what made it big.
+    let cut_task = |run: &mut SyncRun, floor: usize| {
+        let size = run_json_len(run);
+        if size > MAX_RUN_PAYLOAD_BYTES {
+            let over = size - MAX_RUN_PAYLOAD_BYTES;
+            let target = run.task.len().saturating_sub(over).max(floor.min(run.task.len()));
+            truncate_with_mark(&mut run.task, target);
+        }
+    };
+    cut_task(run, TASK_FLOOR_BYTES);
+    if run_json_len(run) > MAX_RUN_PAYLOAD_BYTES {
+        drop_trailing_stages(run);
+    }
+    cut_task(run, 0);
+    true
+}
+
+/// The status of the summary stage that stands in for dropped stages.
+pub const TRUNCATED_STAGES_STATUS: &str = "truncated";
+
+/// The role text of that summary stage: `… (N stages truncated)`.
+pub fn truncated_stages_label(n: usize) -> String {
+    format!("… ({n} stage{} truncated)", if n == 1 { "" } else { "s" })
+}
+
+/// Last resort of [`cap_run_payload`]: drop trailing stage summaries until the
+/// run fits, and say so honestly with one final summary stage in the existing
+/// shape (role `… (N stages truncated)`, status `truncated`, no model, the
+/// dropped stages' summed cost), so the run's stage costs still add up and the
+/// list never silently looks complete. No new field is sent.
+fn drop_trailing_stages(run: &mut SyncRun) {
+    if run.stages.is_empty() {
+        return;
+    }
+    let stage_len = |s: &SyncStage| serde_json::to_string(s).map(|j| j.len()).unwrap_or(usize::MAX);
+    let summary = |dropped: &[SyncStage]| SyncStage {
+        role: truncated_stages_label(dropped.len()),
+        model: None,
+        status: TRUNCATED_STAGES_STATUS.to_string(),
+        cost_usd: dropped.iter().map(|s| s.cost_usd).sum(),
+    };
+    let mut dropped: Vec<SyncStage> = Vec::new();
+    // Pop by size first (each stage plus its comma), leaving room for the
+    // summary, so a run with thousands of stages isn't re-serialized per pop.
+    let over = run_json_len(run).saturating_sub(MAX_RUN_PAYLOAD_BYTES);
+    let room = stage_len(&summary(&run.stages)) + 1;
+    let mut freed = 0usize;
+    while freed < over.saturating_add(room) {
+        let Some(stage) = run.stages.pop() else { break };
+        freed = freed.saturating_add(stage_len(&stage) + 1);
+        dropped.push(stage);
+    }
+    loop {
+        run.stages.push(summary(&dropped));
+        if run_json_len(run) <= MAX_RUN_PAYLOAD_BYTES {
+            break;
+        }
+        run.stages.pop();
+        match run.stages.pop() {
+            Some(stage) => dropped.push(stage),
+            None => {
+                run.stages.push(summary(&dropped)); // the task cut handles the rest
+                break;
+            }
+        }
+    }
+    // `dropped` holds the stages newest-popped-first; only the count and
+    // cost are kept, so the order doesn't matter.
+}
+
 /// POST a batch of runs to the sync API. **Best-effort**: logs and returns on any
 /// error (signed-out, network, non-2xx). A failed sync must never surface to the
-/// run. The batch is capped at [`MAX_PUSH`]; the server upserts by run id so a
-/// re-push of an already-synced terminal run is a harmless no-op.
+/// run. The batch is capped at [`MAX_PUSH`], and each run under
+/// [`MAX_RUN_PAYLOAD_BYTES`] ([`cap_run_payload`]); the server upserts by run id
+/// so a re-push of an already-synced terminal run is a harmless no-op.
 pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutcome {
     if !opted_in(SyncKind::History) {
         return PushOutcome::Disabled;
@@ -701,7 +931,16 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
     if runs.is_empty() {
         return PushOutcome::Empty;
     }
-    let batch: Vec<SyncRun> = runs.into_iter().take(MAX_PUSH).collect();
+    let batch: Vec<SyncRun> = runs
+        .into_iter()
+        .take(MAX_PUSH)
+        .map(|mut run| {
+            if cap_run_payload(&mut run) {
+                tracing::debug!("history sync: a run was cut to fit the per-run size limit");
+            }
+            run
+        })
+        .collect();
     let count = batch.len();
     let Some(token) = access_token().await else {
         return PushOutcome::SignedOut; // signed out / no valid token → skip silently
@@ -726,9 +965,19 @@ pub async fn push_runs(client: &reqwest::Client, runs: Vec<SyncRun>) -> PushOutc
     outcome
 }
 
-/// GET the signed-in user's full run history from the sync API. Parses leniently
-/// — any blob this build can't read is skipped (forward/back compat) rather than
-/// failing the whole pull.
+/// Most pages one run pull follows (the service keeps at most 10,000 runs per
+/// account, in pages of 1,000). A pull that would need more is an error, so
+/// the local mirror is kept rather than replaced with a partial set.
+pub(crate) const MAX_RUN_PULL_PAGES: usize = 50;
+
+/// GET the signed-in user's **whole** run history from the sync API, following
+/// `next_cursor` through every page (octopush-api#27). The first request has no
+/// query, exactly as before; each further page sends only the previous page's
+/// `next_cursor`. Any failed page fails the whole pull (`Err`), so the caller
+/// never replaces its mirror with a partial set. An older service that answers
+/// everything in one `{ runs }` with no cursor is a single page. Parses
+/// leniently — any blob this build can't read is skipped (forward/back compat)
+/// rather than failing the pull; a run repeated across pages is kept once.
 pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
     if !opted_in(SyncKind::History) {
         return Err(sync_off_error(SyncKind::History));
@@ -737,33 +986,58 @@ pub async fn pull_runs(client: &reqwest::Client) -> AppResult<Vec<SyncRun>> {
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
     let url = format!("{}/api/sync-runs", api_base());
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| AppError::Other(format!("history sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
-    if !resp.status().is_success() {
-        return Err(AppError::Other(format!(
-            "history sync pull failed: HTTP {}",
-            resp.status()
-        )));
-    }
     #[derive(Deserialize)]
     struct PullResp {
         #[serde(default)]
         runs: Vec<serde_json::Value>,
+        #[serde(default)]
+        next_cursor: Option<String>,
     }
-    let parsed: PullResp = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Other(format!("history sync pull decode failed: {e}")))?;
-    let runs = parsed
-        .runs
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<SyncRun>(v).ok())
-        .collect();
-    Ok(runs)
+    let mut runs: Vec<SyncRun> = Vec::new();
+    let mut seen_runs = std::collections::HashSet::new();
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _page in 0..MAX_RUN_PULL_PAGES {
+        // Turning sync off mid-pull stops it (and keeps the old mirror).
+        if !opted_in(SyncKind::History) {
+            return Err(sync_off_error(SyncKind::History));
+        }
+        let mut req = client.get(&url).bearer_auth(&token);
+        if let Some(c) = cursor.as_deref() {
+            req = req.query(&[("cursor", c)]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Other(format!("history sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
+        if !resp.status().is_success() {
+            return Err(AppError::Other(format!(
+                "history sync pull failed: HTTP {}",
+                resp.status()
+            )));
+        }
+        let parsed: PullResp = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Other(format!("history sync pull decode failed: {e}")))?;
+        for run in parsed.runs.into_iter().filter_map(|v| serde_json::from_value::<SyncRun>(v).ok()) {
+            if seen_runs.insert(run.run_id.clone()) {
+                runs.push(run);
+            }
+        }
+        match parsed.next_cursor.filter(|c| !c.is_empty()) {
+            None => return Ok(runs),
+            Some(next) => {
+                if !seen_cursors.insert(next.clone()) {
+                    return Err(AppError::Other(
+                        "history sync pull failed: the service repeated a page".into(),
+                    ));
+                }
+                cursor = Some(next);
+            }
+        }
+    }
+    Err(AppError::Other("history sync pull failed: too many pages".into()))
 }
 
 // ─── Library sync: custom pipelines + roles follow the user (Pro) ───────────
@@ -839,6 +1113,67 @@ impl SyncLibraryItem {
 /// can never be rejected wholesale.
 const LIBRARY_PUSH_CHUNK: usize = 200;
 
+/// The service stores a library item only when its `data` JSON is at most this
+/// many bytes (UTF-8), and refuses it with reason `oversize` otherwise.
+pub const MAX_LIBRARY_ITEM_BYTES: usize = 64_000;
+
+/// The size the service measures for an item: the bytes of its `data` as JSON
+/// (a tombstone sends no data). serde_json writes floats as `120.0` where the
+/// service's `JSON.stringify` writes `120`, so this never undercounts.
+pub fn library_item_bytes(item: &SyncLibraryItem) -> usize {
+    if item.deleted {
+        return 0;
+    }
+    let data = item.data.clone().unwrap_or(serde_json::Value::Null);
+    serde_json::to_string(&data).map(|s| s.len()).unwrap_or(usize::MAX)
+}
+
+impl LibraryRejection {
+    fn of(item: &SyncLibraryItem, reason: &str) -> Self {
+        Self { kind: item.kind.clone(), id: item.item_id.clone(), reason: reason.to_string(), name: None }
+    }
+}
+
+/// Read the library POST's 2xx answer: the `rejected` list, empty when the
+/// service sent none (a service older than octopush-api#27 answers
+/// `{ ok, count }`, which reads as "all stored"). `None` when the answer is
+/// unreadable (not a JSON object, or `rejected` not a list): the caller then
+/// treats the chunk as failed, so nothing is taken as stored and earlier
+/// refusals stay listed.
+pub fn read_library_push_answer(body: &str) -> Option<Vec<serde_json::Value>> {
+    let v: serde_json::Value = serde_json::from_str(body).ok()?;
+    let obj = v.as_object()?;
+    match obj.get("rejected") {
+        None | Some(serde_json::Value::Null) => Some(Vec::new()),
+        Some(serde_json::Value::Array(rows)) => Some(rows.clone()),
+        Some(_) => None,
+    }
+}
+
+/// Which items of `chunk` the service listed in `rejected` (`{id, kind,
+/// reason}`, `kind` matched when present since a pipeline and a role can share
+/// an id), with the service's reason.
+fn chunk_rejections(chunk: &[SyncLibraryItem], rejected: &[serde_json::Value]) -> Vec<LibraryRejection> {
+    let mut out: Vec<LibraryRejection> = Vec::new();
+    for r in rejected {
+        let Some(id) = r.get("id").and_then(|v| v.as_str()) else { continue };
+        let kind = r.get("kind").and_then(|v| v.as_str());
+        let reason: String = r
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .unwrap_or("refused")
+            .chars()
+            .take(32)
+            .collect();
+        for item in chunk.iter().filter(|i| i.item_id == id && kind.is_none_or(|k| k == i.kind)) {
+            if !out.iter().any(|o| o.kind == item.kind && o.id == item.item_id) {
+                out.push(LibraryRejection::of(item, &reason));
+            }
+        }
+    }
+    out
+}
+
 pub async fn push_library_items(
     client: &reqwest::Client,
     items: Vec<SyncLibraryItem>,
@@ -849,14 +1184,26 @@ pub async fn push_library_items(
     if items.is_empty() {
         return PushOutcome::Empty;
     }
-    let count = items.len();
+    // Refuse locally what the service would refuse for size (same limit, same
+    // reason): it stays unsent and Settings › Sync names it.
+    let (oversize, sendable): (Vec<SyncLibraryItem>, Vec<SyncLibraryItem>) =
+        items.into_iter().partition(|i| library_item_bytes(i) > MAX_LIBRARY_ITEM_BYTES);
+    let mut rejected: Vec<LibraryRejection> =
+        oversize.iter().map(|i| LibraryRejection::of(i, "oversize")).collect();
+    if sendable.is_empty() {
+        record_library_rejections(&[], rejected);
+        return PushOutcome::Empty;
+    }
+    let count = sendable.len();
     let Some(token) = access_token().await else {
+        record_library_rejections(&[], rejected);
         return PushOutcome::SignedOut; // signed out → skip silently
     };
     let url = format!("{}/api/sync-library", api_base());
     let mut outcome = PushOutcome::Sent;
     let mut failed_status: Option<u16> = None;
-    for chunk in items.chunks(LIBRARY_PUSH_CHUNK) {
+    let mut accepted: Vec<(String, String)> = Vec::new();
+    for chunk in sendable.chunks(LIBRARY_PUSH_CHUNK) {
         // Re-check between chunks: turning sync off mid-heal stops the rest.
         if !opted_in(SyncKind::Library) {
             return PushOutcome::Disabled;
@@ -864,7 +1211,25 @@ pub async fn push_library_items(
         let body = serde_json::json!({ "items": chunk });
         match client.post(&url).bearer_auth(token.clone()).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
-                tracing::debug!("library sync: pushed {} item(s)", chunk.len());
+                let body = resp.text().await.unwrap_or_default();
+                let Some(answer) = read_library_push_answer(&body) else {
+                    tracing::warn!("library sync push: unreadable answer; the chunk stays unsent");
+                    outcome = PushOutcome::Failed;
+                    failed_status = None;
+                    continue;
+                };
+                let refused = chunk_rejections(chunk, &answer);
+                for item in chunk {
+                    if !refused.iter().any(|r| r.kind == item.kind && r.id == item.item_id) {
+                        accepted.push((item.kind.clone(), item.item_id.clone()));
+                    }
+                }
+                tracing::debug!(
+                    "library sync: pushed {} item(s), {} refused",
+                    chunk.len(),
+                    refused.len()
+                );
+                rejected.extend(refused);
             }
             Ok(resp) => {
                 tracing::warn!("library sync push failed: HTTP {}", resp.status());
@@ -878,13 +1243,150 @@ pub async fn push_library_items(
             }
         }
     }
-    record_push(SyncKind::Library, outcome, count, failed_status);
+    // A failed chunk's items keep whatever state they had (an earlier refusal
+    // stays listed until a push of that item is stored).
+    let stored = accepted.len();
+    record_library_rejections(&accepted, rejected);
+    // Sent counts the items the service stored; Failed counts the attempt.
+    let recorded = if outcome == PushOutcome::Failed { count } else { stored };
+    record_push(SyncKind::Library, outcome, recorded, failed_status);
     outcome
 }
 
-/// GET the user's whole library (items + tombstones). Lenient: an item this
-/// build can't parse is skipped by the caller, never fatal.
-pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibraryItem>> {
+/// What one library pull returned.
+#[derive(Clone, Debug, Default)]
+pub struct LibraryPull {
+    /// The items (and tombstones) to apply by per-item LWW. After an
+    /// incremental pull these are only what changed: an item missing here is
+    /// **unchanged**, never deleted.
+    pub items: Vec<SyncLibraryItem>,
+    /// The service's `next_since` (the `since` for the next pull), when it sent
+    /// a usable one. An older service sends none.
+    pub next_since: Option<String>,
+    /// Whether the request that answered carried `?since=`.
+    pub incremental: bool,
+    /// The account (`syncOwner`) the opt-in belonged to when the pull began.
+    /// `next_since` is stored only while it still does, so a pull racing an
+    /// account switch never stores one account's value under another.
+    pub owner: Option<String>,
+    /// How many items the service sent, readable or not. At
+    /// [`LIBRARY_PULL_MAX_ITEMS`] the answer may have been cut short.
+    pub received: usize,
+    /// Items the service sent that this build couldn't read as an envelope.
+    pub unreadable: usize,
+}
+
+/// The service answers at most this many library items per GET (`LIMIT 2000`,
+/// no paging yet). A pull that reaches it may be missing changes, so its
+/// `next_since` is not kept: the next pull is a full one.
+pub const LIBRARY_PULL_MAX_ITEMS: usize = 2_000;
+
+/// Tombstones older than this are pruned server-side, so a stored `since`
+/// older than this could miss a deletion: such a pull is a full one.
+pub(crate) const LIBRARY_SINCE_MAX_AGE_DAYS: i64 = 90;
+
+/// Is a stored `next_since` usable as `?since=` at `now`? It must parse as
+/// RFC 3339, be at most 90 days old, and not be more than a day ahead.
+pub fn library_since_usable(since: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if since.is_empty() || since.len() > 64 {
+        return false;
+    }
+    let Ok(t) = chrono::DateTime::parse_from_rfc3339(since) else { return false };
+    let t = t.with_timezone(&chrono::Utc);
+    t >= now - chrono::Duration::days(LIBRARY_SINCE_MAX_AGE_DAYS) && t <= now + chrono::Duration::days(1)
+}
+
+/// The stored library `next_since` for the account that owns the opt-in
+/// (`settings.json` `libraryPullSince`, beside the other sync markers).
+pub mod library_since {
+    /// The stored value, if one is stored for the account that turned library
+    /// sync on. Any read failure reads as none (a full pull).
+    pub fn load() -> Option<String> {
+        #[cfg(test)]
+        if crate::settings::test_settings_path::get().is_none() {
+            return None; // tests never read the developer's real settings
+        }
+        crate::settings::load_settings()
+            .ok()
+            .and_then(|s| s.library_since_for_owner().map(str::to_string))
+    }
+
+    /// The account that owns the library opt-in now (`syncOwner`, only while
+    /// library sync is on). Any read failure reads as none.
+    pub fn owner() -> Option<String> {
+        #[cfg(test)]
+        if crate::settings::test_settings_path::get().is_none() {
+            return None;
+        }
+        crate::settings::load_settings()
+            .ok()
+            .filter(|s| s.library_sync_enabled)
+            .and_then(|s| s.sync_owner)
+            .filter(|o| !o.is_empty())
+    }
+
+    /// Store `value` for `owner`, only if `owner` still owns the library
+    /// opt-in when the write happens (checked under the settings write lock).
+    pub fn store_for(owner: &str, value: String) {
+        #[cfg(test)]
+        if crate::settings::test_settings_path::get().is_none() {
+            return;
+        }
+        if let Err(e) = crate::settings::update_settings(|s| s.set_library_since_for(owner, value)) {
+            tracing::debug!("library sync: could not store next_since: {e}");
+        }
+    }
+
+    /// Store (or, with `None`, drop) the value for the account that turned
+    /// library sync on. A failure is logged: the next pull is then a full one.
+    pub fn store(value: Option<String>) {
+        #[cfg(test)]
+        if crate::settings::test_settings_path::get().is_none() {
+            return; // tests never write the developer's real settings
+        }
+        if let Err(e) = crate::settings::update_settings(|s| s.set_library_since(value)) {
+            tracing::debug!("library sync: could not store next_since: {e}");
+        }
+    }
+}
+
+/// Should this pull's `next_since` be kept? Only when nothing could have been
+/// missed: every item was read (`unreadable`) and applied (`skipped`: items
+/// the caller couldn't apply for a parse or DB error), the answer wasn't at the
+/// service's item cap, and the service sent one. Otherwise the next pull must
+/// be a full one, so a skipped item comes back once this build can apply it.
+pub fn library_since_to_keep(pull: &LibraryPull, skipped: usize) -> Option<&str> {
+    if skipped > 0 || pull.unreadable > 0 || pull.received >= LIBRARY_PULL_MAX_ITEMS {
+        return None;
+    }
+    pull.next_since.as_deref()
+}
+
+/// After the caller applied a pull (`skipped` = items it couldn't apply for a
+/// parse or DB error): keep its `next_since` for the next pull, or drop the
+/// stored one so the next pull is full ([`library_since_to_keep`]). A value
+/// is stored only while library sync is on and still owned by the account the
+/// pull began under, so a pull racing a toggle-off, sign-out or account switch
+/// stores nothing for anyone.
+pub fn commit_library_pull(pull: &LibraryPull, skipped: usize) {
+    match (library_since_to_keep(pull, skipped), pull.owner.as_deref()) {
+        (Some(next), Some(owner)) if opted_in(SyncKind::Library) => {
+            library_since::store_for(owner, next.to_string());
+        }
+        _ => library_since::store(None),
+    }
+}
+
+/// GET the user's library (items + tombstones). With a usable stored
+/// `next_since` it sends `?since=` and gets only what changed since; with none
+/// (first pull, sign-in, account switch), one older than 90 days, or after the
+/// service answers `400 {"error":"bad_since"}` (the stored value is dropped
+/// and the pull retried once without it) it is a full pull. An older service
+/// that ignores `since` answers the whole library, which applies the same way.
+/// Lenient: an item this build can't parse is skipped, never fatal. Storing
+/// the answer's `next_since` is the caller's step ([`commit_library_pull`]),
+/// after the items are applied.
+pub async fn pull_library(client: &reqwest::Client) -> AppResult<LibraryPull> {
     if !opted_in(SyncKind::Library) {
         return Err(sync_off_error(SyncKind::Library));
     }
@@ -892,30 +1394,68 @@ pub async fn pull_library(client: &reqwest::Client) -> AppResult<Vec<SyncLibrary
         .await
         .ok_or_else(|| AppError::Other("not signed in".into()))?;
     let url = format!("{}/api/sync-library", api_base());
-    let resp = client
-        .get(&url)
-        .bearer_auth(token)
-        .send()
-        .await
-        .map_err(|e| AppError::Other(format!("library sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
-    if !resp.status().is_success() {
-        return Err(AppError::Other(format!(
-            "library sync pull failed: HTTP {}",
-            resp.status()
-        )));
+
+    let owner = library_since::owner();
+    let stored = library_since::load();
+    let mut since = stored.clone().filter(|s| library_since_usable(s, chrono::Utc::now()));
+    if stored.is_some() && since.is_none() {
+        library_since::store(None); // too old or unreadable: start over
     }
-    #[derive(Deserialize)]
-    struct PullResp {
-        #[serde(default)]
-        items: Vec<serde_json::Value>,
+
+    loop {
+        let mut req = client.get(&url).bearer_auth(&token);
+        if let Some(s) = since.as_deref() {
+            req = req.query(&[("since", s)]);
+        }
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| AppError::Other(format!("library sync pull failed: {}", crate::tls::describe_request_error(&e))))?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::BAD_REQUEST && since.is_some() {
+            let body = resp.text().await.unwrap_or_default();
+            let bad_since = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|e| e == "bad_since"))
+                .unwrap_or(false);
+            if bad_since {
+                library_since::store(None);
+                since = None; // one full pull, then stop
+                continue;
+            }
+            return Err(AppError::Other(format!("library sync pull failed: HTTP {status}")));
+        }
+        if !status.is_success() {
+            return Err(AppError::Other(format!("library sync pull failed: HTTP {status}")));
+        }
+        #[derive(Deserialize)]
+        struct PullResp {
+            #[serde(default)]
+            items: Vec<serde_json::Value>,
+            #[serde(default)]
+            next_since: Option<serde_json::Value>,
+        }
+        let parsed: PullResp = resp
+            .json()
+            .await
+            .map_err(|e| AppError::Other(format!("library sync decode failed: {e}")))?;
+        let next_since = parsed
+            .next_since
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| library_since_usable(s, chrono::Utc::now()));
+        let received = parsed.items.len();
+        let items: Vec<SyncLibraryItem> = parsed
+            .items
+            .into_iter()
+            .filter_map(|v| serde_json::from_value::<SyncLibraryItem>(v).ok())
+            .collect();
+        return Ok(LibraryPull {
+            unreadable: received - items.len(),
+            received,
+            items,
+            next_since,
+            incremental: since.is_some(),
+            owner,
+        });
     }
-    let parsed: PullResp = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Other(format!("library sync decode failed: {e}")))?;
-    Ok(parsed
-        .items
-        .into_iter()
-        .filter_map(|v| serde_json::from_value::<SyncLibraryItem>(v).ok())
-        .collect())
 }
