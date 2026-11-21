@@ -648,6 +648,18 @@ describe("MissionControl", () => {
     expect(screen.getByText("⟜").className).toContain("text-octo-brass");
   });
 
+  it("sets the header's fleet spend in ivory, not brass", () => {
+    const run = mkRun("a", "running", { costUsd: 2.87 });
+    useRunsStore.setState({
+      runsByWs: { "ws-a": [run] },
+      detailByRun: { a: { run, stages: [mkStage("s1", "a", 0, "running")] } },
+    });
+    renderRoom();
+    const total = screen.getByText("spent $2.87");
+    expect(total).toHaveClass("octo-tabular", "text-octo-ivory");
+    expect(total.className).not.toContain("brass");
+  });
+
   it("a question-block reads distinctly from an approval gate (asked you, not the gate)", () => {
     // The escape valve: a stage parked via ask_director shows an answer-form
     // indicator, NOT the approval-gate wording — the director must see one is waiting.

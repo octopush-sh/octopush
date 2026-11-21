@@ -1015,7 +1015,7 @@ Pills share the same geometry as the existing status pills (mono uppercase, `sm`
 
 **Ledger strip (`RunLedger`)** — a single calm line at the canvas bottom, **savings-first** (the differentiator leads).
 
-- Format: `saved $0.089 · 86% under all-premium · spent $0.014 · budget $0.50` — verdigris saved value, brass spent value, mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
+- Format: `saved $0.089 · 86% under all-premium · spent $0.014 · budget $0.50` — verdigris saved value, ivory spent value (a cost is data, never brass), mute labels, all `.octo-tabular`. No baseline ⇒ `baseline unavailable` (the slot never disappears).
 - A 2px progress inset beneath (solid brass fill = cost as % of baseline) glides with `--dur-standard`; clicking the strip unfolds the per-stage breakdown via `<Reveal>`.
 - **Completion moment:** when a run completes, a one-shot **solid** brass line (`.octo-sweep`, no gradient) crosses the strip and a serif phrase restates the savings. The one ceremony in Direct; failed/aborted runs get none.
 
@@ -1051,7 +1051,8 @@ frames a destination, not an interruption. Rules:
   savings-first fleet ledger. Law 2's fleet scope: only the **longest-waiting**
   needs-you card pulses (FIFO by `statusSince`); every other needs-you card
   keeps a static brass border. The header shows a combined live-cost figure
-  (`saved $X · Y% under all-premium · spent $Z`) over active runs only — this
+  (`saved $X · Y% under all-premium · spent $Z`; saved verdigris, spent ivory)
+  over active runs only — this
   figure is Mission-Control-only; the top-bar `RunsTray` chip dropped it (see
   §9/FEATURES for the chip's own vocabulary).
 

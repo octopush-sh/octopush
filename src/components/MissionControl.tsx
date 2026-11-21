@@ -228,7 +228,7 @@ export function MissionControl({ open, onClose, onJumpToRun, onJumpToAttention, 
                     <span className="text-octo-mute">· {savedPct}% under all-premium ·</span>
                   </>
                 )}
-                <span className="octo-tabular text-octo-brass">spent {formatUsd(spent)}</span>
+                <span className="octo-tabular text-octo-ivory">spent {formatUsd(spent)}</span>
               </span>
             )}
             <button
@@ -896,7 +896,7 @@ function CardFoot({ run, band, size }: { run: Run; band: Band; size: DiffSize | 
       {settledJustNow && (
         <span aria-hidden className="octo-sweep absolute -top-1 left-0 h-px w-full bg-octo-brass" />
       )}
-      {/* Per-card spend is quiet; brass spend belongs to the header's fleet ledger. */}
+      {/* Per-card spend is quiet; the fleet total lives in the header's ledger. */}
       <span data-tour="mission-control-card-spent" className="octo-tabular text-octo-mute">
         {formatUsd(run.costUsd)}
       </span>

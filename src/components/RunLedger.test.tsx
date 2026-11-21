@@ -19,6 +19,8 @@ describe("RunLedger", () => {
     expect(within(strip).getByText(/86% under all-premium/)).toBeInTheDocument();
     const spent = within(strip).getByText("$0.01");                  // spent
     expect(spent.className).toContain("octo-tabular");
+    expect(spent.className).toContain("text-octo-ivory");
+    expect(spent.className).not.toContain("brass");
     expect(within(strip).getByText("$0.09").className).toContain("octo-tabular");
   });
 

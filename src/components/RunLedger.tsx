@@ -78,7 +78,7 @@ export function RunLedger({ run, stages }: Props) {
           <span className="text-octo-mute">baseline unavailable</span>
         )}
         <span className="ml-auto text-octo-mute">spent</span>
-        <span className="octo-tabular text-octo-brass">{formatUsd(run.costUsd)}</span>
+        <span className="octo-tabular text-octo-ivory">{formatUsd(run.costUsd)}</span>
         {unreported > 0 && (
           <span
             className="octo-tabular text-octo-mute"

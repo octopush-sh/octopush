@@ -67,7 +67,7 @@ export function LogbookCard({
               >
                 {fmtHours(row!.hoursSecs)}
               </span>
-              <span className="octo-fade-in octo-tabular text-octo-brass" title="Spend on this mission">
+              <span className="octo-fade-in octo-tabular text-octo-ivory" title="Spend on this mission">
                 {formatUsd(row!.costUsd)}
               </span>
               {row!.savingsUsd > 0 && (
