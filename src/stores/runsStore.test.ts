@@ -56,12 +56,20 @@ describe("runsStore", () => {
     (ipc.resolveCheckpoint as any).mockRejectedValue("This stage was already decided — refresh to see what's waiting.");
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
     await expect(
-      useRunsStore.getState().resolve("r1", "approve", undefined, undefined, undefined, "st-stale"),
+      useRunsStore.getState().resolve("r1", "st-stale", "approve"),
     ).resolves.toBeUndefined();
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st-stale", "approve", undefined);
     expect(pushToastMock).toHaveBeenCalledTimes(1);
     expect(pushToastMock.mock.calls[0][0]).toMatchObject({ level: "info" });
     expect(pushToastMock.mock.calls[0][0].body).toContain("already decided");
     expect(ipc.getRun).toHaveBeenCalledWith("r1");
+  });
+
+  it("resolve sends the named stage and its options to the backend", async () => {
+    (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+    (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
+    await useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
+    expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
   });
 
   it("appendEntry accumulates structured entries per stage and caps the buffer", () => {

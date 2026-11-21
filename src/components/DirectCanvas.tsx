@@ -223,12 +223,22 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           // Every decision names the stage its bar shows, so the backend never
           // resolves another stage of the run: if that stage was decided
           // elsewhere meanwhile, it refuses, the store toasts the refusal and
-          // the refresh shows what is waiting now.
-          onApprove={() => void resolve(run.id, "approve", undefined, undefined, undefined, blockedStage?.id)}
-          onReject={(fb, maxTurns) => void resolve(run.id, "reject", fb || undefined, undefined, maxTurns, blockedStage?.id)}
-          onResume={(maxTurns) => void resolve(run.id, "resume", undefined, undefined, maxTurns, blockedStage?.id)}
-          onDiscard={() => void resolve(run.id, "discard", undefined, undefined, undefined, blockedStage?.id)}
-          onSendBack={(fb) => void resolve(run.id, "send_back", fb || undefined, undefined, undefined, blockedStage?.id)}
+          // the refresh shows what is waiting now. No stage shown, no decision.
+          onApprove={() => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "approve");
+          }}
+          onReject={(fb, maxTurns) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
+          }}
+          onResume={(maxTurns) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "resume", { maxTurnsOverride: maxTurns });
+          }}
+          onDiscard={() => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "discard");
+          }}
+          onSendBack={(fb) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
+          }}
           onAnswerBlocker={(answers) => {
             if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);
           }}

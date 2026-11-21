@@ -24,6 +24,13 @@ export function pickBlockedStage<S extends { status: string; error?: string | nu
   return resolvable.find((s) => !(s.status === "failed" && isPlanLimitHalt(s.error))) ?? resolvable[0] ?? null;
 }
 
+/** The stage a plan park's Resume acts on: the first plan-limited one, as the
+ *  automatic resume picks it (`plan_wait.rs`). Resuming it resumes every
+ *  plan-limited stage of the run. Null once none is left. */
+export function planLimitedStage<S extends { status: string; error?: string | null }>(stages: readonly S[]): S | null {
+  return stages.find((s) => s.status === "failed" && isPlanLimitHalt(s.error)) ?? null;
+}
+
 /** Automatic resumes before a plan-parked run waits for the director. Mirrors
  *  `plan_wait::AUTO_RESUME_CAP` in Rust; `planWait.test.ts` pins the two. */
 export const AUTO_RESUME_CAP = 3;

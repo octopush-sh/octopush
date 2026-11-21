@@ -164,7 +164,7 @@ describe("DirectCanvas viewed-run routing", () => {
     expect(screen.getByText("decides:g1")).toBeInTheDocument();
     expect(screen.getByText("decision-beacon:true")).toBeInTheDocument();
     fireEvent.click(screen.getByText("approve"));
-    expect(resolve).toHaveBeenCalledWith("r1", "approve", undefined, undefined, undefined, "g1");
+    expect(resolve).toHaveBeenCalledWith("r1", "g1", "approve");
   });
 
   it("shows the decision surface when paused at a checkpoint, and the running controls once resumed", () => {
