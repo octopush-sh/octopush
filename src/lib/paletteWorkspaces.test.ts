@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { defaultFilter } from "cmdk";
-import { paletteFilter, paletteWorkspaces } from "./paletteWorkspaces";
+import { paletteFilter, paletteShowsProject, paletteWorkspaceMeta, paletteWorkspaces } from "./paletteWorkspaces";
 import type { Workspace } from "./types";
 
 const ws = (id: string, name: string, branch: string, lastActive: string, extra: Partial<Workspace> = {}): Workspace => ({
@@ -63,6 +63,36 @@ describe("paletteWorkspaces", () => {
     const row = paletteWorkspaces(projects, {}, {}, {}).find((r) => r.id === "d")!;
     expect(row.keywords).toEqual(["Waiting long", "pm/issue-772", "octopush-api"]);
     expect(row.glyph).toBe("W");
+  });
+});
+
+describe("paletteWorkspaceMeta (#935)", () => {
+  const PROJECT = "octopush-enterprise-monorepo-with-a-very-long-name";
+  const one = [
+    {
+      name: PROJECT,
+      workspaces: [3, 10, 17].map((n) =>
+        ws(`r${n}`, `rollback-${n}`, `feature/new-model-rollout-with-staged-canaries-and-rollback-${n}`, "2026-11-01T00:00:00Z"),
+      ),
+    },
+  ];
+
+  it("leaves the project out when every row shares it, so each line is its own branch", () => {
+    const rows = paletteWorkspaces(one, {}, {}, {});
+    expect(paletteShowsProject(rows)).toBe(false);
+    const metas = rows.map((r) => paletteWorkspaceMeta(r, paletteShowsProject(rows)));
+    expect(metas.every((m) => !m.includes(PROJECT))).toBe(true);
+    expect(new Set(metas).size).toBe(3);
+    expect(metas).toContain("feature/new-model-rollout-with-staged-canaries-and-rollback-10");
+  });
+
+  it("names the project when the list spans several, outermost first", () => {
+    const two = [...one, { name: "octopush-api", workspaces: [ws("d", "Waiting", "pm/issue-772", "2026-10-01T00:00:00Z")] }];
+    const rows = paletteWorkspaces(two, {}, {}, {});
+    expect(paletteShowsProject(rows)).toBe(true);
+    expect(paletteWorkspaceMeta(rows.find((r) => r.id === "d")!, true)).toBe("octopush-api · pm/issue-772");
+    expect(paletteWorkspaceMeta({ project: "p", group: "Fixes", branch: "fix/a" }, false)).toBe("Fixes · fix/a");
+    expect(paletteWorkspaceMeta({ project: "p", group: "Fixes", branch: "fix/a" }, true)).toBe("p · Fixes · fix/a");
   });
 });
 

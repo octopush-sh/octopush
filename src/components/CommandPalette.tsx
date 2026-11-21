@@ -15,7 +15,14 @@ import { tourId } from "../lib/tour/ids";
 import { useCrewImportStore } from "../stores/crewImportStore";
 import { useRunsStore } from "../stores/runsStore";
 import { MidTruncate } from "./primitives/MidTruncate";
-import { paletteFilter, paletteWorkspaces, WORKSPACE_VALUE_PREFIX, type PaletteWorkspace } from "../lib/paletteWorkspaces";
+import {
+  paletteFilter,
+  paletteShowsProject,
+  paletteWorkspaceMeta,
+  paletteWorkspaces,
+  WORKSPACE_VALUE_PREFIX,
+  type PaletteWorkspace,
+} from "../lib/paletteWorkspaces";
 import type { ProjectGroup } from "./WorkspaceRail";
 import { firstRevealedModel, paletteModelValue, paletteModels } from "../lib/paletteModels";
 import { GROUP_VALUE_PREFIX, paletteGroups, type PaletteGroup } from "../lib/paletteGroups";
@@ -122,11 +129,17 @@ export function CommandPalette({
 
   // Workspaces — every open project's, needs-you first, then running, then
   // most recently active. Typing part of a branch or a project name finds
-  // the row.
+  // the row. With one project open, the meta lines leave its name out.
+  const showProject = paletteShowsProject(workspaceRows);
   const workspacesSection = workspaceRows.length > 0 && onSelectWorkspace && (
     <Group key="workspaces" heading="Workspaces" tour={tourId("palette-workspaces")}>
       {workspaceRows.map((w) => (
-        <WorkspaceItem key={w.id} row={w} onSelect={() => run(() => onSelectWorkspace(w.id))} />
+        <WorkspaceItem
+          key={w.id}
+          row={w}
+          showProject={showProject}
+          onSelect={() => run(() => onSelectWorkspace(w.id))}
+        />
       ))}
     </Group>
   );
@@ -585,13 +598,22 @@ function GroupItem({ row, onSelect }: { row: PaletteGroup; onSelect: () => void 
 }
 
 /** A Workspaces row: the name over a mono meta line, "<project> · <branch>"
- *  ("<project> · <group> · <branch>" for a mission in a group), both
- *  middle-truncated like the rail with the full text in a title. A
+ *  ("<project> · <group> · <branch>" for a mission in a group; the project
+ *  only when the list spans several, #935), both middle-truncated like the
+ *  rail with the full text, project included, in a title. A
  *  static dot says the crew needs you (brass, the rail's non-beacon dot) or
  *  that it is working (sage); the palette never pulses. */
-function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () => void }) {
-  // Outermost first, as the slim rail's flyout reads: project · group · branch.
-  const meta = [row.project, row.group, row.branch].filter(Boolean).join(" · ");
+function WorkspaceItem({
+  row,
+  showProject,
+  onSelect,
+}: {
+  row: PaletteWorkspace;
+  showProject: boolean;
+  onSelect: () => void;
+}) {
+  const meta = paletteWorkspaceMeta(row, showProject);
+  const fullMeta = paletteWorkspaceMeta(row, true);
   const state = row.needsYou ? "Needs you" : row.running ? "Working" : null;
   return (
     <Command.Item
@@ -615,7 +637,7 @@ function WorkspaceItem({ row, onSelect }: { row: PaletteWorkspace; onSelect: () 
         <span className="flex min-w-0" title={row.name}>
           <MidTruncate text={row.name} className="min-w-0 flex-1" />
         </span>
-        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={meta}>
+        <span className="flex min-w-0 font-mono text-[10px] text-octo-mute" title={fullMeta}>
           <MidTruncate text={meta} tail={16} className="min-w-0 flex-1" />
         </span>
       </span>

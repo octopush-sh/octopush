@@ -57,6 +57,24 @@ interface ProjectLike {
   workspaces: Workspace[];
 }
 
+/** Whether the rows' meta lines name their project: only when the list spans
+ *  more than one. With one project every line would open on the same name
+ *  and leave the branch, the part that tells rows apart, only the leftover
+ *  room (#935). */
+export function paletteShowsProject(rows: readonly Pick<PaletteWorkspace, "project">[]): boolean {
+  return new Set(rows.map((r) => r.project)).size > 1;
+}
+
+/** A row's meta line, outermost first as the slim rail's flyout reads:
+ *  "<project> · <group> · <branch>", the project dropped when
+ *  {@link paletteShowsProject} says the list doesn't need it. */
+export function paletteWorkspaceMeta(
+  row: Pick<PaletteWorkspace, "project" | "group" | "branch">,
+  showProject: boolean,
+): string {
+  return [showProject ? row.project : "", row.group, row.branch].filter(Boolean).join(" · ");
+}
+
 const ms = (iso: string | null | undefined): number => {
   const t = iso ? Date.parse(iso) : NaN;
   return Number.isNaN(t) ? 0 : t;
