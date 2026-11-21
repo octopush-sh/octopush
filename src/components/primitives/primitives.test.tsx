@@ -585,4 +585,35 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
     expect(head.style.maxWidth).toBe(`${10 * GLYPH + ELL + 0.5}px`);
     expect(readable(container)).toBe(name);
   });
+
+  it("never leaves a head held at clip when one box's measurement throws (#866)", () => {
+    // The header's branch, beside a row whose Range read fails mid-frame.
+    const branch = "feature/JIRA-1000-production-deploy-of-the-shard-copy";
+    const broken = "octopush-enterprise-monorepo-with-a-very-long-name";
+    room = 80;
+    const plain = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      if (this.startContainer.textContent?.startsWith("octopush-enterprise")) {
+        throw new DOMException("offset", "IndexSizeError");
+      }
+      return plain.call(this);
+    };
+    const { container } = render(
+      <>
+        <MidTruncate text={broken} tail={12} />
+        <MidTruncate text={branch} tail={12} />
+      </>,
+    );
+    expect(() => act(flushFrames)).not.toThrow();
+    const [bad, good] = Array.from(container.querySelectorAll<HTMLElement>(".octo-midtrunc"));
+    // Neither box stays at `data-measuring`, the one state whose head clips.
+    expect(container.querySelectorAll("[data-measuring]")).toHaveLength(0);
+    // The failed box keeps the plain CSS ellipsis; the other is still seated.
+    expect(bad).not.toHaveAttribute("data-elided");
+    expect(bad.querySelector<HTMLElement>(".octo-midtrunc-head")!.style.maxWidth).toBe("");
+    expect(good).toHaveAttribute("data-elided");
+    // The synchronous path holds too.
+    seatEllipsis(bad, bad.querySelector<HTMLElement>(".octo-midtrunc-head")!);
+    expect(bad).not.toHaveAttribute("data-measuring");
+  });
 });

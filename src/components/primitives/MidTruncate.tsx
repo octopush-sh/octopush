@@ -189,8 +189,21 @@ function flush() {
   const batch = [...dirty].filter((t) => t.box.isConnected);
   dirty.clear();
   for (const t of batch) reset(t.box, t.head); // writes
-  const cuts = batch.map((t) => measureCut(t.box, t.head, t.ell)); // reads
+  const cuts = batch.map((t) => safeCut(t.box, t.head, t.ell)); // reads
   batch.forEach((t, i) => applyCut(t.box, t.head, cuts[i])); // writes
+}
+
+/** `measureCut`, but a read that throws (a Range offset past a text node an
+ *  engine re-split, a detached node) keeps the CSS ellipsis for that box
+ *  instead of escaping the frame. Escaping would skip every `applyCut` of the
+ *  batch and leave each box at `data-measuring` — its head held at
+ *  `text-overflow: clip` for good, text hard-cut with no ellipsis (#866). */
+function safeCut(box: HTMLElement, head: HTMLElement, ell: HTMLElement | null): number | null {
+  try {
+    return measureCut(box, head, ell);
+  } catch {
+    return null;
+  }
 }
 
 /** The element whose width actually bounds the box: the nearest ancestor
@@ -245,7 +258,7 @@ function sizedByContent(el: HTMLElement): boolean {
  *  instance (`flush`). */
 export function seatEllipsis(box: HTMLElement, head: HTMLElement) {
   reset(box, head);
-  applyCut(box, head, measureCut(box, head, ellOf(box)));
+  applyCut(box, head, safeCut(box, head, ellOf(box)));
 }
 
 function ellOf(box: HTMLElement): HTMLElement | null {
