@@ -424,6 +424,51 @@ describe("WorkspaceRail", () => {
     expect(container.querySelectorAll(".octo-midtrunc")).toHaveLength(2);
   });
 
+  it("leaves every long rail name on its head's own ellipsis after a layout pass (#865)", () => {
+    // The audit's stress names, plus one whose text the engine can't measure:
+    // its throw must not strand the other heads at `text-overflow: clip`.
+    const frames: FrameRequestCallback[] = [];
+    vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => frames.push(cb));
+    vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+      const width = this.classList.contains("octo-midtrunc-head") ? 80 : 0;
+      return { left: 0, right: width, top: 0, bottom: 0, width, height: 0 } as DOMRect;
+    });
+    const realRangeRect = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      if (this.startContainer.textContent?.startsWith("Ü/ñ")) throw new Error("no layout");
+      const w = (this.endOffset - this.startOffset) * 7;
+      return { left: 0, right: w, top: 0, bottom: 0, width: w, height: 0 } as DOMRect;
+    };
+    try {
+      const names = [
+        "Production deploy (octopush-api)-1",
+        "Ü/ñ émojis 🐙 and CJK 長い名前のパイプライン-5",
+        "New Model Rollout with staged canaries and rollback-3",
+      ];
+      const workspaces = names.map((name, i) => makeWorkspace({ id: `w${i}`, name }));
+      const projects: ProjectGroup[] = [
+        { id: "proj-1", name: "octopush-enterprise-monorepo-with-a-very-long-name", workspaces },
+      ];
+      const { container } = render(
+        <WorkspaceRail projects={projects} activeWorkspaceId="w0" onSelect={vi.fn()} isCollapsed={false} onCustomize={vi.fn()} />,
+      );
+      act(() => frames.splice(0).forEach((cb) => cb(0)));
+      const boxes = [...container.querySelectorAll(".octo-midtrunc")];
+      expect(boxes).toHaveLength(4); // the project name and the three missions
+      for (const box of boxes) {
+        expect(box).not.toHaveAttribute("data-measuring");
+        // The head is the one clipping span, and it clips with an ellipsis.
+        expect(box.querySelector(".octo-midtrunc-head")).toBeInTheDocument();
+        expect(box.querySelector(".octo-midtrunc-head")).not.toHaveClass("truncate");
+      }
+      expect(container.querySelectorAll(".octo-midtrunc[data-elided]")).toHaveLength(3);
+    } finally {
+      Range.prototype.getBoundingClientRect = realRangeRect;
+      vi.unstubAllGlobals();
+      vi.restoreAllMocks();
+    }
+  });
+
   it("sheds the ahead/behind counts into the tooltip before a long name loses its tail", () => {
     const workspaces = [
       makeWorkspace({ id: "a", name: "refactor-the-entire-authentication-flow-9" }),

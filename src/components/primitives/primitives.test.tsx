@@ -530,6 +530,7 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
   const ELL = 9;
   let room = 0;
   const realRangeRect = Range.prototype.getBoundingClientRect;
+  const text865 = "Production deploy (octopush-api)-1";
 
   beforeEach(() => {
     frames = [];
@@ -568,6 +569,51 @@ describe("MidTruncate — a cut head keeps its own ellipsis (#864)", () => {
     expect(rules[0][2]).toMatch(/width:\s*0;/);
     expect(rules[0][2]).toMatch(/visibility:\s*hidden;/);
     expect(css).not.toMatch(/\[data-elided\]/);
+  });
+
+  it("never strands a head at clip when one box in the pass can't be measured (#865)", () => {
+    room = 70;
+    const broken = "Ü/ñ émojis 🐙 and CJK 長い名前のパイプライン-5";
+    const rangeRect = Range.prototype.getBoundingClientRect;
+    Range.prototype.getBoundingClientRect = function (this: Range) {
+      if (this.startContainer.textContent?.startsWith("Ü/ñ")) throw new Error("no layout");
+      return rangeRect.call(this);
+    };
+    const names = ["Production deploy (octopush-api)-1", broken, "New Model Rollout with staged canaries and rollback-3"];
+    const { container } = render(
+      <div style={{ display: "flex" }}>
+        {names.map((n) => (
+          <div key={n} style={{ display: "flex", flexGrow: 1 }}>
+            <MidTruncate text={n} tail={14} />
+          </div>
+        ))}
+      </div>,
+    );
+    expect(frames).toHaveLength(1); // one shared pass for all three
+    act(flushFrames);
+    const boxes = [...container.querySelectorAll(".octo-midtrunc")];
+    expect(boxes).toHaveLength(3);
+    // The hold is released everywhere, so every head is back on its ellipsis…
+    for (const box of boxes) expect(box).not.toHaveAttribute("data-measuring");
+    // …the boxes measured around the broken one are still cut…
+    expect(boxes.map((b) => b.hasAttribute("data-elided"))).toEqual([true, false, true]);
+    // …and the broken one keeps the plain CSS ellipsis, uncut by hand.
+    expect(boxes[1].querySelector<HTMLElement>(".octo-midtrunc-head")!.style.maxWidth).toBe("");
+  });
+
+  it("releases the hold in a synchronous seatEllipsis that can't measure", () => {
+    room = 70;
+    const { container } = render(<MidTruncate text={text865} tail={14} />);
+    act(flushFrames);
+    const box = container.querySelector<HTMLElement>(".octo-midtrunc")!;
+    const head = container.querySelector<HTMLElement>(".octo-midtrunc-head")!;
+    Range.prototype.getBoundingClientRect = () => {
+      throw new Error("no layout");
+    };
+    seatEllipsis(box, head);
+    expect(box).not.toHaveAttribute("data-measuring");
+    expect(box).not.toHaveAttribute("data-elided");
+    expect(head.style.maxWidth).toBe("");
   });
 
   it("sizes the cut head to its kept glyphs plus its own `…`", () => {
