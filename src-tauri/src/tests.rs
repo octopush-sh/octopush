@@ -23156,6 +23156,59 @@ mod plan_wait_tests {
         assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
     }
 
+    /// The retry cap is counted on the run's row (#857): another process (the
+    /// app beside a detached worker, or the app after a restart) continues
+    /// the same count instead of starting its own.
+    #[tokio::test]
+    async fn the_retry_cap_is_shared_across_processes() {
+        use crate::orchestrator::plan_wait::MAX_PLAN_RETRIES;
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (first, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(first.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        first.set_active_for_test(&run_id, true);
+        for i in 1..MAX_PLAN_RETRIES {
+            make_due(&db, &run_id);
+            assert_eq!(first.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry, "retry {i}");
+        }
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), MAX_PLAN_RETRIES - 1);
+        drop(first);
+        let (second, reasons, _) = orch(&db, 0, now() + 600);
+        second.set_active_for_test(&run_id, true);
+        make_due(&db, &run_id);
+        assert_eq!(second.claim_plan_resume(&run_id).unwrap(), PlanClaim::NeedsYou, "the count carried over");
+        let wait = db.lock().get_run(&run_id).unwrap().unwrap().plan_wait.expect("still parked");
+        assert_eq!(wait.resume_at, None, "waits for the director");
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0, "handed over: the count starts over");
+        assert_eq!(reasons.reasons.lock().last().map(String::as_str), Some("decision"));
+    }
+
+    /// The director acting (a decision, a re-run, turning the automatic
+    /// resume off) starts the failed-claim count over (#857).
+    #[tokio::test]
+    async fn the_director_acting_resets_the_retry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, run_id) = seed(&dir.path().join("o.db"));
+        let (orch, _, _) = orch(&db, 1, now() + 600);
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        orch.set_active_for_test(&run_id, true);
+        for _ in 0..3 {
+            make_due(&db, &run_id);
+            assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        }
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 3);
+        // A decision (`dispatch_checkpoint`) or a re-run.
+        db.lock().reset_plan_resume_count(&run_id).unwrap();
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0);
+
+        make_due(&db, &run_id);
+        assert_eq!(orch.claim_plan_resume(&run_id).unwrap(), PlanClaim::Retry);
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 1);
+        // Turning the automatic resume off.
+        orch.cancel_plan_resume(&run_id).unwrap();
+        assert_eq!(db.lock().plan_retry_count(&run_id).unwrap(), 0);
+    }
+
     /// A decision naming a stage that is no longer waiting (decided
     /// elsewhere) is refused, never redirected to the first resolvable
     /// stage: the other gate and the plan stage stay as they were.

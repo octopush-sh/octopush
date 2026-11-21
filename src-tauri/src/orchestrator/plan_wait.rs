@@ -110,9 +110,10 @@ pub enum PlanClaim {
 /// that dies between the claim and the apply never loses the resume).
 pub const RETRY_SECS: i64 = 60;
 
-/// Consecutive claims that couldn't be applied (per process) before the run
-/// stops retrying on its own and waits for the director.
-pub const MAX_PLAN_RETRIES: u32 = 10;
+/// Consecutive claims that couldn't be applied, by the app and a detached
+/// worker alike (`runs.plan_retry_count`), before the run stops retrying on
+/// its own and waits for the director. The director acting starts it over.
+pub const MAX_PLAN_RETRIES: i64 = 10;
 
 /// Whether every stage waiting for a decision is a Claude plan limit: only
 /// then is a run with a scheduled resume calm. A sibling's real halt, a gate
@@ -257,15 +258,15 @@ impl Orchestrator {
         }
         match self.apply_claimed_plan_resume(run_id, claimed_at) {
             Ok(PlanClaim::Retry) | Err(_) => {
-                let tries = {
-                    let mut r = self.plan_retries.lock();
-                    let n = r.entry(run_id.to_string()).or_insert(0);
-                    *n += 1;
-                    *n
-                };
+                // Counted on the row: every process that claims it shares
+                // the cap, and a restart doesn't reset it.
+                let tries = self.db.lock().bump_plan_retry_count(run_id).unwrap_or_else(|e| {
+                    tracing::warn!(run_id = %run_id, error = %e, "plan resume: counting the retry failed");
+                    0
+                });
                 if tries >= MAX_PLAN_RETRIES {
                     // Retrying blind forever helps nobody: hand it over.
-                    self.plan_retries.lock().remove(run_id);
+                    let _ = self.db.lock().reset_plan_retry_count(run_id);
                     if !self.restore_park(run_id, &before, None, claimed_at) {
                         // The director changed the park meanwhile: theirs stands.
                         self.emit_run_update(run_id);
@@ -292,7 +293,7 @@ impl Orchestrator {
                 Ok(if restored { PlanClaim::Retry } else { PlanClaim::NotClaimed })
             }
             Ok(claim) => {
-                self.plan_retries.lock().remove(run_id);
+                let _ = self.db.lock().reset_plan_retry_count(run_id);
                 Ok(claim)
             }
         }
@@ -415,6 +416,8 @@ impl Orchestrator {
         if !self.db.lock().cancel_plan_resume(run_id)? {
             return Ok(());
         }
+        // The director acted: failed claims before this no longer count.
+        self.db.lock().reset_plan_retry_count(run_id)?;
         let stage = self
             .db
             .lock()

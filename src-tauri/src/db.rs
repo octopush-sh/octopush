@@ -943,6 +943,10 @@ impl Db {
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resets_at INTEGER")?;
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_at INTEGER")?;
         add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_resume_count INTEGER NOT NULL DEFAULT 0")?;
+        // Consecutive automatic resumes claimed but not applied (#857): on
+        // the row, so the app and a detached worker share one count and a
+        // restart doesn't reset it.
+        add_column_if_missing(&self.conn, "ALTER TABLE runs ADD COLUMN plan_retry_count INTEGER NOT NULL DEFAULT 0")?;
         add_column_if_missing(&self.conn, "ALTER TABLE chat_threads ADD COLUMN mission_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE terminals ADD COLUMN mission_id TEXT")?;
         // One-shot re-parenting: every existing workspace becomes a 'build'
@@ -5996,10 +6000,40 @@ impl Db {
     }
 
     /// A fresh allowance of automatic resumes (the director acted, or a stage
-    /// finished: the run got past the wall).
+    /// finished: the run got past the wall). Failed claims start over too.
     pub fn reset_plan_resume_count(&self, run_id: &str) -> AppResult<()> {
         self.conn.execute(
-            "UPDATE runs SET plan_resume_count = 0 WHERE id = ?1 AND plan_resume_count <> 0",
+            "UPDATE runs SET plan_resume_count = 0, plan_retry_count = 0
+             WHERE id = ?1 AND (plan_resume_count <> 0 OR plan_retry_count <> 0)",
+            params![run_id],
+        )?;
+        Ok(())
+    }
+
+    /// Count one more automatic resume that was claimed but couldn't be
+    /// applied, by any process; returns the consecutive count.
+    pub fn bump_plan_retry_count(&self, run_id: &str) -> AppResult<i64> {
+        self.conn.execute(
+            "UPDATE runs SET plan_retry_count = plan_retry_count + 1 WHERE id = ?1",
+            params![run_id],
+        )?;
+        self.plan_retry_count(run_id)
+    }
+
+    /// Consecutive automatic resumes claimed but not applied.
+    pub fn plan_retry_count(&self, run_id: &str) -> AppResult<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT plan_retry_count FROM runs WHERE id = ?1", params![run_id], |r| r.get(0))
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// An automatic resume applied (or handed to the director): failed
+    /// claims start over.
+    pub fn reset_plan_retry_count(&self, run_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE runs SET plan_retry_count = 0 WHERE id = ?1 AND plan_retry_count <> 0",
             params![run_id],
         )?;
         Ok(())

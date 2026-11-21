@@ -304,9 +304,6 @@ pub struct Orchestrator {
     /// The bridge's watch table for leased (worker-driven) runs: journal
     /// cursor + last-emitted snapshot per run id (see `bridge`).
     bridge_watch: Mutex<std::collections::HashMap<String, crate::orchestrator::bridge::Watch>>,
-    /// Consecutive automatic plan resumes per run that this process claimed
-    /// but couldn't apply (`plan_wait::MAX_PLAN_RETRIES` caps them).
-    pub(crate) plan_retries: Mutex<std::collections::HashMap<String, u32>>,
     /// Claude Code's transcript directory (`~/.claude/projects`): a stage's
     /// session rows a mid-run ingest pass metered are dropped from it the
     /// moment the stage reports its session (#863).
@@ -342,7 +339,6 @@ impl Orchestrator {
             headless,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
-            plan_retries: Mutex::new(std::collections::HashMap::new()),
             transcripts_root: crate::transcripts::projects_root(),
         }
     }
@@ -372,7 +368,6 @@ impl Orchestrator {
             headless: false,
             director_pauses: Mutex::new(std::collections::HashSet::new()),
             bridge_watch: Mutex::new(std::collections::HashMap::new()),
-            plan_retries: Mutex::new(std::collections::HashMap::new()),
             // Tests never read the real `~/.claude/projects`: an empty root
             // (a path nobody creates) unless `with_transcripts_root` sets one.
             transcripts_root: std::env::temp_dir()
