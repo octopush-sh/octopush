@@ -122,6 +122,7 @@ import {
   type ChangeStats,
   type CommitsAhead,
 } from "./lib/runChanges";
+import { refetchForWorkspace } from "./lib/workspaceRefetch";
 import { useReviewSource } from "./stores/reviewSourceStore";
 import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaultPin";
 import { shouldClearAttention } from "./lib/attentionFocus";
@@ -2510,19 +2511,25 @@ function App() {
                       }}
                       onChangesChange={() => {
                         // Refetch diff + status after commit / push so the
-                        // canvas catches up immediately.
+                        // canvas catches up immediately — unless the user has
+                        // switched workspace meanwhile (#908).
                         const path = activeWorkspace.worktreePath || project.path;
-                        Promise.all([
-                          ipc.getGitStatus(path),
-                          ipc.getGitDiff(path, ignoreWs).catch(() => ""),
-                          ipc.getCommittedDiff(activeWorkspaceId!, ignoreWs).catch(() => null),
-                        ])
-                          .then(([s, d, c]) => {
+                        const wsId = activeWorkspaceId!;
+                        refetchForWorkspace(
+                          wsId,
+                          () =>
+                            Promise.all([
+                              ipc.getGitStatus(path),
+                              ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+                              ipc.getCommittedDiff(wsId, ignoreWs).catch(() => null),
+                            ]),
+                          () => useWorkspaceStore.getState().activeId,
+                          ([s, d, c]) => {
                             setGitStatus(s);
                             setGitDiff(d);
-                            useReviewSource.getState().setCommitted(activeWorkspaceId!, c);
-                          })
-                          .catch(() => {});
+                            useReviewSource.getState().setCommitted(wsId, c);
+                          },
+                        ).catch(() => {});
                       }}
                     />
 
@@ -2546,17 +2553,22 @@ function App() {
                         onViewModeChange={setReviewViewMode}
                         onOpenFileAtLine={(p, line) => navigateToFile(p, "editor", line)}
                         onDiffChange={() => {
-                          // Re-fetch git status + diff after a hunk action
+                          // Re-fetch git status + diff after a hunk action,
+                          // for the workspace it was taken in (#908).
                           const path = activeWorkspace.worktreePath || project.path;
-                          Promise.all([
-                            ipc.getGitStatus(path),
-                            ipc.getGitDiff(path, ignoreWs).catch(() => ""),
-                          ])
-                            .then(([s, d]) => {
+                          refetchForWorkspace(
+                            activeWorkspaceId!,
+                            () =>
+                              Promise.all([
+                                ipc.getGitStatus(path),
+                                ipc.getGitDiff(path, ignoreWs).catch(() => ""),
+                              ]),
+                            () => useWorkspaceStore.getState().activeId,
+                            ([s, d]) => {
                               setGitStatus(s);
                               setGitDiff(d);
-                            })
-                            .catch(() => {});
+                            },
+                          ).catch(() => {});
                         }}
                         initialTestCommand={activeWorkspace.testCommand ?? null}
                         onFocusCommit={() => focusCommitFn.current?.()}
