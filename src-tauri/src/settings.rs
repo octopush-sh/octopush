@@ -152,7 +152,7 @@ pub struct AppSettings {
 
 /// `settings.json`'s reader for an enum-valued field: a value this build
 /// can't read (an unknown variant, or a wrong shape) falls back to the
-/// field's own default, never a failed file — the same rule
+/// field's own default, never a failed file (malformed JSON still fails) — the same rule
 /// `SyncStatus::deserialize_lenient` applies to `lastSyncAttempt`. Every
 /// enum-valued field of [`AppSettings`] uses it.
 fn enum_or_default<'de, D, T>(d: D) -> Result<T, D::Error>
@@ -160,7 +160,10 @@ where
     D: serde::Deserializer<'de>,
     T: serde::de::DeserializeOwned + Default,
 {
-    let v = serde_json::Value::deserialize(d).unwrap_or(serde_json::Value::Null);
+    // A syntax error inside the value is still an error: only a well-formed
+    // value this build can't read falls back. Broken JSON must keep failing
+    // the whole file, so no writer overwrites it (#641).
+    let v = serde_json::Value::deserialize(d)?;
     Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
@@ -831,6 +834,38 @@ mod tests {
             set_update_channel(crate::updater::UpdateChannel::Beta).unwrap();
             assert_eq!(update_channel(), crate::updater::UpdateChannel::Beta);
             assert_other_keys_intact(&load_settings().unwrap());
+        }
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn malformed_json_inside_an_enum_field_still_fails_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        // Broken syntax inside the lenient field's own value, with and
+        // without keys after it.
+        for corrupt in [
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":[1,}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":{"name":},"editorCommand":"code"}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":bet"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AppSettings>(corrupt).is_err(),
+                "not read leniently: {corrupt}"
+            );
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                unreadable_settings_path(),
+                Some(path.to_string_lossy().into_owned()),
+                "reported as unparseable"
+            );
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
         }
         test_settings_path::set(None);
     }
