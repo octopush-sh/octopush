@@ -1744,7 +1744,110 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.
     state.chat.talk_shell.close(&thread_id);
+    // Its checkpoints go with it (#958).
+    let worktree = state.db.lock().chat_thread_worktree(&thread_id).ok().flatten();
+    if let Some(path) = worktree {
+        crate::talk_checkpoints::prune_thread(std::path::Path::new(&path), &thread_id);
+    }
     state.db.lock().delete_chat_thread(&thread_id)
+}
+
+// ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+
+/// The user turns of a thread whose files can be rewound.
+#[tauri::command]
+pub async fn list_talk_checkpoints(workspace_path: String, thread_id: String) -> AppResult<Vec<i64>> {
+    crate::talk_checkpoints::list(std::path::Path::new(&workspace_path), &thread_id)
+}
+
+/// What rewinding to a turn would change — shown before anything is written.
+#[tauri::command]
+pub async fn preview_talk_rewind(
+    workspace_path: String,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<crate::talk_checkpoints::RewindPreview> {
+    crate::talk_checkpoints::preview(std::path::Path::new(&workspace_path), &thread_id, message_id)
+}
+
+/// The quiet note a rewind leaves in the conversation, naming the turn.
+pub(crate) fn rewind_note(turn: Option<&str>, files: usize) -> String {
+    let first = turn.and_then(|t| t.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim();
+    let short: String = first.chars().take(40).collect();
+    let short = if first.chars().count() > 40 { format!("{short}…") } else { short };
+    let plural = if files == 1 { "file" } else { "files" };
+    if short.is_empty() {
+        format!("Files rewound to before a turn · {files} {plural}")
+    } else {
+        format!("Files rewound to before “{short}” · {files} {plural}")
+    }
+}
+
+/// Rewind the worktree to the checkpoint of a user turn. `expected` is the
+/// preview the user confirmed; a tree that moved on since is refused.
+#[tauri::command]
+pub async fn rewind_talk_files(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    workspace_path: String,
+    thread_id: String,
+    message_id: i64,
+    expected: String,
+) -> AppResult<usize> {
+    if state.chat.is_running(&thread_id) {
+        return Err(AppError::Other("Stop the running turn before rewinding its files.".into()));
+    }
+    let n = crate::talk_checkpoints::rewind(std::path::Path::new(&workspace_path), &thread_id, message_id, &expected)?;
+    let db = state.db.lock();
+    let turn = db.get_chat_message(message_id).ok().flatten().map(|m| m.content);
+    let note = rewind_note(turn.as_deref(), n);
+    db.insert_chat_message(&workspace_id, &thread_id, "stopped", &note, None, None, None, None)?;
+    Ok(n)
+}
+
+/// Put back the files the thread's last rewind replaced.
+#[tauri::command]
+pub async fn undo_talk_rewind(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    workspace_path: String,
+    thread_id: String,
+) -> AppResult<usize> {
+    let n = crate::talk_checkpoints::undo(std::path::Path::new(&workspace_path), &thread_id)?;
+    state.db.lock().insert_chat_message(
+        &workspace_id,
+        &thread_id,
+        "stopped",
+        "Rewind undone · the files are back as they were",
+        None,
+        None,
+        None,
+        None,
+    )?;
+    Ok(n)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedThread {
+    pub thread: crate::db::ChatThreadRow,
+    /// The forked turn's text, for the new thread's composer.
+    pub draft: String,
+}
+
+/// Fork a conversation from a user turn: a new thread with the history
+/// before it (and those turns' checkpoints); the turn itself becomes the
+/// new thread's draft. The original thread is left as it is.
+#[tauri::command]
+pub async fn fork_chat_thread(
+    state: State<'_, AppState>,
+    workspace_path: String,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<ForkedThread> {
+    let (thread, draft, pairs) = state.db.lock().fork_chat_thread(&thread_id, message_id)?;
+    crate::talk_checkpoints::copy_to_fork(std::path::Path::new(&workspace_path), &thread_id, &thread.id, &pairs);
+    Ok(ForkedThread { thread, draft })
 }
 
 /// List the skills available to a worktree (project ∪ user SKILL.md files).

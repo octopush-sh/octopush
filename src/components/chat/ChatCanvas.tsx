@@ -1,6 +1,11 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from "react";
-import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil } from "lucide-react";
+import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil, History, GitFork } from "lucide-react";
 import { useChatStore, buildTimeline, isAgentToolName, type ConversationItem } from "../../stores/chatStore";
+import { ipc } from "../../lib/ipc";
+import { rewindError } from "../../lib/talkRewind";
+import { pushToast } from "../Toasts";
+import { RewindDialog } from "./RewindDialog";
+import { tourId } from "../../lib/tour/ids";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
@@ -70,6 +75,7 @@ export function ChatCanvas({
   const respondSubagentCap = useChatStore((s) => s.respondSubagentCap);
   const regenerate = useChatStore((s) => s.regenerate);
   const editAndResend = useChatStore((s) => s.editAndResend);
+  const forkThread = useChatStore((s) => s.forkThread);
   const model = useChatStore((s) => s.model);
   const loadHistory = useChatStore((s) => s.loadHistory);
   const clearError = useChatStore((s) => s.clearError);
@@ -96,6 +102,34 @@ export function ChatCanvas({
   useEffect(() => {
     loadHistory(workspaceId);
   }, [workspaceId, loadHistory]);
+
+  // The user turns whose files can be rewound (#958): each turn that could
+  // write took a checkpoint before it ran. Re-read when a turn ends.
+  const [checkpoints, setCheckpoints] = useState<ReadonlySet<number>>(() => new Set());
+  const [rewindAt, setRewindAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (!activeThreadId || streaming || typeof ipc.listTalkCheckpoints !== "function") return;
+    let live = true;
+    ipc
+      .listTalkCheckpoints(workspacePath, activeThreadId)
+      .then((ids) => {
+        if (live && Array.isArray(ids)) setCheckpoints(new Set(ids));
+      })
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [workspacePath, activeThreadId, streaming, messages.length]);
+
+  const handleFork = useCallback(
+    (messageId: number) => {
+      if (!activeThreadId) return;
+      forkThread(workspaceId, workspacePath, activeThreadId, messageId)
+        .then(() => pushToast({ level: "success", title: "Forked into a new conversation.", body: "The turn's text is in the composer." }))
+        .catch((e) => pushToast({ level: "error", title: "Couldn't fork the conversation.", body: rewindError(e) }));
+    },
+    [forkThread, workspaceId, workspacePath, activeThreadId],
+  );
 
   // Regenerate / Edit truncate the thread from the targeted message onward, so
   // they're offered ONLY on the latest exchange — the last assistant turn and
@@ -253,6 +287,12 @@ export function ChatCanvas({
                     ? (id, content) => editAndResend(workspaceId, workspacePath, id, content)
                     : undefined
                 }
+                onRewind={
+                  item.message.role === "user" && checkpoints.has(item.message.id)
+                    ? setRewindAt
+                    : undefined
+                }
+                onFork={item.message.role === "user" && activeThreadId ? handleFork : undefined}
                 disabled={streaming}
               />
             );
@@ -363,6 +403,15 @@ export function ChatCanvas({
           Latest
         </button>
       )}
+      {rewindAt !== null && activeThreadId && (
+        <RewindDialog
+          workspaceId={workspaceId}
+          workspacePath={workspacePath}
+          threadId={activeThreadId}
+          messageId={rewindAt}
+          onClose={() => setRewindAt(null)}
+        />
+      )}
     </div>
   );
 }
@@ -370,7 +419,9 @@ export function ChatCanvas({
 /**
  * Wraps a message with hover/focus actions: Copy always, Regenerate on assistant
  * turns, Edit on user turns. Editing swaps the bubble for an inline composer that
- * truncates from this message and resends. Actions hide while a turn streams.
+ * truncates from this message and resends. A user turn also offers Rewind files
+ * to here (when it took a checkpoint) and Fork from here. Actions are disabled
+ * while a turn streams.
  */
 function MessageRow({
   message,
@@ -378,6 +429,8 @@ function MessageRow({
   onOpenInEditor,
   onRegenerate,
   onEdit,
+  onRewind,
+  onFork,
   disabled,
 }: {
   message: StoredMessage;
@@ -385,6 +438,8 @@ function MessageRow({
   onOpenInEditor?: (path: string) => void;
   onRegenerate?: (id: number) => void;
   onEdit?: (id: number, newContent: string) => void;
+  onRewind?: (id: number) => void;
+  onFork?: (id: number) => void;
   disabled?: boolean;
 }) {
   const { copied, copy } = useCopyFeedback();
@@ -448,6 +503,24 @@ function MessageRow({
         <ChatMessage message={message} onOpenInEditor={onOpenInEditor} skillNames={skillNames} />
       </div>
       <div className="absolute -top-1 right-0 flex items-center gap-0.5 opacity-0 transition group-hover/msg:opacity-100 focus-within:opacity-100">
+        {onRewind && (
+          <RowAction
+            label="Rewind files to here"
+            tour={tourId("talk-turn-rewind")}
+            onClick={() => onRewind(message.id)}
+            disabled={disabled}
+            icon={<History size={12} />}
+          />
+        )}
+        {onFork && (
+          <RowAction
+            label="Fork from here"
+            tour={tourId("talk-turn-fork")}
+            onClick={() => onFork(message.id)}
+            disabled={disabled}
+            icon={<GitFork size={12} />}
+          />
+        )}
         {onEdit && (
           <RowAction
             label="Edit & resend"
@@ -485,15 +558,18 @@ function RowAction({
   onClick,
   icon,
   disabled,
+  tour,
 }: {
   label: string;
   onClick: () => void;
   icon: React.ReactNode;
   disabled?: boolean;
+  tour?: string;
 }) {
   return (
     <button
       type="button"
+      data-tour={tour}
       onClick={onClick}
       disabled={disabled}
       aria-label={label}

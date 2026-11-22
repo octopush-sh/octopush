@@ -25376,3 +25376,226 @@ mod sync_contract_tests {
         assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
     }
 }
+
+#[cfg(test)]
+mod talk_checkpoint_tests {
+    //! #958: Talk checkpoints — rewind a turn's files, undo, fork.
+    use crate::talk_checkpoints::{self as ck, AfterTurn, RewindChange};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const THREAD: &str = "5b1e-thread-a";
+
+    fn repo(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("octo-talk-ckpt-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(dir: &Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    fn change<'a>(changes: &'a [RewindChange], path: &str) -> &'a RewindChange {
+        changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("no change for {path}: {changes:?}"))
+    }
+
+    /// The whole loop: a turn edits, creates and deletes files; the director
+    /// edits another between turns; the rewind shows all of it (the
+    /// director's file flagged), restores the turn's start, leaves the index,
+    /// HEAD and ignored files alone, and the undo puts everything back.
+    #[test]
+    fn rewind_restores_the_turn_start_and_undo_puts_it_back() {
+        let dir = repo("loop");
+        write(&dir, "a.txt", "A\n");
+        write(&dir, "b.txt", "B\n");
+        write(&dir, "gone.txt", "G\n");
+        write(&dir, ".gitignore", "ignored.log\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        // The user has something staged and an ignored file around.
+        write(&dir, "a.txt", "A staged\n");
+        git(&dir, &["add", "a.txt"]);
+        write(&dir, "ignored.log", "secret\n");
+
+        assert!(ck::capture_before(&dir, THREAD, 10));
+        // The turn writes.
+        write(&dir, "a.txt", "A agent\n");
+        write(&dir, "sub/new.txt", "N\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        drop(AfterTurn::new(&dir, THREAD, 10));
+        // The director edits between turns; the ignored file changes too.
+        write(&dir, "b.txt", "B director\n");
+        write(&dir, "ignored.log", "changed\n");
+
+        let p = ck::preview(&dir, THREAD, 10).unwrap();
+        assert_eq!(p.changes.len(), 4, "{:?}", p.changes);
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        assert!(!change(&p.changes, "a.txt").outside_talk);
+        assert_eq!(change(&p.changes, "sub/new.txt").kind, "removed");
+        assert_eq!(change(&p.changes, "gone.txt").kind, "restored");
+        assert!(change(&p.changes, "b.txt").outside_talk, "the director's edit is flagged");
+
+        assert_eq!(ck::rewind(&dir, THREAD, 10, &p.current).unwrap(), 4);
+        assert_eq!(read(&dir, "a.txt"), "A staged\n");
+        assert_eq!(read(&dir, "b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        assert!(!dir.join("sub").exists(), "the created file and its folder are gone");
+        assert_eq!(read(&dir, "ignored.log"), "changed\n", "ignored files are never touched");
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), head, "HEAD never moves");
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "a.txt", "the user's index is kept");
+        assert_eq!(git(&dir, &["show", ":a.txt"]), "A staged");
+
+        assert_eq!(ck::undo(&dir, THREAD).unwrap(), 4);
+        assert_eq!(read(&dir, "a.txt"), "A agent\n");
+        assert_eq!(read(&dir, "b.txt"), "B director\n");
+        assert_eq!(read(&dir, "sub/new.txt"), "N\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(ck::undo(&dir, THREAD).is_err(), "an undo is used once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_refuses_when_the_files_moved_on_since_the_preview() {
+        let dir = repo("stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 3));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 3).unwrap();
+        write(&dir, "a.txt", "typed after the preview\n");
+        assert!(ck::rewind(&dir, THREAD, 3, &p.current).is_err());
+        assert_eq!(read(&dir, "a.txt"), "typed after the preview\n", "nothing is overwritten");
+        assert!(ck::rewind(&dir, THREAD, 3, "--force").is_err(), "a preview id is never an option");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_regenerate_keeps_the_first_checkpoint_and_pruning_clears_the_thread() {
+        let dir = repo("regen");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 7));
+        write(&dir, "a.txt", "first attempt\n");
+        assert!(ck::capture_before(&dir, THREAD, 7), "the regenerate still has a checkpoint");
+        assert!(ck::capture_before(&dir, THREAD, 9));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![7, 9]);
+        let p = ck::rewind(&dir, THREAD, 7, &ck::preview(&dir, THREAD, 7).unwrap().current);
+        assert_eq!(p.unwrap(), 1);
+        assert_eq!(read(&dir, "a.txt"), "A\n", "back to before the FIRST attempt");
+
+        ck::prune_thread(&dir, THREAD);
+        assert!(ck::list(&dir, THREAD).unwrap().is_empty());
+        assert_eq!(git(&dir, &["for-each-ref", ck::REF_ROOT]), "", "undo ref pruned too");
+        assert!(!ck::capture_before(&dir, "../heads/main", 1), "a bad thread id never reaches a ref");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn works_before_the_first_commit_and_outside_a_repo() {
+        let dir = repo("empty");
+        write(&dir, "x.txt", "X\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("x.txt")).unwrap();
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(change(&p.changes, "x.txt").kind, "restored");
+        ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(read(&dir, "x.txt"), "X\n");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let plain = std::env::temp_dir().join(format!("octo-talk-ckpt-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!ck::capture_before(&plain, THREAD, 1));
+        assert!(ck::list(&plain, THREAD).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn a_fork_gets_the_checkpoints_of_the_turns_it_copied() {
+        let dir = repo("fork");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 4));
+        write(&dir, "a.txt", "turn 4\n");
+        ck::copy_to_fork(&dir, THREAD, "5b1e-thread-b", &[(4, 40), (5, 50)]);
+        assert_eq!(ck::list(&dir, "5b1e-thread-b").unwrap(), vec![40]);
+        let p = ck::preview(&dir, "5b1e-thread-b", 40).unwrap();
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_diff_parsing_and_age_pruning_are_exact() {
+        let raw = b":100644 100644 aaa bbb M\0src/a.rs\0:000000 100644 000 ccc A\0new file.txt\0:160000 160000 d e M\0vendor/sub\0";
+        let parsed = ck::parse_raw_diff(raw);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!((parsed[0].status, parsed[0].path.as_str(), parsed[0].submodule), ('M', "src/a.rs", false));
+        assert_eq!((parsed[1].status, parsed[1].path.as_str()), ('A', "new file.txt"));
+        assert!(parsed[2].submodule, "submodules are never rewound");
+
+        let lines = "refs/octopush/talk/t/1 100\nrefs/octopush/talk/t/2 500\ngarbage\n";
+        assert_eq!(ck::expired_refs(lines, 200), vec!["refs/octopush/talk/t/1".to_string()]);
+    }
+
+    #[test]
+    fn the_rewind_note_names_the_turn() {
+        use crate::commands::rewind_note;
+        assert_eq!(rewind_note(Some("Fix the parser"), 1), "Files rewound to before “Fix the parser” · 1 file");
+        assert_eq!(
+            rewind_note(Some("\nMake the whole importer stream rows instead of loading them"), 3),
+            "Files rewound to before “Make the whole importer stream rows inst…” · 3 files"
+        );
+        assert_eq!(rewind_note(None, 0), "Files rewound to before a turn · 0 files");
+    }
+
+    #[test]
+    fn fork_copies_the_history_before_a_user_turn() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork", "P", "/tmp/p-fork").unwrap();
+        db.insert_workspace("w-fork", "p-fork", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork", "Parser work").unwrap();
+        let u1 = db.insert_chat_message("w-fork", &t.id, "user", "one", None, None, None, None).unwrap();
+        let a1 = db.insert_chat_message("w-fork", &t.id, "assistant", "ok", Some("m"), Some(5), Some(2), Some(0.01)).unwrap();
+        let u2 = db.insert_chat_message("w-fork", &t.id, "user", "two", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork", &t.id, "assistant", "done", None, None, None, None).unwrap();
+
+        let (fork, draft, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(fork.title, "Parser work · fork");
+        assert_eq!(fork.workspace_id, "w-fork");
+        assert_eq!(draft, "two");
+        assert_eq!(pairs.iter().map(|p| p.0).collect::<Vec<_>>(), vec![u1, a1]);
+        let copied = db.list_chat_messages(&fork.id).unwrap();
+        let shape: Vec<(&str, &str)> = copied.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+        assert_eq!(shape, vec![("user", "one"), ("assistant", "ok")]);
+        assert_eq!(copied[1].output_tokens, Some(2));
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 4, "the original is untouched");
+        assert!(db.fork_chat_thread(&t.id, a1).is_err(), "only a user turn forks");
+        assert_eq!(db.chat_thread_worktree(&t.id).unwrap(), None);
+    }
+}

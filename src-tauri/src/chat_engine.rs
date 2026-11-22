@@ -1724,6 +1724,13 @@ impl ChatEngine {
         self.cap_gate.deny_thread(thread_id);
     }
 
+    /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
+    /// A rewind waits for it: it would race the agent's own writes.
+    pub fn is_running(&self, thread_id: &str) -> bool {
+        let prefix = format!("{thread_id}#");
+        self.cancels.lock().keys().any(|k| k == thread_id || k.starts_with(&prefix))
+    }
+
     /// Record one provider response's token usage: the canonical spend ledger
     /// (so the Companion CONTEXT card and Settings · Usage see chat turns)
     /// and the mission logbook. Shared by the loop and the forced close.
@@ -2462,6 +2469,21 @@ impl ChatEngine {
         // same-role turns merge (Anthropic 400 guard), and `error`/`stopped`
         // rows are never replayed.
         let history = self.db.lock().list_chat_messages(&request.thread_id)?;
+
+        // Talk checkpoint (#958): snapshot the tree before this turn can
+        // write, so its files can be rewound later (a regenerate keeps the
+        // first attempt's checkpoint). A read-only mission can't write, so it
+        // takes none. Held to the end of the turn, the guard then records how
+        // the turn left the tree.
+        let can_write = !matches!(sandbox_roots.as_deref(), Some([]));
+        let _after_turn = history
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .filter(|_| can_write)
+            .filter(|m| crate::talk_checkpoints::capture_before(&workspace_path, &request.thread_id, m.id))
+            .map(|m| crate::talk_checkpoints::AfterTurn::new(&workspace_path, &request.thread_id, m.id));
+
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
             .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
