@@ -1169,6 +1169,10 @@ export const ipc = {
     invoke<AppSettings>("get_settings"),
   saveSettings: (settings: AppSettings) =>
     invoke<void>("save_settings", { settings }),
+  /** The path of `settings.json` when it exists but can't be parsed (the app
+   *  then shows defaults and refuses every save), else null. */
+  unreadableSettingsPath: () =>
+    invoke<string | null>("unreadable_settings_path"),
   // ─── Updater (channels + launch alert) ─────────────────────────
   /** The persisted update channel (`stable` by default). */
   getUpdateChannel: () => invoke<UpdateChannel>("get_update_channel"),
