@@ -158,7 +158,7 @@ export function CommentableDocument({ text, comments, onAdd, onRemove, tour }: P
               type="button"
               onClick={add}
               disabled={!note.trim()}
-              title="Add the comment (⌘↩)"
+              title="Add the comment (⌘⏎)"
               className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] disabled:opacity-40"
             >
               Add the comment
@@ -175,7 +175,9 @@ export function CommentableDocument({ text, comments, onAdd, onRemove, tour }: P
       ) : (
         ordered.length === 0 && (
           <div className="octo-fade-in flex items-center gap-1.5 font-mono text-[10px] text-octo-mute">
-            <MessageSquarePlus size={11} strokeWidth={1.75} aria-hidden />
+            <span title="Comment on a passage" className="inline-flex">
+              <MessageSquarePlus size={11} strokeWidth={1.75} aria-hidden />
+            </span>
             Select a passage to comment on it.
           </div>
         )
@@ -189,7 +191,7 @@ export function CommentableDocument({ text, comments, onAdd, onRemove, tour }: P
           {ordered.map((c) => (
             <div key={c.id} className="octo-rise-in flex items-start gap-2">
               <div className="flex min-w-0 flex-1 flex-col gap-1">
-                <div className="line-clamp-2 border-l border-[var(--brass-dim)] pl-2 font-mono text-[11px] text-octo-mute" title={c.quote}>
+                <div className="line-clamp-2 border-l border-octo-hairline pl-2 font-mono text-[11px] text-octo-mute" title={c.quote}>
                   {c.quote}
                 </div>
                 <div className="whitespace-pre-wrap pl-2 font-sans text-xs text-octo-ivory">{c.note}</div>

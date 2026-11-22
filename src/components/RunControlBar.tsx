@@ -587,7 +587,7 @@ function DecisionBar({
                   title={hasComments
                     ? nextStageLabel
                       ? `Your comments go to ${nextStageLabel} as guidance`
-                      : "No stage follows, so approving sets your comments aside"
+                      : "No stage that hasn't begun follows, so approving sets your comments aside"
                     : undefined}
                   className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
                   {hasComments && nextStageLabel ? "Approve with comments" : <>Approve &amp; continue</>}

@@ -39,6 +39,35 @@ describe("CommentableDocument", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
+  it("⌘⏎ and Ctrl+⏎ add the comment, and do nothing while the note is empty", () => {
+    const onAdd = vi.fn();
+    render(<CommentableDocument text={DOC} comments={[]} onAdd={onAdd} onRemove={vi.fn()} tour={{ document: "doc" }} />);
+    const root = document.querySelector('[data-tour="doc"]') as HTMLElement;
+    const at = root.textContent!.indexOf("Ship it");
+
+    selectPassage(root, "Ship it");
+    let box = screen.getByRole("textbox", { name: "Your comment on this passage" });
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    fireEvent.change(box, { target: { value: "   " } });
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    expect(onAdd).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox")).toBeInTheDocument();
+    // A plain Enter is a line break, not an add.
+    fireEvent.change(box, { target: { value: "After the freeze." } });
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onAdd).not.toHaveBeenCalled();
+    fireEvent.keyDown(box, { key: "Enter", metaKey: true });
+    expect(onAdd).toHaveBeenCalledWith("Ship it", "After the freeze.", at, "Ship it".length);
+    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+
+    selectPassage(root, "Add the column");
+    box = screen.getByRole("textbox", { name: "Your comment on this passage" });
+    fireEvent.change(box, { target: { value: "Nullable first." } });
+    fireEvent.keyDown(box, { key: "Enter", ctrlKey: true });
+    expect(onAdd).toHaveBeenLastCalledWith("Add the column", "Nullable first.", root.textContent!.indexOf("Add the column"), "Add the column".length);
+    expect(onAdd).toHaveBeenCalledTimes(2);
+  });
+
   it("ignores a selection outside the document, and Escape cancels the composer", () => {
     render(
       <>

@@ -74,6 +74,16 @@ describe("gate comments", () => {
     expect(nextStages([gate, stage({ id: "impl", position: 1, status: "running", startedAt: "t" })], gate)).toEqual([]);
   });
 
+  it("treats a parentless stage as a root, not the next stage, once any stage has parents", () => {
+    const gate = stage({ id: "plan", position: 0, status: "awaiting_checkpoint" });
+    // `root` sits at position + 1 but has no parents: in a flow graph it doesn't follow the gate.
+    const mixed = [gate, stage({ id: "root", position: 1 }), stage({ id: "impl", position: 2, parents: [0] }), stage({ id: "rev", position: 3, parents: [1, 2] })];
+    expect(nextStages(mixed, gate).map((s) => s.id)).toEqual(["impl"]);
+    // A graph where nothing lists the gate as a parent: no stage follows it.
+    const unrelated = [gate, stage({ id: "root", position: 1 }), stage({ id: "rev", position: 2, parents: [1] })];
+    expect(nextStages(unrelated, gate)).toEqual([]);
+  });
+
   it("keys a gate by its stage and attempt", () => {
     expect(gateKey({ id: "s1", finishedAt: "t1" })).not.toBe(gateKey({ id: "s1", finishedAt: "t2" }));
   });

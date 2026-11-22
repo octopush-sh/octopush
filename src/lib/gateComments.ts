@@ -89,15 +89,18 @@ export function gateKey(stage: Pick<RunStage, "id" | "finishedAt">): string {
 
 /**
  * The stages an approved stage hands off to and that haven't begun — where
- * approve-with-comments guidance goes. A stage with `parents` follows those
- * positions; one without follows the position before it (the linear chain).
+ * approve-with-comments guidance goes. As in the orchestrator, a run is a
+ * flow graph as soon as ANY stage has `parents`: then a stage follows the
+ * gate only when it lists it as a parent (a parentless stage is a root).
+ * Only with no `parents` anywhere is the next position the next stage.
  */
 export function nextStages(stages: readonly RunStage[], from: Pick<RunStage, "position">): RunStage[] {
+  const graph = stages.some((s) => (s.parents?.length ?? 0) > 0);
   return stages.filter(
     (s) =>
       s.status === "pending" &&
       s.startedAt === null &&
-      (s.parents.length > 0 ? s.parents.includes(from.position) : s.position === from.position + 1),
+      (graph ? (s.parents ?? []).includes(from.position) : s.position === from.position + 1),
   );
 }
 
