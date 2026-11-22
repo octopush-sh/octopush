@@ -1004,10 +1004,12 @@ pub(crate) fn starts_like_zip_within(repo: &Repository, path: &str, id: Oid, lim
         return repo.find_blob(id).is_ok_and(|b| b.content().starts_with(ZIP_MAGIC));
     }
     let mut head = [0u8; 4];
-    match odb.as_ref().map(|o| o.reader(id)) {
+    // Bound to a local so the reader (which borrows `odb`) drops before `odb`.
+    let is_zip = match odb.as_ref().map(|o| o.reader(id)) {
         Some(Ok((mut r, _, _))) => std::io::Read::read_exact(&mut r, &mut head).is_ok_and(|()| &head == ZIP_MAGIC),
         _ => worktree_starts_like_zip(repo, path, Some(size as u64)),
-    }
+    };
+    is_zip
 }
 
 /// Whether the worktree file `path` starts with [`ZIP_MAGIC`]. Reads four
