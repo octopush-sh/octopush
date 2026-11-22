@@ -1817,7 +1817,8 @@ mod tests {
         commit_file(dir.path(), "a.txt", "one\n", "first");
         let err = switch_branch(dir.path(), "a\\'; touch PWNED; echo '").unwrap_err();
         assert!(err.to_string().contains("isn't a valid branch name"), "{err}");
-        let err = cherry_pick(dir.path(), "main; touch PWNED").unwrap_err();
+        // `PullOutcome` isn't `Debug`, so no `unwrap_err` here.
+        let err = cherry_pick(dir.path(), "main; touch PWNED").err().expect("cherry_pick should refuse");
         assert!(err.to_string().contains("isn't a commit id"), "{err}");
         assert!(!dir.path().join("PWNED").exists());
     }
