@@ -69,9 +69,14 @@ export function AiReviewPanel({
           data-tour="ai-review-partial"
           className="font-mono text-[10px] leading-[1.5] text-octo-mute"
           title={
-            review.partial.omitted.length > 0
-              ? `Not reviewed:\n${review.partial.omitted.slice(0, 20).join("\n")}${review.partial.omitted.length > 20 ? `\n…and ${review.partial.omitted.length - 20} more` : ""}`
-              : undefined
+            [
+              review.partial.cutFile != null ? `Read in part: ${review.partial.cutFile}` : "",
+              review.partial.omitted.length > 0
+                ? `Not reviewed:\n${review.partial.omitted.slice(0, 20).join("\n")}${review.partial.omitted.length > 20 ? `\n…and ${review.partial.omitted.length - 20} more` : ""}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n") || undefined
           }
         >
           {partialReviewLine(review.partial)}

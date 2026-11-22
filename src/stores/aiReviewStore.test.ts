@@ -106,7 +106,18 @@ describe("aiReviewStore", () => {
       const prompt = (ipc.aiComplete as any).mock.calls[0][2] as string;
       expect(prompt).toContain("PARTIAL");
       expect(prompt).not.toContain("diff truncated (too large");
-      expect(useAiReview.getState().reviewFor("w1").partial).toEqual({ readFiles: 1, totalFiles: null, omitted: [] });
+      expect(useAiReview.getState().reviewFor("w1").partial).toEqual({ readFiles: 1, totalFiles: null, omitted: [], cutFile: null });
+    });
+
+    it("fails before the call when the model's window is smaller than the reserves", async () => {
+      (ipc.listModels as any).mockResolvedValue([{ provider: "x", model: { id: "tiny-8k", maxContext: 8_000 } }]);
+      useAiReview.getState().setModel("w1", "tiny-8k");
+      await useAiReview.getState().run("w1", file("a.ts", 1));
+      expect(ipc.aiComplete).not.toHaveBeenCalled();
+      const r = useAiReview.getState().reviewFor("w1");
+      expect(r.status).toBe("error");
+      expect(r.error).toBe("This model's context window is too small to review this change.");
+      expect(r.partial).toBeNull();
     });
   });
   it("diffHash changes with the diff (freshness)", () => {

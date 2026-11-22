@@ -53,10 +53,10 @@ export const AI_REVIEW_SCHEMA = {
 } as const;
 
 /** What the review read when it couldn't read the whole change (#943): the
- *  backend's 1 MiB cap cut the diff, or it was cut at a file boundary to fit
- *  the model's context window. */
+ *  backend's 1 MiB cap cut the diff, or it was cut to fit the model's
+ *  context window (at a file boundary, or inside a file too big on its own). */
 export interface ReviewPartial {
-  /** Files the model was sent (the last one may be cut short). */
+  /** Files the model was sent, counting `cutFile`. */
   readFiles: number;
   /** Files in the whole change; null when the 1 MiB cap cut it, so the
    *  count past the cut is unknown. */
@@ -64,7 +64,13 @@ export interface ReviewPartial {
   /** Paths left out to fit the window, in diff order; empty when only the
    *  1 MiB cap cut the diff. */
   omitted: string[];
+  /** The last file sent, when the window fit cut it inside (only its head
+   *  was read); null when every file sent is whole. */
+  cutFile: string | null;
 }
+
+/** Shown when the model's window can't hold even the start of the diff. */
+export const WINDOW_TOO_SMALL = "This model's context window is too small to review this change.";
 
 export interface FittedDiff {
   diff: string;
@@ -121,7 +127,9 @@ function chunkPath(chunk: string): string {
  *  marker (the prompt's note says so instead) and, when the prompt would
  *  overflow `maxContext` less room for the answer, keeps whole files from the
  *  start while they fit. A first file too big on its own is cut at a line.
- *  `maxContext` null/0 (model not in the catalog) skips the window fit. */
+ *  `maxContext` null/0 (model not in the catalog) skips the window fit.
+ *  Throws `WINDOW_TOO_SMALL` when not even one line of the diff fits, so
+ *  nothing is sent (or billed) for an empty review. */
 export function fitReviewDiff(gitDiff: string, maxContext: number | null | undefined): FittedDiff {
   const capped = isDiffTruncated(gitDiff);
   const body = capped
@@ -136,7 +144,7 @@ export function fitReviewDiff(gitDiff: string, maxContext: number | null | undef
   if (estimateTokens(body) <= budget) {
     return {
       diff: body,
-      partial: capped ? { readFiles: total, totalFiles: null, omitted: [] } : null,
+      partial: capped ? { readFiles: total, totalFiles: null, omitted: [], cutFile: null } : null,
     };
   }
 
@@ -149,13 +157,17 @@ export function fitReviewDiff(gitDiff: string, maxContext: number | null | undef
     kept.push(c);
     used += t;
   }
+  let cutFile: string | null = null;
   if (kept.length === 0) {
     // Not even the first file fits: keep its head, cut at a line boundary.
     const room = Math.max(0, Math.floor(budget)) * BYTES_PER_TOKEN;
     let cut = chunks[0].slice(0, room);
     while (utf8Length(cut) > room) cut = cut.slice(0, Math.floor(cut.length * 0.9));
-    const nl = cut.lastIndexOf("\n");
-    kept.push(nl > 0 ? cut.slice(0, nl + 1) : cut);
+    const head = cut.slice(0, cut.lastIndexOf("\n") + 1);
+    // Headers alone aren't a review: at least one changed line must fit.
+    if (!/\n@@[^\n]*\n./.test(head)) throw new Error(WINDOW_TOO_SMALL);
+    kept.push(head);
+    cutFile = chunkPath(chunks[0]);
   }
   return {
     diff: kept.join(""),
@@ -163,12 +175,26 @@ export function fitReviewDiff(gitDiff: string, maxContext: number | null | undef
       readFiles: kept.length,
       totalFiles: capped ? null : total,
       omitted: chunks.slice(kept.length).map(chunkPath),
+      cutFile,
     },
   };
 }
 
+function baseName(path: string): string {
+  return path.slice(path.lastIndexOf("/") + 1);
+}
+
 /** The mute line under the review summary saying what wasn't read. */
 export function partialReviewLine(p: ReviewPartial): string {
+  if (p.cutFile != null) {
+    const name = baseName(p.cutFile);
+    if (p.readFiles > 1) {
+      const of = p.totalFiles != null ? ` of ${p.totalFiles}` : "";
+      return `Read the first ${p.readFiles}${of} files, the last one (${name}) in part; the rest wasn't reviewed.`;
+    }
+    const of = p.totalFiles != null && p.totalFiles > 1 ? `, the first of ${p.totalFiles} files` : "";
+    return `Read the first part of ${name}${of}; the rest wasn't reviewed.`;
+  }
   if (p.totalFiles != null) {
     return `Read the first ${p.readFiles} of ${p.totalFiles} files; the rest wasn't reviewed.`;
   }
@@ -180,10 +206,22 @@ export function partialReviewLine(p: ReviewPartial): string {
 
 export function buildReviewPrompt(gitDiff: string, partial: ReviewPartial | null = null): string {
   if (!partial) return `Here is the unified diff to review:\n\n${gitDiff}`;
-  const why =
-    partial.omitted.length > 0
-      ? "it was cut at a file boundary to fit your context window"
-      : "the change was too large to load in full, so it stops mid-way";
+  const capped = partial.totalFiles == null;
+  const windowCut = partial.cutFile != null || partial.omitted.length > 0;
+  const reasons: string[] = [];
+  if (partial.cutFile != null) {
+    reasons.push(`it was cut inside ${partial.cutFile} to fit your context window, so that file stops mid-way`);
+  } else if (partial.omitted.length > 0) {
+    reasons.push("it was cut at a file boundary to fit your context window");
+  }
+  if (capped) {
+    reasons.push(
+      windowCut
+        ? "the change was also too large to load in full, so more files may be missing than are listed"
+        : "the change was too large to load in full, so it stops mid-way",
+    );
+  }
+  const why = reasons.join("; ");
   let note = `This diff is PARTIAL: ${why}. Review only what it shows. Do not report code that is missing from it, a file that ends abruptly at the end, or the cut itself as a finding, and say in the summary that the review covers part of the change.`;
   if (partial.omitted.length > 0) {
     const named = partial.omitted.slice(0, MAX_OMITTED_NAMED).join(", ");
