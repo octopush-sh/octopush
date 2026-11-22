@@ -22368,6 +22368,26 @@ mod secret_guard_tests {
         assert!(f.is_empty(), "{f:?}");
     }
 
+    /// A `git push` typed in Talk's shell goes to the branch's upstream, not
+    /// necessarily `origin`, so its scan keeps the upstream range: commits
+    /// `origin/<branch>` already has are still new to the other remote.
+    #[test]
+    fn shell_push_keeps_the_upstream_range_when_origin_is_ahead() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        let push = ShellPlan { push: true, ..Default::default() };
+        let f = scan_added(&shell_files(dir.path(), &push).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+        // The Push button sends to origin, which has that commit already.
+        assert!(scan_added(&push_files(dir.path()).unwrap(), &[]).is_empty());
+    }
+
     /// A committed blob larger than the scan budget: in a tree-to-tree diff
     /// its size isn't known until the patch is generated, so it must still
     /// make push and PR scans partial (never silently clean).

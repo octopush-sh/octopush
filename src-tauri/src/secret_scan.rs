@@ -1642,6 +1642,22 @@ pub fn push_files(path: &Path) -> AppResult<Collected> {
     Ok(budget.into_collected(files, "push"))
 }
 
+/// The commits a `git push` typed in Talk's shell would send (#819). That
+/// command isn't `push_branch`: a bare `git push` goes to the branch's
+/// upstream, which may not be `origin`, so the range starts from
+/// [`push_base`] rather than `origin/<branch>` (commits `origin` already has
+/// can still be new to the remote the command pushes to).
+fn shell_push_files(path: &Path) -> AppResult<Collected> {
+    let repo = crate::git_ops::open_repo(path)?;
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Budget::new().into_collected(Vec::new(), "push"));
+    };
+    let base = base_or_unpushed(push_base(&repo, head));
+    let mut budget = Budget::new();
+    let files = range_files(&repo, base, head, Some(MAX_RANGE_COMMITS), &mut budget)?;
+    Ok(budget.into_collected(files, "push"))
+}
+
 /// The merge base of HEAD with `base` (resolved like the PR it opens:
 /// `pr_target`'s remote ref first, then the local name).
 fn pr_merge_base(repo: &Repository, base: &str, head: Oid) -> Option<Oid> {
@@ -1826,12 +1842,12 @@ pub fn shell_files(path: &Path, plan: &ShellPlan) -> AppResult<Collected> {
         None => {}
     }
     if plan.push {
-        parts.push(push_files(path)?);
+        parts.push(shell_push_files(path)?);
     }
     if let Some(base) = &plan.pr {
         match base.clone().or_else(|| crate::git_ops::repo_default_branch(path)) {
             Some(b) => parts.push(pr_files(path, &b)?),
-            None => parts.push(push_files(path)?),
+            None => parts.push(shell_push_files(path)?),
         }
     }
     let mut out = Collected { scope: "shell", ..Collected::default() };
