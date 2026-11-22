@@ -11,10 +11,12 @@ import {
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
   SESSION_TAIL_LINES,
+  capTail,
   capText,
   diffForFile,
   fenced,
   formatFolderListing,
+  joinDiffs,
   sliceLines,
   stripAnsi,
   tailLines,
@@ -59,16 +61,25 @@ export async function resolveContextBlock(
       case "session": {
         const lines = readTerminalBuffer(ref.session.id);
         if (!lines) return `\n\nRun session "${ref.session.label}" _(not included: not open)_`;
-        const tail = tailLines(lines, SESSION_TAIL_LINES);
+        // The newest output is what matters: a tail over the cap loses its
+        // oldest lines, and the heading counts the lines actually sent.
+        const tail = capTail(tailLines(lines, SESSION_TAIL_LINES).map(stripAnsi));
         return fenced(
-          `Run session "${ref.session.label}" · last ${tail.length} lines`,
-          capText(stripAnsi(tail.join("\n"))),
+          `Run session "${ref.session.label}" · last ${tail.lines} line${tail.lines === 1 ? "" : "s"}`,
+          tail.cut ? `… (cut at 64k characters, older lines left out)\n${tail.text}` : tail.text,
         );
       }
       case "diff": {
-        const all = await ipc.getGitDiff(workspacePath);
-        const diff = ref.path ? diffForFile(all, ref.path) : all.trimEnd();
-        const heading = ref.path ? `Diff of ${ref.path}` : "Workspace diff (uncommitted)";
+        // Uncommitted = staged (HEAD → index) plus not staged yet (index →
+        // worktree, untracked files included).
+        const [staged, unstaged] = await Promise.all([
+          ipc.getStagedDiff(workspacePath),
+          ipc.getGitDiff(workspacePath),
+        ]);
+        const diff = ref.path
+          ? joinDiffs(diffForFile(staged, ref.path), diffForFile(unstaged, ref.path))
+          : joinDiffs(staged, unstaged);
+        const heading = ref.path ? `Diff of ${ref.path} (uncommitted)` : "Workspace diff (uncommitted)";
         return fenced(heading, capText(diff || "(no changes)"), "diff");
       }
     }

@@ -86,7 +86,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
   // ── @file mentions ──────────────────────────────────────────────────
   // Worktree file catalog (loaded once per workspace) + the active mention
-  // popover state. filesSetRef gives extractMentions an O(1) membership test.
+  // popover state. The context catalog below turns it into what `@` can name.
   const [files, setFiles] = useState<string[]>([]);
   const [mention, setMention] = useState<{ query: string; start: number; caret: number } | null>(null);
   const [mentionItems, setMentionItems] = useState<string[]>([]);
@@ -267,8 +267,18 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   );
   const contextRefs = useMemo(() => extractContextRefs(input, catalog), [input, catalog]);
   // Each chip's token estimate, from its block as resolved now. Send
-  // resolves again, so a session or diff that moved on is sent fresh.
+  // resolves again, so a session or diff that moved on is sent fresh. An
+  // estimate goes when its token leaves the draft (and on send), so adding
+  // the token back estimates it again.
   const [tokensByToken, setTokensByToken] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setTokensByToken((prev) => {
+      const live = new Set(contextRefs.map((r) => r.token));
+      const keys = Object.keys(prev);
+      if (keys.every((k) => live.has(k))) return prev;
+      return Object.fromEntries(keys.filter((k) => live.has(k)).map((k) => [k, prev[k]]));
+    });
+  }, [contextRefs]);
   useEffect(() => {
     const missing = contextRefs.filter((r) => tokensByToken[r.token] == null);
     if (missing.length === 0) return;
@@ -472,6 +482,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       useChatStore.getState().getAttachments(workspaceId).length > 0;
     if ((!trimmed && !hasAttachments) || streaming || expandingRef.current) return;
     setInput("");
+    // The next draft estimates its tokens afresh (a diff or session moves on).
+    setTokensByToken({});
     historyIdxRef.current = -1;
     setHistoryActive(false);
     closeMention();
@@ -704,6 +716,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           <SkillHighlights text={input} skillNames={skillNames} scrollRef={highlightRef} />
         <textarea
           ref={textareaRef}
+          data-tour="talk-composer-input"
           value={input}
           role="combobox"
           aria-expanded={activePopover !== null}

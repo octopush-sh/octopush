@@ -8,6 +8,7 @@ import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { attachOsc52Clipboard } from "../lib/osc52";
 import { registerTerminalBuffer } from "../lib/terminalBuffers";
+import { joinWrappedRows } from "../lib/talkContext";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -230,15 +231,14 @@ export function TerminalPane({
     // Talk's `@session` reads what this session shows (lib/terminalBuffers).
     const unregisterBuffer = registerTerminalBuffer(terminalId, () => {
       const buf = term.buffer.active;
-      const lines: string[] = [];
+      const rows: { text: string; wrapped: boolean }[] = [];
       for (let i = 0; i < buf.length; i++) {
         const line = buf.getLine(i);
-        const text = line?.translateToString(true) ?? "";
-        // A soft-wrapped row continues the line above it.
-        if (line?.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
-        else lines.push(text);
+        // Untrimmed: a wrap may fall on a space; joinWrappedRows trims each
+        // logical line's end once.
+        rows.push({ text: line?.translateToString(false) ?? "", wrapped: !!line?.isWrapped });
       }
-      return lines;
+      return joinWrappedRows(rows);
     });
 
     // Follow Octopush theme switches: themeStore.applyThemeToDom fires

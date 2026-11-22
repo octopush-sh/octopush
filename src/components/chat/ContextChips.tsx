@@ -39,9 +39,11 @@ export function ContextChips({ refs, tokensByToken, onRemove }: Props) {
             title={`${WHAT[ref.kind]} · @${ref.token}${tokens != null ? ` · ≈ ${formatTokenCount(tokens)} tokens` : ""}`}
             className="octo-pop-in flex items-center gap-1.5 rounded-md border border-octo-hairline bg-octo-panel py-0.5 pl-1.5 pr-1 font-mono text-[10px] text-octo-sage"
           >
-            <Icon size={11} className="text-octo-brass" aria-hidden />
+            <Icon size={11} className="text-octo-mute" aria-hidden />
             <span className="max-w-[12rem] truncate">{chipLabel(ref)}</span>
-            {tokens != null && <span className="text-octo-mute">{formatTokenCount(tokens)}</span>}
+            {tokens != null && (
+              <span className="octo-tabular text-octo-mute">{formatTokenCount(tokens)}</span>
+            )}
             <button
               type="button"
               onClick={() => onRemove(ref.token)}

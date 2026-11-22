@@ -6,8 +6,8 @@
  * - `@folder/`     — a listing of a folder (paths and sizes, not contents);
  * - `@session:<slug>` — the last lines a Run session printed (`@session`
  *   alone when the workspace has exactly one session);
- * - `@diff` / `@diff:<path>` — the workspace's uncommitted diff, or one
- *   (existing) file's.
+ * - `@diff` / `@diff:<path>` — the workspace's uncommitted diff (staged and
+ *   not staged), or one (existing) file's.
  *
  * Every expansion shares the 64k cap whole-file mentions already use. The
  * composer shows each resolved token as a removable chip with its token
@@ -176,6 +176,48 @@ export function tailLines(lines: string[], n: number): string[] {
   let end = lines.length;
   while (end > 0 && lines[end - 1].trim() === "") end--;
   return lines.slice(Math.max(0, end - n), end);
+}
+
+/** A terminal buffer's rows (untrimmed, as `translateToString(false)` gives
+ *  them) joined into logical lines: a soft-wrapped row continues the row
+ *  above it, and only each logical line's end is trimmed, so a wrap that
+ *  falls on a space keeps it. */
+export function joinWrappedRows(rows: { text: string; wrapped: boolean }[]): string[] {
+  const lines: string[] = [];
+  for (const row of rows) {
+    if (row.wrapped && lines.length > 0) lines[lines.length - 1] += row.text;
+    else lines.push(row.text);
+  }
+  return lines.map((l) => l.trimEnd());
+}
+
+/** The newest lines that fit in CONTEXT_CAP, oldest first. When it had to
+ *  leave older output out, `cut` is true and `lines` counts what was kept. */
+export function capTail(lines: string[]): { text: string; lines: number; cut: boolean } {
+  const kept: string[] = [];
+  let len = 0;
+  let cut = false;
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const add = lines[i].length + (kept.length > 0 ? 1 : 0);
+    if (len + add > CONTEXT_CAP) {
+      // One line longer than the whole cap: keep its end.
+      if (kept.length === 0) kept.push(lines[i].slice(-CONTEXT_CAP));
+      cut = true;
+      break;
+    }
+    kept.unshift(lines[i]);
+    len += add;
+  }
+  return { text: kept.join("\n"), lines: kept.length, cut };
+}
+
+/** The uncommitted diff: what is staged, then what isn't staged yet, each
+ *  under its own label when there is any; "" when neither has changes. */
+export function joinDiffs(staged: string, unstaged: string): string {
+  const parts: string[] = [];
+  if (staged.trim()) parts.push(`# Staged\n${staged.trimEnd()}`);
+  if (unstaged.trim()) parts.push(`# Not staged\n${unstaged.trimEnd()}`);
+  return parts.join("\n\n");
 }
 
 /** Strip ANSI escape sequences (CSI, OSC, single-char escapes). */

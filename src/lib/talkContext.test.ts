@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import {
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
+  capTail,
   capText,
   chipLabel,
   contextMentionItems,
@@ -9,6 +10,8 @@ import {
   dirsOf,
   extractContextRefs,
   formatFolderListing,
+  joinDiffs,
+  joinWrappedRows,
   parseLineRange,
   rangeToken,
   removeContextToken,
@@ -135,6 +138,34 @@ describe("talkContext — blocks", () => {
     expect(listing).toBe("a.ts  812 B\nlib/b.ts  14 KB\nc.png  ?");
     const many = Array.from({ length: FOLDER_MAX_ENTRIES + 3 }, (_, i) => ({ path: `src/f${i}`, size: 1 }));
     expect(formatFolderListing("src", many).split("\n").pop()).toBe("… 3 more not listed");
+  });
+
+  it("rejoins soft-wrapped rows without losing a space at the wrap", () => {
+    expect(
+      joinWrappedRows([
+        { text: "$ echo hello ", wrapped: false },
+        { text: "world        ", wrapped: true },
+        { text: "hello world  ", wrapped: false },
+        { text: "             ", wrapped: false },
+      ]),
+    ).toEqual(["$ echo hello world", "hello world", ""]);
+  });
+
+  it("keeps a tail's newest lines under the cap, counting what it kept", () => {
+    expect(capTail(["a", "b"])).toEqual({ text: "a\nb", lines: 2, cut: false });
+    const half = "x".repeat(CONTEXT_CAP / 2);
+    const capped = capTail(["old", half, half.replace(/x/g, "y")]);
+    expect(capped.cut).toBe(true);
+    expect(capped.lines).toBe(1);
+    expect(capped.text).toBe(half.replace(/x/g, "y"));
+    const long = capTail(["a".repeat(10) + "z".repeat(CONTEXT_CAP)]);
+    expect(long).toEqual({ text: "z".repeat(CONTEXT_CAP), lines: 1, cut: true });
+  });
+
+  it("joins the staged and not-staged diffs under their own labels", () => {
+    expect(joinDiffs("+s\n", "+u\n")).toBe("# Staged\n+s\n\n# Not staged\n+u");
+    expect(joinDiffs("+s\n", "")).toBe("# Staged\n+s");
+    expect(joinDiffs("", "")).toBe("");
   });
 
   it("caps a block at 64k and says so", () => {

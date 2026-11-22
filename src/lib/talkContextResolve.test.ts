@@ -3,7 +3,8 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const readFileChecked = vi.fn();
 const fileMeta = vi.fn();
 const getGitDiff = vi.fn();
-vi.mock("./ipc", () => ({ ipc: { readFileChecked, fileMeta, getGitDiff } }));
+const getStagedDiff = vi.fn();
+vi.mock("./ipc", () => ({ ipc: { readFileChecked, fileMeta, getGitDiff, getStagedDiff } }));
 
 const { resolveContextBlock } = await import("./talkContextResolve");
 const { registerTerminalBuffer } = await import("./terminalBuffers");
@@ -22,6 +23,7 @@ describe("resolveContextBlock", () => {
     readFileChecked.mockReset();
     fileMeta.mockReset();
     getGitDiff.mockReset();
+    getStagedDiff.mockReset().mockResolvedValue("");
   });
 
   it("keeps a whole file's block as before: path heading, fenced contents, 64k read", async () => {
@@ -54,13 +56,37 @@ describe("resolveContextBlock", () => {
     off();
   });
 
+  it("cuts a long session tail at its start, keeping the newest lines", async () => {
+    const big = Array.from({ length: 150 }, (_, i) => `${i}`.padEnd(1000, "."));
+    const off = registerTerminalBuffer("t1", () => big);
+    const block = await resolveContextBlock(one("session:dev-server"), "/w", files);
+    off();
+    expect(block).toContain(" · last 63 lines\n```\n… (cut at 64k characters, older lines left out)\n87.");
+    expect(block.endsWith(`${big[149]}\n\`\`\``)).toBe(true);
+  });
+
   it("attaches the workspace diff, or one file's section of it", async () => {
     getGitDiff.mockResolvedValue(
       "diff --git a/src/a.ts b/src/a.ts\n+a\ndiff --git a/src/lib/b.ts b/src/lib/b.ts\n+b\n",
     );
-    expect(await resolveContextBlock(one("diff"), "/w", files)).toContain("Workspace diff (uncommitted)\n```diff\n");
+    expect(await resolveContextBlock(one("diff"), "/w", files)).toContain(
+      "Workspace diff (uncommitted)\n```diff\n# Not staged\ndiff --git a/src/a.ts",
+    );
     const file = await resolveContextBlock(one("diff:src/lib/b.ts"), "/w", files);
-    expect(file).toBe("\n\nDiff of src/lib/b.ts\n```diff\ndiff --git a/src/lib/b.ts b/src/lib/b.ts\n+b\n```");
+    expect(file).toBe(
+      "\n\nDiff of src/lib/b.ts (uncommitted)\n```diff\n# Not staged\ndiff --git a/src/lib/b.ts b/src/lib/b.ts\n+b\n```",
+    );
+  });
+
+  it("includes staged changes in the diff, also for a fully staged file", async () => {
+    getStagedDiff.mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n+staged\n");
+    getGitDiff.mockResolvedValue("diff --git a/src/lib/b.ts b/src/lib/b.ts\n+b\n");
+    expect(await resolveContextBlock(one("diff:src/a.ts"), "/w", files)).toBe(
+      "\n\nDiff of src/a.ts (uncommitted)\n```diff\n# Staged\ndiff --git a/src/a.ts b/src/a.ts\n+staged\n```",
+    );
+    expect(await resolveContextBlock(one("diff"), "/w", files)).toContain(
+      "# Staged\ndiff --git a/src/a.ts b/src/a.ts\n+staged\n\n# Not staged\ndiff --git a/src/lib/b.ts",
+    );
   });
 
   it("writes a failed read into the message instead of dropping it", async () => {

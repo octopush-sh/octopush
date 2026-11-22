@@ -37,6 +37,8 @@ vi.mock("../lib/ipc", () => ({
     currentSpend: vi.fn().mockResolvedValue({ costUsd: 0, tokens: 0 }),
     listWorkspaceFiles: vi.fn().mockResolvedValue([]),
     readFileChecked: vi.fn().mockResolvedValue({ kind: "text", content: "", size: 0, mtime: 0 }),
+    getGitDiff: vi.fn().mockResolvedValue(""),
+    getStagedDiff: vi.fn().mockResolvedValue(""),
     cancelChat: vi.fn().mockResolvedValue(undefined),
     listChatThreads: vi.fn().mockResolvedValue([
       { id: "t1", workspaceId: "ws-1", title: "Conversation", createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z" },
@@ -818,6 +820,26 @@ describe("ChatView — context mentions (#962)", () => {
     await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
     const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect(req.userMessage).toBe("explain @src/a.ts#L2-3\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```");
+  });
+
+  it("estimates @diff again in the next draft once the diff changed", async () => {
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n+a\n");
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    const chipTitle = () =>
+      document.querySelector("[data-tour='talk-context-chip']")?.getAttribute("title") ?? "";
+    fireEvent.change(ta, { target: { value: "review @diff today" } });
+    await waitFor(() => expect(chipTitle()).toMatch(/≈ \d+ tokens$/));
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue(`diff --git a/src/a.ts b/src/a.ts\n+${"x".repeat(8000)}\n`);
+    fireEvent.change(ta, { target: { value: "and @diff again" } });
+    await waitFor(() => expect(chipTitle()).toMatch(/≈ 2k tokens$/));
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue("");
   });
 
   it("appends a range handed over from Review to the draft", async () => {
