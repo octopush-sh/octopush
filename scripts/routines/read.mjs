@@ -7,9 +7,11 @@
 //   read.mjs issue <n> [owner/repo]
 //   read.mjs pr <n> [owner/repo]       (body + trusted comments; use `gh pr diff <n>` for the code)
 //
-// octopush-web is read with the cycle's App token (OCTOPUSH_WEB_TOKEN), and
-// there the App's bot is the builder and reviewer (identity.mjs idsForRepo).
-import { ghForRepo, APP_REPO, WEB_REPO, labelsOf, reportFatal } from "./gh.mjs";
+// octopush-web and epiku are read with the cycle's App token (OCTOPUSH_WEB_TOKEN,
+// OCTOPUSH_EPIKU_TOKEN), and there the App's bot is the builder and reviewer
+// (identity.mjs idsForRepo). What this prints goes into an agent's prompt file,
+// never to the log: epiku is private and this repo's logs are public.
+import { ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, sameLogin, idsForRepo } from "./identity.mjs";
 
 export function render({ item, comments, ids, kind, repo = APP_REPO }) {
@@ -32,7 +34,7 @@ export function render({ item, comments, ids, kind, repo = APP_REPO }) {
 async function main() {
   const [kind, n, repo = APP_REPO] = process.argv.slice(2);
   if (!["issue", "pr"].includes(kind) || !/^\d+$/.test(n ?? "")) { console.error("usage: read.mjs issue|pr <n> [owner/repo]"); return 64; }
-  if (![APP_REPO, WEB_REPO].includes(repo)) { console.error(`read.mjs: ${repo} is not a cycle repo`); return 64; }
+  if (![APP_REPO, WEB_REPO, EPIKU_REPO].includes(repo)) { console.error(`read.mjs: ${repo} is not a cycle repo`); return 64; }
   const ids = idsForRepo(requireIdentities(loadIdentities()), repo);
   const gh = ghForRepo(repo);
   const item = gh.get(`repos/${repo}/${kind === "pr" ? "pulls" : "issues"}/${n}`);

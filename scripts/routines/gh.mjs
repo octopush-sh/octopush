@@ -7,6 +7,21 @@ export const APP_REPO = `${OWNER}/octopush`;
 export const WEB_REPO = `${OWNER}/octopush-web`;
 export const API_REPO = `${OWNER}/octopush-api`;
 export const ALL_REPOS = [APP_REPO, API_REPO, WEB_REPO];
+/**
+ * Epiku: a PRIVATE repo with its own lane (epiku-build.yml, epiku-review.yml).
+ * Deliberately not in ALL_REPOS: the digest, the report and the audits walk
+ * that list and print titles in this public repo.
+ */
+export const EPIKU_REPO = `${OWNER}/epiku`;
+/**
+ * The repos the cycle reaches as the "Octopush Cycle" GitHub App, and the
+ * variable that carries each one's installation token. One variable per repo,
+ * so a step never holds a token for a repo it wasn't given.
+ */
+const APP_TOKEN_ENV = { [WEB_REPO]: "OCTOPUSH_WEB_TOKEN", [EPIKU_REPO]: "OCTOPUSH_EPIKU_TOKEN" };
+export const tokenEnvFor = (repo) => (Object.hasOwn(APP_TOKEN_ENV, repo) ? APP_TOKEN_ENV[repo] : null);
+/** Private repos: nothing but numbers and commit ids of theirs may reach this public repo's logs. */
+export const isPrivateLane = (repo) => repo === EPIKU_REPO;
 
 /** Default runner: `gh api ...` → stdout. Throws on non-zero exit. */
 export function ghRun(args, input, token) {
@@ -24,13 +39,18 @@ export const ghRunAs = (token) => (args, input) => ghRun(args, input, token);
 
 /**
  * The client for a repo. In GitHub Actions the workflow's GITHUB_TOKEN (GH_TOKEN)
- * only reaches the app repo; octopush-web is reached with a short-lived
- * installation token of the "Octopush Cycle" GitHub App (OCTOPUSH_WEB_TOKEN),
+ * only reaches the app repo; octopush-web and epiku are reached with a
+ * short-lived installation token of the "Octopush Cycle" GitHub App
+ * (OCTOPUSH_WEB_TOKEN, OCTOPUSH_EPIKU_TOKEN: one per repo, never shared),
  * which fixed workflow steps mint and never hand to an agent. Without it, the
  * default login is used (on a Mac, the owner's `gh` setup).
  */
 export function ghForRepo(repo, env = process.env) {
-  if (repo === WEB_REPO && env.OCTOPUSH_WEB_TOKEN) return makeGh(ghRunAs(env.OCTOPUSH_WEB_TOKEN));
+  const key = tokenEnvFor(repo);
+  if (key && env[key]) return makeGh(ghRunAs(env[key]));
+  // Epiku is private: in Actions the workflow's own token can't see it, and
+  // falling back to it would only turn a missing token into a confusing 404.
+  if (repo === EPIKU_REPO && env.GITHUB_ACTIONS === "true") throw new Error(`${key} is not set: ${EPIKU_REPO} is reached only with the Octopush Cycle App's installation token`);
   return makeGh();
 }
 /** Is octopush-web reachable with its own token in this process? */

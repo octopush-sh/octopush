@@ -14,10 +14,14 @@
 //                                    app-issue<TAB>number<TAB>title<TAB>url
 //                                  (claim/release app-issue <n> label it in the app repo)
 //
+//   jobs.mjs --repo octopush-sh/epiku next|claim|release …          the Epiku builder (epiku-build.yml):
+//                                  the plain queue above, in that private repo, with the App's token
+//                                  (OCTOPUSH_EPIKU_TOKEN); `next` prints no title or URL.
+//
 // Only builder-authored, same-repo PRs labelled `agent` count — as jobs and as
 // claims on issues — so an outsider's PR can neither steal nor block work.
 import { execFileSync } from "node:child_process";
-import { makeGh, ghForRepo, APP_REPO, WEB_REPO, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, isPrivateLane, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
 
@@ -111,6 +115,16 @@ export function appWebIssueJobs(appGh, webGh, webIds, now) {
     .filter((i) => !isFreshClaim(appGh, APP_REPO, i, now));
 }
 
+/**
+ * The line `next` prints for a job. For a private lane (epiku) it stops at the
+ * number and the branch: a title or URL of that repo must never be one `cat`
+ * away from this public repo's log.
+ */
+export function jobLine(j, repo) {
+  const head = j.kind === "pr" ? [j.kind, j.n, j.branch] : [j.kind, j.n];
+  return (isPrivateLane(repo) ? head : [...head, j.title, j.url]).join("\t");
+}
+
 function thisRepo() {
   if (process.env.OCTOPUSH_ROUTINE_REPO) return process.env.OCTOPUSH_ROUTINE_REPO;
   const url = execFileSync("git", ["remote", "get-url", "origin"], { encoding: "utf8" }).trim().replace(/\.git$/, "");
@@ -144,11 +158,11 @@ async function main() {
         gh.send("POST", `repos/${repo}/issues/${j.pr.number}/comments`, { body: `Still failing after ${MAX_FIX_ROUNDS} fix rounds or a week of red CI — parking for the owner.\n\n<!-- octopush-jobs:stale -->` });
         continue;
       }
-      console.log(`pr\t${j.pr.number}\t${j.pr.head.ref}\t${j.pr.title}\t${j.pr.html_url}`);
+      console.log(jobLine({ kind: "pr", n: j.pr.number, branch: j.pr.head.ref, title: j.pr.title, url: j.pr.html_url }, repo));
       return 0;
     }
     const [i] = issueJobs(gh, repo, ids, now);
-    if (i) { console.log(`issue\t${i.number}\t${i.title}\t${i.html_url}`); return 0; }
+    if (i) { console.log(jobLine({ kind: "issue", n: i.number, title: i.title, url: i.html_url }, repo)); return 0; }
     console.error(`nothing to do in ${repo}`);
     return 1;
   }

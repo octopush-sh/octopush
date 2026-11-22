@@ -15,7 +15,7 @@
 // prompt). Log lines come from CI output of the agent's own branch: only
 // `##[error]` lines, control/invisible characters stripped, capped, and the
 // whole report is fenced as untrusted data.
-import { ghForRepo, ALL_REPOS, NON_VERDICT } from "./gh.mjs";
+import { ghForRepo, ALL_REPOS, EPIKU_REPO, NON_VERDICT } from "./gh.mjs";
 import { fence } from "./social.mjs";
 
 export const UNAVAILABLE = "(CI checks unavailable)";
@@ -100,7 +100,7 @@ export function ciFailures(gh, repo, sha) {
 
 function main() {
   const [repo, sha] = process.argv.slice(2);
-  if (!ALL_REPOS.includes(repo) || !/^[0-9a-f]{40}$/.test(sha ?? "")) {
+  if (![...ALL_REPOS, EPIKU_REPO].includes(repo) || !/^[0-9a-f]{40}$/.test(sha ?? "")) {
     console.error("usage: ci-failures.mjs <cycle owner/repo> <40-hex sha>");
     return 64;
   }

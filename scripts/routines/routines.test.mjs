@@ -1235,3 +1235,428 @@ test("ci-failures: a fenced report reaches stdout end to end", async () => {
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /^\(untrusted data: [^\n]*\)\n````text\n- CI \/ build: failure\n  - ``` break out\n````\n$/);
 });
+
+// ---------------------------------------------------------------- the Epiku lane (a private repo)
+import { EPIKU_REPO, ALL_REPOS, tokenEnvFor, isPrivateLane } from "./gh.mjs";
+import { EPIKU_HUMAN_ONLY, EPIKU_GUARD_TESTS, epikuRefusals, tryMergeEpiku, dataMarker, dataClassFor, approvedQueue, DATA_CLASSES } from "./automerge.mjs";
+import { jobLine } from "./jobs.mjs";
+
+const eIds = { owner: "johnatan", builder: APP_BOT, reviewer: APP_BOT };
+const ESHA = "e".repeat(40);
+const epikuPr = (over = {}) => ({
+  number: 9, state: "open", draft: false, user: { login: APP_BOT }, labels: [{ name: "agent" }], title: "PRIVATE-TITLE", html_url: "https://github.com/octopush-sh/epiku/pull/9",
+  body: "Closes #4\n\nSummary.", head: { sha: ESHA, ref: "agent/issue-4", repo: { full_name: EPIKU_REPO } }, base: { ref: "main", repo: { full_name: EPIKU_REPO } },
+  additions: 60, deletions: 5, changed_files: 2, mergeable: true, ...over,
+});
+const readyIssue = (over = {}) => ({ number: 4, state: "open", labels: [{ name: "ready" }], ...over });
+const eFiles = () => [{ filename: "components/Tarjeta.tsx", status: "modified", additions: 3, patch: "@@\n+<span />" }, { filename: "tests/tablero.test.ts", status: "modified", additions: 4, patch: "@@\n+test()" }];
+const eOk = () => ({ pr: epikuPr(), files: eFiles(), ci: "success", verdict: "approve", dataClass: "none", issue: readyIssue(), ids: eIds });
+const codes = (o = {}) => epikuRefusals({ ...eOk(), ...o }).map((w) => w.code);
+
+test("epiku: its own token and the App's bot — never the web token, never the workflow's, never in the public lists", () => {
+  assert.equal(tokenEnvFor(EPIKU_REPO), "OCTOPUSH_EPIKU_TOKEN");
+  assert.equal(tokenEnvFor(WEB_REPO), "OCTOPUSH_WEB_TOKEN");
+  assert.equal(tokenEnvFor(APP_REPO), null);
+  assert.equal(tokenEnvFor("constructor"), null, "a prototype key is not a repo");
+  assert.ok(isPrivateLane(EPIKU_REPO) && !isPrivateLane(WEB_REPO) && !isPrivateLane(APP_REPO));
+  assert.ok(!ALL_REPOS.includes(EPIKU_REPO), "the digest, the report and the audits walk ALL_REPOS and print titles here");
+  assert.throws(() => ghForRepo(EPIKU_REPO, { GITHUB_ACTIONS: "true", OCTOPUSH_WEB_TOKEN: "w", GH_TOKEN: "g" }), /OCTOPUSH_EPIKU_TOKEN is not set/, "another repo's token is never used for epiku");
+  assert.equal(typeof ghForRepo(EPIKU_REPO, { GITHUB_ACTIONS: "true", OCTOPUSH_EPIKU_TOKEN: "e" }).list, "function");
+  assert.equal(typeof ghForRepo(WEB_REPO, { OCTOPUSH_EPIKU_TOKEN: "e" }).list, "function", "the web repo is unchanged");
+  assert.deepEqual(idsForRepo(actIds, EPIKU_REPO, WEB_ENV), eIds);
+  assert.deepEqual(idsForRepo(actIds, APP_REPO, WEB_ENV), actIds);
+  assert.throws(() => idsForRepo(actIds, EPIKU_REPO, { ...WEB_ENV, OCTOPUSH_APP_BOT_LOGIN: "johnatan" }), /App bot login/);
+});
+
+test("epiku human-only paths: VISION.md §2's list, refused when publishing and when merging", () => {
+  assert.equal(humanOnlyFor(EPIKU_REPO), EPIKU_HUMAN_ONLY);
+  const refused = [
+    "lib/identidad.ts", "lib/auth.ts", "lib/api.ts", "LIB/Auth.ts", "scripts/tokens.py",
+    "data/plan.json", "data/planes/x.json", "data",
+    ".github/workflows/ci.yml", ".github/dependabot.yml",
+    "next.config.ts", "next.config.mjs", "vercel.json", ".vercel/project.json", ".npmrc", ".env", ".env.local", "app/.env.production",
+    "package.json", "package-lock.json",
+    "CLAUDE.md", "AGENTS.md", "VISION.md", "docs/CLAUDE.md", ".claude/settings.json", ".agents/skills/x/SKILL.md", "skills-lock.json", ".gitattributes",
+  ];
+  for (const p of refused) assert.deepEqual(forbiddenPaths([p], EPIKU_REPO), [p], p);
+  const allowed = [
+    "lib/almacen.ts", "lib/estado.ts", "lib/store.ts", "lib/apiary.ts", "app/api/historias/route.ts", "app/page.tsx", "components/Tarjeta.tsx",
+    "tests/estado.test.ts", "tests/rutas.test.ts", "scripts/parse-plan.py", "scripts/test_tokens.py", "docs/FEATURES.md", "docs/DATA-SAFETY.md",
+    "tsconfig.json", "vitest.config.ts", "postcss.config.mjs", "README.md", "app/database.ts",
+  ];
+  assert.deepEqual(forbiddenPaths(allowed, EPIKU_REPO), []);
+  assert.deepEqual(forbiddenPaths([".agent-out/result.json", ".git/config"], EPIKU_REPO).length, 2, "the agent's output and git stay forbidden");
+  assert.deepEqual(forbiddenPaths(["lib/auth.ts", "data/plan.json"], APP_REPO), [], "the app's list is unchanged");
+  assert.ok(EPIKU_GUARD_TESTS.some((re) => re.test("tests/rutas.test.ts")) && EPIKU_GUARD_TESTS.some((re) => re.test("tests/backup-roundtrip.test.ts")));
+});
+
+test("epikuRefusals: a clean builder PR passes; each rule refuses on its own", () => {
+  assert.deepEqual(epikuRefusals(eOk()), []);
+  const pr = (over) => ({ pr: epikuPr(over) });
+  assert.deepEqual(codes(pr({ state: "closed" })), ["closed"]);
+  assert.deepEqual(codes(pr({ draft: true })), ["draft"]);
+  assert.deepEqual(codes(pr({ labels: [] })), ["label"]);
+  assert.deepEqual(codes(pr({ labels: [{ name: "agent" }, { name: "needs-owner" }] })), ["needs-owner"]);
+  assert.deepEqual(codes(pr({ user: { login: "johnatan" } })), ["author"], "not even the owner's own PR");
+  assert.deepEqual(codes(pr({ user: { login: "dependabot[bot]" } })), ["author"], "Dependabot PRs are never auto-merged");
+  assert.deepEqual(codes(pr({ user: { login: ACTIONS_BOT } })), ["author"]);
+  assert.deepEqual(codes(pr({ head: { sha: ESHA, repo: { full_name: "evil/epiku" } } })), ["branch"]);
+  assert.deepEqual(codes(pr({ head: { sha: ESHA, repo: null } })), ["branch"], "a deleted fork");
+  assert.deepEqual(codes(pr({ base: { ref: "release", repo: { full_name: EPIKU_REPO } } })), ["branch"]);
+  assert.deepEqual(codes({ ci: "failure" }), ["ci"]);
+  assert.deepEqual(codes({ verdict: "changes" }), ["review"]);
+  assert.deepEqual(codes(pr({ additions: MAX_CHANGED_LINES, deletions: 1 })), ["size"], "the app lane's cap");
+  assert.deepEqual(codes(pr({ additions: MAX_CHANGED_LINES, deletions: 0 })), []);
+  assert.deepEqual(codes(pr({ changed_files: 3 })), ["files"]);
+  assert.deepEqual(codes(pr({ mergeable: false })), ["conflicts"]);
+  // The issue it closes must be an open, `ready`, unparked issue.
+  assert.deepEqual(codes({ issue: null }), ["issue"]);
+  assert.deepEqual(codes({ issue: readyIssue({ labels: [] }) }), ["issue"]);
+  assert.deepEqual(codes({ issue: readyIssue({ labels: [{ name: "ready" }, { name: "proposal" }] }) }), ["issue"]);
+  assert.deepEqual(codes({ issue: readyIssue({ state: "closed" }) }), ["issue"]);
+  assert.deepEqual(codes({ issue: readyIssue({ pull_request: {} }) }), ["issue"], "a PR number is not an issue");
+  // Paths.
+  const withFile = (f) => ({ files: [...eFiles().slice(0, 1), { status: "modified", additions: 1, patch: "@@\n+x", ...f }] });
+  assert.deepEqual(codes(withFile({ filename: "lib/identidad.ts" })), ["human-only"]);
+  assert.deepEqual(codes(withFile({ filename: "docs/x.md", previous_filename: "data/plan.json", status: "renamed" })), ["human-only"], "renames count");
+  assert.deepEqual(codes(withFile({ filename: "Package.json" })), ["human-only"], "case-insensitive; dependencies are the owner's");
+  assert.deepEqual(codes(withFile({ filename: "tests/rutas.test.ts" })), ["guard-test"]);
+  assert.deepEqual(codes(withFile({ filename: "tests/backup-roundtrip.test.ts" })), ["guard-test"]);
+  assert.match(epikuRefusals({ ...eOk(), ...withFile({ filename: "lib/auth.ts" }) })[0].text, /lib\/auth\.ts/, "the path is in the text (for the private PR), never in the code");
+  // Transient reasons never park.
+  for (const o of [{ ci: "pending" }, { ci: "none" }, { verdict: null }, pr({ mergeable: null }), pr({ labels: [{ name: "agent" }, { name: "in-progress" }] })]) {
+    const why = epikuRefusals({ ...eOk(), ...o });
+    assert.equal(why.length, 1); assert.equal(why[0].transient, true, why[0].code);
+  }
+  assert.ok(!epikuRefusals({ ...eOk(), ci: "failure" })[0].transient && !epikuRefusals({ ...eOk(), verdict: "changes" })[0].transient);
+});
+
+test("epikuRefusals: environment reads, unreadable diffs and removed routes are refused whatever the review says", () => {
+  const one = (f) => codes({ files: [{ filename: "lib/estado.ts", status: "modified", additions: 1, ...f }, eFiles()[1]] });
+  assert.deepEqual(one({ patch: "@@ -1 +1 @@\n+const url = process.env.KV_REST_API_URL;" }), ["env-read"]);
+  assert.deepEqual(one({ patch: "@@\n+const { API_TOKEN } = process . env" }), ["env-read"]);
+  assert.deepEqual(one({ patch: "@@\n+const m = import.meta.env.MODE" }), ["env-read"]);
+  assert.deepEqual(one({ filename: "scripts/parse-plan.py", patch: "@@\n+token = os.environ['API_TOKEN']" }), ["env-read"]);
+  assert.deepEqual(one({ filename: "scripts/parse-plan.py", patch: "@@\n+token = os.getenv('X')" }), ["env-read"]);
+  assert.deepEqual(one({ patch: "@@\n-const url = process.env.OLD;\n context process.env.KEPT\n+const x = 1;" }), [], "only added lines count");
+  assert.deepEqual(one({ filename: "docs/FEATURES.md", patch: "@@\n+Reads `process.env` only in two modules." }), [], "prose in a doc is not code");
+  assert.deepEqual(one({ additions: 40, patch: undefined }), ["no-diff"], "GitHub omits the patch of a large file: unchecked lines don't merge");
+  assert.deepEqual(one({ filename: "public/logo.png", additions: 0, patch: undefined }), [], "a binary file has no lines to check");
+  const rm = (f) => codes({ files: [eFiles()[0], f], pr: epikuPr() });
+  assert.deepEqual(rm({ filename: "app/api/siguientes/route.ts", status: "removed", additions: 0 }), ["api-removed"]);
+  assert.deepEqual(rm({ filename: "app/api/next/route.ts", previous_filename: "app/api/siguientes/route.ts", status: "renamed", additions: 0 }), ["api-removed"]);
+  assert.deepEqual(rm({ filename: "app/api/nuevo/route.ts", status: "added", additions: 1, patch: "@@\n+export const dynamic = 1" }), [], "a new route is additive");
+});
+
+test("epikuRefusals: breaking never merges; additive needs its proof; an approval without a class can't merge", () => {
+  assert.deepEqual(DATA_CLASSES, ["none", "additive", "breaking"]);
+  assert.deepEqual(codes({ dataClass: "breaking" }), ["breaking"]);
+  assert.ok(!epikuRefusals({ ...eOk(), dataClass: "breaking" })[0].transient, "breaking parks the PR for the owner");
+  assert.deepEqual(codes({ dataClass: null }), ["data-class"]);
+  assert.deepEqual(codes({ dataClass: "harmless" }), ["data-class"]);
+  const f = (...names) => names.map((filename) => ({ filename, status: "modified", additions: 1, patch: "@@\n+x" }));
+  const additive = (files, n = files.length) => epikuRefusals({ ...eOk(), dataClass: "additive", files, pr: epikuPr({ changed_files: n }) });
+  assert.deepEqual(additive(f("lib/estado.ts", "tests/estado.test.ts", "docs/DATA-SAFETY.md", "docs/FEATURES.md")), []);
+  let why = additive(f("lib/estado.ts", "docs/FEATURES.md"));
+  assert.deepEqual(why.map((w) => w.code), ["additive-proof"]);
+  assert.match(why[0].text, /a test under `tests\/`.*DATA-SAFETY\.md/);
+  assert.doesNotMatch(why[0].text, /FEATURES/);
+  why = additive([...f("lib/estado.ts", "docs/DATA-SAFETY.md", "docs/FEATURES.md"), { filename: "tests/estado.test.ts", status: "removed", additions: 0 }]);
+  assert.deepEqual(why.map((w) => w.code), ["additive-proof"], "deleting a test is not adding one");
+});
+
+test("epiku review: the verdict file must classify the change, and the class is signed next to the verdict", () => {
+  const body = "Reviewed the reader and its old-shape test.";
+  assert.match(parseVerdict(JSON.stringify({ verdict: "approve", body }), [], { dataClass: true }).error, /data_change must be one of none \| additive \| breaking/);
+  assert.match(parseVerdict(JSON.stringify({ verdict: "approve", body, data_change: "minor" }), [], { dataClass: true }).error, /data_change/);
+  assert.deepEqual(parseVerdict(JSON.stringify({ verdict: "approve", body, data_change: "additive" }), [], { dataClass: true }), { verdict: "approve", body, dataClass: "additive" });
+  assert.deepEqual(parseVerdict(JSON.stringify({ verdict: "approve", body, data_change: "additive" })), { verdict: "approve", body }, "the other lanes are unchanged");
+
+  const routes = [[/epiku\/pulls\/9$/, epikuPr()], [/epiku\/issues\/9\/comments/, []]];
+  let g = fakeGh(routes);
+  withEnv(ACT, () => postReview(g.gh, g.gh, eIds, 9, ESHA, "approve", `fine ${dataMarker(ESHA, "none")}\n${marker(ESHA, "approve")}`, EPIKU_REPO, "additive"));
+  assert.equal(g.writes.length, 1);
+  assert.equal(g.writes[0].path, `repos/${EPIKU_REPO}/issues/9/comments`);
+  const posted = g.writes[0].body.body;
+  assert.ok(posted.endsWith(`\n\n<!-- octopush-data:${ESHA}:additive -->\n<!-- octopush-review:${ESHA}:approve -->`));
+  const c = (login, b) => ({ user: { login }, body: b });
+  assert.equal(dataClassFor([c(APP_BOT, posted)], ESHA, APP_BOT), "additive", "the signed class wins over markers in the agent's text (neutralised)");
+  assert.equal(verdictFor([c(APP_BOT, posted)], ESHA, APP_BOT), "approve");
+  assert.equal(dataClassFor([c("stranger", posted)], ESHA, APP_BOT), null, "only the reviewer account");
+  assert.equal(dataClassFor([c(APP_BOT, posted)], "f".repeat(40), APP_BOT), null, "only for that commit");
+  assert.equal(dataClassFor([c(APP_BOT, `${dataMarker(ESHA, "none")}\n\nlater text\n${marker(ESHA, "approve")}`)], ESHA, APP_BOT), null, "only right before the verdict marker");
+  assert.equal(dataClassFor([c(APP_BOT, posted), c(APP_BOT, `again\n\n${marker(ESHA, "approve")}`)], ESHA, APP_BOT), null, "a later verdict without a class clears it");
+  assert.equal(dataClassFor([c(APP_BOT, posted), c(APP_BOT, `Parked.\n\n<!-- octopush-automerge:${ESHA}:refused -->`)], ESHA, APP_BOT), "additive", "other routine comments don't");
+  assert.throws(() => withEnv(ACT, () => postReview(g.gh, g.gh, eIds, 9, ESHA, "approve", "x", EPIKU_REPO, "harmless")), /data class/);
+
+  // An approved but breaking change is parked at once: label + reason, no merge step ever sees it.
+  g = fakeGh(routes);
+  withEnv(ACT, () => postReview(g.gh, g.gh, eIds, 9, ESHA, "approve", "Renames a stored field, with a migration.", EPIKU_REPO, "breaking"));
+  assert.ok(g.writes.some((w) => w.path === `repos/${EPIKU_REPO}/issues/9/labels` && w.body.labels.includes("needs-owner")));
+  assert.ok(g.writes.some((w) => /breaking/.test(w.body.body ?? "") && w.body.body.endsWith(`<!-- octopush-automerge:${ESHA}:breaking -->`)));
+  // `changes` + breaking goes back to the builder (it may make it additive): not parked.
+  g = fakeGh(routes);
+  withEnv(ACT, () => postReview(g.gh, g.gh, eIds, 9, ESHA, "changes", "Make the field optional.", EPIKU_REPO, "breaking"));
+  assert.ok(!g.writes.some((w) => /labels$/.test(w.path)));
+});
+
+const epikuMergeRoutes = ({ pr = epikuPr(), files = eFiles(), cls = "none", verdict = "approve", issue = readyIssue(), ci = "success" } = {}) => [
+  [/epiku\/pulls\/9$/, pr],
+  [/epiku\/pulls\/9\/files/, files],
+  [/epiku\/issues\/9\/comments/, verdict ? [{ user: { login: APP_BOT }, body: `ok\n\n${cls ? `${dataMarker(ESHA, cls)}\n` : ""}${marker(ESHA, verdict)}` }] : []],
+  [/epiku\/issues\/4$/, issue],
+  [/epiku\/actions\/runs\?head_sha=/, { workflow_runs: [{ name: "CI", created_at: "1", status: ci === "pending" ? "in_progress" : "completed", conclusion: ci === "pending" ? null : ci }] }],
+];
+
+test("tryMergeEpiku: merges exactly the approved head; parks a hard refusal; leaves a pending one alone", () => {
+  let g = fakeGh(epikuMergeRoutes());
+  let r = tryMergeEpiku(g.gh, 9, eIds);
+  assert.equal(r.merged, true);
+  assert.deepEqual(g.writes, [{ method: "PUT", path: `repos/${EPIKU_REPO}/pulls/9/merge`, body: { merge_method: "merge", sha: ESHA } }], "one write: the merge of that commit");
+
+  g = fakeGh(epikuMergeRoutes({ files: [eFiles()[0], { filename: "lib/api.ts", status: "modified", additions: 1, patch: "@@\n+x" }] }));
+  r = tryMergeEpiku(g.gh, 9, eIds);
+  assert.equal(r.merged, false);
+  assert.deepEqual(r.why.map((w) => w.code), ["human-only"]);
+  assert.ok(!g.writes.some((w) => w.method === "PUT"), "nothing merged");
+  assert.ok(g.writes.some((w) => w.path === `repos/${EPIKU_REPO}/issues/9/labels` && w.body.labels[0] === "needs-owner"));
+  assert.ok(g.writes.some((w) => /lib\/api\.ts/.test(w.body.body ?? "") && w.body.body.endsWith(`<!-- octopush-automerge:${ESHA}:refused -->`)), "the reasons go on the private PR");
+
+  for (const o of [{ ci: "pending" }, { verdict: null }]) {
+    g = fakeGh(epikuMergeRoutes(o));
+    assert.equal(tryMergeEpiku(g.gh, 9, eIds).merged, false);
+    assert.equal(g.writes.length, 0, "not yet is not a reason to park");
+  }
+  // An approval from before a new push doesn't count: the verdict is for another commit.
+  g = fakeGh(epikuMergeRoutes({ pr: epikuPr({ head: { sha: "f".repeat(40), ref: "agent/issue-4", repo: { full_name: EPIKU_REPO } } }) }));
+  r = tryMergeEpiku(g.gh, 9, eIds);
+  assert.deepEqual(r.why.map((w) => w.code), ["review"]);
+  assert.equal(g.writes.length, 0);
+  // The approval's class is read from the PR, not handed over: missing, or breaking, never merges.
+  for (const [cls, code] of [[null, "data-class"], ["breaking", "breaking"]]) {
+    g = fakeGh(epikuMergeRoutes({ cls }));
+    assert.deepEqual(tryMergeEpiku(g.gh, 9, eIds).why.map((w) => w.code), [code]);
+    assert.ok(!g.writes.some((w) => w.method === "PUT"));
+  }
+  // `Closes #n` counts only as the first line of the body, and the issue must be `ready`.
+  for (const pr of [epikuPr({ body: "Summary.\n\nCloses #4" }), epikuPr({ body: null })]) {
+    g = fakeGh(epikuMergeRoutes({ pr }));
+    assert.deepEqual(tryMergeEpiku(g.gh, 9, eIds).why.map((w) => w.code), ["issue"]);
+  }
+  g = fakeGh(epikuMergeRoutes({ issue: readyIssue({ labels: [{ name: "proposal" }] }) }));
+  assert.deepEqual(tryMergeEpiku(g.gh, 9, eIds).why.map((w) => w.code), ["issue"]);
+});
+
+test("tryMergeEpiku dry run: reports what it would do and writes nothing", () => {
+  let g = fakeGh(epikuMergeRoutes());
+  let r = tryMergeEpiku(g.gh, 9, eIds, { dryRun: true });
+  assert.deepEqual({ merged: r.merged, wouldMerge: r.wouldMerge }, { merged: false, wouldMerge: true });
+  assert.equal(g.writes.length, 0);
+  g = fakeGh(epikuMergeRoutes({ cls: "breaking" }));
+  r = tryMergeEpiku(g.gh, 9, eIds, { dryRun: true });
+  assert.deepEqual(r.why.map((w) => w.code), ["breaking"]);
+  assert.equal(g.writes.length, 0, "no label, no comment");
+});
+
+test("epiku queues: only the App bot's own PRs into main; approved means approved on the current head", () => {
+  const other = { sha: "d".repeat(40), ref: "agent/issue-5", repo: { full_name: EPIKU_REPO } };
+  const { gh } = fakeGh([
+    [/epiku\/pulls\?state=open/, [epikuPr(), epikuPr({ number: 10, head: other }), epikuPr({ number: 11, user: { login: "dependabot[bot]" } }), epikuPr({ number: 12, labels: [{ name: "agent" }, { name: "needs-owner" }] })]],
+    [/epiku\/issues\/9\/comments/, [{ user: { login: APP_BOT }, body: `${dataMarker(ESHA, "none")}\n${marker(ESHA, "approve")}` }]],
+    [/epiku\/issues\/10\/comments/, [{ user: { login: APP_BOT }, body: marker(ESHA, "approve") }]],
+    [/actions\/runs/, { workflow_runs: [{ name: "CI", created_at: "1", status: "completed", conclusion: "success" }] }],
+  ]);
+  assert.deepEqual(reviewQueue(gh, eIds, EPIKU_REPO).map((p) => p.number), [10], "9 has a verdict; 11 is not the builder's; 12 is parked");
+  assert.deepEqual(approvedQueue(gh, eIds, EPIKU_REPO).map((p) => p.number), [9]);
+});
+
+test("epiku is private: branches, job lines and every command's output carry numbers and commits only", async () => {
+  assert.equal(branchFor(12, "Rename the client's board", "issue", EPIKU_REPO), "agent/issue-12", "no title in a branch name: it shows in the public log");
+  assert.equal(branchFor(12, "Add Dark Mode", "issue"), "agent/issue-12-add-dark-mode", "the app repo is unchanged");
+  assert.equal(branchFor(12, "Fix it", "issue", WEB_REPO), "agent/issue-12-fix-it");
+  assert.equal(jobLine({ kind: "issue", n: 4, title: "PRIVATE-TITLE", url: "https://x/4" }, EPIKU_REPO), "issue\t4");
+  assert.equal(jobLine({ kind: "pr", n: 9, branch: "agent/issue-4", title: "PRIVATE-TITLE", url: "https://x/9" }, EPIKU_REPO), "pr\t9\tagent/issue-4");
+  assert.equal(jobLine({ kind: "issue", n: 4, title: "T", url: "U" }, APP_REPO), "issue\t4\tT\tU");
+
+  // End to end: the real scripts against a fake `gh` whose every answer carries a private title and path.
+  const { spawnSync } = await import("node:child_process");
+  const { chmodSync } = await import("node:fs");
+  const { fileURLToPath } = await import("node:url");
+  const bin = mkdtempSync(join(tmpdir(), "fakegh-epiku-"));
+  const pr = JSON.stringify(epikuPr());
+  const waiting = JSON.stringify(epikuPr({ number: 10, head: { sha: "d".repeat(40), ref: "agent/issue-5", repo: { full_name: EPIKU_REPO } } }));
+  const files = JSON.stringify([{ filename: "lib/PRIVATE-PATH/identidad.ts", status: "modified", additions: 1, patch: "@@\n+x" }, { filename: "lib/identidad.ts", status: "modified", additions: 1, patch: "@@\n+x" }]);
+  const comments = JSON.stringify([{ user: { login: APP_BOT }, body: `PRIVATE-REVIEW\n\n${dataMarker(ESHA, "none")}\n${marker(ESHA, "approve")}` }]);
+  // Answers come from files: a shell `echo` would rewrite the `\n` inside the JSON.
+  const ans = (name, text) => { writeFileSync(join(bin, name), text); return `cat "${join(bin, name)}"`; };
+  writeFileSync(join(bin, "gh"), [
+    "#!/bin/sh",
+    '[ "$GH_TOKEN" = epiku-token ] || { echo "wrong token" >&2; exit 1; }',
+    'case "$2" in',
+    "  -X) echo WRITE >&2; exit 1 ;;",
+    `  repos/${EPIKU_REPO}/pulls\\?state=open*) ${ans("open.json", `[${pr},${waiting}]`)} ;;`,
+    `  repos/${EPIKU_REPO}/pulls/9/files*) ${ans("files.json", files)} ;;`,
+    `  repos/${EPIKU_REPO}/pulls/9) ${ans("pr.json", pr)} ;;`,
+    `  repos/${EPIKU_REPO}/issues/9/comments*) ${ans("comments.json", comments)} ;;`,
+    `  repos/${EPIKU_REPO}/issues/10/comments*) echo '[]' ;;`,
+    `  repos/${EPIKU_REPO}/issues/4) echo '{"number":4,"state":"open","title":"PRIVATE-TITLE","labels":[{"name":"ready"}]}' ;;`,
+    `  repos/${EPIKU_REPO}/issues\\?labels=ready*) echo '[{"number":4,"title":"PRIVATE-TITLE","labels":[{"name":"ready"}]},{"number":6,"title":"PRIVATE-TITLE","html_url":"https://github.com/${EPIKU_REPO}/issues/6","labels":[{"name":"ready"}]}]' ;;`,
+    `  repos/${EPIKU_REPO}/actions/runs*) echo '{"workflow_runs":[{"name":"CI","created_at":"1","status":"completed","conclusion":"success"}]}' ;;`,
+    "  *) echo '[]' ;;",
+    "esac",
+  ].join("\n") + "\n");
+  chmodSync(join(bin, "gh"), 0o755);
+  const env = { PATH: `${bin}:${process.env.PATH}`, GITHUB_ACTIONS: "true", OCTOPUSH_OWNER_LOGIN: "johnatan", OCTOPUSH_APP_BOT_LOGIN: APP_BOT, OCTOPUSH_EPIKU_TOKEN: "epiku-token", GH_TOKEN: "app-repo-token" };
+  const run = (script, ...args) => spawnSync(process.execPath, [fileURLToPath(new URL(`./${script}`, import.meta.url)), "--repo", EPIKU_REPO, ...args], { encoding: "utf8", env });
+  const clean = (r) => { assert.doesNotMatch(r.stdout + r.stderr, /PRIVATE|identidad|lib\/|https:\/\//, "nothing but numbers, commits and codes"); return r; };
+
+  let r = clean(run("automerge.mjs", "queue"));
+  assert.equal(r.stdout, `10\t${"d".repeat(40)}\n`, r.stderr);
+  r = clean(run("automerge.mjs", "approved"));
+  assert.equal(r.stdout, "9\n", r.stderr);
+  r = clean(run("automerge.mjs", "merge", "9", "--dry-run"));
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, "dry run: not merged epiku#9 at eeeeeee: human-only\n", r.stderr);
+  r = clean(run("automerge.mjs", "merge", "9"));
+  assert.equal(r.status, 2, "the fake gh refuses writes: the parking attempt fails, and even that prints nothing private");
+  r = clean(run("jobs.mjs", "next"));
+  assert.equal(r.stdout, "issue\t6\n", r.stderr); // #4 is already claimed by PR 9
+  // Website PRs still never auto-merge, and no other repo gets these commands.
+  r = spawnSync(process.execPath, [fileURLToPath(new URL("./automerge.mjs", import.meta.url)), "--repo", WEB_REPO, "merge", "9"], { encoding: "utf8", env: { ...env, OCTOPUSH_WEB_TOKEN: "epiku-token" } });
+  assert.equal(r.status, 64);
+  assert.match(r.stderr, /website PRs never auto-merge/);
+  r = spawnSync(process.execPath, [fileURLToPath(new URL("./automerge.mjs", import.meta.url)), "--repo", "evil/epiku", "queue"], { encoding: "utf8", env });
+  assert.equal(r.status, 2);
+});
+
+test("publish-build for epiku: branch agent/issue-<n>, PR and labels in epiku only, no CI dispatch; human-only paths parked", async () => {
+  const { publish } = await import("./publish-build.mjs");
+  const { execFileSync } = await import("node:child_process");
+  const { mkdirSync } = await import("node:fs");
+  const sh = (cwd, ...a) => execFileSync("git", a, { cwd, encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" } });
+  const run = async (prep) => {
+    const root = mkdtempSync(join(tmpdir(), "pubepiku-"));
+    const bare = join(root, "origin.git"); sh(root, "init", "-q", "--bare", bare);
+    const work = join(root, "work"); mkdirSync(work); sh(work, "init", "-q");
+    writeFileSync(join(work, "README.md"), "x\n"); writeFileSync(join(work, ".gitignore"), "/.next/\n"); sh(work, "add", "."); sh(work, "commit", "-qm", "init");
+    const gitDir = join(root, "repo.git"); execFileSync("mv", [join(work, ".git"), gitDir]);
+    prep(work);
+    mkdirSync(join(work, ".agent-out")); writeFileSync(join(work, ".agent-out", "result.json"), JSON.stringify({ action: "pr", title: "Add an optional due date to a story", summary: "Optional field, default on read." }));
+    const epiku = fakeGh([[/pulls\?state=open/, []]]);
+    const app = fakeGh([]);
+    const cwd = process.cwd(); process.chdir(work);
+    const log = []; const orig = console.log; console.log = (...a) => log.push(a.join(" "));
+    try {
+      const code = await publish({ kind: "issue", n: 4, repo: EPIKU_REPO, gitDir, token: "epiku-installation-token", secrets: ["sk-very-secret-1"], gh: epiku.gh, appGh: app.gh, pushUrl: bare });
+      return { code, epiku: epiku.writes, app: app.writes, log: log.join("\n"), branches: execFileSync("git", ["--git-dir", bare, "branch", "--list"], { encoding: "utf8" }), tree: code === 0 ? execFileSync("git", ["--git-dir", bare, "ls-tree", "-r", "--name-only", "agent/issue-4"], { encoding: "utf8" }) : "" };
+    } finally { process.chdir(cwd); console.log = orig; }
+  };
+  const ok = await run((w) => {
+    mkdirSync(join(w, "lib")); writeFileSync(join(w, "lib", "estado.ts"), "export const x = 1;\n");
+    mkdirSync(join(w, "scripts", "__pycache__"), { recursive: true }); writeFileSync(join(w, "scripts", "__pycache__", "a.cpython-312.pyc"), "x");
+    writeFileSync(join(w, "next-env.d.ts"), "/// types\n");
+  });
+  assert.equal(ok.code, 0);
+  assert.equal(ok.branches.trim(), "agent/issue-4");
+  assert.equal(ok.tree, ".gitignore\nREADME.md\nlib/estado.ts\n", "build and bytecode leftovers are never committed");
+  const pr = ok.epiku.find((w) => w.method === "POST" && /\/pulls$/.test(w.path));
+  assert.equal(pr.path, `repos/${EPIKU_REPO}/pulls`);
+  assert.equal(pr.body.head, "agent/issue-4");
+  assert.match(pr.body.body, /^Closes #4\n/);
+  assert.match(pr.body.body, /epiku-build\.yml.*adversarial review.*parks it for the owner/);
+  assert.ok(ok.epiku.some((w) => /issues\/\d+\/labels$/.test(w.path) && w.body.labels?.includes("agent")));
+  assert.ok(ok.epiku.every((w) => w.path.startsWith(`repos/${EPIKU_REPO}/`)), "every write stays in epiku");
+  assert.equal(ok.app.length, 0, "nothing is written to this public repo");
+  assert.ok(!ok.epiku.some((w) => /dispatches$/.test(w.path)), "App-token pushes start Epiku's CI themselves");
+  assert.match(ok.log, /^published issue #4 → epiku#\d+$/);
+  assert.doesNotMatch(ok.log, /due date|agent\//i, "no title and no branch in the public log");
+
+  const { privateFailure } = await import("./publish-build.mjs");
+  let failed;
+  try { execFileSync("git", ["commit", "-m", "PRIVATE-TITLE"], { cwd: tmpdir(), stdio: "pipe", env: { ...process.env, GIT_DIR: "/nonexistent" } }); } catch (e) { failed = e; }
+  assert.match(failed.message, /PRIVATE-TITLE/, "a failed command's message carries its arguments…");
+  assert.match(privateFailure(failed).message, /^publishing to a private repo failed: a command exited \d+ \(details withheld/);
+  assert.doesNotMatch(privateFailure(failed).message, /PRIVATE/, "…which never reach the public log for epiku");
+  assert.match(privateFailure(new Error("PRIVATE")).message, /^publishing to a private repo failed: a step failed/);
+
+  const bad = await run((w) => { mkdirSync(join(w, "data")); writeFileSync(join(w, "data", "plan.json"), "{}"); });
+  assert.equal(bad.code, 1);
+  assert.equal(bad.branches.trim(), "", "nothing pushed");
+  assert.ok(bad.epiku.some((w) => w.path === `repos/${EPIKU_REPO}/issues/4/labels` && w.body.labels.includes("needs-owner")), "parked on the Epiku issue");
+  assert.equal(bad.app.length, 0);
+});
+
+test("workflows: the Epiku lane starts nothing by itself, holds least privilege, and keeps the App key and the merge away from agents", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const dir = new URL("../../.github/workflows/", import.meta.url);
+  const wf = (f) => readFileSync(new URL(f, dir), "utf8");
+  const build = wf("epiku-build.yml"), review = wf("epiku-review.yml");
+  const code = (text) => text.split("\n").filter((l) => !/^\s*#/.test(l)).join("\n");
+  for (const [name, text] of [["build", build], ["review", review]]) {
+    const live = code(text);
+    assert.match(live, /\non:\n  workflow_dispatch:\n/, `${name}: manual runs only`);
+    assert.doesNotMatch(live, /schedule:|cron:|pull_request|workflow_run|issue_comment|repository_dispatch|\bpush:/, `${name}: no other trigger — merging this starts nothing`);
+    assert.match(live, /\npermissions:\n  contents: read\n\n/, `${name}: the workflow's own token is read-only`);
+    assert.equal((live.match(/\n\s*permissions:/g) ?? []).length, 1, `${name}: no job widens it`);
+    assert.doesNotMatch(live, /github\.token|secrets\.GITHUB_TOKEN|GH_TOKEN: \$\{\{ (?!steps\.(pick|read)-token\.outputs\.token)/, `${name}: this repo's token goes to no step; GH_TOKEN only to revoke an Epiku token`);
+    assert.doesNotMatch(live, /OCTOPUSH_WEB_TOKEN/, `${name}: never the website's token`);
+    assert.doesNotMatch(live, /\$\{\{\s*(github\.event|inputs)\b/, `${name}: no event or input text anywhere`);
+    assert.equal((live.match(/repositories: /g) ?? []).length, (live.match(/repositories: epiku\n/g) ?? []).length, `${name}: every App token is scoped to epiku alone`);
+    assert.equal((live.match(/create-github-app-token@/g) ?? []).length, (live.match(/repositories: epiku\n/g) ?? []).length);
+    assert.match(live, /if: github\.ref == 'refs\/heads\/main'/);
+    assert.doesNotMatch(live, /upload-artifact|cache@|\$GITHUB_STEP_SUMMARY/, `${name}: nothing of a private repo is stored where this public repo can serve it`);
+    // Expressions reach scripts only through `env:`/`with:` — never interpolated into a `run:` block.
+    const lines = live.split("\n");
+    let runs = 0;
+    for (let i = 0; i < lines.length; i++) {
+      const m = /^(\s+)(?:- )?run: (.*)$/.exec(lines[i]);
+      if (!m) continue;
+      runs++;
+      const body = [m[2]];
+      if (m[2].trim() === "|") for (let j = i + 1; j < lines.length && (lines[j].trim() === "" || lines[j].startsWith(`${m[1]}  `)); j++) body.push(lines[j]);
+      assert.doesNotMatch(body.join("\n"), /\$\{\{/, `${name}: an expression inside a run: block`);
+    }
+    assert.ok(runs >= 5, `${name}: run blocks found`);
+  }
+  // Build: Epiku's code runs only as octo-sandbox; the App key only before the sandbox exists and after it is proved gone.
+  const s = build.indexOf("name: Install and sandbox"), e = build.indexOf("id: sandbox-gone");
+  assert.ok(s > 0 && e > s);
+  for (let i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY"); i >= 0; i = build.indexOf("OCTOPUSH_APP_PRIVATE_KEY", i + 1)) assert.ok(i < s || i > e);
+  assert.ok(build.indexOf("name: Revoke the pick token") < s, "the pick token is dead before the agent starts");
+  assert.ok(build.indexOf("Trusted copy of the routines") < build.indexOf("name: Check out epiku"));
+  assert.match(build, /OCTO_CHECK_PROFILE=epiku /);
+  assert.match(build, /npm ci --no-audit --no-fund --ignore-scripts\) > "\$RUNNER_TEMP\/npm-ci\.log" 2>&1/, "no lifecycle scripts, and the private dependency tree is not echoed");
+  assert.match(build, /\^agent\/issue-\[0-9\]\+\$/, "only the builder's numbered branches are checked out");
+  assert.doesNotMatch(code(build), /automerge\.mjs/, "the builder's workflow never reviews or merges");
+  assert.doesNotMatch(code(build), /cat "\$RUNNER_TEMP\/(job|prompt)/);
+  // Review: the read token dies before any agent; the merge is another job, on a runner no agent touched.
+  assert.ok(review.indexOf("name: Revoke the read token") < review.indexOf("name: Review each PR"));
+  assert.match(review, /rm -rf "\$work\/data"/);
+  assert.match(review, /for f in CLAUDE\.md AGENTS\.md VISION\.md; do git -C epiku-main show "origin\/main:\$f"/, "main's rules, not the PR's");
+  const m = review.indexOf("\n  merge:\n");
+  const reviewJob = code(review.slice(review.indexOf("\n  review:\n"), m)), mergeJob = code(review.slice(m));
+  assert.doesNotMatch(reviewJob, /permission-contents: write| merge "\$|approved/, "the job that runs agents can't merge");
+  assert.match(mergeJob, /needs: review/);
+  assert.doesNotMatch(mergeJob, /agent\.mjs|CLAUDE_CODE_OAUTH_TOKEN|repository: octopush-sh\/epiku|npm (ci|install)|needs\.review\.outputs|download-artifact/, "no agent, no Epiku code, nothing handed over from the review job");
+  assert.match(mergeJob, /id: merge-token\n\s+if: vars\.EPIKU_AUTOMERGE == 'true'\n/, "write access only when the owner switched auto-merge on");
+  assert.match(mergeJob, /id: dry-token\n\s+if: vars\.EPIKU_AUTOMERGE != 'true'\n[\s\S]*?permission-contents: read\n\s+permission-pull-requests: read\n\s+permission-issues: read\n/);
+  assert.equal((mergeJob.match(/: write\b/g) ?? []).length, 3, "contents, pull-requests and issues: nothing else");
+  assert.match(mergeJob, /dry=\(--dry-run\)\n\s+if \[ "\$EPIKU_AUTOMERGE" = true \]; then dry=\(\);/);
+  // No other workflow is taught about Epiku: the digest, the answers and the audits print titles in this public repo.
+  for (const f of readdirSync(dir).filter((n) => !n.startsWith("epiku-"))) assert.doesNotMatch(wf(f), /epiku/i, f);
+});
+
+test("octo-check epiku: Epiku's own gates, with nothing in the environment that could reach a store", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { readFileSync } = await import("node:fs");
+  const src = readFileSync(new URL("./agent-check.sh", import.meta.url), "utf8");
+  const f = join(mkdtempSync(join(tmpdir(), "oc-epiku-")), "octo-check");
+  writeFileSync(f, src.replace(/^ROOT=.*$/m, 'ROOT="/nonexistent"').replace(/^NODE_DIR=.*$/m, `NODE_DIR="${process.execPath.replace(/\/node$/, "")}"`).replace(/^PROFILE=.*$/m, 'PROFILE="epiku"'));
+  assert.match(spawnSync("bash", [f, "nope"], { encoding: "utf8" }).stderr, /typecheck \| test \[vitest args\] \| test-py \| agents \| build \| all/);
+  assert.match(spawnSync("bash", [f, "consistency"], { encoding: "utf8" }).stderr, /usage: octo-check typecheck/, "another profile's checks aren't offered");
+  assert.match(src, /all\) cmd=\(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents && npm run --silent build'\)/);
+  assert.match(src, /\/usr\/bin\/env -i \\\n/, "the checks' environment is built from nothing");
+  assert.doesNotMatch(src, /KV_REST_API|API_TOKEN|UPSTASH/, "and no store or token variable is ever put into it");
+  const setup = readFileSync(new URL("./agent-sandbox-setup.sh", import.meta.url), "utf8");
+  assert.match(setup, /"\$PROFILE" == epiku/);
+});

@@ -4,6 +4,7 @@
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all     (profile app)
 #   agent-check.sh build | check | consistency | routes | all            (profile web: octopush-web)
 #   agent-check.sh site                                                 (profile web-audit: web-audit.yml only)
+#   agent-check.sh typecheck | test [vitest args…] | test-py | agents | build | all   (profile epiku)
 #
 # agent-sandbox-setup.sh installs it as root-owned /usr/local/bin/octo-check
 # (with the checkout's path and the check profile baked in); the agent may run
@@ -21,7 +22,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SANDBOX_USER=octo-sandbox   # fixed: nothing the caller sets may change who runs the checks
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # replaced with the checkout path when installed
 NODE_DIR=""                                     # replaced with node's directory when installed
-PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web | web-audit)
+PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web | web-audit | epiku)
 
 # Only the installed copy works: agent-sandbox-setup.sh bakes NODE_DIR in. (The
 # agent's environment is rebuilt from scratch, so GITHUB_ACTIONS isn't there.)
@@ -65,6 +66,20 @@ case "$PROFILE" in
       # runner-installed node_modules with it.
       site) cmd=(bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent build') ;;
       *) echo "usage: octo-check site" >&2; exit 64 ;;
+    esac ;;
+  epiku)
+    # Epiku's own gates (its CI runs the same four). The environment below is
+    # empty: no store, no token, exactly like its CI, so nothing here can reach
+    # a real Redis. The build fetches its fonts from Google Fonts.
+    extra_env=(NEXT_TELEMETRY_DISABLED=1)
+    case "${1:-}" in
+      typecheck) cmd=(npm run --silent typecheck) ;;
+      test) shift; cmd=(npx vitest run "$@") ;;
+      test-py) cmd=(npm run --silent test:py) ;;
+      agents) cmd=(npm run --silent check:agents) ;;
+      build) cmd=(npm run --silent build) ;;
+      all) cmd=(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents && npm run --silent build') ;;
+      *) echo "usage: octo-check typecheck | test [vitest args] | test-py | agents | build | all" >&2; exit 64 ;;
     esac ;;
   *) echo "octo-check: unknown profile $PROFILE" >&2; exit 64 ;;
 esac

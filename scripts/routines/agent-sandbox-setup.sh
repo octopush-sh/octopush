@@ -12,9 +12,9 @@ SANDBOX_USER=octo-sandbox
 # copy taken from main (outside the checkout), so the path comes in explicitly.
 ROOT="${OCTOPUSH_CHECKOUT:?OCTOPUSH_CHECKOUT is required}"
 HERE="$(cd "$(dirname "$0")" && pwd)"
-# Which checks octo-check runs: app (this repo) or web (octopush-web). Baked in below.
+# Which checks octo-check runs: app (this repo), web (octopush-web) or epiku. Baked in below.
 PROFILE="${OCTO_CHECK_PROFILE:-app}"
-[[ "$PROFILE" == app || "$PROFILE" == web || "$PROFILE" == web-audit ]] || { echo "agent-sandbox-setup: OCTO_CHECK_PROFILE is app, web or web-audit" >&2; exit 64; }
+[[ "$PROFILE" == app || "$PROFILE" == web || "$PROFILE" == web-audit || "$PROFILE" == epiku ]] || { echo "agent-sandbox-setup: OCTO_CHECK_PROFILE is app, web, web-audit or epiku" >&2; exit 64; }
 
 [[ "${GITHUB_ACTIONS:-}" == "true" ]] || { echo "agent-sandbox-setup: GitHub Actions only" >&2; exit 64; }
 

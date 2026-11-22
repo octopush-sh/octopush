@@ -1,0 +1,243 @@
+# Epiku builder (VISION.md §8, docs/ROUTINES.md "The Epiku lane"): the builder
+# for octopush-sh/epiku, a PRIVATE repo.
+#
+# Takes ONE job — an Epiku PR its review sent back or whose CI is red, else the
+# oldest Epiku issue labelled `ready` — and has a Claude agent build it in a
+# checkout of that repo, with that repo's CLAUDE.md. Same hardening as
+# web-build.yml: the agent holds no GitHub credential, its checks run through
+# the root-owned `octo-check` (epiku profile: typecheck, tests, Python tests,
+# the AGENTS.md mirror, the build) as an unprivileged user with an empty
+# environment, the checkout's .git is moved out of its reach, and publishing
+# runs a copy of scripts/routines taken from main before anything else.
+#
+# Credentials: short-lived installation tokens of the "Octopush Cycle" GitHub
+# App, scoped to epiku alone: one to pick, claim and check out (revoked before
+# the agent starts), a fresh one to publish after it has finished. This
+# workflow's own GITHUB_TOKEN is read-only and is given to no step. No token is
+# ever in the agent's environment (agent.mjs rebuilds it).
+#
+# THIS REPO IS PUBLIC AND EPIKU IS PRIVATE. Everything a step prints here is
+# public: steps print issue/PR numbers and commit ids of Epiku only — never a
+# title, a body, a file path or file content. Branches are `agent/issue-<n>`
+# (no title in them), `jobs.mjs next` prints no title for Epiku, the agent's
+# transcript stays on the runner, and the dependency install is not echoed.
+#
+# Merging is epiku-review.yml's job, never this one's.
+#
+# Manual runs only until the owner enables the schedule: uncomment the two
+# `schedule` lines (even hours at :22, a slot no other lane uses).
+name: epiku-build
+
+on:
+  # schedule:
+  #   - cron: "22 */2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: epiku-build
+  cancel-in-progress: false
+
+env:
+  OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
+  OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
+  EPIKU_REPO: octopush-sh/epiku
+  CLAUDE_CODE_VERSION: "2.1.314"
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Trusted copy of the routines (from main)
+        # Taken BEFORE anything else: everything that runs with a token from
+        # here on comes from main, never from Epiku or the agent's work.
+        run: cp -R scripts/routines "$RUNNER_TEMP/routines"
+
+      - name: Epiku token (pick, claim, check out — revoked before the agent)
+        id: pick-token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: epiku
+          skip-token-revoke: true   # revoked explicitly below, before the agent runs
+          permission-contents: read
+          permission-issues: write
+          permission-pull-requests: write
+          permission-actions: read
+
+      - name: Pick a job
+        id: pick
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          echo "bot=${OCTOPUSH_APP_BOT_LOGIN}" >> "$GITHUB_OUTPUT"
+          # For Epiku the line is `pr<TAB>n<TAB>branch` or `issue<TAB>n`: no title, no URL.
+          if node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$EPIKU_REPO" next > "$RUNNER_TEMP/job.tsv"; then
+            IFS=$'\t' read -r kind num third _ < "$RUNNER_TEMP/job.tsv"
+            [[ "$kind" =~ ^(pr|issue)$ && "$num" =~ ^[0-9]+$ ]] || { echo "unexpected job line"; exit 1; }
+            ref=main
+            if [ "$kind" = pr ]; then
+              # The builder's own branches only, and they carry a number, never a title.
+              [[ "$third" =~ ^agent/issue-[0-9]+$ ]] || { echo "unexpected branch name"; exit 1; }
+              ref="$third"
+              echo "branch=$third" >> "$GITHUB_OUTPUT"
+            fi
+            echo "kind=$kind" >> "$GITHUB_OUTPUT"
+            echo "num=$num" >> "$GITHUB_OUTPUT"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            echo "job: epiku $kind #$num"
+          else
+            echo "nothing to build"
+          fi
+
+      - name: Claim it
+        if: steps.pick.outputs.kind != ''
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$EPIKU_REPO" claim "$KIND" "$NUM"
+
+      - name: Check out epiku
+        if: steps.pick.outputs.kind != ''
+        uses: actions/checkout@v7
+        with:
+          repository: octopush-sh/epiku
+          token: ${{ steps.pick-token.outputs.token }}
+          ref: ${{ steps.pick.outputs.ref }}
+          path: epiku
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Context and brief
+        if: steps.pick.outputs.kind != ''
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pick-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: |
+          set -euo pipefail
+          R="$RUNNER_TEMP/routines"
+          # Everything here goes into the prompt FILE (the runner's temp dir), never to the log.
+          {
+            cat "$R/briefs/epiku-builder.md"
+            echo
+            node "$R/read.mjs" "$KIND" "$NUM" "$EPIKU_REPO"
+            if [ "$KIND" = pr ]; then
+              echo; echo "## Failing CI checks on the PR's head (if any)"
+              # Actions API only (actions: read). Never fatal — missing CI
+              # context must not stop the build.
+              sha="$(git -C epiku rev-parse HEAD)"
+              node "$R/ci-failures.mjs" "$EPIKU_REPO" "$sha" || echo "(CI checks unavailable)"
+            fi
+          } > "$RUNNER_TEMP/prompt.md"
+
+      - name: Revoke the pick token
+        if: always() && steps.pick-token.outputs.token != ''
+        env:
+          GH_TOKEN: ${{ steps.pick-token.outputs.token }}
+        run: gh api -X DELETE installation/token >/dev/null 2>&1 || echo "::warning title=token::could not revoke the installation token (it still expires within the hour)"
+
+      - name: Install and sandbox (no GitHub token in this step)
+        if: steps.pick.outputs.kind != ''
+        run: |
+          set -euo pipefail
+          # Epiku's dependencies, without lifecycle scripts. Not echoed: the
+          # install log would list a private repo's dependency tree.
+          (cd epiku && npm ci --no-audit --no-fund --ignore-scripts) > "$RUNNER_TEMP/npm-ci.log" 2>&1 \
+            || { echo "::error::npm ci failed in the Epiku checkout (its log stays on the runner)"; exit 1; }
+          npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
+          # Out of the agent's (and the sandbox's) reach from here on.
+          mv epiku/.git "$RUNNER_TEMP/epiku.git"
+          OCTO_CHECK_PROFILE=epiku OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/epiku" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
+
+      - name: Build (Claude agent, no GitHub access)
+        if: steps.pick.outputs.kind != ''
+        timeout-minutes: 75
+        working-directory: epiku
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+        run: node "$RUNNER_TEMP/routines/agent.mjs" builder "$RUNNER_TEMP/prompt.md"
+
+      - name: Stop the sandbox and freeze the checkout
+        if: always() && steps.pick.outputs.kind != ''
+        run: |
+          sudo pkill -KILL -u octo-sandbox || true
+          sudo find "$GITHUB_WORKSPACE/epiku" -type l -user octo-sandbox -delete || true
+          chmod -R o-w "$GITHUB_WORKSPACE/epiku" || true
+
+      - name: Nothing of Epiku's code is still running
+        id: sandbox-gone
+        # Epiku's code (its type check, tests and build) only ever runs as
+        # octo-sandbox, through octo-check: a separate user without sudo, which
+        # can't read the runner's processes. The App's private key is used again
+        # only after this step (the publish token, and the token action's post
+        # steps) — refuse if any sandbox process survived.
+        if: always() && steps.pick.outputs.kind != ''
+        run: |
+          sleep 1
+          if pgrep -u octo-sandbox >/dev/null; then
+            echo "::error::octo-sandbox processes survived the kill — not minting the publish token"; exit 1
+          fi
+
+      - name: Epiku token (publish)
+        id: pub-token
+        if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.OCTOPUSH_APP_ID }}
+          private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
+          owner: octopush-sh
+          repositories: epiku
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Publish
+        if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
+        working-directory: epiku
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pub-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          OCTOPUSH_PUBLISH_REPO: octopush-sh/epiku
+          OCTOPUSH_GIT_DIR: ${{ runner.temp }}/epiku.git
+          OCTOPUSH_SECRETS: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+          BRANCH: ${{ steps.pick.outputs.branch }}
+        run: |
+          set -euo pipefail
+          # Commits are the App's bot's (its noreply address needs the bot's user id).
+          id="$(GH_TOKEN="$OCTOPUSH_EPIKU_TOKEN" gh api "users/$OCTOPUSH_APP_BOT_LOGIN" --jq .id 2>/dev/null || true)"
+          if [[ "$id" =~ ^[0-9]+$ ]]; then
+            export OCTOPUSH_GIT_NAME="$OCTOPUSH_APP_BOT_LOGIN" OCTOPUSH_GIT_EMAIL="$id+$OCTOPUSH_APP_BOT_LOGIN@users.noreply.github.com"
+          fi
+          # Refuses Epiku's human-only paths, symlinks and secrets; prints numbers only.
+          node "$RUNNER_TEMP/routines/publish-build.mjs" "$KIND" "$NUM" "$BRANCH"
+
+      - name: Release the claim
+        if: always() && steps.pick.outputs.kind != ''
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pub-token.outputs.token }}
+          OCTOPUSH_APP_BOT_LOGIN: ${{ steps.pick.outputs.bot }}
+          KIND: ${{ steps.pick.outputs.kind }}
+          NUM: ${{ steps.pick.outputs.num }}
+        run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$EPIKU_REPO" release "$KIND" "$NUM" >/dev/null 2>&1 || true

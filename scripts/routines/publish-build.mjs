@@ -13,6 +13,11 @@
 // GH_TOKEN. App-token pushes start the web repo's CI themselves (only
 // GITHUB_TOKEN pushes don't), so nothing is dispatched there.
 //
+// For epiku (epiku-build.yml; a PRIVATE repo) it does the same with
+// OCTOPUSH_EPIKU_TOKEN and Epiku's human-only paths, needs no token for this
+// repo, names its branch `agent/issue-<n>` (no title in it: branch names show
+// in this public repo's Actions log) and prints numbers only.
+//
 // Reads .agent-out/result.json:
 //   { "action": "pr",     "title": "…", "summary": "…" }   new work for an issue
 //   { "action": "update", "summary": "…" }                  fixes pushed to an existing PR
@@ -24,7 +29,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { makeGh, ghForRepo, APP_REPO, WEB_REPO, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, isPrivateLane, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { humanOnlyFor } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
@@ -38,6 +43,7 @@ const forbiddenFor = (repo) => [...humanOnlyFor(repo), /^\.agent-out\//, /^\.age
 // run leaves behind (#383 shipped a 2,500-test Vitest dump with runner paths).
 export const CACHE = [
   /(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/, /^dist\//, /(^|\/)\.astro\//,
+  /^\.next\//, /^next-env\.d\.ts$/, /(^|\/)__pycache__\//, /\.pyc$/, // epiku: Next's build and typegen output, Python's bytecode
   /(^|\/)vitest-report[^/]*\.json$/, /(^|\/)[^/]*\.tmp\.json$/, /(^|\/)junit[^/]*\.xml$/,
 ];
 export const KINDS = ["issue", "pr", "app-issue"];
@@ -87,8 +93,9 @@ export function leaks(texts, secrets) {
   return texts.some((t) => s.some((x) => t.includes(x)));
 }
 
-export const branchFor = (n, title, kind = "issue") =>
-  `agent/${kind === "app-issue" ? "app-issue" : "issue"}-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
+export const branchFor = (n, title, kind = "issue", repo = APP_REPO) =>
+  // A private lane's branch carries the number only (see the header).
+  isPrivateLane(repo) ? `agent/issue-${n}` : `agent/${kind === "app-issue" ? "app-issue" : "issue"}-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
 
 /** Paths an agent may not change in `repo` (pure). */
 export const forbiddenPaths = (paths, repo = APP_REPO) => paths.filter((p) => forbiddenFor(repo).some((re) => re.test(p)));
@@ -143,13 +150,30 @@ async function main() {
   const repo = process.env.OCTOPUSH_PUBLISH_REPO || process.env.GITHUB_REPOSITORY;
   const gitDir = process.env.OCTOPUSH_GIT_DIR;
   const web = repo === WEB_REPO;
-  const token = web ? process.env.OCTOPUSH_WEB_TOKEN : process.env.GH_TOKEN;
-  if (!repo || !gitDir || !token) throw new Error(`the repo, OCTOPUSH_GIT_DIR and ${web ? "OCTOPUSH_WEB_TOKEN" : "GH_TOKEN"} are required`);
+  if (!repo) throw new Error("OCTOPUSH_PUBLISH_REPO or GITHUB_REPOSITORY is required");
+  // The repo's own token: the App's installation token for octopush-web and epiku, GH_TOKEN here.
+  const tokenEnv = tokenEnvFor(repo) ?? "GH_TOKEN";
+  const token = process.env[tokenEnv];
+  if (!gitDir || !token) throw new Error(`OCTOPUSH_GIT_DIR and ${tokenEnv} are required`);
   if (kind === "app-issue" && !web) throw new Error("app-issue jobs are built in octopush-web");
   if (web && !process.env.GH_TOKEN) throw new Error("GH_TOKEN (the app repo) is required for web jobs");
   // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
-  return publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
+  try {
+    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
+  } catch (e) {
+    throw isPrivateLane(repo) ? privateFailure(e) : e;
+  }
+}
+
+/**
+ * A failed command's message carries its whole command line — for `git commit`
+ * that includes the PR title. For a private repo only its exit status may reach
+ * this public repo's log (pure).
+ */
+export function privateFailure(e) {
+  const how = Number.isInteger(e?.status) ? `a command exited ${e.status}` : "a step failed";
+  return new Error(`publishing to a private repo failed: ${how} (details withheld from this public log)`);
 }
 
 /**
@@ -189,7 +213,7 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
     return 1;
   }
 
-  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind);
+  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind, repo);
   if (!branch) throw new Error("a PR job needs its branch");
   const closes = kind === "app-issue" ? `Closes ${APP_REPO}#${n}` : `Closes #${n}`;
   // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
@@ -202,11 +226,14 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
     "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`], { env: authEnv });
 
   const web = repo === WEB_REPO;
-  const workflow = web ? "web-build.yml" : "nightly-build.yml";
+  const epiku = repo === EPIKU_REPO;
+  const workflow = web ? "web-build.yml" : epiku ? "epiku-build.yml" : "nightly-build.yml";
   let prNumber = n;
   if (kind !== "pr") {
     const open = gh.list(`repos/${repo}/pulls?state=open&head=${repo.split("/")[0]}:${branch}`);
-    const decides = web ? "The web review judges it; the owner merges website PRs (merging publishes)" : "The nightly review decides";
+    const decides = web ? "The web review judges it; the owner merges website PRs (merging publishes)"
+      : epiku ? "An independent adversarial review judges it; a fixed script then merges it only if every auto-merge rule of VISION.md §2 holds on the reviewed commit, and parks it for the owner otherwise"
+      : "The nightly review decides";
     const body = `${closes}\n\n${defuseClosing(sanitize(r.summary))}\n\n---\n_Opened by the nightly builder (\`${workflow}\` in ${APP_REPO}). ${decides}; see docs/ROUTINES.md._`;
     const pr = open[0] ?? gh.send("POST", `repos/${repo}/pulls`, { title: defuseClosing(sanitize(r.title)), head: branch, base: "main", body });
     prNumber = pr.number;
@@ -218,8 +245,8 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   }
   // Pushes made with GITHUB_TOKEN don't start workflows: dispatch the app's CI
   // explicitly. App installation-token pushes (the web repo) start it on their own.
-  if (!web) gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
-  console.log(`published ${kind} #${n} → ${web ? "web" : "PR "}#${prNumber} (${branch})`);
+  if (!tokenEnvFor(repo)) gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
+  console.log(epiku ? `published ${kind} #${n} → epiku#${prNumber}` : `published ${kind} #${n} → ${web ? "web" : "PR "}#${prNumber} (${branch})`);
   return 0;
 }
 
