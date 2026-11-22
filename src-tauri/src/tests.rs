@@ -21476,18 +21476,19 @@ mod secret_guard_tests {
         let (dir, git) = repo();
         let mut keynote = b"PK\x03\x04".to_vec();
         keynote.resize(4096, b'x');
-        std::fs::write(dir.path().join("Big.key"), &keynote).unwrap();
-        std::fs::write(dir.path().join("big.key"), vec![b'-'; 4096]).unwrap();
-        stage(&git, "Big.key");
-        stage(&git, "big.key");
+        // Names that differ by more than case: macOS's file system ignores it.
+        std::fs::write(dir.path().join("Deck.key"), &keynote).unwrap();
+        std::fs::write(dir.path().join("server.key"), vec![b'-'; 4096]).unwrap();
+        stage(&git, "Deck.key");
+        stage(&git, "server.key");
         let id = |rel: &str| git.index().unwrap().get_path(Path::new(rel), 0).unwrap().id;
         // Past the limit the blob is streamed, so the worktree isn't needed.
-        std::fs::remove_file(dir.path().join("Big.key")).unwrap();
-        assert!(starts_like_zip_within(&git, "Big.key", id("Big.key"), 16));
-        assert!(!starts_like_zip_within(&git, "big.key", id("big.key"), 16));
+        std::fs::remove_file(dir.path().join("Deck.key")).unwrap();
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 16));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 16));
         // Under the limit the blob is read whole, with the same answer.
-        assert!(starts_like_zip_within(&git, "Big.key", id("Big.key"), 1 << 20));
-        assert!(!starts_like_zip_within(&git, "big.key", id("big.key"), 1 << 20));
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 1 << 20));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 1 << 20));
         // No blob in git: the worktree file's first bytes.
         std::fs::write(dir.path().join("New.key"), &keynote).unwrap();
         assert!(starts_like_zip_within(&git, "New.key", git2::Oid::zero(), 16));
