@@ -22307,6 +22307,109 @@ mod secret_guard_tests {
         assert_eq!(f[0].file, "new.ts");
     }
 
+    /// Make `<remote>/<branch>` (a ref at `at`) the upstream of the local
+    /// branch `branch`.
+    fn track(repo: &git2::Repository, branch: &str, remote: &str, at: git2::Oid) {
+        if repo.find_remote(remote).is_err() {
+            repo.remote(remote, &format!("https://example.invalid/{remote}.git")).unwrap();
+        }
+        repo.reference(&format!("refs/remotes/{remote}/{branch}"), at, true, "test").unwrap();
+        let mut local = repo.find_branch(branch, git2::BranchType::Local).unwrap();
+        local.set_upstream(Some(&format!("{remote}/{branch}"))).unwrap();
+        let upstream = local.upstream().unwrap().get().target();
+        assert_eq!(upstream, Some(at), "the test's upstream is set");
+    }
+
+    /// The push goes to `origin/<branch>`, so that ref bounds the scan even
+    /// when the branch tracks another remote (#859). Here the upstream is
+    /// ahead of origin: its commits are new to origin, so they are scanned.
+    #[test]
+    fn push_scans_commits_origin_lacks_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let on_origin = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        track(&repo, "main", "fork", on_fork);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+    }
+
+    /// The other way round: the upstream on another remote is behind origin,
+    /// and what origin already has isn't scanned again.
+    #[test]
+    fn push_skips_commits_origin_has_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// A branch that isn't on origin yet keeps the earlier bases: its
+    /// upstream, else origin's default branch.
+    #[test]
+    fn push_of_a_branch_not_on_origin_yet_keeps_the_earlier_bases() {
+        let (dir, repo) = repo();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.reference("refs/remotes/origin/main", root.id(), true, "test").unwrap();
+        repo.branch("feature", &root, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+
+        // No upstream, no origin/feature: everything since origin's default branch.
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+
+        // With an upstream on another remote and still no origin/feature,
+        // the upstream bounds the range, as before.
+        track(&repo, "feature", "fork", on_fork);
+        assert!(repo.find_reference("refs/remotes/origin/feature").is_err());
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// A `git push` typed in Talk's shell goes to the branch's upstream, not
+    /// necessarily `origin`, so its scan keeps the upstream range: commits
+    /// `origin/<branch>` already has are still new to the other remote.
+    #[test]
+    fn shell_push_keeps_the_upstream_range_when_origin_is_ahead() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        let push = ShellPlan { push: true, ..Default::default() };
+        let f = scan_added(&shell_files(dir.path(), &push).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+        // The Push button sends to origin, which has that commit already.
+        assert!(scan_added(&push_files(dir.path()).unwrap(), &[]).is_empty());
+    }
+
     /// A committed blob larger than the scan budget: in a tree-to-tree diff
     /// its size isn't known until the patch is generated, so it must still
     /// make push and PR scans partial (never silently clean).
