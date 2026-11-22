@@ -975,12 +975,16 @@ export const ipc = {
   respondApproval: (callId: string, decision: "approve" | "always" | "deny") =>
     invoke<void>("respond_approval", { callId, decision }),
   /** Run a `$`-direct command in the thread's TALK shell (no LLM). Persists the
-   *  command + output into the conversation; returns cwd/exit for the badge. */
+   *  command + output into the conversation; returns cwd/exit for the badge.
+   *  Secret guard (#819): a command that commits, pushes or opens a PR
+   *  rejects with `SecretsFound` (see `lib/secretGuard`) before it runs;
+   *  `allowFindings` echoes the confirm's fingerprint for this one run. */
   runShellCommand: (request: {
     workspaceId: string;
     threadId: string;
     workspacePath: string;
     command: string;
+    allowFindings?: string;
   }) =>
     invoke<{
       output: string;
