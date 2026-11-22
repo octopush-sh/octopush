@@ -77,5 +77,9 @@ describe("secretGuard", () => {
     expect(overrideLabel("commit")).toBe("Commit regardless");
     expect(overrideLabel("push")).toBe("Push regardless");
     expect(overrideLabel("pr")).toBe("Open it regardless");
+    expect(overrideLabel("command")).toBe("Run regardless");
+    expect(guardHeadline("command", [f({ kind: "GitHub token" })])).toBe(
+      "This command adds what looks like a GitHub token in tests/fixtures.ts:12.",
+    );
   });
 });
