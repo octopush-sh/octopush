@@ -89,7 +89,9 @@ export function RewindDialog({ workspaceId, workspacePath, threadId, messageId, 
     <ModalShell onClose={onClose} closeOnBackdrop={false} ariaLabel="Rewind files" panelClassName="w-full max-w-[520px]">
       <div data-tour="talk-rewind-dialog" className="rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl">
         <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-          <History size={12} strokeWidth={1.75} aria-hidden />
+          <span title="Rewind files" className="inline-flex">
+            <History size={12} strokeWidth={1.75} aria-hidden />
+          </span>
           <span>Rewind files</span>
         </div>
         <h2 className="mt-2 font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory">

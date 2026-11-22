@@ -175,6 +175,8 @@ describe("Talk rewind & fork (#958)", () => {
     expect(screen.getByText("Reading the files…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Rewind the files" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "Rewind and fork from here" })).toBeDisabled();
+    const dialog = document.querySelector('[data-tour="talk-rewind-dialog"]')!;
+    for (const icon of dialog.querySelectorAll("svg")) expect(icon.closest("[title]")).not.toBeNull();
   });
 
   it("says a turn can't be rewound, with the reason, and offers nothing to confirm", async () => {
