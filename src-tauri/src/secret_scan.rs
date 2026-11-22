@@ -1615,6 +1615,138 @@ pub fn worktree_files(path: &Path, base: Option<&str>) -> AppResult<Collected> {
     Ok(budget.into_collected(files, "worktree"))
 }
 
+/// Every uncommitted change, staged or not, untracked files included
+/// (ignored files excluded): what a command that stages and then commits
+/// (`git add -A && git commit`, `git commit -a`) could record (#819).
+pub fn uncommitted_files(path: &Path) -> AppResult<Collected> {
+    let repo = crate::git_ops::open_repo(path)?;
+    let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+    let mut o = opts();
+    o.include_untracked(true).recurse_untracked_dirs(true).show_untracked_content(true);
+    let diff = repo
+        .diff_tree_to_workdir_with_index(head_tree.as_ref(), Some(&mut o))
+        .map_err(|e| AppError::Other(format!("secret scan: worktree diff: {e}")))?;
+    let mut files = Vec::new();
+    let mut budget = Budget::new();
+    collect_added(&repo, &diff, &mut files, &mut budget)?;
+    Ok(budget.into_collected(files, "uncommitted"))
+}
+
+// ─── Talk's shell (#819) ───────────────────────────────────────────────
+
+/// What a shell command would commit, push or open as a pull request, read
+/// from its text: Talk's `run_command` and `$`-direct commands are checked
+/// against it before they run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ShellPlan {
+    /// A `git commit`: `Some(true)` when the same command also stages
+    /// (`git add`, `git stage`, `commit -a`/`--all`), so the scan covers every
+    /// uncommitted change; `Some(false)` scans the staged diff only.
+    pub commit: Option<bool>,
+    /// A `git push`.
+    pub push: bool,
+    /// A `gh pr create`, with its `--base`/`-B` when given.
+    pub pr: Option<Option<String>>,
+}
+
+impl ShellPlan {
+    /// The scan reads changes that aren't staged yet (the card says so).
+    pub fn covers_uncommitted(&self) -> bool {
+        self.commit == Some(true)
+    }
+}
+
+/// `git` or a path to it (`/usr/bin/git`).
+fn is_bin(tok: &str, name: &str) -> bool {
+    tok == name || tok.strip_suffix(name).is_some_and(|p| p.ends_with('/'))
+}
+
+/// The subcommand after `git`'s global options (`git -C dir commit`).
+fn git_subcommand<'a>(rest: &[&'a str]) -> Option<(&'a str, usize)> {
+    let mut i = 0;
+    while i < rest.len() {
+        let t = rest[i];
+        if matches!(t, "-C" | "-c" | "--git-dir" | "--work-tree" | "--namespace") {
+            i += 2;
+        } else if t.starts_with('-') {
+            i += 1;
+        } else {
+            return Some((t, i));
+        }
+    }
+    None
+}
+
+/// The [`ShellPlan`] of `command`, or `None` when it neither commits, pushes
+/// nor opens a pull request. Each shell segment (split on `;`, `|`, `&` and
+/// newlines, like `chat_engine::dangerous_command`) is read on its own; a
+/// `git add` in any segment makes a commit cover uncommitted changes. A
+/// heuristic over the text, not a shell parser: it errs towards scanning.
+pub fn shell_plan(command: &str) -> Option<ShellPlan> {
+    let mut plan = ShellPlan::default();
+    let (mut commits, mut stages) = (false, false);
+    for seg in command.split([';', '|', '&', '\n']) {
+        let tokens: Vec<&str> = seg.split_whitespace().collect();
+        if let Some(gi) = tokens.iter().position(|t| is_bin(t, "git")) {
+            let rest = &tokens[gi + 1..];
+            match git_subcommand(rest) {
+                Some(("commit", si)) => {
+                    commits = true;
+                    stages |= rest[si + 1..].iter().any(|t| {
+                        *t == "--all" || (t.starts_with('-') && !t.starts_with("--") && t.contains('a'))
+                    });
+                }
+                Some(("add" | "stage", _)) => stages = true,
+                Some(("push", _)) => plan.push = true,
+                _ => {}
+            }
+        }
+        if let Some(hi) = tokens.iter().position(|t| is_bin(t, "gh")) {
+            if tokens.get(hi + 1) == Some(&"pr") && tokens.get(hi + 2) == Some(&"create") {
+                let args = &tokens[hi + 3..];
+                let base = args.iter().enumerate().find_map(|(i, t)| match *t {
+                    "--base" | "-B" => args.get(i + 1).map(|b| b.to_string()),
+                    _ => t.strip_prefix("--base=").map(str::to_string),
+                });
+                plan.pr = Some(base.filter(|b| !b.is_empty()));
+            }
+        }
+    }
+    if commits {
+        plan.commit = Some(stages);
+    }
+    (plan != ShellPlan::default()).then_some(plan)
+}
+
+/// Everything `plan` would send out of `path`, as one scan: the staged diff
+/// (or every uncommitted change) for a commit, the unpushed commits for a
+/// push, and the pull request's commits for `gh pr create` (onto its
+/// `--base`, else the repo's default branch).
+pub fn shell_files(path: &Path, plan: &ShellPlan) -> AppResult<Collected> {
+    let mut parts = Vec::new();
+    match plan.commit {
+        Some(true) => parts.push(uncommitted_files(path)?),
+        Some(false) => parts.push(staged_files(path)?),
+        None => {}
+    }
+    if plan.push {
+        parts.push(push_files(path)?);
+    }
+    if let Some(base) = &plan.pr {
+        match base.clone().or_else(|| crate::git_ops::repo_default_branch(path)) {
+            Some(b) => parts.push(pr_files(path, &b)?),
+            None => parts.push(push_files(path)?),
+        }
+    }
+    let mut out = Collected { scope: "shell", ..Collected::default() };
+    for c in parts {
+        out.files.extend(c.files);
+        out.partial |= c.partial;
+        out.unscanned.extend(c.unscanned);
+    }
+    Ok(out)
+}
+
 // ─── Enforcement ───────────────────────────────────────────────────────
 
 /// Block when the report needs confirmation (a finding, or a partial scan)
@@ -1641,9 +1773,23 @@ pub async fn guard<F>(allow_findings: Option<String>, collect: F) -> AppResult<(
 where
     F: FnOnce() -> AppResult<Collected> + Send + 'static,
 {
+    match guarded_scan(collect).await {
+        Some(report) => enforce(report, allow_findings.as_deref()),
+        None => Ok(()),
+    }
+}
+
+/// The guard's scan of what `collect` gathers when the guard is on: `None`
+/// when it is off, or when the repository can't be read (logged without any
+/// diff content). The caller decides what a report that
+/// [`ScanReport::needs_confirmation`] means.
+pub async fn guarded_scan<F>(collect: F) -> Option<ScanReport>
+where
+    F: FnOnce() -> AppResult<Collected> + Send + 'static,
+{
     let settings = crate::settings::load_settings().unwrap_or_default();
     if !guard_enabled(&settings) {
-        return Ok(());
+        return None;
     }
     let known = known_secrets_from(&settings);
     let scanned = tokio::task::spawn_blocking(move || {
@@ -1652,10 +1798,10 @@ where
     .await
     .unwrap_or_else(|e| Err(AppError::Other(format!("secret scan stopped: {e}"))));
     match scanned {
-        Ok(report) => enforce(report, allow_findings.as_deref()),
+        Ok(report) => Some(report),
         Err(e) => {
             tracing::warn!("secret guard skipped: {e}");
-            Ok(())
+            None
         }
     }
 }

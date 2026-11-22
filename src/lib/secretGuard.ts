@@ -25,8 +25,9 @@ export interface SecretFinding {
   preview?: string | null;
 }
 
-/** The action the guard held: it names the confirm CTA and the copy. */
-export type GuardedAction = "commit" | "push" | "pr";
+/** The action the guard held: it names the confirm CTA and the copy.
+ *  `command` is a Talk `$` command that commits, pushes or opens a PR (#819). */
+export type GuardedAction = "commit" | "push" | "pr" | "command";
 
 /** One refusal: what to show, and the fingerprint an override must echo. */
 export interface SecretRefusal {
@@ -76,7 +77,7 @@ function withArticle(kind: string): string {
   return /^[aeiouAEIOU]/.test(kind) ? `an ${kind}` : `a ${kind}`;
 }
 
-const NOUN: Record<GuardedAction, string> = { commit: "change", push: "push", pr: "pull request" };
+const NOUN: Record<GuardedAction, string> = { commit: "change", push: "push", pr: "pull request", command: "command" };
 
 /** The dialog's lead sentence: "This change adds what looks like an Anthropic
  *  API key in tests/fixtures.ts:12." `total` defaults to the list's length. */
@@ -92,6 +93,7 @@ export function guardHeadline(action: GuardedAction, findings: SecretFinding[], 
 
 /** The explicit-override CTA, one per action. */
 export function overrideLabel(action: GuardedAction): string {
+  if (action === "command") return "Run regardless";
   return action === "commit" ? "Commit regardless" : action === "push" ? "Push regardless" : "Open it regardless";
 }
 

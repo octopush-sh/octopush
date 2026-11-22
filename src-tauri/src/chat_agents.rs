@@ -21,7 +21,7 @@
 
 use crate::db::Db;
 use crate::error::AppResult;
-use crate::chat_engine::{continuation_note, dangerous_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
+use crate::chat_engine::{continuation_note, dangerous_command, guard_agent_command, ApprovalBroker, ApprovalDecision, CapAnswer, CapGate};
 use crate::orchestrator::agentic::resume_messages_for_continuation;
 use crate::orchestrator::agentic::{run_agentic_loop, user_messages, AgenticResult, BlockedTranscript, ExternalTools, ToolGate};
 use crate::orchestrator::events::EventSink;
@@ -711,6 +711,8 @@ impl EventSink for ChatAgentSink {
 /// call id (`<agent call id>:<n>`) because one sub-agent may ask more than
 /// once. A denial is fed back as an error tool_result; nothing else is
 /// gated (reads, searches and edits stay ungated, as in the parent loop).
+/// A `run_command` that commits or pushes meets the secret guard's card
+/// first, which the grant never answers (#819).
 pub struct SubagentGate {
     pub broker: Arc<ApprovalBroker>,
     pub app: AppHandle,
@@ -719,6 +721,8 @@ pub struct SubagentGate {
     pub call_id: String,
     /// The sub-agent's description, shown on the approval card.
     pub label: String,
+    /// The worktree the secret guard scans before a commit or push (#819).
+    pub workspace_path: String,
     /// MCP tools (namespaced) the server did not mark read-only: a call
     /// may change external state (create an issue, post a comment), so it
     /// asks the user first — nobody is watching a sub-agent otherwise.
@@ -735,6 +739,7 @@ impl SubagentGate {
             thread_id: spec.thread_id.clone(),
             call_id: spec.call_id.clone(),
             label: spec.call.description.clone(),
+            workspace_path: spec.workspace_path.clone(),
             mcp_writes: std::collections::HashSet::new(),
             seq: AtomicU64::new(1),
         }
@@ -777,6 +782,22 @@ impl ToolGate for SubagentGate {
     async fn check(&self, name: &str, input: &serde_json::Value) -> Option<String> {
         let (shown, card_reason, denial) = if name == "run_command" {
             let command = input.get("command").and_then(|c| c.as_str()).unwrap_or("");
+            // The secret guard first (#819); the thread's grant never answers it.
+            let id = format!("{}:{}", self.call_id, self.seq.fetch_add(1, Ordering::Relaxed));
+            if let Some(denial) = guard_agent_command(
+                &self.broker,
+                &self.app,
+                &self.workspace_id,
+                &self.thread_id,
+                &id,
+                command,
+                &self.workspace_path,
+                Some(self.label.as_str()),
+            )
+            .await
+            {
+                return Some(denial);
+            }
             let reason = dangerous_command(command)?;
             let (card_reason, denial) = gate_texts(&self.label, reason);
             (command.to_string(), card_reason, denial)

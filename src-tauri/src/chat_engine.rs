@@ -186,6 +186,10 @@ pub struct ShellRequest {
     pub thread_id: String,
     pub workspace_path: String,
     pub command: String,
+    /// The secret guard's override (#819): the fingerprint of exactly the
+    /// findings the confirm showed, for this one run of the command.
+    #[serde(default)]
+    pub allow_findings: Option<String>,
 }
 
 /// Monotonic counter for `$`-direct call ids (correlates the resolved card to
@@ -211,7 +215,8 @@ fn format_command_output(output: &str, exit_code: i32) -> String {
 /// Flag a command the agent wants to run as destructive (returns a short reason
 /// for the approval card). Conservative + high-confidence: a safety net before
 /// the agent does something irreversible, not a sandbox. User-typed `$` commands
-/// are never passed here. Case-insensitive, matches anywhere in the command.
+/// are never passed here (only the secret guard checks them, #819).
+/// Case-insensitive, matches anywhere in the command.
 pub(crate) fn dangerous_command(command: &str) -> Option<&'static str> {
     // Normalize runs of whitespace so spacing tricks (`rm  -rf`) don't slip past.
     let normalized = command.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -449,6 +454,13 @@ pub struct ApprovalRequestEvent {
     pub call_id: String,
     pub command: String,
     pub reason: String,
+    /// The secret guard asks (#819): the card offers no "don't ask again",
+    /// and a thread's grant never answers it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub secret: bool,
+    /// The command also stages, so the scan read uncommitted changes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub covers_uncommitted: bool,
 }
 
 /// The one approval channel for dangerous agent commands in TALK: the parent
@@ -502,6 +514,64 @@ impl ApprovalBroker {
         if self.auto_approve.lock().contains(thread_id) {
             return ApprovalDecision::Approve;
         }
+        let decision = self.ask(app, workspace_id, thread_id, call_id, command, reason, None).await;
+        self.record(thread_id, decision, false);
+        decision
+    }
+
+    /// Ask about a command the secret guard stopped (#819). Unlike
+    /// [`Self::await_approval`], a thread's "don't ask again" never answers it,
+    /// and an approval grants nothing beyond this one call.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn await_secret_approval(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        command: &str,
+        reason: &str,
+        covers_uncommitted: bool,
+    ) -> ApprovalDecision {
+        let decision = self
+            .ask(app, workspace_id, thread_id, call_id, command, reason, Some(covers_uncommitted))
+            .await;
+        self.record(thread_id, decision, true)
+    }
+
+    /// Keep a "don't ask again" grant, except from a secret card, whose
+    /// approval reads as a plain one. Returns the decision to act on.
+    pub(crate) fn record(&self, thread_id: &str, decision: ApprovalDecision, secret: bool) -> ApprovalDecision {
+        match decision {
+            ApprovalDecision::ApproveAlways if secret => ApprovalDecision::Approve,
+            ApprovalDecision::ApproveAlways => {
+                self.auto_approve.lock().insert(thread_id.to_string());
+                decision
+            }
+            d => d,
+        }
+    }
+
+    /// Whether the thread's "don't ask again" grant skips a dangerous-command
+    /// prompt (never a secret one).
+    #[cfg(test)]
+    pub(crate) fn auto_approves(&self, thread_id: &str) -> bool {
+        self.auto_approve.lock().contains(thread_id)
+    }
+
+    /// Emit the card and wait for its answer. `secret` is `Some(covers
+    /// uncommitted)` for the secret guard's card.
+    #[allow(clippy::too_many_arguments)]
+    async fn ask(
+        &self,
+        app: &AppHandle,
+        workspace_id: &str,
+        thread_id: &str,
+        call_id: &str,
+        command: &str,
+        reason: &str,
+        secret: Option<bool>,
+    ) -> ApprovalDecision {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.approvals
             .lock()
@@ -512,6 +582,8 @@ impl ApprovalBroker {
             call_id: call_id.to_string(),
             command: command.to_string(),
             reason: reason.to_string(),
+            secret: secret.is_some(),
+            covers_uncommitted: secret.unwrap_or(false),
         });
         let decision = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
             Ok(Ok(d)) => d,
@@ -520,15 +592,68 @@ impl ApprovalBroker {
                 ApprovalDecision::Deny
             }
         };
-        if decision == ApprovalDecision::ApproveAlways {
-            self.auto_approve.lock().insert(thread_id.to_string());
-        }
         let _ = app.emit("chat://approval-resolved", &ApprovalResolvedEvent {
             workspace_id: workspace_id.to_string(),
             thread_id: thread_id.to_string(),
             call_id: call_id.to_string(),
         });
         decision
+    }
+}
+
+/// The secret card's reason and the denial fed back to the model (#819):
+/// kinds and `file:line` only, never a value. `label` names the sub-agent.
+/// Pure, so the wording is tested.
+pub(crate) fn secret_gate_texts(label: Option<&str>, summary: &str) -> (String, String) {
+    let card = match label {
+        Some(l) => format!("Sub-agent \u{201c}{l}\u{201d}: possible secret \u{b7} {summary}"),
+        None => format!("possible secret \u{b7} {summary}"),
+    };
+    let denial = format!(
+        "Command not run — the secret guard found {summary} in what it would commit or push, \
+         and the user declined. Take it out of the change or ask the user how to proceed; \
+         do not retry the same command."
+    );
+    (card, denial)
+}
+
+/// The secret guard on an agent's `run_command` in Talk (#819): a command
+/// that commits, pushes or opens a pull request is scanned first, and a
+/// finding (or a partial scan) parks it on the secret card. The approval is
+/// bound to the scan's fingerprint: the command runs only if a rescan still
+/// finds exactly what the card showed, else the card asks again. `Some` is
+/// the denial for the model. Guard off, or nothing found: `None`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn guard_agent_command(
+    broker: &ApprovalBroker,
+    app: &AppHandle,
+    workspace_id: &str,
+    thread_id: &str,
+    call_id: &str,
+    command: &str,
+    workspace_path: &str,
+    label: Option<&str>,
+) -> Option<String> {
+    let plan = crate::secret_scan::shell_plan(command)?;
+    let mut approved: Option<String> = None;
+    loop {
+        let (path, p) = (workspace_path.to_string(), plan.clone());
+        let report = crate::secret_scan::guarded_scan(move || {
+            crate::secret_scan::shell_files(std::path::Path::new(&path), &p)
+        })
+        .await?;
+        if !report.needs_confirmation() || approved.as_deref() == Some(report.fingerprint.as_str()) {
+            return None;
+        }
+        let summary = crate::secret_scan::refusal_summary(&report.findings, report.total, report.partial);
+        let (card, denial) = secret_gate_texts(label, &summary);
+        match broker
+            .await_secret_approval(app, workspace_id, thread_id, call_id, command, &card, plan.covers_uncommitted())
+            .await
+        {
+            ApprovalDecision::Deny => return Some(denial),
+            _ => approved = Some(report.fingerprint),
+        }
     }
 }
 
@@ -2137,6 +2262,17 @@ impl ChatEngine {
         app: AppHandle,
         request: ShellRequest,
     ) -> AppResult<crate::talk_shell::ShellResult> {
+        // Secret guard (#819): a command that commits, pushes or opens a pull
+        // request is refused with `SecretsFound` before anything is shown or
+        // run, unless `allow_findings` is the fingerprint the confirm showed.
+        if let Some(plan) = crate::secret_scan::shell_plan(&request.command) {
+            let path = request.workspace_path.clone();
+            crate::secret_scan::guard(request.allow_findings.clone(), move || {
+                crate::secret_scan::shell_files(std::path::Path::new(&path), &plan)
+            })
+            .await?;
+        }
+
         // Show the command as the user's turn straight away.
         self.insert_and_emit_message(
             &app,
@@ -3008,12 +3144,25 @@ impl ChatEngine {
 
                 // ── Approval gate (agent run_command only) ────────────
                 // A command flagged destructive pauses for the user's OK before
-                // it runs. User-typed `$` commands are never gated. A denial
-                // skips execution and tells the model the user declined.
+                // it runs. User-typed `$` commands meet only the secret guard.
+                // A denial skips execution and tells the model the user
+                // declined. The secret guard asks first (#819): a thread's
+                // "don't ask again" covers the destructive check, never it.
                 let mut denied: Option<String> = None;
                 if u.name == "run_command" {
                     let command = u.input.get("command").and_then(|c| c.as_str()).unwrap_or("");
-                    if let Some(reason) = dangerous_command(command) {
+                    denied = guard_agent_command(
+                        &self.approvals,
+                        &app,
+                        &request.workspace_id,
+                        &request.thread_id,
+                        &u.id,
+                        command,
+                        &request.workspace_path,
+                        None,
+                    )
+                    .await;
+                    if let Some(reason) = dangerous_command(command).filter(|_| denied.is_none()) {
                         match self
                             .await_approval(
                                 &app,
@@ -3904,6 +4053,39 @@ mod tests {
         );
         assert!(!ok, "a readonly mission refuses even an in-workspace write: {msg}");
         assert!(!wp.join("in_workspace.txt").exists(), "nothing was written");
+    }
+
+    #[test]
+    fn a_secret_card_never_grants_dont_ask_again() {
+        let broker = ApprovalBroker::default();
+        // "Always" on a secret card acts as one approval and grants nothing.
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, true), ApprovalDecision::Approve);
+        assert!(!broker.auto_approves("t"));
+        assert_eq!(broker.record("t", ApprovalDecision::Deny, true), ApprovalDecision::Deny);
+        // On a destructive-command card it still grants the thread.
+        assert_eq!(broker.record("t", ApprovalDecision::ApproveAlways, false), ApprovalDecision::ApproveAlways);
+        assert!(broker.auto_approves("t"));
+    }
+
+    #[test]
+    fn secret_gate_texts_name_kind_and_place_never_a_value() {
+        let (card, denial) = secret_gate_texts(None, "Anthropic API key in a.ts:3");
+        assert_eq!(card, "possible secret \u{b7} Anthropic API key in a.ts:3");
+        assert!(denial.contains("Anthropic API key in a.ts:3") && denial.contains("do not retry"));
+        let (card, _) = secret_gate_texts(Some("Ship it"), "GitHub token in b.ts:1");
+        assert!(card.starts_with("Sub-agent \u{201c}Ship it\u{201d}: possible secret"));
+    }
+
+    #[test]
+    fn approval_event_marks_a_secret_card_only_when_it_is_one() {
+        let ev = |secret, covers_uncommitted| ApprovalRequestEvent {
+            workspace_id: "w".into(), thread_id: "t".into(), call_id: "c".into(),
+            command: "git commit".into(), reason: "r".into(), secret, covers_uncommitted,
+        };
+        let plain = serde_json::to_value(ev(false, false)).unwrap();
+        assert!(plain.get("secret").is_none() && plain.get("coversUncommitted").is_none());
+        let s = serde_json::to_value(ev(true, true)).unwrap();
+        assert_eq!((s["secret"].as_bool(), s["coversUncommitted"].as_bool()), (Some(true), Some(true)));
     }
 
     #[test]
