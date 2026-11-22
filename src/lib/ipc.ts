@@ -593,6 +593,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
@@ -904,7 +905,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────

@@ -696,14 +696,14 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     ))}
                   </ul>
                   <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
-                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is shared state: an install in one mission changes it for every mission. Copies stay git-ignored, so they never stage.
+                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is shared state: an install in one mission changes it for every mission. Copies stay git-ignored, so they never stage. To keep a link out of commits, Octopush adds its name to this repo&apos;s local .git/info/exclude, where it stays.
                   </div>
                   {execIsolation === "sandbox" && shareList.some((r) => r.kind === "link" && r.checked) && (
                     <div
                       data-tour="mission-share-sandbox"
                       className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
                     >
-                      A sandboxed mission gets the copies but no links, so nothing points its agents outside the worktree.
+                      A sandboxed mission gets the copies but no links, so nothing points its agents outside the worktree. Turning the sandbox on later removes a mission&apos;s links.
                     </div>
                   )}
                 </div>

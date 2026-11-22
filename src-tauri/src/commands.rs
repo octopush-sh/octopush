@@ -992,6 +992,27 @@ pub(crate) fn share_into_fresh_worktree(
     ))
 }
 
+/// When a mission's Execution becomes `sandbox`, remove the links "Share with
+/// new missions" made in its worktree (`worktree_share::unlink`): the sandbox
+/// would refuse reads and writes through them. Returns the names removed.
+pub(crate) fn unshare_links_for_sandbox(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: Option<&str>,
+) -> Vec<String> {
+    let Some(ws_id) = workspace_id else { return Vec::new() };
+    let found = {
+        let db = db.lock();
+        let ws = db.get_workspace(ws_id).ok().flatten();
+        let root = ws
+            .as_ref()
+            .and_then(|w| db.get_project(&w.project_id).ok().flatten())
+            .map(|p| expand_tilde(&p.path));
+        ws.and_then(|w| w.worktree_path).zip(root)
+    };
+    let Some((wt, root)) = found else { return Vec::new() };
+    crate::worktree_share::unlink(std::path::Path::new(&root), std::path::Path::new(&wt))
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
@@ -1051,7 +1072,17 @@ pub async fn create_workspace(
     }
     install_claude_hooks_later(state.inner(), ws.clone());
     // Links and copies land before the setup script, which can use them.
-    let shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    let mut shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    // A reused worktree reopened as a sandboxed mission drops its old links.
+    if exec_isolation == "sandbox" && outcome != crate::workspace::CreateOutcome::Created {
+        let removed = unshare_links_for_sandbox(&state.db, Some(&ws.id));
+        if !removed.is_empty() {
+            shared = Some(crate::worktree_share::ShareOutcome {
+                skipped: removed.iter().map(|n| format!("{n}: link removed in a sandboxed mission")).collect(),
+                ..Default::default()
+            });
+        }
+    }
     let shared_line = shared.as_ref().and_then(|s| s.summary());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
@@ -1113,6 +1144,16 @@ pub async fn create_mission(
     )
 }
 
+/// `update_mission`'s response: the mission, plus the links removed from its
+/// worktree when its Execution became `sandbox` (`unshare_links_for_sandbox`).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedMission {
+    #[serde(flatten)]
+    pub mission: crate::db::MissionRow,
+    pub unlinked: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn update_mission(
     state: State<'_, AppState>,
@@ -1121,7 +1162,7 @@ pub async fn update_mission(
     status: Option<String>,
     linked_issue_key: Option<String>,
     exec_isolation: Option<String>,
-) -> AppResult<crate::db::MissionRow> {
+) -> AppResult<UpdatedMission> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
     }
@@ -1155,7 +1196,12 @@ pub async fn update_mission(
             archive_workspace_internal(&state, ws_id)?;
         }
     }
-    Ok(updated)
+    let unlinked = if exec_isolation.as_deref() == Some("sandbox") {
+        unshare_links_for_sandbox(&state.db, updated.workspace_id.as_deref())
+    } else {
+        Vec::new()
+    };
+    Ok(UpdatedMission { mission: updated, unlinked })
 }
 
 /// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,

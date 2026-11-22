@@ -240,6 +240,13 @@ export interface Mission {
   archivedAt: string | null;
 }
 
+/** `update_mission`'s response: the mission, plus the links "Share with new
+ *  missions" made that were removed from its worktree because its Execution
+ *  became `sandbox`. */
+export interface UpdatedMission extends Mission {
+  unlinked?: string[];
+}
+
 // ─── Logbook ──────────────────────────────────────────────────────
 
 export interface LogbookSurfaceSecs {

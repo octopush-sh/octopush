@@ -65,3 +65,13 @@ export function shareToasts(o: ShareOutcome | null | undefined, hasSetupTerminal
   }
   return out;
 }
+
+/** The "Sandbox enabled" toast's body. Turning the sandbox on removes the
+ *  folders linked from the main checkout (`unlinked`), which the sandbox
+ *  couldn't read or write through. */
+export function sandboxOnBody(unlinked: string[] | undefined): string {
+  const base = "Agent writes are now confined to the workspace.";
+  if (!unlinked?.length) return base;
+  const many = unlinked.length > 1;
+  return `${base} Removed the link${many ? "s" : ""} to the main checkout's ${unlinked.join(", ")}; install inside this mission if it needs ${many ? "them" : "it"}.`;
+}

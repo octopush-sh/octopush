@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { sameSpec, shareRows, shareSummary, shareToasts, specFromRows } from "./shareWithMissions";
+import { sandboxOnBody, sameSpec, shareRows, shareSummary, shareToasts, specFromRows } from "./shareWithMissions";
 
 describe("shareRows", () => {
   it("lists links then copies, checked only where the project already shares them", () => {
@@ -57,5 +57,16 @@ describe("shareSummary / shareToasts", () => {
     expect(toasts).toEqual([
       { level: "warning", title: "Some entries weren't shared", body: "node_modules: not linked in a sandboxed mission" },
     ]);
+  });
+});
+
+describe("sandboxOnBody", () => {
+  it("names the links the sandbox removed, and stays plain when there were none", () => {
+    expect(sandboxOnBody(undefined)).toBe("Agent writes are now confined to the workspace.");
+    expect(sandboxOnBody([])).toBe("Agent writes are now confined to the workspace.");
+    expect(sandboxOnBody(["node_modules"])).toBe(
+      "Agent writes are now confined to the workspace. Removed the link to the main checkout's node_modules; install inside this mission if it needs it.",
+    );
+    expect(sandboxOnBody(["node_modules", ".venv"])).toContain("node_modules, .venv; install inside this mission if it needs them.");
   });
 });

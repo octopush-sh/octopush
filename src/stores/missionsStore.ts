@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { ipc } from "../lib/ipc";
-import type { Mission } from "../lib/types";
+import type { Mission, UpdatedMission } from "../lib/types";
 
 /**
  * Missions store. Missions are the first-level unit of intent; a code mission
@@ -32,8 +32,9 @@ interface MissionsState {
     linkedIssueKey: string | null,
   ) => Promise<Mission>;
   /** Set a mission's execution isolation in place (e.g. the launcher's
-   *  one-click "enable sandbox" for an unattended run). */
-  setExecIsolation: (missionId: string, execIsolation: string) => Promise<Mission>;
+   *  one-click "enable sandbox" for an unattended run). Turning the sandbox on
+   *  removes the worktree's shared links; `unlinked` names them. */
+  setExecIsolation: (missionId: string, execIsolation: string) => Promise<UpdatedMission>;
   archive: (missionId: string) => Promise<void>;
 }
 

@@ -25,7 +25,8 @@
 //! Seatbelt would refuse writes through it but Claude Code's read guard
 //! (`cli_runner::CLAUDE_SANDBOXED_STAGE_SETTINGS`) would refuse reads through
 //! it too, and widening either for a shared folder isn't worth it. Copies
-//! still apply: they are ordinary files inside the worktree.
+//! still apply: they are ordinary files inside the worktree. A mission whose
+//! Execution later becomes `sandbox` loses the links it got ([`unlink`]).
 //!
 //! Only a freshly created worktree is touched (like the setup script), and
 //! nothing already in the worktree is replaced.
@@ -284,6 +285,41 @@ pub fn apply(root: &Path, worktree: &Path, spec: &ShareSpec, sandboxed: bool) ->
     out
 }
 
+/// Whether `link` is a symlink to the main checkout's `src` (as [`apply`]
+/// made it: the same path, or one that resolves to the same folder).
+fn links_to(link: &Path, src: &Path) -> bool {
+    let is_link = std::fs::symlink_metadata(link).map(|m| m.file_type().is_symlink()).unwrap_or(false);
+    let Ok(target) = std::fs::read_link(link) else { return false };
+    is_link
+        && (target == src
+            || matches!(
+                (std::fs::canonicalize(link), std::fs::canonicalize(src)),
+                (Ok(a), Ok(b)) if a == b
+            ))
+}
+
+/// Remove the links [`apply`] made in `worktree`, for a mission whose
+/// Execution became `sandbox`: each [`LINK_CANDIDATES`] entry that is a
+/// symlink to the main checkout `root`'s folder of the same name. A real
+/// folder, a copy, or a link elsewhere is left alone, and so is `root` itself.
+/// Returns the names removed.
+pub fn unlink(root: &Path, worktree: &Path) -> Vec<String> {
+    if worktree == root {
+        return Vec::new();
+    }
+    let mut removed = Vec::new();
+    for name in LINK_CANDIDATES {
+        let (src, dest) = (root.join(name), worktree.join(name));
+        if links_to(&dest, &src) {
+            match std::fs::remove_file(&dest) {
+                Ok(()) => removed.push(name.to_string()),
+                Err(e) => tracing::warn!(error = %e, name = %name, "share: couldn't remove a link"),
+            }
+        }
+    }
+    removed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,6 +439,29 @@ mod tests {
         assert_eq!(out.copied, vec![".env".to_string()]);
         assert_eq!(out.skipped, vec!["node_modules: not linked in a sandboxed mission".to_string()]);
         assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unlink_removes_only_the_links_to_the_main_checkout() {
+        let (_tmp, root, wt) = repo("node_modules\n.venv\n.env\n");
+        let spec = ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] };
+        assert_eq!(apply(&root, &wt, &spec, false).linked, vec!["node_modules".to_string()]);
+        // A `.venv` linked somewhere else is the user's, not ours.
+        let elsewhere = root.parent().unwrap().join("other-venv");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, wt.join(".venv")).unwrap();
+        assert_eq!(unlink(&root, &wt), vec!["node_modules".to_string()]);
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(root.join("node_modules/left-pad/index.js").exists(), "the main checkout's folder stays");
+        assert!(std::fs::symlink_metadata(wt.join(".venv")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "SECRET=1\n");
+        // A real folder of that name is never removed, nor the main checkout's own.
+        std::fs::create_dir(wt.join("node_modules")).unwrap();
+        assert!(unlink(&root, &wt).is_empty());
+        assert!(wt.join("node_modules").is_dir());
+        assert!(unlink(&root, &root).is_empty());
+        assert!(root.join("node_modules").is_dir());
     }
 
     #[cfg(unix)]
