@@ -5779,6 +5779,9 @@ pub async fn ensure_pr_branch(
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
 async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return None;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
@@ -5840,9 +5843,10 @@ async fn gh_check_runs(
     repo: &str,
     sha: Option<&str>,
 ) -> Option<Vec<serde_json::Value>> {
-    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let (cmd, path) = crate::github::gh_check_runs_command(owner, repo, sha?)?;
     let output = tokio::process::Command::new(shell)
-        .arg("-l").arg("-c").arg(&cmd)
+        .arg("-l").arg("-c").arg(cmd)
+        .env(crate::github::GH_API_PATH_ENV, path)
         .current_dir(workspace_path)
         .output()
         .await
