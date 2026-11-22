@@ -13,6 +13,8 @@ vi.mock("../lib/ipc", () => ({
     createWorkspace: vi.fn(),
     setProjectSetupScript: vi.fn().mockResolvedValue(undefined),
     conductorSetupScript: vi.fn().mockResolvedValue(null),
+    shareWithMissions: vi.fn(),
+    setShareWithMissions: vi.fn().mockResolvedValue(undefined),
     listBranches: vi.fn(),
     listPrs: vi.fn(),
     ensurePrBranch: vi.fn(),
@@ -76,10 +78,88 @@ beforeEach(() => {
   localStorage.clear();
   useCompanionPrefs.setState({ setupScriptByProject: {} });
   vi.mocked(ipcModule.ipc.conductorSetupScript).mockResolvedValue(null);
+  vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+    saved: { link: [], copy: [] },
+    available: { link: [], copy: [] },
+  });
+  vi.mocked(ipcModule.ipc.setShareWithMissions).mockResolvedValue(undefined);
   vi.mocked(useWorkspaceStore).mockReturnValue(vi.fn().mockResolvedValue(mockWorkspace));
   vi.mocked(ipcModule.ipc.listBranches).mockResolvedValue({
     local: ["main", "release/1.0"],
     remote: ["origin/dev"],
+  });
+});
+
+describe("MissionCreator · Share with new missions", () => {
+  function offer() {
+    vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+      saved: { link: [], copy: [] },
+      available: { link: ["node_modules"], copy: [".env"] },
+    });
+  }
+
+  it("shows nothing when the main checkout has nothing to share", async () => {
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    await screen.findByText("Begin the mission");
+    expect(screen.queryByText("SHARE WITH NEW MISSIONS")).not.toBeInTheDocument();
+  });
+
+  it("offers what the checkout has, all off, and saves the choice before the worktree is made", async () => {
+    offer();
+    const order: string[] = [];
+    vi.mocked(ipcModule.ipc.setShareWithMissions).mockImplementation(async () => {
+      order.push("save");
+    });
+    const mockCreate = vi.fn().mockImplementation(async () => {
+      order.push("create");
+      return mockWorkspace;
+    });
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    const link = await screen.findByRole("switch", { name: "Link node_modules into new missions" });
+    const copy = screen.getByRole("switch", { name: "Copy .env into new missions" });
+    expect(link).toHaveAttribute("aria-checked", "false");
+    expect(copy).toHaveAttribute("aria-checked", "false");
+    expect(screen.getByText(/A linked folder is shared state/)).toBeInTheDocument();
+    fireEvent.click(link);
+    fireEvent.click(screen.getByText("Begin the mission"));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
+    expect(ipcModule.ipc.setShareWithMissions).toHaveBeenCalledWith("proj-1", { link: ["node_modules"], copy: [] });
+    expect(order).toEqual(["save", "create"]);
+  });
+
+  it("doesn't write an unchanged list", async () => {
+    vi.mocked(ipcModule.ipc.shareWithMissions).mockResolvedValue({
+      saved: { link: [], copy: [".env"] },
+      available: { link: [], copy: [".env"] },
+    });
+    const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    expect(await screen.findByRole("switch", { name: "Copy .env into new missions" })).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(screen.getByText("Begin the mission"));
+    await waitFor(() => expect(mockCreate).toHaveBeenCalled());
+    expect(ipcModule.ipc.setShareWithMissions).not.toHaveBeenCalled();
+  });
+
+  it("a failed save stops before the mission is created", async () => {
+    offer();
+    vi.mocked(ipcModule.ipc.setShareWithMissions).mockRejectedValue("db locked");
+    const mockCreate = vi.fn().mockResolvedValue(mockWorkspace);
+    vi.mocked(useWorkspaceStore).mockReturnValue(mockCreate);
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    fireEvent.click(await screen.findByRole("switch", { name: "Copy .env into new missions" }));
+    fireEvent.click(screen.getByText("Begin the mission"));
+    expect(await screen.findByText(/Couldn't save what this project shares with new missions: db locked/)).toBeInTheDocument();
+    expect(mockCreate).not.toHaveBeenCalled();
   });
 });
 

@@ -187,6 +187,31 @@ export interface CreatedWorkspace extends Workspace {
   setupTerminalId: string | null;
   /** Why the setup script couldn't be started; the workspace itself is fine. */
   setupError: string | null;
+  /** What the fresh worktree borrowed from the main checkout; null (or absent)
+   *  when the project shares nothing or the worktree wasn't fresh. */
+  shared?: ShareOutcome | null;
+}
+
+/** "Share with new missions" (#961): dependency folders to link from the main
+ *  checkout and local env files to copy, each a name at the repo root. */
+export interface ShareSpec {
+  link: string[];
+  copy: string[];
+}
+
+/** `share_with_missions`: what the project shares now, and what its main
+ *  checkout could share (present and git-ignored there). */
+export interface ShareOptions {
+  saved: ShareSpec;
+  available: ShareSpec;
+}
+
+/** What applying a project's ShareSpec did to a fresh worktree. */
+export interface ShareOutcome {
+  linked: string[];
+  copied: string[];
+  /** One sentence per entry left out ("node_modules: not linked in a sandboxed mission"). */
+  skipped: string[];
 }
 
 // ─── Missions ─────────────────────────────────────────────────────

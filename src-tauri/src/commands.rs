@@ -834,6 +834,9 @@ pub struct CreatedWorkspace {
     pub setup_terminal_id: Option<String>,
     /// Why the setup script couldn't be started. The workspace itself is fine.
     pub setup_error: Option<String>,
+    /// What the fresh worktree borrowed from the main checkout (#961); `None`
+    /// when the project shares nothing or the worktree wasn't fresh.
+    pub shared: Option<crate::worktree_share::ShareOutcome>,
 }
 
 /// Start `script` in a new `setup` Run terminal in `ws`'s worktree. The PTY
@@ -844,6 +847,7 @@ fn start_setup_terminal(
     ws: &crate::db::WorkspaceRow,
     project_root: &str,
     script: &str,
+    shared: Option<String>,
 ) -> AppResult<String> {
     use crate::workspace_setup as setup;
     let cwd = ws
@@ -854,7 +858,10 @@ fn start_setup_terminal(
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
     // The script, plus Conductor's variables for every setup script, so scripts
     // written for Conductor work unchanged (the runner skips any the user exports).
-    let env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    let mut env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    if let Some(line) = shared {
+        env.insert(setup::SHARED_ENV.to_string(), line);
+    }
     if let Err(e) = spawn_terminal_session(
         app.clone(),
         state,
@@ -917,6 +924,74 @@ pub async fn conductor_setup_script(
     .flatten())
 }
 
+/// The step-3 "Share with new missions" list: what the project shares now
+/// (`saved`) and what its main checkout could share (`available`, see
+/// `worktree_share::candidates`). The repo is the project's path in the DB,
+/// never a path the caller sends.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareOptions {
+    pub saved: crate::worktree_share::ShareSpec,
+    pub available: crate::worktree_share::ShareSpec,
+}
+
+#[tauri::command]
+pub async fn share_with_missions(state: State<'_, AppState>, project_id: String) -> AppResult<ShareOptions> {
+    let (saved, root) = {
+        let db = state.db.lock();
+        let saved = db.get_project_share(&project_id)?;
+        let root = db.get_project_by_id(&project_id)?.map(|(_, _, path)| expand_tilde(&path));
+        (saved, root)
+    };
+    let available = match root {
+        Some(root) => tauri::async_runtime::spawn_blocking(move || {
+            crate::worktree_share::candidates(std::path::Path::new(&root))
+        })
+        .await
+        .unwrap_or_default(),
+        None => crate::worktree_share::ShareSpec::default(),
+    };
+    Ok(ShareOptions { saved, available })
+}
+
+/// Remember what the project shares with new missions (sanitized: only the
+/// allowed link and copy names are kept).
+#[tauri::command]
+pub async fn set_share_with_missions(
+    state: State<'_, AppState>,
+    project_id: String,
+    spec: crate::worktree_share::ShareSpec,
+) -> AppResult<()> {
+    state.db.lock().set_project_share(&project_id, &spec)
+}
+
+/// Apply the project's "Share with new missions" list to a freshly created
+/// worktree — never a reused, restored or adopted one, nor the main checkout.
+/// A sandboxed mission gets its copies but no links (`worktree_share`).
+pub(crate) fn share_into_fresh_worktree(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    outcome: crate::workspace::CreateOutcome,
+    project_id: &str,
+    project_root: &str,
+    ws: &crate::db::WorkspaceRow,
+    exec_isolation: &str,
+) -> Option<crate::worktree_share::ShareOutcome> {
+    if outcome != crate::workspace::CreateOutcome::Created {
+        return None;
+    }
+    let wt = ws.worktree_path.as_deref()?;
+    let spec = db.lock().get_project_share(project_id).ok()?;
+    if spec.is_empty() || std::path::Path::new(wt) == std::path::Path::new(project_root) {
+        return None;
+    }
+    Some(crate::worktree_share::apply(
+        std::path::Path::new(project_root),
+        std::path::Path::new(wt),
+        &spec,
+        exec_isolation == "sandbox",
+    ))
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
@@ -975,11 +1050,14 @@ pub async fn create_workspace(
         }
     }
     install_claude_hooks_later(state.inner(), ws.clone());
+    // Links and copies land before the setup script, which can use them.
+    let shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    let shared_line = shared.as_ref().and_then(|s| s.summary());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
         if crate::workspace_setup::should_run(outcome, &setup_script) {
-            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script, shared_line) {
                 Ok(id) => (Some(id), None),
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");
@@ -989,7 +1067,7 @@ pub async fn create_workspace(
         } else {
             (None, None)
         };
-    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error })
+    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error, shared })
 }
 
 // ─── Mission commands ─────────────────────────────────────────────

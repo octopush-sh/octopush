@@ -5,7 +5,8 @@ import { BaseBranchPicker } from "./BaseBranchPicker";
 import { PrPicker } from "./PrPicker";
 import { Reveal } from "./primitives/Reveal";
 import { Listbox } from "./controls/Listbox";
-import type { PrInfo } from "../lib/types";
+import { TogglePill } from "./controls/TogglePill";
+import type { PrInfo, ShareSpec } from "../lib/types";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { moveMissionToGroup } from "../lib/groupActions";
@@ -16,6 +17,7 @@ import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
 import { SETUP_FIELD_ROWS, conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
+import { type ShareRow, sameSpec, shareRows, specFromRows } from "../lib/shareWithMissions";
 
 interface Props {
   projectId: string;
@@ -106,6 +108,10 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
   const [conductorScript, setConductorScript] = useState<string | null>(null);
   /** Set once the user types in the field: a late prefill never overwrites it. */
   const setupEditedRef = useRef(false);
+  /** "Share with new missions": the main checkout's dependency folders and
+   *  env files, checked where the project shares them (opt-in). */
+  const [shareList, setShareList] = useState<ShareRow[]>([]);
+  const savedShareRef = useRef<ShareSpec>({ link: [], copy: [] });
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [branches, setBranches] = useState<string[]>([]);
@@ -138,6 +144,23 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
         if (cancelled || !script?.trim() || setupEditedRef.current) return;
         setSetupScript(script);
         setConductorScript(script);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectId]);
+
+  // What the main checkout could share, and what the project already shares.
+  // Fails quietly — the section just doesn't show.
+  useEffect(() => {
+    let cancelled = false;
+    ipc
+      .shareWithMissions(projectId)
+      .then((opts) => {
+        if (cancelled || !opts) return;
+        savedShareRef.current = opts.saved;
+        setShareList(shareRows(opts));
       })
       .catch(() => {});
     return () => {
@@ -255,6 +278,19 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
       : fromPr
         ? "pr"
         : gitIsolation;
+    // The share list is a project setting the backend applies while it makes
+    // the worktree, so it is saved first; a failed save stops here.
+    const shareSpec = specFromRows(shareList);
+    if (!sameSpec(shareSpec, savedShareRef.current)) {
+      try {
+        await ipc.setShareWithMissions(projectId, shareSpec);
+        savedShareRef.current = shareSpec;
+      } catch (e) {
+        setError(`Couldn't save what this project shares with new missions: ${String(e)}`);
+        setCreating(false);
+        return;
+      }
+    }
     let newWs;
     try {
       newWs = await create(
@@ -631,6 +667,47 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
               >
                 Saved as this project&apos;s setup script: new missions start from it, and a Routine&apos;s fresh workspace runs it before its crew.
               </div>
+
+              {shareList.length > 0 && (
+                <div data-tour="mission-share" className="octo-rise-in mt-8">
+                  <div className="mb-2 font-mono text-[9px] uppercase tracking-[0.25em] text-octo-mute">
+                    SHARE WITH NEW MISSIONS
+                  </div>
+                  <ul className="m-0 list-none p-0">
+                    {shareList.map((row) => (
+                      <li key={`${row.kind}:${row.name}`} className="flex items-center gap-3 py-1">
+                        <span className="font-mono text-[12px] text-octo-ivory">{row.name}</span>
+                        <span className="font-mono text-[10px] text-octo-mute">
+                          {row.kind === "link" ? "linked from the main checkout" : "copied into the worktree"}
+                        </span>
+                        <span className="ml-auto">
+                          <TogglePill
+                            on={row.checked}
+                            label={row.kind === "link" ? "Link" : "Copy"}
+                            ariaLabel={`${row.kind === "link" ? "Link" : "Copy"} ${row.name} into new missions`}
+                            onChange={(on) =>
+                              setShareList((cur) =>
+                                cur.map((r) => (r.kind === row.kind && r.name === row.name ? { ...r, checked: on } : r)),
+                              )
+                            }
+                          />
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
+                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is shared state: an install in one mission changes it for every mission. Copies stay git-ignored, so they never stage.
+                  </div>
+                  {execIsolation === "sandbox" && shareList.some((r) => r.kind === "link" && r.checked) && (
+                    <div
+                      data-tour="mission-share-sandbox"
+                      className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
+                    >
+                      A sandboxed mission gets the copies but no links, so nothing points its agents outside the worktree.
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {error && (
