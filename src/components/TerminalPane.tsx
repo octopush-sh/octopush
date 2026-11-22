@@ -7,6 +7,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { attachOsc52Clipboard } from "../lib/osc52";
+import { registerTerminalBuffer } from "../lib/terminalBuffers";
 import type {
   PtyAttentionEvent,
   PtyDataEvent,
@@ -226,6 +227,19 @@ export function TerminalPane({
     termRef.current = term;
     fitRef.current = fit;
     fontSizeRef.current = ZOOM_DEFAULT;
+    // Talk's `@session` reads what this session shows (lib/terminalBuffers).
+    const unregisterBuffer = registerTerminalBuffer(terminalId, () => {
+      const buf = term.buffer.active;
+      const lines: string[] = [];
+      for (let i = 0; i < buf.length; i++) {
+        const line = buf.getLine(i);
+        const text = line?.translateToString(true) ?? "";
+        // A soft-wrapped row continues the line above it.
+        if (line?.isWrapped && lines.length > 0) lines[lines.length - 1] += text;
+        else lines.push(text);
+      }
+      return lines;
+    });
 
     // Follow Octopush theme switches: themeStore.applyThemeToDom fires
     // `octo:theme` after writing the new tokens to :root. xterm can't read
@@ -670,6 +684,7 @@ export function TerminalPane({
       copyEl.removeEventListener("contextmenu", onContextMenu);
       copyEl.removeEventListener("mousedown", onMouseDownCapture, true);
       copyEl.removeEventListener("wheel", onWheel);
+      unregisterBuffer();
       term.dispose();
       termRef.current = null;
       fitRef.current = null;

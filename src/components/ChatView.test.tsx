@@ -11,7 +11,7 @@
  * specific DOM content.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
 type EventHandler = (ev: { payload: unknown }) => void;
@@ -773,5 +773,76 @@ describe("ChatView — /skill menu and inline highlight", () => {
     expect("skill" in req).toBe(false);
     expect(ta.value).toBe("");
     expect(screen.queryByTestId("skill-highlight")).toBeNull();
+  });
+});
+
+describe("ChatView — context mentions (#962)", () => {
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(["src/a.ts", "src/lib/b.ts"]);
+    vi.mocked(ipcMock.readFileChecked).mockResolvedValue({
+      kind: "text", content: "1\n2\n3\n4\n5", size: 9, mtime: 0,
+    });
+  });
+
+  function getTextarea() {
+    return screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+  }
+
+  it("shows a removable chip with its token estimate for a line range, and removing it edits the draft", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "why @src/a.ts#L2-3 fails" } });
+    const chip = await screen.findByText("a.ts#L2-3");
+    await waitFor(() =>
+      expect(chip.closest("[data-tour='talk-context-chip']")?.getAttribute("title")).toMatch(/≈ \d+ tokens/),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove @src/a.ts#L2-3" }));
+    expect(ta.value).toBe("why fails");
+    expect(screen.queryByText("a.ts#L2-3")).toBeNull();
+  });
+
+  it("sends only the range's lines", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "explain @src/a.ts#L2-3" } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toBe("explain @src/a.ts#L2-3\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```");
+  });
+
+  it("appends a range handed over from Review to the draft", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "look at" } });
+    act(() => useChatStore.getState().queueDraftInsert("ws-1", "@src/a.ts#L4-5 "));
+    expect(ta.value).toBe("look at @src/a.ts#L4-5 ");
+    expect(useChatStore.getState().draftInsertByWs["ws-1"]).toBeUndefined();
+    expect(await screen.findByText("a.ts#L4-5")).toBeInTheDocument();
+  });
+
+  it("offers folders and the diff in the @ popover, and closes it while a range is typed", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "@", selectionStart: 1, selectionEnd: 1 } });
+    const list = await screen.findByRole("listbox", { name: "Worktree files" });
+    expect(list.textContent).toContain("Add context");
+    expect(list.textContent).toContain("diff");
+    expect(list.textContent).toContain("src/");
+    fireEvent.change(ta, { target: { value: "@src/a.ts#L1", selectionStart: 12, selectionEnd: 12 } });
+    expect(screen.queryByRole("listbox", { name: "Worktree files" })).toBeNull();
   });
 });

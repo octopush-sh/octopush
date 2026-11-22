@@ -1,9 +1,14 @@
+import { MessageSquareText } from "lucide-react";
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 
 interface Props {
   line: number;
   col: number;
   selectionCount: number;
+  /** The main selection's lines; null when nothing is selected. */
+  selectionLines?: { from: number; to: number } | null;
+  /** Hand the selection to Talk ("Ask Talk about this"). */
+  onAskTalk?: () => void;
   lang: string;
   /** Disk changed (or file deleted) under unsaved local edits. */
   diskStale?: boolean;
@@ -17,7 +22,9 @@ const SEG =
 const CLICK =
   "transition-colors hover:bg-octo-panel hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
 
-export function EditorStatusBar({ line, col, selectionCount, lang, diskStale, blameSavedNote }: Props) {
+export function EditorStatusBar({
+  line, col, selectionCount, selectionLines, onAskTalk, lang, diskStale, blameSavedNote,
+}: Props) {
   const wrap = useEditorPrefs((s) => s.wrap);
   const lineNumbers = useEditorPrefs((s) => s.lineNumbers);
   const tabWidth = useEditorPrefs((s) => s.tabWidth);
@@ -41,6 +48,23 @@ export function EditorStatusBar({ line, col, selectionCount, lang, diskStale, bl
 
       {selectionCount > 1 && (
         <div className={`${SEG} text-octo-brass`}>{selectionCount} selections</div>
+      )}
+
+      {selectionLines && onAskTalk && (
+        <button
+          type="button"
+          data-tour="review-editor-ask-talk"
+          onClick={onAskTalk}
+          title={
+            selectionLines.from === selectionLines.to
+              ? `Ask Talk about line ${selectionLines.from}`
+              : `Ask Talk about lines ${selectionLines.from}–${selectionLines.to}`
+          }
+          className={`${SEG} ${CLICK} octo-pop-in text-octo-brass`}
+        >
+          <MessageSquareText size={11} aria-hidden />
+          Ask Talk about this
+        </button>
       )}
 
       {blameSavedNote && (

@@ -33,6 +33,21 @@ describe("EditorStatusBar", () => {
     expect(screen.getByText("rust")).toBeInTheDocument();
   });
 
+  it("offers Ask Talk about this only while text is selected", async () => {
+    const onAskTalk = vi.fn();
+    const { rerender } = render(
+      <EditorStatusBar line={1} col={1} selectionCount={1} selectionLines={null} onAskTalk={onAskTalk} lang="ts" />,
+    );
+    expect(screen.queryByText("Ask Talk about this")).not.toBeInTheDocument();
+    rerender(
+      <EditorStatusBar line={1} col={1} selectionCount={1} selectionLines={{ from: 5, to: 10 }} onAskTalk={onAskTalk} lang="ts" />,
+    );
+    const btn = screen.getByRole("button", { name: /Ask Talk about this/ });
+    expect(btn).toHaveAttribute("title", "Ask Talk about lines 5–10");
+    await userEvent.click(btn);
+    expect(onAskTalk).toHaveBeenCalledTimes(1);
+  });
+
   it("shows selection count only when more than one selection", () => {
     const { rerender } = render(
       <EditorStatusBar line={1} col={1} selectionCount={1} lang="rust" />,
