@@ -29,7 +29,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { makeGh, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, isPrivateLane, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, isPrivateLane, markPrivate, safeError, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { humanOnlyFor } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
@@ -109,8 +109,14 @@ const botIdentity = (env = process.env) => {
 // Never run hooks, fsmonitor or filters from anything the agent could have written.
 const SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never"];
 
+// A private lane: git's stderr is captured, never inherited — its warnings and
+// errors name files ("could not open directory …", "adding embedded git
+// repository: …"). The step that failed is all that is reported (privateFailure).
+let QUIET = false;
+let STAGE = "start";
 function git(gitDir, args, opts = {}) {
-  return execFileSync("git", [...SAFE, `--git-dir=${gitDir}`, `--work-tree=${process.cwd()}`, ...args], { encoding: "utf8", ...opts });
+  return execFileSync("git", [...SAFE, `--git-dir=${gitDir}`, `--work-tree=${process.cwd()}`, ...args],
+    { encoding: "utf8", ...(QUIET ? { stdio: ["pipe", "pipe", "pipe"] } : {}), ...opts });
 }
 
 /**
@@ -151,11 +157,15 @@ async function main() {
   const gitDir = process.env.OCTOPUSH_GIT_DIR;
   const web = repo === WEB_REPO;
   if (!repo) throw new Error("OCTOPUSH_PUBLISH_REPO or GITHUB_REPOSITORY is required");
+  markPrivate(repo);
   // The repo's own token: the App's installation token for octopush-web and epiku, GH_TOKEN here.
   const tokenEnv = tokenEnvFor(repo) ?? "GH_TOKEN";
   const token = process.env[tokenEnv];
   if (!gitDir || !token) throw new Error(`OCTOPUSH_GIT_DIR and ${tokenEnv} are required`);
   if (kind === "app-issue" && !web) throw new Error("app-issue jobs are built in octopush-web");
+  // A private lane's merge guard accepts only commits by the App's bot (automerge.mjs commitsByBot):
+  // never fall back to another commit identity there.
+  if (isPrivateLane(repo) && botIdentity().some((a) => a.includes("github-actions[bot]"))) throw safeError("OCTOPUSH_GIT_NAME and OCTOPUSH_GIT_EMAIL (the App bot's commit identity) are required");
   if (web && !process.env.GH_TOKEN) throw new Error("GH_TOKEN (the app repo) is required for web jobs");
   // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
@@ -167,13 +177,16 @@ async function main() {
 }
 
 /**
- * A failed command's message carries its whole command line — for `git commit`
- * that includes the PR title. For a private repo only its exit status may reach
- * this public repo's log (pure).
+ * A failed command's message carries its whole command line and its stderr —
+ * for `git commit` that includes the PR title, for `git add` file names. For a
+ * private repo only the step that failed (a fixed word) and the exit status
+ * may reach this public repo's log (pure).
  */
-export function privateFailure(e) {
-  const how = Number.isInteger(e?.status) ? `a command exited ${e.status}` : "a step failed";
-  return new Error(`publishing to a private repo failed: ${how} (details withheld from this public log)`);
+export const STAGES = ["start", "result", "status", "stage", "commit", "push", "github"];
+export function privateFailure(e, stage = STAGE) {
+  const at = STAGES.includes(stage) ? stage : "start";
+  const how = Number.isInteger(e?.status) ? `exit ${e.status}` : "error";
+  return safeError(`publishing to a private repo failed at ${at} (${how}); details withheld from this public log`);
 }
 
 /**
@@ -181,6 +194,8 @@ export function privateFailure(e) {
  * checkout). `pushUrl` is only for tests (a local bare repo).
  */
 export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, appGh = gh, pushUrl }) {
+  QUIET = isPrivateLane(repo);
+  STAGE = "result";
   // Where the job's issue lives: an app-issue job's issue is in the app repo.
   const [jobGh, jobRepo] = kind === "app-issue" ? [appGh, APP_REPO] : [gh, repo];
   const file = join(".agent-out", "result.json");
@@ -193,6 +208,7 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
 
   // The path checks run on ALL changed paths first; caches are dropped only
   // after (the secret scan reads only what will be committed).
+  STAGE = "status";
   const entries = changedPaths(gitDir);
   const all = entries.map((e) => e.path);
   if (!all.length) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
@@ -216,15 +232,19 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind, repo);
   if (!branch) throw new Error("a PR job needs its branch");
   const closes = kind === "app-issue" ? `Closes ${APP_REPO}#${n}` : `Closes #${n}`;
+  STAGE = "stage";
   // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
   git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
+  STAGE = "commit";
   git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
   // The token reaches git through the environment, never argv (visible in the process table).
   const authEnv = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };
+  STAGE = "push";
   git(gitDir, [...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
     "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`], { env: authEnv });
 
+  STAGE = "github";
   const web = repo === WEB_REPO;
   const epiku = repo === EPIKU_REPO;
   const workflow = web ? "web-build.yml" : epiku ? "epiku-build.yml" : "nightly-build.yml";

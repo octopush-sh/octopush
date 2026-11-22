@@ -123,11 +123,12 @@ other users only after that promotion.
 - **Epiku PRs (`octopush-sh/epiku`, a private repo) auto-merge under Epiku's own rules**, not
   these: its `VISION.md` §2, enforced by `scripts/routines/automerge.mjs` (`epikuRefusals`) on the
   PR's current head commit — opened by the cycle's App from a branch of that repo into `main` and
-  labelled `agent`; CI green; an approving review from the independent, adversarial review
-  workflow on that exact commit; it closes an issue labelled `ready`; at most 800 changed lines; no
-  human-only path of Epiku's; and no breaking data or API change (the reviewer classifies every PR
-  `none` / `additive` / `breaking`; an additive one must carry its test and doc updates). Anything
-  else is labelled `needs-owner` there and waits for the owner. The lane runs in this repo's
+  labelled `agent`, every commit and the head push the App's; CI green on a head that contains
+  `main`; an approving review from the independent, adversarial review workflow on that exact
+  commit, in an unedited comment of the App's; it closes an issue the owner labelled `ready`; at
+  most 800 changed lines; no human-only path of Epiku's; and no breaking data or API change (the
+  reviewer classifies every PR `none` / `additive` / `breaking`; an additive one must carry its
+  test and doc updates). Anything else is labelled `needs-owner` there and waits for the owner. The lane runs in this repo's
   Actions (`epiku-build.yml`, `epiku-review.yml`). **This repo is public and Epiku is not:** the
   lane prints only Epiku issue/PR numbers and commit ids here — never a title, a body, a path or
   content — and Epiku is in no digest, report or audit.

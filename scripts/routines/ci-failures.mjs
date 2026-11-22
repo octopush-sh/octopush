@@ -15,7 +15,7 @@
 // prompt). Log lines come from CI output of the agent's own branch: only
 // `##[error]` lines, control/invisible characters stripped, capped, and the
 // whole report is fenced as untrusted data.
-import { ghForRepo, ALL_REPOS, EPIKU_REPO, NON_VERDICT } from "./gh.mjs";
+import { ghForRepo, ALL_REPOS, EPIKU_REPO, NON_VERDICT, markPrivate, quietErrors, quietMessage } from "./gh.mjs";
 import { fence } from "./social.mjs";
 
 export const UNAVAILABLE = "(CI checks unavailable)";
@@ -104,11 +104,13 @@ function main() {
     console.error("usage: ci-failures.mjs <cycle owner/repo> <40-hex sha>");
     return 64;
   }
+  markPrivate(repo);
   try {
     console.log(forPrompt(ciFailures(ghForRepo(repo), repo, sha)));
   } catch (e) {
     console.log(UNAVAILABLE);
-    const msg = String(e?.stderr || e?.message || e).trim().split("\n")[0].slice(0, 300);
+    // A private repo: a fixed code, never the command's own words.
+    const msg = quietErrors() ? quietMessage(e) : String(e?.stderr || e?.message || e).trim().split("\n")[0].slice(0, 300);
     console.error(`ci-failures: ${msg}`);
     // stderr: stdout is the prompt; Actions reads workflow commands from both.
     if (process.env.GITHUB_ACTIONS === "true") console.error(`::warning title=ci-failures::CI checks unavailable for the prompt (${msg.replace(/[%\r\n:,]/g, " ")})`);

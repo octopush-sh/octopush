@@ -32,6 +32,37 @@ while :; do
   if [[ -O "$dir" ]]; then chmod o-r,o+x "$dir"; else sudo chmod o+x "$dir"; fi
 done
 
+# OCTO_SANDBOX_NETWORK=none (epiku-build.yml): the sandbox user gets no network
+# at all. Its checkout holds a private repo, real project plans included, and
+# the code it runs was just written by an agent: with no way out, that code
+# can read them but can't send them anywhere. Packet rules by uid (IPv4 and
+# IPv6): loopback stays (test runners talk to themselves) except DNS, which the
+# local stub resolver would carry out; the resolver's and the system bus's
+# sockets are closed to the user as well (they answer DNS without a packet of
+# its own). Proved below — any way out left open stops the job.
+if [[ "${OCTO_SANDBOX_NETWORK:-open}" == none ]]; then
+  uid="$(id -u "$SANDBOX_USER")"
+  for ipt in iptables ip6tables; do
+    sudo "$ipt" -w -I OUTPUT 1 -m owner --uid-owner "$uid" -j REJECT
+    sudo "$ipt" -w -I OUTPUT 1 -m owner --uid-owner "$uid" -o lo -j ACCEPT
+    sudo "$ipt" -w -I OUTPUT 1 -m owner --uid-owner "$uid" -o lo -p udp --dport 53 -j REJECT
+    sudo "$ipt" -w -I OUTPUT 1 -m owner --uid-owner "$uid" -o lo -p tcp --dport 53 -j REJECT
+  done
+  for sock in /run/systemd/resolve/io.systemd.Resolve /run/systemd/resolve/io.systemd.Resolve.Monitor /run/dbus/system_bus_socket /var/run/nscd/socket; do
+    if [[ -e "$sock" ]]; then sudo setfacl -m "u:$SANDBOX_USER:---" "$sock"; fi
+  done
+  as_sandbox() { sudo -n -u "$SANDBOX_USER" /usr/bin/env -i PATH=/usr/bin:/bin /usr/bin/timeout 8 "$@" >/dev/null 2>&1; }
+  open=""
+  if as_sandbox /bin/bash -c 'exec 3<>/dev/tcp/1.1.1.1/443'; then open="$open tcp"; fi
+  if as_sandbox /bin/bash -c 'exec 3<>/dev/tcp/2606:4700:4700::1111/443'; then open="$open tcp6"; fi
+  if as_sandbox /usr/bin/getent hosts github.com; then open="$open dns"; fi
+  if command -v resolvectl >/dev/null && as_sandbox resolvectl query github.com; then open="$open resolved"; fi
+  [[ -z "$open" ]] || { echo "::error::the sandbox user still has a way out ($open ) — not starting the agent"; exit 1; }
+  echo "sandbox user $SANDBOX_USER has no network (proved: tcp, tcp6, dns, the resolver)"
+elif [[ "${OCTO_SANDBOX_NETWORK:-open}" != open ]]; then
+  echo "agent-sandbox-setup: OCTO_SANDBOX_NETWORK is open or none" >&2; exit 64
+fi
+
 # The runner's temp dir holds step scripts and env files: runner only.
 [[ -n "${RUNNER_TEMP:-}" ]] && chmod 700 "$RUNNER_TEMP"
 

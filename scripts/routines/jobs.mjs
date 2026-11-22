@@ -21,7 +21,7 @@
 // Only builder-authored, same-repo PRs labelled `agent` count — as jobs and as
 // claims on issues — so an outsider's PR can neither steal nor block work.
 import { execFileSync } from "node:child_process";
-import { makeGh, ghForRepo, APP_REPO, WEB_REPO, isPrivateLane, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, isPrivateLane, markPrivate, ciStatus, labelsOf, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 import { verdictFor, reviewRounds, MAX_REVIEW_ROUNDS } from "./automerge.mjs";
 
@@ -136,6 +136,7 @@ async function main() {
   let repo = null;
   if (argv[0] === "--repo") { repo = argv[1]; argv = argv.slice(2); }
   repo ??= thisRepo();
+  markPrivate(repo);
   const [cmd, kind, num] = argv;
   const baseIds = requireIdentities(loadIdentities());
   const ids = idsForRepo(baseIds, repo);

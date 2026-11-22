@@ -4,7 +4,7 @@
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all     (profile app)
 #   agent-check.sh build | check | consistency | routes | all            (profile web: octopush-web)
 #   agent-check.sh site                                                 (profile web-audit: web-audit.yml only)
-#   agent-check.sh typecheck | test [vitest args…] | test-py | agents | build | all   (profile epiku)
+#   agent-check.sh typecheck | test [paths…] | test-py | agents | all   (profile epiku)
 #
 # agent-sandbox-setup.sh installs it as root-owned /usr/local/bin/octo-check
 # (with the checkout's path and the check profile baked in); the agent may run
@@ -68,18 +68,31 @@ case "$PROFILE" in
       *) echo "usage: octo-check site" >&2; exit 64 ;;
     esac ;;
   epiku)
-    # Epiku's own gates (its CI runs the same four). The environment below is
-    # empty: no store, no token, exactly like its CI, so nothing here can reach
-    # a real Redis. The build fetches its fonts from Google Fonts.
-    extra_env=(NEXT_TELEMETRY_DISABLED=1)
+    # Epiku's own gates. The environment below is empty — no store, no token,
+    # like its CI — and agent-sandbox-setup.sh (OCTO_SANDBOX_NETWORK=none) took
+    # the network away from the sandbox user, so code the agent wrote can read
+    # the checkout (the real plans under data/ included) but can send nothing
+    # out. That is why there is no `build` here: `next build` fetches its fonts
+    # from Google Fonts. Epiku's own CI runs the build on the PR.
+    extra_env=(NEXT_TELEMETRY_DISABLED=1 NPM_CONFIG_UPDATE_NOTIFIER=false)
     case "${1:-}" in
       typecheck) cmd=(npm run --silent typecheck) ;;
-      test) shift; cmd=(npx vitest run "$@") ;;
+      test)
+        shift
+        # Arguments are test files or folders that exist in the checkout, and
+        # nothing else. The agent's shell could expand a variable of its own
+        # environment (the Claude token) into an argument, handing it to the
+        # code under test; the agent can't name a file after a value it has
+        # never seen, so an existing path can't be one.
+        for a in "$@"; do
+          [[ "$a" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$ && "$a" != *..* && -e "$ROOT/$a" && ! -L "$ROOT/$a" ]] \
+            || { echo "octo-check: test takes existing files or folders of the checkout (relative paths), nothing else" >&2; exit 64; }
+        done
+        cmd=(npx vitest run "$@") ;;
       test-py) cmd=(npm run --silent test:py) ;;
       agents) cmd=(npm run --silent check:agents) ;;
-      build) cmd=(npm run --silent build) ;;
-      all) cmd=(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents && npm run --silent build') ;;
-      *) echo "usage: octo-check typecheck | test [vitest args] | test-py | agents | build | all" >&2; exit 64 ;;
+      all) cmd=(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents') ;;
+      *) echo "usage: octo-check typecheck | test [paths] | test-py | agents | all" >&2; exit 64 ;;
     esac ;;
   *) echo "octo-check: unknown profile $PROFILE" >&2; exit 64 ;;
 esac

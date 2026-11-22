@@ -111,12 +111,31 @@ export const labelsOf = (issueOrPr) => (issueOrPr.labels ?? []).map((l) => (type
 export const sanitize = (text) => String(text ?? "").replace(/<!--/g, "&lt;!--").replace(/-->/g, "--&gt;");
 
 /**
+ * Private lanes (epiku): an error's message is never printed. A failed command's
+ * message carries its command line and its stderr, a JSON parse error quotes
+ * the text it choked on — and this repo's log is public. Only a fixed reason
+ * code leaves: the HTTP status or exit status, or the text of an error made
+ * with `safeError` (written here, with nothing of the private repo in it).
+ * On for the whole process once a script learns its repo is private
+ * (`markPrivate`), or from the workflow (OCTOPUSH_QUIET_ERRORS=1).
+ */
+export const quietErrors = (env = process.env) => env.OCTOPUSH_QUIET_ERRORS === "1";
+export function markPrivate(repo, env = process.env) { if (isPrivateLane(repo)) env.OCTOPUSH_QUIET_ERRORS = "1"; }
+export const safeError = (msg) => Object.assign(new Error(msg), { safe: true });
+export function quietMessage(e) {
+  if (e?.safe === true) return String(e.message);
+  const http = /\(HTTP (\d{3})\)/.exec(String(e?.stderr ?? "") + String(e?.message ?? ""))?.[1];
+  const code = http ? `HTTP ${http}` : Number.isInteger(e?.status) ? `exit ${e.status}` : /^E[A-Z0-9]{2,12}$/.test(e?.code ?? "") ? e.code : "error";
+  return `failed (${code}); details withheld from this public log`;
+}
+
+/**
  * Report a script's fatal error. In GitHub Actions it is also an annotation,
  * which shows on the run's summary page (and through the checks API) without
  * opening the logs.
  */
 export function reportFatal(name, e) {
-  const msg = String(e?.message ?? e);
+  const msg = quietErrors() ? quietMessage(e) : String(e?.message ?? e);
   console.error(`${name}: ${msg}`);
   if (process.env.GITHUB_ACTIONS === "true") {
     const one = msg.slice(0, 1500).replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");

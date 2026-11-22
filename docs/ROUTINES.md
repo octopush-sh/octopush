@@ -32,7 +32,7 @@ You approve ideas; everything else runs continuously (VISION.md §8–§9): the 
 | 06:37 | [`ideas.yml`](../.github/workflows/ideas.yml) | a Claude agent researches; at least 5 ranked ideas across app, API and site are filed — app and API ones here (label `area:app\|api`), website ones in octopush-web — and one digest issue here lists them all |
 | 06:47 | [`social.yml`](../.github/workflows/social.yml) | the community routines for octopush-web's `marketing/` work, two jobs (see [Community routines](#community-routines)): `intel` — a Claude agent researches the market and competitors → issue **Market report YYYY-MM-DD**; then `drafts` (also when `intel` failed) — a Claude agent reads that report and the Reddit threads → issue **Social drafts YYYY-MM-DD** with comment drafts. Both issues land in **octopush-web**, label `social`, filed by the App's bot. Nothing is posted anywhere: you approve each draft in your PM chat |
 | any time | [`answers.yml`](../.github/workflows/answers.yml) | the moment you comment on the digest, your answers are applied and confirmed in a reply |
-| manual for now (planned: even hours, :22) | [`epiku-build.yml`](../.github/workflows/epiku-build.yml) | the builder for **Epiku** (`octopush-sh/epiku`, private): one job per run — an Epiku PR its review sent back or whose CI is red, else the oldest Epiku issue labelled `ready` — built by a Claude agent in a checkout of Epiku (its CLAUDE.md, checks via `octo-check typecheck\|test\|test-py\|agents\|build`); the workflow opens or updates the PR there (branch `agent/issue-<n>`, label `agent`). See [The Epiku lane](#the-epiku-lane) |
+| manual for now (planned: even hours, :22) | [`epiku-build.yml`](../.github/workflows/epiku-build.yml) | the builder for **Epiku** (`octopush-sh/epiku`, private): one job per run — an Epiku PR its review sent back or whose CI is red, else the oldest Epiku issue labelled `ready` — built by a Claude agent in a checkout of Epiku (its CLAUDE.md, checks via `octo-check typecheck\|test\|test-py\|agents`, run without network; Epiku's CI builds the PR); the workflow opens or updates the PR there (branch `agent/issue-<n>`, label `agent`). See [The Epiku lane](#the-epiku-lane) |
 | manual for now (planned: odd hours, :22) | [`epiku-review.yml`](../.github/workflows/epiku-review.yml) | an independent, **adversarial** Claude reviewer judges each green Epiku PR (up to 3) against Epiku's data-safety and tenant-isolation rules and classifies it `none` / `additive` / `breaking`; then, in a separate job on a fresh runner, `automerge.mjs --repo octopush-sh/epiku merge` re-checks every rule on that exact commit and merges it, or parks it as `needs-owner`. A dry run unless the repository variable `EPIKU_AUTOMERGE` is `true` |
 
 Every workflow also has **Run workflow** (Actions tab) for a manual run. Schedules sit off the hour on purpose: GitHub delays (and sometimes drops) scheduled runs at :00 under load.
@@ -209,59 +209,127 @@ instance that holds real projects. Its lane lives here for the same reason the w
 (free runner minutes, one set of hardened scripts), and it follows **Epiku's** rules — its
 `VISION.md` §2, `CLAUDE.md` and `docs/DATA-SAFETY.md` — not this repo's.
 
+**Before the first `epiku-build` run** (not only before auto-merge): the builder pushes a branch
+`agent/issue-<n>` of unreviewed, agent-written code. If Epiku's Vercel project builds previews
+from Git, that push would build and run that code with whatever variables the Preview environment
+has. So first either turn preview deployments off for `agent/*` branches (an *Ignored Build Step*,
+or Git → preview branch settings), or remove `KV_REST_API_URL`, `KV_REST_API_TOKEN` and
+`API_TOKEN` from the Preview environment (Production only, or a separate store for Preview).
+
 - **Same machinery as the website lane.** The "Octopush Cycle" App mints installation tokens
   **scoped to `epiku` alone** (`OCTOPUSH_EPIKU_TOKEN`, its own variable: a step never holds the
   website's token and Epiku's together, and the scripts refuse to fall back to another token).
   The token that picks the job or reads the PRs is revoked before any agent starts; a fresh one
-  publishes afterwards. Epiku's code (type check, Vitest, the Python tests, the `AGENTS.md` mirror,
-  `next build`) runs only through `octo-check` (profile `epiku`) as `octo-sandbox` with an empty
-  environment — no store, no token, like Epiku's own CI — and the App's key is used only before
-  the sandbox exists and after it is proved gone. The workflows' own `GITHUB_TOKEN` is read-only
-  and is given to no step.
+  publishes afterwards. The App's key is used only before the sandbox exists and after it is
+  proved gone. The workflows' own `GITHUB_TOKEN` is read-only and is given to no step. The three
+  actions the two workflows use are pinned by commit, and the Claude CLI (an exact version; its
+  postinstall script has to run, it puts the binary in place) is installed in a step that holds
+  no token.
+- **Epiku's code runs with no network.** The checks (type check, Vitest, the Python tests, the
+  `AGENTS.md` mirror) run only through `octo-check` (profile `epiku`) as `octo-sandbox`, with an
+  empty environment — no store, no token — and `agent-sandbox-setup.sh`
+  (`OCTO_SANDBOX_NETWORK=none`) removes that user's network before the agent starts: packet rules
+  by uid for IPv4 and IPv6, loopback kept except DNS, the resolver's and the system bus's sockets
+  closed to it, and a proof (a TCP connection and a name lookup must fail) that stops the job if
+  anything is still open. Code an agent wrote can read the checkout but has nowhere to send it.
+  The price: no `next build` in the sandbox (it downloads fonts); Epiku's own CI builds the PR,
+  and a red build comes back to the builder as a fix round. `octo-check test` accepts only
+  existing files or folders of the checkout as arguments, so the agent's shell can't hand a value
+  from its own environment (the Claude token) to the code under test.
+- **The real plans (`data/`).** Epiku's code imports them, so they can't be removed from the
+  builder's checkout without breaking its own checks. Instead the agent's file tools are denied
+  the folder (`OCTOPUSH_AGENT_DENY=data`), the sandbox that can read it has no network, publishing
+  refuses any change under `data/`, and the reviewer's copy has the folder removed. What remains:
+  the checks do read those files, and their output goes back to the model as tool results. The
+  clean fix is in Epiku (move the real plans out of the repo, a synthetic bundled default) — an
+  owner decision there.
 - **Nothing private is printed here.** This repo's logs, comments and digests are public. The
-  Epiku steps print issue/PR numbers, commit ids and reason codes only. Concretely: the job picker
-  and the review queue emit no title or URL for Epiku; the builder's branch is `agent/issue-<n>`
-  (branch names show in the log, so no title in them); publishing prints `epiku#<n>`; a refused
-  merge prints codes (`human-only`, `breaking`, …) while the reasons, with file names, go into a
-  comment **on the Epiku PR**; the dependency install is not echoed; prompts, diffs, reviews and
-  agent transcripts stay in the runner's temp dir; nothing is uploaded as an artifact or written
-  to the run summary; and Epiku is not in `ALL_REPOS`, so the digest, the answers, the weekly
-  report and the audits never read it. Parked Epiku PRs reach you through GitHub's own
-  notifications for that repo (label `needs-owner`), not through the digest.
+  Epiku steps print issue/PR numbers, commit ids and fixed reason codes only:
+  - Epiku is fetched **by hand**, one named ref at a time (`main`, the job's `agent/issue-<n>`,
+    `pull/<n>/head`), with git's output discarded. `actions/checkout` is not used for it: it prints
+    the refs it fetches, and with history it lists every branch and tag name.
+  - The job picker and the review queue emit no title or URL; the builder's branch is
+    `agent/issue-<n>`; publishing prints `epiku#<n>`; a refused merge prints codes (`human-only`,
+    `breaking`, …) while the reasons, with file names, go into a comment **on the Epiku PR**.
+  - No command's own words reach the log. Publishing runs git with its output captured (its
+    warnings name files) and reports only the step that failed (`failed at push (exit 128)`);
+    with `OCTOPUSH_QUIET_ERRORS` every script reports a failure as an HTTP or exit status, never
+    a command line, a stderr or the snippet a JSON error quotes; the dependency install and the
+    sandbox setup log stay on the runner.
+  - From the agents: the exit code, and denied tool calls by tool name — only names from a fixed
+    list, since the model chooses the name. Prompts, diffs, reviews and transcripts stay in the
+    runner's temp dir; nothing is uploaded as an artifact or written to the run summary.
+  - Epiku is not in `ALL_REPOS`: the digest, the answers, the weekly report and the audits never
+    read it. Parked Epiku PRs reach you through GitHub's notifications for that repo
+    (`needs-owner`), not through the digest.
 - **The review is adversarial** ([`briefs/epiku-reviewer.md`](../scripts/routines/briefs/epiku-reviewer.md)):
   the reviewer is told its approval merges with no human reading, and to look for the way the PR
   damages stored data, leaks across projects or breaks an API client. It reads `main`'s
-  `CLAUDE.md`, `AGENTS.md` and `VISION.md`, never the PR's, and `data/` (the real plans) is removed
-  from its copy. Besides the verdict it must classify the change — `data_change`: `none`,
+  `CLAUDE.md`, `AGENTS.md` and `VISION.md`, never the PR's. The diff is handed to it between two
+  lines carrying a random value generated for that run, not in a code fence a line of the diff
+  could close. Besides the verdict it must classify the change — `data_change`: `none`,
   `additive` or `breaking`; a verdict file without it is not posted. The posting step signs the
   class next to the verdict, for that commit (`<!-- octopush-data:<sha>:<class> -->`; agent text
   can't carry it), and parks an approved-but-`breaking` PR at once.
 - **The merge is a different job on a fresh runner**, where no agent ran and Epiku's code is
-  never checked out. It is handed nothing by the review job: it lists the PRs approved on their
-  current head and re-reads everything from GitHub. `epikuRefusals` (`automerge.mjs`) refuses
-  unless **all** hold on the head commit: opened by the App's bot from a branch of Epiku into
-  `main`, labelled `agent`, not a draft, not `needs-owner`; `CI` green; the approval on that exact
-  commit; the PR's first line closes an open issue labelled `ready`; ≤ 800 changed lines; the
-  complete file list; no human-only path (`EPIKU_HUMAN_ONLY`: `lib/identidad.ts`, `lib/auth.ts`,
-  `lib/api.ts`, `scripts/tokens.py`, `data/`, `.github/`, `next.config.*`, `vercel.json`,
-  `.vercel/`, `.npmrc`, `.env*`, `package.json` and lockfiles, `CLAUDE.md`, `AGENTS.md`,
-  `VISION.md`, `.claude/`, `.agents/`, `.gitattributes`; renames count); neither guard test
-  (`tests/rutas.test.ts`, `tests/backup-roundtrip.test.ts`); no added line that reads an
-  environment variable; no file whose diff GitHub didn't return; no removed or moved route file
-  under `app/api/`; the review's class is not `breaking`, and an `additive` one also changes a
-  test, `docs/DATA-SAFETY.md` and `docs/FEATURES.md`; no conflicts. A hard refusal labels the PR
-  `needs-owner` and comments the reasons there; "not yet" (CI running, mergeability not computed)
-  is retried next run. Dependabot's PRs never qualify (wrong author).
+  never fetched. It is handed nothing by the review job: it lists the PRs approved on their
+  current head and re-reads everything from GitHub, and every lookup that fails counts as "no".
+  `epikuRefusals` (`automerge.mjs`) refuses unless **all** hold on the head commit:
+  - *the PR*: opened by the App's bot from a branch `agent/issue-<n>` of Epiku into `main`,
+    labelled `agent`, not a draft, not `needs-owner`; ≤ 800 changed lines; the complete file list;
+    no conflicts; `CI` green;
+  - *nobody forged it*: the approval is a comment by the App's bot **account id** (not just its
+    login) that was **never edited** (`updated_at` = `created_at`), on that exact commit; every
+    commit on the branch is authored and committed by the bot (GitHub's own signed merge of
+    `main` into the branch excepted); the head is the latest push to the branch and the bot made
+    it; the PR's first line closes an open issue whose `ready` label was last applied **by you**
+    (`OCTOPUSH_OWNER_LOGIN`, from the issue's events);
+  - *the paths*: no human-only path (`EPIKU_HUMAN_ONLY`: `lib/identidad.ts`, `lib/auth.ts`,
+    `lib/api.ts`, `scripts/tokens.py`, `data/`, `.github/`, `next.config.*`, `vercel.json`,
+    `.vercel/`, `.npmrc`, `.env*`, `package.json` and lockfiles, `tsconfig*.json`,
+    `vitest.config.*`, `postcss.config.*`, a root `proxy.ts` / `middleware.ts` /
+    `instrumentation*.ts`, `.gitmodules`, `.gitattributes`, `CLAUDE.md`, `AGENTS.md`, `VISION.md`,
+    `.claude/`, `.agents/`; renames count); neither guard test (`tests/rutas.test.ts`,
+    `tests/backup-roundtrip.test.ts`); no removed or moved route file under `app/api/`;
+  - *the content a script can test*: no added line that could read an environment variable
+    (`process.` in any spelling, an alias of `process` or `globalThis`, `import.meta.env`, a quoted
+    `"env"` key, Python's `environ`); no non-doc file GitHub returned **without a diff** (binary,
+    a NUL byte, a pure rename, too large — whatever its line counts say); no hunk of `lib/store.ts`
+    that mentions the token, `localStorage`, `sessionStorage` or cookies;
+  - *the data class*: not `breaking`; an `additive` one also changes a test,
+    `docs/DATA-SAFETY.md` and `docs/FEATURES.md`;
+  - *up to date*: the head already contains `main`. If that is the only thing missing, the script
+    merges `main` into the branch instead — a new commit, so CI and the review run again on it —
+    so two PRs that are each green can't break `main` together.
+  
+  A hard refusal labels the PR `needs-owner` and comments the reasons there; "not yet" (CI
+  running, mergeability not computed, behind `main`) is retried next run. Dependabot's PRs never
+  qualify (wrong author).
+- **Open decision — `lib/almacen.ts` and `app/api/**`** stay auto-mergeable (under the review, the
+  data class and the rules above). To have every PR that touches them parked instead, list them in
+  the one-line constant `EPIKU_PARK_PATHS` in `automerge.mjs`.
 - **Two switches, both off when this lane was merged.** The workflows have no schedule (manual
   runs only), and the merge job mints a **read-only** token and does a dry run — it prints what it
   would merge or refuse and writes nothing — unless the repository variable `EPIKU_AUTOMERGE` is
-  exactly `true`.
-- **What a script can't see** stays with the reviewer: whether a change that looks additive really
-  keeps old records readable, `useToken` inside `lib/store.ts`, a dependency-free change that
-  still alters deploy behaviour. `package.json` is refused whole, which is stricter than Epiku's
-  `VISION.md` (it lets an agent edit the `scripts` block): a job that needs it stops for you.
-  Not automated at all: PRs for `agent-ok` issues (human-only areas), UX design PRs without an
-  issue, an ideas routine or a visual audit for Epiku, and deploying it.
+  exactly the string `true` (decided by a shell comparison, and checked twice; `TRUE` or `true `
+  is a dry run).
+- **Accepted risks.**
+  - *The publish token on the builder's runner* (as in the website lane). The agent runs as the
+    runner's user, confined by Claude Code's permission rules rather than by the operating
+    system, and the publish token (epiku: contents, issues, pull requests) is minted on that
+    runner after it exits. Publishing from a fresh runner would mean passing the work tree
+    between jobs, and artifacts of a public repo are downloadable. The merge token is never on
+    such a runner.
+  - *The network cut is unproved on a real runner* until the first dry run; it fails closed. A
+    name lookup through a local service the proof doesn't know would be a slow way out.
+  - *The model reads the private repo*, and what it writes (a PR, a review) is posted to the
+    private repo only.
+  - *What a script can't see* stays with the reviewer: whether a change that looks additive
+    really keeps old records readable; an environment read hidden behind a string built at run
+    time. `package.json` and the build configuration are refused whole, which is stricter than
+    Epiku's `VISION.md`: a job that needs them stops for you.
+  - *Not automated at all*: PRs for `agent-ok` issues (human-only areas), UX design PRs without
+    an issue, an ideas routine or a visual audit for Epiku, and deploying it.
 
 **Residual risk:** an agent steered by a hostile issue or web page could still write bad code into
 its PR or a misleading review — which is why merges need the independent review *and* every
@@ -287,16 +355,23 @@ Revoke it any time with `claude setup-token` → new token, or by deleting the s
    and update both secrets; uninstalling the App stops the website lane and nothing else.
 5. **First runs:** Actions → `ideas` → *Run workflow* to get the first digest; answer it; then run
    `nightly-build` by hand to watch one build end to end (`web-build` for the website).
-6. **The Epiku lane.** The App must be installed on `epiku` too (App settings → *Install App* →
-   Configure → Repository access). No new secret: the lane uses `OCTOPUSH_APP_ID`,
-   `OCTOPUSH_APP_PRIVATE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` and `OCTOPUSH_OWNER_LOGIN` from this repo;
-   Epiku itself needs none. In Epiku, create the labels `agent`, `in-progress`, `needs-owner` and
-   `later` next to `ready` / `proposal` / `agent-ok` / `idea`. Dry run: label one small issue
-   `ready`, run `epiku-build` by hand, read the PR it opens, then run `epiku-review` by hand — its
-   merge job prints `dry run: epiku#N at <sha> would be merged` or the refusal codes and changes
-   nothing. To go live: set the repository variable `EPIKU_AUTOMERGE` to `true` (only once Vercel
-   previews can't reach the production store and you know what a merge to Epiku's `main`
-   deploys), then uncomment the `schedule` lines in both workflows.
+6. **The Epiku lane.** In this order:
+   1. *Vercel, before the first build*: previews off for `agent/*` branches, or no store/token
+      variables in the Preview environment (see [The Epiku lane](#the-epiku-lane)).
+   2. The App installed on `epiku` (and only where intended), with Contents, Issues and Pull
+      requests read & write and Actions read — nothing wider. No new secret: the lane uses
+      `OCTOPUSH_APP_ID`, `OCTOPUSH_APP_PRIVATE_KEY`, `CLAUDE_CODE_OAUTH_TOKEN` and
+      `OCTOPUSH_OWNER_LOGIN` from this repo; Epiku itself needs none.
+   3. In Epiku, the labels `agent`, `in-progress`, `needs-owner` and `later`, next to `ready` /
+      `proposal` / `agent-ok` / `idea`. Label issues `ready` **yourself**: the merge checks who did.
+   4. Dry runs: label one small issue `ready`, run `epiku-build` by hand, read the whole public
+      log and the PR it opens, then run `epiku-review` by hand — its merge job prints
+      `dry run: epiku#N at <sha> would be merged` or the refusal codes and changes nothing.
+      Repeat a few times.
+   5. To go live: the repository variable `EPIKU_AUTOMERGE` = `true` — only once you know what a
+      merge to Epiku's `main` deploys and how to roll it back, Epiku's `main` has a ruleset
+      (required up-to-date CI, few people with write access) and there is a recent, tested backup
+      (Epiku `docs/DATA-SAFETY.md`). Then uncomment the `schedule` lines in both workflows.
 
 Scheduled workflows in a public repo pause after 60 days without repository activity; the nightly
 cycle itself keeps the repo active.

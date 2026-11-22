@@ -25,7 +25,7 @@
 //
 // Identities (owner / builder / reviewer) come from identity.mjs.
 import { readFileSync } from "node:fs";
-import { makeGh, ghRunAs, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { makeGh, ghRunAs, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, markPrivate, safeError, ciStatus, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { loadIdentities, requireIdentities, reviewerToken, assertActingAs, sameLogin, idsForRepo } from "./identity.mjs";
 
 export const MAX_CHANGED_LINES = 800;
@@ -97,14 +97,18 @@ export const EPIKU_HUMAN_ONLY = [
   /^\.github\//i,
   /^vision\.md$/i,
   /(^|\/)(claude|agents)(\.local)?\.md$/i, /(^|\/)\.claude\//i, /(^|\/)\.agents\//i, /^skills-lock\.json$/i,
-  /(^|\/)\.gitattributes$/i,
+  /(^|\/)\.gitattributes$/i, /(^|\/)\.gitmodules$/i,
   // Real project plans: read-only for agents, and nothing of theirs may be copied anywhere.
   /^data(\/|$)/i,
   // Authentication and tokens.
   /^lib\/(identidad|auth|api)\.[cm]?[jt]sx?$/i, /^scripts\/tokens\.py$/i,
   // Deploy and environment configuration.
-  /^next\.config\.[cm]?[jt]s$/i, /^vercel\.json$/i, /^\.vercel(\/|$)/i, /^\.vercelignore$/i,
+  /^next\.config\.[^/]+$/i, /^vercel\.json$/i, /^\.vercel(\/|$)/i, /^\.vercelignore$/i,
   /^\.npmrc$/i, /^\.nvmrc$/i, /(^|\/)\.env[^/]*$/i,
+  // Code Next runs on every request or at server start, outside any route's permission check.
+  /^(src\/)?(proxy|middleware)\.[cm]?[jt]sx?$/i, /^(src\/)?instrumentation[^/]*\.[cm]?[jt]sx?$/i,
+  // Build and test configuration: executed by CI and by the build (stricter than Epiku's VISION.md §2).
+  /^tsconfig[^/]*\.json$/i, /^postcss\.config\.[^/]+$/i, /^vitest\.config\.[^/]+$/i,
   // Dependencies.
   /^package(-lock)?\.json$/i, /^npm-shrinkwrap\.json$/i, /^pnpm-lock\.yaml$/i, /^yarn\.lock$/i,
 ];
@@ -114,6 +118,13 @@ export const EPIKU_HUMAN_ONLY = [
  * loosening one is how tenant isolation or the restore path would break quietly.
  */
 export const EPIKU_GUARD_TESTS = [/^tests\/rutas\.test\.[cm]?[jt]sx?$/i, /^tests\/backup-roundtrip\.test\.[cm]?[jt]sx?$/i];
+/**
+ * Paths an Epiku PR may change but that are never auto-merged, by path alone.
+ * OWNER DECISION, empty for now: the storage layer and the route handlers stay
+ * auto-mergeable under the review and the other rules. To park every PR that
+ * touches them, list them here, e.g. [/^lib\/almacen\.ts$/i, /^app\/api\//i].
+ */
+export const EPIKU_PARK_PATHS = [];
 /** Human-only paths per repo. */
 export const humanOnlyFor = (repo) => (repo === WEB_REPO ? WEB_HUMAN_ONLY : repo === EPIKU_REPO ? EPIKU_HUMAN_ONLY : HUMAN_ONLY);
 
@@ -166,11 +177,63 @@ export function dataClassFor(comments, sha, reviewer) {
   return cls;
 }
 
-/** Added lines that read an environment variable or a secret (human-only in Epiku, whatever the file). */
-const ENV_READ = /process\s*\.\s*env|import\.meta\.env|os\.environ|getenv\s*\(|loadEnvConfig|dotenv/i;
+/**
+ * Added lines that could read an environment variable or a secret (human-only
+ * in Epiku, whatever the file). Deliberately broad — any use or aliasing of
+ * `process`, `globalThis`, `import.meta.env`, a quoted "env" key, Python's
+ * environ — because parking a harmless PR costs the owner a minute. It is a
+ * tripwire, not a proof: the reviewer's brief carries the rule itself.
+ */
+const ENV_READ = [
+  /\bprocess\s*(\?\.|\.|\[)/, /[=(,:]\s*process\b/, /["'`](node:)?process["'`]/,
+  /\bglobalThis\b/, /\bglobal\s*(\?\.|\.|\[)/,
+  /\bimport\s*\.\s*meta\s*(\?\.|\.|\[)\s*["'`]?env\b/, /[=(,:]\s*import\s*\.\s*meta\b(?!\s*\.\s*(url|dirname|filename)\b)/,
+  /["'`]env["'`]/, /\benviron\b/, /\bgetenv\b/, /\bDeno\s*\./, /\bBun\s*\./,
+  /dotenv/i, /loadEnvConfig/, /@next\/env/,
+];
+export const readsEnv = (line) => ENV_READ.some((re) => re.test(line));
 const addedLines = (patch) => String(patch).split("\n").filter((l) => l.startsWith("+") && !l.startsWith("+++"));
+const hunks = (patch) => String(patch).split(/^(?=@@)/m);
 const isDoc = (n) => /\.mdx?$/i.test(n);
 const EPIKU_ISSUE_PARKED = ["needs-owner", "proposal", "later"];
+/** Where the browser keeps the token (`useToken`): human-only, inside a file that otherwise isn't. */
+const TOKEN_STORE_FILE = /^lib\/store\.[cm]?[jt]sx?$/i;
+const TOKEN_STORE = /token|localStorage|sessionStorage|cookie/i;
+/** The builder's branches in Epiku, as publish-build.mjs names them. */
+export const EPIKU_BRANCH = /^agent\/issue-\d+$/;
+
+/**
+ * Comments that can carry a verdict in Epiku: written by the cycle's App bot
+ * — matched by its numeric account id, not its login — and never edited since
+ * (a maintainer can edit anyone's comment; an edit moves `updated_at`).
+ */
+export function trustedComments(comments, botId) {
+  return comments.filter((c) => Number.isInteger(botId) && c.user?.id === botId && typeof c.created_at === "string" && c.created_at === c.updated_at);
+}
+
+/** Was the issue's `ready` label last applied by the owner, and not removed since? (issue events, oldest first) */
+export function readyByOwner(events, owner) {
+  const last = events.filter((e) => ["labeled", "unlabeled"].includes(e.event) && e.label?.name === "ready").at(-1);
+  return !!last && last.event === "labeled" && sameLogin(last.actor?.login, owner);
+}
+
+/**
+ * Is every commit of the PR the bot's? Author and committer must be the App's
+ * bot (by account id). The one exception is the merge commit GitHub itself
+ * writes when the merge script updates the branch from main: authored by the
+ * bot, committed and signed by GitHub.
+ */
+export function commitsByBot(commits, botId) {
+  if (!Number.isInteger(botId) || !commits.length || commits.length >= 250) return false; // 250: the API's cap — can't see them all
+  return commits.every((c) => c.author?.id === botId && (c.committer?.id === botId
+    || (c.committer?.login === "web-flow" && c.parents?.length === 2 && c.commit?.verification?.verified === true)));
+}
+
+/** Did the App's bot make the latest push to the branch, and is it this commit? (repository activity, newest first) */
+export function pushedByBot(activity, sha, botId) {
+  const last = activity[0];
+  return Number.isInteger(botId) && !!last && last.after === sha && last.actor?.id === botId;
+}
 
 /**
  * Why an Epiku agent PR must NOT be auto-merged (pure). Each reason is
@@ -180,9 +243,14 @@ const EPIKU_ISSUE_PARKED = ["needs-owner", "proposal", "later"];
  * and the checks a script can make for what those conditions leave to judgement:
  *   - `issue` is the issue the PR body closes (`Closes #n` on its first line), or null;
  *   - `dataClass` is the reviewer's signed classification for the head commit.
+ *   - `provenance` is what tryMergeEpiku established from GitHub about who did
+ *     what: `{ author, ready, commits, pusher }` (the PR author's account id, readyByOwner,
+ *     commitsByBot, pushedByBot);
+ *     anything not `true` refuses;
+ *   - `behind` is how many commits of main the head lacks (0 = up to date).
  * A `transient` reason means "not yet" and never parks the PR.
  */
-export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids }) {
+export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids, provenance = {}, behind = null }) {
   const r = [];
   const no = (code, text, transient = false) => r.push(transient ? { code, text, transient } : { code, text });
   const labels = labelsOf(pr);
@@ -192,14 +260,16 @@ export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids })
   if (!labels.includes("agent")) no("label", "the PR is not labelled `agent`");
   if (labels.includes("needs-owner")) no("needs-owner", "the PR is labelled `needs-owner`");
   if (labels.includes("in-progress")) no("in-progress", "the builder is working on it (`in-progress`)", true);
-  if (!sameLogin(pr.user?.login, ids.builder)) no("author", "the PR was not opened by the cycle's builder");
-  if (pr.head?.repo?.full_name !== EPIKU_REPO || pr.base?.repo?.full_name !== EPIKU_REPO || pr.base?.ref !== "main") no("branch", "it must be a PR from a branch of this repo into main");
+  if (!sameLogin(pr.user?.login, ids.builder) || provenance.author !== true) no("author", "the PR was not opened by the cycle's builder");
+  if (pr.head?.repo?.full_name !== EPIKU_REPO || pr.base?.repo?.full_name !== EPIKU_REPO || pr.base?.ref !== "main" || !EPIKU_BRANCH.test(pr.head?.ref ?? "")) no("branch", "it must be a PR from one of the builder's branches of this repo into main");
+  if (provenance.commits !== true) no("commits", "not every commit on the branch is authored and committed by the cycle's App");
+  if (provenance.pusher !== true) no("pusher", "the head commit is not the latest push to the branch by the cycle's App");
   if (ci !== "success") no("ci", `CI is ${ci} on ${sha7}`, ci === "pending" || ci === "none");
   if (verdict !== "approve") no("review", verdict === "changes" ? "the review requested changes" : `no approving review on ${sha7}`, verdict == null);
   const issueLabels = issue ? labelsOf(issue) : [];
   if (!issue || issue.pull_request || issue.state !== "open" || !issueLabels.includes("ready") || issueLabels.some((l) => EPIKU_ISSUE_PARKED.includes(l))) {
     no("issue", "its first line does not close an open issue labelled `ready` (and not parked)");
-  }
+  } else if (provenance.ready !== true) no("issue-owner", "the `ready` label on its issue was not applied by the owner");
   const changed = (pr.additions ?? 0) + (pr.deletions ?? 0);
   if (changed > MAX_CHANGED_LINES) no("size", `${changed} changed lines (max ${MAX_CHANGED_LINES})`);
   if (files.length >= GITHUB_FILES_CAP || (Number.isInteger(pr.changed_files) && files.length !== pr.changed_files)) {
@@ -210,11 +280,17 @@ export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids })
   if (blocked.length) no("human-only", `touches human-only paths: ${blocked.join(", ")}`);
   const guards = paths.filter((n) => EPIKU_GUARD_TESTS.some((re) => re.test(n)));
   if (guards.length) no("guard-test", `changes a guard test (${guards.join(", ")}): the owner checks it was not loosened`);
+  const parkPaths = paths.filter((n) => EPIKU_PARK_PATHS.some((re) => re.test(n)));
+  if (parkPaths.length) no("park-path", `touches paths the owner merges himself: ${parkPaths.join(", ")}`);
   const code = files.filter((f) => !isDoc(f.filename));
-  const envReads = code.filter((f) => typeof f.patch === "string" && addedLines(f.patch).some((l) => ENV_READ.test(l))).map((f) => f.filename);
-  if (envReads.length) no("env-read", `adds or changes a read of an environment variable or secret (${envReads.join(", ")})`);
-  const blind = code.filter((f) => (f.additions ?? 0) > 0 && typeof f.patch !== "string").map((f) => f.filename);
-  if (blind.length) no("no-diff", `GitHub returned no diff for ${blind.join(", ")}: its added lines can't be checked`);
+  const envReads = code.filter((f) => typeof f.patch === "string" && addedLines(f.patch).some(readsEnv)).map((f) => f.filename);
+  if (envReads.length) no("env-read", `may add or change a read of an environment variable or secret (${envReads.join(", ")})`);
+  // No patch at all — a binary file, a file with a NUL byte in it, a pure rename, a very large
+  // diff: whatever the line counts say, nothing above could look inside it.
+  const blind = code.filter((f) => typeof f.patch !== "string").map((f) => f.filename);
+  if (blind.length) no("no-diff", `GitHub returned no diff for ${blind.join(", ")}: it can't be checked`);
+  const tokenStore = files.filter((f) => TOKEN_STORE_FILE.test(f.filename) && typeof f.patch === "string" && hunks(f.patch).some((h) => TOKEN_STORE.test(h))).map((f) => f.filename);
+  if (tokenStore.length) no("token-store", `changes code next to how the browser stores the token (${tokenStore.join(", ")})`);
   // A route file that disappears or moves changes an existing API contract, whatever the review says.
   const routes = files.filter((f) => ["removed", "renamed"].includes(f.status))
     .flatMap((f) => [f.filename, f.previous_filename].filter(Boolean)).filter((n) => /^app\/api\//i.test(n));
@@ -234,6 +310,10 @@ export function epikuRefusals({ pr, files, ci, verdict, dataClass, issue, ids })
   }
   if (pr.mergeable === false) no("conflicts", "the PR has merge conflicts");
   if (pr.mergeable == null) no("mergeability", "GitHub hasn't computed mergeability yet", true);
+  // CI was green on this commit, not on what main would become with it: two green PRs can break
+  // main together. Only a head that already contains main merges; the script updates the branch
+  // instead (a new commit: CI and the review run again on it).
+  if (behind !== 0) no("behind", Number.isInteger(behind) ? `the branch is ${behind} commit(s) behind main` : "can't tell whether the branch contains main", true);
   return r;
 }
 
@@ -334,7 +414,7 @@ export function postReview(gh, reviewerGh, ids, n, sha, verdict, body, repo = AP
   if (!["approve", "changes"].includes(verdict)) throw new Error("verdict must be approve|changes");
   if (dataClass != null && !DATA_CLASSES.includes(dataClass)) throw new Error(`data class must be ${DATA_CLASSES.join("|")}`);
   const pr = gh.get(`repos/${repo}/pulls/${n}`);
-  if (pr.head.sha !== sha) throw new Error(`head moved: reviewed ${sha.slice(0, 7)}, PR is now at ${pr.head.sha.slice(0, 7)} — review it again`);
+  if (pr.head.sha !== sha) throw safeError(`head moved: reviewed ${sha.slice(0, 7)}, PR is now at ${pr.head.sha.slice(0, 7)} — review it again`);
   // With separate bot accounts the reviewer must not have opened the PR. In
   // Actions both are github-actions[bot]; independence comes from the agents
   // holding no token (identity.mjs).
@@ -404,14 +484,25 @@ export function tryMergeEpiku(gh, n, ids, { waitMs = 3000, tries = 6, dryRun = f
   let pr = gh.get(`repos/${repo}/pulls/${n}`);
   for (let i = 1; pr.mergeable == null && i < tries; i++) { sleepMs(waitMs); pr = gh.get(`repos/${repo}/pulls/${n}`); }
   const sha = pr.head.sha;
+  // Anything that can't be read counts as "no": every lookup below fails closed.
+  const or = (fallback, fn) => { try { return fn(); } catch { return fallback; } };
+  const botId = or(null, () => gh.get(`users/${encodeURIComponent(ids.reviewer)}`)?.id);
   const files = gh.list(`repos/${repo}/pulls/${n}/files`, GITHUB_FILES_CAP);
-  const comments = gh.list(`repos/${repo}/issues/${n}/comments`);
+  // Verdicts count only from unedited comments of the App's bot account (by id).
+  const comments = trustedComments(gh.list(`repos/${repo}/issues/${n}/comments`), botId);
   // The builder's PR body starts with `Closes #<n>` (publish-build.mjs); nothing later in it counts.
   const closes = /^closes #(\d+)\s*(\n|$)/i.exec(pr.body ?? "")?.[1];
-  let issue = null;
-  if (closes) { try { issue = gh.get(`repos/${repo}/issues/${closes}`); } catch { /* unreadable: refused below */ } }
+  const issue = closes ? or(null, () => gh.get(`repos/${repo}/issues/${closes}`)) : null;
+  const branch = EPIKU_BRANCH.test(pr.head?.ref ?? "") ? pr.head.ref : null;
+  const provenance = {
+    author: Number.isInteger(botId) && pr.user?.id === botId, // the account, not just a login that reads the same
+    ready: !!closes && readyByOwner(or([], () => gh.list(`repos/${repo}/issues/${closes}/events`, 500)), ids.owner),
+    commits: commitsByBot(or([], () => gh.list(`repos/${repo}/pulls/${n}/commits`, 250)), botId),
+    pusher: !!branch && pushedByBot(or([], () => gh.get(`repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${branch}`)}&per_page=30`) ?? []), sha, botId),
+  };
+  const behind = or(null, () => gh.get(`repos/${repo}/compare/main...${sha}`)?.behind_by);
   const why = epikuRefusals({
-    pr, files, issue, ids,
+    pr, files, issue, ids, provenance, behind: Number.isInteger(behind) ? behind : null,
     ci: ciStatus(gh, repo, sha),
     verdict: verdictFor(comments, sha, ids.reviewer),
     dataClass: dataClassFor(comments, sha, ids.reviewer),
@@ -422,6 +513,19 @@ export function tryMergeEpiku(gh, n, ids, { waitMs = 3000, tries = 6, dryRun = f
       gh.send("POST", `repos/${repo}/issues/${n}/comments`, {
         body: `Not auto-merged — needs the owner:\n\n${why.map((w) => `- ${sanitize(w.text)}`).join("\n")}\n\n<!-- octopush-automerge:${sha}:refused -->`,
       });
+    } else if (!dryRun && why.length === 1 && why[0].code === "behind" && Number.isInteger(behind)) {
+      // Everything else holds: bring main into the branch. That is a new head — CI runs on it
+      // and the review must approve it again before the next run can merge it.
+      try {
+        gh.send("PUT", `repos/${repo}/pulls/${n}/update-branch`, { expected_head_sha: sha });
+        return { merged: false, why, sha, updated: true };
+      } catch {
+        // Never left waiting silently: if the branch can't be updated, the owner hears about it.
+        const stuck = { code: "update-failed", text: "the branch is behind main and could not be updated automatically" };
+        gh.send("POST", `repos/${repo}/issues/${n}/labels`, { labels: ["needs-owner"] });
+        gh.send("POST", `repos/${repo}/issues/${n}/comments`, { body: `Not auto-merged — needs the owner:\n\n- ${stuck.text}\n\n<!-- octopush-automerge:${sha}:refused -->` });
+        return { merged: false, why: [...why, stuck], sha };
+      }
     }
     return { merged: false, why, sha };
   }
@@ -435,6 +539,7 @@ async function main() {
   let repo = APP_REPO;
   if (argv[0] === "--repo") { repo = argv[1]; argv = argv.slice(2); }
   if (![APP_REPO, WEB_REPO, EPIKU_REPO].includes(repo)) throw new Error(`--repo is ${APP_REPO}, ${WEB_REPO} or ${EPIKU_REPO}`);
+  markPrivate(repo);
   const [cmd, a, b, c, d] = argv;
   const ids = idsForRepo(requireIdentities(loadIdentities()), repo);
   if (tokenEnvFor(repo)) {
@@ -469,7 +574,7 @@ async function main() {
       if (r.merged) { console.log(`merged epiku#${a} at ${at}`); return 0; }
       if (r.wouldMerge) { console.log(`dry run: epiku#${a} at ${at} would be merged`); return 0; }
       // Reason codes only: the reasons themselves name files of a private repo and are on the PR.
-      console.log(`${dryRun ? "dry run: " : ""}not merged epiku#${a} at ${at}: ${r.why.map((w) => w.code).join(", ")}`);
+      console.log(`${dryRun ? "dry run: " : ""}not merged epiku#${a} at ${at}: ${r.why.map((w) => w.code).join(", ")}${r.updated ? " (branch updated from main; CI and the review run again)" : ""}`);
       return 1;
     }
     console.error(epiku

@@ -6,8 +6,8 @@
 # checkout of that repo, with that repo's CLAUDE.md. Same hardening as
 # web-build.yml: the agent holds no GitHub credential, its checks run through
 # the root-owned `octo-check` (epiku profile: typecheck, tests, Python tests,
-# the AGENTS.md mirror, the build) as an unprivileged user with an empty
-# environment, the checkout's .git is moved out of its reach, and publishing
+# the AGENTS.md mirror) as an unprivileged user with an empty environment and
+# no network, the checkout's .git is moved out of its reach, and publishing
 # runs a copy of scripts/routines taken from main before anything else.
 #
 # Credentials: short-lived installation tokens of the "Octopush Cycle" GitHub
@@ -18,9 +18,27 @@
 #
 # THIS REPO IS PUBLIC AND EPIKU IS PRIVATE. Everything a step prints here is
 # public: steps print issue/PR numbers and commit ids of Epiku only — never a
-# title, a body, a file path or file content. Branches are `agent/issue-<n>`
-# (no title in them), `jobs.mjs next` prints no title for Epiku, the agent's
-# transcript stays on the runner, and the dependency install is not echoed.
+# title, a body, a file path, a branch or tag name, or file content. Branches
+# are `agent/issue-<n>` (no title in them), `jobs.mjs next` prints no title for
+# Epiku, the agent's transcript stays on the runner, and nothing a command says
+# about Epiku is echoed: the repo is fetched by hand (one ref, output
+# discarded — `actions/checkout` would list its branches and tags), git and
+# npm run with their output captured, and errors are reported as fixed codes
+# (OCTOPUSH_QUIET_ERRORS).
+#
+# Epiku's checkout holds real project plans (`data/`) that its code imports, so
+# they can't be removed from the builder's tree. Instead: the agent's file
+# tools are denied that folder, and the sandbox user that runs the agent's code
+# has NO network (OCTO_SANDBOX_NETWORK=none, proved before the agent starts).
+# The sandbox therefore doesn't run `next build` (it downloads fonts); Epiku's
+# own CI does, on the PR.
+#
+# Accepted exposure, as in web-build.yml: the publish token is minted on the
+# runner the agent ran on. The agent's tools are confined by Claude Code's
+# permission rules, not by the operating system; the code it writes runs as
+# another user. The token is scoped to epiku (contents, issues, pull requests).
+#
+# Actions are pinned by commit.
 #
 # Merging is epiku-review.yml's job, never this one's.
 #
@@ -44,6 +62,7 @@ env:
   OCTOPUSH_OWNER_LOGIN: ${{ vars.OCTOPUSH_OWNER_LOGIN }}
   OCTOPUSH_ROUTINE_REPO: ${{ github.repository }}
   EPIKU_REPO: octopush-sh/epiku
+  OCTOPUSH_QUIET_ERRORS: "1"   # errors as fixed codes, never a command's own words (gh.mjs)
   CLAUDE_CODE_VERSION: "2.1.314"
 
 jobs:
@@ -52,11 +71,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
 
@@ -67,7 +86,7 @@ jobs:
 
       - name: Epiku token (pick, claim, check out — revoked before the agent)
         id: pick-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.OCTOPUSH_APP_ID }}
           private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
@@ -115,16 +134,29 @@ jobs:
           NUM: ${{ steps.pick.outputs.num }}
         run: node "$RUNNER_TEMP/routines/jobs.mjs" --repo "$EPIKU_REPO" claim "$KIND" "$NUM"
 
-      - name: Check out epiku
+      - name: Fetch epiku (main and the job's ref only; nothing echoed)
         if: steps.pick.outputs.kind != ''
-        uses: actions/checkout@v7
-        with:
-          repository: octopush-sh/epiku
-          token: ${{ steps.pick-token.outputs.token }}
-          ref: ${{ steps.pick.outputs.ref }}
-          path: epiku
-          fetch-depth: 0
-          persist-credentials: false
+        env:
+          OCTOPUSH_EPIKU_TOKEN: ${{ steps.pick-token.outputs.token }}
+          REF: ${{ steps.pick.outputs.ref }}
+        run: |
+          set -euo pipefail
+          # By hand, not actions/checkout: that action prints every ref it
+          # fetches, and with history it fetches every branch and tag. Here
+          # exactly two refs are asked for by name and git's output is discarded.
+          [[ "$REF" == main || "$REF" =~ ^agent/issue-[0-9]+$ ]] || { echo "unexpected ref"; exit 1; }
+          # The token reaches git through the environment, never a command line or a config file.
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$OCTOPUSH_EPIKU_TOKEN" | base64 -w0)"
+          specs=("+refs/heads/main:refs/remotes/origin/main")
+          [ "$REF" = main ] || specs+=("+refs/heads/$REF:refs/remotes/origin/$REF")
+          {
+            git init --quiet epiku &&
+            git -C epiku remote add origin "https://github.com/$EPIKU_REPO.git" &&
+            GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0="http.https://github.com/.extraheader" GIT_CONFIG_VALUE_0="$auth" \
+              git -C epiku fetch --quiet --no-tags --no-recurse-submodules origin "${specs[@]}" &&
+            git -C epiku -c advice.detachedHead=false checkout --quiet --detach "refs/remotes/origin/$REF"
+          } >/dev/null 2>&1 || { echo "::error::could not fetch epiku (git's output is withheld from this public log)"; exit 1; }
+          echo "epiku at $(git -C epiku rev-parse HEAD)"
 
       - name: Context and brief
         if: steps.pick.outputs.kind != ''
@@ -145,7 +177,7 @@ jobs:
               echo; echo "## Failing CI checks on the PR's head (if any)"
               # Actions API only (actions: read). Never fatal — missing CI
               # context must not stop the build.
-              sha="$(git -C epiku rev-parse HEAD)"
+              sha="$(git -C epiku rev-parse HEAD)"   # .git is still in place here
               node "$R/ci-failures.mjs" "$EPIKU_REPO" "$sha" || echo "(CI checks unavailable)"
             fi
           } > "$RUNNER_TEMP/prompt.md"
@@ -167,7 +199,11 @@ jobs:
           npm install --global --no-audit --no-fund "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION"
           # Out of the agent's (and the sandbox's) reach from here on.
           mv epiku/.git "$RUNNER_TEMP/epiku.git"
-          OCTO_CHECK_PROFILE=epiku OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/epiku" bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh"
+          # The sandbox user gets no network at all (the script proves it or fails).
+          # Its stderr could name files of the checkout: kept on the runner.
+          OCTO_CHECK_PROFILE=epiku OCTO_SANDBOX_NETWORK=none OCTOPUSH_CHECKOUT="$GITHUB_WORKSPACE/epiku" \
+            bash "$RUNNER_TEMP/routines/agent-sandbox-setup.sh" 2> "$RUNNER_TEMP/sandbox-setup.log" \
+            || { echo "::error::the sandbox could not be prepared (its log stays on the runner)"; exit 1; }
 
       - name: Build (Claude agent, no GitHub access)
         if: steps.pick.outputs.kind != ''
@@ -175,18 +211,20 @@ jobs:
         working-directory: epiku
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          OCTOPUSH_AGENT_DENY: data   # the real plans: on disk for the checks, closed to the agent's file tools
         run: node "$RUNNER_TEMP/routines/agent.mjs" builder "$RUNNER_TEMP/prompt.md"
 
       - name: Stop the sandbox and freeze the checkout
         if: always() && steps.pick.outputs.kind != ''
         run: |
           sudo pkill -KILL -u octo-sandbox || true
-          sudo find "$GITHUB_WORKSPACE/epiku" -type l -user octo-sandbox -delete || true
-          chmod -R o-w "$GITHUB_WORKSPACE/epiku" || true
+          # Quiet: an error here would name a file of the checkout.
+          sudo find "$GITHUB_WORKSPACE/epiku" -type l -user octo-sandbox -delete >/dev/null 2>&1 || true
+          chmod -R o-w "$GITHUB_WORKSPACE/epiku" >/dev/null 2>&1 || true
 
       - name: Nothing of Epiku's code is still running
         id: sandbox-gone
-        # Epiku's code (its type check, tests and build) only ever runs as
+        # Epiku's code (its type check and tests) only ever runs as
         # octo-sandbox, through octo-check: a separate user without sudo, which
         # can't read the runner's processes. The App's private key is used again
         # only after this step (the publish token, and the token action's post
@@ -201,7 +239,7 @@ jobs:
       - name: Epiku token (publish)
         id: pub-token
         if: steps.pick.outputs.kind != '' && !cancelled() && steps.sandbox-gone.outcome == 'success'
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
         with:
           app-id: ${{ secrets.OCTOPUSH_APP_ID }}
           private-key: ${{ secrets.OCTOPUSH_APP_PRIVATE_KEY }}
@@ -227,9 +265,9 @@ jobs:
           set -euo pipefail
           # Commits are the App's bot's (its noreply address needs the bot's user id).
           id="$(GH_TOKEN="$OCTOPUSH_EPIKU_TOKEN" gh api "users/$OCTOPUSH_APP_BOT_LOGIN" --jq .id 2>/dev/null || true)"
-          if [[ "$id" =~ ^[0-9]+$ ]]; then
-            export OCTOPUSH_GIT_NAME="$OCTOPUSH_APP_BOT_LOGIN" OCTOPUSH_GIT_EMAIL="$id+$OCTOPUSH_APP_BOT_LOGIN@users.noreply.github.com"
-          fi
+          # Required: the merge guard accepts only commits authored and committed by this identity.
+          [[ "$id" =~ ^[0-9]+$ ]] || { echo "::error::could not resolve the App bot's account id"; exit 1; }
+          export OCTOPUSH_GIT_NAME="$OCTOPUSH_APP_BOT_LOGIN" OCTOPUSH_GIT_EMAIL="$id+$OCTOPUSH_APP_BOT_LOGIN@users.noreply.github.com"
           # Refuses Epiku's human-only paths, symlinks and secrets; prints numbers only.
           node "$RUNNER_TEMP/routines/publish-build.mjs" "$KIND" "$NUM" "$BRANCH"
 
