@@ -25651,3 +25651,241 @@ mod sync_contract_tests {
         assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
     }
 }
+
+#[cfg(test)]
+mod request_context_tests {
+    use crate::request_context::{
+        agents_item, apportion, estimate_tokens, memory_files, memory_imports, request_context, session_files, skills_item,
+        CarriedItem, MAX_SESSIONS,
+    };
+    use crate::transcripts::project_dir_name;
+    use std::collections::HashSet;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn file_item(label: &str, bytes: u64) -> CarriedItem {
+        CarriedItem { kind: "memory".into(), label: label.into(), path: None, count: 1, bytes, tokens: 0 }
+    }
+
+    fn assistant(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "requestId": req,
+            "timestamp": ts,
+            "sessionId": session,
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": model,
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": i,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cc,
+                    "output_tokens": o
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Labels of the items whose file sits under one of `roots` (the
+    /// machine's own `/tmp/CLAUDE.md`, if any, is not the test's).
+    fn labels_under(items: &[CarriedItem], roots: &[&Path]) -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| i.path.as_deref().is_some_and(|p| roots.iter().any(|r| Path::new(p).starts_with(r))))
+            .map(|i| i.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn estimates_fill_the_measured_total_and_the_rest_is_by_difference() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4_000), 1_000);
+
+        // Under the total: the remainder is one "by difference" row, ranked with the rest.
+        let items = apportion(vec![file_item("CLAUDE.md", 40_000), file_item("AGENTS.md", 4_000)], Some(30_000));
+        let rows: Vec<(&str, &str, u64)> = items.iter().map(|i| (i.kind.as_str(), i.label.as_str(), i.tokens)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("by_difference", "MCP and built-in tools, by difference", 19_000),
+                ("memory", "CLAUDE.md", 10_000),
+                ("memory", "AGENTS.md", 1_000),
+            ]
+        );
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 30_000);
+
+        // Over the total: scaled down to add up to it exactly, no difference row.
+        let items = apportion(vec![file_item("a", 4_000), file_item("b", 4_000), file_item("c", 4_000)], Some(1_000));
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 1_000);
+        assert!(items.iter().all(|i| i.kind == "memory" && (333..=334).contains(&i.tokens)));
+
+        // An exact fit leaves no empty difference row; an empty file is no row.
+        let items = apportion(vec![file_item("a", 400), file_item("empty", 0)], Some(100));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tokens, 100);
+
+        // Nothing measured: the raw estimates stand.
+        let items = apportion(vec![file_item("a", 400)], None);
+        assert_eq!(items.iter().map(|i| i.tokens).collect::<Vec<_>>(), [100]);
+    }
+
+    #[test]
+    fn imports_are_at_paths_outside_code_fences() {
+        let text = "Read @AGENTS.md, then @docs/style.md.\nMail a@b.co or `@code`.\n```\n@inside-fence.md\n```\nAgain @AGENTS.md\n";
+        assert_eq!(memory_imports(text), ["AGENTS.md", "docs/style.md"]);
+    }
+
+    #[test]
+    fn the_claude_md_chain_is_user_then_top_down_with_imports() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let project = tree.path().join("work").join("repo");
+        write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        write(&tree.path().join("work/CLAUDE.md"), "parent rules");
+        // AGENTS.md counts only because CLAUDE.md imports it; it imports
+        // CLAUDE.md back, which is not counted twice.
+        write(&project.join("CLAUDE.md"), "See @AGENTS.md.\n```\n@fenced.md\n```\n");
+        write(&project.join("AGENTS.md"), "agents rules, see @CLAUDE.md");
+        write(&project.join("fenced.md"), "not loaded");
+        write(&project.join("CLAUDE.local.md"), "local");
+        write(&project.join("sub/AGENTS.md"), "never imported");
+
+        let items = memory_files(&project, Some(home.path()));
+        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        assert_eq!(
+            labels_under(&items, &[home.path(), tree.path()]),
+            ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
+        );
+        let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
+        assert_eq!((local.kind.as_str(), local.count, local.bytes), ("memory", 1, 5));
+    }
+
+    #[test]
+    fn skills_and_agents_count_their_listings_project_first() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(&project.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: abcd\n---\nA long body that is not in context.");
+        write(&home.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: shadowed by the project's\n---\nx");
+        write(&home.path().join(".claude/skills/docs/SKILL.md"), "---\nname: docs\ndescription: ab\n---\nx");
+        write(&home.path().join(".claude/skills/broken/SKILL.md"), "no frontmatter");
+        let skills = skills_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((skills.kind.as_str(), skills.label.as_str(), skills.count), ("skills", "Skills", 2));
+        assert_eq!(skills.bytes, ("tests".len() + "abcd".len() + "docs".len() + "ab".len()) as u64);
+
+        write(&project.path().join(".claude/agents/reviewer.md"), "---\nname: reviewer\ndescription: Reviews\n---\nbody");
+        write(&project.path().join(".claude/agents/notes.txt"), "---\nname: notes\ndescription: not an agent\n---\n");
+        let agents = agents_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((agents.kind.as_str(), agents.count, agents.bytes), ("agents", 1, ("reviewer".len() + "Reviews".len()) as u64));
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(skills_item(empty.path(), Some(empty.path())), None);
+        assert_eq!(agents_item(empty.path(), None), None);
+    }
+
+    #[test]
+    fn the_total_is_the_smallest_first_request_of_the_projects_sessions() {
+        let root = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let cwd = project.path().display().to_string();
+        let dir = root.path().join(project_dir_name(&cwd));
+        let m = "claude-sonnet-5-5";
+        write(
+            &dir.join("s-old.jsonl"),
+            &format!(
+                "{}\n{}\n",
+                assistant("s-old", "o1", m, 10, 0, 30_000, 50, "2026-11-20T10:00:00Z"),
+                assistant("s-old", "o2", m, 5, 30_000, 200, 40, "2026-11-20T10:01:00Z"),
+            ),
+        );
+        let mut side: serde_json::Value =
+            serde_json::from_str(&assistant("s-new", "n0", m, 100, 0, 0, 5, "2026-11-21T09:59:00Z")).unwrap();
+        side["isSidechain"] = serde_json::json!(true);
+        write(
+            &dir.join("s-new.jsonl"),
+            &format!(
+                "{}\n{}\n{}\n{}\n",
+                // An inline sub-agent's request is not the session's first.
+                side,
+                serde_json::json!({ "type": "user", "message": { "role": "user", "content": "hi" } }),
+                assistant("s-new", "n1", m, 10, 20_000, 5_000, 30, "2026-11-21T10:00:00Z"),
+                assistant("s-new", "n2", m, 3, 25_000, 100, 20, "2026-11-21T10:01:00Z"),
+            ),
+        );
+        // A Direct stage's session and a sub-agent's file are not the project's sessions.
+        write(&dir.join("d-1.jsonl"), &format!("{}\n", assistant("d-1", "d1", m, 1, 0, 1_000, 5, "2026-11-21T11:00:00Z")));
+        write(
+            &dir.join("s-new/subagents/agent-1.jsonl"),
+            &format!("{}\n", assistant("s-new", "a1", m, 1, 0, 50, 5, "2026-11-21T10:02:00Z")),
+        );
+        write(&project.path().join("CLAUDE.md"), &"x".repeat(4_000));
+
+        let direct: HashSet<String> = ["d-1".to_string()].into();
+        let ctx = request_context(root.path(), Some(home.path()), project.path(), &[cwd.clone()], &direct);
+        assert_eq!(ctx.measured_tokens, Some(25_010));
+        assert_eq!(ctx.sessions_measured, 2);
+        assert_eq!(ctx.model.as_deref(), Some(m));
+        let hit = ctx.cache_hit_pct.unwrap();
+        let expected = 75_000.0 / (128.0 + 75_000.0 + 35_300.0) * 100.0;
+        assert!((hit - expected).abs() < 1e-9, "{hit} vs {expected}");
+
+        let prices = crate::token_engine::prices_for(m).expect("a priced model");
+        let uncached = ctx.uncached_usd.unwrap();
+        assert!((uncached - prices.input_per_m * 25_010.0 / 1_000_000.0).abs() < 1e-12);
+        // Most of these prompts were cache reads: the usual request pays less.
+        let usual = ctx.usual_usd.unwrap();
+        assert!(usual > 0.0 && usual < uncached, "{usual} vs {uncached}");
+
+        let claude_md = ctx.items.iter().find(|i| i.label == "CLAUDE.md").unwrap();
+        assert_eq!(claude_md.tokens, 1_000);
+        assert_eq!(ctx.items[0].kind, "by_difference");
+        assert_eq!(ctx.items.iter().map(|i| i.tokens).sum::<u64>(), 25_010);
+
+        // An unpriced model: tokens measured, no price invented.
+        let other = TempDir::new().unwrap();
+        let cwd2 = other.path().display().to_string();
+        write(
+            &root.path().join(project_dir_name(&cwd2)).join("u.jsonl"),
+            &format!("{}\n", assistant("u", "u1", "mystery-model-9", 10, 0, 900, 5, "2026-11-21T10:00:00Z")),
+        );
+        let ctx = request_context(root.path(), None, other.path(), &[cwd2], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(910));
+        assert_eq!((ctx.uncached_usd, ctx.usual_usd), (None, None));
+
+        // No transcript: nothing measured, the files stand as raw estimates.
+        let none = TempDir::new().unwrap();
+        let ctx = request_context(root.path(), None, project.path(), &[none.path().display().to_string()], &HashSet::new());
+        assert_eq!((ctx.measured_tokens, ctx.sessions_measured, ctx.model.as_deref()), (None, 0, None));
+        assert!(ctx.items.iter().all(|i| i.kind != "by_difference"));
+    }
+
+    #[test]
+    fn only_the_most_recent_sessions_are_read() {
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/request-context-recent";
+        let dir = root.path().join(project_dir_name(cwd));
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for n in 0..=MAX_SESSIONS {
+            let path = dir.join(format!("s{n}.jsonl"));
+            // s0 is the oldest and the smallest.
+            let l = assistant(&format!("s{n}"), &format!("r{n}"), "claude-sonnet-5-5", 1, 0, 1_000 + n as u64, 5, "2026-11-21T10:00:00Z");
+            write(&path, &format!("{l}\n"));
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(n as u64 * 10)).unwrap();
+        }
+        let files = session_files(root.path(), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(files.len(), MAX_SESSIONS);
+        assert_eq!(files[0].file_name().unwrap(), format!("s{MAX_SESSIONS}.jsonl").as_str());
+        assert!(!files.iter().any(|f| f.file_name().unwrap() == "s0.jsonl"));
+        let ctx = request_context(root.path(), None, Path::new(cwd), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(1_002));
+    }
+}

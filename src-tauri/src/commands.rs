@@ -4542,6 +4542,45 @@ pub async fn get_session_usage(
     .map_err(|e| AppError::Other(format!("session usage: {e}")))?
 }
 
+/// What every request of one project carries (#959): the fixed context
+/// measured from its recent transcripts (its root and its workspaces'
+/// worktrees; Direct stages' CLI sessions left out), priced at its usual
+/// model and cache rate, and the CLAUDE.md chain, skills and agents that
+/// make it up as estimates (`request_context`). Read-only: no file is
+/// edited, no MCP server contacted, nothing leaves the Mac.
+#[tauri::command]
+pub async fn get_request_context(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<crate::request_context::RequestContext> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, cwds, direct) = {
+            let db = db.lock();
+            let Some(project) = db.get_project(&project_id)? else {
+                return Err(AppError::Other(format!("project not found: {project_id}")));
+            };
+            let mut cwds = vec![project.path.clone()];
+            for (_, pid, worktree) in db.list_workspace_paths()? {
+                if pid == project_id && !cwds.contains(&worktree) {
+                    cwds.push(worktree);
+                }
+            }
+            (project.path, cwds, db.direct_cli_session_ids()?)
+        };
+        let home = dirs::home_dir();
+        Ok(crate::request_context::request_context(
+            &crate::transcripts::projects_root(),
+            home.as_deref(),
+            std::path::Path::new(&path),
+            &cwds,
+            &direct,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("request context: {e}")))?
+}
+
 /// Answer a turn-limit card: the extra turns to give the paused writing
 /// sub-agent, or none to accept its partial report and let the director go on.
 #[tauri::command]
