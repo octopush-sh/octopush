@@ -1576,7 +1576,31 @@ fn range_files(
     Ok(files)
 }
 
-/// The commit already on the remote that a push from HEAD starts after: the
+/// The remote `push_branch` pushes to (`git push --set-upstream origin
+/// <branch>`), whatever upstream the branch tracks.
+pub const PUSH_REMOTE: &str = "origin";
+
+/// The commit a push of the current branch starts after, on the ref that
+/// push updates: `origin/<branch>`. `None` when HEAD isn't on a branch, the
+/// branch isn't on that remote yet, or the two share no history; the caller
+/// then falls back to [`push_base`].
+fn push_target_base(repo: &Repository, head: Oid) -> Option<Oid> {
+    let head_ref = repo.head().ok()?;
+    if !head_ref.is_branch() {
+        return None;
+    }
+    let branch = head_ref.shorthand().ok()?;
+    let tip = repo
+        .find_reference(&format!("refs/remotes/{PUSH_REMOTE}/{branch}"))
+        .ok()?
+        .peel_to_commit()
+        .ok()?
+        .id();
+    repo.merge_base(tip, head).ok()
+}
+
+/// The fallback base when the pushed-to ref doesn't exist yet (and the
+/// base of a PR or crew scan whose own base can't be resolved): the
 /// branch's upstream, else the remote's default branch. `None` when neither
 /// exists (the range then is every commit not on any remote ref).
 fn push_base(repo: &Repository, head: Oid) -> Option<Oid> {
@@ -1606,6 +1630,24 @@ fn base_or_unpushed(base: Option<Oid>) -> RangeBase {
 
 /// The commits a push of the current branch would send.
 pub fn push_files(path: &Path) -> AppResult<Collected> {
+    let repo = crate::git_ops::open_repo(path)?;
+    let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
+        return Ok(Budget::new().into_collected(Vec::new(), "push"));
+    };
+    // What the push actually sends: the commits not yet on `origin/<branch>`.
+    // The branch's upstream may be another remote, so it is only a fallback.
+    let base = base_or_unpushed(push_target_base(&repo, head).or_else(|| push_base(&repo, head)));
+    let mut budget = Budget::new();
+    let files = range_files(&repo, base, head, Some(MAX_RANGE_COMMITS), &mut budget)?;
+    Ok(budget.into_collected(files, "push"))
+}
+
+/// The commits a `git push` typed in Talk's shell would send (#819). That
+/// command isn't `push_branch`: a bare `git push` goes to the branch's
+/// upstream, which may not be `origin`, so the range starts from
+/// [`push_base`] rather than `origin/<branch>` (commits `origin` already has
+/// can still be new to the remote the command pushes to).
+fn shell_push_files(path: &Path) -> AppResult<Collected> {
     let repo = crate::git_ops::open_repo(path)?;
     let Some(head) = repo.head().ok().and_then(|h| h.target()) else {
         return Ok(Budget::new().into_collected(Vec::new(), "push"));
@@ -1800,12 +1842,12 @@ pub fn shell_files(path: &Path, plan: &ShellPlan) -> AppResult<Collected> {
         None => {}
     }
     if plan.push {
-        parts.push(push_files(path)?);
+        parts.push(shell_push_files(path)?);
     }
     if let Some(base) = &plan.pr {
         match base.clone().or_else(|| crate::git_ops::repo_default_branch(path)) {
             Some(b) => parts.push(pr_files(path, &b)?),
-            None => parts.push(push_files(path)?),
+            None => parts.push(shell_push_files(path)?),
         }
     }
     let mut out = Collected { scope: "shell", ..Collected::default() };
