@@ -51,6 +51,25 @@ describe("AiReviewPanel", () => {
     const second = render(<AiReviewPanel workspaceId="w1" gitDiff="DIFF" onJump={() => {}} />);
     expect(second.getByRole("button", { name: /AI Review/i })).toHaveAttribute("aria-expanded", "true");
   });
+  it("says when the review read only part of a cut diff, and keeps saying it once stale", async () => {
+    (ipc.aiComplete as any).mockResolvedValue({ text: JSON.stringify({ summary: "s", findings: [] }), inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    const cut = "diff --git a/a.ts b/a.ts\n+x\n\n... diff truncated (too large to display fully) ...\n";
+    const { getByRole, getByText, container, rerender } = render(<AiReviewPanel workspaceId="w1" gitDiff={cut} onJump={() => {}} />);
+    fireEvent.click(getByRole("button", { name: /review this change/i }));
+    await waitFor(() => expect(getByText("Read the first 1 MB of the diff; the rest wasn't reviewed.")).toBeTruthy());
+    expect(container.querySelector('[data-tour="ai-review-partial"]')).toBeTruthy();
+    expect(getByText("No issues in what was read.")).toBeTruthy();
+    rerender(<AiReviewPanel workspaceId="w1" gitDiff={cut + "more"} onJump={() => {}} />);
+    expect(getByText(/diff changed/)).toBeTruthy();
+    expect(container.querySelector('[data-tour="ai-review-partial"]')).toBeTruthy();
+  });
+  it("shows no partial line for a whole diff", async () => {
+    (ipc.aiComplete as any).mockResolvedValue({ text: JSON.stringify({ summary: "s", findings: [] }), inputTokens: 1, outputTokens: 1, costUsd: 0 });
+    const { getByRole, getByText, container } = render(<AiReviewPanel workspaceId="w1" gitDiff="DIFF" onJump={() => {}} />);
+    fireEvent.click(getByRole("button", { name: /review this change/i }));
+    await waitFor(() => expect(getByText("No issues found.")).toBeTruthy());
+    expect(container.querySelector('[data-tour="ai-review-partial"]')).toBeNull();
+  });
   it("starting a review expands the panel", () => {
     (ipc.aiComplete as any).mockReturnValue(new Promise(() => {}));
     const { getByRole } = render(<AiReviewPanel workspaceId="w1" gitDiff="DIFF" onJump={() => {}} />);

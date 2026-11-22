@@ -125,6 +125,7 @@ Current anchors:
 | `review-companion-ahead` | Review Companion, Branch & publish: "3 commits ahead of main" (only with commits since the base) | `CompanionReview.tsx` |
 | `review-companion-scan-branch` · `review-companion-scan-result` | Review Companion, Branch & publish, only with commits since the base: "Scan this branch's commits" (then "Scan again"; hidden while a scan runs) · its result ("No possible secrets in 3 commits." or what it found; only once a scan answered) | `CompanionReview.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
+| `ai-review-partial` | AI review drawer, under the summary: "Read the first 2 of 14 files; the rest wasn't reviewed." (only when the review read part of the diff) | `review/AiReviewPanel.tsx` |
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
 | `review-editor` | Review, Editor view: the code editor pane (tabs excluded, status bar included) | `EditorPane.tsx` |
