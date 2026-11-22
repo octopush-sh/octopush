@@ -4589,6 +4589,14 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
     crate::settings::load_settings()
 }
 
+/// The path of `settings.json` when it exists but can't be parsed (the app
+/// then shows defaults and refuses every save), else `None`. Path only —
+/// never the file's contents.
+#[tauri::command]
+pub async fn unreadable_settings_path() -> AppResult<Option<String>> {
+    Ok(crate::settings::unreadable_settings_path())
+}
+
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
     // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
