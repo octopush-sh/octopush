@@ -11,6 +11,7 @@ import { RunFlow } from "./RunFlow";
 import { StageFocus } from "./StageFocus";
 import { RunControlBar } from "./RunControlBar";
 import { isPlanWaiting, pickBlockedStage } from "../lib/planWait";
+import { sendBackGate } from "../lib/reviewComments";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
@@ -121,18 +122,11 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     const anchor = beaconAnchor({ run, blockedStage, runningStage, launcherReady: false, planWaiting: !!run && isPlanWaiting(run) });
 
     // Loop props (unchanged logic, but computed off blockedStage)
-    let loopTargetRole: string | null = null;
-    let loopState: { iteration: number; max: number } | null = null;
     // A budget-parked stage (never started) offers no send-back — it has produced
     // nothing to send. Approve overrides the budget once; Reject re-parks.
-    const budgetParked = blockedStage !== null && blockedStage.startedAt === null && blockedStage.artifact === null;
-    if (blockedStage && !budgetParked && blockedStage.loopMode === "gated" && blockedStage.loopTargetPosition !== null && blockedStage.status === "awaiting_checkpoint") {
-      const targetStage = stages.find((s) => s.position === blockedStage.loopTargetPosition);
-      if (targetStage) {
-        loopTargetRole = labelForRole(targetStage.role);
-        loopState = { iteration: blockedStage.loopIterations, max: blockedStage.loopMaxIterations };
-      }
-    }
+    const gate = sendBackGate(blockedStage, stages);
+    const loopTargetRole: string | null = gate ? labelForRole(gate.target.role) : null;
+    const loopState: { iteration: number; max: number } | null = gate ? { iteration: gate.iteration, max: gate.max } : null;
 
     const doneCount = stages.filter((s) => s.status === "done").length;
     const onRunAgain = () => {

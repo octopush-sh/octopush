@@ -1,6 +1,7 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, fireEvent } from "@testing-library/react";
 import { DiffView, keyboardHelpLine } from "./DiffView";
+import { useReviewComments } from "../../stores/reviewCommentsStore";
 import type { DiffFile } from "../../lib/diffParser";
 
 const files: DiffFile[] = [{
@@ -101,6 +102,54 @@ describe("DiffView", () => {
       rerender(view(fs, "/w2"));
       expect(queryByText("✓ viewed")).toBeNull();
       expect(queryByText("changed since viewed")).toBeNull();
+    });
+  });
+  describe("ask for a change (#956)", () => {
+    const two: DiffFile[] = [{
+      filePath: "src/a.ts", changeType: "modified", fileHeader: "",
+      hunks: [{ header: "@@ -4,2 +4,3 @@", lines: [], rawText: "x", additions: 2, deletions: 0,
+        rows: [
+          { kind: "context", text: "a", oldLine: 4, newLine: 4 },
+          { kind: "add", text: "b", oldLine: null, newLine: 5 },
+          { kind: "add", text: "c", oldLine: null, newLine: 6 },
+        ] }],
+    }];
+    const view = (fs: DiffFile[], readOnly = false) => (
+      <DiffView files={fs} workspacePath="/w" workspaceId="w1" readOnly={readOnly} onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />
+    );
+    beforeEach(() => useReviewComments.setState({ byWs: {}, liveByWs: {} }));
+
+    it("m opens a comment on the focused hunk; ⌘↩ adds it to the tray and shows it under the hunk", () => {
+      const { getByLabelText, getByText } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      const field = getByLabelText("What should change");
+      expect(getByText("src/a.ts:4–6")).toBeTruthy();
+      fireEvent.change(field, { target: { value: "Split this." } });
+      fireEvent.keyDown(field, { key: "Enter", metaKey: true });
+      const [c] = useReviewComments.getState().byWs.w1;
+      expect(c).toMatchObject({ filePath: "src/a.ts", startLine: 4, endLine: 6, note: "Split this.", quote: [" a", "+b", "+c"] });
+      expect(getByText("Split this.")).toBeTruthy();
+      expect(useReviewComments.getState().liveByWs.w1.size).toBe(1);
+    });
+
+    it("a line number starts a comment on that line; shift-click extends it", () => {
+      const { getByText, getAllByText, getByRole, container } = render(view(two));
+      fireEvent.click(getAllByText("5")[0]);
+      expect(getByText("src/a.ts:5")).toBeTruthy();
+      fireEvent.click(getAllByText("6")[0], { shiftKey: true });
+      expect(getByText("src/a.ts:5–6")).toBeTruthy();
+      expect(container.querySelectorAll("[data-picked]")).toHaveLength(2);
+      fireEvent.click(getByRole("button", { name: "Cancel" }));
+      expect(container.querySelectorAll("[data-picked]")).toHaveLength(0);
+    });
+
+    it("offers no comments in the read-only Since base view", () => {
+      const { queryByRole, queryByLabelText } = render(view(two, true));
+      expect(queryByRole("button", { name: "Ask for a change" })).toBeNull();
+      fireEvent.keyDown(window, { key: "m" });
+      expect(queryByLabelText("What should change")).toBeNull();
+      expect(keyboardHelpLine(true)).not.toContain("m ask");
+      expect(keyboardHelpLine(false)).toContain("m ask for a change");
     });
   });
   it("renders empty state with no files", () => {

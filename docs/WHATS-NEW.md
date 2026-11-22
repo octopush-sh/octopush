@@ -131,6 +131,8 @@ Current anchors:
 | `review-editor` | Review, Editor view: the code editor pane (tabs excluded, status bar included) | `EditorPane.tsx` |
 | `review-sidebar` | Review: the Changes/Files navigator (expanded, or its icon strip) | `ReviewSidebar.tsx` |
 | `review-diff-hunk` | Review diff: one hunk (its rail and highlighted lines; the first on screen) | `review/FileDiffSection.tsx` |
+| `review-hunk-comment` · `review-comment-composer` · `review-comment-add` | Review diff, working tree only: a hunk rail's "Ask for a change" icon (the first on screen) · the inline comment field under a hunk · its "Ask for this change" (both only while one is open) | `review/HunkRail.tsx` · `review/HunkComments.tsx` |
+| `review-companion-comments` · `review-companion-send-comments` | Review Companion, only while a comment is waiting: the "For the agent" tray · its "Send to the agent" | `review/CommentTray.tsx` |
 | `review-file-viewed` · `review-file-changed` | Review diff, file header: "mark viewed" / "✓ viewed" · the "changed since viewed" chip (only after a viewed file changed) | `review/FileDiffSection.tsx` |
 | `review-open-pr` | Review: "Open a pull request" (published branch, no PR yet, `gh` signed in) | `ChangesPanel.tsx` |
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |
