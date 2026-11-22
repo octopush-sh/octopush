@@ -4,6 +4,7 @@ import { useAiReview, diffHash } from "../../stores/aiReviewStore";
 import { AiFindingCard } from "./AiFindingCard";
 import { FadeSwap } from "../primitives/FadeSwap";
 import { ModelPicker } from "../ModelPicker";
+import { partialReviewLine } from "../../lib/aiReview";
 
 export function AiReviewPanel({
   workspaceId,
@@ -63,11 +64,31 @@ export function AiReviewPanel({
         </button>
       )}
       <p className="text-[11px] leading-[1.5] text-octo-sage">{review.result!.summary}</p>
+      {review.partial && (
+        <p
+          data-tour="ai-review-partial"
+          className="font-mono text-[10px] leading-[1.5] text-octo-mute"
+          title={
+            [
+              review.partial.cutFile != null ? `Read in part: ${review.partial.cutFile}` : "",
+              review.partial.omitted.length > 0
+                ? `Not reviewed:\n${review.partial.omitted.slice(0, 20).join("\n")}${review.partial.omitted.length > 20 ? `\n…and ${review.partial.omitted.length - 20} more` : ""}`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n") || undefined
+          }
+        >
+          {partialReviewLine(review.partial)}
+        </p>
+      )}
       {findings.map((f, i) => (
         <AiFindingCard key={`${f.file ?? ""}:${f.line ?? ""}:${f.title}:${i}`} finding={f} onJump={onJump} onEdit={onEdit} />
       ))}
       {findings.length === 0 && (
-        <p className="text-[11px] text-octo-verdigris">No issues found.</p>
+        <p className="text-[11px] text-octo-verdigris">
+          {review.partial ? "No issues in what was read." : "No issues found."}
+        </p>
       )}
     </div>
   );

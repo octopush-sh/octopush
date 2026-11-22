@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 
 vi.mock("../lib/ipc", () => ({
-  ipc: { aiComplete: vi.fn(), listProviders: vi.fn(), suggestModel: vi.fn() },
+  ipc: { aiComplete: vi.fn(), listProviders: vi.fn(), listModels: vi.fn(), suggestModel: vi.fn() },
 }));
 vi.mock("../components/Toasts", () => ({ pushToast: vi.fn() }));
 import { ipc } from "../lib/ipc";
@@ -15,6 +15,7 @@ beforeEach(() => {
   localStorage.clear();
   useAiReview.setState({ models: {}, reviews: {}, runGen: {} });
   (ipc.aiComplete as any).mockReset();
+  (ipc.listModels as any).mockReset().mockRejectedValue(new Error("no backend"));
   (ipc.suggestModel as any).mockReset().mockRejectedValue(new Error("no backend"));
   _resetHelperModelsForTests();
 });
@@ -66,6 +67,58 @@ describe("aiReviewStore", () => {
     const r = useAiReview.getState().reviewFor("w1");
     expect(r.status).toBe("error");
     expect(r.error).toContain("no key");
+  });
+  describe("partial diffs (#943)", () => {
+    const file = (name: string, kb: number) =>
+      `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -0,0 +1 @@\n` + `+${"x".repeat(99)}\n`.repeat(kb * 10);
+
+    it("a small diff goes as is and the result is not partial", async () => {
+      (ipc.listModels as any).mockResolvedValue([{ provider: "anthropic", model: { id: "claude-opus-5-5", maxContext: 200_000 } }]);
+      (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+      useAiReview.getState().setModel("w1", "claude-opus-5-5");
+      const diff = file("a.ts", 1);
+      await useAiReview.getState().run("w1", diff);
+      expect((ipc.aiComplete as any).mock.calls[0][2]).toBe(`Here is the unified diff to review:\n\n${diff}`);
+      expect(useAiReview.getState().reviewFor("w1").partial).toBeNull();
+    });
+
+    it("fits a diff over the model's window and records the files left out", async () => {
+      (ipc.listModels as any).mockResolvedValue([{ provider: "x", model: { id: "small-32k", maxContext: 32_000 } }]);
+      (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+      useAiReview.getState().setModel("w1", "small-32k");
+      const diff = file("a.ts", 20) + file("b.ts", 20) + file("c.ts", 20) + file("d.ts", 20);
+      await useAiReview.getState().run("w1", diff);
+      const prompt = (ipc.aiComplete as any).mock.calls[0][2] as string;
+      expect(prompt).toContain("PARTIAL");
+      expect(prompt).toContain("diff --git a/a.ts b/a.ts");
+      expect(prompt).not.toContain("diff --git a/d.ts b/d.ts");
+      const r = useAiReview.getState().reviewFor("w1");
+      expect(r.partial).toMatchObject({ totalFiles: 4 });
+      expect(r.partial!.readFiles + r.partial!.omitted.length).toBe(4);
+      expect(r.partial!.omitted).toContain("d.ts");
+      expect(r.diffHash).toBe(diffHash(diff)); // stale check still keys on the whole diff
+    });
+
+    it("flags a diff the 1 MiB cap cut, even when the catalog is unreadable", async () => {
+      (ipc.aiComplete as any).mockResolvedValue({ text: okJson, inputTokens: 1, outputTokens: 1, costUsd: 0 });
+      const diff = file("a.ts", 1) + "\n... diff truncated (too large to display fully) ...\n";
+      await useAiReview.getState().run("w1", diff);
+      const prompt = (ipc.aiComplete as any).mock.calls[0][2] as string;
+      expect(prompt).toContain("PARTIAL");
+      expect(prompt).not.toContain("diff truncated (too large");
+      expect(useAiReview.getState().reviewFor("w1").partial).toEqual({ readFiles: 1, totalFiles: null, omitted: [], cutFile: null });
+    });
+
+    it("fails before the call when the model's window is smaller than the reserves", async () => {
+      (ipc.listModels as any).mockResolvedValue([{ provider: "x", model: { id: "tiny-8k", maxContext: 8_000 } }]);
+      useAiReview.getState().setModel("w1", "tiny-8k");
+      await useAiReview.getState().run("w1", file("a.ts", 1));
+      expect(ipc.aiComplete).not.toHaveBeenCalled();
+      const r = useAiReview.getState().reviewFor("w1");
+      expect(r.status).toBe("error");
+      expect(r.error).toBe("This model's context window is too small to review this change.");
+      expect(r.partial).toBeNull();
+    });
   });
   it("diffHash changes with the diff (freshness)", () => {
     expect(diffHash("a")).not.toBe(diffHash("b"));
