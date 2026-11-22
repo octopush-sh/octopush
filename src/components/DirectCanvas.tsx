@@ -14,6 +14,7 @@ import { isPlanWaiting, pickBlockedStage } from "../lib/planWait";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { nextStages } from "../lib/gateComments";
 
 interface Props {
   active: boolean;
@@ -34,6 +35,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const begin = useRunsStore((s) => s.begin);
   const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
+  const approveWithComments = useRunsStore((s) => s.approveWithComments);
   const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
@@ -134,6 +136,13 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
       }
     }
 
+    // Where an approve with comments hands them (#957).
+    const followers = blockedStage ? nextStages(stages, blockedStage) : [];
+    const nextLabel =
+      followers.length === 0 ? null
+      : followers.length === 1 ? labelForRole(followers[0].role)
+      : `${followers.length} stages`;
+
     const doneCount = stages.filter((s) => s.status === "done").length;
     const onRunAgain = () => {
       // Seed the launcher with this run's brief, pipeline, and crew — the
@@ -224,8 +233,11 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           // resolves another stage of the run: if that stage was decided
           // elsewhere meanwhile, it refuses, the store toasts the refusal and
           // the refresh shows what is waiting now. No stage shown, no decision.
-          onApprove={() => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "approve");
+          nextStageLabel={nextLabel}
+          onApprove={(comments) => {
+            if (!blockedStage) return;
+            if (comments && comments.length > 0) void approveWithComments(run.id, blockedStage.id, comments);
+            else void resolve(run.id, blockedStage.id, "approve");
           }}
           onReject={(fb, maxTurns) => {
             if (blockedStage) void resolve(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });

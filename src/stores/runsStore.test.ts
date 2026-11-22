@@ -26,6 +26,8 @@ vi.mock("../lib/ipc", async () => {
 
 import { ipc, type Run, type RunStage } from "../lib/ipc";
 import { useRunsStore, EMPTY_RUNS, prefilledTask } from "./runsStore";
+import { useGateCommentsStore } from "./gateCommentsStore";
+import { gateKey } from "../lib/gateComments";
 
 const RUN: Run = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
@@ -70,6 +72,39 @@ describe("runsStore", () => {
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
     await useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
     expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
+  });
+
+  describe("approveWithComments (#957)", () => {
+    const gate: RunStage = { ...STAGE, id: "plan", status: "awaiting_checkpoint", finishedAt: "f1" };
+    const impl: RunStage = { ...STAGE, id: "impl", position: 1, role: "implement", status: "pending", instructions: "Keep it small." };
+    const comments = [{ id: "c1", quote: "Step 2", note: "Behind a flag.", at: 0, len: 6 }];
+    const seed = () => {
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [gate, impl] } } as any });
+      useGateCommentsStore.setState({ byGate: { [gateKey(gate)]: comments } });
+      (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [gate, impl] });
+    };
+
+    it("appends the comments to the next stage's instructions, clears them, then approves", async () => {
+      seed();
+      (ipc.updateRunStage as any).mockResolvedValue(undefined);
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      const [, stageId, patch] = (ipc.updateRunStage as any).mock.calls[0];
+      expect(stageId).toBe("impl");
+      expect(patch.instructions).toMatch(/^Keep it small\.\n\nThe director approved Plan with these comments/);
+      expect(patch.instructions).toContain('1. On "Step 2":\n   Behind a flag.');
+      expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "plan", "approve", undefined);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
+    });
+
+    it("approves nothing and keeps the comments when the next stage refuses them", async () => {
+      seed();
+      (ipc.updateRunStage as any).mockRejectedValue("implement has already started");
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      expect(ipc.resolveCheckpoint).not.toHaveBeenCalled();
+      expect(pushToastMock.mock.calls[0][0].title).toBe("Not approved yet");
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+    });
   });
 
   it("appendEntry accumulates structured entries per stage and caps the buffer", () => {

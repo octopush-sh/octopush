@@ -1111,6 +1111,15 @@ button:not(:disabled),
   -webkit-user-select: text;
 }
 
+/* Commented passages in a document the director annotates (CommentableDocument):
+   painted through the CSS Custom Highlight API, so the rendered Markdown is
+   never re-wrapped to mark them. */
+::highlight(octo-comment) {
+  background-color: var(--brass-ghost);
+  text-decoration: underline;
+  text-decoration-color: var(--brass-dim);
+}
+
 /* Attention indicator pulse animation */
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }

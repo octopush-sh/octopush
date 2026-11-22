@@ -14,6 +14,9 @@ import {
 import { useUpgradeStore } from "./upgradeStore";
 import { isUpgradeRequired } from "../lib/upgradeError";
 import { pushToast } from "../components/Toasts";
+import { labelForRole } from "../lib/stageMeta";
+import { gateKey, nextStages, withGuidance, type GateComment } from "../lib/gateComments";
+import { useGateCommentsStore } from "./gateCommentsStore";
 
 export const EMPTY_RUNS: Run[] = [];
 const EMPTY_ENTRIES: LiveEntry[] = [];
@@ -136,6 +139,12 @@ interface RunsState {
     action: CheckpointActionName,
     opts?: CheckpointOptions,
   ) => Promise<void>;
+  /** Approve a gate with the director's comments (#957): append them as
+   *  guidance to the instructions of every stage it hands off to that hasn't
+   *  begun, clear the comments, then approve. If a stage refuses the
+   *  guidance, nothing is approved, the comments stay and the refusal is
+   *  toasted, so no comment is silently lost. */
+  approveWithComments: (runId: string, stageId: string, comments: GateComment[]) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
    *  injected as feedback. Refreshes the detail so the form gives way to the
@@ -467,6 +476,31 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       });
     }
     await get().refreshDetail(runId);
+  },
+
+  approveWithComments: async (runId, stageId, comments) => {
+    const stages = get().detailByRun[runId]?.stages ?? [];
+    const from = stages.find((s) => s.id === stageId);
+    if (from && comments.length > 0) {
+      const gate = gateKey(from);
+      for (const next of nextStages(stages, from)) {
+        try {
+          await ipc.updateRunStage(runId, next.id, {
+            instructions: withGuidance(next.instructions, comments, labelForRole(from.role)),
+          });
+        } catch (e) {
+          pushToast({
+            level: "info",
+            title: "Not approved yet",
+            body: `Your comments couldn't reach ${labelForRole(next.role)}: ${String(e).split("\n")[0]}`,
+          });
+          await get().refreshDetail(runId);
+          return;
+        }
+      }
+      useGateCommentsStore.getState().clear(gate);
+    }
+    await get().resolve(runId, stageId, "approve");
   },
 
   answerBlocker: async (runId, stageId, answers, source) => {
