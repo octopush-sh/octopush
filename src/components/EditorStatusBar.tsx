@@ -9,6 +9,9 @@ interface Props {
   selectionLines?: { from: number; to: number } | null;
   /** Hand the selection to Talk ("Ask Talk about this"). */
   onAskTalk?: () => void;
+  /** The buffer has unsaved edits: Talk reads the file from disk, so the
+   *  lines would not be the ones selected. The button is disabled. */
+  askTalkUnsaved?: boolean;
   lang: string;
   /** Disk changed (or file deleted) under unsaved local edits. */
   diskStale?: boolean;
@@ -23,7 +26,8 @@ const CLICK =
   "transition-colors hover:bg-octo-panel hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass";
 
 export function EditorStatusBar({
-  line, col, selectionCount, selectionLines, onAskTalk, lang, diskStale, blameSavedNote,
+  line, col, selectionCount, selectionLines, onAskTalk, askTalkUnsaved, lang, diskStale,
+  blameSavedNote,
 }: Props) {
   const wrap = useEditorPrefs((s) => s.wrap);
   const lineNumbers = useEditorPrefs((s) => s.lineNumbers);
@@ -55,12 +59,15 @@ export function EditorStatusBar({
           type="button"
           data-tour="review-editor-ask-talk"
           onClick={onAskTalk}
+          disabled={askTalkUnsaved}
           title={
-            selectionLines.from === selectionLines.to
-              ? `Ask Talk about line ${selectionLines.from}`
-              : `Ask Talk about lines ${selectionLines.from}–${selectionLines.to}`
+            askTalkUnsaved
+              ? "Save the file first: Talk reads the lines from disk, not your unsaved edits"
+              : selectionLines.from === selectionLines.to
+                ? `Ask Talk about line ${selectionLines.from}`
+                : `Ask Talk about lines ${selectionLines.from}–${selectionLines.to}`
           }
-          className={`${SEG} ${CLICK} octo-pop-in text-octo-brass`}
+          className={`${SEG} octo-pop-in ${askTalkUnsaved ? "cursor-default" : `${CLICK} text-octo-brass`}`}
         >
           <MessageSquareText size={11} aria-hidden />
           Ask Talk about this

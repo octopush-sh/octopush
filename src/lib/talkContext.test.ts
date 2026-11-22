@@ -77,6 +77,13 @@ describe("talkContext — parsing", () => {
     expect(removeContextToken("(@src/lib/)", "src/lib/")).toBe("()");
   });
 
+  it("never removes a longer token that starts with the one asked for", () => {
+    expect(removeContextToken("see @diff:src/a.ts and @diff", "diff")).toBe("see @diff:src/a.ts and ");
+    expect(removeContextToken("tail @session:zsh then @session", "session")).toBe("tail @session:zsh then ");
+    expect(removeContextToken("@src/a.ts.orig vs @src/a.ts.", "src/a.ts")).toBe("@src/a.ts.orig vs .");
+    expect(removeContextToken("only @diff:src/a.ts", "diff")).toBe("only @diff:src/a.ts");
+  });
+
   it("labels chips by basename, range, folder, session and diff", () => {
     const labels = extractContextRefs("@src/lib/b.ts#L2-3 @src/lib/ @session:zsh-2 @diff:src/a.ts", cat).map(chipLabel);
     expect(labels).toEqual(["b.ts#L2-3", "lib/", "zsh", "diff · a.ts"]);

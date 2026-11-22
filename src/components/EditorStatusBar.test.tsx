@@ -48,6 +48,21 @@ describe("EditorStatusBar", () => {
     expect(onAskTalk).toHaveBeenCalledTimes(1);
   });
 
+  it("disables Ask Talk about this while the file has unsaved edits", async () => {
+    const onAskTalk = vi.fn();
+    render(
+      <EditorStatusBar
+        line={1} col={1} selectionCount={1} selectionLines={{ from: 5, to: 10 }}
+        onAskTalk={onAskTalk} askTalkUnsaved lang="ts"
+      />,
+    );
+    const btn = screen.getByRole("button", { name: /Ask Talk about this/ });
+    expect(btn).toBeDisabled();
+    expect(btn.getAttribute("title")).toMatch(/^Save the file first/);
+    await userEvent.click(btn);
+    expect(onAskTalk).not.toHaveBeenCalled();
+  });
+
   it("shows selection count only when more than one selection", () => {
     const { rerender } = render(
       <EditorStatusBar line={1} col={1} selectionCount={1} lang="rust" />,

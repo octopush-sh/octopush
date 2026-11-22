@@ -126,10 +126,13 @@ export function extractContextRefs(text: string, cat: ContextCatalog): ContextRe
   return out;
 }
 
-/** Remove the first `@token` from a draft (and one space after it). */
+/** Remove the first `@token` from a draft (and one space after it). The token
+ *  only matches where the extractor would have ended it — trailing
+ *  punctuation, then whitespace or the end — so `@diff` never matches the
+ *  start of `@diff:src/a.ts`. */
 export function removeContextToken(text: string, token: string): string {
   const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(^|[\\s([{"'\`])@${esc}(?=$|[\\s.,;:!?)\\]}'"\`]) ?`);
+  const re = new RegExp(`(^|[\\s([{"'\`])@${esc}(?=[.,;:!?)\\]}'"\`]*(?:$|\\s)) ?`);
   return text.replace(re, "$1");
 }
 

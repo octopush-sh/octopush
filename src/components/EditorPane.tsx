@@ -293,11 +293,12 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
 
   // "Ask Talk about this": hand the selection's range to Talk's draft as
   // `@path#L5-10` and switch to Talk. The selection stays as it was, so
-  // coming back to Review finds it still highlighted.
+  // coming back to Review finds it still highlighted. Only offered for files
+  // inside the worktree (a token outside it names nothing in the catalog).
   const askTalk = () => {
     if (!activeFile || pos.selFrom == null || pos.selTo == null) return;
-    const rel = activeFile.path.startsWith(workspacePath + "/")
-      ? activeFile.path.slice(workspacePath.length + 1) : activeFile.path;
+    if (!activeFile.path.startsWith(workspacePath + "/")) return;
+    const rel = activeFile.path.slice(workspacePath.length + 1);
     useChatStore.getState().queueDraftInsert(workspaceId, `@${rangeToken(rel, pos.selFrom, pos.selTo)} `);
     navigate({ kind: "mode", mode: "talk" });
   };
@@ -857,7 +858,8 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           col={pos.col}
           selectionCount={pos.selections}
           selectionLines={pos.selFrom != null && pos.selTo != null ? { from: pos.selFrom, to: pos.selTo } : null}
-          onAskTalk={askTalk}
+          onAskTalk={activeFile.path.startsWith(workspacePath + "/") ? askTalk : undefined}
+          askTalkUnsaved={isFileDirty(activeFile)}
           lang={activeFile.lang}
           diskStale={activeFile.diskStale}
           blameSavedNote={blameEnabled && isFileDirty(activeFile)}
