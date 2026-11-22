@@ -21945,6 +21945,74 @@ mod secret_guard_tests {
         assert_eq!(f[0].location(), "tests/fixtures/data.ts:2");
     }
 
+    // ── Talk's shell (#819) ─────────────────────────────────────────────
+
+    #[test]
+    fn shell_plan_reads_commits_pushes_and_prs_per_segment() {
+        let plan = |c: &str| shell_plan(c);
+        assert_eq!(plan("git status"), None);
+        assert_eq!(plan("npm test && git log --oneline"), None);
+        assert_eq!(plan("echo commit push"), None);
+        assert_eq!(plan("gh pr view 3"), None);
+        assert_eq!(plan("git commit -m 'fix'"), Some(ShellPlan { commit: Some(false), ..Default::default() }));
+        assert_eq!(plan("git -C sub commit --amend --no-edit").unwrap().commit, Some(false));
+        // Staging in the same command (or `-a`) covers every uncommitted change.
+        for c in ["git add -A && git commit -m x", "git commit -am x", "git commit --all -m x", "git stage . ; git commit"] {
+            let p = plan(c).unwrap();
+            assert_eq!(p.commit, Some(true), "{c}");
+            assert!(p.covers_uncommitted(), "{c}");
+        }
+        assert_eq!(plan("git add -A").unwrap_or_default().commit, None, "staging alone sends nothing");
+        let p = plan("git add -A && git commit -m x && /usr/bin/git push -u origin HEAD").unwrap();
+        assert_eq!((p.commit, p.push), (Some(true), true));
+        assert_eq!(plan("gh pr create --fill").unwrap().pr, Some(None));
+        assert_eq!(plan("gh pr create --base develop --fill").unwrap().pr, Some(Some("develop".into())));
+        assert_eq!(plan("gh pr create -B Release/2.0").unwrap().pr, Some(Some("Release/2.0".into())));
+        assert_eq!(plan("gh pr create --base=main").unwrap().pr, Some(Some("main".into())));
+        assert_eq!(plan("digit commit"), None, "only git itself");
+    }
+
+    #[test]
+    fn shell_files_scan_what_the_command_would_send() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        let commit = ShellPlan { commit: Some(false), ..Default::default() };
+        let staging = ShellPlan { commit: Some(true), ..Default::default() };
+        // A plain commit records only the index: nothing staged, nothing found.
+        assert!(scan_added(&shell_files(dir.path(), &commit).unwrap(), &[]).is_empty());
+        // `git add -A && git commit` would record the untracked file.
+        let f = scan_added(&shell_files(dir.path(), &staging).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "unstaged.ts:1");
+        // Committed: a push sends it, and so does a PR with no --base given.
+        commit_all(&repo, "leak");
+        let push = ShellPlan { push: true, ..Default::default() };
+        assert_eq!(scan_added(&shell_files(dir.path(), &push).unwrap(), &[]).len(), 1);
+        let c = shell_files(dir.path(), &ShellPlan { commit: Some(false), push: true, ..Default::default() }).unwrap();
+        assert_eq!(c.scope, "shell");
+        assert_eq!(scan_added(&c, &[]).len(), 1, "the push's finding; nothing is staged");
+    }
+
+    #[tokio::test]
+    async fn guard_scans_a_shell_command_only_when_the_setting_is_on() {
+        let (dir, _repo) = repo();
+        std::fs::write(dir.path().join("a.ts"), format!("{}\n", true_positives().remove(0).2)).unwrap();
+        let plan = shell_plan("git add -A && git commit -m x").unwrap();
+        let p = dir.path().to_path_buf();
+        let collect = move || shell_files(&p, &plan);
+        {
+            let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+            assert!(guarded_scan(collect.clone()).await.is_none(), "setting off: today's behaviour");
+        }
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let report = guarded_scan(collect.clone()).await.unwrap();
+        assert!(report.needs_confirmation());
+        let fp = report.fingerprint.clone();
+        assert!(matches!(guard(None, collect.clone()).await, Err(crate::error::AppError::SecretsFound { .. })));
+        assert!(guard(Some(fp), collect).await.is_ok(), "the confirm's fingerprint lets this run through");
+    }
+
     /// Scanning a 5,000-line staged diff stays far below a click's latency.
     #[test]
     fn a_5k_line_diff_scans_fast() {

@@ -268,6 +268,7 @@ export const defaultScenario: Scenario = {
     list_providers: PROVIDERS,
     list_models: MODELS,
     get_settings: SETTINGS,
+    unreadable_settings_path: null,
     get_sync_prefs: { historySync: false, librarySync: false } satisfies SyncPrefs,
     sketchbook_path: "/Users/dev/.octopush/sketchbook",
     detect_editors: [],

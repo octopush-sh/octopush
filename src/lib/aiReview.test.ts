@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseAiReview, buildReviewPrompt } from "./aiReview";
+import { parseAiReview, buildReviewPrompt, fitReviewDiff, estimateTokens, partialReviewLine, WINDOW_TOO_SMALL } from "./aiReview";
 
 const valid = JSON.stringify({
   summary: "Adds a word-diff",
@@ -75,6 +75,111 @@ describe("parseAiReview", () => {
 describe("buildReviewPrompt", () => {
   it("embeds the diff", () => {
     expect(buildReviewPrompt("DIFF")).toContain("DIFF");
+  });
+  it("tells the model a cut diff is partial and names the files left out", () => {
+    const p = buildReviewPrompt("DIFF", { readFiles: 1, totalFiles: 3, omitted: ["b.ts", "c.ts"], cutFile: null });
+    expect(p).toContain("PARTIAL");
+    expect(p).toContain("it was cut at a file boundary to fit your context window.");
+    expect(p).toContain("Do not report code that is missing");
+    expect(p).toContain("Files left out: b.ts, c.ts.");
+    expect(p.endsWith("DIFF")).toBe(true);
+  });
+  it("words the note after what was actually cut", () => {
+    const inside = buildReviewPrompt("DIFF", { readFiles: 1, totalFiles: 1, omitted: [], cutFile: "huge.ts" });
+    expect(inside).toContain("it was cut inside huge.ts to fit your context window, so that file stops mid-way.");
+    expect(inside).not.toContain("file boundary");
+    expect(inside).not.toContain("too large to load in full");
+
+    const cap = buildReviewPrompt("DIFF", { readFiles: 2, totalFiles: null, omitted: [], cutFile: null });
+    expect(cap).toContain("the change was too large to load in full, so it stops mid-way.");
+    expect(cap).not.toContain("context window");
+
+    const both = buildReviewPrompt("DIFF", { readFiles: 2, totalFiles: null, omitted: ["c.ts"], cutFile: null });
+    expect(both).toContain(
+      "it was cut at a file boundary to fit your context window; the change was also too large to load in full, so more files may be missing than are listed.",
+    );
+  });
+  it("caps the named files and counts the rest", () => {
+    const omitted = Array.from({ length: 35 }, (_, i) => `f${i}.ts`);
+    const p = buildReviewPrompt("DIFF", { readFiles: 1, totalFiles: 36, omitted, cutFile: null });
+    expect(p).toContain("f29.ts (and 5 more)");
+    expect(p).not.toContain("f30.ts");
+  });
+});
+
+describe("fitReviewDiff (#943)", () => {
+  const MARKER = "... diff truncated (too large to display fully) ...";
+  const file = (name: string, lines: number) =>
+    `diff --git a/${name} b/${name}\n--- a/${name}\n+++ b/${name}\n@@ -0,0 +1 @@\n` + `+${"x".repeat(99)}\n`.repeat(lines);
+
+  it("leaves a small diff untouched", () => {
+    const d = file("a.ts", 10) + file("b.ts", 10);
+    expect(fitReviewDiff(d, 200_000)).toEqual({ diff: d, partial: null });
+    expect(fitReviewDiff(d, null)).toEqual({ diff: d, partial: null });
+  });
+
+  it("flags the 1 MiB marker and drops it from what the model reads", () => {
+    const d = file("a.ts", 10) + file("b.ts", 3) + `\n${MARKER}\n`;
+    const f = fitReviewDiff(d, 200_000);
+    expect(f.diff).not.toContain(MARKER);
+    expect(f.diff).toBe(file("a.ts", 10) + file("b.ts", 3));
+    expect(f.partial).toEqual({ readFiles: 2, totalFiles: null, omitted: [], cutFile: null });
+    expect(partialReviewLine(f.partial!)).toBe("Read the first 1 MB of the diff; the rest wasn't reviewed.");
+  });
+
+  it("cuts at a file boundary to fit the window", () => {
+    // ~6.7k estimated tokens per file; 32k window leaves ~19k for the diff.
+    const d = file("a.ts", 200) + file("b.ts", 200) + file("c.ts", 200) + file("d.ts", 200);
+    const f = fitReviewDiff(d, 32_000);
+    expect(f.diff).toBe(file("a.ts", 200) + file("b.ts", 200));
+    expect(f.partial).toEqual({ readFiles: 2, totalFiles: 4, omitted: ["c.ts", "d.ts"], cutFile: null });
+    expect(estimateTokens(f.diff)).toBeLessThan(32_000 - 8192);
+    expect(partialReviewLine(f.partial!)).toBe("Read the first 2 of 4 files; the rest wasn't reviewed.");
+  });
+
+  it("a capped diff that also overflows the window can't name a total", () => {
+    const d = file("a.ts", 200) + file("b.ts", 200) + file("c.ts", 200) + `\n${MARKER}\n`;
+    const f = fitReviewDiff(d, 32_000);
+    expect(f.partial).toEqual({ readFiles: 2, totalFiles: null, omitted: ["c.ts"], cutFile: null });
+    expect(partialReviewLine(f.partial!)).toBe("Read the first 2 files; the rest wasn't reviewed.");
+  });
+
+  it("keeps the head of a first file too big for the window, cut at a line", () => {
+    const d = file("src/huge.ts", 2000) + file("b.ts", 10);
+    const f = fitReviewDiff(d, 32_000);
+    expect(f.diff.startsWith("diff --git a/src/huge.ts b/src/huge.ts\n")).toBe(true);
+    expect(f.diff.endsWith("\n")).toBe(true);
+    expect(estimateTokens(f.diff)).toBeLessThan(32_000 - 8192);
+    expect(f.partial).toEqual({ readFiles: 1, totalFiles: 2, omitted: ["b.ts"], cutFile: "src/huge.ts" });
+    expect(partialReviewLine(f.partial!)).toBe("Read the first part of huge.ts, the first of 2 files; the rest wasn't reviewed.");
+  });
+
+  it("says a single file over the window was read only in part", () => {
+    // ~200 KB lockfile (~67k estimated tokens) against a 64k window.
+    const d = file("package-lock.json", 2000);
+    const f = fitReviewDiff(d, 64_000);
+    expect(f.diff.length).toBeLessThan(d.length);
+    expect(f.partial).toEqual({ readFiles: 1, totalFiles: 1, omitted: [], cutFile: "package-lock.json" });
+    expect(partialReviewLine(f.partial!)).toBe("Read the first part of package-lock.json; the rest wasn't reviewed.");
+    expect(buildReviewPrompt(f.diff, f.partial)).toContain("cut inside package-lock.json");
+  });
+
+  it("refuses a window smaller than the reserves instead of sending an empty diff", () => {
+    const d = file("a.ts", 200) + file("b.ts", 10);
+    expect(() => fitReviewDiff(d, 10_000)).toThrow(WINDOW_TOO_SMALL);
+    expect(() => fitReviewDiff(d, 8_192)).toThrow(WINDOW_TOO_SMALL);
+  });
+
+  it("names the count and the cut file when several files were read", () => {
+    expect(partialReviewLine({ readFiles: 3, totalFiles: 5, omitted: ["d.ts", "e.ts"], cutFile: "lib/c.ts" })).toBe(
+      "Read the first 3 of 5 files, the last one (c.ts) in part; the rest wasn't reviewed.",
+    );
+  });
+
+  it("estimates tokens from UTF-8 bytes", () => {
+    expect(estimateTokens("abc")).toBe(1);
+    expect(estimateTokens("é")).toBe(1); // 2 bytes
+    expect(estimateTokens("€€€")).toBe(3); // 9 bytes
   });
 });
 

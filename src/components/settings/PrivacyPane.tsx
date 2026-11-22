@@ -25,6 +25,21 @@ export const OUTBOUND: readonly string[] = [
 export const AGENT_CLI_NOTE =
   "Agent CLIs Octopush launches for you (Claude Code, Codex) talk to their own services and follow their own telemetry policies.";
 
+/** The opening words of `AGENT_CLI_NOTE`, set in the lead-in voice like every
+ *  other item's opening. Styling only: the sentence is still rendered whole,
+ *  from the constant above. */
+export const AGENT_CLI_LEAD_IN = "Agent CLIs";
+
+/** The data inventory is a real list: one native marker for every item, in
+ *  a 16px gutter, so a wrapped line hangs under the text and never under the
+ *  marker. The marker takes the item's own colour. Exported for the test. */
+export const INVENTORY_LIST_CLASS =
+  "max-w-[640px] list-disc space-y-2 pl-4 text-[13px] leading-[1.6] text-octo-sage";
+/** The outbound destinations: the same list, one level in. */
+export const OUTBOUND_LIST_CLASS = "mt-1 list-disc space-y-1 pl-4";
+/** Every item opens with its lead-in in the serif voice. */
+export const LEAD_IN_CLASS = "font-serif text-octo-ivory";
+
 /** The variable "Quiet Claude Code" sets on crew stages and Routines (#703). */
 export const QUIET_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1";
 
@@ -48,38 +63,41 @@ export function PrivacyPane() {
         subtitle="Your work stays on this Mac, unless you turn on sync. Requests to AI providers go straight from this machine to the provider, never through Octopush."
       />
 
-      <ul className="max-w-[640px] space-y-2 text-[13px] leading-[1.6] text-octo-sage">
+      <ul className={INVENTORY_LIST_CLASS} data-testid="privacy-inventory">
         <li>
-          · <span className="font-serif text-octo-ivory">Stored on this Mac:</span> projects,
-          workspaces, chats, tool executions, Direct runs, token usage — in{" "}
+          <span className={LEAD_IN_CLASS}>Stored on this Mac:</span> projects, workspaces, chats,
+          tool executions, Direct runs, token usage — in{" "}
           <code className={PATH_CHIP_CLASS}>
             ~/Library/Application Support/octopush/octopush.db
           </code>
           . Runs and custom pipelines leave it only if you turn on sync.
         </li>
         <li>
-          · <span className="font-serif text-octo-ivory">API keys:</span> stored in{" "}
+          <span className={LEAD_IN_CLASS}>API keys:</span> stored in{" "}
           <code className={PATH_CHIP_CLASS}>~/.octopush/settings.json</code>. Your
           account session lives in the macOS Keychain.
         </li>
         <li>
-          · <span className="font-serif text-octo-ivory">Outbound traffic, only to:</span>
-          <ul className="mt-1 space-y-1 pl-4" data-testid="privacy-outbound">
+          <span className={LEAD_IN_CLASS}>Outbound traffic, only to:</span>
+          <ul className={OUTBOUND_LIST_CLASS} data-testid="privacy-outbound">
             {OUTBOUND.map((line) => (
               <li key={line}>{line}</li>
             ))}
           </ul>
         </li>
         <li>
-          · <span className="font-serif text-octo-ivory">No analytics, no telemetry.</span>
+          <span className={LEAD_IN_CLASS}>No analytics, no telemetry.</span>
         </li>
-        <li data-testid="privacy-agent-cli">· {AGENT_CLI_NOTE}</li>
+        <li data-testid="privacy-agent-cli">
+          <span className={LEAD_IN_CLASS}>{AGENT_CLI_NOTE.slice(0, AGENT_CLI_LEAD_IN.length)}</span>
+          {AGENT_CLI_NOTE.slice(AGENT_CLI_LEAD_IN.length)}
+        </li>
       </ul>
 
       <div className="mt-8 max-w-[640px] space-y-2">
         <QuietClaudeCodeRow />
         <p
-          className="px-4 text-[12px] leading-[1.55] text-octo-sage"
+          className="text-[12px] leading-[1.55] text-octo-sage"
           data-testid="privacy-quiet-off-note"
         >
           {QUIET_OFF_NOTE}

@@ -2,7 +2,15 @@ import { create } from "zustand";
 import { persist } from "zustand/middleware";
 import { ipc } from "../lib/ipc";
 import { pushToast } from "../components/Toasts";
-import { AI_REVIEW_SCHEMA, AI_REVIEW_SYSTEM, buildReviewPrompt, parseAiReview, type AiReviewResult } from "../lib/aiReview";
+import {
+  AI_REVIEW_SCHEMA,
+  AI_REVIEW_SYSTEM,
+  buildReviewPrompt,
+  fitReviewDiff,
+  parseAiReview,
+  type AiReviewResult,
+  type ReviewPartial,
+} from "../lib/aiReview";
 import { helperModelNow, resolveHelperModel } from "../lib/helperModels";
 
 export type ReviewStatus = "idle" | "running" | "done" | "error";
@@ -11,8 +19,22 @@ export interface WsReview {
   result: AiReviewResult | null;
   diffHash: string | null;
   error: string | null;
+  /** What the result didn't read (#943); null when it read the whole diff.
+   *  Kept with the result, so a stale result still says it was partial. */
+  partial: ReviewPartial | null;
 }
-const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null };
+const EMPTY: WsReview = { status: "idle", result: null, diffHash: null, error: null, partial: null };
+
+/** The model's context window from the catalog; null when it isn't listed
+ *  or the catalog can't be read (the diff then goes as is). */
+async function modelContextWindow(model: string): Promise<number | null> {
+  try {
+    const catalog = await ipc.listModels();
+    return catalog.find((m) => m.model.id === model)?.model.maxContext ?? null;
+  } catch {
+    return null;
+  }
+}
 
 /** Stable FNV-1a hash of the diff string — used to detect "diff changed". */
 export function diffHash(s: string): string {
@@ -76,19 +98,26 @@ export const useAiReview = create<State>()(
         }));
         try {
           const model = picked ?? (await resolveHelperModel("review"));
-          const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(gitDiff), {
+          const fitted = fitReviewDiff(gitDiff, await modelContextWindow(model));
+          const res = await ipc.aiComplete(model, AI_REVIEW_SYSTEM, buildReviewPrompt(fitted.diff, fitted.partial), {
             workspaceId: ws,
             jsonSchema: AI_REVIEW_SCHEMA,
           });
           if (get().runGen[ws] !== gen) return; // a newer run superseded this one
           const result = parseAiReview(res.text);
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null } },
+            reviews: {
+              ...s.reviews,
+              [ws]: { status: "done", result, diffHash: diffHash(gitDiff), error: null, partial: fitted.partial },
+            },
           }));
         } catch (e) {
           if (get().runGen[ws] !== gen) return;
           set((s) => ({
-            reviews: { ...s.reviews, [ws]: { status: "error", result: null, diffHash: null, error: e instanceof Error ? e.message : String(e) } },
+            reviews: {
+              ...s.reviews,
+              [ws]: { status: "error", result: null, diffHash: null, error: e instanceof Error ? e.message : String(e), partial: null },
+            },
           }));
         }
       },

@@ -337,6 +337,7 @@ pub fn run() {
             // Settings
             commands::get_settings,
             commands::save_settings,
+            commands::unreadable_settings_path,
             commands::save_git_credentials,
             // Provider catalog
             commands::save_providers,

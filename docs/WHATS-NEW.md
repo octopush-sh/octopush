@@ -125,6 +125,7 @@ Current anchors:
 | `review-companion-ahead` | Review Companion, Branch & publish: "3 commits ahead of main" (only with commits since the base) | `CompanionReview.tsx` |
 | `review-companion-scan-branch` · `review-companion-scan-result` | Review Companion, Branch & publish, only with commits since the base: "Scan this branch's commits" (then "Scan again"; hidden while a scan runs) · its result ("No possible secrets in 3 commits." or what it found; only once a scan answered) | `CompanionReview.tsx` |
 | `review-ai-pass` | Review: the AI review button | `ReviewCanvas.tsx` |
+| `ai-review-partial` | AI review drawer, under the summary: "Read the first 2 of 14 files; the rest wasn't reviewed." (only when the review read part of the diff) | `review/AiReviewPanel.tsx` |
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
 | `review-editor` | Review, Editor view: the code editor pane (tabs excluded, status bar included) | `EditorPane.tsx` |
@@ -147,8 +148,9 @@ Current anchors:
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-quiet-claude-code` | Settings › Privacy: the "Quiet Claude Code in crews and Routines" toggle | `settings/PrivacyPane.tsx` |
 | `settings-secret-guard` | Settings › General › Safety: "Guard commits against secrets" | `settings/GeneralPane.tsx` |
-| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push or PR is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` |
+| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push, PR or Talk `$` command is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` · `chat/Composer.tsx` |
 | `secret-guard-preview` | The secret guard's confirm, with one finding that has a masked preview: the mono `sk-ant-…9fQ2` line under the lead | `SecretGuardDialog.tsx` |
+| `talk-secret-approval` | Talk timeline, only while the secret guard holds an agent's commit, push or `gh pr create`: the inline "Possible secret" card ("Leave it out" · "Run regardless") | `chat/ApprovalCard.tsx` via `chat/ChatCanvas.tsx` |
 | `direct-secret-hold` | Direct run bar, on an Action stage held by the secret guard: "Held before Pull request: possible secret · …" | `RunControlBar.tsx` |
 | `settings-appearance-legacy` | Settings › Appearance: the Legacy theme group (Dark, Midnight, Solarized Dark; only when the theme list has any) | `settings/AppearancePane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |
