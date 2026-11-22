@@ -108,8 +108,27 @@ pub fn undo_ref_for(thread_id: &str) -> String {
     format!("{REF_ROOT}/{thread_id}/undo")
 }
 
+pub fn rewound_ref_for(thread_id: &str) -> String {
+    format!("{REF_ROOT}/{thread_id}/rewound")
+}
+
+/// Whether `ws` is the top of a git worktree. A folder that only sits
+/// inside some parent repository (a home directory under git) is not: its
+/// snapshot would be the whole parent tree, with paths that don't start at `ws`.
 fn is_repo(ws: &Path) -> bool {
-    git(ws, None, &["rev-parse", "--git-dir"]).map(|o| o.status.success()).unwrap_or(false)
+    git(ws, None, &["rev-parse", "--is-inside-work-tree", "--show-prefix"])
+        .ok()
+        .filter(|o| o.status.success())
+        // `true` then an empty prefix: the trimmed output is exactly `true`.
+        .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "true")
+}
+
+fn check_repo(ws: &Path) -> AppResult<()> {
+    if is_repo(ws) {
+        Ok(())
+    } else {
+        Err(AppError::Other("This folder isn't the top of a git repository.".into()))
+    }
 }
 
 fn resolve(ws: &Path, refname: &str) -> Option<String> {
@@ -217,8 +236,21 @@ pub fn capture_before(ws: &Path, thread_id: &str, message_id: i64) -> bool {
     }
 }
 
-/// Records how a turn left the tree when it is dropped — on every exit path
-/// of the turn, an error or a Stop included.
+/// Run checkpoint work (git subprocesses, file writes) on a blocking thread,
+/// never on an async runtime worker.
+pub async fn off_runtime<T, F>(f: F) -> AppResult<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> AppResult<T> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| AppError::Other(format!("talk checkpoint: {e}")))?
+}
+
+/// The turn whose end must be recorded: `send_agentic` records it once the
+/// turn returns — on every exit path, an error or a Stop included — while
+/// the turn still counts as running, so no rewind can race the snapshot.
 pub struct AfterTurn {
     ws: PathBuf,
     thread_id: String,
@@ -229,12 +261,23 @@ impl AfterTurn {
     pub fn new(ws: &Path, thread_id: &str, message_id: i64) -> Self {
         AfterTurn { ws: ws.to_path_buf(), thread_id: thread_id.to_string(), message_id }
     }
-}
 
-impl Drop for AfterTurn {
-    fn drop(&mut self) {
+    /// Snapshot how the turn left the tree as `<message>-after`. Best-effort.
+    pub fn record(self) {
         let name = after_ref_for(&self.thread_id, self.message_id);
         if let Err(e) = snapshot(&self.ws).and_then(|sha| set_ref(&self.ws, &name, &sha)) {
+            tracing::warn!(error = %e, "talk checkpoint (after turn) failed");
+        }
+    }
+
+    /// `record`, on a blocking thread.
+    pub async fn record_off_runtime(self) {
+        if let Err(e) = off_runtime(move || {
+            self.record();
+            Ok(())
+        })
+        .await
+        {
             tracing::warn!(error = %e, "talk checkpoint (after turn) failed");
         }
     }
@@ -345,6 +388,7 @@ fn outside_paths(ws: &Path, thread_id: &str, from_id: i64, current: &str) -> App
 /// the tree as it is now.
 pub fn preview(ws: &Path, thread_id: &str, message_id: i64) -> AppResult<RewindPreview> {
     check_thread(thread_id)?;
+    check_repo(ws)?;
     let target = resolve(ws, &ref_for(thread_id, message_id))
         .ok_or_else(|| AppError::Other("This turn has no checkpoint.".into()))?;
     let current = snapshot(ws)?;
@@ -412,9 +456,12 @@ fn apply(ws: &Path, current: &str, target: &str) -> AppResult<usize> {
 /// Rewind the worktree to the checkpoint of `message_id`. `expected` is the
 /// `current` of the preview the user confirmed: if the files changed since,
 /// nothing is written and the user is asked to look again. The replaced
-/// state is kept as the thread's undo. Returns the number of files changed.
+/// state is kept as the thread's undo, and the state the rewind left as
+/// `<thread>/rewound`, so the undo can tell whether anything moved on since.
+/// Returns the number of files changed.
 pub fn rewind(ws: &Path, thread_id: &str, message_id: i64, expected: &str) -> AppResult<usize> {
     check_thread(thread_id)?;
+    check_repo(ws)?;
     if !valid_sha(expected) {
         return Err(AppError::Other("invalid preview id".into()));
     }
@@ -425,17 +472,35 @@ pub fn rewind(ws: &Path, thread_id: &str, message_id: i64, expected: &str) -> Ap
         return Err(AppError::Other("The files changed since the preview. Look at the rewind again.".into()));
     }
     set_ref(ws, &undo_ref_for(thread_id), &now)?;
-    apply(ws, &now, &target)
+    let applied = apply(ws, &now, &target);
+    // Recorded even after a part-way failure: the undo then puts back
+    // exactly what this rewind managed to change.
+    let left = snapshot(ws).and_then(|sha| set_ref(ws, &rewound_ref_for(thread_id), &sha));
+    let n = applied?;
+    left?;
+    Ok(n)
 }
 
-/// Put back the tree the thread's last rewind replaced.
+/// Put back the tree the thread's last rewind replaced. Refused when the
+/// files no longer match what the rewind left (a new turn or the user changed
+/// them since): the undo would silently revert those edits too.
 pub fn undo(ws: &Path, thread_id: &str) -> AppResult<usize> {
     check_thread(thread_id)?;
+    check_repo(ws)?;
     let undo_ref = undo_ref_for(thread_id);
-    let target = resolve(ws, &undo_ref).ok_or_else(|| AppError::Other("Nothing to undo.".into()))?;
+    let rewound_ref = rewound_ref_for(thread_id);
+    let (Some(target), Some(left)) = (resolve(ws, &undo_ref), resolve(ws, &rewound_ref)) else {
+        return Err(AppError::Other("Nothing to undo.".into()));
+    };
     let now = snapshot(ws)?;
+    if tree_of(ws, &now)? != tree_of(ws, &left)? {
+        return Err(AppError::Other(
+            "The files changed since the rewind, so it can't be undone without losing those changes.".into(),
+        ));
+    }
     let n = apply(ws, &now, &target)?;
     delete_ref(ws, &undo_ref)?;
+    delete_ref(ws, &rewound_ref)?;
     Ok(n)
 }
 

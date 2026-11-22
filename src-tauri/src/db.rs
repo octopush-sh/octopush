@@ -3786,10 +3786,12 @@ impl Db {
             .query_map(params![thread_id, message_id], |r| r.get(0))?
             .collect::<Result<Vec<i64>, rusqlite::Error>>()?;
         drop(stmt);
+        // One transaction: a failure part-way leaves no half-copied fork.
+        let tx = self.conn.unchecked_transaction()?;
         let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
         let mut pairs = Vec::with_capacity(ids.len());
         for old in ids {
-            self.conn.execute(
+            tx.execute(
                 "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
                     output_tokens, cost_usd, created_at, cache_read_tokens, cache_creation_tokens, context_tokens)
                  SELECT workspace_id, ?1, role, content, model, input_tokens, output_tokens, cost_usd,
@@ -3797,8 +3799,9 @@ impl Db {
                  FROM chat_messages WHERE id = ?2",
                 params![thread.id, old],
             )?;
-            pairs.push((old, self.conn.last_insert_rowid()));
+            pairs.push((old, tx.last_insert_rowid()));
         }
+        tx.commit()?;
         Ok((thread, draft, pairs))
     }
 

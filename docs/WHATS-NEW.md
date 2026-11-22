@@ -104,7 +104,7 @@ Current anchors:
 | `run-pane-waiting` | Run canvas: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `talk-seat-leave` | Talk canvas, while the terminal seat is open: the minus on its caption, "Leave the view · the session keeps running" | `chat/TalkSeat.tsx` |
-| `talk-turn-rewind` · `talk-turn-fork` | Talk, on a message you sent (revealed on hover or focus): "Rewind files to here" (only when that turn took a checkpoint) · "Fork from here" | `chat/ChatCanvas.tsx` |
+| `talk-turn-actions` · `talk-turn-rewind` · `talk-turn-fork` | Talk, on a message you sent (revealed on hover or focus, and while a tour points at it): its row of actions · "Rewind files to here" (only when that turn took a checkpoint) · "Fork from here" | `chat/ChatCanvas.tsx` |
 | `talk-rewind-dialog` · `talk-rewind-outside` · `talk-rewind-confirm` | Talk rewind confirm, while open: the dialog · the amber "changed outside this conversation" line (only when such a file is listed) · "Rewind the files" | `chat/RewindDialog.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |

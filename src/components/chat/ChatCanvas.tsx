@@ -6,6 +6,7 @@ import { rewindError } from "../../lib/talkRewind";
 import { pushToast } from "../Toasts";
 import { RewindDialog } from "./RewindDialog";
 import { tourId } from "../../lib/tour/ids";
+import { useTourStore } from "../../stores/tourStore";
 import type { ChatMessage as StoredMessage } from "../../lib/types";
 import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
@@ -444,6 +445,8 @@ function MessageRow({
 }) {
   const { copied, copy } = useCopyFeedback();
   const ref = useRef<HTMLDivElement>(null);
+  const actionsRef = useRef<HTMLDivElement>(null);
+  const tourTarget = useTourStore((s) => s.target);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
 
@@ -497,12 +500,21 @@ function MessageRow({
     );
   }
 
+  // A tour pointing at one of these actions shows the bar, as a hover would.
+  const toured = tourTarget !== null && actionsRef.current?.contains(tourTarget) === true;
+
   return (
     <div className="group/msg relative">
       <div ref={ref}>
         <ChatMessage message={message} onOpenInEditor={onOpenInEditor} skillNames={skillNames} />
       </div>
-      <div className="absolute -top-1 right-0 flex items-center gap-0.5 opacity-0 transition group-hover/msg:opacity-100 focus-within:opacity-100">
+      <div
+        ref={actionsRef}
+        data-tour={onFork ? tourId("talk-turn-actions") : undefined}
+        className={`absolute -top-1 right-0 flex items-center gap-0.5 transition group-hover/msg:opacity-100 focus-within:opacity-100 ${
+          toured ? "opacity-100" : "opacity-0"
+        }`}
+      >
         {onRewind && (
           <RowAction
             label="Rewind files to here"

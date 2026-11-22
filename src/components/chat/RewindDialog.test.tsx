@@ -41,6 +41,7 @@ const { ipc } = await import("../../lib/ipc");
 const { useChatStore } = await import("../../stores/chatStore");
 const { ChatCanvas } = await import("./ChatCanvas");
 const { rewindHeadline, outsideNote, rewindError } = await import("../../lib/talkRewind");
+const { useTourStore, TOUR_IDLE } = await import("../../stores/tourStore");
 
 async function flush() {
   await act(async () => {
@@ -55,6 +56,8 @@ async function mount() {
 
 beforeEach(() => {
   toasts.length = 0;
+  vi.clearAllMocks();
+  useTourStore.setState({ ...TOUR_IDLE });
   vi.mocked(ipc.listChatThreads).mockResolvedValue([THREAD]);
   vi.mocked(ipc.listChatMessages).mockResolvedValue(ROWS);
   // Only the second turn took a checkpoint (the first ran before checkpoints).
@@ -147,6 +150,107 @@ describe("Talk rewind & fork (#958)", () => {
     expect(ipc.rewindTalkFiles).toHaveBeenCalledWith("ws-1", "/repo", "t1", 3, "abc1234");
     expect(ipc.forkChatThread).toHaveBeenCalledWith("/repo", "t1", 3);
     expect(useChatStore.getState().activeThreadByWs["ws-1"]).toBe("t2");
+  });
+
+  it("when the fork fails after the rewind, closes the dialog, offers the undo and reports the fork on its own", async () => {
+    vi.mocked(ipc.forkChatThread).mockRejectedValue("other: That conversation no longer exists.");
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind and fork from here" }));
+    await flush();
+    expect(ipc.rewindTalkFiles).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("3 files go back to before this turn.")).not.toBeInTheDocument();
+    expect(toasts.map((t) => t.title)).toEqual(["Rewound 3 files.", "The files are rewound, but the fork failed."]);
+    expect(toasts[0].action?.label).toBe("Undo the rewind");
+    expect(toasts[1].body).toBe("That conversation no longer exists.");
+  });
+
+  it("shows the loading state with nothing callable while the preview is read", async () => {
+    vi.mocked(ipc.previewTalkRewind).mockReturnValue(new Promise(() => {}));
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    expect(screen.getByText("Reading the files…")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rewind the files" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Rewind and fork from here" })).toBeDisabled();
+  });
+
+  it("says a turn can't be rewound, with the reason, and offers nothing to confirm", async () => {
+    vi.mocked(ipc.previewTalkRewind).mockRejectedValue("other: This turn has no checkpoint.");
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    expect(screen.getByText("This turn can't be rewound.")).toBeInTheDocument();
+    expect(screen.getByText("This turn has no checkpoint.")).toBeInTheDocument();
+    const confirm = screen.getByRole("button", { name: "Rewind the files" });
+    expect(confirm).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Rewind and fork from here" })).toBeDisabled();
+    fireEvent.click(confirm);
+    await flush();
+    expect(ipc.rewindTalkFiles).not.toHaveBeenCalled();
+  });
+
+  it("says the files already match when nothing would change, with both actions disabled", async () => {
+    vi.mocked(ipc.previewTalkRewind).mockResolvedValue({ messageId: 3, current: "abc1234", changes: [] });
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    expect(screen.getByText("The files already match this turn.")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "What will change" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rewind the files" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Rewind and fork from here" })).toBeDisabled();
+  });
+
+  it("closes on Escape and on Cancel without writing anything", async () => {
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    expect(screen.getByText("3 files go back to before this turn.")).toBeInTheDocument();
+    fireEvent.keyDown(window, { key: "Escape" });
+    await flush();
+    expect(screen.queryByText("3 files go back to before this turn.")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await flush();
+    expect(screen.queryByText("3 files go back to before this turn.")).not.toBeInTheDocument();
+    expect(ipc.rewindTalkFiles).not.toHaveBeenCalled();
+    expect(toasts).toHaveLength(0);
+  });
+
+  it("reports an undo the backend refuses", async () => {
+    vi.mocked(ipc.undoTalkRewind).mockRejectedValue(
+      "other: The files changed since the rewind, so it can't be undone without losing those changes.",
+    );
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind the files" }));
+    await flush();
+    toasts.at(-1)!.action!.onClick();
+    await flush();
+    const t = toasts.at(-1)!;
+    expect(t.title).toBe("Couldn't undo the rewind.");
+    expect(t.body).toBe("The files changed since the rewind, so it can't be undone without losing those changes.");
+  });
+
+  it("shows a user turn's hidden actions while a tour points at them", async () => {
+    await mount();
+    const fork = screen.getAllByRole("button", { name: "Fork from here" })[0];
+    const bar = fork.closest('[data-tour="talk-turn-actions"]') as HTMLElement;
+    expect(bar).not.toBeNull();
+    // Bare classes only: `group-hover/msg:opacity-100` is always there.
+    const hidden = /(^|\s)opacity-0(\s|$)/;
+    const shown = /(^|\s)opacity-100(\s|$)/;
+    expect(bar.className).toMatch(hidden);
+    act(() => useTourStore.setState({ active: true, target: fork }));
+    expect(bar.className).toMatch(shown);
+    expect(bar.className).not.toMatch(hidden);
+    act(() => useTourStore.setState({ ...TOUR_IDLE }));
+    expect(bar.className).toMatch(hidden);
   });
 
   it("forks into a new thread whose composer takes the turn's text once", async () => {

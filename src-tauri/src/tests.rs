@@ -25445,7 +25445,7 @@ mod talk_checkpoint_tests {
         write(&dir, "a.txt", "A agent\n");
         write(&dir, "sub/new.txt", "N\n");
         std::fs::remove_file(dir.join("gone.txt")).unwrap();
-        drop(AfterTurn::new(&dir, THREAD, 10));
+        AfterTurn::new(&dir, THREAD, 10).record();
         // The director edits between turns; the ignored file changes too.
         write(&dir, "b.txt", "B director\n");
         write(&dir, "ignored.log", "changed\n");
@@ -25491,6 +25491,49 @@ mod talk_checkpoint_tests {
         assert_eq!(read(&dir, "a.txt"), "typed after the preview\n", "nothing is overwritten");
         assert!(ck::rewind(&dir, THREAD, 3, "--force").is_err(), "a preview id is never an option");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo only puts back what the rewind changed: once a new turn or
+    /// the user edits the files, it refuses and writes nothing.
+    #[test]
+    fn undo_refuses_when_the_files_moved_on_since_the_rewind() {
+        let dir = repo("undo-stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 2));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 2).unwrap();
+        assert_eq!(ck::rewind(&dir, THREAD, 2, &p.current).unwrap(), 1);
+        write(&dir, "b.txt", "a later turn's file\n");
+        let err = ck::undo(&dir, THREAD).unwrap_err().to_string();
+        assert!(err.contains("changed since the rewind"), "{err}");
+        assert_eq!(read(&dir, "a.txt"), "A\n", "nothing is written");
+        assert_eq!(read(&dir, "b.txt"), "a later turn's file\n");
+        // Back to the state the rewind left, the undo works again.
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        assert_eq!(ck::undo(&dir, THREAD).unwrap(), 1);
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project folder that only sits inside a parent repository takes no
+    /// checkpoint: its snapshot would be the parent's whole tree.
+    #[test]
+    fn a_folder_nested_in_a_parent_repo_is_not_a_repo() {
+        let parent = repo("nested");
+        write(&parent, "top.txt", "T\n");
+        git(&parent, &["add", "-A"]);
+        git(&parent, &["commit", "-qm", "init"]);
+        let proj = parent.join("projects/app");
+        write(&proj, "main.txt", "M\n");
+        assert!(!ck::capture_before(&proj, THREAD, 1));
+        assert!(ck::list(&proj, THREAD).unwrap().is_empty());
+        assert!(ck::preview(&proj, THREAD, 1).is_err());
+        assert!(ck::undo(&proj, THREAD).is_err());
+        assert_eq!(git(&parent, &["for-each-ref", ck::REF_ROOT]), "", "no ref in the parent repo");
+        assert_eq!(read(&parent, "top.txt"), "T\n");
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     #[test]
@@ -25597,5 +25640,32 @@ mod talk_checkpoint_tests {
         assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 4, "the original is untouched");
         assert!(db.fork_chat_thread(&t.id, a1).is_err(), "only a user turn forks");
         assert_eq!(db.chat_thread_worktree(&t.id).unwrap(), None);
+    }
+
+    /// A copy that fails part-way leaves no half-copied `· fork` thread.
+    #[test]
+    fn a_fork_that_fails_part_way_leaves_nothing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork2", "P", "/tmp/p-fork2").unwrap();
+        db.insert_workspace("w-fork2", "p-fork2", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork2", "Atomic").unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "user", "one", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "assistant", "boom", None, None, None, None).unwrap();
+        let u2 = db.insert_chat_message("w-fork2", &t.id, "user", "two", None, None, None, None).unwrap();
+        // The second row's copy fails, after the thread and the first row.
+        db.conn_ref()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_copy BEFORE INSERT ON chat_messages
+                 WHEN NEW.content = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        assert!(db.fork_chat_thread(&t.id, u2).is_err());
+        let titles: Vec<String> = db.list_chat_threads("w-fork2").unwrap().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, vec!["Atomic".to_string()], "no half-copied fork");
+        db.conn_ref().execute_batch("DROP TRIGGER fail_copy;").unwrap();
+        let (fork, _, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(db.list_chat_messages(&fork.id).unwrap().len(), 2);
     }
 }

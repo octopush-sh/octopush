@@ -4,7 +4,8 @@
  * whether it is restored, removed or reverted, with the files changed
  * outside this conversation since flagged in amber so nothing is overwritten
  * silently. "Rewind the files" is the default; "Rewind and fork" also opens
- * a new conversation from this turn. The toast that follows offers the undo.
+ * a new conversation from this turn. The toast that follows offers the undo;
+ * once the files are rewound the dialog closes, even if the fork then fails.
  */
 import { useEffect, useState } from "react";
 import { History } from "lucide-react";
@@ -53,21 +54,30 @@ export function RewindDialog({ workspaceId, workspacePath, threadId, messageId, 
   async function confirm(fork: boolean) {
     if (!preview) return;
     setBusy(true);
+    let n: number;
     try {
-      const n = await ipc.rewindTalkFiles(workspaceId, workspacePath, threadId, messageId, preview.current);
-      await refreshThread(workspaceId);
-      if (fork) await forkThread(workspaceId, workspacePath, threadId, messageId);
-      onClose();
-      pushToast({
-        level: "success",
-        title: `Rewound ${n} ${n === 1 ? "file" : "files"}.`,
-        body: fork ? "This turn now waits in a new conversation." : undefined,
-        timeout: 12000,
-        action: { label: "Undo the rewind", onClick: () => void undo() },
-      });
+      n = await ipc.rewindTalkFiles(workspaceId, workspacePath, threadId, messageId, preview.current);
     } catch (e) {
       setError(rewindError(e));
       setBusy(false);
+      return;
+    }
+    // The files are rewound: from here the dialog closes and the undo is
+    // offered whatever happens to the fork.
+    onClose();
+    pushToast({
+      level: "success",
+      title: `Rewound ${n} ${n === 1 ? "file" : "files"}.`,
+      timeout: 12000,
+      action: { label: "Undo the rewind", onClick: () => void undo() },
+    });
+    await refreshThread(workspaceId).catch(() => {});
+    if (!fork) return;
+    try {
+      await forkThread(workspaceId, workspacePath, threadId, messageId);
+      pushToast({ level: "success", title: "Forked into a new conversation.", body: "The turn's text is in the composer." });
+    } catch (e) {
+      pushToast({ level: "error", title: "The files are rewound, but the fork failed.", body: rewindError(e) });
     }
   }
 
@@ -112,7 +122,7 @@ export function RewindDialog({ workspaceId, workspacePath, threadId, messageId, 
         )}
         {error && <p className="mt-3 text-[12px] leading-relaxed text-octo-rouge">{error}</p>}
         <p className="mt-3 text-[12px] leading-relaxed text-octo-sage">
-          The conversation stays as it is. Your staged changes, branch and ignored files are left alone, and you can undo the rewind.
+          The conversation stays as it is. Your staged changes, branch and ignored files are left alone. The notice that follows offers an undo for a few seconds.
         </p>
         <div className="mt-6 flex items-center justify-end gap-3">
           <button
@@ -126,7 +136,7 @@ export function RewindDialog({ workspaceId, workspacePath, threadId, messageId, 
             type="button"
             disabled={disabled}
             onClick={() => void confirm(true)}
-            className="rounded-md border border-octo-hairline px-4 py-2 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:cursor-not-allowed disabled:opacity-40"
+            className="rounded-md border border-octo-border-strong px-4 py-2 font-serif text-[13px] text-octo-sage transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:cursor-not-allowed disabled:opacity-40"
           >
             Rewind and fork from here
           </button>

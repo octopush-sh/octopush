@@ -6,8 +6,8 @@ highlight: true
 scenario: default
 steps:
   - open: mode/talk
-    target: talk-turn-rewind
-    caption: Hover a message you sent to put the files back as they were before it.
+    target: talk-turn-actions
+    caption: Hover a message you sent. Once a turn has run, Rewind files to here puts its files back as they were before it.
   - target: talk-turn-fork
     caption: Or fork a new conversation from that turn, with its text ready to send again.
 ---

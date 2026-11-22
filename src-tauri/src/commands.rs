@@ -1747,17 +1747,26 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     // Its checkpoints go with it (#958).
     let worktree = state.db.lock().chat_thread_worktree(&thread_id).ok().flatten();
     if let Some(path) = worktree {
-        crate::talk_checkpoints::prune_thread(std::path::Path::new(&path), &thread_id);
+        let id = thread_id.clone();
+        crate::talk_checkpoints::off_runtime(move || {
+            crate::talk_checkpoints::prune_thread(std::path::Path::new(&path), &id);
+            Ok(())
+        })
+        .await?;
     }
     state.db.lock().delete_chat_thread(&thread_id)
 }
 
 // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+// Every one runs git on a blocking thread (`talk_checkpoints::off_runtime`).
 
 /// The user turns of a thread whose files can be rewound.
 #[tauri::command]
 pub async fn list_talk_checkpoints(workspace_path: String, thread_id: String) -> AppResult<Vec<i64>> {
-    crate::talk_checkpoints::list(std::path::Path::new(&workspace_path), &thread_id)
+    crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::list(std::path::Path::new(&workspace_path), &thread_id)
+    })
+    .await
 }
 
 /// What rewinding to a turn would change — shown before anything is written.
@@ -1767,7 +1776,10 @@ pub async fn preview_talk_rewind(
     thread_id: String,
     message_id: i64,
 ) -> AppResult<crate::talk_checkpoints::RewindPreview> {
-    crate::talk_checkpoints::preview(std::path::Path::new(&workspace_path), &thread_id, message_id)
+    crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::preview(std::path::Path::new(&workspace_path), &thread_id, message_id)
+    })
+    .await
 }
 
 /// The quiet note a rewind leaves in the conversation, naming the turn.
@@ -1797,7 +1809,11 @@ pub async fn rewind_talk_files(
     if state.chat.is_running(&thread_id) {
         return Err(AppError::Other("Stop the running turn before rewinding its files.".into()));
     }
-    let n = crate::talk_checkpoints::rewind(std::path::Path::new(&workspace_path), &thread_id, message_id, &expected)?;
+    let id = thread_id.clone();
+    let n = crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::rewind(std::path::Path::new(&workspace_path), &id, message_id, &expected)
+    })
+    .await?;
     let db = state.db.lock();
     let turn = db.get_chat_message(message_id).ok().flatten().map(|m| m.content);
     let note = rewind_note(turn.as_deref(), n);
@@ -1805,7 +1821,8 @@ pub async fn rewind_talk_files(
     Ok(n)
 }
 
-/// Put back the files the thread's last rewind replaced.
+/// Put back the files the thread's last rewind replaced — refused while a
+/// turn runs, or once the files moved on since the rewind.
 #[tauri::command]
 pub async fn undo_talk_rewind(
     state: State<'_, AppState>,
@@ -1813,7 +1830,14 @@ pub async fn undo_talk_rewind(
     workspace_path: String,
     thread_id: String,
 ) -> AppResult<usize> {
-    let n = crate::talk_checkpoints::undo(std::path::Path::new(&workspace_path), &thread_id)?;
+    if state.chat.is_running(&thread_id) {
+        return Err(AppError::Other("Stop the running turn before undoing the rewind.".into()));
+    }
+    let id = thread_id.clone();
+    let n = crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::undo(std::path::Path::new(&workspace_path), &id)
+    })
+    .await?;
     state.db.lock().insert_chat_message(
         &workspace_id,
         &thread_id,
@@ -1846,7 +1870,12 @@ pub async fn fork_chat_thread(
     message_id: i64,
 ) -> AppResult<ForkedThread> {
     let (thread, draft, pairs) = state.db.lock().fork_chat_thread(&thread_id, message_id)?;
-    crate::talk_checkpoints::copy_to_fork(std::path::Path::new(&workspace_path), &thread_id, &thread.id, &pairs);
+    let to = thread.id.clone();
+    crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::copy_to_fork(std::path::Path::new(&workspace_path), &thread_id, &to, &pairs);
+        Ok(())
+    })
+    .await?;
     Ok(ForkedThread { thread, draft })
 }
 

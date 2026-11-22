@@ -77,18 +77,6 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const historyRef = useRef<string[]>([]);
   const historyIdxRef = useRef<number>(-1); // -1 = not navigating
 
-  // A fork from a turn opens with that turn's text as the draft, once.
-  const composerSeed = useChatStore((s) => s.composerSeedByWs[workspaceId] ?? null);
-  const takeComposerSeed = useChatStore((s) => s.takeComposerSeed);
-  useEffect(() => {
-    if (composerSeed === null) return;
-    const seed = takeComposerSeed(workspaceId);
-    if (seed === null) return;
-    setInput(seed);
-    textareaRef.current?.focus();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [composerSeed, workspaceId, takeComposerSeed]);
-
   // ── @file mentions ──────────────────────────────────────────────────
   // Worktree file catalog (loaded once per workspace) + the active mention
   // popover state. filesSetRef gives extractMentions an O(1) membership test.
@@ -309,6 +297,20 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
+
+  // A fork from a turn opens with that turn's text as the draft, once.
+  // Declared after the reset above: effects run in order, so a composer that
+  // mounts with a seed keeps it.
+  const composerSeed = useChatStore((s) => s.composerSeedByWs[workspaceId] ?? null);
+  const takeComposerSeed = useChatStore((s) => s.takeComposerSeed);
+  useEffect(() => {
+    if (composerSeed === null) return;
+    const seed = takeComposerSeed(workspaceId);
+    if (seed === null) return;
+    setInput(seed);
+    textareaRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composerSeed, workspaceId, takeComposerSeed]);
 
   // ── Inline cost preview ─────────────────────────────────────────────
   const modelCatalog = useProvidersStore((s) => s.providers);

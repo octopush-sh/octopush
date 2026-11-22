@@ -70,6 +70,7 @@ function resetStore() {
     activeThreadByWs: {},
     streamingThreadByWs: {},
     attachmentsByWs: {},
+    composerSeedByWs: {},
   });
   useBudgetsStore.setState({
     budgets: [],
@@ -622,6 +623,19 @@ describe("ChatView — arrow-key prompt history", () => {
 
     fireEvent.keyDown(ta, { key: "ArrowDown" }); // → ""
     expect(ta.value).toBe("");
+  });
+
+  it("takes a fork's seeded draft into the textarea, once (#958)", async () => {
+    useChatStore.setState({ composerSeedByWs: { "ws-1": "Make it stream" } });
+    const { unmount } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    expect(getTextarea().value).toBe("Make it stream");
+    expect(useChatStore.getState().composerSeedByWs["ws-1"]).toBeNull();
+    // Opened again, the composer doesn't put it back.
+    unmount();
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    expect(getTextarea().value).toBe("");
   });
 
   it("Escape while navigating clears input and exits history mode", async () => {
