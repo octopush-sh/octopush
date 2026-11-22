@@ -152,7 +152,7 @@ describe("DirectCanvas viewed-run routing", () => {
   });
 
   it("a sibling's gate beside a scheduled plan wait takes the bar and the beacon, and Approve names it", () => {
-    const resolve = vi.fn(async () => {});
+    const resolve = vi.fn(async () => true);
     const resumeAt = Math.floor(Date.now() / 1000) + 3600;
     const paused: Run = { ...run, status: "paused",
       planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: true } };

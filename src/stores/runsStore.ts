@@ -131,11 +131,12 @@ interface RunsState {
   resolve: (
     runId: string,
     /** The stage decided on (see `ipc.resolveCheckpoint`). A refusal is
-     *  toasted, never thrown, and the detail refreshes either way. */
+     *  toasted, never thrown, and the detail refreshes either way. Resolves
+     *  `false` on a refusal. */
     stageId: string,
     action: CheckpointActionName,
     opts?: CheckpointOptions,
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
    *  injected as feedback. Refreshes the detail so the form gives way to the
@@ -454,9 +455,11 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   },
 
   resolve: async (runId, stageId, action, opts) => {
+    let ok = true;
     try {
       await ipc.resolveCheckpoint(runId, stageId, action, opts);
     } catch (e) {
+      ok = false;
       // A refusal (e.g. the stage was already decided elsewhere) is shown
       // calmly — the callers fire-and-forget — and the refresh below brings
       // the canvas up to what is actually waiting.
@@ -467,6 +470,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
       });
     }
     await get().refreshDetail(runId);
+    return ok;
   },
 
   answerBlocker: async (runId, stageId, answers, source) => {

@@ -44,7 +44,7 @@ export function CommentComposer({
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-md border border-octo-hairline px-2.5 py-1 font-mono text-[10px] text-octo-mute transition-colors hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+          className="rounded-md border border-octo-border-strong px-2.5 py-1 font-mono text-[10px] text-octo-mute transition-colors hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           Cancel
         </button>

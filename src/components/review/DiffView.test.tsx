@@ -143,10 +143,30 @@ describe("DiffView", () => {
       expect(container.querySelectorAll("[data-picked]")).toHaveLength(0);
     });
 
+    it("Escape in the composer drops the draft and doesn't reach the diff keyboard", () => {
+      const seen: string[] = [];
+      const onKey = (e: KeyboardEvent) => seen.push(e.key);
+      const { getByLabelText, queryByLabelText, container } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      const field = getByLabelText("What should change");
+      fireEvent.change(field, { target: { value: "Never mind." } });
+      window.addEventListener("keydown", onKey);
+      try {
+        fireEvent.keyDown(field, { key: "Escape" });
+      } finally {
+        window.removeEventListener("keydown", onKey);
+      }
+      expect(seen).toEqual([]);
+      expect(queryByLabelText("What should change")).toBeNull();
+      expect(container.querySelectorAll("[data-picked]")).toHaveLength(0);
+      expect(useReviewComments.getState().byWs.w1 ?? []).toEqual([]);
+    });
+
     it("offers no comments in the read-only Since base view", () => {
       const { queryByRole, queryByLabelText } = render(view(two, true));
       expect(queryByRole("button", { name: "Ask for a change" })).toBeNull();
-      fireEvent.keyDown(window, { key: "m" });
+      // `m` is left alone there, not claimed and swallowed.
+      expect(fireEvent.keyDown(window, { key: "m" })).toBe(true);
       expect(queryByLabelText("What should change")).toBeNull();
       expect(keyboardHelpLine(true)).not.toContain("m ask");
       expect(keyboardHelpLine(false)).toContain("m ask for a change");

@@ -8,7 +8,7 @@ import { useChatStore } from "../../stores/chatStore";
 const base = { filePath: "src/a.ts", startLine: 2, endLine: 3, quote: ["+one", "+two", "+three", "+four"], note: "Name these." };
 
 describe("CommentTray", () => {
-  const send = vi.fn(async () => {});
+  const send = vi.fn(async () => true);
   beforeEach(() => {
     send.mockClear();
     useReviewComments.setState({ byWs: {}, liveByWs: { w1: new Set(["src/a.ts\nlive"]) } });
@@ -27,8 +27,9 @@ describe("CommentTray", () => {
       useReviewComments.getState().add("w1", { ...base, fingerprint: "gone", note: "Old." });
     });
     const onJump = vi.fn();
-    const { getAllByText, queryAllByText, getByText, getAllByRole } = render(<CommentTray workspaceId="w1" workspacePath="/w1" onJump={onJump} />);
-    expect(getByText(/For the agent · 2/)).toBeTruthy();
+    const { getAllByText, queryAllByText, getByText, getByRole, getAllByRole } = render(<CommentTray workspaceId="w1" workspacePath="/w1" onJump={onJump} />);
+    expect(getByRole("heading").textContent).toBe("For the agent · 2");
+    expect(getByText("2")).toHaveClass("octo-tabular");
     expect(getAllByText("outdated")).toHaveLength(1);
     expect(getAllByText("+three")).toHaveLength(2);
     expect(queryAllByText("+four")).toHaveLength(0);
@@ -45,7 +46,7 @@ describe("CommentTray", () => {
     expect(btn).toBeDisabled();
     act(() => useChatStore.setState({ streamingByWs: { w1: false } }));
     await act(async () => { fireEvent.click(btn); });
-    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("Name these."));
+    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("Name these."), undefined, { attachments: false });
     expect(useReviewComments.getState().byWs.w1).toEqual([]);
   });
 });

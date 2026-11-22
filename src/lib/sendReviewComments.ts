@@ -28,7 +28,10 @@ export function commentTarget(workspaceId: string): CommentTarget {
   return { kind: "talk" };
 }
 
-/** Send the tray, empty it, and show where it went. */
+/** Send the tray, empty it, and show where it went. A send that doesn't go
+ *  out (budget cap, no thread, IPC error, a refused checkpoint) puts the
+ *  comments back; the store it went to shows why. Talk's staged attachments
+ *  stay staged: the message is the comments only. */
 export async function sendReviewComments(workspaceId: string, workspacePath: string): Promise<void> {
   const store = useReviewComments.getState();
   const live = store.liveByWs[workspaceId] ?? null;
@@ -36,11 +39,16 @@ export async function sendReviewComments(workspaceId: string, workspacePath: str
   const comments = store.take(workspaceId);
   if (comments.length === 0) return;
   const message = commentsMessage(comments, live);
-  if (target.kind === "gate") {
-    navigate({ kind: "mode", mode: "direct" });
-    await useRunsStore.getState().resolve(target.runId, target.stageId, "send_back", { feedback: message });
-  } else {
-    navigate({ kind: "mode", mode: "talk" });
-    await useChatStore.getState().send(workspaceId, workspacePath, message);
+  let sent = false;
+  try {
+    if (target.kind === "gate") {
+      navigate({ kind: "mode", mode: "direct" });
+      sent = await useRunsStore.getState().resolve(target.runId, target.stageId, "send_back", { feedback: message });
+    } else {
+      navigate({ kind: "mode", mode: "talk" });
+      sent = await useChatStore.getState().send(workspaceId, workspacePath, message, undefined, { attachments: false });
+    }
+  } finally {
+    if (!sent) useReviewComments.getState().restore(workspaceId, comments);
   }
 }

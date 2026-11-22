@@ -53,7 +53,7 @@ export function CommentTray({
         <div className="flex h-9 items-center px-4">
           <h3 className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-brass">
             <MessageSquare size={11} aria-hidden />
-            For the agent · {n}
+            For the agent · <span className="octo-tabular">{n}</span>
           </h3>
         </div>
         <div className="px-4 pb-3">

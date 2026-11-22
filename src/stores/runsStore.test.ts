@@ -57,7 +57,7 @@ describe("runsStore", () => {
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
     await expect(
       useRunsStore.getState().resolve("r1", "st-stale", "approve"),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
     expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st-stale", "approve", undefined);
     expect(pushToastMock).toHaveBeenCalledTimes(1);
     expect(pushToastMock.mock.calls[0][0]).toMatchObject({ level: "info" });
@@ -68,7 +68,9 @@ describe("runsStore", () => {
   it("resolve sends the named stage and its options to the backend", async () => {
     (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
-    await useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
+    await expect(
+      useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 }),
+    ).resolves.toBe(true);
     expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
   });
 

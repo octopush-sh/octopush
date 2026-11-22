@@ -28,8 +28,8 @@ const parked = (over: Partial<RunStage> = {}) => {
 };
 
 describe("sendReviewComments", () => {
-  const send = vi.fn(async () => {});
-  const resolve = vi.fn(async () => {});
+  const send = vi.fn(async (..._args: unknown[]) => true);
+  const resolve = vi.fn(async (..._args: unknown[]) => true);
   const modes: string[] = [];
   const onNav = (e: Event) => modes.push((e as CustomEvent).detail.mode);
 
@@ -47,10 +47,38 @@ describe("sendReviewComments", () => {
   it("sends to the open Talk thread when no run waits at a gate, and empties the tray", async () => {
     useReviewComments.getState().add("w1", note);
     await sendReviewComments("w1", "/w1");
-    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("> +x\n\nRename x."));
+    // Without Talk's staged attachments: the message is the comments only.
+    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("> +x\n\nRename x."), undefined, { attachments: false });
     expect(resolve).not.toHaveBeenCalled();
     expect(modes).toEqual(["talk"]);
     expect(useReviewComments.getState().byWs.w1).toEqual([]);
+  });
+
+  it("keeps the comments when Talk doesn't send the turn (budget cap, no thread, IPC error)", async () => {
+    send.mockResolvedValueOnce(false);
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(useReviewComments.getState().byWs.w1).toEqual([expect.objectContaining({ note: "Rename x." })]);
+  });
+
+  it("keeps the comments when the gate refuses the send-back", async () => {
+    parked();
+    resolve.mockResolvedValueOnce(false);
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(resolve).toHaveBeenCalledTimes(1);
+    expect(useReviewComments.getState().byWs.w1).toEqual([expect.objectContaining({ note: "Rename x." })]);
+  });
+
+  it("keeps the comments when the send throws, ahead of any added meanwhile", async () => {
+    send.mockImplementationOnce(async () => {
+      useReviewComments.getState().add("w1", { ...note, note: "Later." });
+      throw new Error("ipc down");
+    });
+    useReviewComments.getState().add("w1", note);
+    await expect(sendReviewComments("w1", "/w1")).rejects.toThrow("ipc down");
+    expect(useReviewComments.getState().byWs.w1.map((c) => c.note)).toEqual(["Rename x.", "Later."]);
   });
 
   it("sends back the latest run's gate with the comments as its feedback", async () => {

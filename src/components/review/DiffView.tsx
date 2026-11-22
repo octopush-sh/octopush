@@ -156,7 +156,7 @@ export function DiffView(props: Props) {
       toggleViewed: () => curFile && toggleViewed(curFile),
       open: () => cur && props.onOpen(files[cur.fileIdx].filePath, firstChangedLine(files[cur.fileIdx], cur.hunkIdx)),
       why: () => cur && props.onWhy(files[cur.fileIdx].filePath, cur.hunkIdx),
-      comment: () => cur && startComment(files[cur.fileIdx].filePath, cur.hunkIdx),
+      ...(commentWs && { comment: () => cur && startComment(files[cur.fileIdx].filePath, cur.hunkIdx) }),
       toggleCollapse: () => curFile && setCollapsed((m) => ({ ...m, [curFile.filePath]: !m[curFile.filePath] })),
       focusFilter: () => props.onFocusFilter?.(),
       focusCommit: () => props.onFocusCommit?.(),

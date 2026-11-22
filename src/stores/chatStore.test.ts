@@ -455,6 +455,45 @@ describe("chatStore — stop + effort (P3)", () => {
     expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(0);
   });
 
+  it("send() with attachments: false leaves the staged attachments staged and reports delivery", async () => {
+    useChatStore.getState().addAttachment("ws-1", { mediaType: "image/png", data: "QUJD", name: "a.png" });
+    await expect(
+      useChatStore.getState().send("ws-1", "/tmp", "review notes", undefined, { attachments: false }),
+    ).resolves.toBe(true);
+    const req = (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.attachments).toBeUndefined();
+    expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(1);
+  });
+
+  it("send() resolves false when the turn fails to dispatch", async () => {
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce("boom");
+    await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+  });
+
+  it("send() resolves false at the budget cap", async () => {
+    const { useBudgetsStore, BUDGET_CAP_MSG } = await import("./budgetsStore");
+    const { isOverBudget, consumeOverride } = useBudgetsStore.getState();
+    useBudgetsStore.setState({ isOverBudget: () => true, consumeOverride: () => false });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+      expect(useChatStore.getState().getError("ws-1")).toBe(BUDGET_CAP_MSG);
+      expect(ipc.sendChatMessage).not.toHaveBeenCalled();
+    } finally {
+      useBudgetsStore.setState({ isOverBudget, consumeOverride });
+    }
+  });
+
+  it("send() resolves false when no thread can be started", async () => {
+    const { ensureThread } = useChatStore.getState();
+    useChatStore.setState({ ensureThread: async () => "" });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);
+      expect(useChatStore.getState().getError("ws-1")).toBe("Could not start a conversation.");
+    } finally {
+      useChatStore.setState({ ensureThread });
+    }
+  });
+
   it("send() uses the effort's max-tokens budget", async () => {
     useChatStore.getState().setEffort("deep");
     await useChatStore.getState().send("ws-1", "/tmp", "hi");

@@ -15,6 +15,8 @@ interface ReviewCommentsState {
   remove: (workspaceId: string, id: string) => void;
   /** Empty the workspace's tray and hand back what it held. */
   take: (workspaceId: string) => ReviewComment[];
+  /** Put taken comments back (a send that didn't go out), ahead of any added since. */
+  restore: (workspaceId: string, comments: ReviewComment[]) => void;
   setLive: (workspaceId: string, keys: Set<string>) => void;
 }
 
@@ -35,6 +37,8 @@ export const useReviewComments = create<ReviewCommentsState>((set, get) => ({
     set((s) => ({ byWs: { ...s.byWs, [workspaceId]: EMPTY } }));
     return held;
   },
+  restore: (workspaceId, comments) =>
+    set((s) => ({ byWs: { ...s.byWs, [workspaceId]: [...comments, ...(s.byWs[workspaceId] ?? EMPTY)] } })),
   setLive: (workspaceId, keys) => {
     const cur = get().liveByWs[workspaceId];
     if (cur && cur.size === keys.size && [...keys].every((k) => cur.has(k))) return;
