@@ -28,6 +28,15 @@ const { useReadinessStore } = await import("../../stores/readinessStore");
 const { usePipelineStore } = await import("../../stores/pipelineStore");
 const { useRoutinesStore } = await import("../../stores/routinesStore");
 const { resetModelRetirementCache } = await import("../../lib/modelRetirement");
+const { useTerminalsStore } = await import("../../stores/terminalsStore");
+type Terminal = import("../../stores/terminalsStore").TerminalState;
+
+function runSession(over: Partial<Terminal>): Terminal {
+  return {
+    id: "t1", label: "claude", position: 0, running: true, busy: true, restored: false,
+    role: "agent", agentCli: "claude", command: "claude", ...over,
+  } as Terminal;
+}
 
 function row(over: Partial<ReadinessCheck> & Pick<ReadinessCheck, "id">): ReadinessCheck {
   return { label: over.id, status: "ok", value: "", fix: null, command: null, timedOut: false, ...over };
@@ -42,6 +51,7 @@ beforeEach(() => {
   usePipelineStore.setState({ pipelines: [], loaded: false, error: null });
   useRoutinesStore.setState({ routines: [], loaded: false });
   resetModelRetirementCache();
+  useTerminalsStore.setState({ terminalsByWs: {} });
   listPipelines.mockReset().mockResolvedValue([]);
   listRoutines.mockReset().mockResolvedValue([]);
   modelRetirements.mockReset().mockImplementation(async (models: string[]) =>
@@ -89,6 +99,41 @@ describe("ReadinessCard · crew models", () => {
     await screen.findByTestId("readiness-row-git");
     await waitFor(() => expect(listPipelines).toHaveBeenCalled());
     expect(screen.queryByTestId("readiness-row-models")).toBeNull();
+  });
+});
+
+describe("ReadinessCard · recommended Claude Code note", () => {
+  const note = "Recommended: Claude Code 2.1.330 fixes ExitWorktree removing a worktree another session is using.";
+
+  it("shows the note under a ready Claude Code row while a Run session runs Claude Code", async () => {
+    useTerminalsStore.setState({ terminalsByWs: { w1: [runSession({ agentCli: "codex" })], w2: [runSession({ id: "t2" })] } });
+    readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.325", note })]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-claude");
+    expect(r).toHaveAttribute("data-status", "ok");
+    expect(within(r).getByText("Ready")).toBeInTheDocument();
+    const line = within(r).getByTestId("readiness-note");
+    expect(line).toHaveTextContent(note);
+    expect(line).toHaveAttribute("data-tour", "settings-readiness-claude-note");
+    expect(line).toHaveClass("text-octo-sage");
+  });
+
+  it("hides the note with no Run session on Claude Code", async () => {
+    useTerminalsStore.setState({
+      terminalsByWs: { w1: [runSession({ agentCli: "codex" }), runSession({ id: "t2", running: false })] },
+    });
+    readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.325", note })]);
+    render(<ReadinessCard />);
+    const r = await screen.findByTestId("readiness-row-claude");
+    expect(within(r).queryByTestId("readiness-note")).toBeNull();
+  });
+
+  it("shows nothing when the backend sends no note", async () => {
+    useTerminalsStore.setState({ terminalsByWs: { w1: [runSession({})] } });
+    readinessCheck.mockResolvedValue([row({ id: "claude", label: "Claude Code", value: "2.1.330" })]);
+    render(<ReadinessCard />);
+    await screen.findByTestId("readiness-row-claude");
+    expect(screen.queryByTestId("readiness-note")).toBeNull();
   });
 });
 

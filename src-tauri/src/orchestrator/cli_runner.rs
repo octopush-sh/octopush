@@ -1405,14 +1405,28 @@ pub fn review_disallowed_tools() -> String {
 /// parks it for the director.
 pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 
+/// Claude Code's worktree tools, denied to EVERY Claude CLI stage (#1002).
+/// A stage's workspace is the Octopush-made worktree it was spawned in, and
+/// Review, Collision radar and the diff snapshots all watch that path. With
+/// `EnterWorktree` a stage could move its work to a worktree Octopush doesn't
+/// track; before Claude Code 2.1.330, `ExitWorktree` could remove a worktree
+/// another running session was working in, and Octopush runs several at once.
+/// This denies the two tools only: Bash (`git worktree …`, `cd` elsewhere) is
+/// not covered and stays unconfined outside a sandboxed mission.
+pub const WORKTREE_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
+
 /// The one `--disallowedTools` value for a Claude CLI stage: the question
-/// tool, plus the review denial on a read-only stage.
+/// tool and the worktree tools, plus the review denial on a read-only stage.
 pub fn cli_disallowed_tools(read_only: bool) -> String {
+    let mut tools: String = std::iter::once(ASK_USER_QUESTION_TOOL)
+        .chain(WORKTREE_TOOLS.iter().copied())
+        .collect::<Vec<_>>()
+        .join(",");
     if read_only {
-        format!("{ASK_USER_QUESTION_TOOL},{}", review_disallowed_tools())
-    } else {
-        ASK_USER_QUESTION_TOOL.to_string()
+        tools.push(',');
+        tools.push_str(&review_disallowed_tools());
     }
+    tools
 }
 
 /// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
@@ -1522,7 +1536,8 @@ pub fn read_guard_label(reads_confined: bool, cli_version: Option<&str>) -> Opti
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
 /// independently and non-JSON log lines are simply skipped. Every stage
-/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`];
+/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`]
+/// and the [`WORKTREE_TOOLS`];
 /// `read_only` adds the review-stage tool denial (see [`cli_disallowed_tools`]).
 pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
     vec![

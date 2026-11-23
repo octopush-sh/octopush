@@ -10938,6 +10938,25 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn every_claude_stage_disallows_the_worktree_tools_once() {
+        // #1002: a stage's workspace is fixed. EnterWorktree would move its
+        // work out of the worktree Octopush watches; before Claude Code
+        // 2.1.330, ExitWorktree could remove one another session works in.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            for tool in ["EnterWorktree", "ExitWorktree"] {
+                let n = args[i + 1].split(',').filter(|t| *t == tool).count();
+                assert_eq!(n, 1, "{tool} exactly once: {args:?}");
+            }
+        }
+    }
+
+    #[test]
     fn args_include_model_format_and_permission() {
         let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40, false);
         assert!(args.contains(&"-p".to_string()));
@@ -24730,7 +24749,8 @@ mod read_only_role_tests {
         for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
             assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
         }
-        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion");
+        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion,EnterWorktree,ExitWorktree");
+        assert!(cli_disallowed_tools(true).starts_with("AskUserQuestion,EnterWorktree,ExitWorktree,"));
     }
 }
 
