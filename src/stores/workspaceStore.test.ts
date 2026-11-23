@@ -469,6 +469,18 @@ describe("workspaceStore — create (project-aware, C3)", () => {
     });
     expect(useTerminalsStore.getState().activeByWs[created.id]).toBe("term-setup");
   });
+
+  it("keeps what the worktree borrowed off the stored row", async () => {
+    useProjectStore.setState({ current: makeProject("proj-1") });
+    const created = makeWorkspace("proj-1", "shared");
+    const shared = { linked: ["node_modules"], copied: [".env"], skipped: [] };
+    mockIpc.createWorkspace.mockResolvedValueOnce({ ...created, setupTerminalId: null, setupError: null, shared });
+
+    const ws = await useWorkspaceStore.getState().create("proj-1", "/repo", "shared", "", created.branch, "main", "");
+
+    expect(ws).toEqual(created);
+    expect(useWorkspaceStore.getState().workspaces[0]).toEqual(created);
+  });
 });
 
 describe("workspaceStore — pruneProject (C8)", () => {

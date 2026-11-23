@@ -16,6 +16,7 @@ import { blameGutter } from "./editor/blameGutter";
 import { diffGutter, gotoNextChange, gotoPrevChange } from "./editor/diffGutter";
 import { EDITOR_NAV_KEYS, EDITOR_PANE_KEYS, GOTO_LINE_DIALOG } from "./editor/navKeys";
 import { selectAllOccurrences } from "./editor/multiCursor";
+import { selectionLines } from "./editor/selectionLines";
 import { symbolOccurrenceHighlight } from "./editor/symbolHighlight";
 import { symbolNav, goToDefinitionCommand, type DefinitionRequest } from "./editor/symbolNav";
 import {
@@ -39,6 +40,9 @@ import { useEditorStore, isFileDirty, type NavLocation } from "../stores/editorS
 import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 import { EditorStatusBar } from "./EditorStatusBar";
+import { useChatStore } from "../stores/chatStore";
+import { rangeToken } from "../lib/talkContext";
+import { navigate } from "../lib/tour/surfaces";
 import { EditorBinaryPane } from "./EditorBinaryPane";
 import { ConfirmDialog } from "./ConfirmDialog";
 
@@ -98,6 +102,8 @@ function buildState(opts: {
     /** Asked only while a ⌘⌥G is pending: a state-field read, no DOM. */
     gotoLineOpen: () => boolean;
     line: number; col: number; selections: number;
+    /** The main selection's first and last line; null when it is empty. */
+    selFrom: number | null; selTo: number | null;
   }) => void;
 }) {
   const {
@@ -163,6 +169,7 @@ function buildState(opts: {
       EditorView.updateListener.of((update) => {
         const head = update.state.selection.main.head;
         const lineObj = update.state.doc.lineAt(head);
+        const sel = selectionLines(update.state);
         onUpdate({
           // No text here: serialising the whole document costs the same as the
           // edit that caused it, and this listener runs on EVERY update. The
@@ -173,6 +180,8 @@ function buildState(opts: {
           line: lineObj.number,
           col: head - lineObj.from + 1,
           selections: update.state.selection.ranges.length,
+          selFrom: sel?.from ?? null,
+          selTo: sel?.to ?? null,
         });
       }),
     ],
@@ -278,7 +287,21 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   // Where ⌘⌥G was pressed, held until its dialog jumps (recorded) or closes.
   const gotoLineOriginRef = useRef<NavLocation | null>(null);
 
-  const [pos, setPos] = useState({ line: 1, col: 1, selections: 1 });
+  const [pos, setPos] = useState<{
+    line: number; col: number; selections: number; selFrom: number | null; selTo: number | null;
+  }>({ line: 1, col: 1, selections: 1, selFrom: null, selTo: null });
+
+  // "Ask Talk about this": hand the selection's range to Talk's draft as
+  // `@path#L5-10` and switch to Talk. The selection stays as it was, so
+  // coming back to Review finds it still highlighted. Only offered for files
+  // inside the worktree (a token outside it names nothing in the catalog).
+  const askTalk = () => {
+    if (!activeFile || pos.selFrom == null || pos.selTo == null) return;
+    if (!activeFile.path.startsWith(workspacePath + "/")) return;
+    const rel = activeFile.path.slice(workspacePath.length + 1);
+    useChatStore.getState().queueDraftInsert(workspaceId, `@${rangeToken(rel, pos.selFrom, pos.selTo)} `);
+    navigate({ kind: "mode", mode: "talk" });
+  };
 
   // Re-runs the reveal effect while a reveal is being held for a hidden column.
   //
@@ -551,9 +574,10 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
         // Same values → same object, so React bails out instead of re-rendering
         // the pane for every transaction that left the caret where it was.
         setPos((prev) =>
-          prev.line === u.line && prev.col === u.col && prev.selections === u.selections
+          prev.line === u.line && prev.col === u.col && prev.selections === u.selections &&
+          prev.selFrom === u.selFrom && prev.selTo === u.selTo
             ? prev
-            : { line: u.line, col: u.col, selections: u.selections },
+            : { line: u.line, col: u.col, selections: u.selections, selFrom: u.selFrom, selTo: u.selTo },
         );
       },
     });
@@ -833,6 +857,9 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
           line={pos.line}
           col={pos.col}
           selectionCount={pos.selections}
+          selectionLines={pos.selFrom != null && pos.selTo != null ? { from: pos.selFrom, to: pos.selTo } : null}
+          onAskTalk={activeFile.path.startsWith(workspacePath + "/") ? askTalk : undefined}
+          askTalkUnsaved={isFileDirty(activeFile)}
           lang={activeFile.lang}
           diskStale={activeFile.diskStale}
           blameSavedNote={blameEnabled && isFileDirty(activeFile)}

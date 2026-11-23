@@ -4,6 +4,7 @@
 #   agent-check.sh typecheck | test [vitest args…] | whats-new | all     (profile app)
 #   agent-check.sh build | check | consistency | routes | all            (profile web: octopush-web)
 #   agent-check.sh site                                                 (profile web-audit: web-audit.yml only)
+#   agent-check.sh typecheck | test [paths…] | test-py | agents | all   (profile epiku)
 #
 # agent-sandbox-setup.sh installs it as root-owned /usr/local/bin/octo-check
 # (with the checkout's path and the check profile baked in); the agent may run
@@ -21,7 +22,7 @@ PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 SANDBOX_USER=octo-sandbox   # fixed: nothing the caller sets may change who runs the checks
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"   # replaced with the checkout path when installed
 NODE_DIR=""                                     # replaced with node's directory when installed
-PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web | web-audit)
+PROFILE="app"                                   # replaced with OCTO_CHECK_PROFILE when installed (app | web | web-audit | epiku)
 
 # Only the installed copy works: agent-sandbox-setup.sh bakes NODE_DIR in. (The
 # agent's environment is rebuilt from scratch, so GITHUB_ACTIONS isn't there.)
@@ -65,6 +66,33 @@ case "$PROFILE" in
       # runner-installed node_modules with it.
       site) cmd=(bash -c 'npm ci --no-audit --no-fund --ignore-scripts && npm run --silent build') ;;
       *) echo "usage: octo-check site" >&2; exit 64 ;;
+    esac ;;
+  epiku)
+    # Epiku's own gates. The environment below is empty — no store, no token,
+    # like its CI — and agent-sandbox-setup.sh (OCTO_SANDBOX_NETWORK=none) took
+    # the network away from the sandbox user, so code the agent wrote can read
+    # the checkout (the real plans under data/ included) but can send nothing
+    # out. That is why there is no `build` here: `next build` fetches its fonts
+    # from Google Fonts. Epiku's own CI runs the build on the PR.
+    extra_env=(NEXT_TELEMETRY_DISABLED=1 NPM_CONFIG_UPDATE_NOTIFIER=false)
+    case "${1:-}" in
+      typecheck) cmd=(npm run --silent typecheck) ;;
+      test)
+        shift
+        # Arguments are test files or folders that exist in the checkout, and
+        # nothing else. The agent's shell could expand a variable of its own
+        # environment (the Claude token) into an argument, handing it to the
+        # code under test; the agent can't name a file after a value it has
+        # never seen, so an existing path can't be one.
+        for a in "$@"; do
+          [[ "$a" =~ ^[A-Za-z0-9_][A-Za-z0-9_./-]{0,199}$ && "$a" != *..* && -e "$ROOT/$a" && ! -L "$ROOT/$a" ]] \
+            || { echo "octo-check: test takes existing files or folders of the checkout (relative paths), nothing else" >&2; exit 64; }
+        done
+        cmd=(npx vitest run "$@") ;;
+      test-py) cmd=(npm run --silent test:py) ;;
+      agents) cmd=(npm run --silent check:agents) ;;
+      all) cmd=(bash -c 'npm run --silent typecheck && npx vitest run && npm run --silent test:py && npm run --silent check:agents') ;;
+      *) echo "usage: octo-check typecheck | test [paths] | test-py | agents | all" >&2; exit 64 ;;
     esac ;;
   *) echo "octo-check: unknown profile $PROFILE" >&2; exit 64 ;;
 esac

@@ -338,6 +338,10 @@ interface ChatState {
   /** Pending image attachments per workspace — sent with the next turn, then
    *  cleared. */
   attachmentsByWs: Record<string, Attachment[]>;
+  /** Text another surface hands to a workspace's Talk draft (Review's "Ask
+   *  Talk about this" queues `@path#L5-10 `); the composer appends it and
+   *  takes it. */
+  draftInsertByWs: Record<string, string>;
   /** Working directory of each thread's TALK shell (keyed by threadId), updated
    *  after every `$`-direct command so the composer can show a cwd badge once
    *  the user has `cd`'d away from the workspace root. */
@@ -490,6 +494,10 @@ interface ChatState {
   addAttachment: (workspaceId: string, attachment: Attachment) => void;
   removeAttachment: (workspaceId: string, index: number) => void;
   clearAttachments: (workspaceId: string) => void;
+  /** Queue text for the workspace's Talk draft (several queue in order). */
+  queueDraftInsert: (workspaceId: string, text: string) => void;
+  /** Take (and clear) the text queued for the workspace's Talk draft. */
+  takeDraftInsert: (workspaceId: string) => string | null;
   /** Stop the in-flight turn for this workspace (best-effort; backend halts
    *  before its next iteration/tool and emits the done event). */
   stop: (workspaceId: string) => void;
@@ -965,6 +973,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     streamingThreadByWs: {},
     skillNamesByWs: {},
     attachmentsByWs: {},
+    draftInsertByWs: {},
     shellCwdByThread: {},
     shellCwdAbsByThread: {},
     liveProcessByThread: {},
@@ -1371,6 +1380,22 @@ export const useChatStore = create<ChatState>((set, get) => {
     setEffort: (effort) => set({ effort }),
     setSkillNames: (workspaceId, names) =>
       set((s) => ({ skillNamesByWs: { ...s.skillNamesByWs, [workspaceId]: names } })),
+    queueDraftInsert: (workspaceId, text) =>
+      set((s) => ({
+        draftInsertByWs: {
+          ...s.draftInsertByWs,
+          [workspaceId]: (s.draftInsertByWs[workspaceId] ?? "") + text,
+        },
+      })),
+    takeDraftInsert: (workspaceId) => {
+      const text = get().draftInsertByWs[workspaceId];
+      if (!text) return null;
+      set((s) => {
+        const { [workspaceId]: _taken, ...rest } = s.draftInsertByWs;
+        return { draftInsertByWs: rest };
+      });
+      return text;
+    },
     addAttachment: (workspaceId, attachment) =>
       set((s) => ({
         attachmentsByWs: {

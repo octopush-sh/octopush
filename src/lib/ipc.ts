@@ -593,6 +593,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
@@ -610,6 +611,7 @@ import type {
   RefreshPricingResult,
   ThreadCost,
   SessionUsage,
+  RequestContext,
   PtySettledEvent,
   Session,
   SessionRecap,
@@ -628,6 +630,8 @@ import type {
   GatewayReconciliation,
   Workspace,
   CreatedWorkspace,
+  ShareOptions,
+  ShareSpec,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
   ProjectCollisions,
@@ -879,6 +883,13 @@ export const ipc = {
    *  DB. Reading it never runs it. */
   conductorSetupScript: (projectId: string) =>
     invoke<string | null>("conductor_setup_script", { projectId }),
+  /** The project's "Share with new missions" list, and what its main checkout
+   *  could share. The backend reads the project's own path from the DB. */
+  shareWithMissions: (projectId: string) =>
+    invoke<ShareOptions>("share_with_missions", { projectId }),
+  /** Remember what the project shares with new missions (sanitized server-side). */
+  setShareWithMissions: (projectId: string, spec: ShareSpec) =>
+    invoke<void>("set_share_with_missions", { projectId, spec }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -895,7 +906,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────
@@ -950,6 +961,11 @@ export const ipc = {
    *  Code session or no ledger row yet. Read-only. */
   getSessionUsage: (terminalId: string) =>
     invoke<SessionUsage | null>("get_session_usage", { terminalId }),
+  /** What every request of a project carries: the measured fixed context,
+   *  its price at the project's usual model and cache rate, and the files
+   *  that make it up as ranked estimates. Read-only. */
+  getRequestContext: (projectId: string) =>
+    invoke<RequestContext>("get_request_context", { projectId }),
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */

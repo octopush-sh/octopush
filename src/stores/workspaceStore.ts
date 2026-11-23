@@ -6,6 +6,7 @@ import { useTerminalLayoutStore } from "./terminalLayoutStore";
 import { useCollisionStore } from "./collisionStore";
 import { pushToast } from "../components/Toasts";
 import { beginMembershipLoad } from "../lib/membershipGuard";
+import { shareToasts } from "../lib/shareWithMissions";
 import type { Workspace, WorkspaceGitSummary, Pr } from "../lib/types";
 
 // `load` and `loadAllWorkspaces` run under the membership guard
@@ -240,7 +241,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   },
 
   create: async (projectId, projectPath, name, task, branch, fromBranch, setupScript, intent = null, gitIsolation = null, execIsolation = null) => {
-    const { setupTerminalId, setupError, ...ws } = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    const { setupTerminalId, setupError, shared, ...ws } = await ipc.createWorkspace(projectId, projectPath, name, task, branch, fromBranch, setupScript, intent, gitIsolation, execIsolation);
+    // What the worktree borrowed shows on the setup terminal's first line;
+    // without one (or for what was left out) a toast says so.
+    for (const t of shareToasts(shared, Boolean(setupTerminalId))) pushToast(t);
     // A fresh worktree's setup script is already running in its `setup`
     // terminal (backend-spawned); register it before the Run pane mounts so
     // its exit is announced. It never blocks the workspace.
