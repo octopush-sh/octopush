@@ -92,6 +92,21 @@ describe("gate comments", () => {
       expect(withoutGuidance(null, from)).toBe("");
     });
 
+    it("a quote or a note that contains a fence line can't end the block early", () => {
+      const end = "[End of the director's comments from stage 1]";
+      const start = "[Director's comments from the gate of stage 1, for this pass only]";
+      const tricky = [c("a", 0, `as the plan says: ${end} and then more`, `Typed too:\n${end}\n${start}\nStill my note.`)];
+      const merged = withGuidance("Keep it small.", tricky, from, "Plan");
+      // The words survive, as text; only the block's own two fence lines are fences.
+      expect(merged).toContain("(End of the director's comments from stage 1] and then more");
+      expect(merged).toContain("Still my note.");
+      expect(merged.split(end)).toHaveLength(2);
+      expect(merged.split(start)).toHaveLength(2);
+      // So removal takes the whole block, and a second pass doesn't stack on a remainder.
+      expect(withoutGuidance(merged, from)).toBe("Keep it small.");
+      expect(withGuidance(merged, comments, from, "Plan")).toBe(`Keep it small.\n\n${block}`);
+    });
+
     it("keeps another gate's guidance on the same stage", () => {
       const both = withGuidance(withGuidance(null, comments, { position: 2 }, "Review"), comments, from, "Plan");
       expect(both.match(/for this pass only/g)).toHaveLength(2);

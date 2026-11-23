@@ -70,6 +70,13 @@ const guidanceStart = (position: number) => `[Director's comments from the gate 
 const guidanceEnd = (position: number) => `[End of the director's comments from stage ${position + 1}]`;
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
+/** Quoted or typed text that happens to contain a fence line (a comment on
+ *  a plan that quotes one, say) must not end the block early, or removal
+ *  would stop there and leave the rest behind: its bracket becomes a
+ *  parenthesis, which no fence starts with. */
+const unfenced = (text: string) =>
+  text.replace(/\[(?=End of the director's comments from stage |Director's comments from the gate of stage )/g, "(");
+
 /**
  * A stage's instructions without the guidance a gate left in them. The
  * guidance belongs to one pass of the gate: it is taken out when the gate is
@@ -98,7 +105,7 @@ export function withGuidance(
 ): string {
   const guidance = [
     guidanceStart(from.position),
-    `The director approved ${fromStage} with these comments; take them into account:\n\n${commentList(comments)}`,
+    `The director approved ${fromStage} with these comments; take them into account:\n\n${unfenced(commentList(comments))}`,
     guidanceEnd(from.position),
   ].join("\n");
   const own = withoutGuidance(instructions, from).trim();

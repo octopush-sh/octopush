@@ -385,6 +385,22 @@ describe("RunControlBar", () => {
     });
   });
 
+  it("Approve waits while an approve of this gate is in flight (#957)", () => {
+    const gate = stage({ role: "plan", finishedAt: "f1" });
+    const h = handlers();
+    useGateCommentsStore.setState({ byGate: {} });
+    useRunsStore.setState({ approvingGates: { [`${gate.runId}:${gate.id}`]: true } });
+    try {
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} {...h} />);
+      const approve = screen.getByRole("button", { name: /Approve & continue/ });
+      expect(approve).toBeDisabled();
+      fireEvent.click(approve);
+      expect(h.onApprove).not.toHaveBeenCalled();
+    } finally {
+      useRunsStore.setState({ approvingGates: {} });
+    }
+  });
+
   describe("Claude plan limit", () => {
     const planStage = stage({
       role: "implement", substrate: "cli", checkpoint: false, status: "failed", sessionId: "sess-p",

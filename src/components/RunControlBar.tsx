@@ -419,6 +419,9 @@ function DecisionBar({
     else onApprove();
   }
   const hasComments = comments.length > 0;
+  // An approve of this gate is on its way (guidance being written, then the
+  // decision): the button waits, so a second click can't race the first.
+  const approving = useRunsStore((s) => !!s.approvingGates?.[`${blockedStage.runId}:${blockedStage.id}`]);
   const them = comments.length === 1 ? "it" : "them";
 
   const tone = transient
@@ -583,13 +586,13 @@ function DecisionBar({
                   {secretCount > 1 ? "Proceed past them" : "Proceed regardless"}
                 </button>
               ) : (
-                <button type="button" onClick={approveGate}
+                <button type="button" onClick={approveGate} disabled={approving}
                   title={hasComments
                     ? nextStageLabel
                       ? `Your comments go to ${nextStageLabel} as guidance`
                       : "No stage that hasn't begun follows, so approving sets your comments aside"
                     : undefined}
-                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-50`}>
                   {hasComments ? (nextStageLabel ? "Approve with comments" : "Approve without comments") : <>Approve &amp; continue</>}
                 </button>
               )}
