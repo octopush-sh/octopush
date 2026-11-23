@@ -96,6 +96,24 @@ describe("StageFocus live journal", () => {
     expect(player.className).not.toMatch(/\babsolute\b/);
   });
 
+  it("a gate's text artifact reads as a document the director can comment on (#957)", () => {
+    const parkedRun = {
+      id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status: "running",
+      costUsd: 0, baselineUsd: 0, referenceModel: null, linkedIssueKey: null,
+      createdAt: "t", finishedAt: null, budgetUsd: null, detached: false,
+    } as any;
+    const artifact = JSON.stringify({ kind: "plan", text: "## Steps\n\n1. Add the column" });
+    const gate = { ...baseStage, status: "awaiting_checkpoint", checkpoint: true, startedAt: "t", artifact };
+    const { rerender } = render(<StageFocus stage={gate} workspacePath="/tmp" run={parkedRun} runBlocked />);
+    const doc = document.querySelector('[data-tour="direct-gate-document"]')!;
+    expect(doc).not.toBeNull();
+    expect(doc.querySelector("h2")?.textContent).toBe("Steps"); // rendered, not raw Markdown
+    expect(screen.getByText("Select a passage, then Comment. From the keyboard: ↑ ↓ and ⏎.")).toBeInTheDocument();
+    // Once decided, the same artifact is read-only text again.
+    rerender(<StageFocus stage={{ ...gate, status: "done" }} workspacePath="/tmp" run={parkedRun} />);
+    expect(document.querySelector('[data-tour="direct-gate-document"]')).toBeNull();
+  });
+
   it("puts a budget-parked stage's Player under the header too", () => {
     useRunsStore.setState({ liveByStage: { st1: [{ kind: "notice", text: "budget reached" }] } });
     render(<StageFocus stage={{ ...baseStage, status: "awaiting_checkpoint" }} workspacePath="/tmp" />);

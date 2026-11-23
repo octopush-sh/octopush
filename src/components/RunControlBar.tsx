@@ -12,6 +12,8 @@ import { formatUsd } from "../lib/cost";
 import { isPlanLimitHalt, planWaitSentence, planWaitWhy } from "../lib/planWait";
 import { useRunsStore } from "../stores/runsStore";
 import { findingLocation, holdSummary } from "../lib/secretGuard";
+import { commentCount, composeGateFeedback, gateKey, type GateComment } from "../lib/gateComments";
+import { useGateComments } from "../stores/gateCommentsStore";
 
 interface LoopState {
   iteration: number;
@@ -32,7 +34,14 @@ interface Props {
   onPause: () => void;
   onStopStage: () => void;
   onAbort: () => void;
-  onApprove: () => void;
+  /** Approve; at a gate with the director's comments (#957), they come
+   *  along: to the next stage as guidance, or, with no stage left to take
+   *  them, to be set aside once the approve went through. Whoever handles
+   *  the decision clears the comments, and only when it succeeded. */
+  onApprove: (comments?: GateComment[]) => void;
+  /** Who an approve with comments hands them to ("Implement", "2 stages"),
+   *  or null when no stage that hasn't begun follows. */
+  nextStageLabel?: string | null;
   onReject: (feedback: string, maxTurns?: number) => void;
   onResume: (maxTurns?: number) => void;
   onDiscard: () => void;
@@ -349,8 +358,11 @@ function DecisionBar({
   onDiscard,
   onSendBack,
   onAbort,
+  nextStageLabel = null,
 }: Props & { blockedStage: RunStage }) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
+  // The director's inline comments on the gate's artifact (#957).
+  const comments = useGateComments(gateKey(blockedStage));
   const [feedback, setFeedback] = useState("");
   const [showWhy, setShowWhy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -389,11 +401,27 @@ function DecisionBar({
   const canSendBack = loopTargetRole !== null && !atCap;
 
   function submitFeedback() {
-    if (mode === "reject") onReject(feedback, failed ? turns : undefined);
-    else onSendBack(feedback);
+    // With comments, the feedback is structured: each quoted passage and its
+    // note in document order, then the free-text note.
+    const fb = comments.length > 0 ? composeGateFeedback(comments, feedback) : feedback;
+    if (mode === "reject") onReject(fb, failed ? turns : undefined);
+    else onSendBack(fb);
     setMode("decide");
     setFeedback("");
   }
+
+  function approveGate() {
+    // The comments go with the approve either way; the store hands them to
+    // the next stage, or sets them aside when none follows, and keeps them
+    // if the approve is refused.
+    if (comments.length > 0) onApprove(comments);
+    else onApprove();
+  }
+  const hasComments = comments.length > 0;
+  // An approve of this gate is on its way (guidance being written, then the
+  // decision): the button waits, so a second click can't race the first.
+  const approving = useRunsStore((s) => !!s.approvingGates?.[`${blockedStage.runId}:${blockedStage.id}`]);
+  const them = comments.length === 1 ? "it" : "them";
 
   const tone = transient
     ? "border-[var(--warning-border)] bg-[var(--warning-ghost)]"
@@ -480,7 +508,7 @@ function DecisionBar({
                       className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                       {resumeFirst ? `Resume with ${turns} turns` : `Re-run with ${turns} turns`}
                     </button>
-                    <button type="button" onClick={onApprove}
+                    <button type="button" onClick={() => onApprove()}
                       className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
                       Accept partial work
                     </button>
@@ -527,6 +555,13 @@ function DecisionBar({
                   <span data-tour="direct-secret-hold" title={secret.findings.map((f) => `${f.kind} · ${findingLocation(f)}`).join("\n") || undefined}>
                     Held before <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {holdSummary(secret)}
                   </span>
+                ) : hasComments ? (
+                  <span data-tour="direct-gate-comment-count">
+                    <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {nextStageLabel
+                      ? `${commentCount(comments.length)} ${comments.length === 1 ? "goes" : "go"} with your decision.`
+                      // Said here, before the click: no stage is left to take them.
+                      : `${commentCount(comments.length)}. No stage follows to take ${them}: Approve leaves ${them} out, Reject${canSendBack ? " or Send back" : ""} carries ${them}.`}
+                  </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
                 )}
@@ -537,12 +572,12 @@ function DecisionBar({
                   Resume the stage
                 </button>
               ) : failed ? (
-                <button type="button" onClick={onApprove}
+                <button type="button" onClick={() => onApprove()}
                   className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-sm text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)]">
                   Accept &amp; continue
                 </button>
               ) : secret ? (
-                <button type="button" onClick={onApprove}
+                <button type="button" onClick={() => onApprove()}
                   title={secretCount > 0
                     ? "Start this stage anyway, with exactly these findings. Remove them from the worktree first to continue without overriding."
                     : "Start this stage anyway, without a complete check."}
@@ -550,9 +585,14 @@ function DecisionBar({
                   {secretCount > 1 ? "Proceed past them" : "Proceed regardless"}
                 </button>
               ) : (
-                <button type="button" onClick={onApprove}
-                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
-                  Approve &amp; continue
+                <button type="button" onClick={approveGate} disabled={approving}
+                  title={hasComments
+                    ? nextStageLabel
+                      ? `Your comments go to ${nextStageLabel} as guidance`
+                      : "No stage that hasn't begun follows, so approving sets your comments aside"
+                    : undefined}
+                  className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi disabled:opacity-50`}>
+                  {hasComments ? (nextStageLabel ? "Approve with comments" : "Approve without comments") : <>Approve &amp; continue</>}
                 </button>
               )}
               {canSendBack && (
@@ -573,11 +613,18 @@ function DecisionBar({
           )
         ) : (
           <div className="flex flex-col gap-2">
+            {hasComments && (
+              <span className="font-mono text-[11px] text-octo-mute">
+                {commentCount(comments.length)} on the output {comments.length === 1 ? "goes" : "go"} with it, in document order.
+              </span>
+            )}
             <textarea
               autoFocus
               value={feedback}
               onChange={(e) => setFeedback(e.target.value)}
-              placeholder={mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
+              placeholder={hasComments
+                ? "Optional overall note…"
+                : mode === "reject" ? "Optional feedback for the re-run…" : "Optional feedback for the send-back…"}
               className="h-20 resize-none rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-mono text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
             />
             <div className="flex gap-2">

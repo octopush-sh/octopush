@@ -15,6 +15,7 @@ import { sendBackGate } from "../lib/reviewComments";
 import { RunLedger } from "./RunLedger";
 import { BriefModal } from "./BriefModal";
 import { FadeSwap } from "./primitives/FadeSwap";
+import { nextStages } from "../lib/gateComments";
 
 interface Props {
   active: boolean;
@@ -35,6 +36,8 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const begin = useRunsStore((s) => s.begin);
   const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
+  const approveWithComments = useRunsStore((s) => s.approveWithComments);
+  const resolveGate = useRunsStore((s) => s.resolveGate);
   const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
@@ -128,6 +131,13 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
     const loopTargetRole: string | null = gate ? labelForRole(gate.target.role) : null;
     const loopState: { iteration: number; max: number } | null = gate ? { iteration: gate.iteration, max: gate.max } : null;
 
+    // Where an approve with comments hands them (#957).
+    const followers = blockedStage ? nextStages(stages, blockedStage) : [];
+    const nextLabel =
+      followers.length === 0 ? null
+      : followers.length === 1 ? labelForRole(followers[0].role)
+      : `${followers.length} stages`;
+
     const doneCount = stages.filter((s) => s.status === "done").length;
     const onRunAgain = () => {
       // Seed the launcher with this run's brief, pipeline, and crew — the
@@ -218,11 +228,15 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           // resolves another stage of the run: if that stage was decided
           // elsewhere meanwhile, it refuses, the store toasts the refusal and
           // the refresh shows what is waiting now. No stage shown, no decision.
-          onApprove={() => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "approve");
+          nextStageLabel={nextLabel}
+          onApprove={(comments) => {
+            // Always through the store's gate approve: with no comments it
+            // still takes out guidance an earlier pass of this gate left on
+            // the next stage, and it clears the comments only on success.
+            if (blockedStage) void approveWithComments(run.id, blockedStage.id, Array.isArray(comments) ? comments : []);
           }}
           onReject={(fb, maxTurns) => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
           }}
           onResume={(maxTurns) => {
             if (blockedStage) void resolve(run.id, blockedStage.id, "resume", { maxTurnsOverride: maxTurns });
@@ -231,7 +245,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             if (blockedStage) void resolve(run.id, blockedStage.id, "discard");
           }}
           onSendBack={(fb) => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
           }}
           onAnswerBlocker={(answers) => {
             if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);

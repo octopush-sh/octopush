@@ -3,6 +3,8 @@ import { render, screen, fireEvent } from "@testing-library/react";
 import { RunControlBar } from "./RunControlBar";
 import type { Run, RunStage } from "../lib/ipc";
 import { useRunsStore } from "../stores/runsStore";
+import { useGateCommentsStore } from "../stores/gateCommentsStore";
+import { gateKey } from "../lib/gateComments";
 
 const run = (status: Run["status"]): Run => ({
   id: "r1", workspaceId: "w1", pipelineId: "p", task: "t", status,
@@ -320,6 +322,83 @@ describe("RunControlBar", () => {
     render(<RunControlBar run={run("paused")} blockedStage={partial} loopTargetRole={null} loopState={null} {...h} />);
     expect(screen.getByText(/GitHub token in a\.ts:1 and 2 more · scanned the first 16 MB; the rest wasn't checked/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Proceed past them" })).toBeInTheDocument();
+  });
+
+  describe("gate comments (#957)", () => {
+    const gate = stage({ role: "plan", finishedAt: "f1", loopTargetPosition: 0, loopMaxIterations: 3 });
+    const seed = () => {
+      useGateCommentsStore.setState({ byGate: {} });
+      const add = useGateCommentsStore.getState().add;
+      add(gateKey(gate), "Step 3: drop the table", "Keep the data.", 40, 22);
+      add(gateKey(gate), "Use Redis", "We have no Redis.", 5, 9);
+    };
+
+    it("Send back carries the comments as structured feedback and leaves clearing them to the outcome", async () => {
+      seed();
+      const h = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole="Implement" loopState={{ iteration: 0, max: 3 }} nextStageLabel="Test" {...h} />);
+      expect(screen.getByText(/2 comments go with your decision/)).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: /Send back to Implement/i }));
+      expect(await screen.findByText(/2 comments on the output go with it, in document order/)).toBeInTheDocument();
+      fireEvent.change(screen.getByRole("textbox"), { target: { value: "Otherwise good." } });
+      fireEvent.click(screen.getByRole("button", { name: /^Send back$/i }));
+      const fb = h.onSendBack.mock.calls[0][0] as string;
+      expect(fb).toContain('1. On "Use Redis":\n   We have no Redis.');
+      expect(fb.indexOf("Use Redis")).toBeLessThan(fb.indexOf("Step 3: drop the table"));
+      expect(fb.endsWith("Overall note: Otherwise good.")).toBe(true);
+      // Not cleared here: the send-back may still be refused (`runsStore.resolveGate`).
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+
+    it("Reject carries them too", async () => {
+      seed();
+      const h = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} {...h} />);
+      fireEvent.click(screen.getByRole("button", { name: /^Reject$/i }));
+      await screen.findByRole("textbox");
+      fireEvent.click(screen.getByRole("button", { name: /Re-run the stage/i }));
+      expect(h.onReject.mock.calls[0][0]).toMatch(/^The director commented on 2 passages/);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+
+    it("Approve with comments hands them to the next stage; with none to take them, the bar says so before the click", () => {
+      seed();
+      const h = handlers();
+      const { unmount } = render(
+        <RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} nextStageLabel="Implement" {...h} />,
+      );
+      const approve = screen.getByRole("button", { name: "Approve with comments" });
+      expect(approve).toHaveAttribute("title", "Your comments go to Implement as guidance");
+      fireEvent.click(approve);
+      expect(h.onApprove.mock.calls[0][0]).toHaveLength(2);
+      unmount();
+
+      const h2 = handlers();
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} nextStageLabel={null} {...h2} />);
+      // Visible text, not a tooltip.
+      expect(screen.getByText(/2 comments\. No stage follows to take them: Approve leaves them out, Reject carries them\./)).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: /Approve & continue/ })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Approve without comments" }));
+      // They go with the approve; the store sets them aside once it went through.
+      expect(h2.onApprove.mock.calls[0][0]).toHaveLength(2);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toHaveLength(2);
+    });
+  });
+
+  it("Approve waits while an approve of this gate is in flight (#957)", () => {
+    const gate = stage({ role: "plan", finishedAt: "f1" });
+    const h = handlers();
+    useGateCommentsStore.setState({ byGate: {} });
+    useRunsStore.setState({ approvingGates: { [`${gate.runId}:${gate.id}`]: true } });
+    try {
+      render(<RunControlBar run={run("paused")} blockedStage={gate} loopTargetRole={null} loopState={null} {...h} />);
+      const approve = screen.getByRole("button", { name: /Approve & continue/ });
+      expect(approve).toBeDisabled();
+      fireEvent.click(approve);
+      expect(h.onApprove).not.toHaveBeenCalled();
+    } finally {
+      useRunsStore.setState({ approvingGates: {} });
+    }
   });
 
   describe("Claude plan limit", () => {
