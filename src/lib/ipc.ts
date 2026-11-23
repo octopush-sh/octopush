@@ -593,6 +593,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
@@ -629,6 +630,8 @@ import type {
   GatewayReconciliation,
   Workspace,
   CreatedWorkspace,
+  ShareOptions,
+  ShareSpec,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
   ProjectCollisions,
@@ -880,6 +883,13 @@ export const ipc = {
    *  DB. Reading it never runs it. */
   conductorSetupScript: (projectId: string) =>
     invoke<string | null>("conductor_setup_script", { projectId }),
+  /** The project's "Share with new missions" list, and what its main checkout
+   *  could share. The backend reads the project's own path from the DB. */
+  shareWithMissions: (projectId: string) =>
+    invoke<ShareOptions>("share_with_missions", { projectId }),
+  /** Remember what the project shares with new missions (sanitized server-side). */
+  setShareWithMissions: (projectId: string, spec: ShareSpec) =>
+    invoke<void>("set_share_with_missions", { projectId, spec }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -896,7 +906,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────

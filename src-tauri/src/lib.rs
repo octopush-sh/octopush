@@ -41,6 +41,7 @@ pub mod sync;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
+pub mod worktree_share;
 pub mod mission;
 pub mod template;
 pub mod theme;
@@ -232,6 +233,8 @@ pub fn run() {
             commands::create_workspace,
             commands::set_project_setup_script,
             commands::conductor_setup_script,
+            commands::share_with_missions,
+            commands::set_share_with_missions,
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,
