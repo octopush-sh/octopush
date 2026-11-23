@@ -3752,6 +3752,56 @@ impl Db {
         Ok(path.flatten())
     }
 
+    /// The workspace a thread belongs to and its worktree, when it has one.
+    pub fn chat_thread_home(&self, thread_id: &str) -> AppResult<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT w.id, w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every thread of every workspace checked out at the same path as
+    /// `thread_id`'s workspace (itself included): the conversations whose
+    /// turns write to the same files.
+    pub fn chat_threads_sharing_worktree(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t2.id FROM chat_threads t
+               JOIN workspaces w ON w.id = t.workspace_id
+               JOIN workspaces w2 ON w2.id = w.id
+                 OR (w.worktree_path IS NOT NULL AND rtrim(w2.worktree_path, '/') = rtrim(w.worktree_path, '/'))
+               JOIN chat_threads t2 ON t2.workspace_id = w2.id
+             WHERE t.id = ?1",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether a Direct run is in progress (`running` or `paused`) in a
+    /// workspace checked out at `worktree_path`.
+    pub fn has_active_run_at(&self, worktree_path: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs r JOIN workspaces w ON w.id = r.workspace_id
+             WHERE r.status IN ('running', 'paused')
+               AND rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+            params![worktree_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The ids of a workspace's threads (their checkpoints go when the
+    /// workspace is deleted or archived).
+    pub fn chat_thread_ids(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM chat_threads WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Fork from a user turn (#958): a new thread in the same workspace holding
     /// a copy of every message BEFORE `message_id`, which must be a user turn
     /// of `thread_id`. Returns the new thread, the turn's text (the fork's

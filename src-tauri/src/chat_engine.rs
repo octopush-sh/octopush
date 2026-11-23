@@ -1866,6 +1866,12 @@ impl ChatEngine {
         self.cancels.lock().keys().any(|k| k == thread_id || k.starts_with(&prefix))
     }
 
+    /// Whether a turn (or a sub-agent continuation) is running on any of
+    /// `thread_ids`.
+    pub fn any_running(&self, thread_ids: &[String]) -> bool {
+        thread_ids.iter().any(|t| self.is_running(t))
+    }
+
     /// Record one provider response's token usage: the canonical spend ledger
     /// (so the Companion CONTEXT card and Settings · Usage see chat turns)
     /// and the mission logbook. Shared by the loop and the forced close.

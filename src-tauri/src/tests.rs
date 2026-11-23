@@ -25655,7 +25655,7 @@ mod sync_contract_tests {
 #[cfg(test)]
 mod talk_checkpoint_tests {
     //! #958: Talk checkpoints — rewind a turn's files, undo, fork.
-    use crate::talk_checkpoints::{self as ck, AfterTurn, RewindChange};
+    use crate::talk_checkpoints::{self as ck, AfterTurn, Budget, RewindChange, Untouched};
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -25733,7 +25733,7 @@ mod talk_checkpoint_tests {
         assert_eq!(change(&p.changes, "gone.txt").kind, "restored");
         assert!(change(&p.changes, "b.txt").outside_talk, "the director's edit is flagged");
 
-        assert_eq!(ck::rewind(&dir, THREAD, 10, &p.current).unwrap(), 4);
+        assert_eq!(ck::rewind(&dir, THREAD, 10, &p.current).unwrap().changed, 4);
         assert_eq!(read(&dir, "a.txt"), "A staged\n");
         assert_eq!(read(&dir, "b.txt"), "B\n");
         assert_eq!(read(&dir, "gone.txt"), "G\n");
@@ -25743,7 +25743,7 @@ mod talk_checkpoint_tests {
         assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "a.txt", "the user's index is kept");
         assert_eq!(git(&dir, &["show", ":a.txt"]), "A staged");
 
-        assert_eq!(ck::undo(&dir, THREAD).unwrap(), 4);
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 4);
         assert_eq!(read(&dir, "a.txt"), "A agent\n");
         assert_eq!(read(&dir, "b.txt"), "B director\n");
         assert_eq!(read(&dir, "sub/new.txt"), "N\n");
@@ -25779,7 +25779,7 @@ mod talk_checkpoint_tests {
         assert!(ck::capture_before(&dir, THREAD, 2));
         write(&dir, "a.txt", "agent\n");
         let p = ck::preview(&dir, THREAD, 2).unwrap();
-        assert_eq!(ck::rewind(&dir, THREAD, 2, &p.current).unwrap(), 1);
+        assert_eq!(ck::rewind(&dir, THREAD, 2, &p.current).unwrap().changed, 1);
         write(&dir, "b.txt", "a later turn's file\n");
         let err = ck::undo(&dir, THREAD).unwrap_err().to_string();
         assert!(err.contains("changed since the rewind"), "{err}");
@@ -25787,7 +25787,7 @@ mod talk_checkpoint_tests {
         assert_eq!(read(&dir, "b.txt"), "a later turn's file\n");
         // Back to the state the rewind left, the undo works again.
         std::fs::remove_file(dir.join("b.txt")).unwrap();
-        assert_eq!(ck::undo(&dir, THREAD).unwrap(), 1);
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 1);
         assert_eq!(read(&dir, "a.txt"), "agent\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -25823,7 +25823,7 @@ mod talk_checkpoint_tests {
         assert!(ck::capture_before(&dir, THREAD, 9));
         assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![7, 9]);
         let p = ck::rewind(&dir, THREAD, 7, &ck::preview(&dir, THREAD, 7).unwrap().current);
-        assert_eq!(p.unwrap(), 1);
+        assert_eq!(p.unwrap().changed, 1);
         assert_eq!(read(&dir, "a.txt"), "A\n", "back to before the FIRST attempt");
 
         ck::prune_thread(&dir, THREAD);
@@ -25880,6 +25880,396 @@ mod talk_checkpoint_tests {
         assert_eq!(ck::expired_refs(lines, 200), vec!["refs/octopush/talk/t/1".to_string()]);
     }
 
+    fn left(untouched: &[Untouched], path: &str) -> &'static str {
+        untouched.iter().find(|u| u.path == path).map(|u| u.reason).unwrap_or("")
+    }
+
+    fn rewind_now(dir: &Path, id: i64) -> ck::RewindOutcome {
+        let p = ck::preview(dir, THREAD, id).unwrap();
+        ck::rewind(dir, THREAD, id, &p.current).unwrap()
+    }
+
+    fn tree_paths(dir: &Path, rev: &str) -> Vec<String> {
+        git(dir, &["ls-tree", "-r", "--name-only", rev]).lines().map(str::to_string).collect()
+    }
+
+    fn committed(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = repo(tag);
+        for (rel, body) in files {
+            write(&dir, rel, body);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// The checkpoint ignored a file; the turn un-ignored it, so the
+    /// snapshot of "now" holds it and the checkpoint does not. Neither the
+    /// rewind nor its undo may remove or rewrite it.
+    #[test]
+    fn a_file_ignored_at_the_checkpoint_survives_rewind_and_undo() {
+        let dir = committed("ign-then", &[(".gitignore", "local.cfg\n"), ("a.txt", "A\n")]);
+        write(&dir, "local.cfg", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // The turn drops the rule and edits a file.
+        write(&dir, ".gitignore", "");
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "local.cfg"), "ignored", "{:?}", p.untouched);
+        assert!(p.changes.iter().all(|c| c.path != "local.cfg"));
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 2);
+        assert_eq!(left(&out.untouched, "local.cfg"), "ignored");
+        assert_eq!(read(&dir, "local.cfg"), "mine\n");
+        assert_eq!(read(&dir, ".gitignore"), "local.cfg\n");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+
+        // The file changes while it is ignored again: the undo's target
+        // holds the old copy and must not write it back over this one.
+        write(&dir, "local.cfg", "mine, edited\n");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(left(&undone.untouched, "local.cfg"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "local.cfg"), "mine, edited\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: the turn ADDS an ignore rule and ignored files
+    /// appear. The rewind takes the rule away, so the next snapshot holds
+    /// them, while the undo's target does not. The undo must not remove them.
+    #[test]
+    fn files_ignored_since_the_checkpoint_survive_rewind_and_undo() {
+        let dir = committed("ign-now", &[(".gitignore", ""), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "build/\n.cache\n");
+        write(&dir, "a.txt", "agent\n");
+        write(&dir, "build/out.bin", "artefact\n");
+        write(&dir, "build/deep/more.bin", "artefact 2\n");
+        write(&dir, ".cache", "warm\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.changed, 2, "{out:?}");
+        assert!(out.untouched.is_empty(), "{:?}", out.untouched);
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None);
+        assert_eq!(left(&undone.untouched, "build/out.bin"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(left(&undone.untouched, "build/deep/more.bin"), "ignored");
+        assert_eq!(left(&undone.untouched, ".cache"), "ignored");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+        assert_eq!(read(&dir, "build/deep/more.bin"), "artefact 2\n");
+        assert_eq!(read(&dir, ".cache"), "warm\n");
+        assert_eq!(read(&dir, ".gitignore"), "build/\n.cache\n");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the checkpoint holds is ignored now and was edited since: its
+    /// current content is in no snapshot, so the rewind leaves it. Holds for
+    /// an untracked file and for a tracked one.
+    #[test]
+    fn a_file_ignored_now_is_never_overwritten() {
+        let dir = committed("ign-over", &[(".gitignore", ""), ("tracked.cfg", "T\n")]);
+        write(&dir, "loose.cfg", "L\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "*.cfg\n");
+        write(&dir, "loose.cfg", "L filled in\n");
+        write(&dir, "tracked.cfg", "T filled in\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "loose.cfg"), "ignored", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "tracked.cfg"), "ignored");
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n");
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.cfg\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rule in a nested `.gitignore` of the destination counts too.
+    #[test]
+    fn a_nested_ignore_file_of_the_destination_is_honoured() {
+        let dir = committed("ign-nested", &[("pkg/.gitignore", "*.local\n"), ("pkg/a.txt", "A\n")]);
+        write(&dir, "pkg/db.local", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("pkg/.gitignore")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "pkg/db.local"), "ignored", "{:?}", out.untouched);
+        assert_eq!(read(&dir, "pkg/db.local"), "mine\n");
+        assert_eq!(read(&dir, "pkg/.gitignore"), "*.local\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checkpoint has a FILE where a directory with ignored content now
+    /// sits. The directory is never removed to put the file back, whether
+    /// the whole directory is ignored or only what it holds.
+    #[test]
+    fn a_directory_holding_ignored_content_is_never_removed_to_place_a_file() {
+        let dir = committed("dir-file", &[(".gitignore", "*.bin\n"), ("cache", "a plain file\n"), ("store", "plain\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // `cache` becomes a directory with one ignored and one plain file.
+        std::fs::remove_file(dir.join("cache")).unwrap();
+        write(&dir, "cache/keep.bin", "ignored bytes\n");
+        write(&dir, "cache/note.txt", "plain\n");
+        // `store` becomes a directory that is ignored as a whole.
+        std::fs::remove_file(dir.join("store")).unwrap();
+        write(&dir, ".gitignore", "*.bin\nstore/\n");
+        write(&dir, "store/data", "ignored too\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "cache"), "exists", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "store"), "ignored");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert!(!dir.join("cache/note.txt").exists(), "the plain file the turn created is removed");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.bin\n");
+
+        // The undo puts the turn's own file back and still removes nothing.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert_eq!(read(&dir, "cache/note.txt"), "plain\n");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Something on disk that the current snapshot doesn't hold (here an
+    /// embedded repository, which a snapshot leaves out) is not replaced by
+    /// the file the checkpoint has at that path.
+    #[test]
+    fn what_the_current_snapshot_does_not_hold_is_not_overwritten() {
+        let dir = committed("unknown", &[("vendor", "a plain file\n"), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("vendor")).unwrap();
+        write(&dir, "vendor/lib.txt", "someone's checkout\n");
+        git(&dir.join("vendor"), &["init", "-q"]);
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "vendor"), "exists", "{:?}", p.untouched);
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(read(&dir, "vendor/lib.txt"), "someone's checkout\n");
+        assert!(dir.join("vendor/.git").exists());
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that became a symbolic link is never written through: the
+    /// link itself goes (it is in the snapshot), what it points at stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_never_writes_through_a_symbolic_link() {
+        let dir = committed("symlink", &[("d/f.txt", "F\n")]);
+        let outside = repo("symlink-outside");
+        write(&outside, "f.txt", "outside\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_dir_all(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(read(&outside, "f.txt"), "outside\n", "nothing is written outside the worktree");
+        assert!(std::fs::symlink_metadata(dir.join("d")).map(|m| !m.file_type().is_symlink()).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Files the Secret guard's name rules treat as sensitive never enter a
+    /// snapshot, tracked or not, so a rewind never writes or removes them.
+    #[test]
+    fn sensitive_named_files_are_never_stored_or_rewound() {
+        let dir = committed("sensitive", &[("a.txt", "A\n"), ("certs/server.pem", "tracked pem\n"), (".env.example", "KEY=\n")]);
+        write(&dir, ".env", "TOKEN=before\n");
+        write(&dir, "deploy/id_rsa", "key before\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        let stored = tree_paths(&dir, &ck::ref_for(THREAD, 1));
+        assert_eq!(stored, vec![".env.example".to_string(), "a.txt".to_string()], "only plain files are stored");
+
+        write(&dir, ".env", "TOKEN=after\n");
+        write(&dir, "certs/server.pem", "pem after\n");
+        write(&dir, ".env.local", "created by the turn\n");
+        std::fs::remove_file(dir.join("deploy/id_rsa")).unwrap();
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(p.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), vec!["a.txt"]);
+        assert!(tree_paths(&dir, &p.current).iter().all(|f| f == "a.txt" || f == ".env.example"));
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(read(&dir, ".env"), "TOKEN=after\n");
+        assert_eq!(read(&dir, "certs/server.pem"), "pem after\n");
+        assert_eq!(read(&dir, ".env.local"), "created by the turn\n");
+        assert!(!dir.join("deploy/id_rsa").exists());
+        assert_eq!(git(&dir, &["status", "--porcelain", "--", "certs/server.pem"]), "M certs/server.pem", "the real index is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the budget (files, bytes or time) the turn takes no checkpoint,
+    /// nothing is left to rewind to, and the thread says so with the reason.
+    /// A regenerate of that turn takes none either.
+    #[test]
+    fn a_snapshot_over_its_budget_is_skipped_and_marked() {
+        let dir = committed("budget", &[("a.txt", "A\n")]);
+        for i in 0..4 {
+            write(&dir, &format!("big/f{i}.txt"), "0123456789\n");
+        }
+        let second = std::time::Duration::from_secs(20);
+        let few = Budget { files: 3, bytes: 1 << 20, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 1, &few));
+        let small = Budget { files: 100, bytes: 30, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 2, &small));
+        let instant = Budget { files: 100, bytes: 1 << 20, timeout: std::time::Duration::ZERO };
+        assert!(!ck::capture_before_with(&dir, THREAD, 3, &instant));
+        // A refused snapshot wrote none of the files into the object store.
+        let blob = git(&dir, &["hash-object", "big/f0.txt"]);
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "", "nothing was hashed into the repository");
+        assert!(ck::capture_before_with(&dir, THREAD, 4, &Budget::DEFAULT));
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "blob");
+
+        let cps = ck::checkpoints(&dir, THREAD).unwrap();
+        assert_eq!(cps.turns, vec![4]);
+        assert!(!cps.can_undo);
+        let reasons: Vec<(i64, &str)> = cps.skipped.iter().map(|s| (s.message_id, s.reason.as_str())).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (1, "more than 3 changed or untracked files"),
+                (2, "more than 0 MB of changed or untracked files"),
+                (3, "reading the changed files took too long"),
+            ]
+        );
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        assert!(ck::preview(&dir, THREAD, 1).is_err(), "a skipped turn can't be rewound");
+        // A regenerate must not take a late checkpoint for the skipped turn.
+        assert!(!ck::capture_before(&dir, THREAD, 1));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind that stops part-way reports it, keeps the state from before
+    /// it as the undo, and a second attempt from the half-rewound state
+    /// keeps that FIRST undo target.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_keeps_the_first_undo_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial", &[("a.txt", "A\n"), ("locked/b.txt", "B\n"), ("gone.txt", "G\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        write(&dir, "made.txt", "agent made\n");
+
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            // Running as a user the mode doesn't bind (root): nothing to test.
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some(), "the locked folder stops it: {first:?}");
+        assert!(first.can_undo);
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert!(!dir.join("made.txt").exists(), "the part that ran did run");
+        assert!(ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+
+        // A second attempt from the half-rewound state finishes the job…
+        let second = rewind_now(&dir, 1);
+        assert_eq!(second.error, None, "{second:?}");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        // …and the undo goes back to before the FIRST attempt.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(!ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo of a part-way rewind, taken straight away, puts back
+    /// exactly what the rewind managed to change.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_can_be_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial-undo", &[("a.txt", "A\n"), ("locked/b.txt", "B\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        write(&dir, "made.txt", "agent made\n");
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some() && first.can_undo, "{first:?}");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A later, unrelated rewind does not inherit a stale undo target.
+    #[test]
+    fn a_fresh_rewind_replaces_the_undo_target() {
+        let dir = committed("fresh-undo", &[("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "one\n");
+        rewind_now(&dir, 1);
+        write(&dir, "a.txt", "two\n");
+        rewind_now(&dir, 1);
+        ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "a.txt"), "two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting or archiving a workspace prunes its threads' refs from any
+    /// checkout of the repository, the removed worktree's included.
+    #[test]
+    fn pruning_a_workspace_clears_its_threads_from_the_shared_repository() {
+        let dir = committed("ws-prune", &[("a.txt", "A\n")]);
+        let wt = dir.with_file_name(format!("{}-wt", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt);
+        git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"]);
+        write(&wt, "big.txt", "x\n");
+        assert!(ck::capture_before(&wt, THREAD, 1));
+        assert!(!ck::capture_before_with(&wt, THREAD, 2, &Budget { files: 0, ..Budget::DEFAULT }));
+        assert!(ck::capture_before(&wt, "5b1e-thread-b", 1));
+        assert!(ck::capture_before(&dir, "5b1e-thread-c", 1));
+        // Pruned from the main checkout, as after the worktree is removed.
+        ck::prune_threads(&dir, &[THREAD.to_string(), "../heads/side".to_string()]);
+        let refs = git(&dir, &["for-each-ref", "--format=%(refname)", ck::REF_ROOT]);
+        assert_eq!(refs, "refs/octopush/talk/5b1e-thread-b/1\nrefs/octopush/talk/5b1e-thread-c/1");
+        assert!(!git(&dir, &["branch", "--list", "side"]).is_empty(), "a bad id never reaches another ref");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn the_rewind_note_names_the_turn() {
         use crate::commands::rewind_note;
@@ -25915,6 +26305,66 @@ mod talk_checkpoint_tests {
         assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 4, "the original is untouched");
         assert!(db.fork_chat_thread(&t.id, a1).is_err(), "only a user turn forks");
         assert_eq!(db.chat_thread_worktree(&t.id).unwrap(), None);
+    }
+
+    /// What a rewind checks before it writes: every conversation of every
+    /// workspace checked out at the same folder, and a Direct run in
+    /// progress there. The folder comes from the database.
+    #[test]
+    fn the_worktree_a_rewind_writes_to_is_known_from_the_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-idle", "P", "/tmp/p-idle").unwrap();
+        db.insert_workspace("w-a", "p-idle", "a", "", "main", Some("/tmp/p-idle/wt"), "", None).unwrap();
+        db.insert_workspace("w-b", "p-idle", "b", "", "main", Some("/tmp/p-idle/wt/"), "", None).unwrap();
+        db.insert_workspace("w-c", "p-idle", "c", "", "side", Some("/tmp/p-idle/other"), "", None).unwrap();
+        db.insert_workspace("w-d", "p-idle", "d", "", "none", None, "", None).unwrap();
+        let ta = db.create_chat_thread("w-a", "A").unwrap();
+        let ta2 = db.create_chat_thread("w-a", "A2").unwrap();
+        let tb = db.create_chat_thread("w-b", "B").unwrap();
+        let tc = db.create_chat_thread("w-c", "C").unwrap();
+        let td = db.create_chat_thread("w-d", "D").unwrap();
+
+        assert_eq!(db.chat_thread_home(&ta.id).unwrap(), Some(("w-a".to_string(), Some("/tmp/p-idle/wt".to_string()))));
+        assert_eq!(db.chat_thread_home(&td.id).unwrap(), Some(("w-d".to_string(), None)));
+        assert_eq!(db.chat_thread_home("no-such-thread").unwrap(), None);
+
+        let mut sharing = db.chat_threads_sharing_worktree(&ta.id).unwrap();
+        sharing.sort();
+        let mut expected = vec![ta.id.clone(), ta2.id.clone(), tb.id.clone()];
+        expected.sort();
+        assert_eq!(sharing, expected, "same folder, a trailing slash ignored; another folder left out");
+        assert_eq!(db.chat_threads_sharing_worktree(&td.id).unwrap(), vec![td.id.clone()]);
+        assert_eq!(db.chat_threads_sharing_worktree(&tc.id).unwrap(), vec![tc.id.clone()]);
+
+        let mut ids = db.chat_thread_ids("w-a").unwrap();
+        ids.sort();
+        let mut own = vec![ta.id.clone(), ta2.id.clone()];
+        own.sort();
+        assert_eq!(ids, own);
+
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline = db.list_pipelines().unwrap()[0].id.clone();
+        let run = db.create_run("w-b", &pipeline, "task", None, None, &[]).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a draft is not in progress");
+        db.set_run_status(&run, "running", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a run in a workspace at the same folder counts");
+        assert!(!db.has_active_run_at("/tmp/p-idle/other").unwrap());
+        db.set_run_status(&run, "paused", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt/").unwrap());
+        db.set_run_status(&run, "completed", true).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap());
+    }
+
+    #[test]
+    fn the_note_says_what_was_left_untouched_or_stopped() {
+        use crate::commands::rewind_note_tail;
+        let mut outcome = ck::RewindOutcome { changed: 2, untouched: Vec::new(), error: None, can_undo: true };
+        assert_eq!(rewind_note_tail(&outcome), "");
+        outcome.untouched.push(Untouched { path: "local.cfg".into(), reason: "ignored" });
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched");
+        outcome.error = Some("checkout-index: failed".into());
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched · stopped part-way");
     }
 
     /// A copy that fails part-way leaves no half-copied `· fork` thread.

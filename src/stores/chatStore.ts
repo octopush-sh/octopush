@@ -523,7 +523,7 @@ interface ChatState {
   refreshThread: (workspaceId: string) => Promise<void>;
   /** Fork from a user turn (#958): open a new thread holding the history
    *  before it, with the turn's text as the composer's draft. */
-  forkThread: (workspaceId: string, workspacePath: string, threadId: string, messageId: number) => Promise<void>;
+  forkThread: (workspaceId: string, threadId: string, messageId: number) => Promise<void>;
   /** Hand the composer its seeded draft once (null when there is none). */
   takeComposerSeed: (workspaceId: string) => string | null;
 }
@@ -1619,8 +1619,8 @@ export const useChatStore = create<ChatState>((set, get) => {
       }));
     },
 
-    forkThread: async (workspaceId, workspacePath, threadId, messageId) => {
-      const { thread, draft } = await ipc.forkChatThread(workspacePath, threadId, messageId);
+    forkThread: async (workspaceId, threadId, messageId) => {
+      const { thread, draft } = await ipc.forkChatThread(threadId, messageId);
       set((s) => ({
         threadsByWs: {
           ...s.threadsByWs,

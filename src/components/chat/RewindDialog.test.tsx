@@ -61,7 +61,7 @@ beforeEach(() => {
   vi.mocked(ipc.listChatThreads).mockResolvedValue([THREAD]);
   vi.mocked(ipc.listChatMessages).mockResolvedValue(ROWS);
   // Only the second turn took a checkpoint (the first ran before checkpoints).
-  vi.mocked(ipc.listTalkCheckpoints).mockResolvedValue([3]);
+  vi.mocked(ipc.listTalkCheckpoints).mockResolvedValue({ turns: [3], skipped: [], canUndo: false });
   vi.mocked(ipc.previewTalkRewind).mockResolvedValue({
     messageId: 3,
     current: "abc1234",
@@ -70,9 +70,10 @@ beforeEach(() => {
       { path: "src/stream.ts", kind: "removed", outsideTalk: false },
       { path: "README.md", kind: "reverted", outsideTalk: true },
     ],
+    untouched: [],
   });
-  vi.mocked(ipc.rewindTalkFiles).mockResolvedValue(3);
-  vi.mocked(ipc.undoTalkRewind).mockResolvedValue(3);
+  vi.mocked(ipc.rewindTalkFiles).mockResolvedValue({ changed: 3, untouched: [], error: null, canUndo: true });
+  vi.mocked(ipc.undoTalkRewind).mockResolvedValue({ changed: 3, untouched: [], error: null, canUndo: false });
   vi.mocked(ipc.forkChatThread).mockResolvedValue({ thread: FORK, draft: "Make it stream" });
   useChatStore.setState({
     messagesByWs: {},
@@ -101,14 +102,14 @@ describe("Talk rewind & fork (#958)", () => {
     await mount();
     expect(screen.getAllByRole("button", { name: "Rewind files to here" })).toHaveLength(1);
     expect(screen.getAllByRole("button", { name: "Fork from here" })).toHaveLength(2);
-    expect(ipc.listTalkCheckpoints).toHaveBeenCalledWith("/repo", "t1");
+    expect(ipc.listTalkCheckpoints).toHaveBeenCalledWith("t1");
   });
 
   it("shows what will change before writing, then rewinds the previewed tree and offers the undo", async () => {
     await mount();
     fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
     await flush();
-    expect(ipc.previewTalkRewind).toHaveBeenCalledWith("/repo", "t1", 3);
+    expect(ipc.previewTalkRewind).toHaveBeenCalledWith("t1", 3);
     expect(screen.getByText("3 files go back to before this turn.")).toBeInTheDocument();
     expect(screen.getByText("src/stream.ts")).toBeInTheDocument();
     expect(screen.getByText("changed outside")).toBeInTheDocument();
@@ -117,7 +118,7 @@ describe("Talk rewind & fork (#958)", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Rewind the files" }));
     await flush();
-    expect(ipc.rewindTalkFiles).toHaveBeenCalledWith("ws-1", "/repo", "t1", 3, "abc1234");
+    expect(ipc.rewindTalkFiles).toHaveBeenCalledWith("t1", 3, "abc1234");
     expect(ipc.forkChatThread).not.toHaveBeenCalled();
     expect(screen.queryByText("3 files go back to before this turn.")).not.toBeInTheDocument();
     const toast = toasts.at(-1)!;
@@ -126,7 +127,7 @@ describe("Talk rewind & fork (#958)", () => {
 
     toast.action!.onClick();
     await flush();
-    expect(ipc.undoTalkRewind).toHaveBeenCalledWith("ws-1", "/repo", "t1");
+    expect(ipc.undoTalkRewind).toHaveBeenCalledWith("t1");
     expect(toasts.at(-1)!.title).toBe("The files are back as they were.");
   });
 
@@ -147,8 +148,8 @@ describe("Talk rewind & fork (#958)", () => {
     await flush();
     fireEvent.click(screen.getByRole("button", { name: "Rewind and fork from here" }));
     await flush();
-    expect(ipc.rewindTalkFiles).toHaveBeenCalledWith("ws-1", "/repo", "t1", 3, "abc1234");
-    expect(ipc.forkChatThread).toHaveBeenCalledWith("/repo", "t1", 3);
+    expect(ipc.rewindTalkFiles).toHaveBeenCalledWith("t1", 3, "abc1234");
+    expect(ipc.forkChatThread).toHaveBeenCalledWith("t1", 3);
     expect(useChatStore.getState().activeThreadByWs["ws-1"]).toBe("t2");
   });
 
@@ -195,7 +196,7 @@ describe("Talk rewind & fork (#958)", () => {
   });
 
   it("says the files already match when nothing would change, with both actions disabled", async () => {
-    vi.mocked(ipc.previewTalkRewind).mockResolvedValue({ messageId: 3, current: "abc1234", changes: [] });
+    vi.mocked(ipc.previewTalkRewind).mockResolvedValue({ messageId: 3, current: "abc1234", changes: [], untouched: [] });
     await mount();
     fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
     await flush();
@@ -221,6 +222,85 @@ describe("Talk rewind & fork (#958)", () => {
     expect(screen.queryByText("3 files go back to before this turn.")).not.toBeInTheDocument();
     expect(ipc.rewindTalkFiles).not.toHaveBeenCalled();
     expect(toasts).toHaveLength(0);
+  });
+
+  it("lists the paths a rewind leaves untouched, with the reason, and says where checkpoints are stored", async () => {
+    vi.mocked(ipc.previewTalkRewind).mockResolvedValue({
+      messageId: 3,
+      current: "abc1234",
+      changes: [{ path: "src/parser.ts", kind: "reverted", outsideTalk: false }],
+      untouched: [
+        { path: "local.cfg", reason: "ignored" },
+        { path: "vendor", reason: "exists" },
+      ],
+    });
+    vi.mocked(ipc.rewindTalkFiles).mockResolvedValue({
+      changed: 1,
+      untouched: [{ path: "local.cfg", reason: "ignored" }],
+      error: null,
+      canUndo: true,
+    });
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    expect(screen.getByText("2 paths differ but are left untouched.")).toBeInTheDocument();
+    const list = screen.getByRole("list", { name: "Left untouched" });
+    expect(list).toHaveTextContent("local.cfg");
+    expect(list).toHaveTextContent("git-ignored");
+    expect(list).toHaveTextContent("not in the snapshot");
+    expect(screen.getByText(/git objects under refs\/octopush\/talk\//)).toBeInTheDocument();
+    expect(screen.getByText(/git-ignored now or was at that turn/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Rewind the files" }));
+    await flush();
+    expect(toasts.at(-1)!.title).toBe("Rewound 1 file; 1 left untouched.");
+  });
+
+  it("keeps the dialog open when a rewind stops part-way and offers the undo there", async () => {
+    vi.mocked(ipc.rewindTalkFiles).mockResolvedValue({
+      changed: 2,
+      untouched: [],
+      error: "checkout-index: unable to create file src/parser.ts",
+      canUndo: true,
+    });
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind and fork from here" }));
+    await flush();
+    expect(screen.getByText("The rewind stopped part-way.")).toBeInTheDocument();
+    expect(screen.getByText(/2 files were changed before it stopped: checkout-index: unable to create file/)).toBeInTheDocument();
+    expect(ipc.forkChatThread).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Rewind the files" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Undo the rewind" }));
+    await flush();
+    expect(ipc.undoTalkRewind).toHaveBeenCalledWith("t1");
+    expect(toasts.at(-1)!.title).toBe("The files are back as they were.");
+    expect(screen.queryByText("The rewind stopped part-way.")).not.toBeInTheDocument();
+  });
+
+  it("says there is no undo when the state before a part-way rewind could not be kept", async () => {
+    vi.mocked(ipc.rewindTalkFiles).mockResolvedValue({ changed: 1, untouched: [], error: "it failed", canUndo: false });
+    await mount();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind files to here" }));
+    await flush();
+    fireEvent.click(screen.getByRole("button", { name: "Rewind the files" }));
+    await flush();
+    expect(screen.getByText(/1 file was changed before it stopped: it failed.*there is no undo/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Undo the rewind" })).not.toBeInTheDocument();
+  });
+
+  it("says a turn has no checkpoint, with the reason, where Rewind would be", async () => {
+    vi.mocked(ipc.listTalkCheckpoints).mockResolvedValue({
+      turns: [],
+      skipped: [{ messageId: 3, reason: "more than 5000 changed or untracked files" }],
+      canUndo: false,
+    });
+    await mount();
+    expect(screen.queryByRole("button", { name: "Rewind files to here" })).not.toBeInTheDocument();
+    const mark = screen.getByRole("img", { name: "This turn has no checkpoint: more than 5000 changed or untracked files" });
+    expect(mark).toHaveAttribute("title", "This turn has no checkpoint: more than 5000 changed or untracked files");
   });
 
   it("reports an undo the backend refuses", async () => {
@@ -259,7 +339,7 @@ describe("Talk rewind & fork (#958)", () => {
     await mount();
     fireEvent.click(screen.getAllByRole("button", { name: "Fork from here" })[1]);
     await flush();
-    expect(ipc.forkChatThread).toHaveBeenCalledWith("/repo", "t1", 3);
+    expect(ipc.forkChatThread).toHaveBeenCalledWith("t1", 3);
     const s = useChatStore.getState();
     expect(s.activeThreadByWs["ws-1"]).toBe("t2");
     expect(s.threadsByWs["ws-1"][0].id).toBe("t2");

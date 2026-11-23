@@ -1,8 +1,8 @@
 import { useEffect, useRef, useMemo, useState, useCallback } from "react";
-import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil, History, GitFork } from "lucide-react";
+import { AlertTriangle, Settings, Copy, Check, ArrowDown, RefreshCw, Pencil, History, GitFork, CircleSlash } from "lucide-react";
 import { useChatStore, buildTimeline, isAgentToolName, type ConversationItem } from "../../stores/chatStore";
 import { ipc } from "../../lib/ipc";
-import { rewindError } from "../../lib/talkRewind";
+import { rewindError, skippedLabel } from "../../lib/talkRewind";
 import { pushToast } from "../Toasts";
 import { RewindDialog } from "./RewindDialog";
 import { tourId } from "../../lib/tour/ids";
@@ -105,31 +105,35 @@ export function ChatCanvas({
   }, [workspaceId, loadHistory]);
 
   // The user turns whose files can be rewound (#958): each turn that could
-  // write took a checkpoint before it ran. Re-read when a turn ends.
+  // write took a checkpoint before it ran, unless the snapshot was over its
+  // budget, in which case the turn says it has none. Re-read when a turn ends.
   const [checkpoints, setCheckpoints] = useState<ReadonlySet<number>>(() => new Set());
+  const [skipped, setSkipped] = useState<ReadonlyMap<number, string>>(() => new Map());
   const [rewindAt, setRewindAt] = useState<number | null>(null);
   useEffect(() => {
     if (!activeThreadId || streaming || typeof ipc.listTalkCheckpoints !== "function") return;
     let live = true;
     ipc
-      .listTalkCheckpoints(workspacePath, activeThreadId)
-      .then((ids) => {
-        if (live && Array.isArray(ids)) setCheckpoints(new Set(ids));
+      .listTalkCheckpoints(activeThreadId)
+      .then((c) => {
+        if (!live || !c || !Array.isArray(c.turns)) return;
+        setCheckpoints(new Set(c.turns));
+        setSkipped(new Map((c.skipped ?? []).map((s) => [s.messageId, s.reason])));
       })
       .catch(() => {});
     return () => {
       live = false;
     };
-  }, [workspacePath, activeThreadId, streaming, messages.length]);
+  }, [activeThreadId, streaming, messages.length]);
 
   const handleFork = useCallback(
     (messageId: number) => {
       if (!activeThreadId) return;
-      forkThread(workspaceId, workspacePath, activeThreadId, messageId)
+      forkThread(workspaceId, activeThreadId, messageId)
         .then(() => pushToast({ level: "success", title: "Forked into a new conversation.", body: "The turn's text is in the composer." }))
         .catch((e) => pushToast({ level: "error", title: "Couldn't fork the conversation.", body: rewindError(e) }));
     },
-    [forkThread, workspaceId, workspacePath, activeThreadId],
+    [forkThread, workspaceId, activeThreadId],
   );
 
   // Regenerate / Edit truncate the thread from the targeted message onward, so
@@ -293,6 +297,7 @@ export function ChatCanvas({
                     ? setRewindAt
                     : undefined
                 }
+                noCheckpoint={item.message.role === "user" ? skipped.get(item.message.id) : undefined}
                 onFork={item.message.role === "user" && activeThreadId ? handleFork : undefined}
                 disabled={streaming}
               />
@@ -407,7 +412,6 @@ export function ChatCanvas({
       {rewindAt !== null && activeThreadId && (
         <RewindDialog
           workspaceId={workspaceId}
-          workspacePath={workspacePath}
           threadId={activeThreadId}
           messageId={rewindAt}
           onClose={() => setRewindAt(null)}
@@ -421,7 +425,7 @@ export function ChatCanvas({
  * Wraps a message with hover/focus actions: Copy always, Regenerate on assistant
  * turns, Edit on user turns. Editing swaps the bubble for an inline composer that
  * truncates from this message and resends. A user turn also offers Rewind files
- * to here (when it took a checkpoint) and Fork from here. Actions are disabled
+ * to here (when it took a checkpoint; a turn whose checkpoint was skipped says so) and Fork from here. Actions are disabled
  * while a turn streams.
  */
 function MessageRow({
@@ -431,6 +435,7 @@ function MessageRow({
   onRegenerate,
   onEdit,
   onRewind,
+  noCheckpoint,
   onFork,
   disabled,
 }: {
@@ -440,6 +445,8 @@ function MessageRow({
   onRegenerate?: (id: number) => void;
   onEdit?: (id: number, newContent: string) => void;
   onRewind?: (id: number) => void;
+  /** Set (to the reason, possibly empty) when the turn ran without a checkpoint. */
+  noCheckpoint?: string;
   onFork?: (id: number) => void;
   disabled?: boolean;
 }) {
@@ -523,6 +530,17 @@ function MessageRow({
             disabled={disabled}
             icon={<History size={12} />}
           />
+        )}
+        {!onRewind && noCheckpoint !== undefined && (
+          <span
+            role="img"
+            data-tour={tourId("talk-turn-no-checkpoint")}
+            aria-label={skippedLabel(noCheckpoint)}
+            title={skippedLabel(noCheckpoint)}
+            className="flex h-6 w-6 items-center justify-center rounded p-1 text-octo-mute opacity-60"
+          >
+            <CircleSlash size={12} aria-hidden />
+          </span>
         )}
         {onFork && (
           <RowAction

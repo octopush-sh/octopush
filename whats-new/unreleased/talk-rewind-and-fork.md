@@ -11,7 +11,7 @@ steps:
   - target: talk-turn-fork
     caption: Or fork a new conversation from that turn, with its text ready to send again.
 ---
-Talk now takes a checkpoint of the worktree before each turn that can change files in a git
-repository. Hover a message you sent and choose **Rewind files to here** to see exactly what will
-change, including files changed outside the conversation; the notice that follows offers an undo
-for a few seconds. **Fork from here** starts a new conversation from that turn.
+Talk takes a checkpoint before each turn that can change files in a git repository. Hover a
+message you sent: **Rewind files to here** shows what will change and what it leaves untouched
+(git-ignored files always are), then offers an undo for a few seconds. **Fork from here** starts a
+new conversation. Checkpoints are git objects under `refs/octopush/talk/`, untracked files included.

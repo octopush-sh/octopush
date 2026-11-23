@@ -638,6 +638,19 @@ describe("ChatView — arrow-key prompt history", () => {
     expect(getTextarea().value).toBe("");
   });
 
+  it("puts a fork's seed after a half-typed message instead of replacing it (#958)", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "half a thought " } });
+    await act(async () => {
+      useChatStore.setState({ composerSeedByWs: { "ws-1": "Make it stream" } });
+      await Promise.resolve();
+    });
+    expect(getTextarea().value).toBe("half a thought\n\nMake it stream");
+    expect(useChatStore.getState().composerSeedByWs["ws-1"]).toBeNull();
+  });
+
   it("Escape while navigating clears input and exits history mode", async () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     await act(async () => { await Promise.resolve(); });
