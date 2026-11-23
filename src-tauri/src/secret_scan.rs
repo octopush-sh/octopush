@@ -757,10 +757,21 @@ pub struct AddedFile {
     /// read from the file's new side: the lines right after `lines[i]`,
     /// keyed by `i`.
     pub unchanged: BTreeMap<usize, Vec<String>>,
+    /// Where each diff after the first starts in `lines`, ascending: a range
+    /// scan appends one diff per commit, and a line number in one commit's
+    /// diff says nothing about the next one's.
+    pub segments: Vec<usize>,
     /// The new side starts like a zip archive ([`ZIP_MAGIC`]). Read only for
     /// a `*.key` file: a zip one is a Keynote document, not a key. Across a
     /// range, set only when every add of the path was a zip.
     pub zip: bool,
+}
+
+impl AddedFile {
+    /// The end (exclusive) of the diff's lines holding `lines[idx]`.
+    fn segment_end(&self, idx: usize) -> usize {
+        self.segments.iter().copied().find(|&s| s > idx).unwrap_or(self.lines.len())
+    }
 }
 
 type SeenKey = (String, Option<u32>, String, [u8; 32]);
@@ -945,10 +956,20 @@ fn pem_walk(
 
 /// The unchanged lines [`pem_block`] needs for each PEM block among `lines`
 /// (one diff's added lines of a file), read from `new_side`, the file's
-/// content after the change, keyed like [`AddedFile::unchanged`].
-fn pem_unchanged(lines: &[(u32, String)], new_side: &str) -> BTreeMap<usize, Vec<String>> {
-    let text: Vec<&str> = new_side.lines().collect();
+/// content after the change, keyed like [`AddedFile::unchanged`]. Empty when
+/// `new_side` doesn't hold every added line at its number: a clean filter
+/// (Git LFS, git-crypt, `ident`) or a write since the diff made it something
+/// other than what the diff saw, so its lines would belong to another file.
+pub(crate) fn pem_unchanged(lines: &[(u32, String)], new_side: &str) -> BTreeMap<usize, Vec<String>> {
+    // Trimmed like the diff's lines (`collect_added`), so CRLF matches.
+    let text: Vec<&str> = new_side.lines().map(|l| l.trim_end_matches('\r')).collect();
     let mut out: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let seen = |(n, l): &(u32, String)| {
+        (*n as usize).checked_sub(1).and_then(|i| text.get(i)).is_some_and(|t| *t == l.as_str())
+    };
+    if !lines.iter().all(seen) {
+        return out;
+    }
     for (idx, (_, line)) in lines.iter().enumerate() {
         let Some(h) = PEM_HEADER.find(line) else { continue };
         pem_walk(lines, idx, h.start(), h.as_str(), &mut |j, n| {
@@ -964,24 +985,47 @@ fn pem_unchanged(lines: &[(u32, String)], new_side: &str) -> BTreeMap<usize, Vec
     out
 }
 
+/// What [`new_side`] read.
+enum NewSide {
+    Read(Vec<u8>),
+    /// Past the bytes it may read: the scan didn't see it.
+    TooLarge,
+    /// Not there, or not a regular file.
+    Missing,
+}
+
 /// The content of `path` after the change: its blob, or the worktree file
-/// when git holds no blob for it. `None` past [`MAX_SCAN_BYTES`] or for
-/// anything but a regular file.
-fn new_side(repo: &Repository, path: &str, id: Oid) -> Option<String> {
-    let blob = (!id.is_zero()).then(|| repo.find_blob(id).ok()).flatten();
-    let bytes = match blob {
-        Some(b) if b.size() > MAX_SCAN_BYTES => return None,
-        Some(b) => b.content().to_vec(),
-        None => {
-            let p = repo.workdir()?.join(path);
-            let meta = std::fs::symlink_metadata(&p).ok()?;
-            if !meta.is_file() || meta.len() > MAX_SCAN_BYTES as u64 {
-                return None;
-            }
-            std::fs::read(&p).ok()?
+/// when git holds no blob for it, read only up to `limit` bytes (the scan
+/// budget left). A blob's size is read from its header, so a large one is
+/// never loaded.
+fn new_side(repo: &Repository, path: &str, id: Oid, limit: usize) -> NewSide {
+    let size = (!id.is_zero())
+        .then(|| repo.odb().ok().and_then(|o| o.read_header(id).ok()))
+        .flatten()
+        .map(|(len, _)| len);
+    if let Some(size) = size {
+        if size > limit {
+            return NewSide::TooLarge;
         }
-    };
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+        return match repo.find_blob(id) {
+            Ok(b) => NewSide::Read(b.content().to_vec()),
+            Err(_) => NewSide::Missing,
+        };
+    }
+    let Some(p) = repo.workdir().map(|w| w.join(path)) else { return NewSide::Missing };
+    let Ok(meta) = std::fs::symlink_metadata(&p) else { return NewSide::Missing };
+    if !meta.is_file() {
+        return NewSide::Missing;
+    }
+    if meta.len() > limit as u64 {
+        return NewSide::TooLarge;
+    }
+    match std::fs::read(&p) {
+        // It may have grown since the metadata was read.
+        Ok(bytes) if bytes.len() > limit => NewSide::TooLarge,
+        Ok(bytes) => NewSide::Read(bytes),
+        Err(_) => NewSide::Missing,
+    }
 }
 
 /// Whether the new side of `path` starts with [`ZIP_MAGIC`]: its blob, or
@@ -1118,14 +1162,19 @@ fn scan_hits(files: &[AddedFile], known: &[KnownSecret]) -> Vec<Hit> {
             }
             if PEM_HEADER.is_match(line) {
                 let inline = PEM_INLINE_BODY.is_match(line);
-                let next = file
-                    .lines
+                // This diff's lines only: the next commit's are another file.
+                let block = &file.lines[..file.segment_end(idx)];
+                // The file's next line, added or unchanged: an added header
+                // over a key body the diff didn't touch is still a key.
+                let next = block
                     .get(idx + 1)
                     .filter(|(m, _)| *m == n + 1)
-                    .filter(|(_, l)| PEM_BODY_LINE.is_match(l));
+                    .map(|(_, l)| l.as_str())
+                    .or_else(|| file.unchanged.get(&idx).and_then(|u| u.first()).map(String::as_str))
+                    .filter(|l| PEM_BODY_LINE.is_match(l));
                 if inline || next.is_some() {
                     let h = PEM_HEADER.find(line);
-                    let v = pem_block(&file.lines, &file.unchanged, idx, h.map(|h| h.start()).unwrap_or(0), h.map(|h| h.as_str()).unwrap_or(""));
+                    let v = pem_block(block, &file.unchanged, idx, h.map(|h| h.start()).unwrap_or(0), h.map(|h| h.as_str()).unwrap_or(""));
                     if let Some(h) = h {
                         claimed.claim(h.start(), h.end());
                     }
@@ -1457,9 +1506,16 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             }),
         )
     };
+    for (i, f) in files.iter_mut().enumerate() {
+        let from = starts.get(i).copied().unwrap_or(0);
+        if from > 0 && f.lines.len() > from {
+            f.segments.push(from);
+        }
+    }
     // An unchanged line inside a PEM block (or the block's rest after its
     // last added line) is not in a diff without context: read it from the
-    // file's new side, so the whole block is hashed.
+    // file's new side, so the whole block is hashed. The read counts against
+    // the budget; one past what is left marks the scan partial.
     let mut read = HashSet::new();
     for (path, id) in order.iter().flatten() {
         let Some(&i) = index.get(path) else { continue };
@@ -1471,8 +1527,17 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
         if !added.iter().any(|(_, l)| PEM_HEADER.is_match(l)) {
             continue;
         }
-        let Some(content) = new_side(repo, path, *id) else { continue };
-        let fills = pem_unchanged(added, &content);
+        let content = match new_side(repo, path, *id, budget.left.min(MAX_SCAN_BYTES)) {
+            NewSide::Read(bytes) => bytes,
+            NewSide::TooLarge => {
+                budget.exhausted = true;
+                budget.unscanned.push(unscanned_entry(repo, path, *id));
+                continue;
+            }
+            NewSide::Missing => continue,
+        };
+        budget.left = budget.left.saturating_sub(content.len());
+        let fills = pem_unchanged(added, &String::from_utf8_lossy(&content));
         files[i].unchanged.extend(fills.into_iter().map(|(j, v)| (j + from, v)));
     }
     if !oversized.is_empty() {
