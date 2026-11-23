@@ -1480,6 +1480,153 @@ pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &m
     }
 }
 
+/// The launch line's note on a Claude stage the Seatbelt profile wraps
+/// ([`turn_off_inner_sandbox`]).
+pub const INNER_SANDBOX_OFF_LABEL: &str =
+    "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage";
+
+/// When the stage's effective `exec_isolation` is `sandbox` (the mission's
+/// own choice, or a `readonly` mission's forced sandbox), merge
+/// `"sandbox":{"enabled":false}` into a Claude stage's `--settings` value
+/// (fresh or resumed argv), beside the permission guards. A user who turned
+/// on Claude Code's Bash sandbox in `~/.claude/settings.json` would otherwise
+/// bring it into the stage, where a nested sandbox can't start
+/// (`sandbox::tests::seatbelt_refuses_a_nested_sandbox`) and, since 2.1.328,
+/// the next sandboxed Bash command is refused "the sandbox is off for the
+/// session".
+/// `--settings` outranks the user's file, so Octopush's profile is the one
+/// boundary. Returns whether it did; Codex stages and unsandboxed stages are
+/// left as they are. Pure.
+pub fn turn_off_inner_sandbox(dialect: CliDialect, exec_isolation: &str, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || exec_isolation != "sandbox" {
+        return false;
+    }
+    let Some(i) = args.iter().position(|a| a == "--settings").filter(|i| i + 1 < args.len()) else {
+        return false;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&args[i + 1]) else {
+        return false;
+    };
+    let Some(map) = v.as_object_mut() else {
+        return false;
+    };
+    map.insert("sandbox".to_string(), serde_json::json!({ "enabled": false }));
+    args[i + 1] = v.to_string();
+    true
+}
+
+/// The phrase Claude Code (≥ 2.1.328) puts in a sandboxed Bash command's
+/// refusal when its own sandbox couldn't start, matched case-insensitively.
+const INNER_SANDBOX_OFF_PHRASE: &str = "sandbox is off for the session";
+
+/// The start of the error, and the done card's last notice, of a Claude
+/// stage in which Claude Code refused a Bash command because its own sandbox
+/// couldn't start ([`InnerSandboxWatch`]).
+pub const INNER_SANDBOX_OFF: &str =
+    "Claude Code's own Bash sandbox couldn't start, so it refused a Bash command (the sandbox is off for the session)";
+
+/// Claude Code's "sandbox is off for the session" refusals in one stage's
+/// stream. It watches only a stage the Seatbelt profile wraps (effective
+/// `exec_isolation` `sandbox`, the same key as [`turn_off_inner_sandbox`]),
+/// and counts only an `is_error` `tool_result` whose `tool_use_id` belongs to
+/// a `Bash` `tool_use`: a Read, Grep or `cat` result quoting the phrase (this
+/// repo's own docs and tests do) is not a refusal.
+#[derive(Debug, Default)]
+pub struct InnerSandboxWatch {
+    watching: bool,
+    /// Ids of the Bash calls opened so far whose result hasn't arrived.
+    bash_open: Vec<String>,
+    refused: bool,
+    last_bash_refused: bool,
+}
+
+impl InnerSandboxWatch {
+    pub fn for_stage(dialect: CliDialect, exec_isolation: &str) -> Self {
+        Self { watching: dialect == CliDialect::Claude && exec_isolation == "sandbox", ..Self::default() }
+    }
+
+    pub fn observe(&mut self, v: &Value) {
+        if !self.watching {
+            return;
+        }
+        let kind = v.get("type").and_then(Value::as_str);
+        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for b in blocks {
+            match (kind, b.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    if b.get("name").and_then(Value::as_str) != Some("Bash") {
+                        continue;
+                    }
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        self.bash_open.push(id.to_string());
+                    }
+                }
+                (Some("user"), Some("tool_result")) => {
+                    let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
+                    let Some(at) = self.bash_open.iter().position(|o| o == id) else { continue };
+                    self.bash_open.remove(at);
+                    let refused = b.get("is_error").and_then(Value::as_bool) == Some(true)
+                        && tool_result_text(b).to_ascii_lowercase().contains(INNER_SANDBOX_OFF_PHRASE);
+                    self.refused |= refused;
+                    self.last_bash_refused = refused;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Claude Code refused at least one Bash command: the done card's notice.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The refusal is the last Bash result of the stage (which is also the
+    /// case when every Bash result after the first refusal was refused), so
+    /// it plausibly caused a failure: the error is named and not escalated.
+    /// A later Bash command that ran means the failure has another cause.
+    pub fn decisive(&self) -> bool {
+        self.refused && self.last_bash_refused
+    }
+}
+
+/// A `tool_result` block's text: its string content, or its text parts joined.
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" ")
+        }
+        _ => String::new(),
+    }
+}
+
+/// True when a stage error is an [`INNER_SANDBOX_OFF`] failure: the drive
+/// must not escalate it — a stronger model meets the same refusal.
+pub fn is_inner_sandbox_off(error: &str) -> bool {
+    error.starts_with(INNER_SANDBOX_OFF)
+}
+
+/// Name the inner-sandbox refusal on a failed stage it decided
+/// ([`InnerSandboxWatch::decisive`]): its error starts with
+/// [`INNER_SANDBOX_OFF`] instead of reading as a generic failure. Any other
+/// outcome, or a stage where it wasn't decisive, is returned unchanged.
+/// Pure.
+pub fn name_inner_sandbox_off(mut outcome: StageOutcome, decisive: bool) -> StageOutcome {
+    if decisive && matches!(outcome.status, StageStatus::Failed) {
+        let err = outcome.error.take().unwrap_or_default();
+        outcome.error = Some(if err.trim().is_empty() {
+            INNER_SANDBOX_OFF.to_string()
+        } else if is_inner_sandbox_off(&err) {
+            err
+        } else {
+            format!("{INNER_SANDBOX_OFF}\n{err}")
+        });
+    }
+    outcome
+}
+
 /// The [`CacheTenant`](crate::orchestrator::sandbox::CacheTenant) a sandboxed
 /// CLI stage's cache root and temp dir are keyed by: the mission's own exec
 /// choice and whether the stage is read-confined (the `bool`
@@ -3272,6 +3419,10 @@ impl CliRunner {
         // reads (fresh and resumed). Keyed on the choice, not the effective
         // tier: a readonly mission's forced sandbox keeps the write guard only.
         let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_choice, &mut args);
+        // Every stage the Seatbelt profile wraps (the effective tier, so a
+        // readonly mission's forced sandbox too) turns Claude Code's own Bash
+        // sandbox off: it can't nest in the profile.
+        let inner_sandbox_off = turn_off_inner_sandbox(dialect, &ctx.exec_isolation, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).
@@ -3473,6 +3624,7 @@ impl CliRunner {
             read_guard_label(reads_confined, cli_version.as_ref().and_then(|v| v.version.as_deref()))
                 .map(|s| format!(" · {s}"))
                 .unwrap_or_default(),
+            if inner_sandbox_off { format!(" · {INNER_SANDBOX_OFF_LABEL}") } else { String::new() },
             if resuming { " · resuming session" } else { "" },
             crate::orchestrator::sandbox::left_out_label(&left_out).map(|s| format!(" · {s}")).unwrap_or_default(),
             dialect.version_label(codex_version.as_deref()).map(|s| format!(" · {s}")).unwrap_or_default(),
@@ -3545,8 +3697,17 @@ impl CliRunner {
         // per message (#895). Claude only: Codex's stream has no per-message
         // prompt size, so its meter stays hidden.
         let mut context_watch = ContextWatch::default();
+        // Claude Code refused a Bash command because its own sandbox couldn't
+        // start (`InnerSandboxWatch`, only in a stage the profile wraps):
+        // a notice, and named on a failed outcome it decided, below.
+        let sandbox_watch = std::sync::Arc::new(parking_lot::Mutex::new(InnerSandboxWatch::for_stage(
+            dialect,
+            &ctx.exec_isolation,
+        )));
+        let sandbox_watch_in_loop = std::sync::Arc::clone(&sandbox_watch);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
+                sandbox_watch_in_loop.lock().observe(value);
                 if let Some(ran) = substituted_model(&stage.agent_model, value) {
                     let catalog = crate::token_engine::catalog();
                     emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
@@ -3766,9 +3927,19 @@ impl CliRunner {
                         for call in &outcome.cli.refused_calls {
                             emitter.notice(&refused_notice(call));
                         }
-                        Ok(apply_question_guard(apply_plan_limit(
-                            with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
-                            &plan_watch.lock(),
+                        let (refused, decisive) = {
+                            let w = sandbox_watch.lock();
+                            (w.refused(), w.decisive())
+                        };
+                        if refused {
+                            emitter.notice(INNER_SANDBOX_OFF);
+                        }
+                        Ok(apply_question_guard(name_inner_sandbox_off(
+                            apply_plan_limit(
+                                with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
+                                &plan_watch.lock(),
+                            ),
+                            decisive,
                         )))
                     }
                     Err(_) => Ok(failed_stage(&format!(
@@ -3799,7 +3970,14 @@ impl CliRunner {
                     );
                     flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                     out.cli.ran_model = ran;
-                    Ok(apply_plan_limit(out, &plan_watch.lock()))
+                    let (refused, decisive) = {
+                        let w = sandbox_watch.lock();
+                        (w.refused(), w.decisive())
+                    };
+                    if refused {
+                        emitter.notice(INNER_SANDBOX_OFF);
+                    }
+                    Ok(name_inner_sandbox_off(apply_plan_limit(out, &plan_watch.lock()), decisive))
                 }
             },
         }
