@@ -846,12 +846,6 @@ struct Plan {
     untouched: Vec<Untouched>,
 }
 
-impl Plan {
-    fn changes(&self) -> usize {
-        self.deletes.len() + self.creates.len() + self.rewrites.len()
-    }
-}
-
 /// Plan the move of the worktree from the snapshot `current` to `target`.
 /// `current` must be a snapshot of the tree as it is on disk: what it
 /// doesn't hold is, by construction, ignored, sensitive or unknown, and so
