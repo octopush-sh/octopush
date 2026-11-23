@@ -7653,6 +7653,23 @@ pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::a
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
 }
 
+/// Direct launcher: the line naming a Claude Code release to skip
+/// (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` (Claude
+/// Code CLI stages and their escalation models) is a gateway model
+/// (`cli_runner::is_gateway_model`). Reads the cached version without
+/// probing; `None` otherwise or when the version is unknown.
+#[tauri::command]
+pub fn claude_known_bad_note(models: Vec<String>) -> AppResult<Option<String>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached().and_then(|cli| {
+        crate::agent_adapter::known_bad_launch_note(
+            &models,
+            cli.version.as_deref(),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+            crate::orchestrator::cli_runner::is_gateway_model,
+        )
+    }))
+}
+
 /// Direct launcher: the line saying Codex will skip this repo's `.codex/`
 /// settings and MCP servers because the project isn't trusted in Codex, and
 /// how to trust it. Reads Codex's config only; `None` when the repo has no

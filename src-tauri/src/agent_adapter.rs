@@ -194,6 +194,82 @@ pub const CLAUDE_SECURITY_FIXES: &[(&str, &str)] = &[
     ("2.1.325", "fixes the Bash sandbox not fully protecting a worktree's settings, hooks and shared git folder"),
 ];
 
+/// Who a [`CLAUDE_KNOWN_BAD_RELEASES`] row hurts, which decides where it
+/// warns beyond the Readiness card.
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KnownBadScope {
+    /// Claude Code CLI stages on a gateway model (any model that isn't a
+    /// built-in Anthropic catalog id).
+    GatewayStages,
+}
+
+/// Single Claude Code releases to skip because they broke something a crew
+/// relies on and the next release put it back: (version, why in one line,
+/// scope). Matched exactly, never as a floor: the release after it is fine.
+/// The release-watch routine adds a row the way it adds
+/// [`CLAUDE_SECURITY_FIXES`] rows, when a changelog entry reverts a
+/// regression of the one before.
+pub const CLAUDE_KNOWN_BAD_RELEASES: &[(&str, &str, KnownBadScope)] = &[(
+    "2.1.329",
+    "drops the retry gateway models need when a max_tokens error names a lower limit; 2.1.330 restores it",
+    KnownBadScope::GatewayStages,
+)];
+
+/// The [`CLAUDE_KNOWN_BAD_RELEASES`]-shaped row of `table` that `version`
+/// is exactly (a pre-release suffix ignored); `None` for any other version
+/// or one that doesn't parse.
+pub fn known_bad_release<'a>(
+    version: &str,
+    table: &[(&'a str, &'a str, KnownBadScope)],
+) -> Option<(&'a str, &'a str, KnownBadScope)> {
+    let key = version_key(version)?;
+    table.iter().find(|(v, _, _)| version_key(v) == Some(key)).copied()
+}
+
+/// "Claude Code 2.1.329 drops … ; 2.1.330 restores it" for a known bad row.
+fn known_bad_line(version: &str, reason: &str) -> String {
+    format!("Claude Code {version} {reason}")
+}
+
+/// The Direct launcher's line for a crew whose Claude Code CLI stages
+/// launch `models` (escalations included) on the `installed` CLI: only when
+/// that version is a [`KnownBadScope::GatewayStages`] row of `table` and one
+/// of `models` is a gateway model (`is_gateway`). Never blocks a run.
+pub fn known_bad_launch_note(
+    models: &[String],
+    installed: Option<&str>,
+    table: &[(&str, &str, KnownBadScope)],
+    is_gateway: impl Fn(&str) -> bool,
+) -> Option<String> {
+    let (v, reason, scope) = known_bad_release(installed?, table)?;
+    let hits = match scope {
+        KnownBadScope::GatewayStages => models.iter().any(|m| is_gateway(m.as_str())),
+    };
+    hits.then(|| format!("{}. A stage on a gateway model may fail every turn; update Claude Code.", known_bad_line(v, reason)))
+}
+
+/// The stage error for a failed Claude Code CLI stage on a gateway model
+/// (`gateway`) whose `error` is a `max_tokens` one, on a CLI that is a
+/// [`KnownBadScope::GatewayStages`] row of `table`: the release named and
+/// the update asked for on the first line, the CLI's own error after it.
+/// `None` otherwise, so the error stays as it was. Pure.
+pub fn known_bad_stage_error(
+    error: &str,
+    installed: Option<&str>,
+    gateway: bool,
+    table: &[(&str, &str, KnownBadScope)],
+) -> Option<String> {
+    let (v, reason, scope) = known_bad_release(installed?, table)?;
+    let applies = match scope {
+        KnownBadScope::GatewayStages => gateway && error.to_ascii_lowercase().contains("max_tokens"),
+    };
+    applies.then(|| format!("{KNOWN_BAD_STAGE_PREFIX}{v} on a gateway model: it {reason}. Update Claude Code, then resume or re-run.\n{error}"))
+}
+
+/// How [`known_bad_stage_error`]'s first line starts; `stageHalt.ts` reads it.
+pub const KNOWN_BAD_STAGE_PREFIX: &str = "Skip Claude Code ";
+
 /// Codex CLI releases that fix a sandbox or permission escape, oldest first:
 /// (version, why it matters in one line). Codex writer stages run in Codex's
 /// own `workspace-write` sandbox, so the Readiness card's Codex row warns
@@ -265,6 +341,9 @@ pub struct ClaudeCliVersion {
     pub security_fix: Option<ClaudeSecurityFix>,
     /// The version to update to: the higher of the floor and `security_fix`.
     pub recommended: String,
+    /// The [`CLAUDE_KNOWN_BAD_RELEASES`] row the known version is exactly;
+    /// `None` for any other version or an unknown one.
+    pub known_bad: Option<ClaudeKnownBadRelease>,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq)]
@@ -272,6 +351,14 @@ pub struct ClaudeCliVersion {
 pub struct ClaudeSecurityFix {
     pub version: String,
     pub reason: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeKnownBadRelease {
+    pub version: String,
+    pub reason: String,
+    pub scope: KnownBadScope,
 }
 
 impl ClaudeCliVersion {
@@ -293,7 +380,18 @@ impl ClaudeCliVersion {
             Some(fix) if version_below(floor, &fix.version) => fix.version.clone(),
             _ => floor.to_string(),
         };
-        Self { version, floor: floor.to_string(), below_floor, security_fix, recommended }
+        let known_bad = version.as_deref().and_then(|v| known_bad_release(v, CLAUDE_KNOWN_BAD_RELEASES)).map(
+            |(v, reason, scope)| ClaudeKnownBadRelease { version: v.to_string(), reason: reason.to_string(), scope },
+        );
+        Self { version, floor: floor.to_string(), below_floor, security_fix, recommended, known_bad }
+    }
+
+    /// "Claude Code 2.1.329 drops …; 2.1.330 restores it" when the known
+    /// version is a [`CLAUDE_KNOWN_BAD_RELEASES`] row, whatever its scope (the
+    /// Readiness card); `None` otherwise. Never blocks a run.
+    pub fn known_bad_notice(&self) -> Option<String> {
+        let bad = self.known_bad.as_ref()?;
+        Some(known_bad_line(&bad.version, &bad.reason))
     }
 
     /// "Update Claude Code: 2.1.319 fixes …" when the known version lacks a
@@ -1472,6 +1570,76 @@ mod tests {
         assert_eq!(at(Some("2.1.307")).stage_notices().len(), 2);
         assert!(at(Some("2.1.325")).stage_notices().is_empty());
         assert!(at(None).stage_notices().is_empty());
+    }
+
+    #[test]
+    fn every_known_bad_release_is_a_version_with_a_reason() {
+        assert!(!CLAUDE_KNOWN_BAD_RELEASES.is_empty());
+        for (v, reason, _) in CLAUDE_KNOWN_BAD_RELEASES {
+            assert!(version_key(v).is_some(), "{v}");
+            assert!(!reason.trim().is_empty() && !reason.ends_with('.'), "{v}: one line, no full stop");
+        }
+    }
+
+    #[test]
+    fn known_bad_release_matches_the_exact_version_only() {
+        let at = |v: Option<&str>| ClaudeCliVersion::new(v.map(Into::into), TESTED_CLAUDE_FLOOR);
+        let bad = at(Some("2.1.329"));
+        assert_eq!(
+            bad.known_bad,
+            Some(ClaudeKnownBadRelease {
+                version: "2.1.329".into(),
+                reason: "drops the retry gateway models need when a max_tokens error names a lower limit; 2.1.330 restores it"
+                    .into(),
+                scope: KnownBadScope::GatewayStages,
+            })
+        );
+        assert_eq!(
+            bad.known_bad_notice().as_deref(),
+            Some("Claude Code 2.1.329 drops the retry gateway models need when a max_tokens error names a lower limit; 2.1.330 restores it")
+        );
+        assert!(bad.security_notice().is_none() && !bad.below_floor, "2.1.329 has every fix and is above the floor");
+        assert!(at(Some("2.1.329-beta.1")).known_bad.is_some(), "a pre-release suffix is the same release");
+        for v in ["2.1.328", "2.1.330", "2.2.329", "2.1.3290"] {
+            assert_eq!(at(Some(v)).known_bad_notice(), None, "{v}: a known bad release is never a floor");
+        }
+        assert_eq!(at(None).known_bad, None, "an unknown version never warns");
+        assert_eq!(known_bad_release("not a version", CLAUDE_KNOWN_BAD_RELEASES), None);
+        let json = serde_json::to_value(&bad).unwrap();
+        assert_eq!(json["knownBad"]["scope"], "gatewayStages");
+    }
+
+    #[test]
+    fn known_bad_launch_note_is_for_gateway_stages_only() {
+        let table = [("1.2.3", "drops a retry; 1.2.4 restores it", KnownBadScope::GatewayStages)];
+        let models = |ms: &[&str]| ms.iter().map(|m| m.to_string()).collect::<Vec<_>>();
+        let gateway = |m: &str| m.starts_with("gw/");
+        assert_eq!(
+            known_bad_launch_note(&models(&["claude-sonnet-5-5", "gw/kimi"]), Some("1.2.3"), &table, gateway).as_deref(),
+            Some("Claude Code 1.2.3 drops a retry; 1.2.4 restores it. A stage on a gateway model may fail every turn; update Claude Code.")
+        );
+        assert_eq!(known_bad_launch_note(&models(&["claude-sonnet-5-5"]), Some("1.2.3"), &table, gateway), None, "no gateway stage");
+        assert_eq!(known_bad_launch_note(&models(&["gw/kimi"]), Some("1.2.4"), &table, gateway), None, "another release");
+        assert_eq!(known_bad_launch_note(&models(&["gw/kimi"]), None, &table, gateway), None, "version unknown");
+        assert_eq!(known_bad_launch_note(&[], Some("1.2.3"), &table, gateway), None);
+    }
+
+    #[test]
+    fn known_bad_stage_error_names_the_release_on_a_gateway_max_tokens_failure() {
+        let table = [("1.2.3", "drops a retry; 1.2.4 restores it", KnownBadScope::GatewayStages)];
+        let err = "API Error: 400 max_tokens: 64000 > 32768, the maximum allowed";
+        assert_eq!(
+            known_bad_stage_error(err, Some("1.2.3"), true, &table).as_deref(),
+            Some(
+                "Skip Claude Code 1.2.3 on a gateway model: it drops a retry; 1.2.4 restores it. \
+                 Update Claude Code, then resume or re-run.\nAPI Error: 400 max_tokens: 64000 > 32768, the maximum allowed"
+            )
+        );
+        assert!(known_bad_stage_error("Error: MAX_TOKENS exceeded", Some("1.2.3"), true, &table).is_some(), "any case");
+        assert_eq!(known_bad_stage_error(err, Some("1.2.3"), false, &table), None, "a built-in model");
+        assert_eq!(known_bad_stage_error(err, Some("1.2.4"), true, &table), None, "another release");
+        assert_eq!(known_bad_stage_error(err, None, true, &table), None, "version unknown");
+        assert_eq!(known_bad_stage_error("overloaded", Some("1.2.3"), true, &table), None, "another error");
     }
 
     #[test]

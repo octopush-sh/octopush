@@ -2,6 +2,19 @@ import { describe, it, expect } from "vitest";
 import { haltCause } from "./stageHalt";
 
 describe("haltCause", () => {
+  it("names a Claude Code release to skip on a gateway max_tokens failure", () => {
+    const c = haltCause(
+      "Skip Claude Code 2.1.329 on a gateway model: it drops the retry gateway models need when a max_tokens error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.\nAPI Error: 400 max_tokens: 64000 > 32768",
+      25,
+    );
+    expect(c.title).toBe("Claude Code 2.1.329 is a release to skip on a gateway model");
+    expect(c.remedy).toBe(
+      "It drops the retry gateway models need when a max_tokens error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.",
+    );
+    expect(c.preferRerun).toBeUndefined();
+    // The CLI's own max_tokens error, on any other release, reads as itself.
+    expect(haltCause("API Error: 400 max_tokens: 64000 > 32768", 25).title).toBe("API Error: 400 max_tokens: 64000 > 32768");
+  });
   it("explains a turn-budget halt", () => {
     const c = haltCause("claude stopped early (error_max_turns) — review…", 25);
     expect(c.title).toContain("turn limit");

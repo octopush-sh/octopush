@@ -449,6 +449,7 @@ pub fn run() {
             commands::connect_claude_code,
             commands::claude_cli_version,
             commands::claude_model_floor_note,
+            commands::claude_known_bad_note,
             commands::codex_trust_note,
             commands::model_retirements,
             commands::readiness_check,
