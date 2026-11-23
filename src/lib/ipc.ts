@@ -610,6 +610,7 @@ import type {
   RefreshPricingResult,
   ThreadCost,
   SessionUsage,
+  RequestContext,
   PtySettledEvent,
   Session,
   SessionRecap,
@@ -950,6 +951,11 @@ export const ipc = {
    *  Code session or no ledger row yet. Read-only. */
   getSessionUsage: (terminalId: string) =>
     invoke<SessionUsage | null>("get_session_usage", { terminalId }),
+  /** What every request of a project carries: the measured fixed context,
+   *  its price at the project's usual model and cache rate, and the files
+   *  that make it up as ranked estimates. Read-only. */
+  getRequestContext: (projectId: string) =>
+    invoke<RequestContext>("get_request_context", { projectId }),
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */

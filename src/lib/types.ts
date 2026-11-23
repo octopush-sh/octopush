@@ -420,6 +420,43 @@ export interface SessionUsage {
   asOf: string;
 }
 
+/** One thing a project's requests carry (`request_context::CarriedItem`).
+ *  Its `tokens` is always an estimate (bytes ÷ 4, fitted to the measured
+ *  total). */
+export interface CarriedItem {
+  /** A CLAUDE.md-chain file (or one it imports), the skill or agent
+   *  listings, or the measured total minus every other item. */
+  kind: "memory" | "skills" | "agents" | "by_difference";
+  /** `CLAUDE.md`, `~/.claude/CLAUDE.md`, `Skills`, `Agents`, or
+   *  `MCP and built-in tools, by difference`. */
+  label: string;
+  /** The file's full path, for a `memory` item. */
+  path: string | null;
+  /** Skills or agents counted; 1 for a file, 0 for `by_difference`. */
+  count: number;
+  bytes: number;
+  tokens: number;
+}
+
+/** What every request of a project carries (`get_request_context`, #959). */
+export interface RequestContext {
+  /** Measured: the smallest first-request prompt of the project's recent
+   *  sessions. Null with no transcript to read. */
+  measuredTokens: number | null;
+  sessionsMeasured: number;
+  /** The model of most first requests. */
+  model: string | null;
+  /** Share of the sampled sessions' prompt tokens read from cache, 0–100. */
+  cacheHitPct: number | null;
+  /** `measuredTokens` at the model's input price; null when unpriced. */
+  uncachedUsd: number | null;
+  /** `measuredTokens` at the input-side rate the model's requests actually
+   *  paid; null when unpriced. */
+  usualUsd: number | null;
+  /** Largest first; they add up to `measuredTokens` when it is known. */
+  items: CarriedItem[];
+}
+
 export interface ChatStreamEvent {
   workspaceId: string;
   threadId?: string;

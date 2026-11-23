@@ -56,6 +56,7 @@ pub mod routines;
 pub mod git_lock;
 pub mod mcp_setup;
 pub mod readiness;
+pub mod request_context;
 
 #[cfg(test)]
 mod tests;
@@ -331,6 +332,7 @@ pub fn run() {
             commands::reprice_spend,
             commands::get_thread_cost,
             commands::get_session_usage,
+            commands::get_request_context,
             commands::continue_subagent,
             commands::respond_subagent_cap,
             commands::pending_subagent_caps,
