@@ -38,6 +38,7 @@ pub mod settings;
 pub mod skills;
 mod state;
 pub mod sync;
+pub mod talk_checkpoints;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
@@ -274,6 +275,11 @@ pub fn run() {
             commands::rename_chat_thread,
             commands::set_thread_pinned,
             commands::delete_chat_thread,
+            commands::list_talk_checkpoints,
+            commands::preview_talk_rewind,
+            commands::rewind_talk_files,
+            commands::undo_talk_rewind,
+            commands::fork_chat_thread,
             commands::list_skills,
             commands::list_subagent_types,
             commands::read_attachment,

@@ -1,5 +1,6 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 import type { SecretHold, SecretPreview } from "./secretGuard";
+import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -1034,6 +1035,23 @@ export const ipc = {
     invoke<void>("set_thread_pinned", { threadId, pinned }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
+
+  // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+  // The backend resolves the thread's worktree itself; no path is passed.
+  /** The turns of a thread that can be rewound, the ones without a checkpoint, and whether an undo is on offer. */
+  listTalkCheckpoints: (threadId: string) =>
+    invoke<TalkCheckpoints>("list_talk_checkpoints", { threadId }),
+  /** What rewinding to a turn would change (nothing is written). */
+  previewTalkRewind: (threadId: string, messageId: number) =>
+    invoke<RewindPreview>("preview_talk_rewind", { threadId, messageId }),
+  /** Rewind to a turn; `expected` is the confirmed preview's `current`. */
+  rewindTalkFiles: (threadId: string, messageId: number, expected: string) =>
+    invoke<RewindOutcome>("rewind_talk_files", { threadId, messageId, expected }),
+  undoTalkRewind: (threadId: string) =>
+    invoke<RewindOutcome>("undo_talk_rewind", { threadId }),
+  /** A new thread with the history before a user turn; the turn becomes its draft. */
+  forkChatThread: (threadId: string, messageId: number) =>
+    invoke<{ thread: ChatThread; draft: string }>("fork_chat_thread", { threadId, messageId }),
 
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>

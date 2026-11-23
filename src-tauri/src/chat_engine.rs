@@ -1744,6 +1744,16 @@ impl Drop for CancelGuard {
     }
 }
 
+/// What a Talk turn hands back to `send_agentic` to finish after it returns:
+/// its cancel registration (dropped last, so the turn counts as running until
+/// the end) and the checkpoint whose end state is still to be recorded.
+#[derive(Default)]
+struct TurnHold {
+    /// Only held, never read: dropping it ends the turn.
+    _cancel: Option<CancelGuard>,
+    after: Option<crate::talk_checkpoints::AfterTurn>,
+}
+
 /// Marks one sub-agent as being continued for the life of the guard, so
 /// two continuations of the same run can never race on its row.
 struct ContinuingGuard {
@@ -1847,6 +1857,19 @@ impl ChatEngine {
         // A turn-limit card waiting on the thread resolves as "accept what it
         // has" — the stop ends the turn either way.
         self.cap_gate.deny_thread(thread_id);
+    }
+
+    /// Whether a turn (or a sub-agent continuation) is running on `thread_id`.
+    /// A rewind waits for it: it would race the agent's own writes.
+    pub fn is_running(&self, thread_id: &str) -> bool {
+        let prefix = format!("{thread_id}#");
+        self.cancels.lock().keys().any(|k| k == thread_id || k.starts_with(&prefix))
+    }
+
+    /// Whether a turn (or a sub-agent continuation) is running on any of
+    /// `thread_ids`.
+    pub fn any_running(&self, thread_ids: &[String]) -> bool {
+        thread_ids.iter().any(|t| self.is_running(t))
     }
 
     /// Record one provider response's token usage: the canonical spend ledger
@@ -2514,6 +2537,23 @@ impl ChatEngine {
         app: AppHandle,
         request: ChatRequest,
     ) -> AppResult<()> {
+        let mut held = TurnHold::default();
+        let result = self.run_agentic_turn(app, request, &mut held).await;
+        // Talk checkpoint (#958): record how the turn left the tree, on every
+        // exit path, while its cancel registration still marks it running.
+        if let Some(after) = held.after.take() {
+            after.record_off_runtime().await;
+        }
+        drop(held);
+        result
+    }
+
+    async fn run_agentic_turn(
+        &self,
+        app: AppHandle,
+        request: ChatRequest,
+        held: &mut TurnHold,
+    ) -> AppResult<()> {
         // The Auto policy (economy director): the composer sends `auto`; the
         // turn runs on the strong tier's model under the lean-context
         // doctrine, and sub-agents take their tier by role. Resolved once,
@@ -2566,16 +2606,17 @@ impl ChatEngine {
             });
 
         // Register a fresh cancellation flag for this turn, keyed by thread. The
-        // guard removes it from the registry on every exit path (Drop).
+        // guard removes it from the registry on every exit path (Drop), once
+        // `send_agentic` has also recorded the turn's checkpoint.
         let cancel = Arc::new(AtomicBool::new(false));
         self.cancels
             .lock()
             .insert(request.thread_id.clone(), Arc::clone(&cancel));
-        let _cancel_guard = CancelGuard {
+        held._cancel = Some(CancelGuard {
             cancels: Arc::clone(&self.cancels),
             key: request.thread_id.clone(),
             flag: Arc::clone(&cancel),
-        };
+        });
 
         // Persist user message and emit message-added so the frontend learns the
         // DB id. Skipped on regenerate: history already ends with the user turn
@@ -2598,6 +2639,26 @@ impl ChatEngine {
         // same-role turns merge (Anthropic 400 guard), and `error`/`stopped`
         // rows are never replayed.
         let history = self.db.lock().list_chat_messages(&request.thread_id)?;
+
+        // Talk checkpoint (#958): snapshot the tree before this turn can
+        // write, so its files can be rewound later (a regenerate keeps the
+        // first attempt's checkpoint). A read-only mission can't write, so it
+        // takes none. `send_agentic` records how the turn left the tree. The
+        // git work runs on a blocking thread, off the async runtime.
+        let can_write = !matches!(sandbox_roots.as_deref(), Some([]));
+        let turn_id = history.iter().rev().find(|m| m.role == "user").filter(|_| can_write).map(|m| m.id);
+        if let Some(id) = turn_id {
+            let (ws, thread) = (workspace_path.clone(), request.thread_id.clone());
+            let taken = crate::talk_checkpoints::off_runtime(move || {
+                Ok(crate::talk_checkpoints::capture_before(&ws, &thread, id))
+            })
+            .await
+            .unwrap_or(false);
+            if taken {
+                held.after = Some(crate::talk_checkpoints::AfterTurn::new(&workspace_path, &request.thread_id, id));
+            }
+        }
+
         let rows: Vec<HistoryRow<'_>> = history
             .iter()
             .map(|m| HistoryRow { id: m.id, role: m.role.as_str(), content: m.content.as_str() })
