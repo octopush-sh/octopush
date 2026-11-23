@@ -23045,6 +23045,55 @@ mod secret_guard_tests {
         }
     }
 
+    /// The new side is read only when a key reaches a line the diff didn't
+    /// add, and the added lines it holds aren't counted twice: a large file
+    /// with a key in it isn't partial when every line was scanned.
+    #[test]
+    fn a_new_side_is_read_only_when_a_key_needs_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(600, 64, B64);
+        let whole = vec![(1, header.clone()), (2, b1.clone()), (3, footer.clone())];
+        assert!(!pem_needs_new_side(&whole));
+        assert!(pem_needs_new_side(&whole[..2]), "no END among the added lines");
+        assert!(pem_needs_new_side(&[(1, header.clone()), (3, footer.clone())]), "a gap inside the key");
+        assert!(!pem_needs_new_side(&[(1, "no key here".to_string())]));
+
+        // About 9 MB: more than the budget left once the diff has read it.
+        let filler: String = (0..9_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        // A newly added file holding a whole key.
+        {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("bundle.txt"), format!("{filler}{header}\n{b1}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        }
+
+        // A modified file whose key reads on into an unchanged line: the
+        // read is needed, but the added lines it holds were already counted.
+        let fp = |m: &str| {
+            let (dir, repo) = repo();
+            let p = dir.path().join("bundle.txt");
+            std::fs::write(&p, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(&p, format!("{filler}{header}\n{b1}\n{m}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp(&rnd(601, 64, B64)), fp(&rnd(602, 64, B64)), "the unchanged line is hashed");
+    }
+
     /// The new side must hold the diff's lines where the diff saw them: a
     /// clean filter's output (a Git LFS pointer, git-crypt ciphertext) or a
     /// file rewritten since lends its lines to no key. CRLF still matches.

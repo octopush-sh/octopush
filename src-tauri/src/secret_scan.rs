@@ -993,6 +993,22 @@ pub(crate) fn pem_unchanged(lines: &[(u32, String)], new_side: &str) -> BTreeMap
     out
 }
 
+/// Whether some PEM block among `lines` (one diff's added lines of a file)
+/// reaches a line the diff didn't add: only then does [`pem_unchanged`]
+/// need the file's new side. The walk stops at its first gap, so it asks
+/// exactly when a walk with the new side would.
+pub(crate) fn pem_needs_new_side(lines: &[(u32, String)]) -> bool {
+    lines.iter().enumerate().any(|(idx, (_, line))| {
+        let Some(h) = PEM_HEADER.find(line) else { return false };
+        let mut asked = false;
+        pem_walk(lines, idx, h.start(), h.as_str(), &mut |_, _| {
+            asked = true;
+            None
+        });
+        asked
+    })
+}
+
 /// What [`new_side`] read.
 enum NewSide {
     Read(Vec<u8>),
@@ -1424,8 +1440,9 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
     let mut index: std::collections::HashMap<String, usize> =
         files.iter().enumerate().map(|(i, f)| (f.path.clone(), i)).collect();
     let path_of = |d: &git2::DiffDelta| d.new_file().path().map(|p| p.to_string_lossy().replace('\\', "/"));
-    // Every delta in foreach order: (path, new blob id), None for a deletion.
-    let mut order: Vec<Option<(String, Oid)>> = Vec::new();
+    // Every delta in foreach order: (path, new blob id, newly added), None
+    // for a deletion.
+    let mut order: Vec<Option<(String, Oid, bool)>> = Vec::new();
     // Register every delta first so a newly added empty or binary file is
     // still seen (its name alone can be the finding).
     for delta in diff.deltas() {
@@ -1438,8 +1455,8 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             continue;
         };
         let id = delta.new_file().id();
-        order.push(Some((path.clone(), id)));
         let is_new = matches!(delta.status(), Delta::Added | Delta::Untracked);
+        order.push(Some((path.clone(), id, is_new)));
         let zip = is_new && path.to_ascii_lowercase().ends_with(".key") && starts_like_zip(repo, &path, id);
         match index.get(&path) {
             Some(&i) => {
@@ -1458,6 +1475,8 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
     }
     // Where this diff's lines start in each file (`range_files` appends).
     let starts: Vec<usize> = files.iter().map(|f| f.lines.len()).collect();
+    // The bytes this diff's added lines of each file took off the budget.
+    let mut charged = vec![0usize; files.len()];
     let odb = repo.odb().ok();
     // How many file callbacks have run: the delta being read is `pos - 1`.
     let mut pos = 0usize;
@@ -1469,6 +1488,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
         let oversized = &mut oversized;
         let budget = &mut *budget;
         let files = &mut *files;
+        let charged = &mut charged;
         diff.foreach(
             &mut |delta, _| {
                 *pos += 1;
@@ -1509,6 +1529,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
                 let text = String::from_utf8_lossy(content).trim_end_matches(['\n', '\r']).to_string();
                 if let Some(&i) = index.get(&path) {
                     files[i].lines.push((n, text));
+                    charged[i] += content.len();
                 }
                 true
             }),
@@ -1522,20 +1543,25 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
     }
     // An unchanged line inside a PEM block (or the block's rest after its
     // last added line) is not in a diff without context: read it from the
-    // file's new side, so the whole block is hashed. The read counts against
-    // the budget; one past what is left marks the scan partial.
+    // file's new side, so the whole block is hashed. It is read only when a
+    // block reaches such a line: a newly added file's new side holds nothing
+    // beyond its added lines. The read counts against the budget, less the
+    // added lines already counted; one past what is left marks the scan
+    // partial.
     let mut read = HashSet::new();
-    for (path, id) in order.iter().flatten() {
+    for (path, id, is_new) in order.iter().flatten() {
         let Some(&i) = index.get(path) else { continue };
-        if !read.insert(i) {
+        if *is_new || !read.insert(i) {
             continue;
         }
         let from = starts.get(i).copied().unwrap_or(0);
         let added = &files[i].lines[from..];
-        if !added.iter().any(|(_, l)| PEM_HEADER.is_match(l)) {
+        if !pem_needs_new_side(added) {
             continue;
         }
-        let content = match new_side(repo, path, *id, budget.left.min(MAX_SCAN_BYTES)) {
+        let counted = charged.get(i).copied().unwrap_or(0);
+        let limit = budget.left.saturating_add(counted).min(MAX_SCAN_BYTES);
+        let content = match new_side(repo, path, *id, limit) {
             NewSide::Read(bytes) => bytes,
             NewSide::TooLarge => {
                 budget.exhausted = true;
@@ -1544,7 +1570,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
             }
             NewSide::Missing => continue,
         };
-        budget.left = budget.left.saturating_sub(content.len());
+        budget.left = budget.left.saturating_sub(content.len().saturating_sub(counted));
         let fills = pem_unchanged(added, &String::from_utf8_lossy(&content));
         files[i].unchanged.extend(fills.into_iter().map(|(j, v)| (j + from, v)));
     }
@@ -1554,7 +1580,7 @@ fn collect_added(repo: &Repository, diff: &Diff, files: &mut Vec<AddedFile>, bud
     }
     if stopped {
         // The file being read when the budget ran out, and every one after it.
-        for (p, id) in order.into_iter().skip(pos.saturating_sub(1)).flatten() {
+        for (p, id, _) in order.into_iter().skip(pos.saturating_sub(1)).flatten() {
             budget.unscanned.push(unscanned_entry(repo, &p, id));
         }
     }
