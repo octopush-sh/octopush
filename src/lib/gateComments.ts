@@ -6,7 +6,8 @@
  * passage starts in the document's rendered text, so comments always travel in
  * document order, however they were added. Reject and Send back carry them as
  * structured feedback (`composeGateFeedback`); Approve hands them to the next
- * stage as guidance appended to its instructions (`withGuidance`). The brief
+ * stage as guidance appended to its instructions for that one pass
+ * (`withGuidance`, taken out again by `withoutGuidance`). The brief
  * and the stages' output contracts are untouched — only the feedback is richer.
  */
 import type { RunStage } from "./ipc";
@@ -62,19 +63,45 @@ export function composeGateFeedback(comments: readonly GateComment[], note: stri
   return parts.join("\n\n");
 }
 
+/** The lines that fence a gate's guidance inside a stage's instructions, so
+ *  it can be found again and taken out. Keyed by the gate's position: two
+ *  gates handing off to one stage keep their own blocks. */
+const guidanceStart = (position: number) => `[Director's comments from the gate of stage ${position + 1}, for this pass only]`;
+const guidanceEnd = (position: number) => `[End of the director's comments from stage ${position + 1}]`;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+/**
+ * A stage's instructions without the guidance a gate left in them. The
+ * guidance belongs to one pass of the gate: it is taken out when the gate is
+ * decided again (the stage before it ran again with a new output) and when
+ * the approve that carried it was refused. Instructions holding no such
+ * guidance come back unchanged.
+ */
+export function withoutGuidance(instructions: string | null, from: Pick<RunStage, "position">): string {
+  const own = instructions ?? "";
+  const block = new RegExp(`\\s*${escapeRe(guidanceStart(from.position))}[\\s\\S]*?${escapeRe(guidanceEnd(from.position))}\\s*`, "g");
+  const out = own.replace(block, "\n\n");
+  return out === own ? own : out.trim();
+}
+
 /**
  * The next stage's instructions once the director approves with comments:
- * its own instructions (if any), then the comments as guidance from the gate.
+ * its own instructions (if any), then the comments as guidance from the
+ * gate, fenced so `withoutGuidance` can take them out again. Guidance the
+ * same gate left on an earlier pass is replaced, never stacked.
  */
 export function withGuidance(
   instructions: string | null,
   comments: readonly GateComment[],
+  from: Pick<RunStage, "position">,
   fromStage: string,
 ): string {
-  const guidance = `The director approved ${fromStage} with these comments; take them into account:\n\n${commentList(comments)}`;
-  const own = (instructions ?? "").trim();
-  // Already there (an approve that was retried): never add it twice.
-  if (own.includes(guidance)) return own;
+  const guidance = [
+    guidanceStart(from.position),
+    `The director approved ${fromStage} with these comments; take them into account:\n\n${commentList(comments)}`,
+    guidanceEnd(from.position),
+  ].join("\n");
+  const own = withoutGuidance(instructions, from).trim();
   return own ? `${own}\n\n${guidance}` : guidance;
 }
 

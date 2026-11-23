@@ -15,7 +15,7 @@ import { useUpgradeStore } from "./upgradeStore";
 import { isUpgradeRequired } from "../lib/upgradeError";
 import { pushToast } from "../components/Toasts";
 import { labelForRole } from "../lib/stageMeta";
-import { gateKey, nextStages, withGuidance, type GateComment } from "../lib/gateComments";
+import { gateKey, nextStages, withGuidance, withoutGuidance, type GateComment } from "../lib/gateComments";
 import { useGateCommentsStore } from "./gateCommentsStore";
 
 export const EMPTY_RUNS: Run[] = [];
@@ -139,12 +139,24 @@ interface RunsState {
     action: CheckpointActionName,
     opts?: CheckpointOptions,
   ) => Promise<void>;
-  /** Approve a gate with the director's comments (#957): append them as
-   *  guidance to the instructions of every stage it hands off to that hasn't
-   *  begun, clear the comments, then approve. If a stage refuses the
-   *  guidance, nothing is approved, the comments stay and the refusal is
-   *  toasted, so no comment is silently lost. */
+  /** Approve a gate, with the director's comments if there are any (#957).
+   *  The comments go, as guidance for this one pass, into the instructions
+   *  of every stage the gate hands off to that hasn't begun; guidance the
+   *  gate left there on an earlier pass is replaced, or just taken out when
+   *  this approve carries none. Then it approves, and only an approve that
+   *  went through clears the comments. If a stage refuses the guidance, or
+   *  the approve itself is refused, the guidance is taken back out, the
+   *  comments stay and the refusal is toasted. */
   approveWithComments: (runId: string, stageId: string, comments: GateComment[]) => Promise<void>;
+  /** Reject or send back a gate whose feedback carries the director's
+   *  comments (#957): `resolve`, then clear that gate's comments only if the
+   *  decision went through. */
+  resolveGate: (
+    runId: string,
+    stageId: string,
+    action: "reject" | "send_back",
+    opts?: CheckpointOptions,
+  ) => Promise<void>;
   /** Answer a stage parked via the `ask_director` escape valve. `answers` is
    *  positional (one per question); the stage re-runs with the decisions
    *  injected as feedback. Refreshes the detail so the form gives way to the
@@ -222,6 +234,31 @@ function trackTransition(
   if (wasActive && TERMINAL.has(run.status)) {
     acc.settledAt = { ...(acc.settledAt ?? s.settledAt), [run.id]: Date.now() };
   }
+}
+
+/**
+ * A checkpoint decision that says whether the backend took it: what `resolve`
+ * does (the same calm toast on a refusal, the same refresh either way), plus
+ * the answer. `resolve` itself resolves this boolean once #1014 is on main;
+ * from then on this whole body is `return get().resolve(runId, stageId,
+ * action, opts);`.
+ */
+async function decided(
+  get: () => RunsState,
+  runId: string,
+  stageId: string,
+  action: CheckpointActionName,
+  opts?: CheckpointOptions,
+): Promise<boolean> {
+  let ok = true;
+  try {
+    await ipc.resolveCheckpoint(runId, stageId, action, opts);
+  } catch (e) {
+    ok = false;
+    pushToast({ level: "info", title: "Nothing changed", body: String(e).split("\n")[0] });
+  }
+  await get().refreshDetail(runId);
+  return ok;
 }
 
 export const useRunsStore = create<RunsState>((set, get) => ({
@@ -481,26 +518,64 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   approveWithComments: async (runId, stageId, comments) => {
     const stages = get().detailByRun[runId]?.stages ?? [];
     const from = stages.find((s) => s.id === stageId);
-    if (from && comments.length > 0) {
-      const gate = gateKey(from);
-      for (const next of nextStages(stages, from)) {
+    if (!from) {
+      await get().resolve(runId, stageId, "approve");
+      return;
+    }
+    const gate = gateKey(from);
+    // Every stage whose instructions were changed, with what they go back to
+    // if the approve doesn't go through.
+    const changed: { stage: (typeof stages)[number]; own: string }[] = [];
+    const takeBack = async () => {
+      for (const { stage, own } of changed) {
         try {
-          await ipc.updateRunStage(runId, next.id, {
-            instructions: withGuidance(next.instructions, comments, labelForRole(from.role)),
-          });
+          await ipc.updateRunStage(runId, stage.id, { instructions: own || null });
         } catch (e) {
           pushToast({
             level: "info",
-            title: "Not approved yet",
-            body: `Your comments couldn't reach ${labelForRole(next.role)}: ${String(e).split("\n")[0]}`,
+            title: `Your comments are still on ${labelForRole(stage.role)}`,
+            body: `They couldn't be taken out of its instructions: ${String(e).split("\n")[0]}`,
           });
-          await get().refreshDetail(runId);
-          return;
         }
       }
-      useGateCommentsStore.getState().clear(gate);
+    };
+    for (const next of nextStages(stages, from)) {
+      const own = withoutGuidance(next.instructions, from);
+      const stale = own !== (next.instructions ?? "");
+      if (comments.length === 0 && !stale) continue;
+      const instructions = comments.length > 0 ? withGuidance(next.instructions, comments, from, labelForRole(from.role)) : own;
+      try {
+        await ipc.updateRunStage(runId, next.id, { instructions: instructions || null });
+        if (comments.length > 0) changed.push({ stage: next, own });
+      } catch (e) {
+        pushToast({
+          level: "info",
+          title: "Not approved yet",
+          body: `Your comments couldn't reach ${labelForRole(next.role)}: ${String(e).split("\n")[0]}`,
+        });
+        await takeBack();
+        await get().refreshDetail(runId);
+        return;
+      }
     }
-    await get().resolve(runId, stageId, "approve");
+    if (await decided(get, runId, stageId, "approve")) {
+      useGateCommentsStore.getState().clear(gate);
+      return;
+    }
+    // Refused: the gate still waits with its comments, so the guidance must
+    // not stay behind in the next stage's instructions.
+    if (changed.length > 0) {
+      await takeBack();
+      await get().refreshDetail(runId);
+    }
+  },
+
+  resolveGate: async (runId, stageId, action, opts) => {
+    // Read the gate before deciding: the refresh may show its next attempt.
+    const from = get().detailByRun[runId]?.stages.find((s) => s.id === stageId);
+    if ((await decided(get, runId, stageId, action, opts)) && from) {
+      useGateCommentsStore.getState().clear(gateKey(from));
+    }
   },
 
   answerBlocker: async (runId, stageId, answers, source) => {

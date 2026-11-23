@@ -84,16 +84,21 @@ describe("runsStore", () => {
       (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [gate, impl] });
     };
 
-    it("appends the comments to the next stage's instructions, clears them, then approves", async () => {
+    it("appends the comments to the next stage's instructions, approves, then clears them", async () => {
       seed();
       (ipc.updateRunStage as any).mockResolvedValue(undefined);
-      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      // The comments are still there while the approve is in flight.
+      let duringApprove: unknown;
+      (ipc.resolveCheckpoint as any).mockImplementation(async () => {
+        duringApprove = useGateCommentsStore.getState().byGate[gateKey(gate)];
+      });
       await useRunsStore.getState().approveWithComments("r1", "plan", comments);
       const [, stageId, patch] = (ipc.updateRunStage as any).mock.calls[0];
       expect(stageId).toBe("impl");
-      expect(patch.instructions).toMatch(/^Keep it small\.\n\nThe director approved Plan with these comments/);
+      expect(patch.instructions).toMatch(/^Keep it small\.\n\n\[Director's comments from the gate of stage 1, for this pass only\]\nThe director approved Plan with these comments/);
       expect(patch.instructions).toContain('1. On "Step 2":\n   Behind a flag.');
       expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "plan", "approve", undefined);
+      expect(duringApprove).toEqual(comments);
       expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
     });
 
@@ -104,6 +109,89 @@ describe("runsStore", () => {
       expect(ipc.resolveCheckpoint).not.toHaveBeenCalled();
       expect(pushToastMock.mock.calls[0][0].title).toBe("Not approved yet");
       expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+    });
+
+    it("takes the guidance back out and keeps the comments when the approve is refused", async () => {
+      seed();
+      (ipc.updateRunStage as any).mockResolvedValue(undefined);
+      (ipc.resolveCheckpoint as any).mockRejectedValue("This stage was already decided — refresh to see what's waiting.");
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      const calls = (ipc.updateRunStage as any).mock.calls;
+      expect(calls).toHaveLength(2);
+      expect(calls[0][2].instructions).toContain("Behind a flag.");
+      // Back to the stage's own instructions.
+      expect(calls[1]).toEqual(["r1", "impl", { instructions: "Keep it small." }]);
+      expect(pushToastMock.mock.calls[0][0].title).toBe("Nothing changed");
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+    });
+
+    it("a stage that had no instructions gets none back when the approve is refused", async () => {
+      seed();
+      const bare = { ...impl, instructions: null };
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [gate, bare] } } as any });
+      (ipc.updateRunStage as any).mockResolvedValue(undefined);
+      (ipc.resolveCheckpoint as any).mockRejectedValue("refused");
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      expect((ipc.updateRunStage as any).mock.calls[1]).toEqual(["r1", "impl", { instructions: null }]);
+    });
+
+    it("a second pass replaces the first pass's guidance; an approve without comments takes it out", async () => {
+      seed();
+      (ipc.updateRunStage as any).mockResolvedValue(undefined);
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      const first = (ipc.updateRunStage as any).mock.calls[0][2].instructions as string;
+
+      // The plan ran again (a new attempt) and the next stage is pending once more, still holding the old guidance.
+      const again = { ...gate, finishedAt: "f2" };
+      const carried = { ...impl, instructions: first };
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [again, carried] } } as any });
+      await useRunsStore.getState().approveWithComments("r1", "plan", [{ id: "c2", quote: "Step 5", note: "Skip it.", at: 3, len: 6 }]);
+      const second = (ipc.updateRunStage as any).mock.calls[1][2].instructions as string;
+      expect(second).toContain("Skip it.");
+      expect(second).not.toContain("Behind a flag.");
+      expect(second.match(/for this pass only/g)).toHaveLength(1);
+
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [again, { ...impl, instructions: second }] } } as any });
+      await useRunsStore.getState().approveWithComments("r1", "plan", []);
+      expect((ipc.updateRunStage as any).mock.calls[2]).toEqual(["r1", "impl", { instructions: "Keep it small." }]);
+      expect(ipc.resolveCheckpoint).toHaveBeenCalledTimes(3);
+    });
+
+    it("an approve without comments or stale guidance edits no stage", async () => {
+      seed();
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().approveWithComments("r1", "plan", []);
+      expect(ipc.updateRunStage).not.toHaveBeenCalled();
+      expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "plan", "approve", undefined);
+    });
+
+    it("with no stage left to take them, an approve that went through sets the comments aside", async () => {
+      seed();
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [gate] } } as any });
+      (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [gate] });
+      (ipc.resolveCheckpoint as any).mockRejectedValueOnce("refused");
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      expect(ipc.updateRunStage).not.toHaveBeenCalled();
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
+    });
+
+    it("resolveGate clears the gate's comments only when the reject or send-back went through", async () => {
+      seed();
+      (ipc.resolveCheckpoint as any).mockRejectedValueOnce("run is already executing");
+      await useRunsStore.getState().resolveGate("r1", "plan", "send_back", { feedback: "fb" });
+      expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "plan", "send_back", { feedback: "fb" });
+      expect(pushToastMock.mock.calls[0][0].title).toBe("Nothing changed");
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+
+      // The refresh after a decision shows the stage's next attempt: the key read before it is the one cleared.
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [{ ...gate, status: "pending", finishedAt: null }, impl] });
+      await useRunsStore.getState().resolveGate("r1", "plan", "reject", { feedback: "fb" });
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
     });
   });
 

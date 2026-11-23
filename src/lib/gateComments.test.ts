@@ -7,6 +7,7 @@ import {
   nextStages,
   normalizeQuote,
   withGuidance,
+  withoutGuidance,
   type GateComment,
 } from "./gateComments";
 import { useGateCommentsStore } from "../stores/gateCommentsStore";
@@ -56,13 +57,48 @@ describe("gate comments", () => {
     expect(composeGateFeedback([c("a", 0, "x", "y")], "")).not.toContain("Overall note");
   });
 
-  it("appends approve guidance after the stage's own instructions, once", () => {
+  describe("approve guidance, for one pass", () => {
+    const from = { position: 0 };
     const comments = [c("a", 0, "Step 2", "Do it behind a flag.")];
-    const fresh = withGuidance(null, comments, "Plan");
-    expect(fresh).toBe('The director approved Plan with these comments; take them into account:\n\n1. On "Step 2":\n   Do it behind a flag.');
-    const merged = withGuidance("Keep it small.", comments, "Plan");
-    expect(merged.startsWith("Keep it small.\n\n")).toBe(true);
-    expect(withGuidance(merged, comments, "Plan")).toBe(merged);
+    const block = [
+      "[Director's comments from the gate of stage 1, for this pass only]",
+      'The director approved Plan with these comments; take them into account:\n\n1. On "Step 2":\n   Do it behind a flag.',
+      "[End of the director's comments from stage 1]",
+    ].join("\n");
+
+    it("appends it, fenced, after the stage's own instructions, once", () => {
+      expect(withGuidance(null, comments, from, "Plan")).toBe(block);
+      const merged = withGuidance("Keep it small.", comments, from, "Plan");
+      expect(merged).toBe(`Keep it small.\n\n${block}`);
+      expect(withGuidance(merged, comments, from, "Plan")).toBe(merged);
+    });
+
+    it("replaces the guidance of an earlier pass instead of stacking on it", () => {
+      const first = withGuidance("Keep it small.", comments, from, "Plan");
+      const second = withGuidance(first, [c("b", 0, "Step 5", "Skip it.")], from, "Plan");
+      expect(second).toContain("Skip it.");
+      expect(second).not.toContain("Do it behind a flag.");
+      expect(second.match(/for this pass only/g)).toHaveLength(1);
+      expect(second.startsWith("Keep it small.\n\n")).toBe(true);
+    });
+
+    it("takes it out again, leaving the stage's own instructions as they were", () => {
+      expect(withoutGuidance(withGuidance("Keep it small.", comments, from, "Plan"), from)).toBe("Keep it small.");
+      expect(withoutGuidance(withGuidance(null, comments, from, "Plan"), from)).toBe("");
+      // Instructions the director wrote around it survive.
+      expect(withoutGuidance(`Before.\n\n${block}\n\nAfter.`, from)).toBe("Before.\n\nAfter.");
+      // Nothing to take out: returned untouched, whitespace included.
+      expect(withoutGuidance("  Keep it small. \n", from)).toBe("  Keep it small. \n");
+      expect(withoutGuidance(null, from)).toBe("");
+    });
+
+    it("keeps another gate's guidance on the same stage", () => {
+      const both = withGuidance(withGuidance(null, comments, { position: 2 }, "Review"), comments, from, "Plan");
+      expect(both.match(/for this pass only/g)).toHaveLength(2);
+      const one = withoutGuidance(both, from);
+      expect(one).toContain("from the gate of stage 3");
+      expect(one).not.toContain("from the gate of stage 1");
+    });
   });
 
   it("finds the stages a gate hands off to that haven't begun", () => {

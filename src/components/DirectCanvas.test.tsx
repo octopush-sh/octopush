@@ -158,13 +158,16 @@ describe("DirectCanvas viewed-run routing", () => {
       planWait: { window: "five_hour", resetsAt: resumeAt - 90, resumeAt, resumeCount: 0, otherHold: true } };
     const plan = { ...mkStage("p1", 1, "failed"), error: "Paused by your Claude plan\n(plan_limit)" };
     const gate = { ...mkStage("g1", 2, "awaiting_checkpoint"), checkpoint: true };
-    useRunsStore.setState({ resolve, detailByRun: { r1: { run: paused, stages: [mkStage("s0", 0, "done"), plan, gate] } } });
+    // A gate's approve goes through the store's gate approve (#957), with no comments here.
+    const approveWithComments = vi.fn(async () => {});
+    useRunsStore.setState({ resolve, approveWithComments, detailByRun: { r1: { run: paused, stages: [mkStage("s0", 0, "done"), plan, gate] } } });
     useRunsStore.getState().selectRun("w1", "r1");
     render(<DirectCanvas active workspaceId="w1" defaultTask="" linkedIssueKey={null} workspacePath="/tmp" />);
     expect(screen.getByText("decides:g1")).toBeInTheDocument();
     expect(screen.getByText("decision-beacon:true")).toBeInTheDocument();
     fireEvent.click(screen.getByText("approve"));
-    expect(resolve).toHaveBeenCalledWith("r1", "g1", "approve");
+    expect(approveWithComments).toHaveBeenCalledWith("r1", "g1", []);
+    expect(resolve).not.toHaveBeenCalled();
   });
 
   it("shows the decision surface when paused at a checkpoint, and the running controls once resumed", () => {

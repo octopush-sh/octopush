@@ -108,7 +108,7 @@ describe("StageFocus live journal", () => {
     const doc = document.querySelector('[data-tour="direct-gate-document"]')!;
     expect(doc).not.toBeNull();
     expect(doc.querySelector("h2")?.textContent).toBe("Steps"); // rendered, not raw Markdown
-    expect(screen.getByText("Select a passage to comment on it.")).toBeInTheDocument();
+    expect(screen.getByText("Select a passage, then Comment. From the keyboard: ↑ ↓ and ⏎.")).toBeInTheDocument();
     // Once decided, the same artifact is read-only text again.
     rerender(<StageFocus stage={{ ...gate, status: "done" }} workspacePath="/tmp" run={parkedRun} />);
     expect(document.querySelector('[data-tour="direct-gate-document"]')).toBeNull();

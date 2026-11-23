@@ -36,6 +36,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
   const start = useRunsStore((s) => s.start);
   const resolve = useRunsStore((s) => s.resolve);
   const approveWithComments = useRunsStore((s) => s.approveWithComments);
+  const resolveGate = useRunsStore((s) => s.resolveGate);
   const answerBlocker = useRunsStore((s) => s.answerBlocker);
   const abort = useRunsStore((s) => s.abort);
   const stopStage = useRunsStore((s) => s.stopStage);
@@ -235,12 +236,13 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           // the refresh shows what is waiting now. No stage shown, no decision.
           nextStageLabel={nextLabel}
           onApprove={(comments) => {
-            if (!blockedStage) return;
-            if (comments && comments.length > 0) void approveWithComments(run.id, blockedStage.id, comments);
-            else void resolve(run.id, blockedStage.id, "approve");
+            // Always through the store's gate approve: with no comments it
+            // still takes out guidance an earlier pass of this gate left on
+            // the next stage, and it clears the comments only on success.
+            if (blockedStage) void approveWithComments(run.id, blockedStage.id, Array.isArray(comments) ? comments : []);
           }}
           onReject={(fb, maxTurns) => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "reject", { feedback: fb || undefined, maxTurnsOverride: maxTurns });
           }}
           onResume={(maxTurns) => {
             if (blockedStage) void resolve(run.id, blockedStage.id, "resume", { maxTurnsOverride: maxTurns });
@@ -249,7 +251,7 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
             if (blockedStage) void resolve(run.id, blockedStage.id, "discard");
           }}
           onSendBack={(fb) => {
-            if (blockedStage) void resolve(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
+            if (blockedStage) void resolveGate(run.id, blockedStage.id, "send_back", { feedback: fb || undefined });
           }}
           onAnswerBlocker={(answers) => {
             if (blockedStage) void answerBlocker(run.id, blockedStage.id, answers);

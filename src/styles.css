@@ -1120,6 +1120,13 @@ button:not(:disabled),
   text-decoration-color: var(--brass-dim);
 }
 
+/* The passage under the keyboard cursor of such a document (↑ ↓ move it,
+   ⏎ comments on it). */
+.octo-commentable [data-comment-cursor] {
+  background-color: var(--brass-ghost);
+  box-shadow: inset 2px 0 0 var(--brass-dim);
+}
+
 /* Attention indicator pulse animation */
 @keyframes pulse {
   0%, 100% { opacity: 1; transform: scale(1); }

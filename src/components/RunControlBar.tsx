@@ -13,7 +13,7 @@ import { isPlanLimitHalt, planWaitSentence, planWaitWhy } from "../lib/planWait"
 import { useRunsStore } from "../stores/runsStore";
 import { findingLocation, holdSummary } from "../lib/secretGuard";
 import { commentCount, composeGateFeedback, gateKey, type GateComment } from "../lib/gateComments";
-import { useGateComments, useGateCommentsStore } from "../stores/gateCommentsStore";
+import { useGateComments } from "../stores/gateCommentsStore";
 
 interface LoopState {
   iteration: number;
@@ -34,8 +34,10 @@ interface Props {
   onPause: () => void;
   onStopStage: () => void;
   onAbort: () => void;
-  /** Approve; at a gate with the director's comments (#957), they come along
-   *  to ride to the next stage as guidance. */
+  /** Approve; at a gate with the director's comments (#957), they come
+   *  along: to the next stage as guidance, or, with no stage left to take
+   *  them, to be set aside once the approve went through. Whoever handles
+   *  the decision clears the comments, and only when it succeeded. */
   onApprove: (comments?: GateComment[]) => void;
   /** Who an approve with comments hands them to ("Implement", "2 stages"),
    *  or null when no stage that hasn't begun follows. */
@@ -361,9 +363,7 @@ function DecisionBar({
 }: Props & { blockedStage: RunStage }) {
   const [mode, setMode] = useState<"decide" | "reject" | "sendback">("decide");
   // The director's inline comments on the gate's artifact (#957).
-  const gate = gateKey(blockedStage);
-  const comments = useGateComments(gate);
-  const clearComments = useGateCommentsStore((s) => s.clear);
+  const comments = useGateComments(gateKey(blockedStage));
   const [feedback, setFeedback] = useState("");
   const [showWhy, setShowWhy] = useState(false);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
@@ -407,22 +407,19 @@ function DecisionBar({
     const fb = comments.length > 0 ? composeGateFeedback(comments, feedback) : feedback;
     if (mode === "reject") onReject(fb, failed ? turns : undefined);
     else onSendBack(fb);
-    clearComments(gate);
     setMode("decide");
     setFeedback("");
   }
 
   function approveGate() {
-    // The comments are cleared once they reached the next stage (the store
-    // keeps them if it refused); with no next stage, Approve sets them aside.
-    if (comments.length > 0 && nextStageLabel) {
-      onApprove(comments);
-    } else {
-      onApprove();
-      clearComments(gate);
-    }
+    // The comments go with the approve either way; the store hands them to
+    // the next stage, or sets them aside when none follows, and keeps them
+    // if the approve is refused.
+    if (comments.length > 0) onApprove(comments);
+    else onApprove();
   }
   const hasComments = comments.length > 0;
+  const them = comments.length === 1 ? "it" : "them";
 
   const tone = transient
     ? "border-[var(--warning-border)] bg-[var(--warning-ghost)]"
@@ -558,7 +555,10 @@ function DecisionBar({
                   </span>
                 ) : hasComments ? (
                   <span data-tour="direct-gate-comment-count">
-                    <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {commentCount(comments.length)} {comments.length === 1 ? "goes" : "go"} with your decision.
+                    <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b>: {nextStageLabel
+                      ? `${commentCount(comments.length)} ${comments.length === 1 ? "goes" : "go"} with your decision.`
+                      // Said here, before the click: no stage is left to take them.
+                      : `${commentCount(comments.length)}. No stage follows to take ${them}: Approve leaves ${them} out, Reject${canSendBack ? " or Send back" : ""} carries ${them}.`}
                   </span>
                 ) : (
                   <>Review <b className="text-octo-ivory">{labelForRole(blockedStage.role)}</b> and choose how to proceed.</>
@@ -590,7 +590,7 @@ function DecisionBar({
                       : "No stage that hasn't begun follows, so approving sets your comments aside"
                     : undefined}
                   className={`${beacon ? "octo-stage-pulse " : ""}rounded-md bg-octo-brass px-3 py-1.5 font-serif text-sm text-octo-onyx transition-colors duration-[180ms] hover:bg-octo-brass-hi`}>
-                  {hasComments && nextStageLabel ? "Approve with comments" : <>Approve &amp; continue</>}
+                  {hasComments ? (nextStageLabel ? "Approve with comments" : "Approve without comments") : <>Approve &amp; continue</>}
                 </button>
               )}
               {canSendBack && (
