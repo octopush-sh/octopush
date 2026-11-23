@@ -10978,6 +10978,112 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn every_seatbelt_wrapped_claude_stage_turns_claude_codes_own_bash_sandbox_off() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, turn_off_inner_sandbox, CliDialect, CodexWriteScope, INNER_SANDBOX_OFF_LABEL,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1001: a user's `sandbox.enabled` in ~/.claude/settings.json can't
+        // nest in the mission profile, so every stage the profile wraps
+        // overrides it in `--settings`, beside the guards, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec, wrapped, reads) in [
+            ("worktree", "sandbox", true, true),
+            ("readonly", "sandbox", true, true),
+            ("readonly", "none", true, false),
+            ("worktree", "none", false, false),
+        ] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                assert_eq!(confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args), reads);
+                assert_eq!(turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args), wrapped, "{git}/{exec}");
+                let v = settings(&args);
+                assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+                assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads, "{args:?}");
+                if wrapped {
+                    assert_eq!(v["sandbox"], serde_json::json!({ "enabled": false }), "{git}/{exec}: {args:?}");
+                } else {
+                    assert!(v.get("sandbox").is_none(), "unsandboxed: the user's own sandbox is left alone: {args:?}");
+                }
+            }
+        }
+        // Codex has no `--settings`; its argv is left alone.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let mut same = codex.clone();
+        assert!(!turn_off_inner_sandbox(CliDialect::Codex, "sandbox", &mut same));
+        assert_eq!(same, codex);
+        assert_eq!(
+            INNER_SANDBOX_OFF_LABEL,
+            "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
+        );
+    }
+
+    #[test]
+    fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
+        use crate::orchestrator::cli_runner::{
+            inner_sandbox_refused, is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result,
+            INNER_SANDBOX_OFF,
+        };
+        use crate::orchestrator::types::{ArtifactKind, StageStatus};
+        // #1001: since Claude Code 2.1.328 a sandbox that can't start makes the
+        // next sandboxed Bash command refuse, saying the sandbox is off for the
+        // session. The stage names that instead of failing generically.
+        let refusal = |content: serde_json::Value| {
+            serde_json::json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": content }
+            ] } })
+        };
+        assert!(inner_sandbox_refused(&refusal(serde_json::json!(
+            "Sandbox is off for the session: the sandbox could not start, so this command was not run."
+        ))));
+        assert!(inner_sandbox_refused(&refusal(serde_json::json!([
+            { "type": "text", "text": "Refused: the sandbox is off for the session." }
+        ]))));
+        assert!(!inner_sandbox_refused(&refusal(serde_json::json!("npm test: 3 failed"))));
+        let assistant = serde_json::json!({ "type": "assistant", "message": { "content": [
+            { "type": "text", "text": "the sandbox is off for the session" }
+        ] } });
+        assert!(!inner_sandbox_refused(&assistant), "only a tool result is the CLI's refusal");
+
+        let failed = parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#,
+            false,
+            ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let named = name_inner_sandbox_off(failed.clone(), true);
+        let err = named.error.as_deref().unwrap();
+        assert!(err.starts_with(INNER_SANDBOX_OFF) && is_inner_sandbox_off(err), "{err}");
+        assert!(err.contains("error_max_turns"), "the CLI's own error is kept: {err}");
+        assert_eq!(name_inner_sandbox_off(named.clone(), true).error, named.error, "named once");
+        assert_eq!(name_inner_sandbox_off(failed.clone(), false).error, failed.error, "no refusal: unchanged");
+        assert!(!is_inner_sandbox_off(failed.error.as_deref().unwrap()));
+        assert!(!is_plan_limit(err));
+        // A finished stage keeps its outcome; the notice alone says it.
+        let done = parse_cli_result(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s"}"#,
+            true,
+            ArtifactKind::Note,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(done.status, StageStatus::Done));
+        let kept = name_inner_sandbox_off(done, true);
+        assert!(matches!(kept.status, StageStatus::Done) && kept.error.is_none());
+    }
+
+    #[test]
     fn a_read_confined_stage_adds_only_its_own_cache_root_and_temp_dir_as_working_dirs() {
         use crate::orchestrator::cli_runner::{confine_reads_in_sandbox, sandbox_read_dir_args, CliDialect};
         // #743 review: the read guard must not refuse the stage's own temp dir

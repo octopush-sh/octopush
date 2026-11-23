@@ -864,6 +864,15 @@ impl Orchestrator {
         {
             return Ok(false);
         }
+        // Claude Code's own Bash sandbox couldn't start, so it refused the
+        // stage's Bash commands: a stronger model meets the same refusal.
+        if fresh
+            .error
+            .as_deref()
+            .is_some_and(crate::orchestrator::cli_runner::is_inner_sandbox_off)
+        {
+            return Ok(false);
+        }
         // A hook deferred a tool call, or a resumed session's deferred tool is
         // gone: a stronger model meets the same hook and won't bring the tool back.
         if fresh.error.as_deref().is_some_and(|e| {
