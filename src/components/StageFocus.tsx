@@ -434,7 +434,8 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
                 ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
               </span>
             )}
-            <span className="octo-tabular text-xs text-octo-brass">{formatUsd(stage.costUsd)}</span>
+            {/* A cost is data, never brass: the role eyebrow keeps the accent (#1017). */}
+            <span className="octo-tabular text-xs text-octo-ivory">{formatUsd(stage.costUsd)}</span>
           </span>
         </div>
         <div className="truncate font-serif text-[15px] text-octo-ivory" title={stageTitle(stage)}>
