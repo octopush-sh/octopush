@@ -1411,6 +1411,8 @@ pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 /// `EnterWorktree` a stage could move its work to a worktree Octopush doesn't
 /// track; before Claude Code 2.1.330, `ExitWorktree` could remove a worktree
 /// another running session was working in, and Octopush runs several at once.
+/// This denies the two tools only: Bash (`git worktree …`, `cd` elsewhere) is
+/// not covered and stays unconfined outside a sandboxed mission.
 pub const WORKTREE_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
 
 /// The one `--disallowedTools` value for a Claude CLI stage: the question
