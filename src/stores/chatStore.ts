@@ -417,13 +417,23 @@ interface ChatState {
 
   // Actions
   loadHistory: (workspaceId: string) => Promise<void>;
+  /** Resolves when the whole turn has ENDED (the IPC runs the agentic loop
+   *  inline, which can take minutes): `true` when it ran through, `false`
+   *  when it didn't (the budget cap, no thread, or an IPC error, before or
+   *  during the turn — each shown via `errorByWs`). `onDispatched` is called
+   *  much earlier, once: the pre-flight checks passed (budget, a thread) and
+   *  the turn has started; a refusal before that never calls it.
+   *  `attachments: false` sends without the staged attachments and leaves
+   *  them staged (Review's "Send to the agent", #956). */
   send: (
     workspaceId: string,
     workspacePath: string,
     content: string,
     systemPrompt?: string,
-  ) => Promise<void>;
-  /** Internal: dispatch one agentic turn (shared by send / regenerate). */
+    opts?: { attachments?: boolean; onDispatched?: () => void },
+  ) => Promise<boolean>;
+  /** Internal: dispatch one agentic turn (shared by send / regenerate).
+   *  Resolves `false` when the IPC failed. */
   runTurn: (
     workspaceId: string,
     workspacePath: string,
@@ -436,7 +446,7 @@ interface ChatState {
       /** The turn's budget override was consumed → tell the backend to skip its gate. */
       overrideBudget?: boolean;
     },
-  ) => Promise<void>;
+  ) => Promise<boolean>;
   /** Internal: budget-gate, truncate from a cutoff message id, then dispatch.
    *  Shared by regenerate / editAndResend. */
   truncateAndRun: (
@@ -1069,14 +1079,14 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
     },
 
-    send: async (workspaceId, workspacePath, content, systemPrompt) => {
+    send: async (workspaceId, workspacePath, content, systemPrompt, sendOpts) => {
       // ── Budget hard-stop (client fast-path; the backend gate is authoritative) ──
       const gate = budgetGate(workspaceId);
       if (gate.blocked) {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: BUDGET_CAP_MSG },
         }));
-        return;
+        return false;
       }
 
       // Guarantee a real thread BEFORE persisting, so a fast first-send during
@@ -1086,7 +1096,7 @@ export const useChatStore = create<ChatState>((set, get) => {
         set((s) => ({
           errorByWs: { ...s.errorByWs, [workspaceId]: "Could not start a conversation." },
         }));
-        return;
+        return false;
       }
 
       // The first message names the thread: persist a derived title if it's
@@ -1104,17 +1114,24 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
 
       // Snapshot + clear pending attachments — they ride along on this turn only.
-      const attachments = get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
+      const attachments =
+        sendOpts?.attachments === false
+          ? EMPTY_ATTACHMENTS
+          : get().attachmentsByWs[workspaceId] ?? EMPTY_ATTACHMENTS;
       if (attachments.length > 0) {
         set((s) => ({ attachmentsByWs: { ...s.attachmentsByWs, [workspaceId]: EMPTY_ATTACHMENTS } }));
       }
 
-      await get().runTurn(workspaceId, workspacePath, threadId, {
+      // `runTurn` runs up to its IPC call before it yields: by the time it
+      // hands back its promise the turn is marked as streaming and on its way.
+      const turn = get().runTurn(workspaceId, workspacePath, threadId, {
         userMessage: content,
         systemPrompt,
         attachments,
         overrideBudget: gate.overrode,
       });
+      sendOpts?.onDispatched?.();
+      return turn;
     },
 
     // Core turn dispatch shared by send / regenerate. Sets the streaming flags,
@@ -1177,7 +1194,9 @@ export const useChatStore = create<ChatState>((set, get) => {
         if (!(last && last.role === "error" && last.content === errText)) {
           set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: errText } }));
         }
+        return false;
       }
+      return true;
     },
 
     // Shared core for regenerate / editAndResend: budget-gate, truncate from the

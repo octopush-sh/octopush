@@ -717,6 +717,7 @@ export function ReviewCanvas({
             active={active}
             files={diffFiles}
             workspacePath={workspacePath}
+            workspaceId={workspaceId}
             readOnly={readOnly}
             // The committed side matches the disk only while the tree is clean.
             diskContext={!readOnly || workingCount === 0}

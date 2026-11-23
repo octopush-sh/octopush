@@ -7,6 +7,8 @@
  * I publish?* — context that isn't visible anywhere else on screen.
  *
  *   1. Readiness — a one-line verdict synthesised from the working-tree state.
+ *   1b. For the agent — the "Ask for a change" comments left on the diff, and
+ *      one action that sends them to the agent (only while there is one).
  *   2. Provenance — the agentic story of the diff: which agent turns shaped it,
  *      expandable to the turn's model + message. Octopush's signature.
  *   3. Branch & publish — upstream / ahead-behind / last commit at a glance,
@@ -27,6 +29,7 @@ import { useReviewSource } from "../stores/reviewSourceStore";
 import { baseName, commitCount } from "../lib/reviewSource";
 import { Reveal } from "./primitives/Reveal";
 import { collisionTone, useWorkspaceCollisions } from "./CollisionMark";
+import { CommentTray } from "./review/CommentTray";
 
 interface Props {
   workspaceId: string;
@@ -67,6 +70,9 @@ export function CompanionReview({ workspaceId, workspacePath, gitStatus, onJump 
         <SecretVerdict preview={staged > 0 && conflicted === 0 ? secret : null} onJump={onJump} />
         <CollisionVerdict workspaceId={workspaceId} />
       </div>
+
+      {/* ── Comments for the agent (#956) ───────────────────────── */}
+      <CommentTray workspaceId={workspaceId} workspacePath={workspacePath} onJump={onJump} />
 
       {/* ── Provenance ──────────────────────────────────────────── */}
       <Provenance workspaceId={workspaceId} files={files} onJump={onJump} />

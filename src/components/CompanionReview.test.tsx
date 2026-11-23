@@ -14,6 +14,9 @@ vi.mock("../lib/ipc", () => ({
   ipc: { listFileEdits, getMessage, getLastCommit, secretScanStaged, secretScanBranch },
 }));
 
+// The comments tray reads the runs and Talk stores; it has its own tests.
+vi.mock("./review/CommentTray", () => ({ CommentTray: () => null }));
+
 import { CompanionReview, SECRET_RESCAN_MS } from "./CompanionReview";
 import type { GitStatus } from "../lib/types";
 

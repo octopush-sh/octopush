@@ -21,17 +21,44 @@ function renderText(row: DiffRow, toks: DiffTok[] | undefined) {
  * whole file (`highlightFile`); without it the hunk is highlighted in its
  * own context.
  */
-export function DiffLines({ rows, filePath, mode, tokens }: { rows: DiffRow[]; filePath: string; mode: ReadingMode; tokens?: DiffTok[][] }) {
+/** Rows picked for a comment (#956): indexes into `rows`, inclusive. */
+export interface RowPick { from: number; to: number }
+
+/** A line number that starts a comment on its row (shift extends the pick). */
+interface Pick {
+  selected?: RowPick;
+  onRowClick?: (rowIdx: number, extend: boolean) => void;
+}
+
+const inPick = (p: RowPick | undefined, i: number) => !!p && i >= Math.min(p.from, p.to) && i <= Math.max(p.from, p.to);
+const PICKED = "inset 2px 0 0 var(--brass-dim)";
+
+function LineNo({ n, i, pick }: { n: number | null; i: number; pick: Pick }) {
+  const click = pick.onRowClick && n !== null ? pick.onRowClick : undefined;
+  return (
+    <span
+      aria-hidden
+      onClick={click ? (e) => click(i, e.shiftKey) : undefined}
+      title={click ? "Ask for a change on this line (shift-click for a range)" : undefined}
+      className={`min-w-[36px] select-none px-2 text-right text-octo-mute${click ? " cursor-pointer hover:text-octo-brass" : ""}`}
+    >
+      {n ?? ""}
+    </span>
+  );
+}
+
+export function DiffLines({ rows, filePath, mode, tokens, selected, onRowClick }: { rows: DiffRow[]; filePath: string; mode: ReadingMode; tokens?: DiffTok[][] } & Pick) {
   const own = useMemo(() => (tokens ? null : highlightHunk(rows, filePath)), [tokens, rows, filePath]);
   const toks = tokens ?? own!;
   const tokOf = new Map(rows.map((r, i) => [r, toks[i]]));
-  if (mode === "sbs") return <SideBySide rows={rows} tokOf={tokOf} />;
+  const pick: Pick = { selected, onRowClick };
+  if (mode === "sbs") return <SideBySide rows={rows} tokOf={tokOf} pick={pick} />;
   return (
     <pre className="overflow-x-auto font-mono text-[11.5px] leading-[1.55]">
       {rows.map((row, i) => (
-        <div key={i} data-diff-row data-kind={row.kind} className={`flex ${ROW_FG[row.kind]}`} style={{ background: ROW_BG[row.kind] }}>
-          <span aria-hidden className="min-w-[36px] select-none px-2 text-right text-octo-mute">{row.oldLine ?? ""}</span>
-          <span aria-hidden className="min-w-[36px] select-none px-2 text-right text-octo-mute">{row.newLine ?? ""}</span>
+        <div key={i} data-diff-row data-kind={row.kind} data-picked={inPick(selected, i) || undefined} className={`flex ${ROW_FG[row.kind]}`} style={{ background: ROW_BG[row.kind], boxShadow: inPick(selected, i) ? PICKED : undefined }}>
+          <LineNo n={row.oldLine} i={i} pick={pick} />
+          <LineNo n={row.newLine} i={i} pick={pick} />
           <span aria-hidden className="select-none pr-1 text-octo-mute">{row.kind === "add" ? "+" : row.kind === "del" ? "−" : " "}</span>
           <code className="flex-1 whitespace-pre pr-3">{renderText(row, toks[i])}</code>
         </div>
@@ -42,7 +69,8 @@ export function DiffLines({ rows, filePath, mode, tokens }: { rows: DiffRow[]; f
 
 type TokOf = Map<DiffRow, DiffTok[]>;
 
-function SideBySide({ rows, tokOf }: { rows: DiffRow[]; tokOf: TokOf }) {
+function SideBySide({ rows, tokOf, pick }: { rows: DiffRow[]; tokOf: TokOf; pick: Pick }) {
+  const idxOf = new Map(rows.map((r, i) => [r, i]));
   const left: (DiffRow | null)[] = [];
   const right: (DiffRow | null)[] = [];
   let i = 0;
@@ -58,22 +86,23 @@ function SideBySide({ rows, tokOf }: { rows: DiffRow[]; tokOf: TokOf }) {
   }
   return (
     <div className="flex overflow-x-auto font-mono text-[11.5px] leading-[1.55]">
-      <Col rows={left} side="old" tokOf={tokOf} />
+      <Col rows={left} side="old" tokOf={tokOf} idxOf={idxOf} pick={pick} />
       <div className="w-px shrink-0 bg-octo-hairline" />
-      <Col rows={right} side="new" tokOf={tokOf} />
+      <Col rows={right} side="new" tokOf={tokOf} idxOf={idxOf} pick={pick} />
     </div>
   );
 }
 
-function Col({ rows, side, tokOf }: { rows: (DiffRow | null)[]; side: "old" | "new"; tokOf: TokOf }) {
+function Col({ rows, side, tokOf, idxOf, pick }: { rows: (DiffRow | null)[]; side: "old" | "new"; tokOf: TokOf; idxOf: Map<DiffRow, number>; pick: Pick }) {
   return (
     <div data-sbs-col className="min-w-0 flex-1">
       {rows.map((row, i) => {
         if (!row) return <div key={i} data-diff-row className="h-[1.55em] bg-octo-onyx/30" aria-hidden />;
         const ln = side === "old" ? row.oldLine : row.newLine;
+        const ri = idxOf.get(row) ?? 0;
         return (
-          <div key={i} data-diff-row data-kind={row.kind} className={`flex whitespace-pre ${ROW_FG[row.kind]}`} style={{ background: ROW_BG[row.kind] }}>
-            <span aria-hidden className="min-w-[36px] select-none px-2 text-right text-octo-mute">{ln ?? ""}</span>
+          <div key={i} data-diff-row data-kind={row.kind} data-picked={inPick(pick.selected, ri) || undefined} className={`flex whitespace-pre ${ROW_FG[row.kind]}`} style={{ background: ROW_BG[row.kind], boxShadow: inPick(pick.selected, ri) ? PICKED : undefined }}>
+            <LineNo n={ln} i={ri} pick={pick} />
             <code className="flex-1 pr-3">{renderText(row, tokOf.get(row))}</code>
           </div>
         );

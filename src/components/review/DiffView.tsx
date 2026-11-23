@@ -3,6 +3,9 @@ import { FileDiffSection } from "./FileDiffSection";
 import { EmptyDiffState, type EmptyDiffContext } from "./EmptyDiffState";
 import { useDiffKeyboard, type FlatHunk } from "./useDiffKeyboard";
 import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
+import { commentAnchor, liveHunkKeys, reanchorDraft, type CommentDraft } from "../../lib/reviewComments";
+import { pushToast } from "../Toasts";
+import { selectComments, useReviewComments } from "../../stores/reviewCommentsStore";
 
 export interface DiffAnchor { filePath: string; startLine: number; endLine: number; }
 
@@ -13,6 +16,9 @@ interface Props {
   active?: boolean;
   files: DiffFile[];
   workspacePath: string;
+  /** Turns on review comments (#956) in the working-tree view: their tray is
+   *  per workspace. */
+  workspaceId?: string;
   stagedCount?: number;
   /** The committed view (#851): no Accept / Reject, by click or key. */
   readOnly?: boolean;
@@ -42,6 +48,10 @@ export function DiffView(props: Props) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [changed, setChanged] = useState<Record<string, boolean>>({});
   const [help, setHelp] = useState(false);
+  // The open "Ask for a change" draft: its hunk, the rows picked (if any),
+  // the anchor taken at that moment and the note typed so far. The note lives
+  // here, not in the field, so nothing that remounts the field loses it.
+  const [draft, setDraft] = useState<CommentDraft | null>(null);
 
   // Marks belong to one workspace: the same path elsewhere starts unviewed.
   const [scope, setScope] = useState(props.workspacePath);
@@ -50,7 +60,49 @@ export function DiffView(props: Props) {
     setViewed({});
     setCollapsed({});
     setChanged({});
+    setDraft(null);
   }
+
+  // Comments act on the working tree only; the committed view is out of scope.
+  const commentWs = !readOnly ? props.workspaceId : undefined;
+  const comments = useReviewComments(selectComments(commentWs ?? ""));
+  useEffect(() => {
+    if (commentWs) useReviewComments.getState().setLive(commentWs, liveHunkKeys(files));
+  }, [commentWs, files]);
+  // A refetch (the agent is still editing) must not take a half-typed note
+  // away: the draft follows its hunk, stays open as outdated when the hunk
+  // changed, and is kept in the tray when its file left the diff.
+  useEffect(() => {
+    if (!commentWs || !draft) return;
+    const next = reanchorDraft(draft, files);
+    if (next === draft) return;
+    if (next === null && draft.note.trim()) {
+      useReviewComments.getState().add(commentWs, { ...draft.anchor, note: draft.note.trim() });
+      pushToast({
+        level: "info",
+        title: "Your comment was kept",
+        body: "Its file left the diff while you were writing. It is in the tray, marked outdated.",
+      });
+    }
+    setDraft(next);
+  }, [commentWs, draft, files]);
+  // Opening on another place (another line, another hunk) moves the draft
+  // there with the note typed so far. A folded file opens to show the field.
+  const startComment = (filePath: string, hunkIdx: number, rowIdx?: number, extend = false) => {
+    const hunk = files.find((f) => f.filePath === filePath)?.hunks[hunkIdx];
+    if (!commentWs || !hunk) return;
+    setDraft((d) => {
+      const same = d && !d.stale && d.filePath === filePath && d.hunkIdx === hunkIdx;
+      const rows = rowIdx === undefined ? undefined : extend && same && d.rows ? { from: d.rows.from, to: rowIdx } : { from: rowIdx, to: rowIdx };
+      return { filePath, hunkIdx, rows, anchor: commentAnchor(filePath, hunk, rows), note: d?.note ?? "", stale: false };
+    });
+    setCollapsed((m) => (m[filePath] ? { ...m, [filePath]: false } : m));
+  };
+  const submitComment = () => {
+    if (!commentWs || !draft || !draft.note.trim()) return;
+    useReviewComments.getState().add(commentWs, { ...draft.anchor, note: draft.note.trim() });
+    setDraft(null);
+  };
 
   // anchor: null until G5 anchor-selection task wires setAnchor.
   // Declared with setter so TypeScript does not warn about unused state.
@@ -117,6 +169,7 @@ export function DiffView(props: Props) {
       toggleViewed: () => curFile && toggleViewed(curFile),
       open: () => cur && props.onOpen(files[cur.fileIdx].filePath, firstChangedLine(files[cur.fileIdx], cur.hunkIdx)),
       why: () => cur && props.onWhy(files[cur.fileIdx].filePath, cur.hunkIdx),
+      ...(commentWs && { comment: () => cur && startComment(files[cur.fileIdx].filePath, cur.hunkIdx) }),
       toggleCollapse: () => curFile && setCollapsed((m) => ({ ...m, [curFile.filePath]: !m[curFile.filePath] })),
       focusFilter: () => props.onFocusFilter?.(),
       focusCommit: () => props.onFocusCommit?.(),
@@ -156,6 +209,15 @@ export function DiffView(props: Props) {
             onWhy={(hi) => props.onWhy(file.filePath, hi)}
             onToggleViewed={() => toggleViewed(file)}
             onToggleCollapsed={() => setCollapsed((m) => ({ ...m, [file.filePath]: !m[file.filePath] }))}
+            {...(commentWs && {
+              draft: draft?.filePath === file.filePath ? draft : null,
+              comments: comments.filter((c) => c.filePath === file.filePath),
+              onStartComment: (hi: number, ri?: number, extend?: boolean) => startComment(file.filePath, hi, ri, extend),
+              onDraftNote: (note: string) => setDraft((d) => (d ? { ...d, note } : d)),
+              onSubmitComment: submitComment,
+              onCancelComment: () => setDraft(null),
+              onRemoveComment: (id: string) => useReviewComments.getState().remove(commentWs, id),
+            })}
           />
         ))}
       </div>
@@ -176,7 +238,8 @@ function firstChangedLine(file: DiffFile, hunkIdx: number): number {
  *  accept / reject keys it ignores (#903). Exported for tests. */
 export function keyboardHelpLine(readOnly: boolean): string {
   const act = readOnly ? "" : " · a accept · x reject · A file";
-  return `j/k move · ]/[ file · Space fold${act} · v viewed · o open · w why`;
+  const ask = readOnly ? "" : " · m ask for a change";
+  return `j/k move · ]/[ file · Space fold${act} · v viewed · o open · w why${ask}`;
 }
 
 function KeyboardHelp({ readOnly, onClose }: { readOnly: boolean; onClose: () => void }) {

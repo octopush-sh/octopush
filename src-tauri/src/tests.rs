@@ -6586,6 +6586,56 @@ mod orchestrator_tests {
         assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
+    /// An abort leaves the parked stage at `awaiting_checkpoint`. A late
+    /// decision on that run (a Send-back from Review's comment tray, a stale
+    /// Approve) is refused and changes nothing; only Abort still passes.
+    #[tokio::test]
+    async fn a_decision_on_a_finished_run_is_refused_and_changes_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "review", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let art = serde_json::to_string(&StageArtifact {
+            kind: ArtifactKind::Note, text: "findings".into(), payload: None, refs_worktree: false,
+        }).unwrap();
+        db.lock().set_run_stage_status(&id, "running").unwrap();
+        db.lock().complete_run_stage(&id, "awaiting_checkpoint", 0, 0, 0, 0, 0.0, Some(&art)).unwrap();
+        db.lock().set_run_status(&run_id, "paused", false).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // A run that is still waiting accepts decisions.
+        assert!(orch.check_run_open(&run_id, &CheckpointAction::Approve).is_ok());
+
+        for ended in ["aborted", "completed", "failed"] {
+            db.lock().set_run_status(&run_id, ended, true).unwrap();
+            let actions = || [
+                CheckpointAction::Approve,
+                CheckpointAction::SendBack { feedback: Some("change this".into()) },
+                CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None },
+                CheckpointAction::Resume { max_turns_override: None },
+            ];
+            for action in actions() {
+                let err = orch.check_run_open(&run_id, &action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            for action in actions() {
+                let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&id), action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            let err = orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the parked stage is untouched");
+            assert_eq!(stage.artifact.as_deref(), Some(art.as_str()), "its hand-off is kept");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, ended, "the run stays {ended}");
+            // Abort tears the run down whatever its state.
+            assert!(orch.check_run_open(&run_id, &CheckpointAction::Abort).is_ok());
+        }
+        assert_eq!(orch.resolve_checkpoint_apply_only(&run_id, Some(&id), CheckpointAction::Abort).unwrap(), None);
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";
@@ -9087,27 +9137,26 @@ mod orchestrator_tests {
     }
 
     /// The target's feedback column receives the composed findings+note before
-    /// the re-run starts (checked mid-flight via the archive-free path: a fresh
-    /// loop with no auto-drive). Uses loop_back's persisted effect directly.
+    /// the re-run starts. Checked through the apply-only path, which makes the
+    /// loop-back's changes and leaves the re-drive to its caller, so the
+    /// pending target still holds its feedback. (A send-back on an aborted run,
+    /// which this test once used to skip the re-drive, is refused.)
     #[tokio::test]
     async fn send_back_target_feedback_column_gets_composed_findings() {
         let (orch, run_id, db) = looped_run(1);
         orch.run_to_pause(&run_id).await.unwrap();
-        // Stop the re-drive from consuming the feedback: abort the run after
-        // the loop-back by checking the column straight after resolve starts is
-        // racy — instead mark the run aborted so resolve_checkpoint's re-drive
-        // is a no-op and the pending target keeps its feedback.
-        db.lock().set_run_status(&run_id, "aborted", true).unwrap();
-        orch.resolve_checkpoint(
+        let redrive = orch.resolve_checkpoint_apply_only(
             &run_id,
+            None,
             CheckpointAction::SendBack { feedback: Some("polish".into()) },
-        ).await.unwrap();
+        ).unwrap();
+        assert!(redrive.is_some(), "the run wants driving again");
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(
             stages[0].feedback.as_deref(),
             Some("did code_review\n\nDirector's note: polish"),
         );
-        assert_eq!(stages[0].status, "pending"); // reset, not re-run (aborted)
+        assert_eq!(stages[0].status, "pending"); // reset, not yet re-run
     }
 
     /// A runner whose review-role output carries a verdict; everything else Done.
