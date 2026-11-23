@@ -3767,6 +3767,124 @@ impl Db {
         Ok(())
     }
 
+    /// The worktree of the workspace a thread belongs to (its checkpoints
+    /// live in that repository).
+    pub fn chat_thread_worktree(&self, thread_id: &str) -> AppResult<Option<String>> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(path.flatten())
+    }
+
+    /// The workspace a thread belongs to and its worktree, when it has one.
+    pub fn chat_thread_home(&self, thread_id: &str) -> AppResult<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT w.id, w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every thread of every workspace checked out at the same path as
+    /// `thread_id`'s workspace (itself included): the conversations whose
+    /// turns write to the same files.
+    pub fn chat_threads_sharing_worktree(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t2.id FROM chat_threads t
+               JOIN workspaces w ON w.id = t.workspace_id
+               JOIN workspaces w2 ON w2.id = w.id
+                 OR (w.worktree_path IS NOT NULL AND rtrim(w2.worktree_path, '/') = rtrim(w.worktree_path, '/'))
+               JOIN chat_threads t2 ON t2.workspace_id = w2.id
+             WHERE t.id = ?1",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether a Direct run is in progress (`running` or `paused`) in a
+    /// workspace checked out at `worktree_path`.
+    pub fn has_active_run_at(&self, worktree_path: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs r JOIN workspaces w ON w.id = r.workspace_id
+             WHERE r.status IN ('running', 'paused')
+               AND rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+            params![worktree_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The ids of a workspace's threads (their checkpoints go when the
+    /// workspace is deleted or archived).
+    pub fn chat_thread_ids(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM chat_threads WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Fork from a user turn (#958): a new thread in the same workspace holding
+    /// a copy of every message BEFORE `message_id`, which must be a user turn
+    /// of `thread_id`. Returns the new thread, the turn's text (the fork's
+    /// draft) and each copied row's (old id, new id).
+    pub fn fork_chat_thread(
+        &self,
+        thread_id: &str,
+        message_id: i64,
+    ) -> AppResult<(ChatThreadRow, String, Vec<(i64, i64)>)> {
+        let (workspace_id, title): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT workspace_id, title FROM chat_threads WHERE id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("That conversation no longer exists.".into()))?;
+        let draft: String = self
+            .conn
+            .query_row(
+                "SELECT content FROM chat_messages WHERE id = ?1 AND thread_id = ?2 AND role = 'user'",
+                params![message_id, thread_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("Only a message you sent can be forked from.".into()))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_messages WHERE thread_id = ?1 AND id < ?2 ORDER BY id")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![thread_id, message_id], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, rusqlite::Error>>()?;
+        drop(stmt);
+        // One transaction: a failure part-way leaves no half-copied fork.
+        let tx = self.conn.unchecked_transaction()?;
+        let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
+        let mut pairs = Vec::with_capacity(ids.len());
+        for old in ids {
+            tx.execute(
+                "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
+                    output_tokens, cost_usd, created_at, cache_read_tokens, cache_creation_tokens, context_tokens)
+                 SELECT workspace_id, ?1, role, content, model, input_tokens, output_tokens, cost_usd,
+                    created_at, cache_read_tokens, cache_creation_tokens, context_tokens
+                 FROM chat_messages WHERE id = ?2",
+                params![thread.id, old],
+            )?;
+            pairs.push((old, tx.last_insert_rowid()));
+        }
+        tx.commit()?;
+        Ok((thread, draft, pairs))
+    }
+
     /// Delete a message and everything after it in a thread (ids are monotonic
     /// per thread). Backs Regenerate (truncate from the assistant turn) and
     /// Edit-and-resend (truncate from the edited user message). Scoped by

@@ -683,6 +683,14 @@ fn sensitive_file(path: &str) -> Option<(&'static str, &'static str)> {
     None
 }
 
+/// Whether the file's name alone marks it as sensitive (an env file, a
+/// private key, a keystore, Claude Code's local settings), whatever it
+/// holds. Features that copy or store files by name (Talk checkpoints) use
+/// it to leave such files out.
+pub fn is_sensitive_name(path: &str) -> bool {
+    is_env_file(path) || sensitive_file(path).is_some()
+}
+
 /// A project MCP config: Claude Code's `.mcp.json` or `.claude/mcp.json`,
 /// Cursor's `.cursor/mcp.json`, VS Code's `.vscode/mcp.json`.
 fn is_mcp_config(path: &str) -> bool {

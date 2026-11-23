@@ -25,9 +25,15 @@ vi.mock("../lib/ipc", async () => {
 });
 
 import { ipc, type Run, type RunStage } from "../lib/ipc";
-import { useRunsStore, EMPTY_RUNS, prefilledTask } from "./runsStore";
+import { useRunsStore, EMPTY_RUNS, prefilledTask, forgetPendingDecisions } from "./runsStore";
 import { useGateCommentsStore } from "./gateCommentsStore";
 import { gateKey } from "../lib/gateComments";
+import { listen } from "@tauri-apps/api/event";
+
+// The store subscribes at import; `beforeEach` clears the mock's calls.
+const onRunError = (listen as any).mock.calls.find((c: any[]) => c[0] === "run://error")[1] as (ev: {
+  payload: { runId: string; error: string };
+}) => void;
 
 const RUN: Run = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
@@ -52,6 +58,8 @@ describe("runsStore", () => {
       awayRunIds: [], awayStatus: "idle",
     });
     vi.clearAllMocks();
+    forgetPendingDecisions();
+    useRunsStore.setState({ runErrors: {}, approvingGates: {} });
   });
 
   it("resolve toasts a refusal calmly and still refreshes the run", async () => {
@@ -59,7 +67,7 @@ describe("runsStore", () => {
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
     await expect(
       useRunsStore.getState().resolve("r1", "st-stale", "approve"),
-    ).resolves.toBeUndefined();
+    ).resolves.toBe(false);
     expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st-stale", "approve", undefined);
     expect(pushToastMock).toHaveBeenCalledTimes(1);
     expect(pushToastMock.mock.calls[0][0]).toMatchObject({ level: "info" });
@@ -70,7 +78,9 @@ describe("runsStore", () => {
   it("resolve sends the named stage and its options to the backend", async () => {
     (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
     (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [STAGE] });
-    await useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
+    await expect(
+      useRunsStore.getState().resolve("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 }),
+    ).resolves.toBe(true);
     expect(ipc.resolveCheckpoint).toHaveBeenCalledWith("r1", "st2", "reject", { feedback: "tighten it", maxTurnsOverride: 40 });
   });
 
@@ -91,6 +101,8 @@ describe("runsStore", () => {
       let duringApprove: unknown;
       (ipc.resolveCheckpoint as any).mockImplementation(async () => {
         duringApprove = useGateCommentsStore.getState().byGate[gateKey(gate)];
+        // Applied: the refresh that follows shows the gate decided.
+        (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [{ ...gate, status: "done" }, impl] });
       });
       await useRunsStore.getState().approveWithComments("r1", "plan", comments);
       const [, stageId, patch] = (ipc.updateRunStage as any).mock.calls[0];
@@ -228,9 +240,53 @@ describe("runsStore", () => {
       await useRunsStore.getState().approveWithComments("r1", "plan", comments);
       expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
       (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      (ipc.getRun as any).mockResolvedValue({ run: RUN, stages: [{ ...gate, status: "done" }] });
       await useRunsStore.getState().approveWithComments("r1", "plan", comments);
       expect(ipc.updateRunStage).not.toHaveBeenCalled();
       expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
+    });
+
+    // Without detached runs the backend accepts the decision, applies it in
+    // the background and reports a refusal as `run://error`.
+    it("resolveGate keeps the comments when the run refuses the decision after accepting it", async () => {
+      seed();
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().resolveGate("r1", "plan", "send_back", { feedback: "fb" });
+      // Accepted, not yet applied: the gate still waits, so nothing is cleared yet.
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+      useRunsStore.getState().noteRunError("r1", "run is already executing");
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+      expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({
+        title: "Nothing changed",
+        body: "run is already executing. Your comments are still on the gate.",
+      }));
+      // Settled: the stage moving later (another decision) is not this one's doing.
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [{ ...gate, status: "pending", finishedAt: null }, impl] } } as any });
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+    });
+
+    it("resolveGate clears them once the stage moved, and an older error is not taken for a refusal", async () => {
+      seed();
+      useRunsStore.getState().noteRunError("r1", "old");
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().resolveGate("r1", "plan", "reject", { feedback: "fb" });
+      useRunsStore.setState({ selectedStageByRun: {} });
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
+      useRunsStore.setState({ detailByRun: { r1: { run: RUN, stages: [{ ...gate, status: "pending", finishedAt: null }, impl] } } as any });
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toBeUndefined();
+      expect(pushToastMock).not.toHaveBeenCalled();
+    });
+
+    it("an approve the run refuses after accepting it takes the guidance back and keeps the comments", async () => {
+      seed();
+      (ipc.updateRunStage as any).mockResolvedValue(undefined);
+      (ipc.resolveCheckpoint as any).mockResolvedValue(undefined);
+      await useRunsStore.getState().approveWithComments("r1", "plan", comments);
+      expect((ipc.updateRunStage as any).mock.calls).toHaveLength(1);
+      useRunsStore.getState().noteRunError("r1", "run is already executing");
+      await vi.waitFor(() => expect((ipc.updateRunStage as any).mock.calls).toHaveLength(2));
+      expect((ipc.updateRunStage as any).mock.calls[1]).toEqual(["r1", "impl", { instructions: "Keep it small." }]);
+      expect(useGateCommentsStore.getState().byGate[gateKey(gate)]).toEqual(comments);
     });
 
     it("resolveGate clears the gate's comments only when the reject or send-back went through", async () => {
@@ -708,6 +764,22 @@ describe("runsStore", () => {
     await useRunsStore.getState().loadRuns("w1");
     expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
     expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
+
+  it("run://error is recorded per run, after the run was read again", async () => {
+    useRunsStore.setState({ runErrors: {} });
+    let release!: (v: unknown) => void;
+    (ipc.getRun as any).mockReturnValue(new Promise((r) => { release = r; }));
+    onRunError({ payload: { runId: "r1", error: "run is already executing" } });
+    // Not before the refresh: a watcher must read stages that are current.
+    expect(useRunsStore.getState().runErrors.r1).toBeUndefined();
+    release({ run: RUN, stages: [{ ...STAGE, status: "awaiting_checkpoint" }] });
+    await vi.waitFor(() => expect(useRunsStore.getState().runErrors.r1).toEqual({ n: 1, error: "run is already executing" }));
+    expect(useRunsStore.getState().detailByRun.r1.stages[0].status).toBe("awaiting_checkpoint");
+    // A failed refresh still records it, and each error counts.
+    (ipc.getRun as any).mockRejectedValue("gone");
+    onRunError({ payload: { runId: "r1", error: "second" } });
+    await vi.waitFor(() => expect(useRunsStore.getState().runErrors.r1).toEqual({ n: 2, error: "second" }));
   });
 
   describe("loadSettledWhileAway", () => {

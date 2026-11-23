@@ -359,6 +359,23 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
 
+  // A fork from a turn opens with that turn's text as the draft, once
+  // (after whatever is already typed).
+  // Declared after the reset above: effects run in order, so a composer that
+  // mounts with a seed keeps it.
+  const composerSeed = useChatStore((s) => s.composerSeedByWs[workspaceId] ?? null);
+  const takeComposerSeed = useChatStore((s) => s.takeComposerSeed);
+  useEffect(() => {
+    if (composerSeed === null) return;
+    const seed = takeComposerSeed(workspaceId);
+    if (seed === null) return;
+    // A half-typed message is never replaced: the seed goes after it.
+    const typed = inputRef.current;
+    setInput(typed.trim() ? `${typed.replace(/\s+$/, "")}\n\n${seed}` : seed);
+    textareaRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composerSeed, workspaceId, takeComposerSeed]);
+
   // Text handed over from another surface (Review's "Ask Talk about this"):
   // appended to the draft on its own word, caret after it, focus here.
   // Declared after the reset above so a hand-off that mounts the composer
