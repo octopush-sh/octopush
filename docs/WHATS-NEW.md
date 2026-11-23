@@ -84,6 +84,8 @@ Current anchors:
 | `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
+| `direct-gate-document` · `direct-gate-comment-compose` · `direct-gate-comments` | Direct focus pane, only on a stage parked at its gate with a text artifact: the artifact as a commentable document · the comment composer (only after **Comment** was used on a selected or keyboard-marked passage) · the "your comments · N" list (only with comments) | `comments/CommentableDocument.tsx` via `StageFocus.tsx` |
+| `direct-gate-comment-count` | Direct run bar, at a gate with comments: "Plan: 2 comments go with your decision." (or, with no stage left to take them, "Plan: 2 comments. No stage follows to take them: …") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-ran-on` | Direct run track, on a stage card's meta line: the amber "ran on sonnet-5-5" note (only when Claude Code ran the stage on another model than it asked for) | `RunFlow.tsx` |
 | `direct-stage-refused` · `direct-focus-refused` | Direct run track, on a finished stage card's live line · the focus pane's header beside the tokens: the amber "2 tool calls refused" (only when Claude Code refused calls in the stage's last attempt) | `RunFlow.tsx` · `StageFocus.tsx` |
@@ -139,6 +141,8 @@ Current anchors:
 | `review-editor-ask-talk` | Review, Editor view, status bar: "Ask Talk about this" (only while text is selected) | `EditorStatusBar.tsx` |
 | `review-sidebar` | Review: the Changes/Files navigator (expanded, or its icon strip) | `ReviewSidebar.tsx` |
 | `review-diff-hunk` | Review diff: one hunk (its rail and highlighted lines; the first on screen) | `review/FileDiffSection.tsx` |
+| `review-hunk-comment` · `review-comment-composer` · `review-comment-add` | Review diff, working tree only: a hunk rail's "Ask for a change" icon (the first on screen) · the inline comment field under a hunk · its "Ask for this change" (both only while one is open) | `review/HunkRail.tsx` · `review/HunkComments.tsx` |
+| `review-companion-comments` · `review-companion-send-comments` | Review Companion, only while a comment is waiting: the "For the agent" tray · its "Send to the agent" | `review/CommentTray.tsx` |
 | `review-file-viewed` · `review-file-changed` | Review diff, file header: "mark viewed" / "✓ viewed" · the "changed since viewed" chip (only after a viewed file changed) | `review/FileDiffSection.tsx` |
 | `review-open-pr` | Review: "Open a pull request" (published branch, no PR yet, `gh` signed in) | `ChangesPanel.tsx` |
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |

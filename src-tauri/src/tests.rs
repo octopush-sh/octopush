@@ -6586,6 +6586,56 @@ mod orchestrator_tests {
         assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
+    /// An abort leaves the parked stage at `awaiting_checkpoint`. A late
+    /// decision on that run (a Send-back from Review's comment tray, a stale
+    /// Approve) is refused and changes nothing; only Abort still passes.
+    #[tokio::test]
+    async fn a_decision_on_a_finished_run_is_refused_and_changes_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "review", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let art = serde_json::to_string(&StageArtifact {
+            kind: ArtifactKind::Note, text: "findings".into(), payload: None, refs_worktree: false,
+        }).unwrap();
+        db.lock().set_run_stage_status(&id, "running").unwrap();
+        db.lock().complete_run_stage(&id, "awaiting_checkpoint", 0, 0, 0, 0, 0.0, Some(&art)).unwrap();
+        db.lock().set_run_status(&run_id, "paused", false).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // A run that is still waiting accepts decisions.
+        assert!(orch.check_run_open(&run_id, &CheckpointAction::Approve).is_ok());
+
+        for ended in ["aborted", "completed", "failed"] {
+            db.lock().set_run_status(&run_id, ended, true).unwrap();
+            let actions = || [
+                CheckpointAction::Approve,
+                CheckpointAction::SendBack { feedback: Some("change this".into()) },
+                CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None },
+                CheckpointAction::Resume { max_turns_override: None },
+            ];
+            for action in actions() {
+                let err = orch.check_run_open(&run_id, &action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            for action in actions() {
+                let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&id), action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            let err = orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the parked stage is untouched");
+            assert_eq!(stage.artifact.as_deref(), Some(art.as_str()), "its hand-off is kept");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, ended, "the run stays {ended}");
+            // Abort tears the run down whatever its state.
+            assert!(orch.check_run_open(&run_id, &CheckpointAction::Abort).is_ok());
+        }
+        assert_eq!(orch.resolve_checkpoint_apply_only(&run_id, Some(&id), CheckpointAction::Abort).unwrap(), None);
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";
@@ -9087,27 +9137,26 @@ mod orchestrator_tests {
     }
 
     /// The target's feedback column receives the composed findings+note before
-    /// the re-run starts (checked mid-flight via the archive-free path: a fresh
-    /// loop with no auto-drive). Uses loop_back's persisted effect directly.
+    /// the re-run starts. Checked through the apply-only path, which makes the
+    /// loop-back's changes and leaves the re-drive to its caller, so the
+    /// pending target still holds its feedback. (A send-back on an aborted run,
+    /// which this test once used to skip the re-drive, is refused.)
     #[tokio::test]
     async fn send_back_target_feedback_column_gets_composed_findings() {
         let (orch, run_id, db) = looped_run(1);
         orch.run_to_pause(&run_id).await.unwrap();
-        // Stop the re-drive from consuming the feedback: abort the run after
-        // the loop-back by checking the column straight after resolve starts is
-        // racy — instead mark the run aborted so resolve_checkpoint's re-drive
-        // is a no-op and the pending target keeps its feedback.
-        db.lock().set_run_status(&run_id, "aborted", true).unwrap();
-        orch.resolve_checkpoint(
+        let redrive = orch.resolve_checkpoint_apply_only(
             &run_id,
+            None,
             CheckpointAction::SendBack { feedback: Some("polish".into()) },
-        ).await.unwrap();
+        ).unwrap();
+        assert!(redrive.is_some(), "the run wants driving again");
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(
             stages[0].feedback.as_deref(),
             Some("did code_review\n\nDirector's note: polish"),
         );
-        assert_eq!(stages[0].status, "pending"); // reset, not re-run (aborted)
+        assert_eq!(stages[0].status, "pending"); // reset, not yet re-run
     }
 
     /// A runner whose review-role output carries a verdict; everything else Done.
@@ -22922,6 +22971,286 @@ mod secret_guard_tests {
                 fp(format!("{m}\n{footer}\n"), vec![header.as_str(), b1.as_str(), b2.as_str(), m, footer.as_str()], 3, staged)
             };
             assert_ne!(tail(&m1), tail(&m2), "the key's unchanged rest (staged: {staged})");
+        }
+    }
+
+    /// An added header over a key body the diff didn't touch is still a
+    /// private key, hashed whole; a header that only names itself in code
+    /// stays quiet.
+    #[test]
+    fn an_added_header_over_an_unchanged_body_is_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(560, 64, B64), rnd(561, 64, B64));
+        let f = AddedFile {
+            path: "deploy.txt".into(),
+            lines: vec![(1, header.clone())],
+            unchanged: std::collections::BTreeMap::from([(0, vec![b1.clone(), footer.clone()])]),
+            ..Default::default()
+        };
+        let r = scan_report(&[f], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        let quiet = AddedFile {
+            path: "src/pem.ts".into(),
+            lines: vec![(1, format!("const HEADER = \"{header}\";"))],
+            unchanged: std::collections::BTreeMap::from([(0, vec!["export default HEADER;".into()])]),
+            ..Default::default()
+        };
+        assert!(scan_added(&[quiet], &[]).is_empty());
+
+        let fp = |b2: &str, staged: bool| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{b1}\n{b2}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("deploy.txt"), format!("{header}\n{b1}\n{b2}\n{footer}\n")).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 1, "only the header is added: {:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            let keys: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").collect();
+            assert_eq!(keys.len(), 1, "{:?}", r.findings);
+            assert_eq!(keys[0].line, Some(1));
+            r.fingerprint
+        };
+        for staged in [true, false] {
+            assert_ne!(fp(&b2, staged), fp(&rnd(562, 64, B64), staged), "hashed whole (staged: {staged})");
+        }
+    }
+
+    /// A range scan appends one diff per commit (newest first). A key's walk
+    /// stays in its own commit's lines and reads its unchanged rest from that
+    /// commit's file, not from an older commit's line that happens to carry
+    /// the next number.
+    #[test]
+    fn a_pem_walk_in_a_range_stays_in_its_own_commit() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(570, 64, B64);
+        let fps = |m: &str| -> Vec<String> {
+            let (dir, repo) = repo();
+            let k = dir.path().join("k.txt");
+            std::fs::write(&k, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("feature", &head, false).unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+            // The older commit adds line 3; the newer one adds the header
+            // and first body line, so its key reads on through line 3 (`m`).
+            std::fs::write(&k, format!("{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "a note");
+            std::fs::write(&k, format!("{header}\n{b1}\n{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "the key");
+            [
+                ("history", branch_files(dir.path(), "main")),
+                ("pr", pr_files(dir.path(), "main")),
+                ("push", push_files(dir.path())),
+            ]
+            .into_iter()
+            .map(|(scope, c)| {
+                let c = c.unwrap();
+                let f = c.files.iter().find(|f| f.path == "k.txt").unwrap();
+                let at = f.lines.iter().position(|(_, l)| *l == header).unwrap();
+                assert_eq!(f.lines.get(at + 2), Some(&(3, "note".to_string())), "{scope}: {:?}", f.lines);
+                let r = scan_collected(&c, &[]);
+                assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{scope}: {:?}", r.findings);
+                r.fingerprint
+            })
+            .collect()
+        };
+        let (a, b) = (fps(&rnd(571, 64, B64)), fps(&rnd(572, 64, B64)));
+        for (scope, (x, y)) in ["history", "pr", "push"].iter().zip(a.iter().zip(&b)) {
+            assert_ne!(x, y, "{scope}: the key's unchanged line counts, the older commit's doesn't");
+        }
+    }
+
+    /// A key with no END line runs on into the file's unchanged rest, up to
+    /// the next header, the end of the file or 64 KB, so editing the text
+    /// below it asks again. Fail-safe: a confirm never covers what it didn't see.
+    #[test]
+    fn a_truncated_key_hashes_the_unchanged_text_below_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(575, 64, B64), rnd(576, 64, B64));
+        let fp = |tail: &str| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("notes.txt"), format!("{tail}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("notes.txt"), format!("{header}\n{b1}\n{b2}\n{tail}\n")).unwrap();
+            stage(&repo, "notes.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert_eq!(c.files[0].lines.len(), 3, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp("see the runbook"), fp("see the wiki"));
+    }
+
+    /// Reading a file's new side to hash a key whole counts against the scan
+    /// budget: one past what is left marks the scan partial and names the file.
+    #[test]
+    fn reading_a_new_side_for_a_key_counts_against_the_budget() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (dir, repo) = repo();
+        let big = dir.path().join("big.txt");
+        // About 10 MB: one new side fits the 16 MB budget, two don't.
+        let filler: String = (0..10_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        std::fs::write(&big, &filler).unwrap();
+        commit_all(&repo, "base");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        for (seed, partial) in [(580, false), (581, true)] {
+            let cur = std::fs::read_to_string(&big).unwrap();
+            std::fs::write(&big, format!("{header}\n{}\n{cur}", rnd(seed, 64, B64))).unwrap();
+            commit_all(&repo, "a key on top");
+            let c = branch_files(dir.path(), "main").unwrap();
+            assert_eq!(c.partial, partial, "{:?}", c.unscanned);
+            assert_eq!(c.unscanned.iter().any(|u| u.starts_with("big.txt@")), partial, "{:?}", c.unscanned);
+        }
+    }
+
+    /// The new side is read only when a key reaches a line the diff didn't
+    /// add, and the added lines it holds aren't counted twice: a large file
+    /// with a key in it isn't partial when every line was scanned.
+    #[test]
+    fn a_new_side_is_read_only_when_a_key_needs_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(600, 64, B64);
+        let whole = vec![(1, header.clone()), (2, b1.clone()), (3, footer.clone())];
+        assert!(!pem_needs_new_side(&whole));
+        assert!(pem_needs_new_side(&whole[..2]), "no END among the added lines");
+        assert!(pem_needs_new_side(&[(1, header.clone()), (3, footer.clone())]), "a gap inside the key");
+        assert!(!pem_needs_new_side(&[(1, "no key here".to_string())]));
+
+        // About 9 MB: more than the budget left once the diff has read it.
+        let filler: String = (0..9_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        // A newly added file holding a whole key.
+        {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("bundle.txt"), format!("{filler}{header}\n{b1}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        }
+
+        // A modified file whose key reads on into an unchanged line: the
+        // read is needed, but the added lines it holds were already counted.
+        let fp = |m: &str| {
+            let (dir, repo) = repo();
+            let p = dir.path().join("bundle.txt");
+            std::fs::write(&p, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(&p, format!("{filler}{header}\n{b1}\n{m}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp(&rnd(601, 64, B64)), fp(&rnd(602, 64, B64)), "the unchanged line is hashed");
+    }
+
+    /// The new side must hold the diff's lines where the diff saw them: a
+    /// clean filter's output (a Git LFS pointer, git-crypt ciphertext) or a
+    /// file rewritten since lends its lines to no key. CRLF still matches.
+    #[test]
+    fn a_new_side_unlike_the_diff_fills_nothing() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, mid) = (rnd(585, 64, B64), rnd(586, 64, B64));
+        let lines = vec![(1, header.clone()), (2, b1.clone())];
+        let same = format!("{header}\n{b1}\n{mid}\n{footer}\n");
+        let want = vec![mid.clone(), footer.clone()];
+        assert_eq!(pem_unchanged(&lines, &same).get(&1), Some(&want));
+        assert_eq!(pem_unchanged(&lines, &same.replace('\n', "\r\n")).get(&1), Some(&want), "CRLF");
+        let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1704\n", rnd(587, 64, "0123456789abcdef"));
+        assert!(pem_unchanged(&lines, &pointer).is_empty());
+        let moved = format!("# moved\n{same}");
+        assert!(pem_unchanged(&lines, &moved).is_empty(), "the lines aren't at the diff's numbers");
+    }
+
+    /// A CRLF key split by an unchanged line is hashed whole, with or without
+    /// `core.autocrlf`, staged or not.
+    #[test]
+    fn a_crlf_key_split_by_an_unchanged_line_is_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(590, 64, B64), rnd(591, 64, B64));
+        let fp = |m: &str, autocrlf: bool, staged: bool| {
+            let (dir, repo) = repo();
+            repo.config().unwrap().set_bool("core.autocrlf", autocrlf).unwrap();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{m}\r\n")).unwrap();
+            commit_all(&repo, "base");
+            let key = [header.as_str(), b1.as_str(), m, b2.as_str(), footer.as_str()].join("\r\n") + "\r\n";
+            std::fs::write(dir.path().join("deploy.txt"), key).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 4, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (m1, m2) = (rnd(592, 64, B64), rnd(593, 64, B64));
+        for autocrlf in [false, true] {
+            for staged in [true, false] {
+                assert_ne!(fp(&m1, autocrlf, staged), fp(&m2, autocrlf, staged), "autocrlf {autocrlf}, staged {staged}");
+            }
+        }
+    }
+
+    /// Two keys in one file, apart by unchanged lines and each with an
+    /// unchanged line inside: each is hashed whole, and neither runs into
+    /// the other.
+    #[test]
+    fn two_keys_apart_in_a_repo_are_each_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, m1, b2, m2) = (rnd(595, 64, B64), rnd(596, 64, B64), rnd(597, 64, B64), rnd(598, 64, B64));
+        for staged in [true, false] {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("keys.txt"), format!("{m1}\nsep one\nsep two\n{m2}\n")).unwrap();
+            commit_all(&repo, "base");
+            let (h, e) = (header.as_str(), footer.as_str());
+            let new = [h, b1.as_str(), m1.as_str(), e, "sep one", "sep two", h, b2.as_str(), m2.as_str(), e];
+            std::fs::write(dir.path().join("keys.txt"), new.join("\n") + "\n").unwrap();
+            let c = if staged {
+                stage(&repo, "keys.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            let f = &c.files[0];
+            let numbers: Vec<u32> = f.lines.iter().map(|(n, _)| *n).collect();
+            assert_eq!(numbers, [1, 2, 4, 7, 8, 10], "staged: {staged}");
+            let r = scan_report(&c.files, &[], c.partial);
+            let at: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").map(|f| f.line).collect();
+            assert_eq!(at, [Some(1), Some(7)], "staged: {staged}: {:?}", r.findings);
+            let k1 = pem_block(&f.lines, &f.unchanged, 0, 0, &header);
+            let k2 = pem_block(&f.lines, &f.unchanged, 3, 0, &header);
+            for part in [&b1, &m1, &footer] {
+                assert!(k1.contains(part.as_str()), "first key misses {part} (staged: {staged})");
+            }
+            for part in [&b2, &m2, &footer] {
+                assert!(k2.contains(part.as_str()), "second key misses {part} (staged: {staged})");
+            }
+            assert!(!k1.contains("sep one") && !k1.contains(&b2), "the first key ran on (staged: {staged})");
+            assert!(!k2.contains(&b1), "staged: {staged}");
         }
     }
 

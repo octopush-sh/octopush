@@ -147,6 +147,11 @@ pub(crate) fn stale_stage_error() -> AppError {
     AppError::Other("This stage was already decided — refresh to see what's waiting.".into())
 }
 
+/// A decision reached a run that has already ended.
+pub(crate) fn finished_run_error(status: &str) -> AppError {
+    AppError::Other(format!("This run is {status} — nothing is waiting for a decision."))
+}
+
 /// Format the director's answers to a blocked stage's `ask_director` questions
 /// into the feedback block that `user_input_for` injects on the re-run. Answers
 /// are positional; a missing or empty answer falls back to that question's
@@ -2397,6 +2402,26 @@ impl Orchestrator {
         self.apply_checkpoint_action(run_id, stage_id, action)
     }
 
+    /// Refuse every decision but Abort on a run that has ended (completed,
+    /// aborted or failed). An abort leaves the parked stage at
+    /// `awaiting_checkpoint`, so without this a late Approve or Send-back
+    /// would archive and reset stages of a run nobody drives any more.
+    /// `dispatch_checkpoint` calls it so the caller hears the refusal on the
+    /// in-process path too; the apply itself checks again
+    /// (`apply_checkpoint_action`). A run that isn't found is left to the
+    /// existing checks.
+    pub fn check_run_open(&self, run_id: &str, action: &CheckpointAction) -> AppResult<()> {
+        if matches!(action, CheckpointAction::Abort) {
+            return Ok(());
+        }
+        match self.db.lock().get_run(run_id)? {
+            Some(run) if matches!(run.status.as_str(), "completed" | "aborted" | "failed") => {
+                Err(finished_run_error(&run.status))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Refuse a decision on a named stage that is no longer waiting for one
     /// (decided elsewhere since the caller looked), before anything changes.
     /// `dispatch_checkpoint` calls it so the in-process path, which applies
@@ -2433,6 +2458,7 @@ impl Orchestrator {
         stage_id: Option<&str>,
         action: CheckpointAction,
     ) -> AppResult<Option<bool>> {
+        self.check_run_open(run_id, &action)?;
         let stages = self.db.lock().list_run_stages(run_id)?;
         let is_resolvable =
             |s: &crate::db::RunStageRow| s.status == "awaiting_checkpoint" || s.status == "failed";
