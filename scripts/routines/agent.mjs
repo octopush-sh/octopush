@@ -68,15 +68,28 @@ export const ROLES = {
  * the home directory (the repo itself lives under it on GitHub runners, so the
  * home as a whole stays readable), the runner's temp dir and git config.
  */
-export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
+export function denyRules(runnerTemp = process.env.RUNNER_TEMP, extra = []) {
   const paths = [
     "//proc/**", "//sys/**", "//etc/**", "//root/**",
     "~/.claude/**", "~/.claude.json", "~/.config/**", "~/.ssh/**", "~/.gitconfig", "~/.git-credentials",
     "~/.npmrc", "~/.docker/**", "~/.aws/**",
     ...(runnerTemp ? [`/${runnerTemp}/**`] : []),
     "./.git/config", "./.git/**/config",
+    ...extra.map((d) => `./${d}/**`),
   ];
   return paths.flatMap((p) => [`Read(${p})`, `Edit(${p})`]);
+}
+
+/**
+ * Extra directories of the checkout no file tool may read or write
+ * (OCTOPUSH_AGENT_DENY, colon-separated, relative; pure). epiku-build.yml sets
+ * `data`: the real project plans, which the checks need on disk (the code
+ * imports them) but the agent has no reason to open.
+ */
+export function extraDeny(value = process.env.OCTOPUSH_AGENT_DENY) {
+  const dirs = String(value ?? "").split(":").filter(Boolean);
+  for (const d of dirs) if (!/^[A-Za-z0-9_][A-Za-z0-9._-]*(\/[A-Za-z0-9_][A-Za-z0-9._-]*)*$/.test(d)) throw new Error("OCTOPUSH_AGENT_DENY takes plain relative directories");
+  return dirs;
 }
 
 /**
@@ -85,10 +98,10 @@ export function denyRules(runnerTemp = process.env.RUNNER_TEMP) {
  * thread passes Linux's 128 KiB limit on a single argument (E2BIG), and the
  * agent then never starts.
  */
-export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd()) {
+export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = process.cwd(), deny = extraDeny()) {
   const r = ROLES[role];
   if (!r) throw new Error(`unknown role "${role}" (${Object.keys(ROLES).join(" | ")})`);
-  const settings = { permissions: { allow: r.allow(cwd), deny: denyRules(runnerTemp) } };
+  const settings = { permissions: { allow: r.allow(cwd), deny: denyRules(runnerTemp, deny) } };
   return [
     "-p",
     "--model", process.env.OCTOPUSH_AGENT_MODEL || r.model,
@@ -105,18 +118,23 @@ export function claudeArgs(role, runnerTemp = process.env.RUNNER_TEMP, cwd = pro
 /**
  * A safe summary of the tool calls Claude denied: tool names and counts only
  * (pure, tested). Never a path, pattern or command — those are chosen by the
- * agent and the Actions log is public.
+ * agent and the Actions log is public. The tool name is the model's choice too
+ * (it can ask for a tool that doesn't exist, named as it likes), and the result
+ * subtype comes out of its run: both are printed only when they are one of the
+ * fixed names below.
  */
+const KNOWN_TOOLS = new Set(["Read", "Glob", "Grep", "Edit", "Write", "MultiEdit", "NotebookEdit", "Bash", "WebSearch", "WebFetch", "Task", "TodoWrite"]);
+const KNOWN_SUBTYPES = new Set(["error_max_turns", "error_during_execution", "error_max_budget_usd", "error"]);
 export function denialSummary(resultJson) {
   let r;
   try { r = JSON.parse(resultJson); } catch { return ["(no result object — the agent didn't finish normally)"]; }
   const counts = new Map();
   for (const d of r.permission_denials ?? []) {
-    const name = /^[A-Za-z][A-Za-z0-9_]{0,40}$/.test(d.tool_name ?? "") ? d.tool_name : "(other tool)";
+    const name = KNOWN_TOOLS.has(d.tool_name) ? d.tool_name : "(other tool)";
     counts.set(name, (counts.get(name) ?? 0) + 1);
   }
   const lines = [...counts].map(([name, n]) => `denied: ${name} ×${n}`);
-  if (r.is_error || r.subtype && r.subtype !== "success") lines.push(`result: ${/^[a-z_]{1,40}$/.test(r.subtype ?? "") ? r.subtype : "error"}`);
+  if (r.is_error || r.subtype && r.subtype !== "success") lines.push(`result: ${KNOWN_SUBTYPES.has(r.subtype) ? r.subtype : "error"}`);
   return lines;
 }
 

@@ -13,6 +13,11 @@
 // GH_TOKEN. App-token pushes start the web repo's CI themselves (only
 // GITHUB_TOKEN pushes don't), so nothing is dispatched there.
 //
+// For epiku (epiku-build.yml; a PRIVATE repo) it does the same with
+// OCTOPUSH_EPIKU_TOKEN and Epiku's human-only paths, needs no token for this
+// repo, names its branch `agent/issue-<n>` (no title in it: branch names show
+// in this public repo's Actions log) and prints numbers only.
+//
 // Reads .agent-out/result.json:
 //   { "action": "pr",     "title": "…", "summary": "…" }   new work for an issue
 //   { "action": "update", "summary": "…" }                  fixes pushed to an existing PR
@@ -24,7 +29,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, rmSync, lstatSync } from "node:fs";
 import { join } from "node:path";
-import { makeGh, ghForRepo, APP_REPO, WEB_REPO, labelsOf, sanitize, reportFatal } from "./gh.mjs";
+import { makeGh, ghForRepo, APP_REPO, WEB_REPO, EPIKU_REPO, tokenEnvFor, isPrivateLane, markPrivate, safeError, labelsOf, sanitize, reportFatal } from "./gh.mjs";
 import { humanOnlyFor } from "./automerge.mjs";
 
 export const MAX_TITLE = 90;
@@ -38,6 +43,7 @@ const forbiddenFor = (repo) => [...humanOnlyFor(repo), /^\.agent-out\//, /^\.age
 // run leaves behind (#383 shipped a 2,500-test Vitest dump with runner paths).
 export const CACHE = [
   /(^|\/)node_modules\//, /(^|\/)\.vite\//, /\.tsbuildinfo$/, /^coverage\//, /(^|\/)\.vitest/, /^dist\//, /(^|\/)\.astro\//,
+  /^\.next\//, /^next-env\.d\.ts$/, /(^|\/)__pycache__\//, /\.pyc$/, // epiku: Next's build and typegen output, Python's bytecode
   /(^|\/)vitest-report[^/]*\.json$/, /(^|\/)[^/]*\.tmp\.json$/, /(^|\/)junit[^/]*\.xml$/,
 ];
 export const KINDS = ["issue", "pr", "app-issue"];
@@ -87,8 +93,9 @@ export function leaks(texts, secrets) {
   return texts.some((t) => s.some((x) => t.includes(x)));
 }
 
-export const branchFor = (n, title, kind = "issue") =>
-  `agent/${kind === "app-issue" ? "app-issue" : "issue"}-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
+export const branchFor = (n, title, kind = "issue", repo = APP_REPO) =>
+  // A private lane's branch carries the number only (see the header).
+  isPrivateLane(repo) ? `agent/issue-${n}` : `agent/${kind === "app-issue" ? "app-issue" : "issue"}-${n}-${title.toLowerCase().normalize("NFD").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40)}`;
 
 /** Paths an agent may not change in `repo` (pure). */
 export const forbiddenPaths = (paths, repo = APP_REPO) => paths.filter((p) => forbiddenFor(repo).some((re) => re.test(p)));
@@ -102,8 +109,14 @@ const botIdentity = (env = process.env) => {
 // Never run hooks, fsmonitor or filters from anything the agent could have written.
 const SAFE = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "protocol.file.allow=never"];
 
+// A private lane: git's stderr is captured, never inherited — its warnings and
+// errors name files ("could not open directory …", "adding embedded git
+// repository: …"). The step that failed is all that is reported (privateFailure).
+let QUIET = false;
+let STAGE = "start";
 function git(gitDir, args, opts = {}) {
-  return execFileSync("git", [...SAFE, `--git-dir=${gitDir}`, `--work-tree=${process.cwd()}`, ...args], { encoding: "utf8", ...opts });
+  return execFileSync("git", [...SAFE, `--git-dir=${gitDir}`, `--work-tree=${process.cwd()}`, ...args],
+    { encoding: "utf8", ...(QUIET ? { stdio: ["pipe", "pipe", "pipe"] } : {}), ...opts });
 }
 
 /**
@@ -143,13 +156,37 @@ async function main() {
   const repo = process.env.OCTOPUSH_PUBLISH_REPO || process.env.GITHUB_REPOSITORY;
   const gitDir = process.env.OCTOPUSH_GIT_DIR;
   const web = repo === WEB_REPO;
-  const token = web ? process.env.OCTOPUSH_WEB_TOKEN : process.env.GH_TOKEN;
-  if (!repo || !gitDir || !token) throw new Error(`the repo, OCTOPUSH_GIT_DIR and ${web ? "OCTOPUSH_WEB_TOKEN" : "GH_TOKEN"} are required`);
+  if (!repo) throw new Error("OCTOPUSH_PUBLISH_REPO or GITHUB_REPOSITORY is required");
+  markPrivate(repo);
+  // The repo's own token: the App's installation token for octopush-web and epiku, GH_TOKEN here.
+  const tokenEnv = tokenEnvFor(repo) ?? "GH_TOKEN";
+  const token = process.env[tokenEnv];
+  if (!gitDir || !token) throw new Error(`OCTOPUSH_GIT_DIR and ${tokenEnv} are required`);
   if (kind === "app-issue" && !web) throw new Error("app-issue jobs are built in octopush-web");
+  // A private lane's merge guard accepts only commits by the App's bot (automerge.mjs commitsByBot):
+  // never fall back to another commit identity there.
+  if (isPrivateLane(repo) && botIdentity().some((a) => a.includes("github-actions[bot]"))) throw safeError("OCTOPUSH_GIT_NAME and OCTOPUSH_GIT_EMAIL (the App bot's commit identity) are required");
   if (web && !process.env.GH_TOKEN) throw new Error("GH_TOKEN (the app repo) is required for web jobs");
   // Every token-holding value must be scanned for, not only the Claude one.
   const secrets = (process.env.OCTOPUSH_SECRETS ?? "").split("\n");
-  return publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
+  try {
+    return await publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh: ghForRepo(repo), appGh: makeGh() });
+  } catch (e) {
+    throw isPrivateLane(repo) ? privateFailure(e) : e;
+  }
+}
+
+/**
+ * A failed command's message carries its whole command line and its stderr —
+ * for `git commit` that includes the PR title, for `git add` file names. For a
+ * private repo only the step that failed (a fixed word) and the exit status
+ * may reach this public repo's log (pure).
+ */
+export const STAGES = ["start", "result", "status", "stage", "commit", "push", "github"];
+export function privateFailure(e, stage = STAGE) {
+  const at = STAGES.includes(stage) ? stage : "start";
+  const how = Number.isInteger(e?.status) ? `exit ${e.status}` : "error";
+  return safeError(`publishing to a private repo failed at ${at} (${how}); details withheld from this public log`);
 }
 
 /**
@@ -157,6 +194,8 @@ async function main() {
  * checkout). `pushUrl` is only for tests (a local bare repo).
  */
 export async function publish({ kind, n, existingBranch, repo, gitDir, token, secrets, gh, appGh = gh, pushUrl }) {
+  QUIET = isPrivateLane(repo);
+  STAGE = "result";
   // Where the job's issue lives: an app-issue job's issue is in the app repo.
   const [jobGh, jobRepo] = kind === "app-issue" ? [appGh, APP_REPO] : [gh, repo];
   const file = join(".agent-out", "result.json");
@@ -169,6 +208,7 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
 
   // The path checks run on ALL changed paths first; caches are dropped only
   // after (the secret scan reads only what will be committed).
+  STAGE = "status";
   const entries = changedPaths(gitDir);
   const all = entries.map((e) => e.path);
   if (!all.length) { park(jobGh, jobRepo, kind, n, "It reported success but changed no files."); return 1; }
@@ -189,24 +229,31 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
     return 1;
   }
 
-  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind);
+  const branch = kind === "pr" ? existingBranch : branchFor(n, r.title, kind, repo);
   if (!branch) throw new Error("a PR job needs its branch");
   const closes = kind === "app-issue" ? `Closes ${APP_REPO}#${n}` : `Closes #${n}`;
+  STAGE = "stage";
   // Literal pathspecs from stdin: a file named "*" or ":(glob)**" is just a name.
   git(gitDir, ["--literal-pathspecs", "add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"], { input: paths.join("\0") });
+  STAGE = "commit";
   git(gitDir, [...botIdentity(), "commit", "--quiet", "--no-verify", "-m", kind === "pr" ? `Address review on #${n}` : `${r.title.slice(0, 72)}\n\n${closes}`]);
   const auth = Buffer.from(`x-access-token:${token}`).toString("base64");
   // The token reaches git through the environment, never argv (visible in the process table).
   const authEnv = { ...process.env, GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "http.https://github.com/.extraheader", GIT_CONFIG_VALUE_0: `AUTHORIZATION: basic ${auth}` };
+  STAGE = "push";
   git(gitDir, [...(pushUrl ? ["-c", "protocol.file.allow=always"] : []),
     "push", "--quiet", ...(kind !== "pr" ? ["--force"] : []), pushUrl ?? `https://github.com/${repo}.git`, `HEAD:refs/heads/${branch}`], { env: authEnv });
 
+  STAGE = "github";
   const web = repo === WEB_REPO;
-  const workflow = web ? "web-build.yml" : "nightly-build.yml";
+  const epiku = repo === EPIKU_REPO;
+  const workflow = web ? "web-build.yml" : epiku ? "epiku-build.yml" : "nightly-build.yml";
   let prNumber = n;
   if (kind !== "pr") {
     const open = gh.list(`repos/${repo}/pulls?state=open&head=${repo.split("/")[0]}:${branch}`);
-    const decides = web ? "The web review judges it; the owner merges website PRs (merging publishes)" : "The nightly review decides";
+    const decides = web ? "The web review judges it; the owner merges website PRs (merging publishes)"
+      : epiku ? "An independent adversarial review judges it; a fixed script then merges it only if every auto-merge rule of VISION.md §2 holds on the reviewed commit, and parks it for the owner otherwise"
+      : "The nightly review decides";
     const body = `${closes}\n\n${defuseClosing(sanitize(r.summary))}\n\n---\n_Opened by the nightly builder (\`${workflow}\` in ${APP_REPO}). ${decides}; see docs/ROUTINES.md._`;
     const pr = open[0] ?? gh.send("POST", `repos/${repo}/pulls`, { title: defuseClosing(sanitize(r.title)), head: branch, base: "main", body });
     prNumber = pr.number;
@@ -218,8 +265,8 @@ export async function publish({ kind, n, existingBranch, repo, gitDir, token, se
   }
   // Pushes made with GITHUB_TOKEN don't start workflows: dispatch the app's CI
   // explicitly. App installation-token pushes (the web repo) start it on their own.
-  if (!web) gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
-  console.log(`published ${kind} #${n} → ${web ? "web" : "PR "}#${prNumber} (${branch})`);
+  if (!tokenEnvFor(repo)) gh.send("POST", `repos/${repo}/actions/workflows/ci.yml/dispatches`, { ref: branch });
+  console.log(epiku ? `published ${kind} #${n} → epiku#${prNumber}` : `published ${kind} #${n} → ${web ? "web" : "PR "}#${prNumber} (${branch})`);
   return 0;
 }
 
