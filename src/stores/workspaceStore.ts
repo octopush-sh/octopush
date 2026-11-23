@@ -37,6 +37,9 @@ interface WorkspaceState {
   gitSummaryByWs: Record<string, WorkspaceGitSummary>;
   /** Open PR per workspace id (null = none), for the rail indicator. */
   prByWs: Record<string, Pr | null>;
+  /** The merged PR of each mission that is merged and clean
+   *  (`merged_workspaces`); absent = not merged, or not clean. */
+  mergedPrByWs: Record<string, Pr>;
 
   load: (projectId: string) => Promise<void>;
   /** The startup restore is reopening the last project: what the loads make
@@ -84,6 +87,8 @@ interface WorkspaceState {
   loadGitSummaries: (projectId: string) => Promise<void>;
   /** Fetch a project's open PRs (gh batch) and map them onto its workspaces by branch. */
   loadProjectPrs: (projectId: string, projectPath: string) => Promise<void>;
+  /** Fetch which of a project's missions are merged and clean (`merged_workspaces`). */
+  loadMergedPrs: (projectId: string, projectPath: string) => Promise<void>;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -131,6 +136,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   workspacesByProjectId: {},
   gitSummaryByWs: {},
   prByWs: {},
+  mergedPrByWs: {},
 
   load: async (projectId) => {
     set({ loading: true });
@@ -356,11 +362,13 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       }
       const { [workspaceId]: _dropped, ...nextSummaries } = s.gitSummaryByWs;
       const { [workspaceId]: _droppedPr, ...nextPrs } = s.prByWs;
+      const { [workspaceId]: _droppedMerged, ...nextMerged } = s.mergedPrByWs;
       return {
         workspaces: s.workspaces.filter((w) => w.id !== workspaceId),
         workspacesByProjectId: nextByProject,
         gitSummaryByWs: nextSummaries,
         prByWs: nextPrs,
+        mergedPrByWs: nextMerged,
         activeId: s.activeId === workspaceId ? null : s.activeId,
       };
     });
@@ -395,7 +403,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       for (const id of removedIds) delete nextSummaries[id];
       const nextPrs = { ...s.prByWs };
       for (const id of removedIds) delete nextPrs[id];
+      const nextMerged = { ...s.mergedPrByWs };
+      for (const id of removedIds) delete nextMerged[id];
       return {
+        mergedPrByWs: nextMerged,
         workspacesByProjectId: restByProject,
         workspaces: activeWasPruned ? [] : s.workspaces,
         activeId: activeWasPruned ? null : s.activeId,
@@ -423,6 +434,8 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     if (now - (prFetchLastAt.get(projectId) ?? 0) < 15_000) return;
     prFetchLastAt.set(projectId, now);
     prFetchInFlight.add(projectId);
+    // Under the same throttle: one more `gh` call, for "Merged · archive?".
+    const merged = get().loadMergedPrs(projectId, projectPath);
     try {
       const branchPrs = await ipc.openPrsForProject(projectPath);
       const byBranch = new Map(branchPrs.map((bp) => [bp.branch, bp.pr]));
@@ -435,7 +448,26 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     } catch {
       // Non-critical — no PR indicators for this project.
     } finally {
+      await merged;
       prFetchInFlight.delete(projectId);
+    }
+  },
+
+  loadMergedPrs: async (projectId, projectPath) => {
+    try {
+      const merged = await ipc.mergedWorkspaces(projectId, projectPath);
+      const byWs = new Map(merged.map((m) => [m.workspaceId, m.pr]));
+      set((s) => {
+        const next = { ...s.mergedPrByWs };
+        for (const w of s.workspacesByProjectId[projectId] ?? []) {
+          const pr = byWs.get(w.id);
+          if (pr) next[w.id] = pr;
+          else delete next[w.id];
+        }
+        return { mergedPrByWs: next };
+      });
+    } catch {
+      // Non-critical — nothing is offered for archive in this project.
     }
   },
 

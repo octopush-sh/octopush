@@ -412,6 +412,7 @@ pub fn run() {
             commands::find_pr_for_branch,
             commands::pr_failed_check_logs,
             commands::open_prs_for_project,
+            commands::merged_workspaces,
             commands::list_prs,
             commands::list_github_issues,
             commands::github_ship_readiness,

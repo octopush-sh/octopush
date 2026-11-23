@@ -39,6 +39,17 @@ describe("ProjectContextMenu", () => {
     expect(screen.getByText(/Delete from disk/)).toBeInTheDocument();
   });
 
+  it("offers Archive merged missions… with its count only while there is one (#963)", () => {
+    const onArchiveMerged = vi.fn();
+    const { rerender } = render(<ProjectContextMenu {...baseProps} mergedCount={0} onArchiveMerged={onArchiveMerged} />);
+    expect(screen.queryByText("Archive merged missions…")).toBeNull();
+    rerender(<ProjectContextMenu {...baseProps} mergedCount={2} onArchiveMerged={onArchiveMerged} />);
+    const item = screen.getByRole("menuitem", { name: /Archive merged missions…/ });
+    expect(item).toHaveTextContent("2");
+    fireEvent.click(item);
+    expect(onArchiveMerged).toHaveBeenCalledTimes(1);
+  });
+
   it("does not render the dropped 'coming soon' stub items", () => {
     render(<ProjectContextMenu {...baseProps} />);
     expect(screen.queryByText(/Project settings/)).not.toBeInTheDocument();

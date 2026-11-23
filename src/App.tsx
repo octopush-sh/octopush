@@ -131,7 +131,9 @@ import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
 import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
-import type { GitStatus, TintName, Issue, ProjectInfo, Pr } from "./lib/types";
+import type { GitStatus, TintName, Issue, ProjectInfo, Pr, Workspace } from "./lib/types";
+import { archivableMissions, archiveMergedBody, runStatesByWs } from "./lib/railState";
+import { archiveMergedMissions } from "./lib/archiveMerged";
 import { prefillFixChecks } from "./lib/fixChecks";
 import { useIssuesStore } from "./stores/issuesStore";
 import { detectIssueKey, detectIssueKeyForProject } from "./lib/detectIssueKey";
@@ -176,6 +178,7 @@ function App() {
   const loadGitSummaries = useWorkspaceStore((s) => s.loadGitSummaries);
   const prByWs = useWorkspaceStore((s) => s.prByWs);
   const loadProjectPrs = useWorkspaceStore((s) => s.loadProjectPrs);
+  const mergedPrByWs = useWorkspaceStore((s) => s.mergedPrByWs);
   // The active mission's intent, derived from the active workspace (missions are
   // 1:1 with code workspaces). Drives the ContextHeader intent chip.
   const activeMissionIntent = useMissionsStore((s) =>
@@ -201,6 +204,8 @@ function App() {
     useShallow((s) => Object.keys(s.runsByWs).filter((id) => hasActiveDirectRun(s.runsByWs[id]))),
   );
   const loadActiveRuns = useRunsStore((s) => s.loadActiveRuns);
+  // What each mission's crews say (#963), for "Archive merged missions…".
+  const runStateByWs = useRunsStore(useShallow((s) => runStatesByWs(s.runsByWs)));
   // Hydrate the global runs tray on launch — surfaces background (running/paused)
   // runs in workspaces not opened this session. Live events keep it fresh after.
   useEffect(() => {
@@ -503,6 +508,8 @@ function App() {
     useShallow((s) => (projectMenuOpen ? projectGroupsOf(s.groups) : NO_GROUPS)),
   );
   const [archivedForProject, setArchivedForProject] = useState<{ id: string; name: string; path: string } | null>(null);
+  // "Archive merged missions…" (#963): the missions it lists, until confirmed.
+  const [archivingMerged, setArchivingMerged] = useState<{ projectId: string; path: string; missions: Workspace[] } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
 
@@ -2392,6 +2399,14 @@ function App() {
         isCollapsed={isRailCollapsed}
         onReorderProjects={(ids) => void setProjectOrderAction(ids)}
         shortcutByWs={shortcutByWs}
+        onArchiveMerged={(workspaceId) => {
+          const ws = Object.values(workspacesByProjectId).flat().find((w) => w.id === workspaceId);
+          const path = ws
+            ? (recentProjects.find((p) => p.id === ws.projectId)?.path ??
+              (project?.id === ws.projectId ? project.path : undefined))
+            : undefined;
+          if (ws && path) void archiveMergedMissions(ws.projectId, path, [ws]);
+        }}
       />
 
       <main className="mx-[var(--shell-gutter)] flex min-w-0 flex-1 flex-col overflow-hidden">
@@ -2964,6 +2979,15 @@ function App() {
         const stepUp = stepInRail(railLayout, proj.id, -1);
         const stepDown = stepInRail(railLayout, proj.id, 1);
         const projGroupId = projectScopeGroups.some((g) => g.id === proj.groupId) ? (proj.groupId ?? null) : null;
+        // Exactly the rows that say "merged · archive?" (#963).
+        const mergedMissions = archivableMissions(
+          workspacesByProjectId[proj.id] ?? [],
+          runStateByWs,
+          runningByWs,
+          mergedPrByWs,
+          prByWs,
+          gitSummaryByWs,
+        );
         const dismissProjectMenu = () => {
           const closing = projectContextMenu;
           setProjectContextMenu(null);
@@ -3013,6 +3037,11 @@ function App() {
               setArchivedForProject({ id: proj.id, name: proj.name, path: proj.path });
               setProjectContextMenu(null);
             }}
+            mergedCount={mergedMissions.length}
+            onArchiveMerged={() => {
+              setArchivingMerged({ projectId: proj.id, path: proj.path, missions: mergedMissions });
+              setProjectContextMenu(null);
+            }}
             onNewGroup={() => void createMissionGroup(proj.id)}
             projectGroups={projectScopeGroups}
             projectGroupId={projGroupId}
@@ -3059,6 +3088,26 @@ function App() {
             onClose={() => setArchivedForProject(null)}
           />
         </ModalShell>
+        </ErrorBoundary>
+      )}
+
+      {archivingMerged && (
+        <ErrorBoundary surface="Archive merged missions" variant="overlay" onDismiss={() => setArchivingMerged(null)}>
+          <ConfirmDialog
+            title={
+              archivingMerged.missions.length === 1
+                ? "Archive 1 merged mission?"
+                : `Archive ${archivingMerged.missions.length} merged missions?`
+            }
+            body={archiveMergedBody(archivingMerged.missions.map((w) => w.name || w.branch || "Mission"))}
+            destructiveLabel="Archive them"
+            onConfirm={() => {
+              const { projectId, path, missions } = archivingMerged;
+              setArchivingMerged(null);
+              void archiveMergedMissions(projectId, path, missions);
+            }}
+            onCancel={() => setArchivingMerged(null)}
+          />
         </ErrorBoundary>
       )}
 

@@ -54,6 +54,7 @@ const mockIpc = {
   archiveWorkspace: vi.fn(),
   renameWorkspace: vi.fn(),
   openPrsForProject: vi.fn(),
+  mergedWorkspaces: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -71,6 +72,7 @@ function resetStore() {
     workspacesByProjectId: {},
     gitSummaryByWs: {},
     prByWs: {},
+    mergedPrByWs: {},
     launchRestoredId: undefined,
   });
   __resetLaunchRestore();
@@ -689,6 +691,45 @@ describe("workspaceStore — prByWs", () => {
     const map = useWorkspaceStore.getState().prByWs;
     expect(map.other).toBeDefined();
     expect(map[a.id]).toBeNull();
+  });
+});
+
+describe("workspaceStore — mergedPrByWs (#963)", () => {
+  beforeEach(() => resetStore());
+  const merged = { number: 3, title: "M", url: "u3", isDraft: false, state: "merged" as const };
+
+  it("loads the project's merged-and-clean missions with its PRs, and forgets ones no longer listed", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    const b = makeWorkspace("p1", "beta");
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [a, b] },
+      mergedPrByWs: { [b.id]: merged, other: merged },
+    });
+    mockIpc.openPrsForProject.mockResolvedValueOnce([]);
+    mockIpc.mergedWorkspaces.mockResolvedValueOnce([{ workspaceId: a.id, pr: merged }]);
+
+    await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+
+    expect(mockIpc.mergedWorkspaces).toHaveBeenCalledWith("p1", "/repo/p1");
+    const map = useWorkspaceStore.getState().mergedPrByWs;
+    expect(map[a.id]?.number).toBe(3);
+    expect(map[b.id]).toBeUndefined();
+    expect(map.other).toBeDefined();
+  });
+
+  it("archive drops the mission's entry", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] }, mergedPrByWs: { [a.id]: merged } });
+    mockIpc.archiveWorkspace.mockResolvedValueOnce(undefined);
+    await useWorkspaceStore.getState().archive(a.id, "/repo", a.branch, a.worktreePath);
+    expect(useWorkspaceStore.getState().mergedPrByWs[a.id]).toBeUndefined();
+  });
+
+  it("a failed read leaves the map as it was", async () => {
+    useWorkspaceStore.setState({ mergedPrByWs: { x: merged } });
+    mockIpc.mergedWorkspaces.mockRejectedValueOnce(new Error("gh"));
+    await useWorkspaceStore.getState().loadMergedPrs("p1", "/repo/p1");
+    expect(useWorkspaceStore.getState().mergedPrByWs.x).toBeDefined();
   });
 });
 

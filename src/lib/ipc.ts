@@ -579,6 +579,7 @@ import type {
   BudgetStatus,
   BranchList,
   BranchPr,
+  MergedWorkspace,
   EditorChoice,
   ChatMessage,
   ChatThread,
@@ -1409,6 +1410,12 @@ export const ipc = {
 
   openPrsForProject: (projectPath: string) =>
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
+
+  /** The project's missions whose PR was merged at their worktree's HEAD,
+   *  with nothing changed in the worktree (never the project root). Empty
+   *  without `gh`. */
+  mergedWorkspaces: (projectId: string, projectPath: string) =>
+    invoke<MergedWorkspace[]>("merged_workspaces", { projectId, projectPath }),
 
   /** Open pull requests for the project, for "start a workspace from a PR".
    *  Rejects with a friendly message when the GitHub CLI is missing or not

@@ -6124,6 +6124,103 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
     Ok(parse_open_pr_list(&values))
 }
 
+/// A mission whose pull request was merged at its worktree's HEAD, with no
+/// changes left in the worktree: the rail offers to archive it (#963).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedWorkspace {
+    pub workspace_id: String,
+    pub pr: crate::github::Pr,
+}
+
+/// Parse `gh pr list --state merged --json …,headRefName,headRefOid` output
+/// into branch → (head commit, PR). Pure. The first entry of a branch wins:
+/// gh lists the most recent first. Entries without a branch or a head commit
+/// are skipped.
+pub(crate) fn parse_merged_heads(
+    values: &[serde_json::Value],
+) -> std::collections::HashMap<String, (String, crate::github::Pr)> {
+    let mut out = std::collections::HashMap::new();
+    for v in values {
+        let Some(oid) = v.get("headRefOid").and_then(|x| x.as_str()) else { continue };
+        if oid.is_empty() {
+            continue;
+        }
+        let Some(BranchPr { branch, pr }) = parse_open_pr_list(std::slice::from_ref(v)).pop() else {
+            continue;
+        };
+        out.entry(branch).or_insert((oid.to_string(), pr));
+    }
+    out
+}
+
+/// Whether a worktree is merged and clean: the merged PR's head commit is
+/// exactly the worktree's HEAD (no commits came after the merge, and a reused
+/// branch name never matches) and nothing is changed or untracked. Pure.
+pub(crate) fn is_merged_and_clean(head: Option<&str>, merged_head: &str, dirty: bool) -> bool {
+    !dirty && head == Some(merged_head)
+}
+
+/// Batch: the project's missions that are merged and clean
+/// (`is_merged_and_clean`), for the rail's "Merged · archive?" and the
+/// project menu's "Archive merged missions…". The project root (its main
+/// workspace) is never listed. Returns an empty list, never an error, when gh
+/// is missing/unauthed or the repo isn't on GitHub.
+#[tauri::command]
+pub async fn merged_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+    project_path: String,
+) -> AppResult<Vec<MergedWorkspace>> {
+    let project_path = expand_tilde(&project_path);
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = "gh pr list --state merged --json number,title,url,state,isDraft,headRefName,headRefOid --limit 100";
+    let output = match tokio::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(&project_path)
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return Ok(Vec::new()),
+    };
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let values: Vec<serde_json::Value> = match serde_json::from_slice(&output.stdout) {
+        Ok(v) => v,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let mut merged = parse_merged_heads(&values);
+    if merged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = state.db.lock().list_workspaces(&project_id)?;
+    let root = std::path::Path::new(&project_path);
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(wt) = row.worktree_path else { continue };
+        let path = std::path::Path::new(&wt);
+        if path == root || !crate::git_ops::is_git_repo(path) {
+            continue;
+        }
+        let Some((oid, _)) = merged.get(&row.branch) else { continue };
+        // Unreadable status counts as dirty: never offer to archive what we
+        // could not check.
+        let dirty = crate::git_ops::is_dirty(path).unwrap_or(true);
+        let head = crate::git_ops::head_sha(path);
+        if !is_merged_and_clean(head.as_deref(), oid, dirty) {
+            continue;
+        }
+        if let Some((_, pr)) = merged.remove(&row.branch) {
+            out.push(MergedWorkspace { workspace_id: row.id, pr });
+        }
+    }
+    Ok(out)
+}
+
 /// Push the current branch to `origin` (creating it on the remote if needed,
 /// and tracking it, via `--set-upstream`). Uses the login shell so SSH agents, the
 /// macOS credential helper, and `~/.gitconfig` work like they do in the

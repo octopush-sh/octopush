@@ -544,6 +544,13 @@ export interface BranchPr {
   pr: Pr;
 }
 
+/** A mission whose PR was merged at its worktree's HEAD, with a clean
+ *  worktree (`merged_workspaces`, #963). */
+export interface MergedWorkspace {
+  workspaceId: string;
+  pr: Pr;
+}
+
 /** A single text-search hit (line-level match) within the workspace. */
 export interface SearchHit {
   /** Path relative to the workspace root. */

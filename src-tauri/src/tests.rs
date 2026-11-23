@@ -2894,6 +2894,32 @@ mod pr_state_tests {
     }
 
     #[test]
+    fn parse_merged_heads_keeps_the_latest_merge_per_branch() {
+        use crate::commands::parse_merged_heads;
+        let json = serde_json::json!([
+            { "number": 12, "title": "Again", "url": "https://x/12", "state": "MERGED", "isDraft": false, "headRefName": "fix/a", "headRefOid": "bbb" },
+            { "number": 4, "title": "First", "url": "https://x/4", "state": "MERGED", "isDraft": false, "headRefName": "fix/a", "headRefOid": "aaa" },
+            { "number": 5, "title": "No oid", "url": "https://x/5", "state": "MERGED", "isDraft": false, "headRefName": "fix/b" },
+            { "number": 6, "title": "No branch", "url": "https://x/6", "state": "MERGED", "isDraft": false, "headRefOid": "ccc" }
+        ]);
+        let out = parse_merged_heads(json.as_array().unwrap());
+        assert_eq!(out.len(), 1);
+        let (oid, pr) = &out["fix/a"];
+        assert_eq!(oid, "bbb");
+        assert_eq!(pr.number, 12);
+        assert_eq!(pr.state, crate::github::PrState::Merged);
+    }
+
+    #[test]
+    fn merged_and_clean_needs_the_merged_head_and_no_changes() {
+        use crate::commands::is_merged_and_clean;
+        assert!(is_merged_and_clean(Some("abc"), "abc", false));
+        assert!(!is_merged_and_clean(Some("abc"), "abc", true));
+        assert!(!is_merged_and_clean(Some("def"), "abc", false));
+        assert!(!is_merged_and_clean(None, "abc", false));
+    }
+
+    #[test]
     fn apply_hunk_restores_a_reverted_change() {
         use std::fs;
         let dir = tempfile::tempdir().unwrap();
