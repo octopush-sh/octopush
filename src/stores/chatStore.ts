@@ -10,6 +10,7 @@ import { useAttentionStore } from "./attentionStore";
 import { focus } from "../lib/focus";
 import { deriveChatTitle } from "../lib/chatTitle";
 import { helperModelNow } from "../lib/helperModels";
+import { secretRefusal, type SecretRefusal } from "../lib/secretGuard";
 
 export interface ToolExecution {
   toolName: string;
@@ -128,6 +129,18 @@ export interface PendingApproval {
   threadId: string;
   command: string;
   reason: string;
+  /** The secret guard asks (#819): no "don't ask again" on this card. */
+  secret?: boolean;
+  /** The command also stages, so the scan read uncommitted changes. */
+  coversUncommitted?: boolean;
+}
+
+/** A `$`-direct command the secret guard refused (#819): the confirm shows
+ *  what it found, and "Run regardless" re-runs it with the fingerprint. */
+export interface ShellSecretRefusal {
+  workspacePath: string;
+  command: string;
+  refusal: SecretRefusal;
 }
 
 /** A writing sub-agent that ran out of turns mid-work; the director's turn
@@ -343,6 +356,8 @@ interface ChatState {
   /** Pending dangerous-command approval requests per workspace (inline cards).
    *  Present between chat://approval-request and approval-resolved. */
   pendingApprovalsByWs: Record<string, PendingApproval[]>;
+  /** A `$` command the secret guard refused, per workspace (the confirm). */
+  shellSecretByWs: Record<string, ShellSecretRefusal | null>;
   /** Turn-limit cards per workspace (see `PendingCap`). Present between
    *  chat://subagent-cap and subagent-cap-resolved. */
   pendingCapsByWs: Record<string, PendingCap[]>;
@@ -454,7 +469,11 @@ interface ChatState {
     workspaceId: string,
     workspacePath: string,
     command: string,
+    allowFindings?: string,
   ) => Promise<void>;
+  /** Answer the secret guard's confirm for a refused `$` command: leave it
+   *  out (close), or run it regardless for exactly what was shown. */
+  resolveShellSecret: (workspaceId: string, runRegardless: boolean) => Promise<void>;
   /** SIGINT (Ctrl-C) the active thread's live `$`-direct process. */
   stopShellProcess: (workspaceId: string) => void;
   /** Load the workspace's recent `$`-command history into the cache. */
@@ -809,6 +828,8 @@ export const useChatStore = create<ChatState>((set, get) => {
     callId: string;
     command: string;
     reason: string;
+    secret?: boolean;
+    coversUncommitted?: boolean;
   }>("chat://approval-request", (ev) => {
     const p = ev.payload;
     if (!p.workspaceId) return;
@@ -820,7 +841,13 @@ export const useChatStore = create<ChatState>((set, get) => {
           ...s.pendingApprovalsByWs,
           [p.workspaceId]: [
             ...cur,
-            { callId: p.callId, threadId: p.threadId, command: p.command, reason: p.reason },
+            {
+              callId: p.callId,
+              threadId: p.threadId,
+              command: p.command,
+              reason: p.reason,
+              ...(p.secret ? { secret: true, coversUncommitted: p.coversUncommitted === true } : {}),
+            },
           ],
         },
       };
@@ -944,6 +971,7 @@ export const useChatStore = create<ChatState>((set, get) => {
     liveOutputByCallId: {},
     shellHistoryByWs: {},
     pendingApprovalsByWs: {},
+    shellSecretByWs: {},
     agentLogByCall: {},
     crewFocusByWs: {},
     pendingCapsByWs: {},
@@ -1205,7 +1233,7 @@ export const useChatStore = create<ChatState>((set, get) => {
       });
     },
 
-    runShell: async (workspaceId, workspacePath, command) => {
+    runShell: async (workspaceId, workspacePath, command, allowFindings) => {
       const threadId = await get().ensureThread(workspaceId);
       if (!threadId) {
         set((s) => ({
@@ -1247,6 +1275,7 @@ export const useChatStore = create<ChatState>((set, get) => {
           threadId,
           workspacePath,
           command,
+          ...(allowFindings ? { allowFindings } : {}),
         });
         // Update the badge from the backend-computed label (the single source).
         // Only when a command actually RAN in the shell (result.cwd non-empty):
@@ -1261,7 +1290,15 @@ export const useChatStore = create<ChatState>((set, get) => {
         // Refresh the recall history so the just-run command surfaces.
         void get().loadShellHistory(workspaceId);
       } catch (e) {
-        set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        // The secret guard refused it before it ran: ask, don't error.
+        const refusal = secretRefusal(e);
+        if (refusal) {
+          set((s) => ({
+            shellSecretByWs: { ...s.shellSecretByWs, [workspaceId]: { workspacePath, command, refusal } },
+          }));
+        } else {
+          set((s) => ({ errorByWs: { ...s.errorByWs, [workspaceId]: String(e) } }));
+        }
       } finally {
         // Only clear if THIS run still owns the streaming slot — a normal LLM
         // turn that started on the same workspace meanwhile must not be clobbered.
@@ -1274,6 +1311,14 @@ export const useChatStore = create<ChatState>((set, get) => {
             : {},
         );
       }
+    },
+
+    resolveShellSecret: async (workspaceId, runRegardless) => {
+      const pending = get().shellSecretByWs[workspaceId];
+      set((s) => ({ shellSecretByWs: { ...s.shellSecretByWs, [workspaceId]: null } }));
+      if (!pending || !runRegardless) return;
+      // The core rescans: anything new since the confirm asks again.
+      await get().runShell(workspaceId, pending.workspacePath, pending.command, pending.refusal.fingerprint);
     },
 
     stopShellProcess: (workspaceId) => {

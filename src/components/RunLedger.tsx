@@ -20,11 +20,11 @@ interface Props {
 }
 
 /** The ledger strip — Direct's cost surface, savings-first (the differentiator
- *  leads). Single calm line + 2px progress inset; click to unfold the per-stage
+ *  leads). A single calm line, no progress bar: the printed "N% under
+ *  all-premium" is the one encoding of that fact. Click to unfold the per-stage
  *  breakdown. On run completion, a one-shot brass sweep + serif phrase. */
 export function RunLedger({ run, stages }: Props) {
   const { saved, pct } = savingsVsBaseline(run.costUsd, run.baselineUsd);
-  const fillPct = run.baselineUsd > 0 ? Math.min(100, (run.costUsd / run.baselineUsd) * 100) : 0;
   const tokIn = stages.reduce((a, s) => a + s.inputTokens, 0);
   const tokOut = stages.reduce((a, s) => a + s.outputTokens, 0);
   const [expanded, setExpanded] = useState(false);
@@ -114,12 +114,6 @@ export function RunLedger({ run, stages }: Props) {
         )}
         <span className="font-mono text-[9px] text-octo-mute">{expanded ? "▾" : "▸"}</span>
       </button>
-      <div className="mx-4 h-0.5 overflow-hidden rounded-sm bg-octo-onyx">
-        <div
-          className="h-full rounded-sm bg-octo-brass transition-[width] duration-[280ms]"
-          style={{ width: `${fillPct}%`, transitionTimingFunction: "var(--ease-octo)" }}
-        />
-      </div>
       <Reveal open={expanded}>
         <div className="flex flex-wrap gap-x-5 gap-y-1 px-4 py-2 font-mono text-[10px] text-octo-mute">
           {billed.map((s) => (

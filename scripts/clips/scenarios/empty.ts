@@ -15,6 +15,7 @@ export const empty: Scenario = {
     list_recent_projects: [],
     list_closed_projects: [],
     get_settings: { providerKeys: {}, providerBaseUrls: {}, gitCredentials: {} } satisfies AppSettings,
+    unreadable_settings_path: null,
     auth_status: { signedIn: false, email: null, name: null } satisfies AuthStatus,
     auth_refresh: { signedIn: false, email: null, name: null } satisfies AuthStatus,
     detect_editors: [],

@@ -21569,6 +21569,94 @@ mod secret_guard_tests {
     }
 
     #[test]
+    fn a_newly_added_key_or_keystore_file_is_flagged_by_name() {
+        let new = |p: &str| AddedFile { path: p.into(), is_new: true, ..Default::default() };
+        for (path, rule, kind) in [
+            ("certs/server.p12", "keystore-file", "certificate or keystore file"),
+            ("certs/client.PFX", "keystore-file", "certificate or keystore file"),
+            ("android/release.jks", "keystore-file", "certificate or keystore file"),
+            ("tls/server.key", "key-file", "private key file"),
+        ] {
+            let f = scan_added(&[new(path)], &[]);
+            assert_eq!(f.len(), 1, "{path}: {f:?}");
+            assert_eq!((f[0].rule.as_str(), f[0].kind.as_str(), f[0].line), (rule, kind, None));
+            assert_eq!(f[0].preview, None);
+            // An edit to one already tracked is not.
+            let edited = AddedFile { is_new: false, lines: vec![(3, "x".into())], ..new(path) };
+            assert!(scan_added(&[edited], &[]).is_empty(), "{path}");
+        }
+        // A zip `.key` is a Keynote document; a zip keystore still counts.
+        assert!(scan_added(&[AddedFile { zip: true, ..new("slides/Pitch.key") }], &[]).is_empty());
+        assert_eq!(scan_added(&[AddedFile { zip: true, ..new("certs/a.p12") }], &[]).len(), 1);
+        for path in ["src/key.ts", "docs/p12.md", "certs/server.key.example", "a.keystore.md", "monkey"] {
+            assert!(scan_added(&[new(path)], &[]).is_empty(), "false positive on {path}");
+        }
+    }
+
+    #[test]
+    fn a_keynote_document_stays_quiet_but_a_key_file_asks() {
+        let (dir, git) = repo();
+        std::fs::write(dir.path().join("Pitch.key"), b"PK\x03\x04\x14\x00\x00\x00index.apxl").unwrap();
+        std::fs::write(dir.path().join("server.key"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+        std::fs::write(dir.path().join("tiny.key"), "PK").unwrap();
+        // Untracked (read from the worktree), then staged (read from the blob).
+        let rules = |c: &Collected| {
+            let mut v: Vec<String> = scan_added(c, &[]).iter().filter(|f| f.rule == "key-file").map(|f| f.file.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(rules(&worktree_files(dir.path(), Some("main")).unwrap()), ["server.key", "tiny.key"]);
+        for name in ["Pitch.key", "server.key", "tiny.key"] {
+            stage(&git, name);
+        }
+        assert_eq!(rules(&staged_files(dir.path()).unwrap()), ["server.key", "tiny.key"]);
+    }
+
+    #[test]
+    fn a_large_keynote_blob_is_read_four_bytes_at_a_time() {
+        let (dir, git) = repo();
+        let mut keynote = b"PK\x03\x04".to_vec();
+        keynote.resize(4096, b'x');
+        // Names that differ by more than case: macOS's file system ignores it.
+        std::fs::write(dir.path().join("Deck.key"), &keynote).unwrap();
+        std::fs::write(dir.path().join("server.key"), vec![b'-'; 4096]).unwrap();
+        stage(&git, "Deck.key");
+        stage(&git, "server.key");
+        let id = |rel: &str| git.index().unwrap().get_path(Path::new(rel), 0).unwrap().id;
+        // Past the limit the blob is streamed, so the worktree isn't needed.
+        std::fs::remove_file(dir.path().join("Deck.key")).unwrap();
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 16));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 16));
+        // Under the limit the blob is read whole, with the same answer.
+        assert!(starts_like_zip_within(&git, "Deck.key", id("Deck.key"), 1 << 20));
+        assert!(!starts_like_zip_within(&git, "server.key", id("server.key"), 1 << 20));
+        // No blob in git: the worktree file's first bytes.
+        std::fs::write(dir.path().join("New.key"), &keynote).unwrap();
+        assert!(starts_like_zip_within(&git, "New.key", git2::Oid::zero(), 16));
+    }
+
+    #[test]
+    fn a_keynote_at_the_path_of_an_earlier_key_in_the_range_still_asks() {
+        let (dir, git) = repo();
+        let head = git.head().unwrap().peel_to_commit().unwrap();
+        git.branch("feature", &head, false).unwrap();
+        git.set_head("refs/heads/feature").unwrap();
+        std::fs::write(dir.path().join("x.key"), "not a zip\n").unwrap();
+        commit_all(&git, "add a key");
+        std::fs::remove_file(dir.path().join("x.key")).unwrap();
+        {
+            let mut idx = git.index().unwrap();
+            idx.remove_path(Path::new("x.key")).unwrap();
+            idx.write().unwrap();
+        }
+        commit_all(&git, "take it out");
+        std::fs::write(dir.path().join("x.key"), b"PK\x03\x04index.apxl").unwrap();
+        commit_all(&git, "add a deck");
+        let f = scan_added(&branch_files(dir.path(), "main").unwrap(), &[]);
+        assert!(f.iter().any(|f| f.rule == "key-file" && f.file == "x.key"), "{f:?}");
+    }
+
+    #[test]
     fn mcp_configs_flag_credential_named_env_values() {
         let pw = rnd(300, 24, B62);
         let lines: Vec<String> = vec![
@@ -21599,7 +21687,15 @@ mod secret_guard_tests {
         assert!(!f[0].kind.contains(&pw));
         // Cursor's config, nested projects and a one-line config.
         let inline = format!("{{\"mcpServers\":{{\"s\":{{\"env\":{{\"STRIPE_SECRET\":\"{pw}\"}}}}}}}}");
-        for path in [".cursor/mcp.json", "packages/api/.mcp.json", "packages/api/.cursor/mcp.json"] {
+        for path in [
+            ".cursor/mcp.json",
+            "packages/api/.mcp.json",
+            "packages/api/.cursor/mcp.json",
+            ".claude/mcp.json",
+            "apps/web/.claude/mcp.json",
+            ".vscode/mcp.json",
+            "apps/web/.vscode/mcp.json",
+        ] {
             let f = scan_one(path, &[&inline]);
             assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{path}: {f:?}");
         }
@@ -21608,8 +21704,16 @@ mod secret_guard_tests {
         let f = scan_one(".mcp.json", &[&format!("\"GITHUB_PERSONAL_ACCESS_TOKEN\": \"{ghp}\"")]);
         let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
         assert_eq!(rules, ["github-token"]);
+        // VS Code's `servers` shape: a real value asks, `${VAR}` and an
+        // `${input:…}` reference don't.
+        let vscode = |v: &str| format!("{{\"servers\":{{\"gh\":{{\"type\":\"stdio\",\"env\":{{\"GITHUB_TOKEN\":\"{v}\"}}}}}}}}");
+        let f = scan_one(".vscode/mcp.json", &[&vscode(&pw)]);
+        assert_eq!(f.iter().filter(|f| f.rule == "mcp-env-credential").count(), 1, "{f:?}");
+        for v in ["${GITHUB_TOKEN}", "${env:GITHUB_TOKEN}", "${input:github-token}"] {
+            assert!(scan_one(".vscode/mcp.json", &[&vscode(v)]).is_empty(), "{v}");
+        }
         // Not an MCP config: the rule stays out.
-        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md"] {
+        for path in ["config/mcp.json", ".mcp.json.example", "docs/.mcp.json.md", ".vscode/settings.json", ".claude/mcp.json.bak"] {
             let f = scan_one(path, &[&inline]);
             assert!(f.iter().all(|f| f.rule != "mcp-env-credential"), "{path}: {f:?}");
         }
@@ -21982,6 +22086,74 @@ mod secret_guard_tests {
         assert_eq!(f[0].location(), "tests/fixtures/data.ts:2");
     }
 
+    // ── Talk's shell (#819) ─────────────────────────────────────────────
+
+    #[test]
+    fn shell_plan_reads_commits_pushes_and_prs_per_segment() {
+        let plan = |c: &str| shell_plan(c);
+        assert_eq!(plan("git status"), None);
+        assert_eq!(plan("npm test && git log --oneline"), None);
+        assert_eq!(plan("echo commit push"), None);
+        assert_eq!(plan("gh pr view 3"), None);
+        assert_eq!(plan("git commit -m 'fix'"), Some(ShellPlan { commit: Some(false), ..Default::default() }));
+        assert_eq!(plan("git -C sub commit --amend --no-edit").unwrap().commit, Some(false));
+        // Staging in the same command (or `-a`) covers every uncommitted change.
+        for c in ["git add -A && git commit -m x", "git commit -am x", "git commit --all -m x", "git stage . ; git commit"] {
+            let p = plan(c).unwrap();
+            assert_eq!(p.commit, Some(true), "{c}");
+            assert!(p.covers_uncommitted(), "{c}");
+        }
+        assert_eq!(plan("git add -A").unwrap_or_default().commit, None, "staging alone sends nothing");
+        let p = plan("git add -A && git commit -m x && /usr/bin/git push -u origin HEAD").unwrap();
+        assert_eq!((p.commit, p.push), (Some(true), true));
+        assert_eq!(plan("gh pr create --fill").unwrap().pr, Some(None));
+        assert_eq!(plan("gh pr create --base develop --fill").unwrap().pr, Some(Some("develop".into())));
+        assert_eq!(plan("gh pr create -B Release/2.0").unwrap().pr, Some(Some("Release/2.0".into())));
+        assert_eq!(plan("gh pr create --base=main").unwrap().pr, Some(Some("main".into())));
+        assert_eq!(plan("digit commit"), None, "only git itself");
+    }
+
+    #[test]
+    fn shell_files_scan_what_the_command_would_send() {
+        let (dir, repo) = repo();
+        let line = true_positives().remove(0).2;
+        std::fs::write(dir.path().join("unstaged.ts"), format!("{line}\n")).unwrap();
+        let commit = ShellPlan { commit: Some(false), ..Default::default() };
+        let staging = ShellPlan { commit: Some(true), ..Default::default() };
+        // A plain commit records only the index: nothing staged, nothing found.
+        assert!(scan_added(&shell_files(dir.path(), &commit).unwrap(), &[]).is_empty());
+        // `git add -A && git commit` would record the untracked file.
+        let f = scan_added(&shell_files(dir.path(), &staging).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].location(), "unstaged.ts:1");
+        // Committed: a push sends it, and so does a PR with no --base given.
+        commit_all(&repo, "leak");
+        let push = ShellPlan { push: true, ..Default::default() };
+        assert_eq!(scan_added(&shell_files(dir.path(), &push).unwrap(), &[]).len(), 1);
+        let c = shell_files(dir.path(), &ShellPlan { commit: Some(false), push: true, ..Default::default() }).unwrap();
+        assert_eq!(c.scope, "shell");
+        assert_eq!(scan_added(&c, &[]).len(), 1, "the push's finding; nothing is staged");
+    }
+
+    #[tokio::test]
+    async fn guard_scans_a_shell_command_only_when_the_setting_is_on() {
+        let (dir, _repo) = repo();
+        std::fs::write(dir.path().join("a.ts"), format!("{}\n", true_positives().remove(0).2)).unwrap();
+        let plan = shell_plan("git add -A && git commit -m x").unwrap();
+        let p = dir.path().to_path_buf();
+        let collect = move || shell_files(&p, &plan);
+        {
+            let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+            assert!(guarded_scan(collect.clone()).await.is_none(), "setting off: today's behaviour");
+        }
+        let _s = SettingsGuard::new(serde_json::json!({}));
+        let report = guarded_scan(collect.clone()).await.unwrap();
+        assert!(report.needs_confirmation());
+        let fp = report.fingerprint.clone();
+        assert!(matches!(guard(None, collect.clone()).await, Err(crate::error::AppError::SecretsFound { .. })));
+        assert!(guard(Some(fp), collect).await.is_ok(), "the confirm's fingerprint lets this run through");
+    }
+
     /// Scanning a 5,000-line staged diff stays far below a click's latency.
     #[test]
     fn a_5k_line_diff_scans_fast() {
@@ -22165,8 +22337,8 @@ mod secret_guard_tests {
     fn an_encrypted_pem_key_is_still_a_private_key() {
         let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
         let f = scan_one("deploy/key.key", &[&header, "Proc-Type: 4,ENCRYPTED", "DEK-Info: AES-128-CBC,0A1B2C3D", "", &rnd(42, 64, B64)]);
-        assert_eq!(f.len(), 1, "{f:?}");
-        assert_eq!(f[0].rule, "private-key");
+        let rules: Vec<&str> = f.iter().map(|f| f.rule.as_str()).collect();
+        assert_eq!(rules, ["key-file", "private-key"], "a new .key is also flagged by name");
         let inline = format!("\"key\": \"{}\\nProc-Type: 4,ENCRYPTED\\n\"", header);
         assert_eq!(scan_one("sa.json", &[&inline]).len(), 1);
     }
@@ -22252,6 +22424,109 @@ mod secret_guard_tests {
         let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// Make `<remote>/<branch>` (a ref at `at`) the upstream of the local
+    /// branch `branch`.
+    fn track(repo: &git2::Repository, branch: &str, remote: &str, at: git2::Oid) {
+        if repo.find_remote(remote).is_err() {
+            repo.remote(remote, &format!("https://example.invalid/{remote}.git")).unwrap();
+        }
+        repo.reference(&format!("refs/remotes/{remote}/{branch}"), at, true, "test").unwrap();
+        let mut local = repo.find_branch(branch, git2::BranchType::Local).unwrap();
+        local.set_upstream(Some(&format!("{remote}/{branch}"))).unwrap();
+        let upstream = local.upstream().unwrap().get().target();
+        assert_eq!(upstream, Some(at), "the test's upstream is set");
+    }
+
+    /// The push goes to `origin/<branch>`, so that ref bounds the scan even
+    /// when the branch tracks another remote (#859). Here the upstream is
+    /// ahead of origin: its commits are new to origin, so they are scanned.
+    #[test]
+    fn push_scans_commits_origin_lacks_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let on_origin = repo.head().unwrap().peel_to_commit().unwrap().id();
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        track(&repo, "main", "fork", on_fork);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+    }
+
+    /// The other way round: the upstream on another remote is behind origin,
+    /// and what origin already has isn't scanned again.
+    #[test]
+    fn push_skips_commits_origin_has_when_the_upstream_is_another_remote() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+        let more = true_positives().remove(4).2;
+        std::fs::write(dir.path().join("new.ts"), format!("{more}\n")).unwrap();
+        commit_all(&repo, "local leak");
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "new.ts");
+    }
+
+    /// A branch that isn't on origin yet keeps the earlier bases: its
+    /// upstream, else origin's default branch.
+    #[test]
+    fn push_of_a_branch_not_on_origin_yet_keeps_the_earlier_bases() {
+        let (dir, repo) = repo();
+        let root = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.reference("refs/remotes/origin/main", root.id(), true, "test").unwrap();
+        repo.branch("feature", &root, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_fork = commit_all(&repo, "on the other remote only");
+        std::fs::write(dir.path().join("new.ts"), "clean\n").unwrap();
+        commit_all(&repo, "local only");
+
+        // No upstream, no origin/feature: everything since origin's default branch.
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+
+        // With an upstream on another remote and still no origin/feature,
+        // the upstream bounds the range, as before.
+        track(&repo, "feature", "fork", on_fork);
+        assert!(repo.find_reference("refs/remotes/origin/feature").is_err());
+        let f = scan_added(&push_files(dir.path()).unwrap(), &[]);
+        assert!(f.is_empty(), "{f:?}");
+    }
+
+    /// A `git push` typed in Talk's shell goes to the branch's upstream, not
+    /// necessarily `origin`, so its scan keeps the upstream range: commits
+    /// `origin/<branch>` already has are still new to the other remote.
+    #[test]
+    fn shell_push_keeps_the_upstream_range_when_origin_is_ahead() {
+        let (dir, repo) = repo();
+        let behind = repo.head().unwrap().peel_to_commit().unwrap().id();
+        let line = true_positives().remove(1).2;
+        std::fs::write(dir.path().join("old.ts"), format!("{line}\n")).unwrap();
+        let on_origin = commit_all(&repo, "already on origin");
+        repo.reference("refs/remotes/origin/main", on_origin, true, "test").unwrap();
+        track(&repo, "main", "fork", behind);
+        let push = ShellPlan { push: true, ..Default::default() };
+        let f = scan_added(&shell_files(dir.path(), &push).unwrap(), &[]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].file, "old.ts");
+        // The Push button sends to origin, which has that commit already.
+        assert!(scan_added(&push_files(dir.path()).unwrap(), &[]).is_empty());
     }
 
     /// A committed blob larger than the scan budget: in a tree-to-tree diff

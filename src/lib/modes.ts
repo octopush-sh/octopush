@@ -9,9 +9,11 @@ export const MODE_LABELS: Record<WorkspaceMode, string> = {
   direct: "Direct",
 };
 
+/** Numbered in switcher order (`MODES`). Direct is a letter because macOS
+ *  takes ⌘⇧4 (screenshot) before the webview sees it. */
 export const MODE_SHORTCUTS: Record<WorkspaceMode, string> = {
-  talk: "⌘⇧1",
-  run: "⌘⇧2",
+  run: "⌘⇧1",
+  talk: "⌘⇧2",
   review: "⌘⇧3",
   direct: "⌘⇧D",
 };
