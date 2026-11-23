@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
     apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, is_builtin_claude_model, DISABLE_1M_CONTEXT_ENV,
-    MAX_CONTEXT_TOKENS_ENV, cli_auth_from_init, is_result_event,
+    MAX_CONTEXT_TOKENS_ENV, SIMPLE_SYSTEM_PROMPT_ENV, system_prompt_env, cli_auth_from_init, is_result_event,
     parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
     CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
@@ -1200,6 +1200,74 @@ fn a_custom_gateway_model_reaches_the_spawn_with_its_catalog_window() {
     // An id no catalog lists: nothing.
     let env = stage_spawn_env_for("claude-unknown-gateway");
     assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+}
+
+// ─── Gateway-named Claude models keep the full prompt (#1003) ──
+//
+// 2.1.330: "Changed unrecognized model names containing \"sonnet\" or
+// \"haiku\" to use the shorter system prompt, like other unrecognized names;
+// `CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT=0` gives every model the full one".
+
+#[test]
+fn system_prompt_variable_is_the_documented_name() {
+    assert_eq!(SIMPLE_SYSTEM_PROMPT_ENV, "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT");
+}
+
+#[test]
+fn a_canonical_claude_id_keeps_claude_codes_own_prompt_choice() {
+    let none = |_: &str| false;
+    for model in ["claude-sonnet-5-5", "claude-haiku-4-5", "claude-opus-4-8[1m]", "claude-sonnet-5-5-20261001", " claude-opus-5-5 "] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+        assert!(!stage_spawn_env_for(model).contains_key(SIMPLE_SYSTEM_PROMPT_ENV), "{model}");
+    }
+}
+
+#[test]
+fn a_gateway_named_claude_model_gets_the_full_prompt() {
+    let none = |_: &str| false;
+    let full = vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())];
+    for model in [
+        // dotted
+        "claude-sonnet-5.5",
+        "claude-haiku-4.5",
+        // prefixed
+        "anthropic/claude-sonnet-5.5",
+        "bedrock/claude-haiku-4-5",
+        "openrouter/anthropic/claude-haiku-5-5",
+        "us.anthropic.claude-sonnet-5-5-v1:0",
+    ] {
+        assert_eq!(system_prompt_env(model, is_builtin_claude_model, none), full, "{model}");
+    }
+    // Through the spawn, over whatever the stage inherited.
+    let env = stage_spawn_env_for("anthropic/claude-sonnet-5.5");
+    if std::env::var_os(SIMPLE_SYSTEM_PROMPT_ENV).is_none() {
+        assert_eq!(env.get(SIMPLE_SYSTEM_PROMPT_ENV), Some(&Some("0".to_string())), "{env:?}");
+    }
+    // Codex never gets it.
+    let mut command = tokio::process::Command::new("codex");
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    assert!(!command.as_std().get_envs().any(|(k, _)| k == SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_non_claude_gateway_model_keeps_the_short_prompt() {
+    let none = |_: &str| false;
+    for model in ["ollama/qwen2.5-coder:7b", "llama3.3:latest", "kimi-k3", "claude-sonnet-latest", "team-sonnet", "gpt-4o"] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+    }
+    assert!(!stage_spawn_env_for("ollama/qwen2.5-coder:7b").contains_key(SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_users_own_system_prompt_export_is_never_overridden() {
+    let set = |k: &str| k == SIMPLE_SYSTEM_PROMPT_ENV;
+    assert!(system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, set).is_empty());
+    // Another variable set by the user doesn't count.
+    let other = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
+    assert_eq!(
+        system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, other),
+        vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())]
+    );
 }
 
 /// [`stage_spawn_env`] for a Claude stage on `model`.

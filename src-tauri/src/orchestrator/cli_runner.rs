@@ -2652,10 +2652,70 @@ pub(crate) fn context_window_env(
 /// and `us.anthropic.claude-sonnet-5-v1:0` count) is a builtin Anthropic
 /// catalog id.
 pub(crate) fn is_builtin_claude_model(model: &str) -> bool {
+    is_builtin_claude_id(&crate::token_engine::normalize_model_id(model))
+}
+
+/// Claude Code's switch for its shorter system prompt. 2.1.330: "Changed
+/// unrecognized model names containing \"sonnet\" or \"haiku\" to use the
+/// shorter system prompt, like other unrecognized names;
+/// `CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT=0` gives every model the full one".
+pub const SIMPLE_SYSTEM_PROMPT_ENV: &str = "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT";
+
+/// The system-prompt variable a Claude stage on `model` gets, so a Claude
+/// model under a gateway's name keeps the full prompt Claude Code's tools
+/// were tuned for. Pure:
+/// - `model` normalizes ([`crate::token_engine::normalize_model_id`], the
+///   pricing engine's) to an id `known` reports (the builtin Anthropic
+///   catalog), and the string Claude Code sees isn't that canonical id (a
+///   `[1m]` suffix or a dated snapshot still counts as canonical):
+///   [`SIMPLE_SYSTEM_PROMPT_ENV`]`=0`;
+/// - a canonical id, and any model that isn't a known Claude model (a local
+///   or Ollama model keeps the short prompt), get nothing;
+/// - the user's own export (`user_set`) is never overridden.
+pub(crate) fn system_prompt_env(
+    model: &str,
+    known: impl Fn(&str) -> bool,
+    user_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
     let id = crate::token_engine::normalize_model_id(model);
+    if !known(&id) || is_canonical_claude_id(model, &id) || user_set(SIMPLE_SYSTEM_PROMPT_ENV) {
+        return Vec::new();
+    }
+    vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())]
+}
+
+/// Whether `model` is spelled the way Claude Code knows `id`: exactly, or
+/// with a `[…]` capability suffix or a `-YYYYMMDD` snapshot.
+fn is_canonical_claude_id(model: &str, id: &str) -> bool {
+    let m = model.trim();
+    let m = m.find('[').map_or(m, |i| &m[..i]);
+    m == id
+        || m.strip_prefix(id).is_some_and(|rest| {
+            rest.len() == 9 && rest.starts_with('-') && rest[1..].bytes().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// [`system_prompt_env`] for a stage's model: known per the builtin
+/// Anthropic catalog, a user's export read the way the CLI process will see
+/// it ([`stage_env_value`]). Codex: nothing.
+fn stage_system_prompt_env(dialect: CliDialect, model: &str) -> Vec<(&'static str, String)> {
+    if dialect != CliDialect::Claude {
+        return Vec::new();
+    }
+    system_prompt_env(model, is_builtin_claude_id, |k| stage_env_value(k).is_some())
+}
+
+/// Whether `id` (already normalized) is a builtin Anthropic catalog id.
+fn is_builtin_claude_id(id: &str) -> bool {
     crate::provider_router::builtin_providers()
         .get("anthropic")
         .is_some_and(|p| p.models.iter().any(|m| m.id == id))
+}
+
+/// The launch line's note when the stage keeps Claude Code's full prompt
+/// under a gateway name ([`stage_system_prompt_env`]).
+fn system_prompt_label(dialect: CliDialect, model: &str) -> Option<&'static str> {
+    (!stage_system_prompt_env(dialect, model).is_empty()).then_some("full Claude Code prompt (gateway name)")
 }
 
 /// [`context_window_env`] for a stage's model: built-in per
@@ -2679,8 +2739,9 @@ fn stage_context_env(dialect: CliDialect, model: &str, cli_version: Option<&str>
 /// ([`CliDialect::stage_env`]), the inherited effort override dropped
 /// ([`CliDialect::stage_env_remove`]), the subagent effort
 /// ([`CliDialect::stage_effort_env`]), the quiet-traffic opt-in
-/// ([`CliDialect::stage_quiet_env`]) and a gateway model's context window
-/// ([`stage_context_env`]). The ONE place a stage's env is set — fresh and
+/// ([`CliDialect::stage_quiet_env`]), a gateway model's context window
+/// ([`stage_context_env`]) and a gateway-named Claude model's full prompt
+/// ([`stage_system_prompt_env`]). The ONE place a stage's env is set — fresh and
 /// `--resume` runs, in-process and detached, all spawn through it.
 pub(crate) fn apply_stage_env(
     command: &mut tokio::process::Command,
@@ -2704,6 +2765,9 @@ pub(crate) fn apply_stage_env(
         command.env(k, v);
     }
     for (k, v) in stage_context_env(dialect, model, cli_version) {
+        command.env(k, v);
+    }
+    for (k, v) in stage_system_prompt_env(dialect, model) {
         command.env(k, v);
     }
 }
@@ -3385,10 +3449,11 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
+            system_prompt_label(dialect, &stage.agent_model).map(|s| format!(" · {s}")).unwrap_or_default(),
             dialect.sandbox_label(read_only, write_scope).map(|s| format!(" · {s}")).unwrap_or_default(),
             read_guard_label(reads_confined, cli_version.as_ref().and_then(|v| v.version.as_deref()))
                 .map(|s| format!(" · {s}"))
