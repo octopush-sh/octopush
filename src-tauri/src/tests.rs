@@ -2624,7 +2624,8 @@ mod pr_checks_tests {
     use crate::github::{
         actions_run_id, check_runs_from_gh_pages, checks_from_gh_rollup, checks_from_gh_rollup_and_runs,
         checks_from_rest_check_runs, gh_check_runs_command, gh_rollup_may_be_capped, join_failed_logs,
-        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_ROLLUP_CAP,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_API_PATH_ENV,
+        GH_ROLLUP_CAP,
     };
 
     #[test]
@@ -2639,17 +2640,38 @@ mod pr_checks_tests {
     }
 
     #[test]
-    fn gh_check_runs_command_needs_a_hex_sha_and_quotes_the_path() {
+    fn gh_check_runs_command_needs_a_hex_sha_and_passes_the_path_in_the_env() {
+        assert_eq!(GH_API_PATH_ENV, "OCTOPUSH_GH_API_PATH");
         assert_eq!(
-            gh_check_runs_command("o", "r", "abc123").as_deref(),
-            Some("gh api --paginate 'repos/o/r/commits/abc123/check-runs?per_page=100'"),
+            gh_check_runs_command("o", "r", "abc123"),
+            Some((
+                "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"",
+                "repos/o/r/commits/abc123/check-runs?per_page=100".to_string(),
+            )),
         );
         assert!(gh_check_runs_command("o", "r", "").is_none());
         assert!(gh_check_runs_command("o", "r", "abc; rm -rf ~").is_none());
-        assert_eq!(
-            gh_check_runs_command("o'x", "r", "ab").as_deref(),
-            Some("gh api --paginate 'repos/o'\\''x/r/commits/ab/check-runs?per_page=100'"),
-        );
+        // Owner and repo stay out of the command line, whatever they hold.
+        let (cmd, path) = gh_check_runs_command("o\\'x", "r", "ab").unwrap();
+        assert_eq!(cmd, "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"");
+        assert_eq!(path, "repos/o\\'x/r/commits/ab/check-runs?per_page=100");
+    }
+
+    #[test]
+    fn gh_check_runs_path_reaches_the_command_verbatim_under_every_shell() {
+        use super::login_shell_fixture::available_shells;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_string_lossy().to_string();
+        let (cmd, path) = gh_check_runs_command("o\\'; touch PWNED; echo '", "r", "ab").unwrap();
+        // `printf %s` stands in for `gh api --paginate`, which isn't installed in CI.
+        let cmd = cmd.replace("gh api --paginate", "printf %s");
+        for shell in available_shells() {
+            let out = crate::commands::login_shell_output(&shell, &ws, &cmd, &[(GH_API_PATH_ENV, path.clone())])
+                .unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert!(out.status.success(), "{shell}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), path, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the path");
+        }
     }
 
     #[test]
