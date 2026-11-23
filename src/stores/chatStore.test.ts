@@ -518,6 +518,34 @@ describe("chatStore — stop + effort (P3)", () => {
     expect(useChatStore.getState().getAttachments("ws-1")).toHaveLength(1);
   });
 
+  it("send() reports dispatch long before the turn ends, once", async () => {
+    let end!: () => void;
+    (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise<void>((r) => { end = r; }));
+    const onDispatched = vi.fn();
+    let ended = false;
+    const turn = useChatStore.getState().send("ws-1", "/tmp", "hi", undefined, { onDispatched }).then((ok) => { ended = true; return ok; });
+    await vi.waitFor(() => expect(onDispatched).toHaveBeenCalledTimes(1));
+    // The turn is running: marked as streaming, the IPC in flight, `send` still pending.
+    expect(useChatStore.getState().streamingByWs["ws-1"]).toBe(true);
+    expect(ipc.sendChatMessage).toHaveBeenCalledTimes(1);
+    expect(ended).toBe(false);
+    end();
+    await expect(turn).resolves.toBe(true);
+    expect(onDispatched).toHaveBeenCalledTimes(1);
+  });
+
+  it("send() never reports dispatch for a pre-flight refusal", async () => {
+    const { ensureThread } = useChatStore.getState();
+    const onDispatched = vi.fn();
+    useChatStore.setState({ ensureThread: async () => "" });
+    try {
+      await expect(useChatStore.getState().send("ws-1", "/tmp", "hi", undefined, { onDispatched })).resolves.toBe(false);
+    } finally {
+      useChatStore.setState({ ensureThread });
+    }
+    expect(onDispatched).not.toHaveBeenCalled();
+  });
+
   it("send() resolves false when the turn fails to dispatch", async () => {
     (ipc.sendChatMessage as ReturnType<typeof vi.fn>).mockRejectedValueOnce("boom");
     await expect(useChatStore.getState().send("ws-1", "/tmp", "hi")).resolves.toBe(false);

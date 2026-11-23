@@ -32,7 +32,11 @@ const parked = (over: Partial<RunStage> = {}, status = "paused", listed = status
 };
 
 describe("sendReviewComments", () => {
-  const send = vi.fn(async (..._args: unknown[]) => true);
+  // Like the real `send`: reports dispatch, then resolves when the turn ended.
+  const send = vi.fn(async (...args: unknown[]) => {
+    (args[4] as { onDispatched?: () => void } | undefined)?.onDispatched?.();
+    return true;
+  });
   const resolve = vi.fn(async (..._args: unknown[]) => true);
   const modes: string[] = [];
   const onNav = (e: Event) => modes.push((e as CustomEvent).detail.mode);
@@ -54,7 +58,7 @@ describe("sendReviewComments", () => {
     useReviewComments.getState().add("w1", note);
     await sendReviewComments("w1", "/w1");
     // Without Talk's staged attachments: the message is the comments only.
-    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("> +x\n\nRename x."), undefined, { attachments: false });
+    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("> +x\n\nRename x."), undefined, { attachments: false, onDispatched: expect.any(Function) });
     expect(resolve).not.toHaveBeenCalled();
     expect(modes).toEqual(["talk"]);
     expect(useReviewComments.getState().byWs.w1).toEqual([]);
@@ -119,9 +123,13 @@ describe("sendReviewComments", () => {
     expect(commentTarget("w1")).toEqual({ kind: "talk" });
   });
 
-  it("switches mode only after the send went out", async () => {
+  it("switches mode only once the send went out: Talk on dispatch, Direct on an accepted send-back", async () => {
     const seen: string[][] = [];
-    send.mockImplementationOnce(async () => { seen.push([...modes]); return true; });
+    send.mockImplementationOnce(async (...args: unknown[]) => {
+      seen.push([...modes]);
+      (args[4] as { onDispatched: () => void }).onDispatched();
+      return true;
+    });
     useReviewComments.getState().add("w1", note);
     await sendReviewComments("w1", "/w1");
     expect(seen).toEqual([[]]);

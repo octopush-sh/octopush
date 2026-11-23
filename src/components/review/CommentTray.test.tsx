@@ -59,7 +59,7 @@ describe("CommentTray", () => {
     expect(btn).toBeDisabled();
     act(() => useChatStore.setState({ streamingByWs: { w1: false } }));
     await act(async () => { fireEvent.click(btn); });
-    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("Name these."), undefined, { attachments: false });
+    expect(send).toHaveBeenCalledWith("w1", "/w1", expect.stringContaining("Name these."), undefined, { attachments: false, onDispatched: expect.any(Function) });
     expect(useReviewComments.getState().byWs.w1).toEqual([]);
   });
 });
