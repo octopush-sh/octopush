@@ -8910,27 +8910,26 @@ mod orchestrator_tests {
     }
 
     /// The target's feedback column receives the composed findings+note before
-    /// the re-run starts (checked mid-flight via the archive-free path: a fresh
-    /// loop with no auto-drive). Uses loop_back's persisted effect directly.
+    /// the re-run starts. Checked through the apply-only path, which makes the
+    /// loop-back's changes and leaves the re-drive to its caller, so the
+    /// pending target still holds its feedback. (A send-back on an aborted run,
+    /// which this test once used to skip the re-drive, is refused.)
     #[tokio::test]
     async fn send_back_target_feedback_column_gets_composed_findings() {
         let (orch, run_id, db) = looped_run(1);
         orch.run_to_pause(&run_id).await.unwrap();
-        // Stop the re-drive from consuming the feedback: abort the run after
-        // the loop-back by checking the column straight after resolve starts is
-        // racy — instead mark the run aborted so resolve_checkpoint's re-drive
-        // is a no-op and the pending target keeps its feedback.
-        db.lock().set_run_status(&run_id, "aborted", true).unwrap();
-        orch.resolve_checkpoint(
+        let redrive = orch.resolve_checkpoint_apply_only(
             &run_id,
+            None,
             CheckpointAction::SendBack { feedback: Some("polish".into()) },
-        ).await.unwrap();
+        ).unwrap();
+        assert!(redrive.is_some(), "the run wants driving again");
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(
             stages[0].feedback.as_deref(),
             Some("did code_review\n\nDirector's note: polish"),
         );
-        assert_eq!(stages[0].status, "pending"); // reset, not re-run (aborted)
+        assert_eq!(stages[0].status, "pending"); // reset, not yet re-run
     }
 
     /// A runner whose review-role output carries a verdict; everything else Done.
