@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Ban, RotateCcw, ChevronRight, Hourglass } from "lucide-react";
 import type { Run, RunStage } from "../lib/ipc";
-import { isTransientHalt } from "../lib/runStatus";
+import { isTerminalRun, isTransientHalt } from "../lib/runStatus";
 import { labelForRole } from "../lib/stageMeta";
 import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
@@ -42,7 +42,6 @@ interface Props {
   onRunAgain: () => void;
 }
 
-const TERMINAL = new Set(["completed", "aborted", "failed"]);
 
 function firstLine(error: string | null): string {
   const line = (error ?? "").split("\n")[0].trim();
@@ -108,7 +107,7 @@ function useAbortConfirm(onAbort: () => void): [() => void, React.ReactNode] {
 export function RunControlBar(props: Props) {
   const { run, blockedStage } = props;
 
-  if (TERMINAL.has(run.status)) {
+  if (isTerminalRun(run.status)) {
     return <TerminalBar run={run} onRunAgain={props.onRunAgain} />;
   }
   if (run.status === "draft") {

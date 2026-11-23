@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+
+const { pushToastMock } = vi.hoisted(() => ({ pushToastMock: vi.fn() }));
+vi.mock("../Toasts", () => ({ pushToast: pushToastMock }));
 import { render, fireEvent } from "@testing-library/react";
 import { DiffView, keyboardHelpLine } from "./DiffView";
 import { useReviewComments } from "../../stores/reviewCommentsStore";
@@ -119,7 +122,7 @@ describe("DiffView", () => {
     );
     beforeEach(() => useReviewComments.setState({ byWs: {}, liveByWs: {} }));
 
-    it("m opens a comment on the focused hunk; ⌘↩ adds it to the tray and shows it under the hunk", () => {
+    it("m opens a comment on the focused hunk; ⌘⏎ adds it to the tray and shows it under the hunk", () => {
       const { getByLabelText, getByText } = render(view(two));
       fireEvent.keyDown(window, { key: "m" });
       const field = getByLabelText("What should change");
@@ -160,6 +163,85 @@ describe("DiffView", () => {
       expect(queryByLabelText("What should change")).toBeNull();
       expect(container.querySelectorAll("[data-picked]")).toHaveLength(0);
       expect(useReviewComments.getState().byWs.w1 ?? []).toEqual([]);
+    });
+
+    it("names the shortcut with the app's ⌘⏎ glyph", () => {
+      const { getByRole } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      expect(getByRole("button", { name: "Ask for this change" }).getAttribute("title")).toBe("Add to the comments for the agent (⌘⏎)");
+    });
+
+    it("keeps the typed note when another line is picked, in this hunk or another", () => {
+      const twoHunks: DiffFile[] = [{ ...two[0], hunks: [two[0].hunks[0], {
+        header: "@@ -20 +21 @@", lines: [], rawText: "y", additions: 1, deletions: 0,
+        rows: [{ kind: "add", text: "z", oldLine: null, newLine: 21 }],
+      }] }];
+      const { getByLabelText, getByText, getAllByText } = render(view(twoHunks));
+      fireEvent.click(getAllByText("5")[0]);
+      fireEvent.change(getByLabelText("What should change"), { target: { value: "Half a tho" } });
+      fireEvent.click(getAllByText("6")[0]);
+      expect(getByText("src/a.ts:6")).toBeTruthy();
+      expect((getByLabelText("What should change") as HTMLTextAreaElement).value).toBe("Half a tho");
+      fireEvent.click(getAllByText("21")[0]);
+      expect(getByText("src/a.ts:21")).toBeTruthy();
+      const field = getByLabelText("What should change") as HTMLTextAreaElement;
+      expect(field.value).toBe("Half a tho");
+      // The moved field has the focus, so the next key is typed, not a diff key.
+      expect(document.activeElement).toBe(field);
+    });
+
+    it("keeps the field open, as outdated, when a refetch changes the hunk under a typed note", () => {
+      const { getByLabelText, rerender, container } = render(view(two));
+      fireEvent.click(container.querySelectorAll("[data-diff-row]")[1].querySelectorAll("span")[1]);
+      fireEvent.change(getByLabelText("What should change"), { target: { value: "Half a tho" } });
+      const edited: DiffFile[] = [{ ...two[0], hunks: [{ ...two[0].hunks[0], rawText: "changed",
+        rows: [...two[0].hunks[0].rows, { kind: "add", text: "d", oldLine: null, newLine: 7 }] }] }];
+      rerender(view(edited));
+      const field = getByLabelText("What should change") as HTMLTextAreaElement;
+      expect(field.value).toBe("Half a tho");
+      expect(container.querySelector("[data-comment-stale]")).toBeTruthy();
+      fireEvent.keyDown(field, { key: "Enter", metaKey: true });
+      // Added with the place and lines it was written on: the tray shows it outdated.
+      const [c] = useReviewComments.getState().byWs.w1;
+      expect(c).toMatchObject({ startLine: 5, endLine: 5, quote: ["+b"], note: "Half a tho" });
+      expect(useReviewComments.getState().liveByWs.w1.has(`src/a.ts\n${c.fingerprint}`)).toBe(false);
+    });
+
+    it("keeps a typed note in the tray when its file leaves the diff", () => {
+      pushToastMock.mockClear();
+      const { getByLabelText, queryByLabelText, rerender } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      fireEvent.change(getByLabelText("What should change"), { target: { value: "Half a tho" } });
+      const elsewhere: DiffFile[] = [{ ...two[0], filePath: "src/b.ts" }];
+      rerender(view(elsewhere));
+      expect(queryByLabelText("What should change")).toBeNull();
+      expect(useReviewComments.getState().byWs.w1).toEqual([expect.objectContaining({ filePath: "src/a.ts", note: "Half a tho" })]);
+      expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({ title: "Your comment was kept" }));
+    });
+
+    it("an empty draft whose file left the diff just closes", () => {
+      pushToastMock.mockClear();
+      const { rerender, queryByLabelText } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      rerender(view([{ ...two[0], filePath: "src/b.ts" }]));
+      expect(queryByLabelText("What should change")).toBeNull();
+      expect(useReviewComments.getState().byWs.w1 ?? []).toEqual([]);
+      expect(pushToastMock).not.toHaveBeenCalled();
+    });
+
+    it("m on a folded file opens it to show the field, and folding again keeps the note", () => {
+      const { getByLabelText, queryByLabelText, container } = render(view(two));
+      const folded = () => container.querySelector("[data-collapsed]")!.getAttribute("data-collapsed");
+      fireEvent.keyDown(window, { key: " " });
+      expect(folded()).toBe("true");
+      fireEvent.keyDown(window, { key: "m" });
+      expect(folded()).toBe("false");
+      fireEvent.change(getByLabelText("What should change"), { target: { value: "Half a tho" } });
+      (document.activeElement as HTMLElement).blur();
+      fireEvent.keyDown(window, { key: " " });
+      fireEvent.keyDown(window, { key: " " });
+      expect(folded()).toBe("false");
+      expect((queryByLabelText("What should change") as HTMLTextAreaElement | null)?.value).toBe("Half a tho");
     });
 
     it("offers no comments in the read-only Since base view", () => {

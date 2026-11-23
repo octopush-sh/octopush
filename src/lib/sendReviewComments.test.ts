@@ -1,5 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { commentTarget, sendReviewComments } from "./sendReviewComments";
+
+const { pushToastMock } = vi.hoisted(() => ({ pushToastMock: vi.fn() }));
+vi.mock("../components/Toasts", () => ({ pushToast: pushToastMock }));
+
+import { commentTarget, forgetPendingGateSends, sendReviewComments } from "./sendReviewComments";
 import { useReviewComments } from "../stores/reviewCommentsStore";
 import { useRunsStore } from "../stores/runsStore";
 import { useChatStore } from "../stores/chatStore";
@@ -11,10 +15,10 @@ const note = { filePath: "a.ts", fingerprint: "f1", startLine: 2, endLine: 2, qu
 const stage = (over: Partial<RunStage>): RunStage =>
   ({ id: "s", position: 0, role: "implementer", status: "done", startedAt: "t", artifact: null,
     loopMode: null, loopTargetPosition: null, loopIterations: 0, loopMaxIterations: 3, ...over }) as RunStage;
-const parked = (over: Partial<RunStage> = {}) => {
-  const run = { id: "r1", workspaceId: "w1", status: "paused" } as Run;
+const parked = (over: Partial<RunStage> = {}, status = "paused", listed = status) => {
+  const run = { id: "r1", workspaceId: "w1", status } as Run;
   useRunsStore.setState({
-    runsByWs: { w1: [run] },
+    runsByWs: { w1: [{ ...run, status: listed } as Run] },
     detailByRun: {
       r1: {
         run,
@@ -40,7 +44,9 @@ describe("sendReviewComments", () => {
     window.removeEventListener(NAVIGATE_EVENT, onNav);
     window.addEventListener(NAVIGATE_EVENT, onNav);
     useReviewComments.setState({ byWs: {}, liveByWs: {} });
-    useRunsStore.setState({ runsByWs: {}, detailByRun: {}, resolve });
+    pushToastMock.mockClear();
+    forgetPendingGateSends();
+    useRunsStore.setState({ runsByWs: {}, detailByRun: {}, runErrors: {}, resolve });
     useChatStore.setState({ send });
   });
 
@@ -83,7 +89,7 @@ describe("sendReviewComments", () => {
 
   it("sends back the latest run's gate with the comments as its feedback", async () => {
     parked();
-    expect(commentTarget("w1")).toEqual({ kind: "gate", runId: "r1", stageId: "rev", role: "implementer" });
+    expect(commentTarget("w1")).toEqual({ kind: "gate", runId: "r1", stageId: "rev", role: "implementer", iteration: 0 });
     useReviewComments.getState().add("w1", note);
     await sendReviewComments("w1", "/w1");
     expect(resolve).toHaveBeenCalledWith("r1", "rev", "send_back", { feedback: expect.stringContaining("Rename x.") });
@@ -94,6 +100,92 @@ describe("sendReviewComments", () => {
   it("falls back to Talk once the gate's loop is at its cap", () => {
     parked({ loopIterations: 3 });
     expect(commentTarget("w1")).toEqual({ kind: "talk" });
+  });
+
+  // An abort leaves the parked stage at `awaiting_checkpoint`: a send-back
+  // there would archive stages and reach no agent.
+  it.each(["aborted", "completed", "failed"])("goes to Talk, not to the gate, when the run is %s", async (status) => {
+    parked({}, status);
+    expect(commentTarget("w1")).toEqual({ kind: "talk" });
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(resolve).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(modes).toEqual(["talk"]);
+  });
+
+  it("reads the run's end from the detail too, when the list is behind", () => {
+    parked({}, "aborted", "paused");
+    expect(commentTarget("w1")).toEqual({ kind: "talk" });
+  });
+
+  it("switches mode only after the send went out", async () => {
+    const seen: string[][] = [];
+    send.mockImplementationOnce(async () => { seen.push([...modes]); return true; });
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(seen).toEqual([[]]);
+    expect(modes).toEqual(["talk"]);
+
+    parked();
+    resolve.mockImplementationOnce(async () => { seen.push([...modes]); return true; });
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(seen[1]).toEqual(["talk"]);
+    expect(modes).toEqual(["talk", "direct"]);
+  });
+
+  it("stays in Review when the send didn't go out", async () => {
+    send.mockResolvedValueOnce(false);
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    parked();
+    resolve.mockResolvedValueOnce(false);
+    await sendReviewComments("w1", "/w1");
+    expect(modes).toEqual([]);
+  });
+
+  // Without detached runs the backend applies the decision in the background:
+  // the dispatch succeeds and a refusal arrives later as `run://error`.
+  it("puts the comments back when the run refuses the send-back after accepting it", async () => {
+    parked();
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(useReviewComments.getState().byWs.w1).toEqual([]);
+    useReviewComments.getState().add("w1", { ...note, note: "Later." });
+    // Something else in the store changing settles nothing.
+    useRunsStore.setState({ selectedStageByRun: {} });
+    expect(useReviewComments.getState().byWs.w1.map((c) => c.note)).toEqual(["Later."]);
+
+    useRunsStore.getState().noteRunError("r1", "run is already executing");
+    expect(useReviewComments.getState().byWs.w1.map((c) => c.note)).toEqual(["Rename x.", "Later."]);
+    expect(pushToastMock).toHaveBeenCalledWith(expect.objectContaining({
+      title: "Comments not sent",
+      body: "run is already executing. They are back in Review's tray.",
+    }));
+    // Settled: a second error doesn't restore them twice.
+    useRunsStore.getState().noteRunError("r1", "again");
+    expect(useReviewComments.getState().byWs.w1).toHaveLength(2);
+  });
+
+  it("leaves the tray empty once the gate's stage moved, whatever fails later", async () => {
+    parked();
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    // Applied: the loop went back, the review stage waits for its turn again.
+    parked({ status: "pending", loopIterations: 1 });
+    useRunsStore.getState().noteRunError("r1", "the next stage failed to start");
+    expect(useReviewComments.getState().byWs.w1).toEqual([]);
+    expect(pushToastMock).not.toHaveBeenCalled();
+  });
+
+  it("an error from before the send is not taken for its refusal", async () => {
+    parked();
+    useRunsStore.getState().noteRunError("r1", "old");
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    useRunsStore.setState({ selectedStageByRun: {} });
+    expect(useReviewComments.getState().byWs.w1).toEqual([]);
   });
 
   it("does nothing with an empty tray", async () => {

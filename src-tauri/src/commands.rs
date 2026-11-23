@@ -2833,6 +2833,9 @@ fn dispatch_checkpoint(
 ) -> AppResult<()> {
     // A decision on a stage that was decided elsewhere meanwhile is refused
     // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    // A decision on a run that has ended (aborted from another surface, say)
+    // is refused the same way, before anything changes.
+    orch.check_run_open(&run_id, &action)?;
     orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
     // The director acted: a fresh allowance of automatic plan resumes.
     orch.db().lock().reset_plan_resume_count(&run_id)?;

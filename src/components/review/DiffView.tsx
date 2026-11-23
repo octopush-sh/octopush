@@ -3,9 +3,9 @@ import { FileDiffSection } from "./FileDiffSection";
 import { EmptyDiffState, type EmptyDiffContext } from "./EmptyDiffState";
 import { useDiffKeyboard, type FlatHunk } from "./useDiffKeyboard";
 import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
-import { commentAnchor, liveHunkKeys } from "../../lib/reviewComments";
+import { commentAnchor, liveHunkKeys, reanchorDraft, type CommentDraft } from "../../lib/reviewComments";
+import { pushToast } from "../Toasts";
 import { selectComments, useReviewComments } from "../../stores/reviewCommentsStore";
-import type { RowPick } from "./DiffLines";
 
 export interface DiffAnchor { filePath: string; startLine: number; endLine: number; }
 
@@ -48,9 +48,10 @@ export function DiffView(props: Props) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const [changed, setChanged] = useState<Record<string, boolean>>({});
   const [help, setHelp] = useState(false);
-  // The open "Ask for a change" draft: its hunk (by index and fingerprint, so
-  // a refetch that changes the hunk drops it) and the rows picked, if any.
-  const [draft, setDraft] = useState<{ filePath: string; hunkIdx: number; fingerprint: string; rows?: RowPick } | null>(null);
+  // The open "Ask for a change" draft: its hunk, the rows picked (if any),
+  // the anchor taken at that moment and the note typed so far. The note lives
+  // here, not in the field, so nothing that remounts the field loses it.
+  const [draft, setDraft] = useState<CommentDraft | null>(null);
 
   // Marks belong to one workspace: the same path elsewhere starts unviewed.
   const [scope, setScope] = useState(props.workspacePath);
@@ -68,26 +69,38 @@ export function DiffView(props: Props) {
   useEffect(() => {
     if (commentWs) useReviewComments.getState().setLive(commentWs, liveHunkKeys(files));
   }, [commentWs, files]);
+  // A refetch (the agent is still editing) must not take a half-typed note
+  // away: the draft follows its hunk, stays open as outdated when the hunk
+  // changed, and is kept in the tray when its file left the diff.
   useEffect(() => {
-    setDraft((d) => {
-      if (!d) return d;
-      const h = files.find((f) => f.filePath === d.filePath)?.hunks[d.hunkIdx];
-      return h && hunkFingerprint(h) === d.fingerprint ? d : null;
-    });
-  }, [files]);
+    if (!commentWs || !draft) return;
+    const next = reanchorDraft(draft, files);
+    if (next === draft) return;
+    if (next === null && draft.note.trim()) {
+      useReviewComments.getState().add(commentWs, { ...draft.anchor, note: draft.note.trim() });
+      pushToast({
+        level: "info",
+        title: "Your comment was kept",
+        body: "Its file left the diff while you were writing. It is in the tray, marked outdated.",
+      });
+    }
+    setDraft(next);
+  }, [commentWs, draft, files]);
+  // Opening on another place (another line, another hunk) moves the draft
+  // there with the note typed so far. A folded file opens to show the field.
   const startComment = (filePath: string, hunkIdx: number, rowIdx?: number, extend = false) => {
     const hunk = files.find((f) => f.filePath === filePath)?.hunks[hunkIdx];
     if (!commentWs || !hunk) return;
     setDraft((d) => {
-      const same = d && d.filePath === filePath && d.hunkIdx === hunkIdx;
+      const same = d && !d.stale && d.filePath === filePath && d.hunkIdx === hunkIdx;
       const rows = rowIdx === undefined ? undefined : extend && same && d.rows ? { from: d.rows.from, to: rowIdx } : { from: rowIdx, to: rowIdx };
-      return { filePath, hunkIdx, fingerprint: hunkFingerprint(hunk), rows };
+      return { filePath, hunkIdx, rows, anchor: commentAnchor(filePath, hunk, rows), note: d?.note ?? "", stale: false };
     });
+    setCollapsed((m) => (m[filePath] ? { ...m, [filePath]: false } : m));
   };
-  const submitComment = (note: string) => {
-    const hunk = draft && files.find((f) => f.filePath === draft.filePath)?.hunks[draft.hunkIdx];
-    if (!commentWs || !draft || !hunk) return;
-    useReviewComments.getState().add(commentWs, { ...commentAnchor(draft.filePath, hunk, draft.rows), note });
+  const submitComment = () => {
+    if (!commentWs || !draft || !draft.note.trim()) return;
+    useReviewComments.getState().add(commentWs, { ...draft.anchor, note: draft.note.trim() });
     setDraft(null);
   };
 
@@ -200,6 +213,7 @@ export function DiffView(props: Props) {
               draft: draft?.filePath === file.filePath ? draft : null,
               comments: comments.filter((c) => c.filePath === file.filePath),
               onStartComment: (hi: number, ri?: number, extend?: boolean) => startComment(file.filePath, hi, ri, extend),
+              onDraftNote: (note: string) => setDraft((d) => (d ? { ...d, note } : d)),
               onSubmitComment: submitComment,
               onCancelComment: () => setDraft(null),
               onRemoveComment: (id: string) => useReviewComments.getState().remove(commentWs, id),

@@ -38,6 +38,19 @@ describe("CommentTray", () => {
     expect(onJump).toHaveBeenCalledWith("src/a.ts", 2);
   });
 
+  it("says when the quote was capped, and jumps to the file for a comment on removed lines", () => {
+    act(() => {
+      useReviewComments.getState().add("w1", { ...base, fingerprint: "live", quoteCut: 30, removed: true });
+    });
+    const onJump = vi.fn();
+    const { getByText, getByRole, container } = render(<CommentTray workspaceId="w1" workspacePath="/w1" onJump={onJump} />);
+    expect(getByText("… 30 more lines not quoted")).toBeTruthy();
+    expect(container.querySelectorAll("[data-quote-cut]")).toHaveLength(1);
+    // Old-side numbers are not lines of the file on disk.
+    fireEvent.click(getByRole("button", { name: "src/a.ts:2–3 (removed)" }));
+    expect(onJump).toHaveBeenCalledWith("src/a.ts", null);
+  });
+
   it("Send to the agent delivers them; it waits while Talk is answering", async () => {
     act(() => useReviewComments.getState().add("w1", { ...base, fingerprint: "live" }));
     useChatStore.setState({ streamingByWs: { w1: true } });

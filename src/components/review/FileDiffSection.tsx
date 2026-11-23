@@ -1,14 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { HunkRail } from "./HunkRail";
-import { DiffLines, type RowPick } from "./DiffLines";
+import { DiffLines } from "./DiffLines";
 import { CommentComposer, HunkCommentList } from "./HunkComments";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import { ipc } from "../../lib/ipc";
 import { diffGrammarReady, highlightFile, loadDiffGrammar } from "../../lib/diffSyntax";
 import { hunkFingerprint, type DiffFile } from "../../lib/diffParser";
-import { commentAnchor, commentLocation, type ReviewComment } from "../../lib/reviewComments";
+import { commentLocation, type CommentDraft, type ReviewComment } from "../../lib/reviewComments";
 
 /** Larger files are highlighted hunk by hunk, without the rest of the file. */
 const MAX_CONTEXT_BYTES = 1_000_000;
@@ -30,13 +30,15 @@ interface Props {
   onWhy: (hunkIdx: number) => void;
   onToggleViewed: () => void;
   onToggleCollapsed: () => void;
-  /** Review comments (#956), working tree only. The hunk (and rows) a draft
-   *  comment is open on; this file's comments, shown under their hunk. */
-  draft?: { hunkIdx: number; rows?: RowPick } | null;
+  /** Review comments (#956), working tree only. The draft comment open on
+   *  this file (its hunk, rows and note); this file's comments, shown under
+   *  their hunk. */
+  draft?: CommentDraft | null;
   comments?: ReviewComment[];
   /** Open a draft on a hunk, or on one of its rows (`extend` = shift-click). */
   onStartComment?: (hunkIdx: number, rowIdx?: number, extend?: boolean) => void;
-  onSubmitComment?: (note: string) => void;
+  onDraftNote?: (note: string) => void;
+  onSubmitComment?: () => void;
   onCancelComment?: () => void;
   onRemoveComment?: (id: string) => void;
 }
@@ -57,6 +59,7 @@ export function FileDiffSection({
   draft = null,
   comments = [],
   onStartComment,
+  onDraftNote,
   onSubmitComment,
   onCancelComment,
   onRemoveComment,
@@ -211,9 +214,12 @@ export function FileDiffSection({
                   onRemove={onRemoveComment}
                 />
               )}
-              {draft?.hunkIdx === i && onSubmitComment && onCancelComment && (
+              {draft?.hunkIdx === i && onDraftNote && onSubmitComment && onCancelComment && (
                 <CommentComposer
-                  location={commentLocation(commentAnchor(file.filePath, hunk, draft.rows))}
+                  location={commentLocation(draft.anchor)}
+                  note={draft.note}
+                  stale={draft.stale}
+                  onNoteChange={onDraftNote}
                   onSubmit={onSubmitComment}
                   onCancel={onCancelComment}
                 />

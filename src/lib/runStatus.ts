@@ -2,6 +2,14 @@ import type { Run, RunStageStatus, RunStatus } from "./ipc";
 import { isDeferredToolHalt } from "./stageHalt";
 import { isPlanLimitHalt, isPlanWaiting } from "./planWait";
 
+const TERMINAL: ReadonlySet<string> = new Set(["completed", "aborted", "failed"]);
+
+/** A run that has ended: nothing in it waits for a decision any more, even
+ *  when a stage row still reads `awaiting_checkpoint` (an abort leaves the
+ *  parked stage as it was). The run bar and Review's comment tray both read
+ *  this, so they can't disagree. */
+export const isTerminalRun = (status: string): boolean => TERMINAL.has(status);
+
 export interface StatusMeta {
   label: string;
   className: string;

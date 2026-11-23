@@ -1,29 +1,49 @@
-import { useState } from "react";
+import { useEffect, useRef } from "react";
 import { MessageSquare, X } from "lucide-react";
 import { commentLocation, type ReviewComment } from "../../lib/reviewComments";
 
-/** The inline "Ask for a change" field under a hunk (#956). ⌘↩ adds the
- *  comment to the Companion's tray; Escape drops the draft. */
+/** The inline "Ask for a change" field under a hunk (#956). ⌘⏎ adds the
+ *  comment to the Companion's tray; Escape drops the draft. The note is the
+ *  caller's state, so it outlives this field: picking another line, folding
+ *  the file or a refetch that moves the hunk remounts the field with what
+ *  was typed. `stale` = the hunk changed since the place was picked. */
 export function CommentComposer({
   location,
+  note,
+  stale = false,
+  onNoteChange,
   onSubmit,
   onCancel,
 }: {
   location: string;
-  onSubmit: (note: string) => void;
+  note: string;
+  stale?: boolean;
+  onNoteChange: (note: string) => void;
+  onSubmit: () => void;
   onCancel: () => void;
 }) {
-  const [note, setNote] = useState("");
-  const submit = () => { if (note.trim()) onSubmit(note.trim()); };
+  const field = useRef<HTMLTextAreaElement>(null);
+  // Focus with the caret after what was already typed (a remount must not
+  // send the next keystroke to the diff's own keys, or to the note's start).
+  useEffect(() => {
+    const el = field.current;
+    if (!el) return;
+    el.focus();
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, []);
+  const submit = () => { if (note.trim()) onSubmit(); };
   return (
     <div data-tour="review-comment-composer" className="octo-rise-in mt-1 flex flex-col gap-1.5 border-l-2 border-[var(--brass-dim)] bg-octo-panel px-3 py-2">
-      <div className="font-mono text-[10px] text-octo-mute">{location}</div>
+      <div className="font-mono text-[10px] text-octo-mute">
+        {location}
+        {stale && <span data-comment-stale> · this hunk changed; the comment keeps the lines it quoted</span>}
+      </div>
       <textarea
-        autoFocus
+        ref={field}
         value={note}
         aria-label="What should change"
         placeholder="What should change here…"
-        onChange={(e) => setNote(e.target.value)}
+        onChange={(e) => onNoteChange(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === "Escape") { e.stopPropagation(); onCancel(); }
           if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(); }
@@ -36,7 +56,7 @@ export function CommentComposer({
           data-tour="review-comment-add"
           onClick={submit}
           disabled={!note.trim()}
-          title="Add to the comments for the agent (⌘↩)"
+          title="Add to the comments for the agent (⌘⏎)"
           className="rounded-md border border-[var(--brass-dim)] px-2.5 py-1 font-serif text-[12px] text-octo-brass transition-colors duration-[var(--dur-quick)] hover:bg-[var(--brass-ghost)] disabled:opacity-50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
           Ask for this change

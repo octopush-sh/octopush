@@ -9,7 +9,7 @@ steps:
     caption: Ask for a change on a hunk, or click a line number to comment on lines.
     action: click
   - target: review-comment-composer
-    caption: Say what should change. ⌘↩ adds it to the comments.
+    caption: Say what should change. ⌘⏎ adds it to the comments.
     action: type
     text: Extract this into a helper.
   - target: review-comment-add

@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { parseFullDiff, hunkFingerprint } from "./diffParser";
-import { commentAnchor, commentLocation, commentsMessage, isOutdated, liveHunkKeys, sendBackGate, type ReviewComment } from "./reviewComments";
+import {
+  MAX_QUOTE_LINE_CHARS, MAX_QUOTE_LINES, commentAnchor, commentLocation, commentsMessage, isOutdated, liveHunkKeys,
+  reanchorDraft, sendBackGate, type CommentDraft, type ReviewComment,
+} from "./reviewComments";
 import type { RunStage } from "./ipc";
 
 const DIFF = `diff --git a/src/foo.ts b/src/foo.ts
@@ -37,6 +40,88 @@ describe("commentAnchor", () => {
     const del = commentAnchor("src/foo.ts", hunk, { from: 4, to: 4 });
     expect(del.quote).toEqual(["-deleted_4"]);
     expect(del.startLine).toBe(3);
+  });
+});
+
+describe("commentAnchor: one side per range", () => {
+  // Rows: 0 line1 (1/1) · 1 +added_2 (new 2) · 2 +added_3 (new 3) ·
+  // 3 line3 (old 2/new 4) · 4 -deleted_4 (old 3) · 5 line5 (old 4/new 5).
+  it("numbers a range that includes a removed row by its new-side rows only", () => {
+    const a = commentAnchor("src/foo.ts", hunk, { from: 3, to: 5 });
+    // Old line 3 (the removed row) must not become the start of a new-side range.
+    expect([a.startLine, a.endLine]).toEqual([4, 5]);
+    expect(a.removed).toBeUndefined();
+    expect(a.quote).toEqual([" line3", "-deleted_4", " line5"]);
+    expect(commentLocation(a)).toBe("src/foo.ts:4–5");
+  });
+  it("uses old-side lines, and says so, only when every picked row was removed", () => {
+    const a = commentAnchor("src/foo.ts", hunk, { from: 4, to: 4 });
+    expect([a.startLine, a.endLine, a.removed]).toEqual([3, 3, true]);
+    expect(commentLocation(a)).toBe("src/foo.ts:3 (removed)");
+    const whole = commentAnchor("src/foo.ts", hunk);
+    expect([whole.startLine, whole.endLine, whole.removed]).toEqual([1, 5, undefined]);
+  });
+});
+
+describe("commentAnchor: capped quote", () => {
+  const body = Array.from({ length: 50 }, (_, i) => `+row_${i + 1}`).join("\n");
+  const [bigFile] = parseFullDiff(`diff --git a/new.ts b/new.ts\nnew file mode 100644\n--- /dev/null\n+++ b/new.ts\n@@ -0,0 +1,50 @@\n${body}\n`);
+  const big = bigFile.hunks[0];
+
+  it("quotes at most MAX_QUOTE_LINES rows of a large hunk and counts the rest", () => {
+    const a = commentAnchor("new.ts", big);
+    expect(big.rows).toHaveLength(50);
+    expect(a.quote).toHaveLength(MAX_QUOTE_LINES);
+    expect(a.quote[0]).toBe("+row_1");
+    expect(a.quoteCut).toBe(50 - MAX_QUOTE_LINES);
+    // The place still names the whole range.
+    expect([a.startLine, a.endLine]).toEqual([1, 50]);
+  });
+  it("says in the message how many lines were left out", () => {
+    const msg = commentsMessage([{ id: "c", ...commentAnchor("new.ts", big), note: "Split this file." }], null);
+    expect(msg).toContain(`> +row_${MAX_QUOTE_LINES}\n> … ${50 - MAX_QUOTE_LINES} more lines not quoted\n\nSplit this file.`);
+    expect(msg).not.toContain(`row_${MAX_QUOTE_LINES + 1}`);
+  });
+  it("leaves a short quote whole, with nothing to say", () => {
+    const a = commentAnchor("src/foo.ts", hunk);
+    expect(a.quoteCut).toBeUndefined();
+    expect(commentsMessage([{ id: "c", ...a, note: "n" }], null)).not.toContain("not quoted");
+  });
+  it("cuts an overlong line with an ellipsis", () => {
+    const [f] = parseFullDiff(`diff --git a/m.js b/m.js\n--- a/m.js\n+++ b/m.js\n@@ -1 +1 @@\n-a\n+${"x".repeat(5000)}\n`);
+    const a = commentAnchor("m.js", f.hunks[0], { from: 1, to: 1 });
+    expect(a.quote[0]).toHaveLength(MAX_QUOTE_LINE_CHARS);
+    expect(a.quote[0].endsWith("…")).toBe(true);
+  });
+});
+
+describe("reanchorDraft", () => {
+  const draft = (over: Partial<CommentDraft> = {}): CommentDraft => ({
+    filePath: "src/foo.ts", hunkIdx: 0, rows: { from: 1, to: 2 },
+    anchor: commentAnchor("src/foo.ts", hunk, { from: 1, to: 2 }), note: "Half a tho", stale: false, ...over,
+  });
+  const other = parseFullDiff(DIFF.replace("+added_3", "+added_three"))[0].hunks[0];
+
+  it("is the same draft while its hunk is where it was", () => {
+    const d = draft();
+    expect(reanchorDraft(d, [file])).toBe(d);
+  });
+  it("follows its hunk to a new index", () => {
+    const d = draft();
+    expect(reanchorDraft(d, [{ ...file, hunks: [other, hunk] }])).toEqual({ ...d, hunkIdx: 1 });
+  });
+  it("stays open, as outdated, with its note and anchor when the hunk changed", () => {
+    const d = draft({ hunkIdx: 1 });
+    const next = reanchorDraft(d, [{ ...file, hunks: [other] }])!;
+    expect(next).toMatchObject({ hunkIdx: 0, stale: true, note: "Half a tho", rows: undefined });
+    expect(next.anchor).toBe(d.anchor);
+    // Stable across further refetches of the same diff; fresh again if the hunk returns.
+    expect(reanchorDraft(next, [{ ...file, hunks: [other] }])).toBe(next);
+    expect(reanchorDraft(next, [file])).toMatchObject({ hunkIdx: 0, stale: false });
+  });
+  it("has nowhere to sit once its file left the diff", () => {
+    expect(reanchorDraft(draft(), [])).toBeNull();
+    expect(reanchorDraft(draft(), [{ ...file, hunks: [] }])).toBeNull();
   });
 });
 

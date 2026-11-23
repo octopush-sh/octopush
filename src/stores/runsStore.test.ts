@@ -26,6 +26,12 @@ vi.mock("../lib/ipc", async () => {
 
 import { ipc, type Run, type RunStage } from "../lib/ipc";
 import { useRunsStore, EMPTY_RUNS, prefilledTask } from "./runsStore";
+import { listen } from "@tauri-apps/api/event";
+
+// The store subscribes at import; `beforeEach` clears the mock's calls.
+const onRunError = (listen as any).mock.calls.find((c: any[]) => c[0] === "run://error")[1] as (ev: {
+  payload: { runId: string; error: string };
+}) => void;
 
 const RUN: Run = {
   id: "r1", workspaceId: "w1", pipelineId: "p1", task: "t", status: "running",
@@ -533,6 +539,22 @@ describe("runsStore", () => {
     await useRunsStore.getState().loadRuns("w1");
     expect(useRunsStore.getState().settledAt["r1"]).toBeUndefined();
     expect(useRunsStore.getState().statusSince["r1"]).toBeUndefined();
+  });
+
+  it("run://error is recorded per run, after the run was read again", async () => {
+    useRunsStore.setState({ runErrors: {} });
+    let release!: (v: unknown) => void;
+    (ipc.getRun as any).mockReturnValue(new Promise((r) => { release = r; }));
+    onRunError({ payload: { runId: "r1", error: "run is already executing" } });
+    // Not before the refresh: a watcher must read stages that are current.
+    expect(useRunsStore.getState().runErrors.r1).toBeUndefined();
+    release({ run: RUN, stages: [{ ...STAGE, status: "awaiting_checkpoint" }] });
+    await vi.waitFor(() => expect(useRunsStore.getState().runErrors.r1).toEqual({ n: 1, error: "run is already executing" }));
+    expect(useRunsStore.getState().detailByRun.r1.stages[0].status).toBe("awaiting_checkpoint");
+    // A failed refresh still records it, and each error counts.
+    (ipc.getRun as any).mockRejectedValue("gone");
+    onRunError({ payload: { runId: "r1", error: "second" } });
+    await vi.waitFor(() => expect(useRunsStore.getState().runErrors.r1).toEqual({ n: 2, error: "second" }));
   });
 
   describe("loadSettledWhileAway", () => {

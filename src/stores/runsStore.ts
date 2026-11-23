@@ -71,6 +71,10 @@ interface RunsState {
    *  `currentContext`): a `get_run` refresh can land after a newer event.
    *  A stage's restart (`clearLog`) forgets it. */
   liveContextByStage: Record<string, { contextTokens: number | null; contextWindow: number | null }>;
+  /** The newest `run://error` heard per run this session, counted (`n`) so a
+   *  watcher can tell a new one from the one it already saw. A decision the
+   *  backend applies in the background reports its refusal this way. */
+  runErrors: Record<string, { n: number; error: string }>;
   /** One-shot launcher seed set by "Run it again"; consumed (and cleared) by
    *  PipelineSetup on its next mount. */
   launcherPrefill: LauncherPrefill | null;
@@ -169,6 +173,8 @@ interface RunsState {
 
   applyStageUpdate: (runId: string, run: Run) => void;
   applyCost: (runId: string, costUsd: number, baselineUsd: number) => void;
+  /** Record a `run://error` for a run (see `runErrors`). */
+  noteRunError: (runId: string, error: string) => void;
   /** Keep one stage's newest context reading (`run://context`, #895). */
   applyContext: (runId: string, stageId: string, contextTokens: number | null, contextWindow: number | null) => void;
 }
@@ -221,6 +227,7 @@ export const useRunsStore = create<RunsState>((set, get) => ({
   loadedByWs: {},
   activeRunIdByWs: {},
   detailByRun: {},
+  runErrors: {},
   selectedStageByRun: {},
   selectedRunIdByWs: {},
   liveByStage: {},
@@ -599,6 +606,9 @@ export const useRunsStore = create<RunsState>((set, get) => ({
     });
   },
 
+  noteRunError: (runId, error) =>
+    set((s) => ({ runErrors: { ...s.runErrors, [runId]: { n: (s.runErrors[runId]?.n ?? 0) + 1, error } } })),
+
   applyContext: (_runId, stageId, contextTokens, contextWindow) => {
     set((s) => {
       const cur = s.liveContextByStage[stageId];
@@ -629,7 +639,14 @@ void listen<{ runId: string }>(RUN_EVENTS.checkpoint, (ev) => {
   void useRunsStore.getState().refreshDetail(ev.payload.runId);
 });
 void listen<{ runId: string; error: string }>(RUN_EVENTS.error, (ev) => {
-  void useRunsStore.getState().refreshDetail(ev.payload.runId);
+  // Refresh first, then record the error: whoever watches `runErrors` (the
+  // Review tray, after a send-back) reads stages that are already current.
+  const { runId, error } = ev.payload;
+  void useRunsStore
+    .getState()
+    .refreshDetail(runId)
+    .catch(() => {})
+    .finally(() => useRunsStore.getState().noteRunError(runId, error));
 });
 void listen<{ runId: string; stageId: string; entry?: LiveEntry; reset?: boolean }>(
   RUN_EVENTS.log,

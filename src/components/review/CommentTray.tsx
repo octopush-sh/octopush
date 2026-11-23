@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { MessageSquare, X } from "lucide-react";
-import { commentLocation, isOutdated, type ReviewComment } from "../../lib/reviewComments";
+import { commentLocation, isOutdated, quoteCutNote, type ReviewComment } from "../../lib/reviewComments";
 import { commentTarget, sendReviewComments } from "../../lib/sendReviewComments";
 import { selectComments, useReviewComments } from "../../stores/reviewCommentsStore";
 import { useRunsStore } from "../../stores/runsStore";
@@ -100,7 +100,7 @@ function TrayComment({
       <div className="flex min-w-0 items-center gap-1.5 font-mono text-[10px]">
         <button
           type="button"
-          onClick={() => onJump?.(c.filePath, c.startLine)}
+          onClick={() => onJump?.(c.filePath, c.removed ? null : c.startLine)}
           title={`Jump to ${where}`}
           className="min-w-0 truncate text-left text-octo-sage transition-colors hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
         >
@@ -128,7 +128,8 @@ function TrayComment({
         {c.quote.slice(0, QUOTE_SHOWN).map((l, i) => (
           <div key={i} className="truncate">{l}</div>
         ))}
-        {c.quote.length > QUOTE_SHOWN && <div>…</div>}
+        {c.quote.length > QUOTE_SHOWN && !c.quoteCut && <div>…</div>}
+        {!!c.quoteCut && <div data-quote-cut title="The message quotes the first lines only and says how many it left out.">{quoteCutNote(c.quoteCut)}</div>}
       </pre>
       <p className="mt-0.5 whitespace-pre-wrap break-words text-[11.5px] leading-[1.5] text-octo-sage">{c.note}</p>
     </li>
