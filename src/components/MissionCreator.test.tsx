@@ -124,12 +124,39 @@ describe("MissionCreator · Share with new missions", () => {
     const copy = screen.getByRole("switch", { name: "Copy .env into new missions" });
     expect(link).toHaveAttribute("aria-checked", "false");
     expect(copy).toHaveAttribute("aria-checked", "false");
-    expect(screen.getByText(/A linked folder is shared state/)).toBeInTheDocument();
+    const copyText = screen.getByText(/A linked folder is the main checkout's own folder, not a copy/);
+    expect(copyText).toHaveTextContent(
+      "an install or a clean run inside a mission changes it for the main checkout and for every other mission",
+    );
+    expect(copyText).toHaveTextContent("so agents in the mission can read it");
+    expect(copyText).toHaveTextContent("Routines and workspaces created over MCP don't share.");
+    expect(screen.getByText("copied into the worktree, readable by the mission's agents")).toBeInTheDocument();
     fireEvent.click(link);
     fireEvent.click(screen.getByText("Begin the mission"));
     await waitFor(() => expect(mockCreate).toHaveBeenCalled());
     expect(ipcModule.ipc.setShareWithMissions).toHaveBeenCalledWith("proj-1", { link: ["node_modules"], copy: [] });
     expect(order).toEqual(["save", "create"]);
+  });
+
+  it("warns when a folder is linked and the setup script installs or cleans", async () => {
+    offer();
+    useCompanionPrefs.setState({ setupScriptByProject: { "proj-1": "npm ci\nnpm run build" } });
+    render(<MissionCreator projectId="proj-1" projectPath="/p" onCreated={vi.fn()} onCancel={vi.fn()} initialTask="Add dark mode" />);
+    await gotoTask();
+    fireEvent.keyDown(screen.getByPlaceholderText(TASK_PLACEHOLDER), { key: "Enter" });
+    const link = await screen.findByRole("switch", { name: "Link node_modules into new missions" });
+    // Nothing is linked yet, so there is nothing to warn about.
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("switch", { name: "Copy .env into new missions" }));
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
+    fireEvent.click(link);
+    expect(
+      screen.getByText(
+        "This setup script runs npm ci. With node_modules linked, that changes the main checkout's folder, for the main checkout and for every other mission.",
+      ),
+    ).toBeInTheDocument();
+    fireEvent.click(link);
+    expect(screen.queryByText(/This setup script runs/)).not.toBeInTheDocument();
   });
 
   it("doesn't write an unchanged list", async () => {

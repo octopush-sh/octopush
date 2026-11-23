@@ -17,7 +17,7 @@ import { ipc } from "../lib/ipc";
 import { copyToClipboard } from "../lib/clipboard";
 import { pushToast } from "./Toasts";
 import { SETUP_FIELD_ROWS, conductorSourceLine, wantsConductorPrefill } from "../lib/conductorSetup";
-import { type ShareRow, sameSpec, shareRows, specFromRows } from "../lib/shareWithMissions";
+import { type ShareRow, sameSpec, setupInstallWarning, shareRows, specFromRows } from "../lib/shareWithMissions";
 
 interface Props {
   projectId: string;
@@ -361,6 +361,17 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
     onCreated();
   }
 
+  // A linked dependency folder is the main checkout's own folder: say so
+  // when the setup script would install into it or clean it. A sandboxed
+  // mission gets no links, so there is nothing to warn about.
+  const shareInstallWarning =
+    execIsolation === "sandbox"
+      ? null
+      : setupInstallWarning(
+          setupScript,
+          shareList.filter((r) => r.kind === "link" && r.checked).map((r) => r.name),
+        );
+
   return (
     <div
       data-tauri-drag-region
@@ -678,7 +689,9 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                       <li key={`${row.kind}:${row.name}`} className="flex items-center gap-3 py-1">
                         <span className="font-mono text-[12px] text-octo-ivory">{row.name}</span>
                         <span className="font-mono text-[10px] text-octo-mute">
-                          {row.kind === "link" ? "linked from the main checkout" : "copied into the worktree"}
+                          {row.kind === "link"
+                            ? "the main checkout's own folder, linked"
+                            : "copied into the worktree, readable by the mission's agents"}
                         </span>
                         <span className="ml-auto">
                           <TogglePill
@@ -696,14 +709,22 @@ export function MissionCreator({ projectId, projectPath, onCreated, onCancel, in
                     ))}
                   </ul>
                   <div className="mt-2 font-mono text-[10px] tracking-[0.05em] text-octo-mute">
-                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is shared state: an install in one mission changes it for every mission. Copies stay git-ignored, so they never stage. To keep a link out of commits, Octopush adds its name to this repo&apos;s local .git/info/exclude, where it stays.
+                    Applied to a new worktree before its setup script, and saved for this project. A linked folder is the main checkout&apos;s own folder, not a copy: an install or a clean run inside a mission changes it for the main checkout and for every other mission. A copied env file is a plain file in the mission&apos;s worktree, so agents in the mission can read it. Copies stay git-ignored, so they never stage. To keep a link out of commits, Octopush adds its name to this repo&apos;s local .git/info/exclude, where it stays. Routines and workspaces created over MCP don&apos;t share.
                   </div>
-                  {execIsolation === "sandbox" && shareList.some((r) => r.kind === "link" && r.checked) && (
+                  {shareInstallWarning && (
+                    <div
+                      data-tour="mission-share-install"
+                      className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
+                    >
+                      {shareInstallWarning}
+                    </div>
+                  )}
+                  {execIsolation === "sandbox" && shareList.some((r) => r.checked) && (
                     <div
                       data-tour="mission-share-sandbox"
                       className="octo-rise-in mt-1 font-mono text-[10px] tracking-[0.05em] text-octo-warning"
                     >
-                      A sandboxed mission gets the copies but no links, so nothing points its agents outside the worktree. Turning the sandbox on later removes a mission&apos;s links.
+                      A sandboxed mission gets neither the links nor the env files: nothing points its agents outside the worktree, and no env file is placed inside it. Turning the sandbox on later removes a mission&apos;s links and its unchanged env copies.
                     </div>
                   )}
                 </div>

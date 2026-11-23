@@ -33,7 +33,9 @@ interface MissionsState {
   ) => Promise<Mission>;
   /** Set a mission's execution isolation in place (e.g. the launcher's
    *  one-click "enable sandbox" for an unattended run). Turning the sandbox on
-   *  removes the worktree's shared links; `unlinked` names them. */
+   *  takes back what the worktree was given: `unlinked`, `uncopied` and
+   *  `keptCopies` name the links removed, the env copies removed and the
+   *  env copies kept because they changed. */
   setExecIsolation: (missionId: string, execIsolation: string) => Promise<UpdatedMission>;
   archive: (missionId: string) => Promise<void>;
 }

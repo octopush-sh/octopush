@@ -32,10 +32,10 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
     const next = sandboxed ? "none" : "sandbox";
     setEnabling(true);
     try {
-      const { unlinked } = await setExecIsolation(missionId, next);
+      const { unlinked, uncopied, keptCopies } = await setExecIsolation(missionId, next);
       pushToast(
         next === "sandbox"
-          ? { level: "success", title: "Sandbox enabled", body: sandboxOnBody(unlinked) }
+          ? { level: "success", title: "Sandbox enabled", body: sandboxOnBody({ unlinked, uncopied, keptCopies }) }
           : { level: "info", title: "Sandbox off", body: "This mission's agents run with your normal permissions." },
       );
     } catch (e) {
@@ -86,7 +86,7 @@ export function UnattendedReadiness({ workspaceId }: { workspaceId: string }) {
           title={
             sandboxed
               ? "Sandboxed — the agent's writes are confined to the workspace. Click to turn off (e.g. if a build needs to write outside it)."
-              : "Sandbox this mission — confine the agent's writes to the workspace. Folders linked from the main checkout are removed. Free."
+              : "Sandbox this mission — confine the agent's writes to the workspace. Folders linked and unchanged env files copied from the main checkout are removed. Free."
           }
           className={`flex items-center gap-1 transition-colors duration-[180ms] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-50 ${
             sandboxed ? "text-octo-verdigris hover:text-octo-brass" : "text-octo-brass hover:text-octo-brass-hi"

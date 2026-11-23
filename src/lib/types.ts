@@ -210,7 +210,8 @@ export interface ShareOptions {
 export interface ShareOutcome {
   linked: string[];
   copied: string[];
-  /** One sentence per entry left out ("node_modules: not linked in a sandboxed mission"). */
+  /** One sentence per entry left out ("node_modules: not linked in a sandboxed mission",
+   *  ".env: not copied into a sandboxed mission"). */
   skipped: string[];
 }
 
@@ -240,11 +241,14 @@ export interface Mission {
   archivedAt: string | null;
 }
 
-/** `update_mission`'s response: the mission, plus the links "Share with new
- *  missions" made that were removed from its worktree because its Execution
- *  became `sandbox`. */
+/** `update_mission`'s response: the mission, plus what "Share with new
+ *  missions" had given its worktree and was taken back because its Execution
+ *  became `sandbox`: links removed, env copies removed, and env copies kept
+ *  because they changed in the mission. */
 export interface UpdatedMission extends Mission {
   unlinked?: string[];
+  uncopied?: string[];
+  keptCopies?: string[];
 }
 
 // ─── Logbook ──────────────────────────────────────────────────────

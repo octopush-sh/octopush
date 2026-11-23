@@ -86,6 +86,17 @@ describe("UnattendedReadiness", () => {
     });
   });
 
+  it("says which copied env files turning the sandbox on removed or kept", async () => {
+    setEntitled([]);
+    updateMissionMock.mockResolvedValue({ ...mission("sandbox"), unlinked: [], uncopied: [".env"], keptCopies: [".env.local"] });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    fireEvent.click(screen.getByText(/sandbox it/i));
+    await waitFor(() => expect(pushToast).toHaveBeenCalled());
+    const body = String(vi.mocked(pushToast).mock.calls[0][0].body);
+    expect(body).toContain("Removed the copied .env from this mission's worktree.");
+    expect(body).toContain(".env.local was changed in this mission, so it stays");
+  });
+
   it("for a Pro user on a sandboxed mission, shows the confirmed state, not the enable button", () => {
     setEntitled(["runs.detached"]);
     useMissionsStore.setState({ missionByWorkspaceId: { w1: mission("sandbox") } });

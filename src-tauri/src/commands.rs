@@ -967,7 +967,9 @@ pub async fn set_share_with_missions(
 
 /// Apply the project's "Share with new missions" list to a freshly created
 /// worktree — never a reused, restored or adopted one, nor the main checkout.
-/// A sandboxed mission gets its copies but no links (`worktree_share`).
+/// A sandboxed mission gets neither links nor env copies (`worktree_share`).
+/// Only `create_workspace` (the app's own new-mission path) calls this: a
+/// Routine's fresh worktree and an `octopush-mcp` workspace do not share.
 pub(crate) fn share_into_fresh_worktree(
     db: &parking_lot::Mutex<crate::db::Db>,
     outcome: crate::workspace::CreateOutcome,
@@ -981,7 +983,9 @@ pub(crate) fn share_into_fresh_worktree(
     }
     let wt = ws.worktree_path.as_deref()?;
     let spec = db.lock().get_project_share(project_id).ok()?;
-    if spec.is_empty() || std::path::Path::new(wt) == std::path::Path::new(project_root) {
+    if spec.is_empty()
+        || crate::worktree_share::same_dir(std::path::Path::new(wt), std::path::Path::new(project_root))
+    {
         return None;
     }
     Some(crate::worktree_share::apply(
@@ -992,14 +996,16 @@ pub(crate) fn share_into_fresh_worktree(
     ))
 }
 
-/// When a mission's Execution becomes `sandbox`, remove the links "Share with
-/// new missions" made in its worktree (`worktree_share::unlink`): the sandbox
-/// would refuse reads and writes through them. Returns the names removed.
-pub(crate) fn unshare_links_for_sandbox(
+/// When a mission's Execution becomes `sandbox`, take back what "Share with
+/// new missions" gave its worktree (`worktree_share::unshare`): the links,
+/// which the sandbox would refuse reads and writes through, and each copied
+/// env file that is still identical to the main checkout's (a sandboxed
+/// stage could read it). Only what Octopush recorded making is touched.
+pub(crate) fn unshare_for_sandbox(
     db: &parking_lot::Mutex<crate::db::Db>,
     workspace_id: Option<&str>,
-) -> Vec<String> {
-    let Some(ws_id) = workspace_id else { return Vec::new() };
+) -> crate::worktree_share::Unshared {
+    let Some(ws_id) = workspace_id else { return Default::default() };
     let found = {
         let db = db.lock();
         let ws = db.get_workspace(ws_id).ok().flatten();
@@ -1009,8 +1015,22 @@ pub(crate) fn unshare_links_for_sandbox(
             .map(|p| expand_tilde(&p.path));
         ws.and_then(|w| w.worktree_path).zip(root)
     };
-    let Some((wt, root)) = found else { return Vec::new() };
-    crate::worktree_share::unlink(std::path::Path::new(&root), std::path::Path::new(&wt))
+    let Some((wt, root)) = found else { return Default::default() };
+    crate::worktree_share::unshare(std::path::Path::new(&root), std::path::Path::new(&wt))
+}
+
+/// One sentence per entry `unshare_for_sandbox` handled, in the wording of
+/// `ShareOutcome::skipped`.
+pub(crate) fn unshared_sentences(done: &crate::worktree_share::Unshared) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(done.unlinked.iter().map(|n| format!("{n}: link removed in a sandboxed mission")));
+    out.extend(done.uncopied.iter().map(|n| format!("{n}: copy removed in a sandboxed mission")));
+    out.extend(
+        done.kept
+            .iter()
+            .map(|n| format!("{n}: kept, it was changed in this mission; its agents can read it")),
+    );
+    out
 }
 
 #[tauri::command]
@@ -1073,12 +1093,13 @@ pub async fn create_workspace(
     install_claude_hooks_later(state.inner(), ws.clone());
     // Links and copies land before the setup script, which can use them.
     let mut shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
-    // A reused worktree reopened as a sandboxed mission drops its old links.
+    // A reused worktree reopened as a sandboxed mission gives back what an
+    // earlier, unsandboxed mission was given.
     if exec_isolation == "sandbox" && outcome != crate::workspace::CreateOutcome::Created {
-        let removed = unshare_links_for_sandbox(&state.db, Some(&ws.id));
-        if !removed.is_empty() {
+        let done = unshare_for_sandbox(&state.db, Some(&ws.id));
+        if !done.is_empty() {
             shared = Some(crate::worktree_share::ShareOutcome {
-                skipped: removed.iter().map(|n| format!("{n}: link removed in a sandboxed mission")).collect(),
+                skipped: unshared_sentences(&done),
                 ..Default::default()
             });
         }
@@ -1144,14 +1165,18 @@ pub async fn create_mission(
     )
 }
 
-/// `update_mission`'s response: the mission, plus the links removed from its
-/// worktree when its Execution became `sandbox` (`unshare_links_for_sandbox`).
+/// `update_mission`'s response: the mission, plus what was taken back from
+/// its worktree when its Execution became `sandbox` (`unshare_for_sandbox`):
+/// the links removed, the env copies removed, and the env copies kept
+/// because they changed in the mission.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdatedMission {
     #[serde(flatten)]
     pub mission: crate::db::MissionRow,
     pub unlinked: Vec<String>,
+    pub uncopied: Vec<String>,
+    pub kept_copies: Vec<String>,
 }
 
 #[tauri::command]
@@ -1196,12 +1221,12 @@ pub async fn update_mission(
             archive_workspace_internal(&state, ws_id)?;
         }
     }
-    let unlinked = if exec_isolation.as_deref() == Some("sandbox") {
-        unshare_links_for_sandbox(&state.db, updated.workspace_id.as_deref())
+    let done = if exec_isolation.as_deref() == Some("sandbox") {
+        unshare_for_sandbox(&state.db, updated.workspace_id.as_deref())
     } else {
-        Vec::new()
+        Default::default()
     };
-    Ok(UpdatedMission { mission: updated, unlinked })
+    Ok(UpdatedMission { mission: updated, unlinked: done.unlinked, uncopied: done.uncopied, kept_copies: done.kept })
 }
 
 /// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,

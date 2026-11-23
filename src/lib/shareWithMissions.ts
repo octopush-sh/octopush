@@ -66,12 +66,78 @@ export function shareToasts(o: ShareOutcome | null | undefined, hasSetupTerminal
   return out;
 }
 
+/** What turning the sandbox on took back from a mission's worktree. */
+export interface SandboxUnshared {
+  /** Links to the main checkout's folders that were removed. */
+  unlinked?: string[];
+  /** Copied env files removed (still identical to the main checkout's). */
+  uncopied?: string[];
+  /** Copied env files left in place because they changed in the mission. */
+  keptCopies?: string[];
+}
+
 /** The "Sandbox enabled" toast's body. Turning the sandbox on removes the
- *  folders linked from the main checkout (`unlinked`), which the sandbox
- *  couldn't read or write through. */
-export function sandboxOnBody(unlinked: string[] | undefined): string {
-  const base = "Agent writes are now confined to the workspace.";
-  if (!unlinked?.length) return base;
-  const many = unlinked.length > 1;
-  return `${base} Removed the link${many ? "s" : ""} to the main checkout's ${unlinked.join(", ")}; install inside this mission if it needs ${many ? "them" : "it"}.`;
+ *  folders linked from the main checkout (the sandbox couldn't read or write
+ *  through them) and each copied env file that is still identical to the
+ *  main checkout's; one edited in the mission stays and is named. */
+export function sandboxOnBody(done: SandboxUnshared | undefined): string {
+  const parts = ["Agent writes are now confined to the workspace."];
+  const unlinked = done?.unlinked ?? [];
+  const uncopied = done?.uncopied ?? [];
+  const kept = done?.keptCopies ?? [];
+  if (unlinked.length) {
+    const many = unlinked.length > 1;
+    parts.push(
+      `Removed the link${many ? "s" : ""} to the main checkout's ${unlinked.join(", ")}; install inside this mission if it needs ${many ? "them" : "it"}.`,
+    );
+  }
+  if (uncopied.length) {
+    parts.push(`Removed the copied ${uncopied.join(", ")} from this mission's worktree.`);
+  }
+  if (kept.length) {
+    const many = kept.length > 1;
+    parts.push(
+      `${kept.join(", ")} ${many ? "were" : "was"} changed in this mission, so ${many ? "they stay" : "it stays"}: its agents can still read ${many ? "them" : "it"}.`,
+    );
+  }
+  return parts.join(" ");
+}
+
+/** The install and clean commands a setup script runs that would rewrite a
+ *  linked dependency folder, which is the main checkout's own folder. Each
+ *  is returned as written once (`npm ci`, `rm -rf node_modules`), in order;
+ *  comment lines are ignored. Pure. */
+export function setupInstallCommands(script: string): string[] {
+  const patterns: RegExp[] = [
+    /\bnpm\s+(?:ci|install|i)\b/,
+    /\bpnpm\s+(?:install|i)\b/,
+    /\byarn(?:\s+install\b|(?=\s*(?:$|&&|\|\||;|--)))/,
+    /\bbun\s+install\b/,
+    /\bpip3?\s+install\b/,
+    /\buv\s+(?:sync|pip\s+install)\b/,
+    /\bpoetry\s+install\b/,
+    /\brm\s+-[a-zA-Z]*r[a-zA-Z]*\s+(?:[^\s;&|]+\s+)*?(?:\.\/)?(?:node_modules|\.venv|venv)\b/,
+  ];
+  const found: string[] = [];
+  for (const raw of script.split("\n")) {
+    const line = raw.trim();
+    if (!line || line.startsWith("#")) continue;
+    for (const re of patterns) {
+      const m = re.exec(line);
+      if (!m) continue;
+      const cmd = m[0].replace(/\s+/g, " ").trim();
+      if (!found.includes(cmd)) found.push(cmd);
+    }
+  }
+  return found;
+}
+
+/** The warning under the share list when a dependency folder is linked and
+ *  the setup script installs or cleans; null when there is nothing to say. */
+export function setupInstallWarning(script: string, linked: string[]): string | null {
+  if (linked.length === 0) return null;
+  const cmds = setupInstallCommands(script);
+  if (cmds.length === 0) return null;
+  const many = linked.length > 1;
+  return `This setup script runs ${cmds.join(", ")}. With ${linked.join(", ")} linked, that changes the main checkout's ${many ? "folders" : "folder"}, for the main checkout and for every other mission.`;
 }

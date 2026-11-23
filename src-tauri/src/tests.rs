@@ -7853,12 +7853,13 @@ mod orchestrator_tests {
     }
 
     /// A mission created with Execution = none and switched to sandbox later
-    /// loses its links (the sandbox would refuse reads and writes through
-    /// them) but keeps its copies.
+    /// gives back what it was given: its links (the sandbox would refuse
+    /// reads and writes through them) and its untouched env copy (a
+    /// sandboxed stage could read it).
     #[cfg(unix)]
     #[test]
-    fn switching_a_mission_to_sandbox_removes_its_links() {
-        use crate::commands::{share_into_fresh_worktree, unshare_links_for_sandbox};
+    fn switching_a_mission_to_sandbox_takes_back_what_was_shared() {
+        use crate::commands::{share_into_fresh_worktree, unshare_for_sandbox, unshared_sentences};
         use crate::workspace::CreateOutcome;
         use crate::worktree_share::ShareSpec;
         let git = |dir: &std::path::Path, args: &[&str]| {
@@ -7897,13 +7898,76 @@ mod orchestrator_tests {
         assert_eq!(out.linked, vec!["node_modules".to_string()]);
 
         // Later, Execution becomes sandbox (the launcher's one-click).
-        assert_eq!(unshare_links_for_sandbox(&db, Some("w")), vec!["node_modules".to_string()]);
+        let done = unshare_for_sandbox(&db, Some("w"));
+        assert_eq!(done.unlinked, vec!["node_modules".to_string()]);
+        assert_eq!(done.uncopied, vec![".env".to_string()]);
+        assert!(done.kept.is_empty());
+        assert_eq!(
+            unshared_sentences(&done),
+            vec![
+                "node_modules: link removed in a sandboxed mission".to_string(),
+                ".env: copy removed in a sandboxed mission".to_string(),
+            ]
+        );
         assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
         assert!(root.join("node_modules").is_dir(), "the main checkout keeps its folder");
-        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "A=1\n");
-        // Nothing left to remove, and a mission with no workspace has none.
-        assert!(unshare_links_for_sandbox(&db, Some("w")).is_empty());
-        assert!(unshare_links_for_sandbox(&db, None).is_empty());
+        assert!(!wt.join(".env").exists(), "the untouched copy leaves the sandboxed worktree");
+        assert_eq!(std::fs::read_to_string(root.join(".env")).unwrap(), "A=1\n", "the main checkout keeps its file");
+        // Nothing left to take back, and a mission with no workspace has none.
+        assert!(unshare_for_sandbox(&db, Some("w")).is_empty());
+        assert!(unshare_for_sandbox(&db, None).is_empty());
+    }
+
+    /// A sandboxed mission's fresh worktree gets neither links nor env copies.
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_mission_shares_nothing_into_its_worktree() {
+        use crate::commands::share_into_fresh_worktree;
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        let wt_s = wt.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock().insert_workspace("w", "p", "m", "", "m", Some(wt_s.as_str()), "", None).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let ws = db.lock().get_workspace("w").unwrap().unwrap();
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &ws, "sandbox").unwrap();
+        assert_eq!(out.summary(), None);
+        assert_eq!(
+            out.skipped,
+            vec![
+                "node_modules: not linked in a sandboxed mission".to_string(),
+                ".env: not copied into a sandboxed mission".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(!wt.join(".env").exists());
     }
 
     /// The condition runs with the PATH it's given (the login-shell PATH in

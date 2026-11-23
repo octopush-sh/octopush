@@ -21,15 +21,27 @@
 //! linked name is added as `/<name>` to the repo's local `info/exclude`
 //! (shared by every worktree, never committed) before that check.
 //!
-//! **Sandboxed missions get no links.** A link points outside the worktree:
+//! **A sandboxed mission gets nothing.** A link points outside the worktree:
 //! Seatbelt would refuse writes through it but Claude Code's read guard
 //! (`cli_runner::CLAUDE_SANDBOXED_STAGE_SETTINGS`) would refuse reads through
-//! it too, and widening either for a shared folder isn't worth it. Copies
-//! still apply: they are ordinary files inside the worktree. A mission whose
-//! Execution later becomes `sandbox` loses the links it got ([`unlink`]).
+//! it too, and widening either for a shared folder isn't worth it. An env
+//! file is not copied either: a sandboxed stage can't read outside its
+//! working directory, and a copy would put the file inside it. Both are
+//! reported as left out. A mission whose Execution later becomes `sandbox`
+//! loses what it was given ([`unshare`]): its links, and each copy that is
+//! still identical to the main checkout's file (one edited in the mission is
+//! kept and reported, never deleted).
+//!
+//! **Only what Octopush made is ever removed.** [`apply`] records the links
+//! and copies it made in the worktree's own git directory
+//! ([`RECORD_FILE`], outside the working tree, gone with the worktree), and
+//! [`unshare`] touches nothing that isn't in that record.
 //!
 //! Only a freshly created worktree is touched (like the setup script), and
-//! nothing already in the worktree is replaced.
+//! nothing already in the worktree is replaced. Only the app's own "new
+//! mission" path shares: a Routine's fresh worktree and a workspace created
+//! through `octopush-mcp` do not (they call `workspace::create` directly and
+//! never reach [`apply`]).
 
 use std::path::Path;
 use std::process::Command;
@@ -41,6 +53,11 @@ pub const LINK_CANDIDATES: &[&str] = &["node_modules", ".venv", "venv"];
 
 /// The marker line above the names Octopush adds to `info/exclude`.
 pub const EXCLUDE_MARKER: &str = "# Octopush: folders linked into new missions (#961)";
+
+/// Where [`apply`] records what it made, inside the worktree's own git
+/// directory (`.git/worktrees/<name>/`): one `link<TAB>name` or
+/// `copy<TAB>name` per line.
+pub const RECORD_FILE: &str = "octopush-shared";
 
 /// What a project shares with its new missions: folder names to link and file
 /// names to copy, each a single entry at the repo root.
@@ -190,6 +207,21 @@ pub fn exclude_with(existing: &str, names: &[String]) -> Option<String> {
     Some(text)
 }
 
+/// Replace `path` with `text` in one step: the text is written to a sibling
+/// file and renamed over it, so a reader (git, another mission being
+/// created) never sees a half-written file.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    // A linked file is rewritten where it really lives, not replaced.
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!(".{name}.octopush-{}.tmp", std::process::id()));
+    let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, &path));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    written
+}
+
 /// Make sure the repo's local `info/exclude` ignores each linked name as a
 /// path (a `name/` rule never matches a symlink).
 fn exclude_links(worktree: &Path, names: &[String]) {
@@ -198,10 +230,72 @@ fn exclude_links(worktree: &Path, names: &[String]) {
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
     if let Some(text) = exclude_with(&existing, names) {
         let _ = std::fs::create_dir_all(common.join("info"));
-        if let Err(e) = std::fs::write(&path, text) {
+        if let Err(e) = write_atomic(&path, &text) {
             tracing::warn!(error = %e, "share: couldn't update info/exclude");
         }
     }
+}
+
+/// The worktree's own git directory (`.git/worktrees/<name>` for a linked
+/// worktree).
+fn own_git_dir(worktree: &Path) -> Option<std::path::PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--absolute-git-dir"])
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim();
+    (!s.is_empty()).then(|| std::path::PathBuf::from(s))
+}
+
+/// The text of a record: `link<TAB>name` / `copy<TAB>name` lines. Pure.
+pub fn record_text(made: &ShareSpec) -> String {
+    let mut text = String::new();
+    for (kind, names) in [("link", &made.link), ("copy", &made.copy)] {
+        for name in names {
+            text.push_str(&format!("{kind}\t{name}\n"));
+        }
+    }
+    text
+}
+
+/// Read a record leniently: unknown lines are dropped, and every name goes
+/// through the same allowlist as a stored spec. Pure.
+pub fn parse_record(text: &str) -> ShareSpec {
+    let mut made = ShareSpec::default();
+    for line in text.lines() {
+        match line.split_once('\t') {
+            Some(("link", name)) => made.link.push(name.to_string()),
+            Some(("copy", name)) => made.copy.push(name.to_string()),
+            _ => {}
+        }
+    }
+    made.sanitized()
+}
+
+/// What [`apply`] made in `worktree` and hasn't been removed since.
+pub fn recorded(worktree: &Path) -> ShareSpec {
+    own_git_dir(worktree)
+        .and_then(|dir| std::fs::read_to_string(dir.join(RECORD_FILE)).ok())
+        .map(|text| parse_record(&text))
+        .unwrap_or_default()
+}
+
+/// Remember `made` as what Octopush created in `worktree` (nothing: no file).
+fn record(worktree: &Path, made: &ShareSpec) -> std::io::Result<()> {
+    let dir = own_git_dir(worktree).ok_or_else(|| std::io::Error::other("no git directory"))?;
+    let path = dir.join(RECORD_FILE);
+    if made.is_empty() {
+        return match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    write_atomic(&path, &record_text(made))
 }
 
 /// Copy `src` to `dest` without following or replacing anything at `dest`,
@@ -229,9 +323,11 @@ fn symlink_dir(_target: &Path, _link: &Path) -> std::io::Result<()> {
 }
 
 /// Apply `spec` from the main checkout `root` to the fresh `worktree`
-/// (`sandboxed`: the mission's own exec isolation is `sandbox`, so no links).
-/// Never fails the mission: each entry that can't be shared is reported in
-/// [`ShareOutcome::skipped`].
+/// (`sandboxed`: the mission's own exec isolation is `sandbox`, so nothing
+/// is shared). Never fails the mission: each entry that can't be shared is
+/// reported in [`ShareOutcome::skipped`]. An entry is applied only while
+/// the main checkout still git-ignores it: the list was saved earlier, and
+/// the repo's rules may have changed since.
 pub fn apply(root: &Path, worktree: &Path, spec: &ShareSpec, sandboxed: bool) -> ShareOutcome {
     let spec = spec.sanitized();
     let mut out = ShareOutcome::default();
@@ -241,6 +337,8 @@ pub fn apply(root: &Path, worktree: &Path, spec: &ShareSpec, sandboxed: bool) ->
             out.skipped.push(format!("{name}: not linked in a sandboxed mission"));
         } else if !src.is_dir() {
             out.skipped.push(format!("{name}: not in the main checkout"));
+        } else if !git_ignores(root, name) {
+            out.skipped.push(format!("{name}: no longer git-ignored in the main checkout"));
         } else if std::fs::symlink_metadata(&dest).is_ok() {
             out.skipped.push(format!("{name}: already in the worktree"));
         } else if let Err(e) = symlink_dir(&src, &dest) {
@@ -251,7 +349,13 @@ pub fn apply(root: &Path, worktree: &Path, spec: &ShareSpec, sandboxed: bool) ->
     }
     for name in &spec.copy {
         let (src, dest) = (root.join(name), worktree.join(name));
-        if std::fs::symlink_metadata(&dest).is_ok() {
+        if sandboxed {
+            out.skipped.push(format!("{name}: not copied into a sandboxed mission"));
+        } else if std::fs::symlink_metadata(&src).is_err() {
+            out.skipped.push(format!("{name}: not in the main checkout"));
+        } else if !git_ignores(root, name) {
+            out.skipped.push(format!("{name}: no longer git-ignored in the main checkout"));
+        } else if std::fs::symlink_metadata(&dest).is_ok() {
             out.skipped.push(format!("{name}: already in the worktree"));
         } else if let Err(e) = copy_new(&src, &dest) {
             out.skipped.push(match e.kind() {
@@ -282,6 +386,13 @@ pub fn apply(root: &Path, worktree: &Path, spec: &ShareSpec, sandboxed: bool) ->
         }
         ignored
     });
+    // Remember what was made, so only that can ever be removed again.
+    let made = ShareSpec { link: out.linked.clone(), copy: out.copied.clone() };
+    if !made.is_empty() {
+        if let Err(e) = record(worktree, &made) {
+            tracing::warn!(error = %e, "share: couldn't record what was shared");
+        }
+    }
     out
 }
 
@@ -298,26 +409,92 @@ fn links_to(link: &Path, src: &Path) -> bool {
             ))
 }
 
-/// Remove the links [`apply`] made in `worktree`, for a mission whose
-/// Execution became `sandbox`: each [`LINK_CANDIDATES`] entry that is a
-/// symlink to the main checkout `root`'s folder of the same name. A real
-/// folder, a copy, or a link elsewhere is left alone, and so is `root` itself.
-/// Returns the names removed.
-pub fn unlink(root: &Path, worktree: &Path) -> Vec<String> {
-    if worktree == root {
-        return Vec::new();
+/// Whether `a` and `b` are the same folder, however each path is spelled
+/// (a symlinked parent, `..`, a trailing slash).
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
+/// Whether two regular files hold the same bytes (links not followed).
+fn same_file_content(a: &Path, b: &Path) -> bool {
+    let regular = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.is_file()).unwrap_or(false);
+    if !regular(a) || !regular(b) {
+        return false;
     }
-    let mut removed = Vec::new();
-    for name in LINK_CANDIDATES {
+    matches!((std::fs::read(a), std::fs::read(b)), (Ok(x), Ok(y)) if x == y)
+}
+
+/// What [`unshare`] did.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Unshared {
+    /// Links removed.
+    pub unlinked: Vec<String>,
+    /// Copied env files removed (still identical to the main checkout's).
+    pub uncopied: Vec<String>,
+    /// Copied env files left in place because they changed in the mission.
+    pub kept: Vec<String>,
+}
+
+impl Unshared {
+    pub fn is_empty(&self) -> bool {
+        self.unlinked.is_empty() && self.uncopied.is_empty() && self.kept.is_empty()
+    }
+}
+
+/// Take back what [`apply`] gave `worktree`, for a mission whose Execution
+/// became `sandbox`. Only entries in the worktree's record are considered:
+/// - a recorded link that is still a symlink to the main checkout `root`'s
+///   folder of the same name is removed (the link, never the folder);
+/// - a recorded copy that is still byte-identical to the main checkout's
+///   file is removed; one that changed in the mission is kept and reported.
+///
+/// A real folder, a link the user made, a file Octopush didn't copy and the
+/// main checkout itself are all left alone.
+pub fn unshare(root: &Path, worktree: &Path) -> Unshared {
+    let mut done = Unshared::default();
+    if same_dir(root, worktree) {
+        return done;
+    }
+    let made = recorded(worktree);
+    if made.is_empty() {
+        return done;
+    }
+    let mut left = ShareSpec::default();
+    for name in &made.link {
         let (src, dest) = (root.join(name), worktree.join(name));
-        if links_to(&dest, &src) {
-            match std::fs::remove_file(&dest) {
-                Ok(()) => removed.push(name.to_string()),
-                Err(e) => tracing::warn!(error = %e, name = %name, "share: couldn't remove a link"),
+        if !links_to(&dest, &src) {
+            // Replaced or already gone: no longer ours.
+            continue;
+        }
+        match std::fs::remove_file(&dest) {
+            Ok(()) => done.unlinked.push(name.clone()),
+            Err(e) => {
+                tracing::warn!(error = %e, name = %name, "share: couldn't remove a link");
+                left.link.push(name.clone());
             }
         }
     }
-    removed
+    for name in &made.copy {
+        let (src, dest) = (root.join(name), worktree.join(name));
+        if std::fs::symlink_metadata(&dest).is_err() {
+            continue;
+        }
+        if same_file_content(&src, &dest) && std::fs::remove_file(&dest).is_ok() {
+            done.uncopied.push(name.clone());
+        } else {
+            done.kept.push(name.clone());
+            left.copy.push(name.clone());
+        }
+    }
+    if let Err(e) = record(worktree, &left) {
+        tracing::warn!(error = %e, "share: couldn't update the record");
+    }
+    done
 }
 
 #[cfg(test)]
@@ -431,37 +608,181 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_sandboxed_mission_gets_copies_but_no_links() {
+    fn a_sandboxed_mission_gets_neither_links_nor_env_copies() {
         let (_tmp, root, wt) = repo("node_modules\n.env\n");
         let spec = ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] };
         let out = apply(&root, &wt, &spec, true);
         assert!(out.linked.is_empty());
-        assert_eq!(out.copied, vec![".env".to_string()]);
-        assert_eq!(out.skipped, vec!["node_modules: not linked in a sandboxed mission".to_string()]);
+        assert!(out.copied.is_empty());
+        assert_eq!(
+            out.skipped,
+            vec![
+                "node_modules: not linked in a sandboxed mission".to_string(),
+                ".env: not copied into a sandboxed mission".to_string(),
+            ]
+        );
         assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(std::fs::symlink_metadata(wt.join(".env")).is_err(), "no env file inside a sandboxed worktree");
+        assert_eq!(recorded(&wt), ShareSpec::default());
+    }
+
+    /// Decided on #1019: only the app's own new-mission path shares. A
+    /// Routine's fresh worktree and an `octopush-mcp` workspace create their
+    /// worktree directly and must never reach this module.
+    #[test]
+    fn routines_and_mcp_workspaces_do_not_share() {
+        for (file, src) in [
+            ("routines.rs", include_str!("routines.rs")),
+            ("bin/octopush-mcp/tools.rs", include_str!("bin/octopush-mcp/tools.rs")),
+        ] {
+            for name in ["worktree_share", "share_into_fresh_worktree", "get_project_share"] {
+                assert!(!src.contains(name), "{file} must not reference {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_record_round_trips_and_is_read_through_the_allowlist() {
+        let made = ShareSpec { link: vec!["node_modules".into(), ".venv".into()], copy: vec![".env".into()] };
+        let text = record_text(&made);
+        assert_eq!(text, "link\tnode_modules\nlink\t.venv\ncopy\t.env\n");
+        assert_eq!(parse_record(&text), made);
+        let odd = "link\ttarget\nlink\t../x\ncopy\t../.ssh/id_rsa\nnoise\nlink\tnode_modules\ncopy\t.env.local\n";
+        assert_eq!(
+            parse_record(odd),
+            ShareSpec { link: vec!["node_modules".into()], copy: vec![".env.local".into()] }
+        );
+        assert_eq!(parse_record(""), ShareSpec::default());
     }
 
     #[cfg(unix)]
     #[test]
-    fn unlink_removes_only_the_links_to_the_main_checkout() {
-        let (_tmp, root, wt) = repo("node_modules\n.venv\n.env\n");
+    fn apply_records_what_it_made_outside_the_working_tree() {
+        let (_tmp, root, wt) = repo("node_modules\n.env\n");
+        let spec = ShareSpec { link: vec!["node_modules".into(), ".venv".into()], copy: vec![".env".into()] };
+        let out = apply(&root, &wt, &spec, false);
+        assert_eq!(out.skipped, vec![".venv: not in the main checkout".to_string()]);
+        assert_eq!(recorded(&wt), ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] });
+        assert!(!wt.join(RECORD_FILE).exists(), "the record is not a file in the working tree");
+        assert_eq!(git(&wt, &["status", "--porcelain", "--untracked-files=all"]), "");
+        assert_eq!(recorded(&root), ShareSpec::default(), "the main checkout has no record");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_the_main_checkout_no_longer_ignores_is_not_shared() {
+        let (_tmp, root, wt) = repo("node_modules\n.env\n");
+        // The saved list is older than the repo's rules: both entries have
+        // stopped being ignored in the main checkout.
+        std::fs::write(root.join(".gitignore"), "").unwrap();
         let spec = ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] };
+        let out = apply(&root, &wt, &spec, false);
+        assert!(out.linked.is_empty() && out.copied.is_empty());
+        assert_eq!(
+            out.skipped,
+            vec![
+                "node_modules: no longer git-ignored in the main checkout".to_string(),
+                ".env: no longer git-ignored in the main checkout".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(!wt.join(".env").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_exclude_file_is_replaced_in_one_step() {
+        let (_tmp, root, wt) = repo("node_modules/\n");
+        let exclude = root.join(".git/info/exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, "*.swp\n").unwrap();
+        let out = apply(&root, &wt, &ShareSpec { link: vec!["node_modules".into()], copy: vec![] }, false);
+        assert_eq!(out.linked, vec!["node_modules".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(&exclude).unwrap(),
+            format!("*.swp\n{EXCLUDE_MARKER}\n/node_modules\n")
+        );
+        let stray: Vec<String> = std::fs::read_dir(exclude.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(stray.is_empty(), "no temporary file is left behind: {stray:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unshare_removes_only_the_links_octopush_made() {
+        let (_tmp, root, wt) = repo("node_modules\n.venv\nvenv\n.env\n");
+        std::fs::create_dir(root.join("venv")).unwrap();
+        let spec = ShareSpec { link: vec!["node_modules".into()], copy: vec![] };
         assert_eq!(apply(&root, &wt, &spec, false).linked, vec!["node_modules".to_string()]);
         // A `.venv` linked somewhere else is the user's, not ours.
         let elsewhere = root.parent().unwrap().join("other-venv");
         std::fs::create_dir(&elsewhere).unwrap();
         std::os::unix::fs::symlink(&elsewhere, wt.join(".venv")).unwrap();
-        assert_eq!(unlink(&root, &wt), vec!["node_modules".to_string()]);
+        // So is a link the user made themselves, even to the main checkout's
+        // own folder: it is not in the record.
+        std::os::unix::fs::symlink(root.join("venv"), wt.join("venv")).unwrap();
+
+        let done = unshare(&root, &wt);
+        assert_eq!(done.unlinked, vec!["node_modules".to_string()]);
+        assert!(done.uncopied.is_empty() && done.kept.is_empty());
         assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
         assert!(root.join("node_modules/left-pad/index.js").exists(), "the main checkout's folder stays");
         assert!(std::fs::symlink_metadata(wt.join(".venv")).unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_to_string(wt.join(".env")).unwrap(), "SECRET=1\n");
-        // A real folder of that name is never removed, nor the main checkout's own.
+        assert!(std::fs::symlink_metadata(wt.join("venv")).unwrap().file_type().is_symlink());
+        assert_eq!(recorded(&wt), ShareSpec::default(), "nothing is left on record");
+
+        // A real folder of that name is never removed, and a second pass
+        // finds nothing to do.
         std::fs::create_dir(wt.join("node_modules")).unwrap();
-        assert!(unlink(&root, &wt).is_empty());
+        assert!(unshare(&root, &wt).is_empty());
         assert!(wt.join("node_modules").is_dir());
-        assert!(unlink(&root, &root).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unshare_never_touches_the_main_checkout_however_its_path_is_spelled() {
+        let (_tmp, root, wt) = repo("node_modules\n.env\n");
+        let spec = ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] };
+        apply(&root, &wt, &spec, false);
+        // The same folder through a symlinked parent, `..` and a trailing slash.
+        let alias = root.parent().unwrap().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let dotted = wt.join("..").join("repo");
+        let slashed = std::path::PathBuf::from(format!("{}/", root.display()));
+        for spelled in [&root, &alias, &dotted, &slashed] {
+            assert!(unshare(&root, spelled).is_empty(), "{spelled:?}");
+            assert!(unshare(spelled, &root).is_empty(), "{spelled:?}");
+        }
+        assert!(root.join("node_modules/left-pad/index.js").exists());
+        assert_eq!(std::fs::read_to_string(root.join(".env")).unwrap(), "SECRET=1\n");
+        // Reached through the alias, the worktree's own link still goes.
+        assert_eq!(unshare(&alias, &wt).unlinked, vec!["node_modules".to_string()]);
         assert!(root.join("node_modules").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unshare_removes_an_untouched_env_copy_and_keeps_an_edited_one() {
+        let (_tmp, root, wt) = repo(".env*\n");
+        std::fs::write(root.join(".env.local"), "LOCAL=1\n").unwrap();
+        let spec = ShareSpec { link: vec![], copy: vec![".env".into(), ".env.local".into()] };
+        assert_eq!(apply(&root, &wt, &spec, false).copied.len(), 2);
+        // One copy is edited in the mission; a third file is the user's own.
+        std::fs::write(wt.join(".env.local"), "LOCAL=mission\n").unwrap();
+        std::fs::write(wt.join(".env.test"), "MINE=1\n").unwrap();
+
+        let done = unshare(&root, &wt);
+        assert_eq!(done.uncopied, vec![".env".to_string()]);
+        assert_eq!(done.kept, vec![".env.local".to_string()]);
+        assert!(!wt.join(".env").exists());
+        assert_eq!(std::fs::read_to_string(wt.join(".env.local")).unwrap(), "LOCAL=mission\n");
+        assert_eq!(std::fs::read_to_string(wt.join(".env.test")).unwrap(), "MINE=1\n");
+        assert_eq!(std::fs::read_to_string(root.join(".env")).unwrap(), "SECRET=1\n", "the source stays");
+        assert_eq!(recorded(&wt), ShareSpec { link: vec![], copy: vec![".env.local".into()] });
     }
 
     #[cfg(unix)]
@@ -470,6 +791,8 @@ mod tests {
         // This branch's `.gitignore` doesn't cover `.env`: a copy would show
         // as untracked and could stage, so it must not stay behind.
         let (_tmp, root, wt) = repo("node_modules\n");
+        // The main checkout ignores it (an uncommitted rule); the branch doesn't.
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
         let spec = ShareSpec { link: vec![], copy: vec![".env".into()] };
         let out = apply(&root, &wt, &spec, false);
         assert!(out.copied.is_empty());
