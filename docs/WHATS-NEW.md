@@ -104,6 +104,8 @@ Current anchors:
 | `run-pane-waiting` | Run canvas: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `talk-seat-leave` | Talk canvas, while the terminal seat is open: the minus on its caption, "Leave the view · the session keeps running" | `chat/TalkSeat.tsx` |
+| `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
+| `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
 | `run-switcher-waiting` | ⌘⌥K switcher (or Open beside), while open: the first row's "· waiting on permission" / "· waiting on your input" (only while a listed session waits) | `run/SessionSwitcher.tsx` |
@@ -111,6 +113,7 @@ Current anchors:
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
+| `mission-share` · `mission-share-install` · `mission-share-sandbox` | New-mission wizard step 3: the "Share with new missions" list (only when the main checkout has a dependency folder or env file to share) · its amber "This setup script runs…" line (only while a dependency folder is on and the setup script installs or cleans) · its amber "A sandboxed mission gets neither the links nor the env files" line (only while an entry is on and Execution is Local sandbox) | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
 | `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
 | `routines-model-retirement` | Settings › Routines: the first row's "Sonnet 4.5 retires Nov 30, so this routine will fail from then on." (only while a Routine's crew uses a model within 30 days of its retirement, or past it) | `settings/RoutinesPane.tsx` |
@@ -129,6 +132,7 @@ Current anchors:
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
 | `review-editor` | Review, Editor view: the code editor pane (tabs excluded, status bar included) | `EditorPane.tsx` |
+| `review-editor-ask-talk` | Review, Editor view, status bar: "Ask Talk about this" (only while text is selected) | `EditorStatusBar.tsx` |
 | `review-sidebar` | Review: the Changes/Files navigator (expanded, or its icon strip) | `ReviewSidebar.tsx` |
 | `review-diff-hunk` | Review diff: one hunk (its rail and highlighted lines; the first on screen) | `review/FileDiffSection.tsx` |
 | `review-hunk-comment` · `review-comment-composer` · `review-comment-add` | Review diff, working tree only: a hunk rail's "Ask for a change" icon (the first on screen) · the inline comment field under a hunk · its "Ask for this change" (both only while one is open) | `review/HunkRail.tsx` · `review/HunkComments.tsx` |

@@ -1,4 +1,4 @@
-import { reportFatal, WEB_REPO } from "./gh.mjs";
+import { reportFatal, tokenEnvFor } from "./gh.mjs";
 // Who is who in the nightly cycle (VISION.md §8, docs/ROUTINES.md).
 //
 //   owner     — the human. Only their comments count as answers; never used by routines.
@@ -13,9 +13,9 @@ import { reportFatal, WEB_REPO } from "./gh.mjs";
 // `sanitize`), so an agent can't forge a review verdict. The owner must always
 // be a different account.
 //
-// In octopush-web the cycle acts as the "Octopush Cycle" GitHub App instead
+// In octopush-web and epiku the cycle acts as the "Octopush Cycle" GitHub App instead
 // (OCTOPUSH_APP_BOT_LOGIN, e.g. `octopush-cycle[bot]`): its installation token
-// is the only credential that reaches that private repo, so there the App's bot
+// is the only credential that reaches those private repos, so there the App's bot
 // is both builder and reviewer (`idsForRepo`). Same reasoning: no agent ever
 // holds its token.
 //
@@ -74,13 +74,13 @@ export function requireIdentities(ids, env = process.env) {
 export const sameLogin = (a, b) => !!a && !!b && a.toLowerCase() === b.toLowerCase();
 
 /**
- * The identities that act in `repo`. For octopush-web in GitHub Actions that's
+ * The identities that act in `repo`. For octopush-web and epiku in GitHub Actions that's
  * the GitHub App's bot (OCTOPUSH_APP_BOT_LOGIN) as builder and reviewer; the
  * owner is the same person everywhere. Elsewhere, `ids` unchanged.
  */
 export function idsForRepo(ids, repo, env = process.env) {
   const bot = env.OCTOPUSH_APP_BOT_LOGIN;
-  if (repo !== WEB_REPO || !inActions(env) || !bot) return ids;
+  if (!tokenEnvFor(repo) || !inActions(env) || !bot) return ids;
   if (!isBotLogin(bot)) throw new Error(`OCTOPUSH_APP_BOT_LOGIN must be an App bot login (name[bot]), got ${bot}`);
   if (sameLogin(bot, ids.owner)) throw new Error("the owner's account can never be the builder or the reviewer");
   return { ...ids, builder: bot, reviewer: bot };

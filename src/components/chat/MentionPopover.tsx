@@ -8,15 +8,25 @@ interface Props {
    *  must pass `down` — upward overflow cannot be scrolled to inside an
    *  `overflow:auto` ancestor, it is simply clipped. */
   placement?: "up" | "down";
+  /** The eyebrow; Talk's composer offers more than files ("Add context"). */
+  heading?: string;
 }
 
 /**
  * `@file` autocomplete list, anchored above the composer by the parent. Purely
  * presentational — keyboard navigation (Up/Down/Enter/Esc) lives in the
  * Composer so it can coexist with the textarea's own key handling. The active
- * row is brass-tinted; the basename is emphasized over its dimmed directory.
+ * row is brass-tinted; the basename is emphasized over its dimmed directory
+ * (a folder row, `src/lib/`, emphasizes its own name).
  */
-export function MentionPopover({ items, activeIndex, onSelect, onHover, placement = "up" }: Props) {
+export function MentionPopover({
+  items,
+  activeIndex,
+  onSelect,
+  onHover,
+  placement = "up",
+  heading = "Reference a file",
+}: Props) {
   if (items.length === 0) return null;
   return (
     <div
@@ -26,10 +36,11 @@ export function MentionPopover({ items, activeIndex, onSelect, onHover, placemen
       aria-label="Worktree files"
     >
       <div className="px-3 py-1 font-mono text-[8px] uppercase tracking-[0.3em] text-octo-brass">
-        Reference a file
+        {heading}
       </div>
       {items.map((path, i) => {
-        const slash = path.lastIndexOf("/");
+        const bare = path.endsWith("/") ? path.slice(0, -1) : path;
+        const slash = bare.lastIndexOf("/");
         const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
         const base = slash >= 0 ? path.slice(slash + 1) : path;
         const active = i === activeIndex;

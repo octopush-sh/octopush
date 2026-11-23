@@ -188,14 +188,19 @@ pub fn gh_rollup_may_be_capped(rollup_json: &serde_json::Value) -> bool {
     rollup_json.as_array().is_some_and(|a| a.len() >= GH_ROLLUP_CAP)
 }
 
-/// The `gh api --paginate` command line that lists every check run on `sha`.
-/// `None` unless `sha` is a hex commit id; owner and repo are single-quoted.
-pub fn gh_check_runs_command(owner: &str, repo: &str, sha: &str) -> Option<String> {
+/// Environment variable holding the API path `gh_check_runs_command` reads.
+pub const GH_API_PATH_ENV: &str = "OCTOPUSH_GH_API_PATH";
+
+/// The `gh api --paginate` command line that lists every check run on `sha`,
+/// and the API path to put in `GH_API_PATH_ENV` for it. The command is
+/// constant, so owner and repo never go into it (see
+/// `commands::login_shell_output`). `None` unless `sha` is a hex commit id.
+pub fn gh_check_runs_command(owner: &str, repo: &str, sha: &str) -> Option<(&'static str, String)> {
     if sha.is_empty() || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let path = format!("repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={CHECK_RUNS_PER_PAGE}");
-    Some(format!("gh api --paginate '{}'", path.replace('\'', "'\\''")))
+    Some(("gh api --paginate \"$OCTOPUSH_GH_API_PATH\"", path))
 }
 
 /// The check runs in `gh api --paginate`'s output, which prints each page's

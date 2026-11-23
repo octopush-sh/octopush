@@ -834,6 +834,9 @@ pub struct CreatedWorkspace {
     pub setup_terminal_id: Option<String>,
     /// Why the setup script couldn't be started. The workspace itself is fine.
     pub setup_error: Option<String>,
+    /// What the fresh worktree borrowed from the main checkout (#961); `None`
+    /// when the project shares nothing or the worktree wasn't fresh.
+    pub shared: Option<crate::worktree_share::ShareOutcome>,
 }
 
 /// Start `script` in a new `setup` Run terminal in `ws`'s worktree. The PTY
@@ -844,6 +847,7 @@ fn start_setup_terminal(
     ws: &crate::db::WorkspaceRow,
     project_root: &str,
     script: &str,
+    shared: Option<String>,
 ) -> AppResult<String> {
     use crate::workspace_setup as setup;
     let cwd = ws
@@ -854,7 +858,10 @@ fn start_setup_terminal(
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
     // The script, plus Conductor's variables for every setup script, so scripts
     // written for Conductor work unchanged (the runner skips any the user exports).
-    let env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    let mut env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    if let Some(line) = shared {
+        env.insert(setup::SHARED_ENV.to_string(), line);
+    }
     if let Err(e) = spawn_terminal_session(
         app.clone(),
         state,
@@ -917,6 +924,115 @@ pub async fn conductor_setup_script(
     .flatten())
 }
 
+/// The step-3 "Share with new missions" list: what the project shares now
+/// (`saved`) and what its main checkout could share (`available`, see
+/// `worktree_share::candidates`). The repo is the project's path in the DB,
+/// never a path the caller sends.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareOptions {
+    pub saved: crate::worktree_share::ShareSpec,
+    pub available: crate::worktree_share::ShareSpec,
+}
+
+#[tauri::command]
+pub async fn share_with_missions(state: State<'_, AppState>, project_id: String) -> AppResult<ShareOptions> {
+    let (saved, root) = {
+        let db = state.db.lock();
+        let saved = db.get_project_share(&project_id)?;
+        let root = db.get_project_by_id(&project_id)?.map(|(_, _, path)| expand_tilde(&path));
+        (saved, root)
+    };
+    let available = match root {
+        Some(root) => tauri::async_runtime::spawn_blocking(move || {
+            crate::worktree_share::candidates(std::path::Path::new(&root))
+        })
+        .await
+        .unwrap_or_default(),
+        None => crate::worktree_share::ShareSpec::default(),
+    };
+    Ok(ShareOptions { saved, available })
+}
+
+/// Remember what the project shares with new missions (sanitized: only the
+/// allowed link and copy names are kept).
+#[tauri::command]
+pub async fn set_share_with_missions(
+    state: State<'_, AppState>,
+    project_id: String,
+    spec: crate::worktree_share::ShareSpec,
+) -> AppResult<()> {
+    state.db.lock().set_project_share(&project_id, &spec)
+}
+
+/// Apply the project's "Share with new missions" list to a freshly created
+/// worktree — never a reused, restored or adopted one, nor the main checkout.
+/// A sandboxed mission gets neither links nor env copies (`worktree_share`).
+/// Only `create_workspace` (the app's own new-mission path) calls this: a
+/// Routine's fresh worktree and an `octopush-mcp` workspace do not share.
+pub(crate) fn share_into_fresh_worktree(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    outcome: crate::workspace::CreateOutcome,
+    project_id: &str,
+    project_root: &str,
+    ws: &crate::db::WorkspaceRow,
+    exec_isolation: &str,
+) -> Option<crate::worktree_share::ShareOutcome> {
+    if outcome != crate::workspace::CreateOutcome::Created {
+        return None;
+    }
+    let wt = ws.worktree_path.as_deref()?;
+    let spec = db.lock().get_project_share(project_id).ok()?;
+    if spec.is_empty()
+        || crate::worktree_share::same_dir(std::path::Path::new(wt), std::path::Path::new(project_root))
+    {
+        return None;
+    }
+    Some(crate::worktree_share::apply(
+        std::path::Path::new(project_root),
+        std::path::Path::new(wt),
+        &spec,
+        exec_isolation == "sandbox",
+    ))
+}
+
+/// When a mission's Execution becomes `sandbox`, take back what "Share with
+/// new missions" gave its worktree (`worktree_share::unshare`): the links,
+/// which the sandbox would refuse reads and writes through, and each copied
+/// env file that is still identical to the main checkout's (a sandboxed
+/// stage could read it). Only what Octopush recorded making is touched.
+pub(crate) fn unshare_for_sandbox(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: Option<&str>,
+) -> crate::worktree_share::Unshared {
+    let Some(ws_id) = workspace_id else { return Default::default() };
+    let found = {
+        let db = db.lock();
+        let ws = db.get_workspace(ws_id).ok().flatten();
+        let root = ws
+            .as_ref()
+            .and_then(|w| db.get_project(&w.project_id).ok().flatten())
+            .map(|p| expand_tilde(&p.path));
+        ws.and_then(|w| w.worktree_path).zip(root)
+    };
+    let Some((wt, root)) = found else { return Default::default() };
+    crate::worktree_share::unshare(std::path::Path::new(&root), std::path::Path::new(&wt))
+}
+
+/// One sentence per entry `unshare_for_sandbox` handled, in the wording of
+/// `ShareOutcome::skipped`.
+pub(crate) fn unshared_sentences(done: &crate::worktree_share::Unshared) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(done.unlinked.iter().map(|n| format!("{n}: link removed in a sandboxed mission")));
+    out.extend(done.uncopied.iter().map(|n| format!("{n}: copy removed in a sandboxed mission")));
+    out.extend(
+        done.kept
+            .iter()
+            .map(|n| format!("{n}: kept, it was changed in this mission; its agents can read it")),
+    );
+    out
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
@@ -975,11 +1091,25 @@ pub async fn create_workspace(
         }
     }
     install_claude_hooks_later(state.inner(), ws.clone());
+    // Links and copies land before the setup script, which can use them.
+    let mut shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    // A reused worktree reopened as a sandboxed mission gives back what an
+    // earlier, unsandboxed mission was given.
+    if exec_isolation == "sandbox" && outcome != crate::workspace::CreateOutcome::Created {
+        let done = unshare_for_sandbox(&state.db, Some(&ws.id));
+        if !done.is_empty() {
+            shared = Some(crate::worktree_share::ShareOutcome {
+                skipped: unshared_sentences(&done),
+                ..Default::default()
+            });
+        }
+    }
+    let shared_line = shared.as_ref().and_then(|s| s.summary());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
         if crate::workspace_setup::should_run(outcome, &setup_script) {
-            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script, shared_line) {
                 Ok(id) => (Some(id), None),
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");
@@ -989,7 +1119,7 @@ pub async fn create_workspace(
         } else {
             (None, None)
         };
-    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error })
+    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error, shared })
 }
 
 // ─── Mission commands ─────────────────────────────────────────────
@@ -1035,6 +1165,20 @@ pub async fn create_mission(
     )
 }
 
+/// `update_mission`'s response: the mission, plus what was taken back from
+/// its worktree when its Execution became `sandbox` (`unshare_for_sandbox`):
+/// the links removed, the env copies removed, and the env copies kept
+/// because they changed in the mission.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedMission {
+    #[serde(flatten)]
+    pub mission: crate::db::MissionRow,
+    pub unlinked: Vec<String>,
+    pub uncopied: Vec<String>,
+    pub kept_copies: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn update_mission(
     state: State<'_, AppState>,
@@ -1043,7 +1187,7 @@ pub async fn update_mission(
     status: Option<String>,
     linked_issue_key: Option<String>,
     exec_isolation: Option<String>,
-) -> AppResult<crate::db::MissionRow> {
+) -> AppResult<UpdatedMission> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
     }
@@ -1077,7 +1221,12 @@ pub async fn update_mission(
             archive_workspace_internal(&state, ws_id)?;
         }
     }
-    Ok(updated)
+    let done = if exec_isolation.as_deref() == Some("sandbox") {
+        unshare_for_sandbox(&state.db, updated.workspace_id.as_deref())
+    } else {
+        Default::default()
+    };
+    Ok(UpdatedMission { mission: updated, unlinked: done.unlinked, uncopied: done.uncopied, kept_copies: done.kept })
 }
 
 /// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,
@@ -4545,6 +4694,45 @@ pub async fn get_session_usage(
     .map_err(|e| AppError::Other(format!("session usage: {e}")))?
 }
 
+/// What every request of one project carries (#959): the fixed context
+/// measured from its recent transcripts (its root and its workspaces'
+/// worktrees; Direct stages' CLI sessions left out), priced at its usual
+/// model and cache rate, and the CLAUDE.md chain, skills and agents that
+/// make it up as estimates (`request_context`). Read-only: no file is
+/// edited, no MCP server contacted, nothing leaves the Mac.
+#[tauri::command]
+pub async fn get_request_context(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<crate::request_context::RequestContext> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, cwds, direct) = {
+            let db = db.lock();
+            let Some(project) = db.get_project(&project_id)? else {
+                return Err(AppError::Other(format!("project not found: {project_id}")));
+            };
+            let mut cwds = vec![project.path.clone()];
+            for (_, pid, worktree) in db.list_workspace_paths()? {
+                if pid == project_id && !cwds.contains(&worktree) {
+                    cwds.push(worktree);
+                }
+            }
+            (project.path, cwds, db.direct_cli_session_ids()?)
+        };
+        let home = dirs::home_dir();
+        Ok(crate::request_context::request_context(
+            &crate::transcripts::projects_root(),
+            home.as_deref(),
+            std::path::Path::new(&path),
+            &cwds,
+            &direct,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("request context: {e}")))?
+}
+
 /// Answer a turn-limit card: the extra turns to give the paused writing
 /// sub-agent, or none to accept its partial report and let the director go on.
 #[tauri::command]
@@ -5782,6 +5970,9 @@ pub async fn ensure_pr_branch(
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
 async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return None;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
@@ -5843,9 +6034,10 @@ async fn gh_check_runs(
     repo: &str,
     sha: Option<&str>,
 ) -> Option<Vec<serde_json::Value>> {
-    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let (cmd, path) = crate::github::gh_check_runs_command(owner, repo, sha?)?;
     let output = tokio::process::Command::new(shell)
-        .arg("-l").arg("-c").arg(&cmd)
+        .arg("-l").arg("-c").arg(cmd)
+        .env(crate::github::GH_API_PATH_ENV, path)
         .current_dir(workspace_path)
         .output()
         .await

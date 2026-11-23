@@ -13,7 +13,10 @@ vi.mock("../lib/ipc", () => ({
   },
 }));
 
+vi.mock("./Toasts", () => ({ pushToast: vi.fn() }));
+
 import { ipc } from "../lib/ipc";
+import { pushToast } from "./Toasts";
 const updateMissionMock = vi.mocked(ipc.updateMission);
 const listMissionsMock = vi.mocked(ipc.listMissions);
 
@@ -68,6 +71,30 @@ describe("UnattendedReadiness", () => {
     await waitFor(() =>
       expect(updateMissionMock).toHaveBeenCalledWith("m1", null, null, null, "sandbox"),
     );
+  });
+
+  it("says so when turning the sandbox on removed a link to the main checkout", async () => {
+    setEntitled([]);
+    updateMissionMock.mockResolvedValue({ ...mission("sandbox"), unlinked: ["node_modules"] });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    fireEvent.click(screen.getByText(/sandbox it/i));
+    await waitFor(() => expect(pushToast).toHaveBeenCalled());
+    expect(vi.mocked(pushToast).mock.calls[0][0]).toMatchObject({
+      level: "success",
+      title: "Sandbox enabled",
+      body: expect.stringContaining("Removed the link to the main checkout's node_modules"),
+    });
+  });
+
+  it("says which copied env files turning the sandbox on removed or kept", async () => {
+    setEntitled([]);
+    updateMissionMock.mockResolvedValue({ ...mission("sandbox"), unlinked: [], uncopied: [".env"], keptCopies: [".env.local"] });
+    render(<UnattendedReadiness workspaceId="w1" />);
+    fireEvent.click(screen.getByText(/sandbox it/i));
+    await waitFor(() => expect(pushToast).toHaveBeenCalled());
+    const body = String(vi.mocked(pushToast).mock.calls[0][0].body);
+    expect(body).toContain("Removed the copied .env from this mission's worktree.");
+    expect(body).toContain(".env.local was changed in this mission, so it stays");
   });
 
   it("for a Pro user on a sandboxed mission, shows the confirmed state, not the enable button", () => {
