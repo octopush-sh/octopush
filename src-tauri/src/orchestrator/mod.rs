@@ -864,8 +864,8 @@ impl Orchestrator {
         {
             return Ok(false);
         }
-        // Claude Code's own Bash sandbox couldn't start, so it refused the
-        // stage's Bash commands: a stronger model meets the same refusal.
+        // Claude Code's own Bash sandbox couldn't start, and its refusal was
+        // the stage's last Bash result: a stronger model meets the same refusal.
         if fresh
             .error
             .as_deref()

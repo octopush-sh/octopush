@@ -11030,29 +11030,81 @@ mod cli_args_tests {
     #[test]
     fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
         use crate::orchestrator::cli_runner::{
-            inner_sandbox_refused, is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result,
-            INNER_SANDBOX_OFF,
+            is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result, CliDialect,
+            InnerSandboxWatch, INNER_SANDBOX_OFF,
         };
         use crate::orchestrator::types::{ArtifactKind, StageStatus};
         // #1001: since Claude Code 2.1.328 a sandbox that can't start makes the
         // next sandboxed Bash command refuse, saying the sandbox is off for the
         // session. The stage names that instead of failing generically.
-        let refusal = |content: serde_json::Value| {
-            serde_json::json!({ "type": "user", "message": { "content": [
-                { "type": "tool_result", "tool_use_id": "t1", "is_error": true, "content": content }
+        let refusal_text = "Sandbox is off for the session: the sandbox could not start, so this command was not run.";
+        let tool_use = |name: &str, id: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": { "command": "npm test" } }
             ] } })
         };
-        assert!(inner_sandbox_refused(&refusal(serde_json::json!(
-            "Sandbox is off for the session: the sandbox could not start, so this command was not run."
-        ))));
-        assert!(inner_sandbox_refused(&refusal(serde_json::json!([
-            { "type": "text", "text": "Refused: the sandbox is off for the session." }
-        ]))));
-        assert!(!inner_sandbox_refused(&refusal(serde_json::json!("npm test: 3 failed"))));
-        let assistant = serde_json::json!({ "type": "assistant", "message": { "content": [
-            { "type": "text", "text": "the sandbox is off for the session" }
-        ] } });
-        assert!(!inner_sandbox_refused(&assistant), "only a tool result is the CLI's refusal");
+        let result = |id: &str, is_error: bool, content: serde_json::Value| {
+            serde_json::json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content }
+            ] } })
+        };
+        fn watch(exec: &str, events: &[serde_json::Value]) -> InnerSandboxWatch {
+            let mut w = InnerSandboxWatch::for_stage(CliDialect::Claude, exec);
+            for e in events {
+                w.observe(e);
+            }
+            w
+        }
+        let refused_bash = |id: &str| [tool_use("Bash", id), result(id, true, serde_json::json!(refusal_text))];
+        let ran_bash = |id: &str| [tool_use("Bash", id), result(id, false, serde_json::json!("ok"))];
+
+        // A Bash refusal counts, as string or block content.
+        let w = watch("sandbox", &refused_bash("t1"));
+        assert!(w.refused() && w.decisive());
+        let w = watch(
+            "sandbox",
+            &[
+                tool_use("Bash", "t1"),
+                result("t1", true, serde_json::json!([{ "type": "text", "text": "Refused: the sandbox is off for the session." }])),
+            ],
+        );
+        assert!(w.refused());
+
+        // Review point 1: only an `is_error` result of a Bash call counts. A
+        // Read or Grep of this repo's docs quoting the phrase does not, nor a
+        // Bash `cat` that printed it, nor a result whose call never opened.
+        for events in [
+            vec![tool_use("Read", "r1"), result("r1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Grep", "g1"), result("g1", true, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", true, serde_json::json!("npm test: 3 failed"))],
+            vec![result("t9", true, serde_json::json!(refusal_text))],
+            vec![serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": "the sandbox is off for the session" }
+            ] } })],
+        ] {
+            let w = watch("sandbox", &events);
+            assert!(!w.refused() && !w.decisive(), "{events:?}");
+        }
+
+        // Review point 2: only a stage the Seatbelt profile wraps is watched.
+        assert!(!watch("none", &refused_bash("t1")).refused(), "an unsandboxed stage's stream doesn't count");
+        let mut codex = InnerSandboxWatch::for_stage(CliDialect::Codex, "sandbox");
+        refused_bash("t1").iter().for_each(|e| codex.observe(e));
+        assert!(!codex.refused());
+
+        // Review point 3: decisive only when the refusal is the last Bash result.
+        let last: Vec<_> = [ran_bash("a"), refused_bash("b")].concat();
+        assert!(watch("sandbox", &last).decisive(), "the refusal was the last Bash result");
+        let all: Vec<_> = [ran_bash("a"), refused_bash("b"), refused_bash("c"), refused_bash("d")].concat();
+        assert!(watch("sandbox", &all).decisive(), "every Bash result after the first refusal was refused");
+        let then_read: Vec<_> =
+            [refused_bash("b").to_vec(), vec![tool_use("Read", "r"), result("r", false, serde_json::json!("x"))]].concat();
+        assert!(watch("sandbox", &then_read).decisive(), "a later non-Bash result doesn't change it");
+        let recovered: Vec<_> = [refused_bash("b"), ran_bash("c")].concat();
+        let w = watch("sandbox", &recovered);
+        assert!(w.refused(), "the notice still says it");
+        assert!(!w.decisive(), "a later Bash command ran: the failure has another cause");
 
         let failed = parse_cli_result(
             r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#,
@@ -11069,6 +11121,13 @@ mod cli_args_tests {
         assert_eq!(name_inner_sandbox_off(named.clone(), true).error, named.error, "named once");
         assert_eq!(name_inner_sandbox_off(failed.clone(), false).error, failed.error, "no refusal: unchanged");
         assert!(!is_inner_sandbox_off(failed.error.as_deref().unwrap()));
+        // A refusal a later Bash command got past leaves a max-turns failure's
+        // error as it was, so `try_escalate` still escalates it.
+        let kept = name_inner_sandbox_off(failed.clone(), watch("sandbox", &recovered).decisive());
+        assert_eq!(kept.error, failed.error);
+        assert!(!is_inner_sandbox_off(kept.error.as_deref().unwrap()));
+        let named_last = name_inner_sandbox_off(failed.clone(), watch("sandbox", &last).decisive());
+        assert!(is_inner_sandbox_off(named_last.error.as_deref().unwrap()));
         assert!(!is_plan_limit(err));
         // A finished stage keeps its outcome; the notice alone says it.
         let done = parse_cli_result(

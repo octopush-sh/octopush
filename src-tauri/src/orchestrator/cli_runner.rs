@@ -1478,7 +1478,8 @@ pub const INNER_SANDBOX_OFF_LABEL: &str =
 /// on Claude Code's Bash sandbox in `~/.claude/settings.json` would otherwise
 /// bring it into the stage, where a nested sandbox can't start
 /// (`sandbox::tests::seatbelt_refuses_a_nested_sandbox`) and, since 2.1.328,
-/// every Bash command is refused "the sandbox is off for the session".
+/// the next sandboxed Bash command is refused "the sandbox is off for the
+/// session".
 /// `--settings` outranks the user's file, so Octopush's profile is the one
 /// boundary. Returns whether it did; Codex stages and unsandboxed stages are
 /// left as they are. Pure.
@@ -1505,33 +1506,86 @@ pub fn turn_off_inner_sandbox(dialect: CliDialect, exec_isolation: &str, args: &
 const INNER_SANDBOX_OFF_PHRASE: &str = "sandbox is off for the session";
 
 /// The start of the error, and the done card's last notice, of a Claude
-/// stage whose Bash commands Claude Code refused because its own sandbox
-/// couldn't start ([`inner_sandbox_refused`]).
+/// stage in which Claude Code refused a Bash command because its own sandbox
+/// couldn't start ([`InnerSandboxWatch`]).
 pub const INNER_SANDBOX_OFF: &str =
-    "Claude Code's own Bash sandbox couldn't start, so it refused this stage's Bash commands (the sandbox is off for the session)";
+    "Claude Code's own Bash sandbox couldn't start, so it refused a Bash command (the sandbox is off for the session)";
 
-/// True when a stream event is a `user` tool result carrying Claude Code's
-/// "sandbox is off for the session" refusal ([`INNER_SANDBOX_OFF_PHRASE`]).
-/// Pure.
-pub fn inner_sandbox_refused(value: &Value) -> bool {
-    if value.get("type").and_then(Value::as_str) != Some("user") {
-        return false;
+/// Claude Code's "sandbox is off for the session" refusals in one stage's
+/// stream. It watches only a stage the Seatbelt profile wraps (effective
+/// `exec_isolation` `sandbox`, the same key as [`turn_off_inner_sandbox`]),
+/// and counts only an `is_error` `tool_result` whose `tool_use_id` belongs to
+/// a `Bash` `tool_use`: a Read, Grep or `cat` result quoting the phrase (this
+/// repo's own docs and tests do) is not a refusal.
+#[derive(Debug, Default)]
+pub struct InnerSandboxWatch {
+    watching: bool,
+    /// Ids of the Bash calls opened so far whose result hasn't arrived.
+    bash_open: Vec<String>,
+    refused: bool,
+    last_bash_refused: bool,
+}
+
+impl InnerSandboxWatch {
+    pub fn for_stage(dialect: CliDialect, exec_isolation: &str) -> Self {
+        Self { watching: dialect == CliDialect::Claude && exec_isolation == "sandbox", ..Self::default() }
     }
-    let blocks = value.pointer("/message/content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
-    blocks
-        .iter()
-        .filter(|b| b.get("type").and_then(Value::as_str) == Some("tool_result"))
-        .filter_map(|b| b.get("content"))
-        .any(|c| {
-            let text = match c {
-                Value::String(s) => s.clone(),
-                Value::Array(parts) => {
-                    parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" ")
+
+    pub fn observe(&mut self, v: &Value) {
+        if !self.watching {
+            return;
+        }
+        let kind = v.get("type").and_then(Value::as_str);
+        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for b in blocks {
+            match (kind, b.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    if b.get("name").and_then(Value::as_str) != Some("Bash") {
+                        continue;
+                    }
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        self.bash_open.push(id.to_string());
+                    }
                 }
-                _ => String::new(),
-            };
-            text.to_ascii_lowercase().contains(INNER_SANDBOX_OFF_PHRASE)
-        })
+                (Some("user"), Some("tool_result")) => {
+                    let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
+                    let Some(at) = self.bash_open.iter().position(|o| o == id) else { continue };
+                    self.bash_open.remove(at);
+                    let refused = b.get("is_error").and_then(Value::as_bool) == Some(true)
+                        && tool_result_text(b).to_ascii_lowercase().contains(INNER_SANDBOX_OFF_PHRASE);
+                    self.refused |= refused;
+                    self.last_bash_refused = refused;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Claude Code refused at least one Bash command: the done card's notice.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The refusal is the last Bash result of the stage (which is also the
+    /// case when every Bash result after the first refusal was refused), so
+    /// it plausibly caused a failure: the error is named and not escalated.
+    /// A later Bash command that ran means the failure has another cause.
+    pub fn decisive(&self) -> bool {
+        self.refused && self.last_bash_refused
+    }
+}
+
+/// A `tool_result` block's text: its string content, or its text parts joined.
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" ")
+        }
+        _ => String::new(),
+    }
 }
 
 /// True when a stage error is an [`INNER_SANDBOX_OFF`] failure: the drive
@@ -1540,12 +1594,13 @@ pub fn is_inner_sandbox_off(error: &str) -> bool {
     error.starts_with(INNER_SANDBOX_OFF)
 }
 
-/// Name the inner-sandbox refusal on a failed stage that met it: its error
-/// starts with [`INNER_SANDBOX_OFF`] instead of reading as a generic failure.
-/// Any other outcome, or a stage that never met it, is returned unchanged.
+/// Name the inner-sandbox refusal on a failed stage it decided
+/// ([`InnerSandboxWatch::decisive`]): its error starts with
+/// [`INNER_SANDBOX_OFF`] instead of reading as a generic failure. Any other
+/// outcome, or a stage where it wasn't decisive, is returned unchanged.
 /// Pure.
-pub fn name_inner_sandbox_off(mut outcome: StageOutcome, refused: bool) -> StageOutcome {
-    if refused && matches!(outcome.status, StageStatus::Failed) {
+pub fn name_inner_sandbox_off(mut outcome: StageOutcome, decisive: bool) -> StageOutcome {
+    if decisive && matches!(outcome.status, StageStatus::Failed) {
         let err = outcome.error.take().unwrap_or_default();
         outcome.error = Some(if err.trim().is_empty() {
             INNER_SANDBOX_OFF.to_string()
@@ -3563,14 +3618,16 @@ impl CliRunner {
         // prompt size, so its meter stays hidden.
         let mut context_watch = ContextWatch::default();
         // Claude Code refused a Bash command because its own sandbox couldn't
-        // start (`inner_sandbox_refused`): named on the outcome below.
-        let sandbox_refused = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let sandbox_refused_in_loop = std::sync::Arc::clone(&sandbox_refused);
+        // start (`InnerSandboxWatch`, only in a stage the profile wraps):
+        // a notice, and named on a failed outcome it decided, below.
+        let sandbox_watch = std::sync::Arc::new(parking_lot::Mutex::new(InnerSandboxWatch::for_stage(
+            dialect,
+            &ctx.exec_isolation,
+        )));
+        let sandbox_watch_in_loop = std::sync::Arc::clone(&sandbox_watch);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
-                if inner_sandbox_refused(value) {
-                    sandbox_refused_in_loop.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
+                sandbox_watch_in_loop.lock().observe(value);
                 if let Some(ran) = substituted_model(&stage.agent_model, value) {
                     let catalog = crate::token_engine::catalog();
                     emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
@@ -3790,7 +3847,10 @@ impl CliRunner {
                         for call in &outcome.cli.refused_calls {
                             emitter.notice(&refused_notice(call));
                         }
-                        let refused = sandbox_refused.load(std::sync::atomic::Ordering::Relaxed);
+                        let (refused, decisive) = {
+                            let w = sandbox_watch.lock();
+                            (w.refused(), w.decisive())
+                        };
                         if refused {
                             emitter.notice(INNER_SANDBOX_OFF);
                         }
@@ -3799,7 +3859,7 @@ impl CliRunner {
                                 with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
                                 &plan_watch.lock(),
                             ),
-                            refused,
+                            decisive,
                         )))
                     }
                     Err(_) => Ok(failed_stage(&format!(
@@ -3830,11 +3890,14 @@ impl CliRunner {
                     );
                     flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                     out.cli.ran_model = ran;
-                    let refused = sandbox_refused.load(std::sync::atomic::Ordering::Relaxed);
+                    let (refused, decisive) = {
+                        let w = sandbox_watch.lock();
+                        (w.refused(), w.decisive())
+                    };
                     if refused {
                         emitter.notice(INNER_SANDBOX_OFF);
                     }
-                    Ok(name_inner_sandbox_off(apply_plan_limit(out, &plan_watch.lock()), refused))
+                    Ok(name_inner_sandbox_off(apply_plan_limit(out, &plan_watch.lock()), decisive))
                 }
             },
         }
