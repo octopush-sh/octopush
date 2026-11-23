@@ -128,6 +128,7 @@ import { useReviewDefaultPin, type ReviewAnswers } from "./hooks/useReviewDefaul
 import { shouldClearAttention } from "./lib/attentionFocus";
 import { resolveWorkspaceTarget } from "./lib/workspaceTarget";
 import { ipc, type OpenInWorkspacePayload } from "./lib/ipc";
+import { noticeUnreadableSettings } from "./lib/settingsNotice";
 import { copyToClipboard } from "./lib/clipboard";
 import { conversationToMarkdown } from "./lib/exportConversation";
 import type { GitStatus, TintName, Issue, ProjectInfo, Pr } from "./lib/types";
@@ -564,6 +565,14 @@ function App() {
       });
     }
   }, [terminalsByWs]);
+
+  // ── Startup notice: settings.json exists but can't be read (#642) ──
+  const settingsNoticeFiredRef = useRef(false);
+  useEffect(() => {
+    if (settingsNoticeFiredRef.current) return;
+    settingsNoticeFiredRef.current = true;
+    void noticeUnreadableSettings();
+  }, []);
 
   // ── Theme load ──
   useEffect(() => {

@@ -24,6 +24,7 @@ import { parseShellCommand } from "../../lib/shellCommand";
 import { applySkillMention, findActiveSkillMention } from "../../lib/skillMentions";
 import { SkillHighlights } from "./SkillHighlights";
 import { FadeSwap } from "../primitives/FadeSwap";
+import { SecretGuardDialog } from "../SecretGuardDialog";
 import { Paperclip, TerminalSquare, HelpCircle } from "lucide-react";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 
@@ -49,6 +50,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const setModel = useChatStore((s) => s.setModel);
   const send = useChatStore((s) => s.send);
   const runShell = useChatStore((s) => s.runShell);
+  const shellSecret = useChatStore((s) => s.shellSecretByWs[workspaceId] ?? null);
+  const resolveShellSecret = useChatStore((s) => s.resolveShellSecret);
   const shellCwd = useChatStore((s) => s.getShellCwd(workspaceId));
   const shellCwdAbs = useChatStore((s) => s.getShellCwdAbs(workspaceId));
   const shellHistory = useChatStore((s) => s.getShellHistory(workspaceId));
@@ -793,6 +796,16 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         </button>
         {helpOpen && <ComposerHelp onClose={() => setHelpOpen(false)} />}
       </div>
+      {/* A `$` command the secret guard refused (#819): ask, then re-run
+          with exactly these findings confirmed, or leave it out. */}
+      {shellSecret && (
+        <SecretGuardDialog
+          action="command"
+          refusal={shellSecret.refusal}
+          onLeaveOut={() => void resolveShellSecret(workspaceId, false)}
+          onOverride={() => void resolveShellSecret(workspaceId, true)}
+        />
+      )}
     </div>
   );
 }

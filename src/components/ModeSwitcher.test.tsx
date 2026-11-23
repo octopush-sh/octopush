@@ -28,8 +28,8 @@ describe("ModeSwitcher", () => {
   it("names every mode without its label, so an icon-only segment still has a name and a tooltip", () => {
     render(<ModeSwitcher mode="run" onChange={vi.fn()} />);
     for (const [name, title] of [
-      ["Run", "Run (⌘⇧2)"],
-      ["Talk", "Talk (⌘⇧1)"],
+      ["Run", "Run (⌘⇧1)"],
+      ["Talk", "Talk (⌘⇧2)"],
       ["Review", "Review (⌘⇧3)"],
       ["Direct", "Direct (⌘⇧D)"],
     ]) {
@@ -38,6 +38,16 @@ describe("ModeSwitcher", () => {
       expect(segment).toHaveAttribute("title", title);
       expect(segment.querySelector("svg")).not.toBeNull();
     }
+  });
+
+  it("numbers the shortcuts in the order the segments sit, left to right", () => {
+    render(<ModeSwitcher mode="run" onChange={vi.fn()} />);
+    expect(screen.getAllByRole("button").map((s) => s.getAttribute("title"))).toEqual([
+      "Run (⌘⇧1)",
+      "Talk (⌘⇧2)",
+      "Review (⌘⇧3)",
+      "Direct (⌘⇧D)",
+    ]);
   });
 
   it("puts each label on the band's ladder; the pressed one is the rung that never sheds", () => {

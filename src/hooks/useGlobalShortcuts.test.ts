@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 // Vite serves the doc as a string; no Node fs under the app tsconfig.
 import features from "../../docs/FEATURES.md?raw";
-import type { WorkspaceMode } from "../lib/modes";
+import { MODES, MODE_SHORTCUTS, type WorkspaceMode } from "../lib/modes";
 import { GLOBAL_SHORTCUTS, handleShortcut, matchShortcut, type ShortcutContext } from "./useGlobalShortcuts";
 
 interface Press {
@@ -70,9 +70,9 @@ describe("matchShortcut", () => {
     [{ key: "9" }, "workspace-n"],
     [{ key: "1", ctrl: true }, "workspace-n"],
     [{ key: "0" }, null],
-    [{ key: "1", shift: true }, "mode-talk-run-review"],
-    [{ key: "!", shift: true }, "mode-talk-run-review"],
-    [{ key: "#", shift: true, alt: true }, "mode-talk-run-review"],
+    [{ key: "1", shift: true }, "mode-run-talk-review"],
+    [{ key: "!", shift: true }, "mode-run-talk-review"],
+    [{ key: "#", shift: true, alt: true }, "mode-run-talk-review"],
     [{ key: "D", shift: true }, "mode-direct"],
     [{ key: "m", shift: true }, "mission-control"],
     [{ key: "L", shift: true }, "logbook"],
@@ -98,7 +98,7 @@ describe("matchShortcut", () => {
     // macOS: ⌘⌥1 prints "¡" — the code decides.
     [{ key: "¡", code: "Digit1", alt: true }, "session-n"],
     [{ key: "3", alt: true }, "session-n"],
-    [{ key: "1", alt: true, shift: true }, "mode-talk-run-review"],
+    [{ key: "1", alt: true, shift: true }, "mode-run-talk-review"],
     [{ key: "[", code: "BracketLeft" }, "pane-focus"],
     // Spanish layout: the physical key prints a grave accent.
     [{ key: "`", code: "BracketLeft" }, "pane-focus"],
@@ -142,11 +142,20 @@ describe("handleShortcut", () => {
   });
 
   it.each<[string, WorkspaceMode]>([
-    ["1", "talk"], ["!", "talk"], ["2", "run"], ["@", "run"], ["3", "review"], ["#", "review"],
+    ["1", "run"], ["!", "run"], ["2", "talk"], ["@", "talk"], ["3", "review"], ["#", "review"],
   ])("⌘⇧%s → %s", (key, mode) => {
     const c = ctx();
     handleShortcut(press({ key, shift: true }), c);
     expect(c.setMode).toHaveBeenCalledWith(mode);
+  });
+
+  it("⌘⇧N picks the Nth mode of the switcher, the one its tooltip names", () => {
+    MODES.slice(0, 3).forEach((mode, i) => {
+      const c = ctx();
+      handleShortcut(press({ key: String(i + 1), shift: true }), c);
+      expect(c.setMode).toHaveBeenCalledWith(mode);
+      expect(MODE_SHORTCUTS[mode]).toBe(`⌘⇧${i + 1}`);
+    });
   });
 
   it("runs the plain global shortcuts", () => {

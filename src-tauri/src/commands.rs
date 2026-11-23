@@ -4721,6 +4721,14 @@ pub async fn get_settings() -> AppResult<crate::settings::AppSettings> {
     crate::settings::load_settings()
 }
 
+/// The path of `settings.json` when it exists but can't be parsed (the app
+/// then shows defaults and refuses every save), else `None`. Path only —
+/// never the file's contents.
+#[tauri::command]
+pub async fn unreadable_settings_path() -> AppResult<Option<String>> {
+    Ok(crate::settings::unreadable_settings_path())
+}
+
 #[tauri::command]
 pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings::AppSettings) -> AppResult<()> {
     // The sync opt-ins are owned by `set_sync_pref`; a stale read-modify-write
@@ -6248,13 +6256,14 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
     Ok(parse_open_pr_list(&values))
 }
 
-/// Push the current branch to its tracked upstream (creating it on the remote
-/// if needed via `--set-upstream`). Uses the login shell so SSH agents, the
+/// Push the current branch to `origin` (creating it on the remote if needed,
+/// and tracking it, via `--set-upstream`). Uses the login shell so SSH agents, the
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
 /// user's terminal. Returns the trimmed final stderr line, which usually
 /// includes either the new remote refs or the error reason.
 ///
-/// The secret guard (#730) rescans the commits the push would send and
+/// The secret guard (#730) rescans the commits the push would send — those
+/// not yet on `origin/<branch>`, the ref this push updates (#859) — and
 /// refuses with `AppError::SecretsFound` unless `allow_findings` matches the
 /// fresh scan's fingerprint.
 #[tauri::command]
@@ -6283,7 +6292,8 @@ pub async fn push_branch(workspace_path: String, allow_findings: Option<String>)
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let cmd = format!(
-        "git push --set-upstream origin {} 2>&1",
+        "git push --set-upstream {} {} 2>&1",
+        crate::secret_scan::PUSH_REMOTE,
         crate::git_ops::quote_git_ref(&branch)
     );
 
