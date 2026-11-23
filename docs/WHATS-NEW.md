@@ -138,6 +138,7 @@ Current anchors:
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |
 | `pr-composer-draft-note` | PR composer, once a draft answered: the note under the form ("Drafted by claude-sonnet-5-5 · $0.02") | `PrComposer.tsx` |
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
+| `settings-shortcuts-modes` | Settings › Shortcuts, Navigation: the first mode row ("Run mode" `⌘⇧1`) | `settings/ShortcutsPane.tsx` |
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
@@ -150,8 +151,9 @@ Current anchors:
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-quiet-claude-code` | Settings › Privacy: the "Quiet Claude Code in crews and Routines" toggle | `settings/PrivacyPane.tsx` |
 | `settings-secret-guard` | Settings › General › Safety: "Guard commits against secrets" | `settings/GeneralPane.tsx` |
-| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push or PR is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` |
+| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push, PR or Talk `$` command is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` · `chat/Composer.tsx` |
 | `secret-guard-preview` | The secret guard's confirm, with one finding that has a masked preview: the mono `sk-ant-…9fQ2` line under the lead | `SecretGuardDialog.tsx` |
+| `talk-secret-approval` | Talk timeline, only while the secret guard holds an agent's commit, push or `gh pr create`: the inline "Possible secret" card ("Leave it out" · "Run regardless") | `chat/ApprovalCard.tsx` via `chat/ChatCanvas.tsx` |
 | `direct-secret-hold` | Direct run bar, on an Action stage held by the secret guard: "Held before Pull request: possible secret · …" | `RunControlBar.tsx` |
 | `settings-appearance-legacy` | Settings › Appearance: the Legacy theme group (Dark, Midnight, Solarized Dark; only when the theme list has any) | `settings/AppearancePane.tsx` |
 | `about-whats-new` | Settings › About: "What's in this version" | `settings/AboutPane.tsx` |

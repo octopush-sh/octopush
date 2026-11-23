@@ -98,15 +98,16 @@ export const GLOBAL_SHORTCUTS: readonly Shortcut[] = [
     },
   },
   {
-    // Shift turns the digit into its symbol on US layouts.
-    id: "mode-talk-run-review",
+    // Numbered in switcher order (`MODES`). Shift turns the digit into its
+    // symbol on US layouts.
+    id: "mode-run-talk-review",
     chords: ["⌘⇧1", "⌘⇧2", "⌘⇧3"],
     scope: "global",
     shift: true,
     keys: ["1", "2", "3", "!", "@", "#"],
     run: (e, c) => {
       const modes: Record<string, WorkspaceMode> = {
-        "1": "talk", "!": "talk", "2": "run", "@": "run", "3": "review", "#": "review",
+        "1": "run", "!": "run", "2": "talk", "@": "talk", "3": "review", "#": "review",
       };
       c.setMode(modes[e.key]);
       return true;

@@ -1,4 +1,6 @@
 // Settings → Shortcuts — a read-only reference of every keybinding.
+import { MODES, MODE_LABELS, MODE_SHORTCUTS } from "../../lib/modes";
+import { tourId } from "../../lib/tour/ids";
 import { PaneHeader, SectionLabel } from "./shared";
 
 export function ShortcutsPane() {
@@ -13,10 +15,15 @@ export function ShortcutsPane() {
       <div className="max-w-[640px]">
         <ShortcutGroup title="Navigation">
           <Shortcut keys="⌘1 … ⌘9" desc="Switch to workspace N" />
-          <Shortcut keys="⌘⇧1" desc="Talk mode" />
-          <Shortcut keys="⌘⇧2" desc="Run mode" />
-          <Shortcut keys="⌘⇧3" desc="Review mode" />
-          <Shortcut keys="⌘⇧D" desc="Direct mode" />
+          {/* In switcher order, from the same table as its tooltips. */}
+          {MODES.map((m, i) => (
+            <Shortcut
+              key={m}
+              keys={MODE_SHORTCUTS[m]}
+              desc={`${MODE_LABELS[m]} mode`}
+              tour={i === 0 ? tourId("settings-shortcuts-modes") : undefined}
+            />
+          ))}
           <Shortcut keys="⌘⇧M" desc="Mission Control" />
           <Shortcut keys="⌘⇧L" desc="Logbook Room" />
           <Shortcut keys={"⌘\\"} desc="Toggle companion" />
@@ -56,9 +63,9 @@ function ShortcutGroup({ title, children }: { title: string; children: React.Rea
   );
 }
 
-function Shortcut({ keys, desc }: { keys: string; desc: string }) {
+function Shortcut({ keys, desc, tour }: { keys: string; desc: string; tour?: string }) {
   return (
-    <li className="flex items-baseline justify-between px-4 py-2.5">
+    <li data-tour={tour} className="flex items-baseline justify-between px-4 py-2.5">
       <span className="text-[13px] text-octo-sage">{desc}</span>
       <kbd className="rounded border border-octo-hairline bg-octo-onyx px-2 py-0.5 font-mono text-[10px] text-octo-mute">
         {keys}
