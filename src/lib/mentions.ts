@@ -53,7 +53,9 @@ export function rankFiles(files: string[], query: string, limit = 8): string[] {
   const scored: { p: string; score: number }[] = [];
   for (const p of files) {
     const lower = p.toLowerCase();
-    const base = lower.slice(lower.lastIndexOf("/") + 1);
+    // A folder entry (`src/lib/`) ranks by its own name, not the empty tail.
+    const bare = lower.endsWith("/") ? lower.slice(0, -1) : lower;
+    const base = bare.slice(bare.lastIndexOf("/") + 1);
     let score = -1;
     if (base.startsWith(q)) score = 0;
     else if (base.includes(q)) score = 1;
