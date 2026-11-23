@@ -24,6 +24,13 @@ describe("RunLedger", () => {
     expect(within(strip).getByText("$0.09").className).toContain("octo-tabular");
   });
 
+  it("prints the savings share once, with no bar restating it in brass (#969)", () => {
+    const { container } = render(<RunLedger run={baseRun} stages={stages} />);
+    expect(screen.getAllByText(/under all-premium/)).toHaveLength(1);
+    expect(container.querySelector(".bg-octo-onyx")).toBeNull();
+    expect(container.querySelector("[style*='width']")).toBeNull();
+  });
+
   it("groups thousands in large figures", () => {
     const big = { ...baseRun, costUsd: 12843.27, baselineUsd: 98236.72, budgetUsd: 20000 } as Run;
     render(<RunLedger run={big} stages={stages} />);
