@@ -1,5 +1,6 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 import type { SecretHold, SecretPreview } from "./secretGuard";
+import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -593,6 +594,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
@@ -629,6 +631,8 @@ import type {
   GatewayReconciliation,
   Workspace,
   CreatedWorkspace,
+  ShareOptions,
+  ShareSpec,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
   ProjectCollisions,
@@ -880,6 +884,13 @@ export const ipc = {
    *  DB. Reading it never runs it. */
   conductorSetupScript: (projectId: string) =>
     invoke<string | null>("conductor_setup_script", { projectId }),
+  /** The project's "Share with new missions" list, and what its main checkout
+   *  could share. The backend reads the project's own path from the DB. */
+  shareWithMissions: (projectId: string) =>
+    invoke<ShareOptions>("share_with_missions", { projectId }),
+  /** Remember what the project shares with new missions (sanitized server-side). */
+  setShareWithMissions: (projectId: string, spec: ShareSpec) =>
+    invoke<void>("set_share_with_missions", { projectId, spec }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -896,7 +907,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────
@@ -1024,6 +1035,23 @@ export const ipc = {
     invoke<void>("set_thread_pinned", { threadId, pinned }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
+
+  // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+  // The backend resolves the thread's worktree itself; no path is passed.
+  /** The turns of a thread that can be rewound, the ones without a checkpoint, and whether an undo is on offer. */
+  listTalkCheckpoints: (threadId: string) =>
+    invoke<TalkCheckpoints>("list_talk_checkpoints", { threadId }),
+  /** What rewinding to a turn would change (nothing is written). */
+  previewTalkRewind: (threadId: string, messageId: number) =>
+    invoke<RewindPreview>("preview_talk_rewind", { threadId, messageId }),
+  /** Rewind to a turn; `expected` is the confirmed preview's `current`. */
+  rewindTalkFiles: (threadId: string, messageId: number, expected: string) =>
+    invoke<RewindOutcome>("rewind_talk_files", { threadId, messageId, expected }),
+  undoTalkRewind: (threadId: string) =>
+    invoke<RewindOutcome>("undo_talk_rewind", { threadId }),
+  /** A new thread with the history before a user turn; the turn becomes its draft. */
+  forkChatThread: (threadId: string, messageId: number) =>
+    invoke<{ thread: ChatThread; draft: string }>("fork_chat_thread", { threadId, messageId }),
 
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>

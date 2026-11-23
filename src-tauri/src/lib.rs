@@ -38,9 +38,11 @@ pub mod settings;
 pub mod skills;
 mod state;
 pub mod sync;
+pub mod talk_checkpoints;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
+pub mod worktree_share;
 pub mod mission;
 pub mod template;
 pub mod theme;
@@ -232,6 +234,8 @@ pub fn run() {
             commands::create_workspace,
             commands::set_project_setup_script,
             commands::conductor_setup_script,
+            commands::share_with_missions,
+            commands::set_share_with_missions,
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,
@@ -271,6 +275,11 @@ pub fn run() {
             commands::rename_chat_thread,
             commands::set_thread_pinned,
             commands::delete_chat_thread,
+            commands::list_talk_checkpoints,
+            commands::preview_talk_rewind,
+            commands::rewind_talk_files,
+            commands::undo_talk_rewind,
+            commands::fork_chat_thread,
             commands::list_skills,
             commands::list_subagent_types,
             commands::read_attachment,
