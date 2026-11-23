@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useSyncExternalStore } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { AlertTriangle, CheckCircle, XCircle, Info, X } from "lucide-react";
 import { clsx } from "clsx";
@@ -25,35 +25,55 @@ const ICONS: Record<ToastLevel, React.ReactNode> = {
 
 let toastId = 0;
 
-// Global toast API for imperative use.
-type ToastFn = (t: Omit<Toast, "id">) => void;
-let globalPush: ToastFn = () => {};
+// The live toasts are module state, not a container's own: the app mounts a
+// different `ToastContainer` per top-level view (Welcome, New project, the
+// shell), so a toast pushed while one is on screen — or before any is —
+// must still be there when the next one mounts (#642).
+let liveToasts: Toast[] = [];
+const subscribers = new Set<() => void>();
+const timers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function setLiveToasts(next: Toast[]) {
+  liveToasts = next;
+  subscribers.forEach((notify) => notify());
+}
+
+function subscribe(notify: () => void) {
+  subscribers.add(notify);
+  return () => {
+    subscribers.delete(notify);
+  };
+}
+
+function removeToast(id: string) {
+  const timer = timers.get(id);
+  if (timer !== undefined) clearTimeout(timer);
+  timers.delete(id);
+  if (liveToasts.some((x) => x.id === id)) setLiveToasts(liveToasts.filter((x) => x.id !== id));
+}
+
+/** Show a toast in whichever `ToastContainer` is mounted, now or next. It
+ *  leaves after `timeout` ms (default 5000), counted from this call. */
 export function pushToast(t: Omit<Toast, "id">) {
-  globalPush(t);
+  const id = String(++toastId);
+  setLiveToasts([...liveToasts, { ...t, id }]);
+  timers.set(
+    id,
+    setTimeout(() => removeToast(id), t.timeout ?? 5000),
+  );
+}
+
+/** Test-only: drop every toast and its timer. */
+export function resetToastsForTest() {
+  timers.forEach((timer) => clearTimeout(timer));
+  timers.clear();
+  setLiveToasts([]);
 }
 
 export function ToastContainer() {
-  const [toasts, setToasts] = useState<Toast[]>([]);
-
-  const push = useCallback((t: Omit<Toast, "id">) => {
-    const id = String(++toastId);
-    setToasts((prev) => [...prev, { ...t, id }]);
-    const ms = t.timeout ?? 5000;
-    setTimeout(() => {
-      setToasts((prev) => prev.filter((x) => x.id !== id));
-    }, ms);
-  }, []);
-
-  // Expose globally.
-  useEffect(() => {
-    globalPush = push;
-    return () => {
-      globalPush = () => {};
-    };
-  }, [push]);
-
-  const dismiss = (id: string) =>
-    setToasts((prev) => prev.filter((x) => x.id !== id));
+  const toasts = useSyncExternalStore(subscribe, () => liveToasts);
+  const push = pushToast;
+  const dismiss = removeToast;
 
   // Listen for backend-emitted notification events.
   useEffect(() => {
@@ -106,7 +126,7 @@ export function ToastContainer() {
           <div className="min-w-0 flex-1">
             <div className="text-sm font-medium">{t.title}</div>
             {t.body && (
-              <div className="mt-0.5 text-xs text-zinc-400">{t.body}</div>
+              <div className="mt-0.5 break-words text-xs text-zinc-400">{t.body}</div>
             )}
             {t.action && (
               <button

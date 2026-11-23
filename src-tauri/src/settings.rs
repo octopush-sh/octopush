@@ -132,7 +132,10 @@ pub struct AppSettings {
 
     /// Update channel (Settings › About): `stable` (default) or `beta`.
     /// Owned by `set_update_channel` — whole-file saves carry it over.
-    #[serde(default)]
+    /// Parsed leniently: a value this build doesn't know — a channel written
+    /// by a newer build, before a downgrade — reads as the default instead
+    /// of failing the whole file (#642).
+    #[serde(default, deserialize_with = "enum_or_default")]
     pub update_channel: crate::updater::UpdateChannel,
 
     /// A version the user chose "Skip this version" for: the launch alert
@@ -145,6 +148,23 @@ pub struct AppSettings {
     pub legacy_anthropic_api_key: Option<String>,
     #[serde(default, rename = "openaiApiKey", skip_serializing)]
     pub legacy_openai_api_key: Option<String>,
+}
+
+/// `settings.json`'s reader for an enum-valued field: a value this build
+/// can't read (an unknown variant, or a wrong shape) falls back to the
+/// field's own default, never a failed file (malformed JSON still fails) — the same rule
+/// `SyncStatus::deserialize_lenient` applies to `lastSyncAttempt`. Every
+/// enum-valued field of [`AppSettings`] uses it.
+fn enum_or_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned + Default,
+{
+    // A syntax error inside the value is still an error: only a well-formed
+    // value this build can't read falls back. Broken JSON must keep failing
+    // the whole file, so no writer overwrites it (#641).
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value(v).unwrap_or_default())
 }
 
 fn settings_path() -> PathBuf {
@@ -185,9 +205,21 @@ fn load_settings_for_write() -> AppResult<AppSettings> {
         Err(LoadError::Unparseable) => {
             tracing::warn!("settings.json exists but doesn't parse; refusing to overwrite it");
             Err(crate::error::AppError::Other(
-                "settings.json couldn't be read, so it was left unchanged".into(),
+                "Your change wasn't saved: settings.json couldn't be read, so it was left unchanged.".into(),
             ))
         }
+    }
+}
+
+/// The path of `settings.json` when it exists but doesn't parse — the app is
+/// then showing defaults and every save is refused — so the UI can say so
+/// and name the file. `None` when it is missing, readable, or fails for
+/// another reason (an I/O error already reaches the caller of
+/// [`load_settings`]).
+pub fn unreadable_settings_path() -> Option<String> {
+    match load_settings_strict() {
+        Err(LoadError::Unparseable) => Some(settings_path().to_string_lossy().into_owned()),
+        _ => None,
     }
 }
 
@@ -717,6 +749,154 @@ mod tests {
         assert!(!quiet_claude_code());
         std::fs::write(&path, "{ not json").unwrap();
         assert!(!quiet_claude_code(), "unparseable ⇒ off");
+        test_settings_path::set(None);
+    }
+
+    /// A settings file with every kind of key, and `updateChannel` set to
+    /// `channel` (any JSON value).
+    fn file_with_update_channel(channel: serde_json::Value) -> String {
+        serde_json::json!({
+            "providerKeys": {"anthropic": "sk-ant-keep"},
+            "providerBaseUrls": {"ollama": "http://localhost:11434"},
+            "gitCredentials": {"github.com": {"username": "u", "token": "t"}},
+            "issueTracker": {
+                "baseUrl": "https://example.invalid",
+                "email": "dev@example.invalid",
+                "apiToken": "jira-keep"
+            },
+            "editorCommand": "code",
+            "quietClaudeCode": true,
+            "secretGuardEnabled": false,
+            "updateChannel": channel,
+            "skippedUpdateVersion": "9.9.9"
+        })
+        .to_string()
+    }
+
+    fn assert_other_keys_intact(s: &AppSettings) {
+        assert_eq!(s.provider_keys.get("anthropic").map(String::as_str), Some("sk-ant-keep"));
+        assert_eq!(
+            s.provider_base_urls.get("ollama").map(String::as_str),
+            Some("http://localhost:11434")
+        );
+        assert_eq!(s.git_credentials.get("github.com").map(|c| c.token.as_str()), Some("t"));
+        assert_eq!(s.issue_tracker.as_ref().map(|j| j.api_token.as_str()), Some("jira-keep"));
+        assert_eq!(s.editor_command.as_deref(), Some("code"));
+        assert!(s.quiet_claude_code);
+        assert_eq!(s.secret_guard_enabled, Some(false));
+        assert_eq!(s.skipped_update_version.as_deref(), Some("9.9.9"));
+    }
+
+    #[test]
+    fn a_known_update_channel_still_reads_as_written() {
+        let s: AppSettings =
+            serde_json::from_str(&file_with_update_channel(serde_json::json!("beta"))).unwrap();
+        assert_eq!(s.update_channel, crate::updater::UpdateChannel::Beta);
+        let s: AppSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(s.update_channel, crate::updater::UpdateChannel::Stable);
+    }
+
+    #[test]
+    fn an_unknown_update_channel_reads_as_the_default_and_the_file_can_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        // A variant from a newer build, and values of the wrong shape.
+        for unknown in [
+            serde_json::json!("nightly"),
+            serde_json::json!(7),
+            serde_json::json!(null),
+            serde_json::json!({"name": "beta"}),
+        ] {
+            std::fs::write(&path, file_with_update_channel(unknown.clone())).unwrap();
+
+            // The read side keeps every other key instead of showing defaults.
+            let loaded = load_settings().unwrap();
+            assert_eq!(
+                loaded.update_channel,
+                crate::updater::UpdateChannel::Stable,
+                "{unknown} falls back to the default"
+            );
+            assert_other_keys_intact(&loaded);
+            assert_eq!(update_channel(), crate::updater::UpdateChannel::Stable);
+            assert!(unreadable_settings_path().is_none(), "the file counts as readable");
+
+            // Every kind of writer goes through, and nothing else is lost.
+            update_settings(|s| s.editor_command = Some("code".into())).unwrap();
+            save_settings_from_ui(loaded.clone()).unwrap();
+            let on_disk: AppSettings =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            assert_other_keys_intact(&on_disk);
+            assert_eq!(on_disk.update_channel, crate::updater::UpdateChannel::Stable);
+
+            // The channel itself can be chosen again.
+            set_update_channel(crate::updater::UpdateChannel::Beta).unwrap();
+            assert_eq!(update_channel(), crate::updater::UpdateChannel::Beta);
+            assert_other_keys_intact(&load_settings().unwrap());
+        }
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn malformed_json_inside_an_enum_field_still_fails_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        // Broken syntax inside the lenient field's own value, with and
+        // without keys after it.
+        for corrupt in [
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":[1,}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":{"name":},"editorCommand":"code"}"#,
+            r#"{"providerKeys":{"anthropic":"sk-ant-keep"},"updateChannel":bet"#,
+        ] {
+            assert!(
+                serde_json::from_str::<AppSettings>(corrupt).is_err(),
+                "not read leniently: {corrupt}"
+            );
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                unreadable_settings_path(),
+                Some(path.to_string_lossy().into_owned()),
+                "reported as unparseable"
+            );
+            // Every writer refuses, and the bytes stay as they were.
+            assert!(update_settings(|s| s.editor_command = Some("x".into())).is_err());
+            assert!(save_settings_from_ui(AppSettings::default()).is_err());
+            assert!(set_update_channel(crate::updater::UpdateChannel::Beta).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt);
+        }
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn a_file_that_still_fails_to_parse_is_named_and_the_save_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+
+        assert!(unreadable_settings_path().is_none(), "a missing file is not a problem");
+        std::fs::write(&path, r#"{"providerKeys":{"anthropic":"sk-ant-keep"}}"#).unwrap();
+        assert!(unreadable_settings_path().is_none(), "nor is a readable one");
+
+        for corrupt in ["{ not json", r#"{"quietClaudeCode":"yes"}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            assert_eq!(
+                unreadable_settings_path(),
+                Some(path.to_string_lossy().into_owned())
+            );
+            let err = update_settings(|s| s.editor_command = Some("x".into()))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(
+                    "Your change wasn't saved: settings.json couldn't be read, so it was left unchanged."
+                ),
+                "{err}"
+            );
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), corrupt, "left as it was");
+        }
         test_settings_path::set(None);
     }
 

@@ -59,6 +59,16 @@ describe("paletteWorkspaces", () => {
     expect(paletteWorkspaces(plain, {}, {}, {})[0].glyph).toBe("L");
   });
 
+  it("breaks a tie in activity by name in natural order, -3 before -10 and -17 (#967)", () => {
+    const same = "2026-11-01T00:00:00Z";
+    const tied = [{ name: "p", workspaces: [17, 3, 10].map((n) => ws(`r${n}`, `New Model Rollout-${n}`, `b${n}`, same)) }];
+    expect(paletteWorkspaces(tied, {}, {}, {}).map((r) => r.name)).toEqual([
+      "New Model Rollout-3",
+      "New Model Rollout-10",
+      "New Model Rollout-17",
+    ]);
+  });
+
   it("keys each row by name, branch and project so a branch fragment matches", () => {
     const row = paletteWorkspaces(projects, {}, {}, {}).find((r) => r.id === "d")!;
     expect(row.keywords).toEqual(["Waiting long", "pm/issue-772", "octopush-api"]);

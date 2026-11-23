@@ -132,6 +132,59 @@ describe("chatStore — live `$`-direct process lifecycle", () => {
     expect(useChatStore.getState().getPendingApprovals("ws-1")).toHaveLength(0);
   });
 
+  it("marks the secret guard's card, and only it (#819)", () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" } });
+    emit("chat://approval-request", {
+      workspaceId: "ws-1", threadId: "t1", callId: "call-s",
+      command: "git add -A && git commit -m x", reason: "possible secret · GitHub token in a.ts:3",
+      secret: true, coversUncommitted: true,
+    });
+    emit("chat://approval-request", {
+      workspaceId: "ws-1", threadId: "t1", callId: "call-d",
+      command: "rm -rf x", reason: "rm -rf",
+    });
+    const [s, d] = useChatStore.getState().getPendingApprovals("ws-1");
+    expect(s).toMatchObject({ secret: true, coversUncommitted: true });
+    expect(d.secret).toBeUndefined();
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "call-s" });
+    emit("chat://approval-resolved", { workspaceId: "ws-1", callId: "call-d" });
+  });
+
+  it("a `$` command the guard refuses asks, and Run regardless re-runs it with the fingerprint (#819)", async () => {
+    useChatStore.setState({ activeThreadByWs: { "ws-1": "t1" }, shellSecretByWs: {} });
+    const refusal = {
+      kind: "SecretsFound", message: "possible secret", total: 1, partial: false, fingerprint: "fp-1",
+      findings: [{ file: "a.ts", line: 3, rule: "github-token", kind: "GitHub token", yours: false }],
+    };
+    const run = vi.fn()
+      .mockRejectedValueOnce(refusal)
+      .mockResolvedValueOnce({ output: "", exitCode: 0, ok: true, cwd: "/r", cwdLabel: "", live: false });
+    Object.assign(ipc, { runShellCommand: run, listShellHistory: vi.fn().mockResolvedValue([]) });
+
+    await useChatStore.getState().runShell("ws-1", "/r", "git commit -m x");
+    const pending = useChatStore.getState().shellSecretByWs["ws-1"];
+    expect(pending?.refusal.fingerprint).toBe("fp-1");
+    expect(pending?.command).toBe("git commit -m x");
+    expect(useChatStore.getState().getError("ws-1")).toBeNull();
+    expect(run.mock.calls[0][0].allowFindings).toBeUndefined();
+
+    await useChatStore.getState().resolveShellSecret("ws-1", true);
+    expect(useChatStore.getState().shellSecretByWs["ws-1"]).toBeNull();
+    expect(run).toHaveBeenCalledTimes(2);
+    expect(run.mock.calls[1][0]).toMatchObject({ command: "git commit -m x", allowFindings: "fp-1" });
+  });
+
+  it("leaving a refused `$` command out runs nothing", async () => {
+    useChatStore.setState({
+      shellSecretByWs: { "ws-1": { workspacePath: "/r", command: "git push", refusal: { findings: [], total: 0, partial: true, fingerprint: "f" } } },
+    });
+    const run = vi.fn();
+    Object.assign(ipc, { runShellCommand: run });
+    await useChatStore.getState().resolveShellSecret("ws-1", false);
+    expect(useChatStore.getState().shellSecretByWs["ws-1"]).toBeNull();
+    expect(run).not.toHaveBeenCalled();
+  });
+
   it("surfaces approvals workspace-wide (not hidden by a thread switch)", () => {
     // A destructive-command prompt is a safety signal — it must stay visible
     // even if the user navigates to another thread while it's pending.

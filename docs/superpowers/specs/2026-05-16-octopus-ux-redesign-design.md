@@ -209,8 +209,8 @@ Storage: extend the `Workspace` type with optional `glyph?: string` and `tint?: 
 | Shortcut       | Action                                             | Notes |
 |----------------|----------------------------------------------------|-------|
 | `⌘1` … `⌘9`    | Switch to workspace N in the rail                  | Replaces the current per-view shortcuts. |
-| `⌘⇧1`          | Switch to **Talk** mode                            | New in this redesign. |
-| `⌘⇧2`          | Switch to **Run** mode                             | |
+| `⌘⇧1`          | Switch to **Run** mode                             | Numbered in the switcher's order (Run · Talk · Review) since 2026-11. |
+| `⌘⇧2`          | Switch to **Talk** mode                            | |
 | `⌘⇧3`          | Switch to **Review** mode                          | |
 | `⌘⇧D`          | Switch to **Direct** mode                          | Added with the 4th-mode extension. |
 | `⌘N`           | Create new workspace                               | Unchanged. |

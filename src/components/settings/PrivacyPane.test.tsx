@@ -20,6 +20,8 @@ import {
   OUTBOUND,
   AGENT_CLI_NOTE,
   PATH_CHIP_CLASS,
+  AGENT_CLI_LEAD_IN,
+  LEAD_IN_CLASS,
   QUIET_ENV,
   QUIET_LABEL,
   QUIET_OFF_NOTE,
@@ -72,6 +74,84 @@ describe("PrivacyPane", () => {
     expect(screen.getByTestId("privacy-agent-cli")).toHaveTextContent(AGENT_CLI_NOTE);
     expect(AGENT_CLI_NOTE).toContain("Claude Code");
     expect(AGENT_CLI_NOTE).toContain("Codex");
+  });
+});
+
+/** The data inventory as it reads on screen, verbatim. A change here is a
+ *  privacy-copy change and needs the owner's approval first (#875 changed
+ *  the layout only). */
+const APPROVED_INVENTORY = [
+  "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
+  "API keys: stored in ~/.octopush/settings.json. Your account session lives in the macOS Keychain.",
+  "Outbound traffic, only to:" +
+    "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
+    "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
+    "Octopush's sync service, only if you turn on sync in Account." +
+    "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
+    "Update checks — octopush.sh/update/latest.json and GitHub releases." +
+    "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
+  "No analytics, no telemetry.",
+  "Agent CLIs Octopush launches for you (Claude Code, Codex) talk to their own services and follow their own telemetry policies.",
+];
+
+describe("PrivacyPane — the data inventory is a real list (#875)", () => {
+  const items = () =>
+    Array.from(screen.getByTestId("privacy-inventory").children) as HTMLElement[];
+
+  it("renders the inventory word for word, with no hand-typed marker", () => {
+    render(<PrivacyPane />);
+    const list = screen.getByTestId("privacy-inventory");
+    expect(items().map((li) => li.textContent)).toEqual(APPROVED_INVENTORY);
+    expect(list.textContent).not.toContain("·");
+    expect(OUTBOUND.join("")).toBe(APPROVED_INVENTORY[2].slice("Outbound traffic, only to:".length));
+    expect(AGENT_CLI_NOTE).toBe(APPROVED_INVENTORY[4]);
+  });
+
+  it("gives every item the same native marker and a hanging indent", () => {
+    render(<PrivacyPane />);
+    const list = screen.getByTestId("privacy-inventory");
+    expect(list.tagName).toBe("UL");
+    expect(list).toHaveClass("list-disc", "pl-4");
+    expect(list).not.toHaveClass("list-inside");
+    expect(items()).toHaveLength(5);
+    for (const li of items()) expect(li.tagName).toBe("LI");
+  });
+
+  it("opens every item with a serif lead-in", () => {
+    render(<PrivacyPane />);
+    const leads = items().map((li) => li.firstElementChild as HTMLElement);
+    for (const lead of leads) {
+      expect(lead.tagName).toBe("SPAN");
+      expect(lead).toHaveClass(...LEAD_IN_CLASS.split(" "));
+      // The lead-in is the very start of the item: nothing comes before it.
+      expect(lead.previousSibling).toBeNull();
+    }
+    expect(leads.map((l) => l.textContent)).toEqual([
+      "Stored on this Mac:",
+      "API keys:",
+      "Outbound traffic, only to:",
+      "No analytics, no telemetry.",
+      AGENT_CLI_LEAD_IN,
+    ]);
+    // The last lead-in is the sentence's own opening words, not added copy.
+    expect(AGENT_CLI_NOTE.startsWith(`${AGENT_CLI_LEAD_IN} `)).toBe(true);
+  });
+
+  it("nests the outbound destinations one level in, with the same marker", () => {
+    render(<PrivacyPane />);
+    const outbound = screen.getByTestId("privacy-outbound");
+    expect(outbound.tagName).toBe("UL");
+    expect(outbound).toHaveClass("list-disc", "pl-4");
+    expect(outbound).not.toHaveClass("list-inside");
+    expect(outbound.parentElement).toBe(items()[2]);
+    expect(Array.from(outbound.children).map((li) => li.tagName)).toEqual(OUTBOUND.map(() => "LI"));
+    expect(Array.from(outbound.children).map((li) => li.textContent)).toEqual([...OUTBOUND]);
+  });
+
+  it("starts the note under the toggle at the content column", () => {
+    render(<PrivacyPane />);
+    const note = screen.getByTestId("privacy-quiet-off-note");
+    expect(note.className).not.toMatch(/(^|\s)(p|m)[xlrse]?-/);
   });
 });
 
