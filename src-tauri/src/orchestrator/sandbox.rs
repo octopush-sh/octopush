@@ -4945,4 +4945,47 @@ mod tests {
         let plain = ["-p".to_string(), "(version 1)\n(allow default)\n".to_string(), "/usr/bin/true".to_string()];
         assert!(std::process::Command::new(SANDBOX_EXEC).args(&plain).status().unwrap().success());
     }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_claude_stage_in_the_mission_profile_runs_bash_without_claude_codes_own_sandbox() {
+        use crate::orchestrator::cli_runner::{build_cli_args, build_cli_args_resume, turn_off_inner_sandbox, CliDialect};
+        use std::os::unix::fs::PermissionsExt;
+        // #1001: a fake `claude` that, like Claude Code, wraps its Bash call in
+        // its own sandbox when the user's settings turn it on, unless the
+        // `--settings` value turns it off.
+        let dir = tempfile::tempdir().unwrap();
+        let user_settings = dir.path().join("settings.json");
+        std::fs::write(&user_settings, r#"{"sandbox":{"enabled":true}}"#).unwrap();
+        let fake = dir.path().join("claude");
+        std::fs::write(
+            &fake,
+            format!(
+                "#!/bin/bash\nsettings=\"\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --settings ] && settings=\"$2\"; shift; done\n\
+                 on=0\ngrep -q '\"enabled\":true' \"$FAKE_USER_SETTINGS\" && on=1\n\
+                 case \"$settings\" in *'\"sandbox\":{{\"enabled\":false}}'*) on=0;; esac\n\
+                 if [ $on = 1 ]; then exec {SANDBOX_EXEC} -p '(version 1)\n(allow default)\n' /usr/bin/true; fi\n\
+                 exec /usr/bin/true\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let ws = tempfile::tempdir().unwrap();
+        let roots = vec![canonical_string(ws.path())];
+        let (profile, _) = profile_and_refusals_for(None, None, None, None, &roots, &[]).unwrap();
+        let bash_call = |args: &[String]| {
+            let (prog, wrapped) = sandbox_argv(fake.as_os_str(), args, &profile);
+            std::process::Command::new(prog).args(wrapped).env("FAKE_USER_SETTINGS", &user_settings).output().unwrap()
+        };
+        for mut args in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, true)] {
+            // Without the override the user's sandbox can't start in the profile.
+            let out = bash_call(&args);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(!out.status.success() && stderr.contains("sandbox_apply"), "nested: {stderr}");
+            // With it, the profile is the one boundary and the call runs.
+            assert!(turn_off_inner_sandbox(CliDialect::Claude, "sandbox", &mut args));
+            let out = bash_call(&args);
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
 }
