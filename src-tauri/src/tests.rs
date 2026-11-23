@@ -10253,6 +10253,217 @@ mod orchestrator_tests {
         assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
         assert_eq!(seen[1].resume_prior_cost_usd, 0.03);
     }
+
+    /// Records every run's spec and input. The stage at position 1 ends its
+    /// first run the way `first` says (session `sess-b`); every other run
+    /// succeeds.
+    struct SecondStageOnceRunner {
+        first: fn() -> (StageStatus, Option<String>, Option<BlockedAsk>),
+        seen: Arc<Mutex<Vec<(StageSpec, StageInput)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for SecondStageOnceRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first_run = stage.position == 1 && !self.seen.lock().iter().any(|(s, _)| s.position == 1);
+            self.seen.lock().push((stage.clone(), input.clone()));
+            let (status, error, blocked) =
+                if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status,
+                tool_calls: vec![],
+                error,
+                verdict: None,
+                session_id: Some("sess-b".into()),
+                blocked,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// Plan (API) → implement (Claude CLI), driven by `runner` until the
+    /// implement stage stops, which then had a 120k context reading.
+    async fn plan_then_cli_implement(runner: SecondStageOnceRunner) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Plan then build", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink, Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let implement = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        db.lock().set_run_stage_context(&implement.id, 120_000, Some(200_000)).unwrap();
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn a_resumed_claude_stage_gets_its_full_input_and_last_context() {
+        // #1025: if `--resume` comes back on an empty conversation the runner
+        // reruns fresh, which needs the dossier; the context reading the
+        // Resume found is what the resumed reply must come back near.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || (StageStatus::Failed, Some("claude stopped early (error_max_turns)".into()), None),
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the resumed implement");
+        assert_eq!(seen[0].0.resume_context_tokens, None, "a fresh run carries no context to come back near");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        assert!(input.sections.iter().any(|s| s.text == "did plan"), "the dossier rides along: {:?}", input.sections);
+    }
+
+    #[tokio::test]
+    async fn an_answered_claude_stage_keeps_the_answers_for_a_fresh_rerun() {
+        // #1025: the fresh fallback after an empty resume is prompted with the
+        // full input AND the director's answers.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || {
+                (
+                    StageStatus::Done,
+                    None,
+                    Some(BlockedAsk {
+                        summary: "which db?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "SQLite or Postgres?".into(),
+                            why_blocked: "both fit".into(),
+                            recommended_default: "SQLite".into(),
+                        }],
+                    }),
+                )
+            },
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()], source: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the answered implement");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        let fresh = crate::orchestrator::runner::user_input_for(&spec.role, "t", input, spec.feedback.as_deref());
+        assert!(fresh.contains("did plan"), "{fresh}");
+        assert!(fresh.contains("SQLite"), "{fresh}");
+    }
+
+    fn claude_init(session: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "system", "subtype": "init", "session_id": session })
+    }
+
+    fn claude_reply(tokens: u64, parent: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": parent,
+            "message": { "id": "msg_1", "model": "claude-sonnet-5-5", "usage": {
+                "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": tokens - 10, "cache_creation_input_tokens": 0
+            } }
+        })
+    }
+
+    #[test]
+    fn an_empty_resume_is_named_by_its_session_or_its_first_reply() {
+        use crate::orchestrator::cli_runner::{EmptyResume, ResumeWatch};
+        let observe = |prior: Option<u64>, events: &[serde_json::Value]| {
+            let mut w = ResumeWatch::new("sess-a", prior);
+            events.iter().filter_map(|e| w.observe(e)).collect::<Vec<_>>()
+        };
+        // Another session in `system/init`: decided there, never again.
+        assert_eq!(
+            observe(Some(120_000), &[claude_init("sess-new"), claude_reply(3_000, None)]),
+            vec![EmptyResume::OtherSession { requested: "sess-a".into(), got: "sess-new".into() }]
+        );
+        // No reading recorded: under 8K tokens is empty, at or above it is not.
+        assert_eq!(
+            observe(None, &[claude_init("sess-a"), claude_reply(3_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 3_000, floor: 8_000 }]
+        );
+        assert!(observe(None, &[claude_init("sess-a"), claude_reply(8_000, None)]).is_empty());
+        // A recorded reading: 15% of it is the floor.
+        assert!(observe(Some(120_000), &[claude_init("sess-a"), claude_reply(130_000, None)]).is_empty());
+        assert_eq!(ResumeWatch::floor(Some(120_000)), 18_000);
+        assert_eq!(ResumeWatch::floor(Some(0)), 8_000, "a zero reading counts as none");
+        // Only the FIRST top-level reply decides: a sub-agent's small context
+        // is its own, and a later small reply (after a compaction) is fine.
+        assert!(observe(
+            Some(120_000),
+            &[claude_init("sess-a"), claude_reply(2_000, Some("toolu_1")), claude_reply(125_000, None), claude_reply(4_000, None)]
+        )
+        .is_empty());
+        // An init with no session id doesn't decide.
+        assert_eq!(
+            observe(Some(120_000), &[serde_json::json!({ "type": "system", "subtype": "init" }), claude_reply(4_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 4_000, floor: 18_000 }]
+        );
+    }
+
+    #[test]
+    fn an_empty_resume_notice_names_the_update_only_on_a_known_old_cli() {
+        use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume};
+        let why = EmptyResume::SmallContext { tokens: 4_200, floor: 21_300 };
+        assert_eq!(
+            empty_resume_notice(&why, None),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input and the feedback."
+        );
+        let old = empty_resume_notice(&why, Some("2.1.329"));
+        assert!(
+            old.ends_with("feedback. Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
+            "{old}"
+        );
+        assert_eq!(empty_resume_notice(&why, Some("2.1.330")), empty_resume_notice(&why, None));
+        assert_eq!(empty_resume_notice(&why, Some("not a version")), empty_resume_notice(&why, None));
+        let other = EmptyResume::OtherSession { requested: "aaaaaaaa-0001".into(), got: "bbbbbbbb-0002".into() };
+        assert!(empty_resume_notice(&other, None).contains("(it started session bbbbbbbb instead of aaaaaaaa)"));
+    }
+
+    #[test]
+    fn an_empty_resume_and_its_fresh_rerun_keep_both_spends() {
+        // The stopped attempt's spend is real; the fresh run's result stands.
+        use crate::orchestrator::cli_runner::{merge_resume_fallback, stopped_stage, CliDialect, EMPTY_RESUME_STOP};
+        let stopped = stopped_stage(CliDialect::Claude, EMPTY_RESUME_STOP, "claude-sonnet-5-5", &Default::default(), false);
+        assert_eq!(stopped.status, StageStatus::Failed);
+        assert_eq!(stopped.error.as_deref(), Some(EMPTY_RESUME_STOP));
+        let mut resumed = stopped;
+        resumed.input_tokens = 14_000;
+        resumed.cost_usd = 0.05;
+        let mut fresh = resumed.clone();
+        fresh.status = StageStatus::Done;
+        fresh.error = None;
+        fresh.input_tokens = 30_000;
+        fresh.cost_usd = 0.20;
+        let merged = merge_resume_fallback(resumed, fresh);
+        assert_eq!(merged.status, StageStatus::Done);
+        assert_eq!(merged.input_tokens, 44_000);
+        assert!((merged.cost_usd - 0.25).abs() < 1e-9);
+        assert!(!merged.cli.usage_unreported, "a Claude stop prices what it streamed");
+    }
     /// A Claude CLI stage that reports its `claude -p` session id.
     struct SessionRunner;
     #[async_trait::async_trait]

@@ -861,6 +861,10 @@ impl Db {
         // Codex/API stages, and (window) when the catalog doesn't list the model.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_tokens INTEGER")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_window INTEGER")?;
+        // #1025: the context reading a Resume (or an answered block) found on
+        // the stage before its reset forgot it — a resumed Claude run whose
+        // first reply reads far less came back on an empty conversation.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_context_tokens INTEGER")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -7480,6 +7484,30 @@ impl Db {
             .and_then(|j| serde_json::from_str::<serde_json::Value>(&j).ok())
             .filter(|v| v.get("session").and_then(|s| s.as_str()) == Some(session_id))
             .and_then(|v| serde_json::from_value(v.get("usage")?.clone()).ok()))
+    }
+
+    /// Keep the stage's current context reading for its resumed run (read
+    /// back by [`Self::get_stage_resume_context`]); called before the reset
+    /// that clears `context_tokens`. NULL when it has none.
+    pub fn keep_stage_resume_context(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_context_tokens = context_tokens WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_resume_context(&self, stage_id: &str) -> AppResult<Option<u64>> {
+        let tokens: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT resume_context_tokens FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(tokens.and_then(|t| u64::try_from(t).ok()))
     }
 
     pub fn get_stage_resume_prior_cost(&self, stage_id: &str) -> AppResult<f64> {
