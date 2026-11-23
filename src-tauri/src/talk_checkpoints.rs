@@ -33,7 +33,6 @@ use std::collections::{BTreeSet, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 pub const REF_ROOT: &str = "refs/octopush/talk";
@@ -58,8 +57,6 @@ impl Budget {
     pub const DEFAULT: Budget =
         Budget { files: 5_000, bytes: 200 * 1024 * 1024, timeout: Duration::from_secs(20) };
 }
-
-static IDX_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn git_cmd(ws: &Path, index: Option<&Path>, args: &[&str]) -> Command {
     let mut cmd = Command::new("git");
@@ -181,40 +178,30 @@ fn sensitive(path: &str) -> bool {
     crate::secret_scan::is_sensitive_name(path)
 }
 
-/// A temp index path that is removed when dropped.
-struct TempIndex(PathBuf);
+/// A private scratch directory: an unpredictable name, created readable by
+/// the user only (`tempfile`), removed with everything in it when dropped.
+fn private_dir() -> AppResult<tempfile::TempDir> {
+    Ok(tempfile::Builder::new().prefix("octopush-talk-").tempdir()?)
+}
+
+/// A temporary git index inside its own private directory. `.0` is the
+/// index path; it doesn't exist until git writes it.
+struct TempIndex(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 impl TempIndex {
-    fn new() -> Self {
-        let seq = IDX_SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("octopush-talk-idx-{}-{}", std::process::id(), seq));
-        let _ = std::fs::remove_file(&p);
-        TempIndex(p)
+    fn new() -> AppResult<Self> {
+        let dir = private_dir()?;
+        Ok(TempIndex(dir.path().join("index"), dir))
     }
 }
 
-impl Drop for TempIndex {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-/// A scratch directory that is removed when dropped.
-struct TempDir(PathBuf);
+/// A private scratch work tree. `.0` is its path.
+struct TempDir(PathBuf, #[allow(dead_code)] tempfile::TempDir);
 
 impl TempDir {
     fn new() -> AppResult<Self> {
-        let seq = IDX_SEQ.fetch_add(1, Ordering::Relaxed);
-        let p = std::env::temp_dir().join(format!("octopush-talk-rules-{}-{}", std::process::id(), seq));
-        let _ = std::fs::remove_dir_all(&p);
-        std::fs::create_dir_all(&p)?;
-        Ok(TempDir(p))
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+        let dir = private_dir()?;
+        Ok(TempDir(dir.path().to_path_buf(), dir))
     }
 }
 
@@ -315,7 +302,7 @@ pub fn snapshot(ws: &Path) -> AppResult<String> {
 /// is refused leaves no objects behind.
 pub fn snapshot_with(ws: &Path, budget: &Budget) -> AppResult<String> {
     let deadline = Some(Instant::now() + budget.timeout);
-    let idx = TempIndex::new();
+    let idx = TempIndex::new()?;
     let head = git(ws, None, &["rev-parse", "--verify", "-q", "HEAD"])?;
     let head = head
         .status
@@ -671,7 +658,8 @@ pub struct RewindPreview {
 pub struct Untouched {
     pub path: String,
     /// `ignored` (git-ignored now or at the destination), `sensitive` (a
-    /// name the Secret guard protects), `exists` (something the current
+    /// name the Secret guard protects: such a file is in no snapshot, so it
+    /// is listed when it is tracked and differs from the last commit), `exists` (something the current
     /// snapshot doesn't hold is on disk there), `unchecked` (its ignore
     /// status couldn't be established) or `failed` (it couldn't be removed).
     pub reason: &'static str,
@@ -746,7 +734,7 @@ fn protected_paths(ws: &Path, target: &str, paths: &[String]) -> AppResult<(Hash
         .collect();
     if !rules.is_empty() {
         let scratch = TempDir::new()?;
-        let idx = TempIndex::new();
+        let idx = TempIndex::new()?;
         stdout_ok(git(ws, Some(&idx.0), &["read-tree", target])?, "read-tree")?;
         let prefix = format!("--prefix={}/", scratch.0.display());
         bytes_ok(
@@ -904,7 +892,29 @@ fn plan(ws: &Path, current: &str, target: &str) -> AppResult<Plan> {
         }
     }
     plan.untouched.append(&mut blocked);
+    // Sensitive-named files are in no snapshot, so a change to one never
+    // shows in the diff above. A tracked one that differs from the last
+    // commit is reported all the same: the rewind can't put it back, and
+    // must not pass over it in silence.
+    for path in changed_sensitive(ws) {
+        if !plan.untouched.iter().any(|u| u.path == path) {
+            plan.untouched.push(Untouched { path, reason: "sensitive" });
+        }
+    }
     Ok(plan)
+}
+
+/// The tracked, sensitive-named files whose content on disk differs from
+/// HEAD (edited, staged or deleted). Git compares them in memory: nothing
+/// is stored. Empty when there is no commit yet or git can't say.
+fn changed_sensitive(ws: &Path) -> Vec<String> {
+    let Ok(out) = git(ws, None, &["diff", "--name-only", "-z", "--no-renames", "HEAD", "--"]) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    split_z(&out.stdout).into_iter().filter(|p| sensitive(p)).collect()
 }
 
 /// What rewinding to the checkpoint of `message_id` would change, against
@@ -1001,10 +1011,11 @@ fn apply(ws: &Path, target: &str, plan: Plan) -> (usize, Vec<Untouched>, Option<
             untouched.push(Untouched { path, reason: "exists" });
         }
     }
-    let idx = TempIndex::new();
-    let written = stdout_ok_res(git(ws, Some(&idx.0), &["read-tree", target]), "read-tree")
-        .and_then(|_| checkout(ws, &idx.0, &creates, false))
-        .and_then(|_| checkout(ws, &idx.0, &rewrites, true));
+    let written = TempIndex::new().and_then(|idx| {
+        stdout_ok_res(git(ws, Some(&idx.0), &["read-tree", target]), "read-tree")
+            .and_then(|_| checkout(ws, &idx.0, &creates, false))
+            .and_then(|_| checkout(ws, &idx.0, &rewrites, true))
+    });
     match written {
         Ok(()) => (changed + creates.len() + rewrites.len(), untouched, None),
         Err(e) => (changed, untouched, Some(e)),

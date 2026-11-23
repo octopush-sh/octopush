@@ -335,6 +335,13 @@ describe("Talk rewind & fork (#958)", () => {
     expect(bar.className).toMatch(hidden);
   });
 
+  it("keeps a seed the composer hasn't taken yet when another fork follows", async () => {
+    await mount();
+    useChatStore.setState({ composerSeedByWs: { "ws-1": "an earlier seed" } });
+    await useChatStore.getState().forkThread("ws-1", "t1", 3);
+    expect(useChatStore.getState().takeComposerSeed("ws-1")).toBe("an earlier seed\n\nMake it stream");
+  });
+
   it("forks into a new thread whose composer takes the turn's text once", async () => {
     await mount();
     fireEvent.click(screen.getAllByRole("button", { name: "Fork from here" })[1]);

@@ -42,6 +42,7 @@ pub mod talk_checkpoints;
 pub mod talk_shell;
 pub mod workspace;
 pub mod workspace_setup;
+pub mod worktree_share;
 pub mod mission;
 pub mod template;
 pub mod theme;
@@ -57,6 +58,7 @@ pub mod routines;
 pub mod git_lock;
 pub mod mcp_setup;
 pub mod readiness;
+pub mod request_context;
 
 #[cfg(test)]
 mod tests;
@@ -232,6 +234,8 @@ pub fn run() {
             commands::create_workspace,
             commands::set_project_setup_script,
             commands::conductor_setup_script,
+            commands::share_with_missions,
+            commands::set_share_with_missions,
             commands::list_workspaces,
             commands::delete_workspace,
             commands::archive_workspace,
@@ -337,6 +341,7 @@ pub fn run() {
             commands::reprice_spend,
             commands::get_thread_cost,
             commands::get_session_usage,
+            commands::get_request_context,
             commands::continue_subagent,
             commands::respond_subagent_cap,
             commands::pending_subagent_caps,

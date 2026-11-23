@@ -65,7 +65,7 @@ export const UNTOUCHED_LABEL: Record<UntouchedReason, string> = {
 
 export const UNTOUCHED_TITLE: Record<UntouchedReason, string> = {
   ignored: "Git-ignored now or at that turn, so the rewind doesn't write or remove it",
-  sensitive: "Its name marks it as sensitive (an env file, a key), so it is never stored or rewound",
+  sensitive: "Its name marks it as sensitive (an env file, a key), so it is never stored and a rewind can't put it back. It differs from your last commit",
   exists: "Something the snapshot of your files doesn't hold is on disk at this path, so it isn't replaced",
   unchecked: "Its ignore status couldn't be established, so it is left as it is",
   failed: "It couldn't be removed",

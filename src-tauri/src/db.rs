@@ -468,6 +468,12 @@ impl Db {
             &self.conn,
             "ALTER TABLE projects ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''",
         )?;
+        // What new missions borrow from the main checkout (#961): a JSON
+        // `worktree_share::ShareSpec`, '' for nothing (opt-in).
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
+        )?;
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE workspaces ADD COLUMN linked_issue_key TEXT",
@@ -2499,6 +2505,30 @@ impl Db {
         self.conn.execute(
             "UPDATE projects SET setup_script = ?1 WHERE id = ?2",
             params![script, id],
+        )?;
+        Ok(())
+    }
+
+    /// What the project shares with new missions (nothing when unset, or no
+    /// such project). Read leniently and sanitized.
+    pub fn get_project_share(&self, id: &str) -> AppResult<crate::worktree_share::ShareSpec> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT share_with_missions FROM projects WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(crate::worktree_share::ShareSpec::from_stored(&raw.unwrap_or_default()))
+    }
+
+    pub fn set_project_share(&self, id: &str, spec: &crate::worktree_share::ShareSpec) -> AppResult<()> {
+        let spec = spec.sanitized();
+        let raw = if spec.is_empty() { String::new() } else { serde_json::to_string(&spec).unwrap_or_default() };
+        self.conn.execute(
+            "UPDATE projects SET share_with_missions = ?1 WHERE id = ?2",
+            params![raw, id],
         )?;
         Ok(())
     }

@@ -34,6 +34,11 @@ pub const TERMINAL_LABEL: &str = "setup";
 /// Env var the runner reads the script from (unset before the script runs).
 pub const SCRIPT_ENV: &str = "OCTOPUSH_SETUP_SCRIPT";
 
+/// Env var carrying what the mission borrowed from the main checkout
+/// (`worktree_share::ShareOutcome::summary`), printed under the runner's first
+/// line; unset before the script runs.
+pub const SHARED_ENV: &str = "OCTOPUSH_SETUP_SHARED";
+
 /// Conductor's variables, as its setup scripts read them.
 pub const CONDUCTOR_ROOT_PATH: &str = "CONDUCTOR_ROOT_PATH";
 pub const CONDUCTOR_WORKSPACE_PATH: &str = "CONDUCTOR_WORKSPACE_PATH";
@@ -61,9 +66,11 @@ script="$OCTOPUSH_SETUP_SCRIPT"
 c_root="$OCTOPUSH_CONDUCTOR_ROOT_PATH"
 c_path="$OCTOPUSH_CONDUCTOR_WORKSPACE_PATH"
 c_name="$OCTOPUSH_CONDUCTOR_WORKSPACE_NAME"
-unset OCTOPUSH_SETUP_SCRIPT OCTOPUSH_CONDUCTOR_ROOT_PATH OCTOPUSH_CONDUCTOR_WORKSPACE_PATH OCTOPUSH_CONDUCTOR_WORKSPACE_NAME
+shared="$OCTOPUSH_SETUP_SHARED"
+unset OCTOPUSH_SETUP_SCRIPT OCTOPUSH_CONDUCTOR_ROOT_PATH OCTOPUSH_CONDUCTOR_WORKSPACE_PATH OCTOPUSH_CONDUCTOR_WORKSPACE_NAME OCTOPUSH_SETUP_SHARED
 trap : INT
 printf '\033[2m· setup · %s\033[0m\n' "$PWD"
+if [ -n "$shared" ]; then printf '\033[2m· %s\033[0m\n' "$shared"; fi
 (
   # Conductor's variables, for the script only, unless the user exports them.
   if [ -n "$c_root" ] && [ -z "${CONDUCTOR_ROOT_PATH+set}" ]; then export CONDUCTOR_ROOT_PATH="$c_root"; fi
@@ -302,6 +309,7 @@ mod tests {
     fn runner_osc_matches_the_constant() {
         assert!(RUNNER.contains(&format!("\\033]{EXIT_OSC};exit=%d\\007")));
         assert!(RUNNER.contains(SCRIPT_ENV));
+        assert!(RUNNER.contains(SHARED_ENV));
         for var in [CONDUCTOR_ROOT_ENV, CONDUCTOR_WORKSPACE_PATH_ENV, CONDUCTOR_WORKSPACE_NAME_ENV] {
             assert!(RUNNER.contains(var), "{var}");
         }
@@ -578,6 +586,28 @@ mod tests {
         assert!(stdout.contains("setup failed · exit 3"), "{stdout}");
         assert!(stdout.contains("\x1b]6973;exit=3\x07"), "{stdout}");
         assert!(cwd.path().join("made-here").exists());
+    }
+
+    /// What the mission borrowed shows under the first line; the script never
+    /// sees the variable it came in.
+    #[cfg(unix)]
+    #[test]
+    fn runner_prints_what_was_shared() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let runner = ensure_runner(dir.path()).unwrap();
+        let cwd = tempfile::TempDir::new().unwrap();
+        let out = std::process::Command::new(&runner)
+            .arg("-l")
+            .current_dir(cwd.path())
+            .env("SHELL", "/bin/sh")
+            .env(SCRIPT_ENV, "echo \"[${OCTOPUSH_SETUP_SHARED:-unset}]\"")
+            .env(SHARED_ENV, "linked node_modules · copied .env")
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("· linked node_modules · copied .env"), "{stdout}");
+        assert!(stdout.contains("[unset]"), "{stdout}");
     }
 
     /// The runner hands the script Conductor's variables, keeps any the user
