@@ -3628,7 +3628,7 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),

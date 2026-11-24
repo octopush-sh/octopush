@@ -6170,7 +6170,7 @@ pub async fn ensure_pr_branch(
 
     let _guard = crate::git_lock::git_lock(&path).await;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = crate::github::pr_fetch_command(number, &head_ref_name);
+    let cmd = crate::github::pr_fetch_command(number, &head_ref_name)?;
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(&path)
@@ -6540,6 +6540,23 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
     Ok(parse_open_pr_list(&values))
 }
 
+/// The login-shell command `push_branch` runs for `branch`. The branch is
+/// single-quoted with `git_ops::quote_git_ref`, so it must pass
+/// `git_ops::is_git_ref_arg` first (a branch git lets exist, like `-x`, is
+/// refused before a shell runs, without echoing the name).
+pub fn push_command(branch: &str) -> AppResult<String> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return Err(AppError::Other(
+            "cannot push: the current branch isn't a valid branch name.".into(),
+        ));
+    }
+    Ok(format!(
+        "git push --set-upstream {} {} 2>&1",
+        crate::secret_scan::PUSH_REMOTE,
+        crate::git_ops::quote_git_ref(branch)
+    ))
+}
+
 /// Push the current branch to `origin` (creating it on the remote if needed,
 /// and tracking it, via `--set-upstream`). Uses the login shell so SSH agents, the
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
@@ -6575,11 +6592,7 @@ pub async fn push_branch(workspace_path: String, allow_findings: Option<String>)
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!(
-        "git push --set-upstream {} {} 2>&1",
-        crate::secret_scan::PUSH_REMOTE,
-        crate::git_ops::quote_git_ref(&branch)
-    );
+    let cmd = push_command(&branch)?;
 
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
