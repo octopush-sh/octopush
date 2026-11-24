@@ -224,9 +224,7 @@ pub fn configured_url() -> Option<reqwest::Url> {
     // their webhook): only a test that points the settings at a temp file
     // gets an answer.
     #[cfg(test)]
-    if crate::settings::test_settings_path::get().is_none() {
-        return None;
-    }
+    crate::settings::test_settings_path::get()?;
     let s = crate::settings::load_settings().ok()?;
     if !s.notify_elsewhere_enabled {
         return None;
@@ -633,7 +631,7 @@ mod tests {
         assert_eq!(seen.len(), 1);
         assert!(seen[0].head.starts_with("POST /hook "), "{}", seen[0].head);
         assert!(
-            seen[0].head.lines().any(|l| l.to_ascii_lowercase() == "content-type: application/json"),
+            seen[0].head.lines().any(|l| l.eq_ignore_ascii_case("content-type: application/json")),
             "{}",
             seen[0].head
         );
