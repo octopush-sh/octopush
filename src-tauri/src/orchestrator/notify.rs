@@ -16,12 +16,16 @@ use crate::orchestrator::live::RUN_LOG_EVENT;
 use super::Orchestrator;
 
 /// The event a "decision" park stands for, from the parked stage's row
-/// (pure). A failed stage halted the run; a stage awaiting its checkpoint
+/// (pure). A stage a Claude plan limit stopped waits for the director (its
+/// automatic resume is off, capped or used up, or the budget is spent) and
+/// is no failure, for a Routine either: it can still finish once resumed.
+/// Any other failed stage halted the run; a stage awaiting its checkpoint
 /// with questions asked the director; any other awaiting stage holds a gate
 /// (a checkpoint, a review loop's decision, a budget park, a secret hold). A
 /// Routine's failure is reported as the Routine's.
-pub(crate) fn park_event(stage_status: &str, asked: bool, routine: bool) -> Option<Event> {
+pub(crate) fn park_event(stage_status: &str, asked: bool, plan_limited: bool, routine: bool) -> Option<Event> {
     match stage_status {
+        "failed" if plan_limited => Some(Event::PlanLimit),
         "failed" if routine => Some(Event::RoutineFailed),
         "failed" => Some(Event::RunFailed),
         "awaiting_checkpoint" if asked => Some(Event::DirectorQuestion),
@@ -46,9 +50,10 @@ impl Orchestrator {
             .and_then(|stages| stages.into_iter().find(|s| s.id == stage_id));
         let Some(stage) = stage else { return };
         let asked = stage.blocked_questions.as_deref().is_some_and(|q| !q.trim().is_empty());
-        let routine = self.db.lock().is_routine_run(run_id).unwrap_or(false);
-        if let Some(event) = park_event(&stage.status, asked, routine) {
-            self.send_elsewhere(run_id, stage_id, event);
+        let plan_limited = stage.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_plan_limit);
+        let routine = self.db.lock().routine_name_for_run(run_id).ok().flatten();
+        if let Some(event) = park_event(&stage.status, asked, plan_limited, routine.is_some()) {
+            self.send_elsewhere(run_id, stage_id, event, routine);
         }
     }
 
@@ -58,9 +63,9 @@ impl Orchestrator {
         if notify_elsewhere::configured_url().is_none() {
             return;
         }
-        if !self.db.lock().is_routine_run(run_id).unwrap_or(false) {
+        let Some(routine) = self.db.lock().routine_name_for_run(run_id).ok().flatten() else {
             return;
-        }
+        };
         let last = self
             .db
             .lock()
@@ -68,14 +73,18 @@ impl Orchestrator {
             .ok()
             .and_then(|stages| stages.into_iter().max_by_key(|s| s.position));
         if let Some(stage) = last {
-            self.send_elsewhere(run_id, &stage.id, Event::RoutineFinished);
+            self.send_elsewhere(run_id, &stage.id, Event::RoutineFinished, Some(routine));
         }
     }
 
     /// Send `event` for this run in the background. A failure becomes one
-    /// quiet notice in the stage's journal; the run never waits for it.
-    fn send_elsewhere(&self, run_id: &str, stage_id: &str, event: Event) {
-        let (mission, project) = self.mission_and_project(run_id);
+    /// quiet notice in the stage's journal; the run never waits for it. For a
+    /// Routine's run, `mission` carries the Routine's name: a fresh-mode
+    /// Routine's workspace has no mission, and the name is what the director
+    /// knows the Routine by.
+    fn send_elsewhere(&self, run_id: &str, stage_id: &str, event: Event, routine: Option<String>) {
+        let (mission_title, project) = self.mission_and_project(run_id);
+        let mission = routine.filter(|r| !r.trim().is_empty()).unwrap_or(mission_title);
         let events = Arc::clone(&self.events);
         let (run, stage) = (run_id.to_string(), stage_id.to_string());
         notify_elsewhere::dispatch(notify_elsewhere::payload(event, &mission, &project), move |why| {
@@ -90,8 +99,9 @@ impl Orchestrator {
         });
     }
 
-    /// The names the message carries: the workspace's mission title and the
-    /// project's name. Nothing else about the run, its workspace or its repo.
+    /// The names the message carries: the workspace's mission title (the
+    /// start of its task) and the project's name. Nothing else about the run,
+    /// its workspace or its repo.
     fn mission_and_project(&self, run_id: &str) -> (String, String) {
         let db = self.db.lock();
         let Some(ws) = db
@@ -114,16 +124,27 @@ mod tests {
 
     #[test]
     fn each_park_maps_to_its_event() {
-        assert_eq!(park_event("awaiting_checkpoint", false, false), Some(Event::CheckpointGate));
-        assert_eq!(park_event("awaiting_checkpoint", true, false), Some(Event::DirectorQuestion));
-        assert_eq!(park_event("failed", false, false), Some(Event::RunFailed));
-        // A Routine's gate and question are the director's like any other;
-        // its failure is the Routine's.
-        assert_eq!(park_event("awaiting_checkpoint", false, true), Some(Event::CheckpointGate));
-        assert_eq!(park_event("awaiting_checkpoint", true, true), Some(Event::DirectorQuestion));
-        assert_eq!(park_event("failed", false, true), Some(Event::RoutineFailed));
+        // (status, asked, plan limited, routine) → event
+        let rows = [
+            ("awaiting_checkpoint", false, false, false, Some(Event::CheckpointGate)),
+            ("awaiting_checkpoint", true, false, false, Some(Event::DirectorQuestion)),
+            ("failed", false, false, false, Some(Event::RunFailed)),
+            // A plan limit that waits for the director is no failure.
+            ("failed", false, true, false, Some(Event::PlanLimit)),
+            // A Routine's gate and question are the director's like any
+            // other; its plan limit is a wait, not "Routine failed" (it can
+            // still finish once resumed); any other failure is the Routine's.
+            ("awaiting_checkpoint", false, false, true, Some(Event::CheckpointGate)),
+            ("awaiting_checkpoint", true, false, true, Some(Event::DirectorQuestion)),
+            ("failed", false, true, true, Some(Event::PlanLimit)),
+            ("failed", false, false, true, Some(Event::RoutineFailed)),
+        ];
+        for (status, asked, plan, routine, want) in rows {
+            assert_eq!(park_event(status, asked, plan, routine), want, "{status} {asked} {plan} {routine}");
+        }
         for quiet in ["pending", "running", "done", ""] {
-            assert_eq!(park_event(quiet, false, false), None, "{quiet}");
+            assert_eq!(park_event(quiet, false, false, false), None, "{quiet}");
+            assert_eq!(park_event(quiet, false, true, true), None, "{quiet}");
         }
     }
 }

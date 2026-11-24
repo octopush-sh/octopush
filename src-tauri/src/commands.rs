@@ -5111,7 +5111,7 @@ pub async fn notify_elsewhere_test(url: String) -> AppResult<()> {
     crate::notify_elsewhere::send_test(&url).await.map_err(AppError::Other)
 }
 
-/// The read-only preview in Settings: the exact body for a checkpoint gate
+/// The read-only preview in Settings: the body's fields for a checkpoint gate
 /// and every `event` value.
 #[tauri::command]
 pub async fn notify_elsewhere_preview() -> AppResult<crate::notify_elsewhere::Preview> {

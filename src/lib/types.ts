@@ -774,7 +774,7 @@ export interface NotifyElsewherePayload {
   event: string;
 }
 
-/** The Settings preview: the exact body for a checkpoint gate (sample names)
+/** The Settings preview: the body's fields for a checkpoint gate (sample names)
  *  and every `event` value with its label. */
 export interface NotifyElsewherePreview {
   payload: NotifyElsewherePayload;

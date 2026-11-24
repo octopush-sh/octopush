@@ -4,12 +4,17 @@
 //! **Off by default.** Once the user saves a URL and turns it on (Settings ›
 //! General › Attention), Octopush POSTs one small JSON body to that URL when
 //! a crew waits at a checkpoint gate, a stage asks the director a question, a
-//! crew run fails, or a Routine's run finishes or fails. The body is built by
-//! [`payload`] alone and carries exactly five keys: `text` and `content` (the
-//! same string, for Slack/ntfy and for Discord), `mission`, `project` and
-//! `event`. The text is a fixed label plus the mission and project names,
-//! never the question, code, diffs, prompts, agent output, paths, branches or
-//! a repository URL.
+//! Claude plan limit holds a crew for the director, a crew run fails, or a
+//! Routine's run finishes or fails. The body is built by [`payload`] alone and
+//! carries exactly five keys: `text` and `content` (the same string, for
+//! Slack-style and Discord-style incoming webhooks), `mission`, `project` and
+//! `event`. The text is a fixed label plus the mission's title (the start of
+//! its task; a Routine's name for a Routine's run) and the project's name.
+//! Never code, diffs, the crew's questions, agent output, file paths or a
+//! repository URL.
+//!
+//! Delivery is at least once: a retry after a timeout can deliver a message
+//! twice if the first attempt did arrive.
 //!
 //! The rules the sender keeps:
 //! - the URL is `https`, or `http` only to this Mac (`localhost`, `127.0.0.1`,
@@ -43,8 +48,12 @@ pub const RETRY_DELAY: Duration = Duration::from_secs(2);
 pub const FLUSH_MAX: Duration = Duration::from_secs(15);
 /// Longest URL accepted.
 pub const URL_MAX_LEN: usize = 2048;
-/// A mission or project name is cut to this many characters.
+/// A mission or project name is cut to this many characters, so the whole
+/// body stays under [`BODY_MAX_BYTES`] whatever the names hold.
 pub const NAME_MAX_CHARS: usize = 80;
+/// The most a body can weigh: three names of 80 four-byte characters, twice
+/// in the text, fit with room to spare.
+pub const BODY_MAX_BYTES: usize = 4096;
 /// The names in the Settings preview and in the test message.
 pub const SAMPLE_MISSION: &str = "Example mission";
 pub const SAMPLE_PROJECT: &str = "Example project";
@@ -57,6 +66,10 @@ pub enum Event {
     CheckpointGate,
     /// A stage asked the director a question (`ask_director`).
     DirectorQuestion,
+    /// A Claude plan limit stopped a stage and the run now waits for the
+    /// director (no automatic resume, or it ran out). A park that resumes
+    /// on its own sends nothing.
+    PlanLimit,
     /// A stage failed and halted a crew run.
     RunFailed,
     /// A Routine's run completed.
@@ -68,9 +81,10 @@ pub enum Event {
 }
 
 impl Event {
-    pub const ALL: [Event; 6] = [
+    pub const ALL: [Event; 7] = [
         Event::CheckpointGate,
         Event::DirectorQuestion,
+        Event::PlanLimit,
         Event::RunFailed,
         Event::RoutineFinished,
         Event::RoutineFailed,
@@ -82,6 +96,7 @@ impl Event {
         match self {
             Event::CheckpointGate => "checkpoint_gate",
             Event::DirectorQuestion => "director_question",
+            Event::PlanLimit => "plan_limit",
             Event::RunFailed => "run_failed",
             Event::RoutineFinished => "routine_finished",
             Event::RoutineFailed => "routine_failed",
@@ -94,6 +109,7 @@ impl Event {
         match self {
             Event::CheckpointGate => "Checkpoint gate waiting",
             Event::DirectorQuestion => "Question waiting for you",
+            Event::PlanLimit => "Claude plan limit, waiting for you",
             Event::RunFailed => "Crew run failed",
             Event::RoutineFinished => "Routine finished",
             Event::RoutineFailed => "Routine failed",
@@ -128,19 +144,26 @@ pub fn payload(event: Event, mission: &str, project: &str) -> Payload {
     Payload { content: text.clone(), text, mission, project, event: event.token() }
 }
 
-/// A name as it goes into the body: whitespace (newlines included) collapsed
-/// to single spaces, control characters dropped, `<`, `>` and `@` swapped for
-/// look-alikes so a name can never mention a whole channel (Slack's
-/// `<!channel>`, Discord's `@everyone`), and cut to [`NAME_MAX_CHARS`].
+/// A name as it goes into the body: bidi controls and zero-width characters
+/// dropped (a name can't reorder or hide what the receiver shows), other
+/// control characters dropped, whitespace (newlines included) collapsed to
+/// single spaces, `<` `>` `@` `[` `]` swapped for look-alikes so a name can
+/// never mention a whole channel (Slack's `<!channel>`, Discord's
+/// `@everyone`) or turn into a Markdown link, and cut to [`NAME_MAX_CHARS`].
 pub fn clean_name(raw: &str) -> String {
-    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let visible: String = raw
+        .chars()
+        .filter(|&c| !is_invisible(c) && (!c.is_control() || c.is_whitespace()))
+        .collect();
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
     let cleaned: String = collapsed
         .chars()
-        .filter(|c| !c.is_control())
         .map(|c| match c {
             '<' => '‹',
             '>' => '›',
             '@' => '＠',
+            '[' => '［',
+            ']' => '］',
             other => other,
         })
         .collect();
@@ -177,6 +200,15 @@ pub fn validate_url(raw: &str) -> Result<reqwest::Url, String> {
         "http" => Err("Use an https:// URL. Plain http:// works only to this Mac (localhost or 127.0.0.1).".into()),
         _ => Err("Use an https:// URL.".into()),
     }
+}
+
+/// Bidi embedding, override and isolate controls, the Arabic letter mark,
+/// zero-width characters and the byte-order mark.
+fn is_invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200B}'..='\u{200F}' | '\u{2060}' | '\u{FEFF}' | '\u{061C}'
+    )
 }
 
 fn is_this_mac(host: &str) -> bool {
@@ -358,7 +390,7 @@ pub struct EventInfo {
     pub label: &'static str,
 }
 
-/// The read-only preview in Settings: the exact body for a checkpoint gate
+/// The read-only preview in Settings: the body's fields for a checkpoint gate
 /// (sample names), and every `event` value with its label.
 #[derive(Serialize, Clone, Debug)]
 pub struct Preview {
@@ -485,7 +517,15 @@ mod tests {
         let tokens: Vec<&str> = Event::ALL.iter().map(|e| e.token()).collect();
         assert_eq!(
             tokens,
-            ["checkpoint_gate", "director_question", "run_failed", "routine_finished", "routine_failed", "test"]
+            [
+                "checkpoint_gate",
+                "director_question",
+                "plan_limit",
+                "run_failed",
+                "routine_finished",
+                "routine_failed",
+                "test"
+            ]
         );
         for e in Event::ALL {
             let body = payload(e, "M", "P");
@@ -495,6 +535,7 @@ mod tests {
         }
         assert_eq!(Event::DirectorQuestion.label(), "Question waiting for you");
         assert_eq!(Event::RoutineFailed.label(), "Routine failed");
+        assert_eq!(Event::PlanLimit.label(), "Claude plan limit, waiting for you");
     }
 
     #[test]
@@ -511,9 +552,40 @@ mod tests {
         let cut = clean_name(&long);
         assert_eq!(cut.chars().count(), NAME_MAX_CHARS);
         assert!(cut.ends_with('…'));
-        // The whole body stays tiny, whatever the names.
-        let big = serde_json::to_string(&payload(Event::RoutineFinished, &long, &long)).unwrap();
-        assert!(big.len() < 1024, "{} bytes", big.len());
+    }
+
+    #[test]
+    fn names_keep_their_letters_and_lose_invisible_and_markup_characters() {
+        // Non-ASCII names pass through as written.
+        for name in ["Añadir modo oscuro", "ダークモードを追加", "Dark mode 🌙", "Ünïcødé · ok"] {
+            assert_eq!(clean_name(name), name);
+        }
+        // Bidi controls, zero-width characters and the BOM are dropped, so a
+        // name can't reorder or hide what the receiver shows.
+        assert_eq!(clean_name("abc\u{202E}fed\u{202C}"), "abcfed");
+        assert_eq!(clean_name("pay\u{2066}lo\u{2069}ad"), "payload");
+        assert_eq!(clean_name("a\u{200B}b\u{200C}c\u{200D}d\u{200E}e\u{200F}f"), "abcdef");
+        assert_eq!(clean_name("\u{FEFF}start\u{061C}"), "start");
+        assert_eq!(clean_name("a \u{200B} b"), "a b", "collapsed after the strip");
+        // No Markdown link can ride on a name.
+        let linked = clean_name("[Open](https://example.com)");
+        assert!(!linked.contains('[') && !linked.contains(']'), "{linked}");
+        assert_eq!(linked, "［Open］(https://example.com)");
+    }
+
+    #[test]
+    fn the_body_stays_under_its_bound_for_the_worst_names() {
+        // 80 four-byte characters per name is the heaviest a name can be;
+        // quotes and backslashes are escaped to two bytes, lighter still.
+        for worst in ["🌙".repeat(500), "\"".repeat(500), "\\".repeat(500), "ダ".repeat(500)] {
+            for e in Event::ALL {
+                let wire = serde_json::to_string(&payload(e, &worst, &worst)).unwrap();
+                assert!(wire.len() < BODY_MAX_BYTES, "{} bytes for {:?}", wire.len(), e);
+            }
+        }
+        // An ordinary body is a few hundred bytes.
+        let usual = serde_json::to_string(&payload(Event::CheckpointGate, "Add dark mode", "acme-web")).unwrap();
+        assert!(usual.len() < 512, "{} bytes", usual.len());
     }
 
     #[test]

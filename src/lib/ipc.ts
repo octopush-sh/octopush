@@ -1237,7 +1237,7 @@ export const ipc = {
   /** "Send a test": the test message to `url` (saved or not), once. Rejects
    *  with the cause, never the URL. */
   notifyElsewhereTest: (url: string) => invoke<void>("notify_elsewhere_test", { url }),
-  /** The exact body for a checkpoint gate, and every `event` value. */
+  /** The body's fields for a checkpoint gate, and every `event` value. */
   notifyElsewherePreview: () => invoke<NotifyElsewherePreview>("notify_elsewhere_preview"),
   // ─── Updater (channels + launch alert) ─────────────────────────
   /** The persisted update channel (`stable` by default). */

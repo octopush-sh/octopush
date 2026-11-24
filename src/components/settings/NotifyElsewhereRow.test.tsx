@@ -19,7 +19,13 @@ vi.mock("../../lib/ipc", () => ({
   },
 }));
 
-import { NotifyElsewhereRow, NOTIFY_LABEL, NOTIFY_HELP, notifyErrorText } from "./NotifyElsewhereRow";
+import {
+  NotifyElsewhereRow,
+  NOTIFY_LABEL,
+  NOTIFY_HELP,
+  NOTIFY_URL_PLACEHOLDER,
+  notifyErrorText,
+} from "./NotifyElsewhereRow";
 
 /** What the backend's `notify_elsewhere::preview()` answers. */
 const TEXT = "Octopush · Checkpoint gate waiting · Example mission · Example project";
@@ -34,6 +40,7 @@ const PREVIEW = {
   events: [
     { event: "checkpoint_gate", label: "Checkpoint gate waiting" },
     { event: "director_question", label: "Question waiting for you" },
+    { event: "plan_limit", label: "Claude plan limit, waiting for you" },
     { event: "run_failed", label: "Crew run failed" },
     { event: "routine_finished", label: "Routine finished" },
     { event: "routine_failed", label: "Routine failed" },
@@ -41,7 +48,7 @@ const PREVIEW = {
   ],
 };
 
-const HOOK = "https://ntfy.sh/crew-alerts";
+const HOOK = "https://hooks.example.com/services/T0/B0/crew";
 
 beforeEach(() => {
   getNotifyElsewhere.mockReset().mockResolvedValue({ enabled: false, url: "" });
@@ -78,9 +85,13 @@ describe("NotifyElsewhereRow — off by default", () => {
   it("says what it sends and what it never sends", async () => {
     await renderRow();
     expect(screen.getByText(NOTIFY_HELP)).toBeInTheDocument();
-    expect(NOTIFY_HELP).toContain("the mission name and the project name");
-    expect(NOTIFY_HELP).toContain("never code, diffs, prompts, questions or agent output");
-    expect(NOTIFY_HELP).toContain("Off until you turn it on");
+    expect(NOTIFY_HELP).toContain(
+      "It carries a fixed label, the project's name and the mission's title (the start of its task), never code, diffs, questions or agent output. Off until you turn it on; Send a test posts one test message either way.",
+    );
+    expect(NOTIFY_HELP).toContain("a Slack or Discord incoming webhook, or any endpoint that accepts JSON");
+    expect(NOTIFY_HELP).not.toContain("ntfy");
+    expect(field()).toHaveAttribute("placeholder", NOTIFY_URL_PLACEHOLDER);
+    expect(NOTIFY_URL_PLACEHOLDER).toBe("https://hooks.example.com/…");
     expect(document.querySelector('[data-tour="settings-notify-elsewhere"]')).not.toBeNull();
   });
 
@@ -100,20 +111,61 @@ describe("NotifyElsewhereRow — saving", () => {
     await act(async () => {
       fireEvent.blur(field());
     });
-    expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, HOOK);
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, HOOK));
     expect(toggle()).toHaveAttribute("aria-checked", "false");
     expect(toggle()).not.toBeDisabled();
+    await waitFor(() => expect(screen.getByTestId("notify-elsewhere-saved")).toHaveTextContent("Saved"));
 
     await act(async () => {
       fireEvent.click(toggle());
     });
-    expect(setNotifyElsewhere).toHaveBeenLastCalledWith(true, HOOK);
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenLastCalledWith(true, HOOK));
     expect(toggle()).toHaveAttribute("aria-checked", "true");
 
     await act(async () => {
       fireEvent.click(toggle());
     });
-    expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, HOOK);
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, HOOK));
+    expect(toggle()).toHaveAttribute("aria-checked", "false");
+  });
+
+  it("turns on in one click right after a URL is typed", async () => {
+    // Real browsers blur the field on the press, so the URL saves first and
+    // the switch's save runs after it, never dropped.
+    let release: () => void = () => {};
+    setNotifyElsewhere.mockImplementationOnce(
+      (enabled: boolean, url: string) =>
+        new Promise((resolve) => {
+          release = () => resolve({ enabled, url });
+        }),
+    );
+    await renderRow();
+    fireEvent.change(field(), { target: { value: HOOK } });
+    await act(async () => {
+      fireEvent.blur(field());
+      fireEvent.click(toggle());
+    });
+    expect(toggle()).toHaveAttribute("aria-checked", "true");
+    await act(async () => {
+      release();
+    });
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenCalledTimes(2));
+    expect(setNotifyElsewhere.mock.calls).toEqual([
+      [false, HOOK],
+      [true, HOOK],
+    ]);
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "true"));
+  });
+
+  it("a refused switch goes back to what is stored", async () => {
+    getNotifyElsewhere.mockResolvedValue({ enabled: false, url: HOOK });
+    setNotifyElsewhere.mockRejectedValue("other: Your change wasn't saved: settings.json couldn't be read.");
+    await renderRow();
+    await waitFor(() => expect(toggle()).not.toBeDisabled());
+    await act(async () => {
+      fireEvent.click(toggle());
+    });
+    await waitFor(() => expect(screen.getByTestId("notify-elsewhere-error")).toBeInTheDocument());
     expect(toggle()).toHaveAttribute("aria-checked", "false");
   });
 
@@ -125,11 +177,11 @@ describe("NotifyElsewhereRow — saving", () => {
       fireEvent.blur(field());
     });
     expect(setNotifyElsewhere).not.toHaveBeenCalled();
-    fireEvent.change(field(), { target: { value: "https://ntfy.sh/other" } });
+    fireEvent.change(field(), { target: { value: "https://hooks.example.com/other" } });
     await act(async () => {
       fireEvent.keyDown(field(), { key: "Enter" });
     });
-    expect(setNotifyElsewhere).toHaveBeenLastCalledWith(true, "https://ntfy.sh/other");
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenLastCalledWith(true, "https://hooks.example.com/other"));
   });
 
   it("clearing the URL turns it off", async () => {
@@ -140,8 +192,8 @@ describe("NotifyElsewhereRow — saving", () => {
     await act(async () => {
       fireEvent.blur(field());
     });
-    expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, "");
-    expect(toggle()).toHaveAttribute("aria-checked", "false");
+    await waitFor(() => expect(setNotifyElsewhere).toHaveBeenLastCalledWith(false, ""));
+    await waitFor(() => expect(toggle()).toHaveAttribute("aria-checked", "false"));
   });
 
   it("shows the backend's refusal and keeps the saved state", async () => {
@@ -155,6 +207,7 @@ describe("NotifyElsewhereRow — saving", () => {
     await act(async () => {
       fireEvent.blur(field());
     });
+    await waitFor(() => expect(screen.getByTestId("notify-elsewhere-error")).toBeInTheDocument());
     expect(screen.getByTestId("notify-elsewhere-error")).toHaveTextContent(
       "Use an https:// URL. Plain http:// works only to this Mac (localhost or 127.0.0.1).",
     );
@@ -216,8 +269,9 @@ describe("NotifyElsewhereRow — the payload preview", () => {
     const shown = JSON.parse(pre.textContent ?? "");
     expect(shown).toEqual(PREVIEW.payload);
     expect(Object.keys(shown)).toEqual(["text", "content", "mission", "project", "event"]);
+    expect(toggleButton).toHaveTextContent("The message's fields");
     expect(screen.getByTestId("notify-elsewhere-events")).toHaveTextContent(
-      "checkpoint_gate, director_question, run_failed, routine_finished, routine_failed, test",
+      "checkpoint_gate, director_question, plan_limit, run_failed, routine_finished, routine_failed, test",
     );
   });
 

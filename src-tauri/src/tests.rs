@@ -10723,17 +10723,41 @@ mod orchestrator_tests {
             db.lock()
                 .insert_mission("m1", Some(ws), "p1", "build", "Add dark mode", "active", None, "worktree", "none", "{}")
                 .unwrap();
+            bare_crew(db, ws, checkpoint)
+        }
+
+        /// The same crew on a workspace with no mission (a fresh-mode
+        /// Routine's workspace has none).
+        fn bare_crew(db: &Arc<Mutex<Db>>, ws: &str, checkpoint: bool) -> (String, String) {
             let pid = db.lock().insert_pipeline("NE", "d", false).unwrap();
             db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", checkpoint, None, 0, None, 25).unwrap();
             let run_id = db.lock().create_run(ws, &pid, "PROMPT-TEXT-NEVER-SENT", None, None, &[]).unwrap();
             (pid, run_id)
         }
 
-        /// Make `run_id` the run a Routine fired.
+        /// Make `run_id` the run the Routine "Nightly ship" fired.
         fn fired_by_routine(db: &Arc<Mutex<Db>>, pid: &str, run_id: &str) {
             db.lock().insert_routine("r-ne", &routine_input(pid, "interval", "3600"), None, true).unwrap();
             db.lock().stamp_routine_run("r-ne", run_id, &chrono::Utc::now().to_rfc3339()).unwrap();
-            assert!(db.lock().is_routine_run(run_id).unwrap());
+            assert_eq!(db.lock().routine_name_for_run(run_id).unwrap().as_deref(), Some("Nightly ship"));
+        }
+
+        /// A runner whose stage stops on a Claude plan limit, with no
+        /// automatic resume scheduled: the run waits for the director.
+        struct PlanLimitedRunner;
+        #[async_trait::async_trait]
+        impl AgentRunner for PlanLimitedRunner {
+            async fn run(
+                &self,
+                _stage: &StageSpec,
+                _input: &StageInput,
+                _ctx: &StageContext,
+            ) -> crate::error::AppResult<StageOutcome> {
+                Err(crate::error::AppError::Other(format!(
+                    "Claude plan limit reached {}",
+                    crate::orchestrator::cli_runner::PLAN_LIMIT_MARKER
+                )))
+            }
         }
 
         fn sink() -> Arc<CollectingSink> {
@@ -10812,7 +10836,9 @@ mod orchestrator_tests {
             assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
             settle().await;
             assert_eq!(sent(&got), ["routine_finished"]);
-            assert_eq!(bodies(&got)[0]["text"], "Octopush · Routine finished · Add dark mode · P");
+            // A Routine's events carry its name, not the workspace's mission.
+            assert_eq!(bodies(&got)[0]["text"], "Octopush · Routine finished · Nightly ship · P");
+            assert_eq!(bodies(&got)[0]["mission"], "Nightly ship");
 
             let (db, ws) = db_with_workspace();
             let (pid, run_id) = crew(&db, &ws, false);
@@ -10821,6 +10847,42 @@ mod orchestrator_tests {
             assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
             settle().await;
             assert_eq!(sent(&got), ["routine_finished", "routine_failed"]);
+
+            // A fresh-mode Routine's workspace has no mission: the name still
+            // arrives.
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = bare_crew(&db, &ws, true);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished", "routine_failed", "checkpoint_gate"]);
+            assert_eq!(bodies(&got)[2]["mission"], "Nightly ship");
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_plan_limit_that_waits_for_the_director_is_no_failure() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            // A crew the director started.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(PlanLimitedRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["plan_limit"]);
+            assert_eq!(bodies(&got)[0]["text"], "Octopush · Claude plan limit, waiting for you · Add dark mode · P");
+
+            // A Routine's: a wait too, never "Routine failed" (it can still
+            // finish once the director resumes it).
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(PlanLimitedRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["plan_limit", "plan_limit"]);
             reset();
         }
 

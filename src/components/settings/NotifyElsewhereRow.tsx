@@ -3,18 +3,19 @@
 // default. The URL is saved (and validated by the backend: https, or http to
 // this Mac only) when the field loses focus or on Enter; the switch turns on
 // only with a URL; "Send a test" posts the test message to the URL in the
-// field; the preview shows the exact body the backend builds.
+// field; the preview shows the message's fields as the backend builds them.
 import { useEffect, useRef, useState } from "react";
 import { ChevronRight, Loader2 } from "lucide-react";
 import { ipc } from "../../lib/ipc";
-import type { NotifyElsewherePreview } from "../../lib/types";
+import type { NotifyElsewhere, NotifyElsewherePreview } from "../../lib/types";
+import { FadeSwap } from "../primitives/FadeSwap";
 import { Reveal } from "../primitives/Reveal";
 import { Switch } from "./shared";
 
 export const NOTIFY_LABEL = "Notify me elsewhere";
 export const NOTIFY_HELP =
-  "When a crew waits at a checkpoint gate or on a question, a crew run fails, or a Routine finishes, Octopush posts a short JSON message to the webhook you set here: ntfy, a Slack or Discord incoming webhook, or any URL. It carries a fixed label, the mission name and the project name, never code, diffs, prompts, questions or agent output. Off until you turn it on.";
-export const NOTIFY_URL_PLACEHOLDER = "https://ntfy.sh/your-topic";
+  "When a crew needs your decision (a checkpoint gate, a question, a Claude plan limit), a crew run fails, or a Routine finishes, Octopush posts a short JSON message to the webhook you set here: a Slack or Discord incoming webhook, or any endpoint that accepts JSON. It carries a fixed label, the project's name and the mission's title (the start of its task), never code, diffs, questions or agent output. Off until you turn it on; Send a test posts one test message either way.";
+export const NOTIFY_URL_PLACEHOLDER = "https://hooks.example.com/…";
 
 /** The backend's errors reach JS as `other: <message>` (`error.rs`). */
 export function notifyErrorText(err: unknown): string {
@@ -28,17 +29,33 @@ type TestState =
   | { kind: "sent" }
   | { kind: "failed"; message: string };
 
+/** The one status line under the field. */
+interface Status {
+  key: string;
+  ok: boolean;
+  text: string;
+  testId: string;
+}
+
 export function NotifyElsewhereRow() {
   const [enabled, setEnabled] = useState(false);
   const [savedUrl, setSavedUrl] = useState("");
   const [draft, setDraft] = useState("");
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
   const [test, setTest] = useState<TestState>({ kind: "idle" });
   const [preview, setPreview] = useState<NotifyElsewherePreview | null>(null);
   const [showPayload, setShowPayload] = useState(false);
   const live = useRef(true);
+  /** What the backend last stored: what a failed save falls back to. */
+  const stored = useRef<NotifyElsewhere>({ enabled: false, url: "" });
+  /** Saves run one after another, and only the newest one's answer is
+   *  shown, so a URL saved on blur and the switch clicked right after land
+   *  in that order and the switch doesn't flicker back. */
+  const queue = useRef<Promise<void>>(Promise.resolve());
+  const seq = useRef(0);
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastStatus = useRef<Status | null>(null);
 
   useEffect(() => {
     live.current = true;
@@ -46,6 +63,7 @@ export function NotifyElsewhereRow() {
       try {
         const s = await ipc.getNotifyElsewhere();
         if (!live.current) return;
+        stored.current = s;
         setEnabled(s.enabled);
         setSavedUrl(s.url);
         setDraft(s.url);
@@ -63,41 +81,50 @@ export function NotifyElsewhereRow() {
     })();
     return () => {
       live.current = false;
+      if (savedTimer.current) clearTimeout(savedTimer.current);
     };
   }, []);
 
-  /** Save the switch and the URL together; the backend answers with what it
-   *  stored, so the row never shows a state that isn't saved. */
-  async function persist(on: boolean, url: string) {
-    setBusy(true);
+  /** Save the switch and the URL together. `url` is read when the save
+   *  runs, after the ones queued before it. The backend answers with what it
+   *  stored, and the row shows that. */
+  function persist(on: boolean, url: () => string) {
+    const mine = ++seq.current;
     setError(null);
-    try {
-      const s = await ipc.setNotifyElsewhere(on, url);
-      if (!live.current) return;
-      setEnabled(s.enabled);
-      setSavedUrl(s.url);
-      setDraft(s.url);
-      setSaved(true);
-      setTimeout(() => {
-        if (live.current) setSaved(false);
-      }, 1500);
-    } catch (e) {
-      if (live.current) setError(notifyErrorText(e));
-    } finally {
-      if (live.current) setBusy(false);
-    }
+    queue.current = queue.current.then(async () => {
+      try {
+        const s = await ipc.setNotifyElsewhere(on, url());
+        stored.current = s;
+        if (!live.current || mine !== seq.current) return;
+        setEnabled(s.enabled);
+        setSavedUrl(s.url);
+        setDraft(s.url);
+        setSaved(true);
+        if (savedTimer.current) clearTimeout(savedTimer.current);
+        savedTimer.current = setTimeout(() => {
+          if (live.current) setSaved(false);
+        }, 1500);
+      } catch (e) {
+        if (!live.current) return;
+        setError(notifyErrorText(e));
+        if (mine === seq.current) setEnabled(stored.current.enabled);
+      }
+    });
   }
 
   function commitUrl() {
     const url = draft.trim();
     if (url === savedUrl) return;
     // Clearing the URL turns the setting off; a new URL keeps it as it was.
-    void persist(enabled && url !== "", url);
+    persist(enabled && url !== "", () => url);
   }
 
   function toggle(on: boolean) {
-    // Off always goes through (with the saved URL); on uses the field.
-    void persist(on, on ? draft.trim() : savedUrl);
+    // Show the click at once; the backend's answer then settles it. On uses
+    // the field; off always goes through, with whatever URL is stored.
+    setEnabled(on);
+    const url = draft.trim();
+    persist(on, on ? () => url : () => stored.current.url);
   }
 
   async function sendTest() {
@@ -112,6 +139,24 @@ export function NotifyElsewhereRow() {
 
   const hasUrl = draft.trim() !== "";
   const switchTitle = !enabled && !hasUrl ? "Add a webhook URL first" : NOTIFY_LABEL;
+
+  const status: Status | null = error
+    ? { key: `error:${error}`, ok: false, text: error, testId: "notify-elsewhere-error" }
+    : test.kind === "failed"
+      ? {
+          key: `test-failed:${test.message}`,
+          ok: false,
+          text: `The test didn't send: ${test.message}.`,
+          testId: "notify-elsewhere-test-result",
+        }
+      : test.kind === "sent"
+        ? { key: "test-sent", ok: true, text: "Test sent. The webhook accepted it.", testId: "notify-elsewhere-test-result" }
+        : saved
+          ? { key: "saved", ok: true, text: "Saved", testId: "notify-elsewhere-saved" }
+          : null;
+  // The line keeps its last words while it folds away, so it never blanks.
+  if (status) lastStatus.current = status;
+  const shown = status ?? lastStatus.current;
 
   return (
     <div
@@ -130,7 +175,7 @@ export function NotifyElsewhereRow() {
           onChange={toggle}
           ariaLabel={NOTIFY_LABEL}
           title={switchTitle}
-          disabled={busy || (!enabled && !hasUrl)}
+          disabled={!enabled && !hasUrl}
           testId="notify-elsewhere-switch"
         />
       </div>
@@ -174,24 +219,18 @@ export function NotifyElsewhereRow() {
         </button>
       </div>
 
-      {error && (
-        <p data-testid="notify-elsewhere-error" className="octo-fade-in mt-2 font-mono text-[11px] text-octo-rouge">
-          {error}
-        </p>
-      )}
-      {!error && saved && (
-        <p className="octo-fade-in mt-2 font-mono text-[10px] text-octo-verdigris">Saved</p>
-      )}
-      {test.kind === "sent" && (
-        <p data-testid="notify-elsewhere-test-result" className="octo-fade-in mt-2 font-mono text-[11px] text-octo-verdigris">
-          Test sent. The webhook accepted it.
-        </p>
-      )}
-      {test.kind === "failed" && (
-        <p data-testid="notify-elsewhere-test-result" className="octo-fade-in mt-2 font-mono text-[11px] text-octo-rouge">
-          The test didn't send: {test.message}.
-        </p>
-      )}
+      <Reveal open={status !== null}>
+        {shown && (
+          <FadeSwap swapKey={shown.key}>
+            <p
+              data-testid={shown.testId}
+              className={`pt-2 font-mono text-[11px] ${shown.ok ? "text-octo-verdigris" : "text-octo-rouge"}`}
+            >
+              {shown.text}
+            </p>
+          </FadeSwap>
+        )}
+      </Reveal>
 
       {preview && (
         <div className="mt-3">
@@ -208,7 +247,7 @@ export function NotifyElsewhereRow() {
               aria-hidden
               className={`transition-transform duration-[var(--dur-quick)] ease-[var(--ease-octo)] ${showPayload ? "rotate-90" : ""}`}
             />
-            The exact message
+            The message's fields
           </button>
           <Reveal open={showPayload}>
             <div className="pt-2">
@@ -219,11 +258,11 @@ export function NotifyElsewhereRow() {
                 {JSON.stringify(preview.payload, null, 2)}
               </pre>
               <p className="mt-2 text-[12px] leading-[1.55] text-octo-sage">
-                This is the body for a checkpoint gate, with example names. <code className="font-mono text-[11px] text-octo-ivory">event</code> is one of{" "}
+                The fields of the message for a checkpoint gate, with example names. <code className="font-mono text-[11px] text-octo-ivory">event</code> is one of{" "}
                 <span data-testid="notify-elsewhere-events" className="font-mono text-[11px] text-octo-ivory">
                   {preview.events.map((e) => e.event).join(", ")}
                 </span>
-                . Nothing else is sent.
+                . No other field is sent.
               </p>
             </div>
           </Reveal>
