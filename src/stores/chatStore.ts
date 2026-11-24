@@ -260,6 +260,14 @@ interface MessageUpdatedEvent {
   content: string;
 }
 
+/** The highest message id in a list (0 for none): the mark a running turn's
+ *  rows are newer than. */
+function maxMessageId(msgs: ChatMessage[]): number {
+  let max = 0;
+  for (const m of msgs) if (m.id > max) max = m.id;
+  return max;
+}
+
 // Stable empty values returned by selectors when a workspace has no data.
 // Critical: returning a NEW empty array per call would make Zustand selectors
 // invalidate every render → infinite re-render loop (caught in Phase 4 bug fix).
@@ -313,6 +321,13 @@ interface ChatState {
   messagesByWs: Record<string, ChatMessage[]>;
   /** Streaming flag per workspace. `true` only while THAT workspace's agentic loop runs. */
   streamingByWs: Record<string, boolean>;
+  /** The highest message id on screen when the running turn started, per
+   *  workspace. The turn's own rows (its user row, narration, tool calls)
+   *  are saved after it, so they are the ones above it: Talk's work blocks
+   *  use it to tell the turn in flight from the turns before it, even while
+   *  the backend hasn't saved the new user row yet. Survives a thread switch
+   *  (ids are global), so a running thread shown again still reads as live. */
+  streamSinceByWs: Record<string, number>;
   /** Partial assistant text being streamed per workspace. */
   streamBufferByWs: Record<string, string>;
   /** Last error per workspace. */
@@ -987,6 +1002,7 @@ export const useChatStore = create<ChatState>((set, get) => {
   return {
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     stopRequestedByWs: {},
     errorByWs: {},
@@ -1143,6 +1159,12 @@ export const useChatStore = create<ChatState>((set, get) => {
     runTurn: async (workspaceId, workspacePath, threadId, opts) => {
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        // Read after regenerate/editAndResend truncated the view, so the rows
+        // they cut can't count as the previous turn's.
+        streamSinceByWs: {
+          ...s.streamSinceByWs,
+          [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
+        },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         streamBufferByWs: { ...s.streamBufferByWs, [workspaceId]: "" },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
@@ -1305,6 +1327,10 @@ export const useChatStore = create<ChatState>((set, get) => {
       // `RUN` card are the "process running" indicators while it streams.
       set((s) => ({
         streamingByWs: { ...s.streamingByWs, [workspaceId]: true },
+        streamSinceByWs: {
+          ...s.streamSinceByWs,
+          [workspaceId]: maxMessageId(s.messagesByWs[workspaceId] ?? EMPTY_MESSAGES),
+        },
         streamingThreadByWs: { ...s.streamingThreadByWs, [workspaceId]: threadId },
         stopRequestedByWs: { ...s.stopRequestedByWs, [workspaceId]: false },
         errorByWs: { ...s.errorByWs, [workspaceId]: null },

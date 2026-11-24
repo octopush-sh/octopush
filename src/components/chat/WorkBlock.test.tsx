@@ -76,9 +76,12 @@ describe("WorkBlock", () => {
 
   it("shows a round of five calls in full", () => {
     const tools = Array.from({ length: 5 }, (_, i) => t("read_file", { path: `f${i}.ts` }));
-    render(<WorkBlock calls={5} entries={[round(1, tools)]} />);
-    expect(screen.queryByRole("button", { expanded: false, name: /Show the/ })).toBeNull();
-    expect(screen.getAllByText("READ")).toHaveLength(5);
+    const { container } = render(<WorkBlock calls={5} entries={[round(1, tools)]} />);
+    // No summary row (its accessible name starts with the count)…
+    expect(screen.queryByRole("button", { name: /5 tool calls/ })).toBeNull();
+    // …and the rows are shown, not folded away under a closed Reveal.
+    expect(container.querySelector("div.grid[aria-hidden]")).toHaveAttribute("aria-hidden", "false");
+    expect(container.querySelectorAll('[data-role="tool"]')).toHaveLength(5);
   });
 
   it("folds a round of more than five calls into one summary row that opens in place", () => {

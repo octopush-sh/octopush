@@ -5,6 +5,7 @@ import { parseKeyPhrase } from "../lib/parseKeyPhrase";
 import { ChatMarkdown, REMARK_PLUGINS } from "./chat/ChatMarkdown";
 import { splitBySkillTokens } from "../lib/skillMentions";
 import { formatUsd } from "../lib/cost";
+import { tourId } from "../lib/tour/ids";
 
 interface MessageProps {
   role: "user" | "assistant" | "tool" | "error" | string;
@@ -20,6 +21,11 @@ interface MessageProps {
   createdAt?: string | null;
 }
 
+/** Turn times are UI copy, so they are English whatever the system locale
+ *  (CLAUDE.md rule 8), on a 24-hour clock: `14:02`, never `02:02 p. m.`. */
+const TURN_LOCALE = "en-US";
+const CLOCK: Intl.DateTimeFormatOptions = { hour: "2-digit", minute: "2-digit", hourCycle: "h23" };
+
 /** A turn's time for its header: the clock time today (`14:02`), with the
  *  date in front on any other day (`Nov 23, 14:02`) and the year too in an
  *  earlier year (`Dec 30, 2025, 14:02`), so a thread picked up later still
@@ -29,14 +35,24 @@ export function turnTime(iso: string | null | undefined, now: Date = new Date())
   if (!iso) return "";
   const then = new Date(iso);
   if (Number.isNaN(then.getTime())) return "";
-  const clock = then.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const clock = then.toLocaleTimeString(TURN_LOCALE, CLOCK);
   const sameDay =
     then.getFullYear() === now.getFullYear() &&
     then.getMonth() === now.getMonth() &&
     then.getDate() === now.getDate();
   if (sameDay) return clock;
   const year = then.getFullYear() === now.getFullYear() ? undefined : "numeric";
-  return `${then.toLocaleDateString(undefined, { year, month: "short", day: "numeric" })}, ${clock}`;
+  return `${then.toLocaleDateString(TURN_LOCALE, { year, month: "short", day: "numeric" })}, ${clock}`;
+}
+
+/** The full date and time of a turn, for its time's tooltip:
+ *  `Tue, Nov 24, 2026, 14:02`. English and 24-hour, like `turnTime`. */
+export function turnTimeFull(iso: string | null | undefined): string {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return "";
+  const date = then.toLocaleDateString(TURN_LOCALE, { weekday: "short", year: "numeric", month: "short", day: "numeric" });
+  return `${date}, ${then.toLocaleTimeString(TURN_LOCALE, CLOCK)}`;
 }
 
 /** The footer of an answer: `211k in · 94% cached · 2.1k out · $0.42`. The
@@ -129,7 +145,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
     return (
       <article
         data-role="user"
-        data-tour="talk-turn-ask"
+        data-tour={tourId("talk-turn-ask")}
         aria-label={time ? `You, ${time}` : "You"}
         className="octo-selectable rounded-md border border-octo-hairline bg-octo-panel px-4 pb-3 pt-2"
       >
@@ -139,7 +155,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
           {time && (
             <time
               dateTime={message.createdAt ?? undefined}
-              title={new Date(message.createdAt ?? "").toLocaleString()}
+              title={turnTimeFull(message.createdAt)}
               className={`${actions ? "" : "ml-auto "}octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute`}
             >
               {time}

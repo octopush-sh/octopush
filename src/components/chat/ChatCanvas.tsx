@@ -47,6 +47,7 @@ export function ChatCanvas({
 }: Props) {
   const messages = useChatStore((s) => s.getMessages(workspaceId));
   const streaming = useChatStore((s) => s.getStreaming(workspaceId));
+  const streamSince = useChatStore((s) => s.streamSinceByWs[workspaceId]);
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
@@ -82,8 +83,12 @@ export function ChatCanvas({
   );
   // Narration and tool calls in a row become one work block (lib/talkWork).
   const blocks = useMemo<TalkBlock[]>(() => groupWork(timeline), [timeline]);
-  // Work after the last user turn belongs to the turn in flight: while it
-  // streams, its rounds don't fold (they fold when the turn ends).
+  // The work of the turn in flight doesn't fold while it streams (it folds
+  // when the turn ends). That work comes after the last user turn AND was
+  // saved after the turn started: the backend saves the new user row a
+  // moment after streaming begins (later still for a `$` command, after its
+  // secret scan), and until it lands the last user turn on screen is the
+  // previous one, whose folded rounds must stay folded.
   const currentTurnStart = useMemo(() => {
     for (let i = blocks.length - 1; i >= 0; i--) {
       const b = blocks[i];
@@ -91,7 +96,19 @@ export function ChatCanvas({
     }
     return 0;
   }, [blocks]);
-  const lastIsWork = blocks.length > 0 && blocks[blocks.length - 1].kind === "work";
+  const isLiveWork = (id: number, index: number) =>
+    streaming && index >= currentTurnStart && id > (streamSince ?? -1);
+  // Where the running calls' rows continue the turn's work block: right
+  // under it, as one more row of its last round (no gap) or as a new round
+  // after a narration line (the block's 2px gap), exactly where each row
+  // will land once it resolves, so nothing jumps.
+  const lastBlock = blocks[blocks.length - 1];
+  const liveContinues =
+    lastBlock?.kind === "work"
+      ? lastBlock.entries[lastBlock.entries.length - 1]?.kind === "round"
+        ? "-mt-6"
+        : "-mt-6 pt-0.5"
+      : "";
   const liveAgents = useMemo(() => liveTools.filter((t) => isAgentToolName(t.toolName)), [liveTools]);
   const liveOthers = useMemo(() => liveTools.filter((t) => !isAgentToolName(t.toolName)), [liveTools]);
 
@@ -254,7 +271,7 @@ export function ChatCanvas({
                   key={`work-${item.id}`}
                   entries={item.entries}
                   calls={item.calls}
-                  live={streaming && index >= currentTurnStart}
+                  live={isLiveWork(item.id, index)}
                   workspacePath={workspacePath}
                   onOpenInEditor={onOpenInEditor}
                   onRunInTerminal={onRunInTerminal}
@@ -307,14 +324,14 @@ export function ChatCanvas({
 
           {/* Live tool rows — one per in-flight tool, in call order, on the
               work hairline: when the turn's work block is the last thing on
-              screen the rows continue its line (the negative margin closes
-              the feed's gap), otherwise they start one. Always this one
+              screen the rows continue its line (-mt-6 closes the feed's
+              gap-6), otherwise they start one. Rows sit flush, like a round's. Always this one
               wrapper, so a row never remounts as its block appears. They
               retire as their resolved rows arrive (see chatStore). */}
           {liveOthers.length > 0 && (
             <div
               data-role="live-work"
-              className={`flex flex-col gap-0.5 border-l border-octo-hairline pl-3 ${lastIsWork ? "-mt-[22px] pt-0.5" : ""}`}
+              className={`flex flex-col border-l border-octo-hairline pl-3 ${liveContinues}`}
             >
               {liveOthers.map((t) => (
                 <LiveToolCard key={`live-${t.callId}`} tool={t} />

@@ -164,7 +164,9 @@ The ask is the one filled surface in the thread that isn't code. Brass goes to t
   <div className="mb-1 flex h-6 items-center gap-2">
     <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— You</span>
     <div className="ml-auto flex items-center">{/* RowActions, opacity-0 until hover/focus */}</div>
-    <time dateTime={iso} className="octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute">14:02</time>
+    {/* turnTime / turnTimeFull: English and 24-hour, never the system locale */}
+    <time dateTime={iso} title={turnTimeFull(iso)}
+          className="octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute">14:02</time>
   </div>
   <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">{text}</div>
 </article>
@@ -194,7 +196,7 @@ A resolved call is a row, never a card: no border, no fill, 24px high, on the wo
   <ChevronRight size={11} aria-hidden className="text-octo-mute" />
 </div>
 ```
-`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. The whole-row hover wash, the actions' reveal and the inset focus rings live in `styles.css` (`.octo-ledger`, `.octo-ledger-head`, `.octo-ledger-actions`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor, Reveal in Finder) are titled icons that keep their room while hidden, so nothing moves; they turn brass on hover. A **running** call (`LiveToolCard`) is the same row with a 6px status dot sitting on the hairline, so it settles into its resolved row in place. A round of more than five calls folds into one summary row once its turn has ended, never while it streams, and always as one tree (the rows stay under the same `Reveal`). The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
+`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. The whole-row hover wash, the actions' reveal and the inset focus rings live in `styles.css` (`.octo-ledger`, `.octo-ledger-head`, `.octo-ledger-actions`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor, Reveal in Finder) are titled icons that keep their room while hidden, so nothing moves; they turn brass on hover. A **running** call (`LiveToolCard`) is the same row with a 6px verdigris status dot sitting on the hairline, pulsing on `.octo-stage-pulse` + `.octo-stage-pulse-running` (static halo under reduced motion; running work is never brass), placed exactly where its resolved row will land, so it settles in place. A round of more than five calls folds into one summary row once its turn has ended, never while it streams, and always as one tree (the rows stay under the same `Reveal`). The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
 ### Input with serif placeholder
 ```tsx

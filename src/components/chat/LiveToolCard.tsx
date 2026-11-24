@@ -14,7 +14,7 @@ interface Props {
  * resolved `ToolCallCard`. A ledger row like the resolved one (tool icon · LABEL ·
  * summary, mute and sage) on the work hairline, with a live elapsed timer in a
  * fixed-width slot (stability S1/S2: no reflow) and a status dot sitting ON the
- * hairline: pulsing brass while running, its verdict once `done`. So a running
+ * hairline: verdigris with a calm pulse while running, its verdict once `done`. So a running
  * call settles into its resolved row in place instead of jumping from a card.
  *
  * Renders in the timeline shell (outside react-markdown), so it uses design
@@ -51,19 +51,21 @@ export function LiveToolCard({ tool }: Props) {
   return (
     <div className="octo-rise-in relative flex h-6 w-full items-center gap-2.5" aria-live="polite">
       {/* Status dot ON the work hairline (the row's parent draws it 12px to
-          the left): pulsing brass while running, verdict colour when done. */}
+          the left). Running work is verdigris, never brass (brass pulses
+          are for what needs you): the calm `.octo-stage-pulse` ring in
+          verdigris while it runs, a static halo under reduced motion, then
+          the verdict colour. */}
       <span
         aria-hidden
-        className={`absolute left-[-15.5px] top-1/2 -translate-y-1/2 ${tool.done ? "" : "animate-pulse"}`}
+        data-testid="live-tool-dot"
+        className={`absolute left-[-15.5px] top-1/2 -translate-y-1/2 ${
+          tool.done ? "" : "octo-stage-pulse octo-stage-pulse-running"
+        }`}
         style={{
           width: 6,
           height: 6,
           borderRadius: 999,
-          background: tool.done
-            ? tool.ok
-              ? "var(--color-octo-verdigris)"
-              : "var(--color-octo-rouge)"
-            : "var(--color-octo-brass)",
+          background: failed ? "var(--color-octo-rouge)" : "var(--color-octo-verdigris)",
         }}
       />
       <span title={tool.toolName} className="shrink-0 text-octo-mute">

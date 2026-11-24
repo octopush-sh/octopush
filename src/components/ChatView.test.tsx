@@ -67,6 +67,7 @@ function resetStore() {
   useChatStore.setState({
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
@@ -596,25 +597,124 @@ describe("ChatView — turns read apart in a long thread", () => {
     expect(text.compareDocumentPosition(regenerate) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
+  const liveCall = (callId: string, command: string) => ({
+    callId, toolName: "run_command", toolInput: { command }, startedAt: new Date().toISOString(), done: false, ok: false, durationMs: null,
+  });
+
   it("hangs a running call on the work hairline as a ledger row, continuing the turn's block", () => {
     useChatStore.setState({
       messagesByWs: {
         "ws-1": [row(1, "user", "Run the tests"), row(2, "assistant_tool_use", "Running the suite.")] as never,
       },
       streamingByWs: { "ws-1": true },
-      liveToolsByWs: {
-        "ws-1": [{ callId: "c1", toolName: "run_command", toolInput: { command: "npm test" }, startedAt: new Date().toISOString(), done: false, ok: false, durationMs: null }],
-      },
+      streamSinceByWs: { "ws-1": 0 },
+      liveToolsByWs: { "ws-1": [liveCall("c1", "npm test")] },
     });
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     const live = document.querySelector('[data-role="live-work"]') as HTMLElement;
     expect(live.className).toContain("border-l");
-    // The turn's work block is the last thing on screen, so the live rows
-    // continue its line instead of starting a new one.
-    expect(live.className).toContain("-mt-[22px]");
+    // The turn's work block is the last thing on screen and ends with a
+    // narration line: the live rows close the feed's 24px gap and sit the
+    // block's 2px below it, where the call's row lands once it resolves.
+    expect(live.className).toContain("-mt-6");
+    expect(live.className).toContain("pt-0.5");
     const runRow = within(live).getByText("npm test").parentElement!;
     expect(runRow.className).not.toContain("border");
     expect(within(live).getByText(/running ·/)).toBeInTheDocument();
+    // Running work is verdigris on the stage-pulse primitive, never a brass
+    // Tailwind pulse.
+    const dot = within(live).getByTestId("live-tool-dot");
+    expect(dot.className).toContain("octo-stage-pulse-running");
+    expect(dot.className).not.toContain("animate-pulse");
+    expect(dot.style.background).toBe("var(--color-octo-verdigris)");
+  });
+
+  it("sits a running call flush under the round it will join", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "Run the tests"), toolRow(2, "grep", { pattern: "x" })] as never,
+      },
+      streamingByWs: { "ws-1": true },
+      streamSinceByWs: { "ws-1": 0 },
+      liveToolsByWs: { "ws-1": [liveCall("c1", "npm test")] },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const live = document.querySelector('[data-role="live-work"]') as HTMLElement;
+    expect(live.className).toContain("-mt-6");
+    expect(live.className).not.toContain("pt-0.5");
+  });
+
+  it("keeps the previous turn's folded round folded when a new turn starts before its user row lands", async () => {
+    const tools = [
+      toolRow(2, "grep", { pattern: "should_upload" }),
+      toolRow(3, "read_file", { path: "a.ts" }),
+      toolRow(4, "read_file", { path: "b.ts" }),
+      toolRow(5, "edit_file", { path: "a.ts" }),
+      toolRow(6, "edit_file", { path: "b.ts" }),
+      toolRow(7, "run_command", { command: "npm test" }),
+    ];
+    const rows = [row(1, "user", "Fix it"), ...tools, row(8, "assistant", "Fixed. Tests pass.", "claude-sonnet-4-6")];
+    listChatMessagesMock.mockResolvedValue(rows);
+    try {
+      useChatStore.setState({
+        messagesByWs: { "ws-1": rows as never },
+        activeThreadByWs: { "ws-1": "t1" },
+        streamingByWs: { "ws-1": false },
+      });
+      const { container } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+      await act(async () => { await Promise.resolve(); });
+
+      const fold = screen.getByRole("button", { name: /6 tool calls/ });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const reveal = container.querySelector('[data-role="work"] div.grid[aria-hidden]')!;
+      expect(reveal).toHaveAttribute("aria-hidden", "true");
+      const firstRow = container.querySelector('[data-role="tool"]');
+
+      // A new turn starts: streaming is on, the backend hasn't saved the
+      // user row yet, so the last user turn on screen is still the old one.
+      await act(async () => {
+        await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "And the docs?" });
+      });
+      expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+
+      // Still folded, same summary button, same row nodes.
+      expect(screen.getByRole("button", { name: /6 tool calls/ })).toBe(fold);
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(reveal).toHaveAttribute("aria-hidden", "true");
+      expect(container.querySelector('[data-role="tool"]')).toBe(firstRow);
+    } finally {
+      listChatMessagesMock.mockResolvedValue([]);
+    }
+  });
+
+  it("doesn't fold the turn in flight's long round until the turn ends", async () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [row(1, "user", "Old ask"), row(2, "assistant", "Old answer.", "m")] as never },
+      activeThreadByWs: { "ws-1": "t1" },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => {
+      await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "New ask" });
+    });
+    // The new turn's rows land: its user row, then six calls.
+    act(() => {
+      useChatStore.setState((s) => ({
+        messagesByWs: {
+          "ws-1": [
+            ...(s.messagesByWs["ws-1"] ?? []),
+            row(3, "user", "New ask"),
+            ...[4, 5, 6, 7, 8, 9].map((id) => toolRow(id, "read_file", { path: `f${id}.ts` })),
+          ] as never,
+        },
+      }));
+    });
+    expect(screen.queryByRole("button", { name: /6 tool calls/ })).toBeNull();
+    // The turn ends: now it folds.
+    act(() => {
+      useChatStore.setState({ streamingByWs: { "ws-1": false } });
+    });
+    expect(screen.getByRole("button", { name: /6 tool calls/ })).toHaveAttribute("aria-expanded", "false");
   });
 
   it("copies exactly what the user sent, without the turn's header", async () => {
