@@ -107,6 +107,7 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 - **Radii:** `sm: 6px` (buttons, pills), `md: 10px` (panels, inputs), `lg: 14px` (large canvases). **No pill-shaped controls by default.**
 - **Layout minimums (Talk's terminal seat):** `--talk-chat-min: 44rem` (the conversation keeps the composer at its natural width), `--talk-seat-min: 21rem` (about 40 terminal columns), `--talk-chat-floor: 18rem` (the narrowest the conversation goes, its composer bar wrapped). Mirrored in `tokens.ts` as `talkSeat`.
 - **Shell spacing (2026-11-18):** `--shell-gutter: 8px` (`<main>`'s inset from the rail and from the Companion), `--shell-stack: 8px` (above the ContextHeader, header to mode band, mode band to canvas), `--shell-foot: 8px` (the canvas column's bottom padding). Mirrored in `tokens.ts` as `shell`. The gaps between the app's standing surfaces go through these three, never through a spacing class of their own. See section 8, "Shell spacing".
+- **Settings content column (2026-11-24, #1018):** `--settings-content: 720px`, the one max width every Settings pane renders in. Mirrored in `tokens.ts` as `settingsContent`. See section 8, "Full-screen rooms".
 - **Hairline:** 1px in `--hairline`. Brass hairline: 1px in `--brass-dim` for active borders.
 - **Brass rule: fully deleted (2026-07-11).** The 28px gradient divider (`linear-gradient(90deg, var(--brass), transparent)`), `.animate-brass-grow`, and `@keyframes brassgrow` are **removed from the codebase**, not just retired-for-new-surfaces — there is no legacy allowance left; `grep -rn "linear-gradient" src` returns only non-divider uses (a repeating-stripe running-bar texture, a scrim fade behind tool output, and `mask-image` edge-fades — none of them a rule/line). Use `--hairline` borders or spacing for visual separation; use the solid `--brass-line` token where an *active* connector is needed (see §6, §8).
 
@@ -1037,6 +1038,12 @@ frames a destination, not an interruption. Rules:
   `<RoomClose>` is the canonical `ESC · CLOSE` affordance.
 - Header: the Settings recipe — mono eyebrow + serif title (or app-scoped live
   meta) + right-aligned quiet actions + RoomClose.
+- Settings panes share one content column: `Settings.tsx` renders every pane
+  inside `max-w-[var(--settings-content)]`, so cards and notes end at the same
+  x on every tab. A pane never sets a width of its own; one that needs two
+  columns (Models, Integrations' issue tracking) splits inside the column.
+  `settings/contentWidth.test.ts` fails if a pane brings back a pixel
+  `max-w-[…]` (a ModalShell panel is not pane content and is exempt).
 - A room is **entered from existing chrome** (top bar, shortcut) and never
   persistent — it adds zero standing pixels. One room per concept (§9).
 - Current residents: **Settings** (`⌘,`) and **Mission Control** (`⌘⇧M`) — the

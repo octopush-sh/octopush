@@ -67,7 +67,7 @@ export function ModelTiersSection() {
   }
 
   return (
-    <section data-testid="model-tiers" className="mt-8 max-w-[860px]">
+    <section data-testid="model-tiers" className="mt-8">
       <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">Model tiers</div>
       <p className="mb-3 text-[12px] leading-[1.55] text-octo-sage">
         Provider-agnostic names a sub-agent can ask for. A Claude Code agent definition saying

@@ -200,7 +200,7 @@ export function ModelsPane() {
         subtitle="API keys live on this machine in ~/.octopush/settings.json. They never leave the device except in requests to the providers themselves."
       />
 
-      <div className="grid max-w-[860px] grid-cols-[220px_1fr] gap-5">
+      <div className="grid grid-cols-[220px_1fr] gap-5">
         {/* ── Master: provider list ── */}
         <div className="flex flex-col gap-1">
           <div className="mb-1 font-mono text-[9px] uppercase tracking-[0.3em] text-octo-mute">Providers</div>
@@ -263,7 +263,7 @@ export function ModelsPane() {
       <ModelTiersSection />
 
       {/* ── Unsaved-changes bar ── */}
-      <div className="sticky bottom-0 mt-6 max-w-[860px]">
+      <div className="sticky bottom-0 mt-6">
         <Reveal open={dirty}>
           <div
             className="flex items-center gap-3 rounded-lg px-4 py-2.5"

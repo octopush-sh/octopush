@@ -32,12 +32,12 @@ export function AppearancePane() {
       <PaneHeader eyebrow="Appearance" title="A palette to live in." subtitle={subtitle} />
 
       <SectionLabel>Theme</SectionLabel>
-      <div className="grid max-w-[680px] grid-cols-2 gap-3">{grid(family)}</div>
+      <div className="grid grid-cols-2 gap-3">{grid(family)}</div>
 
       {legacy.length > 0 && (
         <section className="mt-8" data-tour="settings-appearance-legacy">
           <SectionLabel>Legacy</SectionLabel>
-          <div className="grid max-w-[680px] grid-cols-2 gap-3">{grid(legacy)}</div>
+          <div className="grid grid-cols-2 gap-3">{grid(legacy)}</div>
         </section>
       )}
     </>

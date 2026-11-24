@@ -88,6 +88,10 @@ export const shell = {
   foot: "8px",
 } as const;
 
+/** The Settings content column (mirrors `--settings-content` in styles.css):
+ *  the one max width every Settings pane renders in. */
+export const settingsContent = "720px";
+
 export const dur = {
   quick: 220,
   standard: 280,

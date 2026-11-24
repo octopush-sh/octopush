@@ -39,7 +39,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
         subtitle="Application-wide preferences live here. More options will appear as the app grows."
       />
 
-      <div className="max-w-[640px] space-y-8">
+      <div className="space-y-8">
         <ReadinessCard onShowCaches={onShowCaches} />
 
         <div className="space-y-4">
