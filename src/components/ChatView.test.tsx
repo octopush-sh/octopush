@@ -11,7 +11,7 @@
  * specific DOM content.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor, within } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
 type EventHandler = (ev: { payload: unknown }) => void;
@@ -67,6 +67,7 @@ function resetStore() {
   useChatStore.setState({
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
@@ -344,7 +345,8 @@ describe("ChatView — renders tool cards in the DOM", () => {
     });
     const onRunInTerminal = vi.fn();
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" onRunInTerminal={onRunInTerminal} />);
-    fireEvent.click(screen.getByText("Send to terminal"));
+    // An icon with a title and an accessible name (shown on row hover/focus).
+    fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
     expect(onRunInTerminal).toHaveBeenCalledWith("npm test");
   });
 
@@ -529,6 +531,202 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("styles.css")).toBeInTheDocument();
     expect(screen.getAllByText("WRITE")).toHaveLength(2);
     expect(screen.getByText(/landing page está lista/i)).toBeInTheDocument();
+  });
+});
+
+// ─── Turn structure: a section of articles, the work block ─────────────────
+
+describe("ChatView — turns read apart in a long thread", () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  const row = (id: number, role: string, content: string, model: string | null = null) => ({
+    id, workspaceId: "ws-1", role, content, model,
+    inputTokens: null, outputTokens: null, costUsd: null,
+    createdAt: "2026-05-17T10:00:00Z",
+  });
+  const toolRow = (id: number, toolName: string, toolInput: Record<string, unknown>) =>
+    row(id, "tool", JSON.stringify({ toolName, toolInput, result: "" }));
+
+  it("is a section of articles: the ask, the work (one hairline), the answer", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [
+          row(1, "user", "Why a 500?"),
+          row(2, "assistant_tool_use", "Let me find where the limiter talks to Redis."),
+          toolRow(3, "grep", { pattern: "RateLimiter" }),
+          toolRow(4, "read_file", { path: "src/lib/redis.ts" }),
+          row(5, "assistant", "The store call has no catch. Here is the fix.", "claude-opus-4-7"),
+        ] as never,
+      },
+      streamingByWs: { "ws-1": false },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    // A labelled section, not role="feed": the thread doesn't implement the
+    // feed pattern's keyboard model, so it doesn't claim it.
+    expect(screen.queryByRole("feed")).toBeNull();
+    const thread = screen.getByRole("region", { name: "Conversation" });
+    const articles = within(thread).getAllByRole("article");
+    expect(articles.map((a) => a.getAttribute("data-role"))).toEqual(["user", "work", "assistant"]);
+    // The narration and both calls are inside the one work article.
+    const work = articles[1];
+    expect(within(work).getByText(/Let me find where the limiter/)).toBeInTheDocument();
+    expect(within(work).getByRole("group", { name: "2 tool calls" })).toBeInTheDocument();
+    expect(work).toHaveAttribute("aria-label", "Work, 2 tool calls");
+  });
+
+  it("puts a user turn's actions inside the ask, and an answer's inside it after its text", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "do a thing"), row(2, "assistant", "did it", "claude-sonnet-4-6")] as never,
+      },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    const ask = document.querySelector('[data-role="user"]')!;
+    expect(within(ask as HTMLElement).getByLabelText("Edit & resend")).toBeInTheDocument();
+    // An answer's actions are inside its article, after its text.
+    const answer = document.querySelector('[data-role="assistant"]')!;
+    const regenerate = screen.getByLabelText("Regenerate");
+    expect(answer.contains(regenerate)).toBe(true);
+    const text = within(answer as HTMLElement).getByText("did it");
+    expect(text.compareDocumentPosition(regenerate) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  const liveCall = (callId: string, command: string) => ({
+    callId, toolName: "run_command", toolInput: { command }, startedAt: new Date().toISOString(), done: false, ok: false, durationMs: null,
+  });
+
+  it("hangs a running call on the work hairline as a ledger row, continuing the turn's block", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "Run the tests"), row(2, "assistant_tool_use", "Running the suite.")] as never,
+      },
+      streamingByWs: { "ws-1": true },
+      streamSinceByWs: { "ws-1": 0 },
+      liveToolsByWs: { "ws-1": [liveCall("c1", "npm test")] },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const live = document.querySelector('[data-role="live-work"]') as HTMLElement;
+    expect(live.className).toContain("border-l");
+    // The turn's work block is the last thing on screen and ends with a
+    // narration line: the live rows close the feed's 24px gap and sit the
+    // block's 2px below it, where the call's row lands once it resolves.
+    expect(live.className).toContain("-mt-6");
+    expect(live.className).toContain("pt-0.5");
+    const runRow = within(live).getByText("npm test").parentElement!;
+    expect(runRow.className).not.toContain("border");
+    expect(within(live).getByText(/running ·/)).toBeInTheDocument();
+    // Running work is verdigris on the stage-pulse primitive, never a brass
+    // Tailwind pulse.
+    const dot = within(live).getByTestId("live-tool-dot");
+    expect(dot.className).toContain("octo-stage-pulse-running");
+    expect(dot.className).not.toContain("animate-pulse");
+    expect(dot.style.background).toBe("var(--color-octo-verdigris)");
+  });
+
+  it("sits a running call flush under the round it will join", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "Run the tests"), toolRow(2, "grep", { pattern: "x" })] as never,
+      },
+      streamingByWs: { "ws-1": true },
+      streamSinceByWs: { "ws-1": 0 },
+      liveToolsByWs: { "ws-1": [liveCall("c1", "npm test")] },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const live = document.querySelector('[data-role="live-work"]') as HTMLElement;
+    expect(live.className).toContain("-mt-6");
+    expect(live.className).not.toContain("pt-0.5");
+  });
+
+  it("keeps the previous turn's folded round folded when a new turn starts before its user row lands", async () => {
+    const tools = [
+      toolRow(2, "grep", { pattern: "should_upload" }),
+      toolRow(3, "read_file", { path: "a.ts" }),
+      toolRow(4, "read_file", { path: "b.ts" }),
+      toolRow(5, "edit_file", { path: "a.ts" }),
+      toolRow(6, "edit_file", { path: "b.ts" }),
+      toolRow(7, "run_command", { command: "npm test" }),
+    ];
+    const rows = [row(1, "user", "Fix it"), ...tools, row(8, "assistant", "Fixed. Tests pass.", "claude-sonnet-4-6")];
+    listChatMessagesMock.mockResolvedValue(rows);
+    try {
+      useChatStore.setState({
+        messagesByWs: { "ws-1": rows as never },
+        activeThreadByWs: { "ws-1": "t1" },
+        streamingByWs: { "ws-1": false },
+      });
+      const { container } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+      await act(async () => { await Promise.resolve(); });
+
+      const fold = screen.getByRole("button", { name: /6 tool calls/ });
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      const reveal = container.querySelector('[data-role="work"] div.grid[aria-hidden]')!;
+      expect(reveal).toHaveAttribute("aria-hidden", "true");
+      const firstRow = container.querySelector('[data-role="tool"]');
+
+      // A new turn starts: streaming is on, the backend hasn't saved the
+      // user row yet, so the last user turn on screen is still the old one.
+      await act(async () => {
+        await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "And the docs?" });
+      });
+      expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+
+      // Still folded, same summary button, same row nodes.
+      expect(screen.getByRole("button", { name: /6 tool calls/ })).toBe(fold);
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(reveal).toHaveAttribute("aria-hidden", "true");
+      expect(container.querySelector('[data-role="tool"]')).toBe(firstRow);
+    } finally {
+      listChatMessagesMock.mockResolvedValue([]);
+    }
+  });
+
+  it("doesn't fold the turn in flight's long round until the turn ends", async () => {
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [row(1, "user", "Old ask"), row(2, "assistant", "Old answer.", "m")] as never },
+      activeThreadByWs: { "ws-1": "t1" },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => {
+      await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "New ask" });
+    });
+    // The new turn's rows land: its user row, then six calls.
+    act(() => {
+      useChatStore.setState((s) => ({
+        messagesByWs: {
+          "ws-1": [
+            ...(s.messagesByWs["ws-1"] ?? []),
+            row(3, "user", "New ask"),
+            ...[4, 5, 6, 7, 8, 9].map((id) => toolRow(id, "read_file", { path: `f${id}.ts` })),
+          ] as never,
+        },
+      }));
+    });
+    expect(screen.queryByRole("button", { name: /6 tool calls/ })).toBeNull();
+    // The turn ends: now it folds.
+    act(() => {
+      useChatStore.setState({ streamingByWs: { "ws-1": false } });
+    });
+    expect(screen.getByRole("button", { name: /6 tool calls/ })).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("copies exactly what the user sent, without the turn's header", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [row(1, "user", "line one\n  line two")] as never },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    fireEvent.click(screen.getByLabelText("Copy message"));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("line one\n  line two"));
   });
 });
 

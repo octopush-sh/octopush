@@ -9,9 +9,9 @@
  * one run-on paragraph (the bug the second block guards). The user's text is
  * never re-parsed as Markdown — a pasted log or snippet keeps its characters.
  */
-import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { ChatMessage, usageFooter } from "./ChatMessage";
+import { describe, it, expect, vi } from "vitest";
+import { render, screen, within } from "@testing-library/react";
+import { ChatMessage, usageFooter, turnTime, turnTimeFull } from "./ChatMessage";
 
 const TABLE = [
   "Aquí están los resultados en una tabla:",
@@ -176,5 +176,101 @@ describe("user message — skills invoked with it", () => {
     render(<ChatMessage message={{ role: "user", content: "run /release" }} />);
     expect(screen.queryByTestId("skill-chip")).toBeNull();
     expect(screen.getByText("run /release")).toBeInTheDocument();
+  });
+});
+
+describe("turns read apart at a glance", () => {
+  // Local time, in an earlier year, so the header shows a fixed string
+  // whatever the machine's time zone or today's date.
+  const SENT = new Date(2025, 11, 30, 14, 2).toISOString();
+
+  it("sets a user turn on the panel surface, with the brass eyebrow and the time it was sent", () => {
+    render(<ChatMessage message={{ role: "user", content: "Should it fail open?", createdAt: SENT }} />);
+    const turn = screen.getByRole("article", { name: "You, Dec 30, 2025, 14:02" });
+    expect(turn).toHaveAttribute("data-role", "user");
+    expect(turn.className).toContain("bg-octo-panel");
+    expect(turn.className).toContain("border-octo-hairline");
+    expect(within(turn).getByText("— You").className).toContain("text-octo-brass");
+    expect(turn).toHaveAttribute("data-tour", "talk-turn-ask");
+    const stamp = turn.querySelector("time")!;
+    expect(stamp).toHaveAttribute("dateTime", SENT);
+    expect(stamp.textContent).toBe("Dec 30, 2025, 14:02");
+    expect(stamp).toHaveAttribute("title", "Tue, Dec 30, 2025, 14:02");
+  });
+
+  it("puts a user turn's actions in its header, between the eyebrow and the time", () => {
+    render(
+      <ChatMessage
+        message={{ role: "user", content: "Do it", createdAt: SENT }}
+        actions={<button type="button">Fork from here</button>}
+      />,
+    );
+    const turn = screen.getByRole("article", { name: /^You/ });
+    const header = within(turn).getByText("— You").parentElement!;
+    const order = Array.from(header.children).map((el) => el.tagName.toLowerCase());
+    expect(order).toEqual(["span", "div", "time"]);
+    expect(within(header).getByRole("button", { name: "Fork from here" })).toBeInTheDocument();
+    // The actions come before the text in the DOM, so focus reaches them
+    // right after the ask's own label.
+    const body = turn.querySelector(".whitespace-pre-wrap")!;
+    expect(header.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("names a turn without a date just 'You'", () => {
+    render(<ChatMessage message={{ role: "user", content: "hi" }} />);
+    expect(screen.getByRole("article", { name: "You" }).querySelector("time")).toBeNull();
+  });
+
+  it("keeps the model's eyebrow mute: brass belongs to the director's turn", () => {
+    render(<ChatMessage message={{ role: "assistant", content: "Done. All green.", model: "claude-opus-4-7" }} />);
+    const answer = screen.getByRole("article", { name: "Opus 4.7" });
+    const eyebrow = within(answer).getByText("— Opus 4.7");
+    expect(eyebrow.className).toContain("text-octo-mute");
+    expect(eyebrow.className).not.toContain("text-octo-brass");
+  });
+});
+
+describe("turnTime", () => {
+  // Literal strings on purpose: the header is UI copy, English and 24-hour on
+  // every system locale, so the expectation must not be rebuilt with Intl.
+  const now = new Date(2026, 10, 24, 18, 0);
+  const at = (...a: [number, number, number, number, number]) => new Date(...a).toISOString();
+
+  it("is the 24-hour clock time on the same day", () => {
+    expect(turnTime(at(2026, 10, 24, 14, 2), now)).toBe("14:02");
+    expect(turnTime(at(2026, 10, 24, 0, 5), now)).toBe("00:05");
+  });
+
+  it("puts the date in front on any other day", () => {
+    expect(turnTime(at(2026, 10, 23, 9, 30), now)).toBe("Nov 23, 09:30");
+  });
+
+  it("adds the year for an earlier year", () => {
+    expect(turnTime(at(2025, 11, 30, 14, 2), now)).toBe("Dec 30, 2025, 14:02");
+  });
+
+  it("is empty for a missing or unreadable date", () => {
+    expect(turnTime(null)).toBe("");
+    expect(turnTime("not a date")).toBe("");
+  });
+
+  it("stays English and 24-hour when the system locale isn't", () => {
+    const real = Date.prototype.toLocaleTimeString;
+    const realDate = Date.prototype.toLocaleDateString;
+    // Simulate a Spanish (Colombia) default: any call that leaves the
+    // locale to the system gets es-CO.
+    const spy = vi.spyOn(Date.prototype, "toLocaleTimeString").mockImplementation(function (this: Date, locale, opts) {
+      return real.call(this, locale ?? "es-CO", opts);
+    });
+    const spyDate = vi.spyOn(Date.prototype, "toLocaleDateString").mockImplementation(function (this: Date, locale, opts) {
+      return realDate.call(this, locale ?? "es-CO", opts);
+    });
+    try {
+      expect(turnTime(at(2025, 11, 30, 14, 2), now)).toBe("Dec 30, 2025, 14:02");
+      expect(turnTimeFull(at(2025, 11, 30, 14, 2))).toBe("Tue, Dec 30, 2025, 14:02");
+    } finally {
+      spy.mockRestore();
+      spyDate.mockRestore();
+    }
   });
 });

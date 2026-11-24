@@ -56,6 +56,7 @@ function resetStore() {
   useChatStore.setState({
     messagesByWs: {},
     streamingByWs: {},
+    streamSinceByWs: {},
     streamBufferByWs: {},
     errorByWs: {},
     liveToolsByWs: {},
@@ -791,6 +792,30 @@ describe("chatStore — message actions (regenerate / edit-and-resend)", () => {
     expect(ipc.sendChatMessage).toHaveBeenCalledWith(
       expect.objectContaining({ userMessage: "edited prompt" }),
     );
+  });
+
+  it("marks where the running turn starts: the highest id on screen, read after a truncate", async () => {
+    // A plain send: every row on screen predates the turn.
+    await useChatStore.getState().runTurn("ws-1", "/tmp", "t1", { userMessage: "next" });
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(2);
+    // An edit cuts from the user row first, so the rows it removed don't
+    // count: what's left on screen is the previous turns'.
+    useChatStore.setState({ streamingByWs: { "ws-1": false } });
+    await useChatStore.getState().editAndResend("ws-1", "/tmp", 2, "edited");
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(1);
+  });
+
+  it("marks where a `$` command's turn starts too", async () => {
+    let release: (v: unknown) => void = () => {};
+    const run = vi.fn().mockReturnValue(new Promise((r) => { release = r; }));
+    Object.assign(ipc, { runShellCommand: run, listShellHistory: vi.fn().mockResolvedValue([]) });
+    const pending = useChatStore.getState().runShell("ws-1", "/r", "git status");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(useChatStore.getState().getStreaming("ws-1")).toBe(true);
+    expect(useChatStore.getState().streamSinceByWs["ws-1"]).toBe(2);
+    release({ output: "", exitCode: 0, ok: true, cwd: "/r", cwdLabel: "", live: false });
+    await pending;
   });
 
   it("editAndResend is a no-op for blank content", async () => {

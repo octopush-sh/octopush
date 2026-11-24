@@ -12,10 +12,10 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
-import { ChatMarkdown } from "./ChatMarkdown";
 import { OctoWatcher } from "./OctoWatcher";
-import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
+import { WorkBlock } from "./WorkBlock";
+import { groupWork, type TalkBlock } from "../../lib/talkWork";
 import { CrewCard, crewAgentsFromLive, crewAgentsFromTools } from "./CrewCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { SubagentCapCard } from "./SubagentCapCard";
@@ -28,23 +28,6 @@ interface Props {
   onOpenInEditor?: (path: string) => void;
   /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
   onRunInTerminal?: (command: string) => void;
-}
-
-/**
- * The model's words before a round's tool calls — its reasoning in the
- * open ("the tests import X, so let me check…"). A quiet sage line hung on
- * a hairline, so ten tool rounds read as a train of thought instead of a
- * black box; never the eyebrow + key-phrase treatment of an answer.
- */
-function NarrationLine({ text, onOpenInEditor }: { text: string; onOpenInEditor?: (path: string) => void }) {
-  return (
-    <div
-      data-role="narration"
-      className="octo-fade-in octo-selectable border-l border-octo-hairline pl-3 text-[12.5px] leading-[1.55] text-octo-sage"
-    >
-      <ChatMarkdown text={text} onOpenInEditor={onOpenInEditor} />
-    </div>
-  );
 }
 
 /**
@@ -64,6 +47,7 @@ export function ChatCanvas({
 }: Props) {
   const messages = useChatStore((s) => s.getMessages(workspaceId));
   const streaming = useChatStore((s) => s.getStreaming(workspaceId));
+  const streamSince = useChatStore((s) => s.streamSinceByWs[workspaceId]);
   const streamBuffer = useChatStore((s) => s.getStreamBuffer(workspaceId));
   const error = useChatStore((s) => s.getError(workspaceId));
   const liveTools = useChatStore((s) => s.getLiveTools(workspaceId));
@@ -97,6 +81,34 @@ export function ChatCanvas({
     () => buildTimeline(messages),
     [messages],
   );
+  // Narration and tool calls in a row become one work block (lib/talkWork).
+  const blocks = useMemo<TalkBlock[]>(() => groupWork(timeline), [timeline]);
+  // The work of the turn in flight doesn't fold while it streams (it folds
+  // when the turn ends). That work comes after the last user turn AND was
+  // saved after the turn started: the backend saves the new user row a
+  // moment after streaming begins (later still for a `$` command, after its
+  // secret scan), and until it lands the last user turn on screen is the
+  // previous one, whose folded rounds must stay folded.
+  const currentTurnStart = useMemo(() => {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.kind === "message" && b.message.role === "user") return i + 1;
+    }
+    return 0;
+  }, [blocks]);
+  const isLiveWork = (id: number, index: number) =>
+    streaming && index >= currentTurnStart && id > (streamSince ?? -1);
+  // Where the running calls' rows continue the turn's work block: right
+  // under it, as one more row of its last round (no gap) or as a new round
+  // after a narration line (the block's 2px gap), exactly where each row
+  // will land once it resolves, so nothing jumps.
+  const lastBlock = blocks[blocks.length - 1];
+  const liveContinues =
+    lastBlock?.kind === "work"
+      ? lastBlock.entries[lastBlock.entries.length - 1]?.kind === "round"
+        ? "-mt-6"
+        : "-mt-6 pt-0.5"
+      : "";
   const liveAgents = useMemo(() => liveTools.filter((t) => isAgentToolName(t.toolName)), [liveTools]);
   const liveOthers = useMemo(() => liveTools.filter((t) => !isAgentToolName(t.toolName)), [liveTools]);
 
@@ -242,8 +254,8 @@ export function ChatCanvas({
       {isEmpty ? (
         <EmptyState areaRef={scrollRef} />
       ) : (
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-          {timeline.map((item) => {
+        <section aria-label="Conversation" className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+          {blocks.map((item, index) => {
             if (item.kind === "crew") {
               return (
                 <CrewCard
@@ -253,19 +265,18 @@ export function ChatCanvas({
                 />
               );
             }
-            if (item.kind === "tool") {
+            if (item.kind === "work") {
               return (
-                <ToolCallCard
-                  key={`tool-${item.id}`}
-                  tool={item.tool}
+                <WorkBlock
+                  key={`work-${item.id}`}
+                  entries={item.entries}
+                  calls={item.calls}
+                  live={isLiveWork(item.id, index)}
                   workspacePath={workspacePath}
                   onOpenInEditor={onOpenInEditor}
                   onRunInTerminal={onRunInTerminal}
                 />
               );
-            }
-            if (item.kind === "narration") {
-              return <NarrationLine key={`narration-${item.id}`} text={item.text} onOpenInEditor={onOpenInEditor} />;
             }
             if (item.kind === "error") {
               return (
@@ -311,11 +322,22 @@ export function ChatCanvas({
             <CrewCard workspaceId={workspaceId} agents={crewAgentsFromLive(liveAgents)} />
           )}
 
-          {/* Live tool cards — one per in-flight tool, in call order. They
+          {/* Live tool rows — one per in-flight tool, in call order, on the
+              work hairline: when the turn's work block is the last thing on
+              screen the rows continue its line (-mt-6 closes the feed's
+              gap-6), otherwise they start one. Rows sit flush, like a round's. Always this one
+              wrapper, so a row never remounts as its block appears. They
               retire as their resolved rows arrive (see chatStore). */}
-          {liveOthers.map((t) => (
-            <LiveToolCard key={`live-${t.callId}`} tool={t} />
-          ))}
+          {liveOthers.length > 0 && (
+            <div
+              data-role="live-work"
+              className={`flex flex-col border-l border-octo-hairline pl-3 ${liveContinues}`}
+            >
+              {liveOthers.map((t) => (
+                <LiveToolCard key={`live-${t.callId}`} tool={t} />
+              ))}
+            </div>
+          )}
 
           {/* Turn-limit cards — a writing sub-agent stopped mid-work; the
               turn is paused until the user grants turns or accepts. */}
@@ -371,7 +393,7 @@ export function ChatCanvas({
               }
             />
           ) : null}
-        </div>
+        </section>
       )}
     </div>
       {/* Bottom exit wash — keeps the pinned Player legible over the journal
@@ -458,7 +480,9 @@ function MessageRow({
   const [draft, setDraft] = useState("");
 
   function handleCopy() {
-    copy(ref.current?.innerText ?? message.content);
+    // A user turn copies exactly what was sent; its header (eyebrow, time)
+    // is chrome. An answer copies its rendered text, as before.
+    copy(message.role === "user" ? message.content : (ref.current?.innerText ?? message.content));
   }
 
   function startEdit() {
@@ -510,73 +534,86 @@ function MessageRow({
   // A tour pointing at one of these actions shows the bar, as a hover would.
   const toured = tourTarget !== null && actionsRef.current?.contains(tourTarget) === true;
 
+  const isUser = message.role === "user";
+  const actions = (
+    <div
+      ref={actionsRef}
+      data-tour={onFork ? tourId("talk-turn-actions") : undefined}
+      className={`flex items-center gap-0.5 transition group-hover/msg:opacity-100 focus-within:opacity-100 ${
+        isUser ? "" : "absolute -top-1 right-0 "
+      }${toured ? "opacity-100" : "opacity-0"}`}
+    >
+      {onRewind && (
+        <RowAction
+          label="Rewind files to here"
+          tour={tourId("talk-turn-rewind")}
+          onClick={() => onRewind(message.id)}
+          disabled={disabled}
+          icon={<History size={12} />}
+        />
+      )}
+      {!onRewind && noCheckpoint !== undefined && (
+        <span
+          role="img"
+          data-tour={tourId("talk-turn-no-checkpoint")}
+          aria-label={skippedLabel(noCheckpoint)}
+          title={skippedLabel(noCheckpoint)}
+          className="flex h-6 w-6 items-center justify-center rounded p-1 text-octo-mute opacity-60"
+        >
+          <CircleSlash size={12} aria-hidden />
+        </span>
+      )}
+      {onFork && (
+        <RowAction
+          label="Fork from here"
+          tour={tourId("talk-turn-fork")}
+          onClick={() => onFork(message.id)}
+          disabled={disabled}
+          icon={<GitFork size={12} />}
+        />
+      )}
+      {onEdit && (
+        <RowAction
+          label="Edit & resend"
+          onClick={startEdit}
+          disabled={disabled}
+          icon={<Pencil size={12} />}
+        />
+      )}
+      {onRegenerate && (
+        <RowAction
+          label="Regenerate"
+          onClick={() => onRegenerate(message.id)}
+          disabled={disabled}
+          icon={<RefreshCw size={12} />}
+        />
+      )}
+      <RowAction
+        label={copied ? "Copied" : "Copy message"}
+        onClick={handleCopy}
+        icon={
+          copied ? (
+            <Check size={12} className="text-octo-verdigris" />
+          ) : (
+            <Copy size={12} />
+          )
+        }
+      />
+    </div>
+  );
+
+  // The actions live inside their turn's article. A user turn sets them in
+  // its header, between "— You" and the time, so they come right after the
+  // ask in focus order; an answer sets them over its eyebrow line, last in
+  // its article, so they come after its text.
   return (
     <div className="group/msg relative">
       <div ref={ref}>
-        <ChatMessage message={message} onOpenInEditor={onOpenInEditor} skillNames={skillNames} />
-      </div>
-      <div
-        ref={actionsRef}
-        data-tour={onFork ? tourId("talk-turn-actions") : undefined}
-        className={`absolute -top-1 right-0 flex items-center gap-0.5 transition group-hover/msg:opacity-100 focus-within:opacity-100 ${
-          toured ? "opacity-100" : "opacity-0"
-        }`}
-      >
-        {onRewind && (
-          <RowAction
-            label="Rewind files to here"
-            tour={tourId("talk-turn-rewind")}
-            onClick={() => onRewind(message.id)}
-            disabled={disabled}
-            icon={<History size={12} />}
-          />
-        )}
-        {!onRewind && noCheckpoint !== undefined && (
-          <span
-            role="img"
-            data-tour={tourId("talk-turn-no-checkpoint")}
-            aria-label={skippedLabel(noCheckpoint)}
-            title={skippedLabel(noCheckpoint)}
-            className="flex h-6 w-6 items-center justify-center rounded p-1 text-octo-mute opacity-60"
-          >
-            <CircleSlash size={12} aria-hidden />
-          </span>
-        )}
-        {onFork && (
-          <RowAction
-            label="Fork from here"
-            tour={tourId("talk-turn-fork")}
-            onClick={() => onFork(message.id)}
-            disabled={disabled}
-            icon={<GitFork size={12} />}
-          />
-        )}
-        {onEdit && (
-          <RowAction
-            label="Edit & resend"
-            onClick={startEdit}
-            disabled={disabled}
-            icon={<Pencil size={12} />}
-          />
-        )}
-        {onRegenerate && (
-          <RowAction
-            label="Regenerate"
-            onClick={() => onRegenerate(message.id)}
-            disabled={disabled}
-            icon={<RefreshCw size={12} />}
-          />
-        )}
-        <RowAction
-          label={copied ? "Copied" : "Copy message"}
-          onClick={handleCopy}
-          icon={
-            copied ? (
-              <Check size={12} className="text-octo-verdigris" />
-            ) : (
-              <Copy size={12} />
-            )
-          }
+        <ChatMessage
+          message={message}
+          onOpenInEditor={onOpenInEditor}
+          skillNames={skillNames}
+          actions={actions}
         />
       </div>
     </div>
