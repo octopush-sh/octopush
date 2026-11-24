@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { HunkRail } from "./HunkRail";
 import { DiffLines } from "./DiffLines";
-import { CommentComposer, HunkCommentList } from "./HunkComments";
+import { HunkCommentComposer, HunkCommentList } from "./HunkComments";
 import { MidTruncate } from "../primitives/MidTruncate";
 import { useReviewPrefs } from "../../stores/reviewPrefsStore";
 import { ipc } from "../../lib/ipc";
@@ -38,6 +38,8 @@ interface Props {
   /** Open a draft on a hunk, or on one of its rows (`extend` = shift-click). */
   onStartComment?: (hunkIdx: number, rowIdx?: number, extend?: boolean) => void;
   onDraftNote?: (note: string) => void;
+  /** The draft's keyboard line picking: move its line, or extend its range. */
+  onMovePick?: (dir: -1 | 1, extend: boolean) => void;
   onSubmitComment?: () => void;
   onCancelComment?: () => void;
   onRemoveComment?: (id: string) => void;
@@ -60,6 +62,7 @@ export function FileDiffSection({
   comments = [],
   onStartComment,
   onDraftNote,
+  onMovePick,
   onSubmitComment,
   onCancelComment,
   onRemoveComment,
@@ -215,13 +218,14 @@ export function FileDiffSection({
                 />
               )}
               {draft?.hunkIdx === i && onDraftNote && onSubmitComment && onCancelComment && (
-                <CommentComposer
+                <HunkCommentComposer
                   location={commentLocation(draft.anchor)}
                   note={draft.note}
                   stale={draft.stale}
                   onNoteChange={onDraftNote}
                   onSubmit={onSubmitComment}
                   onCancel={onCancelComment}
+                  onMovePick={onMovePick}
                 />
               )}
             </div>

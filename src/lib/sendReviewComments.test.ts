@@ -3,8 +3,10 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 const { pushToastMock } = vi.hoisted(() => ({ pushToastMock: vi.fn() }));
 vi.mock("../components/Toasts", () => ({ pushToast: pushToastMock }));
 
-import { commentTarget, forgetPendingGateSends, sendReviewComments } from "./sendReviewComments";
+import { commentTarget, forgetPendingGateSends, sendBackMessage, sendReviewComments } from "./sendReviewComments";
+import { labelForRole } from "./stageMeta";
 import { useReviewComments } from "../stores/reviewCommentsStore";
+import { useGateCommentsStore } from "../stores/gateCommentsStore";
 import { useRunsStore } from "../stores/runsStore";
 import { useChatStore } from "../stores/chatStore";
 import { NAVIGATE_EVENT } from "./tour/surfaces";
@@ -48,6 +50,7 @@ describe("sendReviewComments", () => {
     window.removeEventListener(NAVIGATE_EVENT, onNav);
     window.addEventListener(NAVIGATE_EVENT, onNav);
     useReviewComments.setState({ byWs: {}, liveByWs: {} });
+    useGateCommentsStore.setState({ byGate: {} });
     pushToastMock.mockClear();
     forgetPendingGateSends();
     useRunsStore.setState({ runsByWs: {}, detailByRun: {}, runErrors: {}, resolve });
@@ -93,12 +96,49 @@ describe("sendReviewComments", () => {
 
   it("sends back the latest run's gate with the comments as its feedback", async () => {
     parked();
-    expect(commentTarget("w1")).toEqual({ kind: "gate", runId: "r1", stageId: "rev", role: "implementer", iteration: 0 });
+    expect(commentTarget("w1")).toEqual({
+      kind: "gate", runId: "r1", stageId: "rev", gate: "rev:", gateRole: labelForRole("reviewer"), role: labelForRole("implementer"), iteration: 0,
+    });
     useReviewComments.getState().add("w1", note);
     await sendReviewComments("w1", "/w1");
     expect(resolve).toHaveBeenCalledWith("r1", "rev", "send_back", { feedback: expect.stringContaining("Rename x.") });
     expect(send).not.toHaveBeenCalled();
     expect(modes).toEqual(["direct"]);
+  });
+
+  it("carries the gate's inline comments in the same message, and clears them once applied (#1051)", async () => {
+    parked();
+    useGateCommentsStore.getState().add("rev:", "Step two", "Too vague.", 10, 8);
+    useReviewComments.getState().add("w1", note);
+    await sendReviewComments("w1", "/w1");
+    expect(resolve).toHaveBeenCalledTimes(1);
+    const feedback = (resolve.mock.calls[0][3] as { feedback: string }).feedback;
+    expect(feedback).toContain("Rename x.");
+    expect(feedback).toContain(`On ${labelForRole("reviewer")}'s output at the gate:`);
+    expect(feedback).toContain('1. On "Step two":\n   Too vague.');
+    expect(feedback.indexOf("Rename x.")).toBeLessThan(feedback.indexOf("Too vague."));
+    // Accepted, not yet applied: the gate keeps them.
+    expect(useGateCommentsStore.getState().byGate["rev:"]).toHaveLength(1);
+    parked({ status: "pending", loopIterations: 1 });
+    expect(useGateCommentsStore.getState().byGate["rev:"]).toBeUndefined();
+  });
+
+  it("leaves the gate's comments on the gate when the send-back is refused", async () => {
+    parked();
+    useGateCommentsStore.getState().add("rev:", "Step two", "Too vague.", 10, 8);
+    useReviewComments.getState().add("w1", note);
+    resolve.mockResolvedValueOnce(false);
+    await sendReviewComments("w1", "/w1");
+    expect(useGateCommentsStore.getState().byGate["rev:"]).toHaveLength(1);
+
+    await sendReviewComments("w1", "/w1");
+    useRunsStore.getState().noteRunError("r1", "run is already executing");
+    expect(useGateCommentsStore.getState().byGate["rev:"]).toHaveLength(1);
+    expect(useReviewComments.getState().byWs.w1).toHaveLength(1);
+  });
+
+  it("sends only the tray's comments when the gate has none", () => {
+    expect(sendBackMessage("review", [], "Reviewer")).toBe("review");
   });
 
   it("falls back to Talk once the gate's loop is at its cap", () => {

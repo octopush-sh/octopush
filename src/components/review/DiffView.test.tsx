@@ -117,10 +117,69 @@ describe("DiffView", () => {
           { kind: "add", text: "c", oldLine: null, newLine: 6 },
         ] }],
     }];
-    const view = (fs: DiffFile[], readOnly = false) => (
-      <DiffView files={fs} workspacePath="/w" workspaceId="w1" readOnly={readOnly} onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />
+    const view = (fs: DiffFile[], readOnly = false, ws = "w1") => (
+      <DiffView files={fs} workspacePath={`/${ws}`} workspaceId={ws} readOnly={readOnly} onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />
     );
-    beforeEach(() => useReviewComments.setState({ byWs: {}, liveByWs: {} }));
+    beforeEach(() => useReviewComments.setState({ byWs: {}, liveByWs: {}, draftByWs: {} }));
+
+    it("⌥↓ / ⌥↑ in the field pick a line, and with ⇧ extend the range (#1051)", () => {
+      const { getByLabelText, getByText, container } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      const field = getByLabelText("What should change");
+      fireEvent.change(field, { target: { value: "Half a tho" } });
+      fireEvent.keyDown(field, { key: "ArrowDown", altKey: true });
+      expect(getByText("src/a.ts:4")).toBeTruthy();
+      fireEvent.keyDown(field, { key: "ArrowDown", altKey: true });
+      expect(getByText("src/a.ts:5")).toBeTruthy();
+      fireEvent.keyDown(field, { key: "ArrowDown", altKey: true, shiftKey: true });
+      expect(getByText("src/a.ts:5–6")).toBeTruthy();
+      expect(container.querySelectorAll("[data-picked]")).toHaveLength(2);
+      // The field keeps the focus and the note; ⌘⏎ adds the picked lines.
+      expect(document.activeElement).toBe(field);
+      fireEvent.keyDown(field, { key: "Enter", metaKey: true });
+      expect(useReviewComments.getState().byWs.w1).toEqual([
+        expect.objectContaining({ startLine: 5, endLine: 6, quote: ["+b", "+c"], note: "Half a tho" }),
+      ]);
+    });
+
+    it("a plain arrow in the field stays the field's", () => {
+      const { getByLabelText, getByText } = render(view(two));
+      fireEvent.keyDown(window, { key: "m" });
+      const field = getByLabelText("What should change");
+      expect(fireEvent.keyDown(field, { key: "ArrowDown" })).toBe(true);
+      expect(getByText("src/a.ts:4–6")).toBeTruthy();
+    });
+
+    it("keeps a half-typed note in its workspace while the view shows another (#1051)", () => {
+      pushToastMock.mockClear();
+      // As App feeds it: on a switch the old workspace's diff stays for a
+      // render, then the diff is empty until the new one is fetched.
+      const at = (ws: string, fs: DiffFile[], diffWs: string | null) => (
+        <DiffView files={fs} workspacePath={`/${ws}`} workspaceId={ws} diffWorkspaceId={diffWs} onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />
+      );
+      // w2 changed the same path elsewhere: its hunk is not the draft's.
+      const other: DiffFile[] = [{ ...two[0], hunks: [{ ...two[0].hunks[0], header: "@@ -40 +40 @@", rawText: "other",
+        rows: [{ kind: "add", text: "q", oldLine: null, newLine: 40 }] }] }];
+      const { getByLabelText, getByText, queryByLabelText, rerender } = render(at("w1", two, "w1"));
+      fireEvent.keyDown(window, { key: "m" });
+      const field = getByLabelText("What should change");
+      fireEvent.change(field, { target: { value: "Half a tho" } });
+      fireEvent.keyDown(field, { key: "ArrowDown", altKey: true });
+      rerender(at("w2", two, "w1"));
+      rerender(at("w2", [], null));
+      rerender(at("w2", other, "w2"));
+      expect(queryByLabelText("What should change")).toBeNull();
+      rerender(at("w1", other, "w2"));
+      rerender(at("w1", [], null));
+      rerender(at("w1", two, "w1"));
+      expect((getByLabelText("What should change") as HTMLTextAreaElement).value).toBe("Half a tho");
+      // Still on the line it was picked on, not marked outdated.
+      expect(getByText("src/a.ts:4")).toBeTruthy();
+      expect(document.querySelector("[data-comment-stale]")).toBeNull();
+      expect(useReviewComments.getState().byWs.w1 ?? []).toEqual([]);
+      expect(useReviewComments.getState().byWs.w2 ?? []).toEqual([]);
+      expect(pushToastMock).not.toHaveBeenCalled();
+    });
 
     it("m opens a comment on the focused hunk; ⌘⏎ adds it to the tray and shows it under the hunk", () => {
       const { getByLabelText, getByText } = render(view(two));

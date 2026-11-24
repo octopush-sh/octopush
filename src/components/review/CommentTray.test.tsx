@@ -4,6 +4,9 @@ import { CommentTray } from "./CommentTray";
 import { useReviewComments } from "../../stores/reviewCommentsStore";
 import { useRunsStore } from "../../stores/runsStore";
 import { useChatStore } from "../../stores/chatStore";
+import { useGateCommentsStore } from "../../stores/gateCommentsStore";
+import { labelForRole } from "../../lib/stageMeta";
+import type { Run, RunStage } from "../../lib/ipc";
 
 const base = { filePath: "src/a.ts", startLine: 2, endLine: 3, quote: ["+one", "+two", "+three", "+four"], note: "Name these." };
 
@@ -49,6 +52,25 @@ describe("CommentTray", () => {
     // Old-side numbers are not lines of the file on disk.
     fireEvent.click(getByRole("button", { name: "src/a.ts:2–3 (removed)" }));
     expect(onJump).toHaveBeenCalledWith("src/a.ts", null);
+  });
+
+  it("says the gate's own comments go along with a send-back (#1051)", () => {
+    const run = { id: "r1", workspaceId: "w1", status: "paused" } as Run;
+    const st = (over: Partial<RunStage>) =>
+      ({ id: "s", position: 0, role: "implementer", status: "done", startedAt: "t", artifact: null, finishedAt: "f",
+        loopMode: null, loopTargetPosition: null, loopIterations: 0, loopMaxIterations: 3, ...over }) as RunStage;
+    useRunsStore.setState({
+      runsByWs: { w1: [run] },
+      detailByRun: { r1: { run, stages: [st({ id: "impl" }), st({ id: "rev", position: 1, role: "reviewer", status: "awaiting_checkpoint", loopMode: "gated", loopTargetPosition: 0 })] } },
+    });
+    useGateCommentsStore.setState({ byGate: {} });
+    act(() => {
+      useReviewComments.getState().add("w1", { ...base, fingerprint: "live" });
+      useGateCommentsStore.getState().add("rev:f", "Step two", "Too vague.", 0, 8);
+      useGateCommentsStore.getState().add("rev:f", "Step three", "Drop it.", 20, 10);
+    });
+    const { container } = render(<CommentTray workspaceId="w1" workspacePath="/w1" />);
+    expect(container.querySelector('[data-tour="review-companion-gate-comments"]')?.textContent).toBe(`, with 2 comments on ${labelForRole("reviewer")}`);
   });
 
   it("Send to the agent delivers them; it waits while Talk is answering", async () => {
