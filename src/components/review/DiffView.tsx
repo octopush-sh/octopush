@@ -19,6 +19,11 @@ interface Props {
   /** Turns on review comments (#956) in the working-tree view: their tray is
    *  per workspace. */
   workspaceId?: string;
+  /** The workspace `files` were fetched for; null while none is (a switch
+   *  with its fetch in flight, or a mode that fetches no diff). Until it is
+   *  `workspaceId`, the diff on screen says nothing about that workspace's
+   *  draft. Left out, `files` are taken as `workspaceId`'s. */
+  diffWorkspaceId?: string | null;
   stagedCount?: number;
   /** The committed view (#851): no Accept / Reject, by click or key. */
   readOnly?: boolean;
@@ -66,13 +71,18 @@ export function DiffView(props: Props) {
   // the store, per workspace, not in the field or this view: nothing that
   // remounts the field loses the note, and a workspace switch under the view
   // leaves it waiting in its own workspace (#1051).
-  const draft = useReviewComments((s) => (commentWs ? s.draftByWs[commentWs] ?? null : null));
+  // Right after a workspace switch, `files` are still the previous
+  // workspace's diff, then empty until the new fetch lands: reading the
+  // draft against them would move it to the wrong hunk or into the tray.
+  const ownDiff = props.diffWorkspaceId === undefined || props.diffWorkspaceId === commentWs;
+  const stored = useReviewComments((s) => (commentWs ? s.draftByWs[commentWs] ?? null : null));
+  const draft = ownDiff ? stored : null;
   const setDraft = (next: CommentDraft | null | ((d: CommentDraft | null) => CommentDraft | null)) => {
     if (commentWs) useReviewComments.getState().setDraft(commentWs, next);
   };
   useEffect(() => {
-    if (commentWs) useReviewComments.getState().setLive(commentWs, liveHunkKeys(files));
-  }, [commentWs, files]);
+    if (commentWs && ownDiff) useReviewComments.getState().setLive(commentWs, liveHunkKeys(files));
+  }, [commentWs, ownDiff, files]);
   // A refetch (the agent is still editing) must not take a half-typed note
   // away: the draft follows its hunk, stays open as outdated when the hunk
   // changed, and is kept in the tray when its file left the diff.

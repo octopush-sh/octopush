@@ -151,15 +151,34 @@ describe("DiffView", () => {
     });
 
     it("keeps a half-typed note in its workspace while the view shows another (#1051)", () => {
-      const { getByLabelText, queryByLabelText, rerender } = render(view(two));
+      pushToastMock.mockClear();
+      // As App feeds it: on a switch the old workspace's diff stays for a
+      // render, then the diff is empty until the new one is fetched.
+      const at = (ws: string, fs: DiffFile[], diffWs: string | null) => (
+        <DiffView files={fs} workspacePath={`/${ws}`} workspaceId={ws} diffWorkspaceId={diffWs} onAccept={vi.fn()} onReject={vi.fn()} onWhy={vi.fn()} onOpen={vi.fn()} />
+      );
+      // w2 changed the same path elsewhere: its hunk is not the draft's.
+      const other: DiffFile[] = [{ ...two[0], hunks: [{ ...two[0].hunks[0], header: "@@ -40 +40 @@", rawText: "other",
+        rows: [{ kind: "add", text: "q", oldLine: null, newLine: 40 }] }] }];
+      const { getByLabelText, getByText, queryByLabelText, rerender } = render(at("w1", two, "w1"));
       fireEvent.keyDown(window, { key: "m" });
-      fireEvent.change(getByLabelText("What should change"), { target: { value: "Half a tho" } });
-      rerender(view(two, false, "w2"));
+      const field = getByLabelText("What should change");
+      fireEvent.change(field, { target: { value: "Half a tho" } });
+      fireEvent.keyDown(field, { key: "ArrowDown", altKey: true });
+      rerender(at("w2", two, "w1"));
+      rerender(at("w2", [], null));
+      rerender(at("w2", other, "w2"));
       expect(queryByLabelText("What should change")).toBeNull();
-      expect(useReviewComments.getState().byWs.w2 ?? []).toEqual([]);
-      rerender(view(two, false, "w1"));
+      rerender(at("w1", other, "w2"));
+      rerender(at("w1", [], null));
+      rerender(at("w1", two, "w1"));
       expect((getByLabelText("What should change") as HTMLTextAreaElement).value).toBe("Half a tho");
+      // Still on the line it was picked on, not marked outdated.
+      expect(getByText("src/a.ts:4")).toBeTruthy();
+      expect(document.querySelector("[data-comment-stale]")).toBeNull();
       expect(useReviewComments.getState().byWs.w1 ?? []).toEqual([]);
+      expect(useReviewComments.getState().byWs.w2 ?? []).toEqual([]);
+      expect(pushToastMock).not.toHaveBeenCalled();
     });
 
     it("m opens a comment on the focused hunk; ⌘⏎ adds it to the tray and shows it under the hunk", () => {
