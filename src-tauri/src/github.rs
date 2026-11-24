@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppError, AppResult};
+
 /// The lifecycle state of a pull request, as understood by Octopush.
 ///
 /// GitHub's REST API returns two fields — `state` ("open"/"closed") and
@@ -331,15 +333,20 @@ pub fn pr_infos_from_json(raw: &str) -> Result<Vec<PrInfo>, String> {
 }
 
 /// The login-shell command that materialises a PR's head ref as a local
-/// branch: `git fetch origin pull/<n>/head:<headRefName>`. Single quotes in
-/// the branch name are shell-escaped (`'\''`), which is safe only because a
-/// ref can't contain a backslash (see `git_ops::quote_git_ref`).
-pub fn pr_fetch_command(number: u64, head_ref_name: &str) -> String {
-    format!(
-        "git fetch origin 'pull/{}/head:{}' 2>&1",
-        number,
-        head_ref_name.replace('\'', "'\\''"),
-    )
+/// branch: `git fetch origin pull/<n>/head:<headRefName>`. The refspec is
+/// single-quoted with `git_ops::quote_git_ref`, so the name must pass
+/// `git_ops::is_git_ref_arg` first; anything else is refused before a shell
+/// runs (without echoing the name, which came from GitHub).
+pub fn pr_fetch_command(number: u64, head_ref_name: &str) -> AppResult<String> {
+    if !crate::git_ops::is_git_ref_arg(head_ref_name) {
+        return Err(AppError::Other(format!(
+            "The head branch of PR #{number} isn't a valid branch name."
+        )));
+    }
+    Ok(format!(
+        "git fetch origin {} 2>&1",
+        crate::git_ops::quote_git_ref(&format!("pull/{number}/head:{head_ref_name}")),
+    ))
 }
 
 pub fn pr_from_json(v: &serde_json::Value) -> Pr {

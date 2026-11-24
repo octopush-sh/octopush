@@ -14489,7 +14489,7 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_targets_the_pr_head_ref() {
         assert_eq!(
-            pr_fetch_command(42, "feat/dark-mode"),
+            pr_fetch_command(42, "feat/dark-mode").unwrap(),
             "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
         );
     }
@@ -14497,9 +14497,39 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_escapes_single_quotes_in_the_branch() {
         assert_eq!(
-            pr_fetch_command(1, "weird'name"),
+            pr_fetch_command(1, "weird'name").unwrap(),
             "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
         );
+    }
+
+    #[test]
+    fn fetch_command_refuses_a_head_ref_that_isnt_a_branch_name() {
+        for bad in ["a\\'; touch PWNED; echo '", "-x", "--upload-pack=touch PWNED", "a b", ""] {
+            let err = pr_fetch_command(9, bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            assert!(err.contains("PR #9"), "{err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_pr_branch_refuses_a_hostile_head_ref_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let hostile = "a\\'; touch PWNED; echo '";
+        let err = tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            hostile.into(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+        assert!(!err.contains(hostile), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]
@@ -22600,6 +22630,35 @@ mod secret_guard_tests {
         let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
         let r = crate::commands::push_branch(path, None).await;
         assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
+    }
+
+    #[test]
+    fn the_push_command_quotes_only_a_branch_name() {
+        assert_eq!(
+            crate::commands::push_command("feat/it's").unwrap(),
+            "git push --set-upstream origin 'feat/it'\\''s' 2>&1",
+        );
+        for bad in ["-x", "--force", "a\\'; touch PWNED; echo '", "a b", ""] {
+            let err = crate::commands::push_command(bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    /// git lets a ref like `refs/heads/-x` exist (only `git branch` refuses
+    /// the name), so the branch HEAD is on can read as an option.
+    #[tokio::test]
+    async fn push_refuses_a_branch_that_reads_as_an_option() {
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/heads/-x", head, false, "test").unwrap();
+        repo.set_head("refs/heads/-x").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let err = crate::commands::push_branch(path, None).await.unwrap_err().to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
     }
 
     const HEX: &str = "0123456789abcdef";
