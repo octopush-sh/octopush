@@ -306,6 +306,12 @@ pub struct StageSpec {
     /// reports the conversation's whole total, so its `--max-budget-usd` cap
     /// adds this on top of the remaining headroom.
     pub resume_prior_cost_usd: f64,
+    /// For a resumed Claude session: the context its last reply read (the
+    /// stage's context reading when the Resume or answer set `resume_pending`;
+    /// `None` when none was recorded, and on a fresh run). A resume whose
+    /// first reply reads far less came back on an empty conversation
+    /// (`cli_runner::ResumeWatch`).
+    pub resume_context_tokens: Option<u64>,
     /// For a resumed Codex session: the token totals the session had reported
     /// at the end of its last run. `codex exec resume` reports the THREAD's
     /// running total on `turn.completed` (the earlier runs' tokens included),

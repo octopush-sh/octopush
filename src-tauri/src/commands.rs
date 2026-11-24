@@ -834,6 +834,9 @@ pub struct CreatedWorkspace {
     pub setup_terminal_id: Option<String>,
     /// Why the setup script couldn't be started. The workspace itself is fine.
     pub setup_error: Option<String>,
+    /// What the fresh worktree borrowed from the main checkout (#961); `None`
+    /// when the project shares nothing or the worktree wasn't fresh.
+    pub shared: Option<crate::worktree_share::ShareOutcome>,
 }
 
 /// Start `script` in a new `setup` Run terminal in `ws`'s worktree. The PTY
@@ -844,6 +847,7 @@ fn start_setup_terminal(
     ws: &crate::db::WorkspaceRow,
     project_root: &str,
     script: &str,
+    shared: Option<String>,
 ) -> AppResult<String> {
     use crate::workspace_setup as setup;
     let cwd = ws
@@ -854,7 +858,10 @@ fn start_setup_terminal(
     let terminal = insert_terminal(state, ws.id.clone(), setup::TERMINAL_LABEL.to_string())?;
     // The script, plus Conductor's variables for every setup script, so scripts
     // written for Conductor work unchanged (the runner skips any the user exports).
-    let env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    let mut env = setup::runner_env(script, project_root, &cwd, &ws.name);
+    if let Some(line) = shared {
+        env.insert(setup::SHARED_ENV.to_string(), line);
+    }
     if let Err(e) = spawn_terminal_session(
         app.clone(),
         state,
@@ -917,6 +924,115 @@ pub async fn conductor_setup_script(
     .flatten())
 }
 
+/// The step-3 "Share with new missions" list: what the project shares now
+/// (`saved`) and what its main checkout could share (`available`, see
+/// `worktree_share::candidates`). The repo is the project's path in the DB,
+/// never a path the caller sends.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShareOptions {
+    pub saved: crate::worktree_share::ShareSpec,
+    pub available: crate::worktree_share::ShareSpec,
+}
+
+#[tauri::command]
+pub async fn share_with_missions(state: State<'_, AppState>, project_id: String) -> AppResult<ShareOptions> {
+    let (saved, root) = {
+        let db = state.db.lock();
+        let saved = db.get_project_share(&project_id)?;
+        let root = db.get_project_by_id(&project_id)?.map(|(_, _, path)| expand_tilde(&path));
+        (saved, root)
+    };
+    let available = match root {
+        Some(root) => tauri::async_runtime::spawn_blocking(move || {
+            crate::worktree_share::candidates(std::path::Path::new(&root))
+        })
+        .await
+        .unwrap_or_default(),
+        None => crate::worktree_share::ShareSpec::default(),
+    };
+    Ok(ShareOptions { saved, available })
+}
+
+/// Remember what the project shares with new missions (sanitized: only the
+/// allowed link and copy names are kept).
+#[tauri::command]
+pub async fn set_share_with_missions(
+    state: State<'_, AppState>,
+    project_id: String,
+    spec: crate::worktree_share::ShareSpec,
+) -> AppResult<()> {
+    state.db.lock().set_project_share(&project_id, &spec)
+}
+
+/// Apply the project's "Share with new missions" list to a freshly created
+/// worktree — never a reused, restored or adopted one, nor the main checkout.
+/// A sandboxed mission gets neither links nor env copies (`worktree_share`).
+/// Only `create_workspace` (the app's own new-mission path) calls this: a
+/// Routine's fresh worktree and an `octopush-mcp` workspace do not share.
+pub(crate) fn share_into_fresh_worktree(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    outcome: crate::workspace::CreateOutcome,
+    project_id: &str,
+    project_root: &str,
+    ws: &crate::db::WorkspaceRow,
+    exec_isolation: &str,
+) -> Option<crate::worktree_share::ShareOutcome> {
+    if outcome != crate::workspace::CreateOutcome::Created {
+        return None;
+    }
+    let wt = ws.worktree_path.as_deref()?;
+    let spec = db.lock().get_project_share(project_id).ok()?;
+    if spec.is_empty()
+        || crate::worktree_share::same_dir(std::path::Path::new(wt), std::path::Path::new(project_root))
+    {
+        return None;
+    }
+    Some(crate::worktree_share::apply(
+        std::path::Path::new(project_root),
+        std::path::Path::new(wt),
+        &spec,
+        exec_isolation == "sandbox",
+    ))
+}
+
+/// When a mission's Execution becomes `sandbox`, take back what "Share with
+/// new missions" gave its worktree (`worktree_share::unshare`): the links,
+/// which the sandbox would refuse reads and writes through, and each copied
+/// env file that is still identical to the main checkout's (a sandboxed
+/// stage could read it). Only what Octopush recorded making is touched.
+pub(crate) fn unshare_for_sandbox(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: Option<&str>,
+) -> crate::worktree_share::Unshared {
+    let Some(ws_id) = workspace_id else { return Default::default() };
+    let found = {
+        let db = db.lock();
+        let ws = db.get_workspace(ws_id).ok().flatten();
+        let root = ws
+            .as_ref()
+            .and_then(|w| db.get_project(&w.project_id).ok().flatten())
+            .map(|p| expand_tilde(&p.path));
+        ws.and_then(|w| w.worktree_path).zip(root)
+    };
+    let Some((wt, root)) = found else { return Default::default() };
+    crate::worktree_share::unshare(std::path::Path::new(&root), std::path::Path::new(&wt))
+}
+
+/// One sentence per entry `unshare_for_sandbox` handled, in the wording of
+/// `ShareOutcome::skipped`.
+pub(crate) fn unshared_sentences(done: &crate::worktree_share::Unshared) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    out.extend(done.unlinked.iter().map(|n| format!("{n}: link removed in a sandboxed mission")));
+    out.extend(done.uncopied.iter().map(|n| format!("{n}: copy removed in a sandboxed mission")));
+    out.extend(
+        done.kept
+            .iter()
+            .map(|n| format!("{n}: kept, it was changed in this mission; its agents can read it")),
+    );
+    out
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub async fn create_workspace(
@@ -975,11 +1091,25 @@ pub async fn create_workspace(
         }
     }
     install_claude_hooks_later(state.inner(), ws.clone());
+    // Links and copies land before the setup script, which can use them.
+    let mut shared = share_into_fresh_worktree(&state.db, outcome, &project_id, &project_path_expanded, &ws, exec_isolation);
+    // A reused worktree reopened as a sandboxed mission gives back what an
+    // earlier, unsandboxed mission was given.
+    if exec_isolation == "sandbox" && outcome != crate::workspace::CreateOutcome::Created {
+        let done = unshare_for_sandbox(&state.db, Some(&ws.id));
+        if !done.is_empty() {
+            shared = Some(crate::worktree_share::ShareOutcome {
+                skipped: unshared_sentences(&done),
+                ..Default::default()
+            });
+        }
+    }
+    let shared_line = shared.as_ref().and_then(|s| s.summary());
     // The setup script never blocks the workspace: a start failure is reported
     // alongside it, and a failing script shows in its terminal.
     let (setup_terminal_id, setup_error) =
         if crate::workspace_setup::should_run(outcome, &setup_script) {
-            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script) {
+            match start_setup_terminal(&app, state.inner(), &ws, &project_path_expanded, &setup_script, shared_line) {
                 Ok(id) => (Some(id), None),
                 Err(e) => {
                     tracing::warn!(workspace = %ws.id, error = %e, "setup script could not be started");
@@ -989,7 +1119,7 @@ pub async fn create_workspace(
         } else {
             (None, None)
         };
-    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error })
+    Ok(CreatedWorkspace { workspace: ws, setup_terminal_id, setup_error, shared })
 }
 
 // ─── Mission commands ─────────────────────────────────────────────
@@ -1035,6 +1165,20 @@ pub async fn create_mission(
     )
 }
 
+/// `update_mission`'s response: the mission, plus what was taken back from
+/// its worktree when its Execution became `sandbox` (`unshare_for_sandbox`):
+/// the links removed, the env copies removed, and the env copies kept
+/// because they changed in the mission.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatedMission {
+    #[serde(flatten)]
+    pub mission: crate::db::MissionRow,
+    pub unlinked: Vec<String>,
+    pub uncopied: Vec<String>,
+    pub kept_copies: Vec<String>,
+}
+
 #[tauri::command]
 pub async fn update_mission(
     state: State<'_, AppState>,
@@ -1043,7 +1187,7 @@ pub async fn update_mission(
     status: Option<String>,
     linked_issue_key: Option<String>,
     exec_isolation: Option<String>,
-) -> AppResult<crate::db::MissionRow> {
+) -> AppResult<UpdatedMission> {
     if let Some(s) = status.as_deref() {
         crate::mission::validate_status(s)?;
     }
@@ -1077,7 +1221,12 @@ pub async fn update_mission(
             archive_workspace_internal(&state, ws_id)?;
         }
     }
-    Ok(updated)
+    let done = if exec_isolation.as_deref() == Some("sandbox") {
+        unshare_for_sandbox(&state.db, updated.workspace_id.as_deref())
+    } else {
+        Default::default()
+    };
+    Ok(UpdatedMission { mission: updated, unlinked: done.unlinked, uncopied: done.uncopied, kept_copies: done.kept })
 }
 
 /// Archive a workspace's worktree (on disk, if Octopush owns it) + DB row,
@@ -1089,6 +1238,19 @@ fn archive_workspace_internal(state: &AppState, workspace_id: &str) -> AppResult
     let Some(ws) = ws else { return Ok(()) };
     let project_path = { state.db.lock().get_project(&ws.project_id)?.map(|p| p.path) };
     let Some(project_path) = project_path else { return Ok(()) };
+    // Its conversations' Talk checkpoints go first (#958), while the worktree
+    // is still there to run git in. Best-effort; a few ref deletions.
+    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+    if !threads.is_empty() {
+        let root = expand_tilde(&project_path);
+        let dir = ws
+            .worktree_path
+            .as_deref()
+            .map(std::path::Path::new)
+            .filter(|d| d.is_dir())
+            .unwrap_or_else(|| std::path::Path::new(&root));
+        crate::talk_checkpoints::prune_threads(dir, &threads);
+    }
     if owns_worktree_on_disk(&state.db, workspace_id, &project_path, ws.worktree_path.as_deref()) {
         crate::claude_hooks::remove_for_workspace(&state.db, workspace_id, ws.worktree_path.as_deref());
         if let Some(wt) = &ws.worktree_path {
@@ -1414,6 +1576,8 @@ pub async fn delete_workspace(
         .as_deref()
         .is_some_and(|wt| is_project_root(&project_path, wt));
 
+    prune_talk_checkpoints_of(&state, &workspace_id, &project_path, worktree_path.as_deref()).await;
+
     // Remove the worktree directory only when Octopush created it (`managed`) and
     // it isn't the project root. An adopted checkout (made by the user/another
     // tool) and the main workspace are left on disk — we just drop the DB row.
@@ -1486,6 +1650,8 @@ pub async fn archive_workspace(
     // IPC/API symmetry but isn't needed here.
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
+
+    prune_talk_checkpoints_of(&state, &workspace_id, &project_path, worktree_path.as_deref()).await;
 
     // Only remove on disk what Octopush created. An adopted checkout and the
     // main workspace (project root) keep their directory — archiving just flips
@@ -1744,7 +1910,211 @@ pub async fn delete_chat_thread(state: State<'_, AppState>, thread_id: String) -
     // Tear down the thread's TALK shell (kills the daemon PTY + releases the
     // session entry) so deleting conversations doesn't leak bash processes.
     state.chat.talk_shell.close(&thread_id);
+    // Its checkpoints go with it (#958).
+    let worktree = state.db.lock().chat_thread_worktree(&thread_id).ok().flatten();
+    if let Some(path) = worktree {
+        let id = thread_id.clone();
+        crate::talk_checkpoints::off_runtime(move || {
+            crate::talk_checkpoints::prune_thread(std::path::Path::new(&path), &id);
+            Ok(())
+        })
+        .await?;
+    }
     state.db.lock().delete_chat_thread(&thread_id)
+}
+
+// ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+// Every one runs git on a blocking thread (`talk_checkpoints::off_runtime`).
+
+/// Where a thread's files live: its workspace and that workspace's
+/// worktree, read from the database. The webview never names the folder a
+/// rewind writes to.
+fn talk_thread_home(state: &AppState, thread_id: &str) -> AppResult<(String, std::path::PathBuf)> {
+    match state.db.lock().chat_thread_home(thread_id)? {
+        Some((workspace_id, Some(path))) => Ok((workspace_id, std::path::PathBuf::from(path))),
+        Some(_) => Err(AppError::Other("This conversation's workspace has no folder on disk.".into())),
+        None => Err(AppError::Other("That conversation no longer exists.".into())),
+    }
+}
+
+/// A rewind (or its undo) rewrites files in a worktree, so nothing else may
+/// be writing there: no Talk turn on any conversation of a workspace checked
+/// out at that path, and no Direct run in progress in one.
+fn ensure_worktree_is_idle(state: &AppState, thread_id: &str, worktree: &std::path::Path) -> AppResult<()> {
+    let (threads, run) = {
+        let db = state.db.lock();
+        (
+            db.chat_threads_sharing_worktree(thread_id)?,
+            db.has_active_run_at(&worktree.to_string_lossy())?,
+        )
+    };
+    if state.chat.is_running(thread_id) {
+        return Err(AppError::Other("Stop the running turn before rewinding its files.".into()));
+    }
+    if state.chat.any_running(&threads) {
+        return Err(AppError::Other(
+            "Another conversation is running a turn in this workspace. Wait for it or stop it before rewinding files.".into(),
+        ));
+    }
+    if run {
+        return Err(AppError::Other(
+            "A Direct run is in progress in this workspace. Wait for it or stop it before rewinding files.".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// The user turns of a thread whose files can be rewound, the turns that
+/// ran without a checkpoint (and why), and whether a rewind can be undone.
+#[tauri::command]
+pub async fn list_talk_checkpoints(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<crate::talk_checkpoints::Checkpoints> {
+    let Ok((_, path)) = talk_thread_home(&state, &thread_id) else {
+        return Ok(crate::talk_checkpoints::Checkpoints::default());
+    };
+    crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::checkpoints(&path, &thread_id)).await
+}
+
+/// What rewinding to a turn would change — shown before anything is written.
+#[tauri::command]
+pub async fn preview_talk_rewind(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<crate::talk_checkpoints::RewindPreview> {
+    let (_, path) = talk_thread_home(&state, &thread_id)?;
+    crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::preview(&path, &thread_id, message_id))
+        .await
+}
+
+/// The quiet note a rewind leaves in the conversation, naming the turn.
+pub(crate) fn rewind_note(turn: Option<&str>, files: usize) -> String {
+    let first = turn.and_then(|t| t.lines().find(|l| !l.trim().is_empty())).unwrap_or("").trim();
+    let short: String = first.chars().take(40).collect();
+    let short = if first.chars().count() > 40 { format!("{short}…") } else { short };
+    let plural = if files == 1 { "file" } else { "files" };
+    if short.is_empty() {
+        format!("Files rewound to before a turn · {files} {plural}")
+    } else {
+        format!("Files rewound to before “{short}” · {files} {plural}")
+    }
+}
+
+/// What a note adds when a rewind or an undo left paths alone or stopped
+/// part-way.
+pub(crate) fn rewind_note_tail(outcome: &crate::talk_checkpoints::RewindOutcome) -> String {
+    let mut tail = String::new();
+    let left = outcome.untouched.len();
+    if left > 0 {
+        tail.push_str(&format!(" · {left} left untouched"));
+    }
+    if outcome.error.is_some() {
+        tail.push_str(" · stopped part-way");
+    }
+    tail
+}
+
+/// Rewind the worktree to the checkpoint of a user turn. `expected` is the
+/// preview the user confirmed; a tree that moved on since is refused, and
+/// so is a worktree something else is writing to.
+#[tauri::command]
+pub async fn rewind_talk_files(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+    expected: String,
+) -> AppResult<crate::talk_checkpoints::RewindOutcome> {
+    let (workspace_id, path) = talk_thread_home(&state, &thread_id)?;
+    ensure_worktree_is_idle(&state, &thread_id, &path)?;
+    let id = thread_id.clone();
+    let outcome = crate::talk_checkpoints::off_runtime(move || {
+        crate::talk_checkpoints::rewind(&path, &id, message_id, &expected)
+    })
+    .await?;
+    let db = state.db.lock();
+    let turn = db.get_chat_message(message_id).ok().flatten().map(|m| m.content);
+    let note = format!("{}{}", rewind_note(turn.as_deref(), outcome.changed), rewind_note_tail(&outcome));
+    db.insert_chat_message(&workspace_id, &thread_id, "stopped", &note, None, None, None, None)?;
+    Ok(outcome)
+}
+
+/// Put back the files the thread's last rewind replaced — refused while
+/// something else writes to the worktree, or once the files moved on since
+/// the rewind.
+#[tauri::command]
+pub async fn undo_talk_rewind(
+    state: State<'_, AppState>,
+    thread_id: String,
+) -> AppResult<crate::talk_checkpoints::RewindOutcome> {
+    let (workspace_id, path) = talk_thread_home(&state, &thread_id)?;
+    ensure_worktree_is_idle(&state, &thread_id, &path)?;
+    let id = thread_id.clone();
+    let outcome = crate::talk_checkpoints::off_runtime(move || crate::talk_checkpoints::undo(&path, &id)).await?;
+    let note = if outcome.error.is_some() {
+        format!("Undo of the rewind{}", rewind_note_tail(&outcome))
+    } else {
+        format!("Rewind undone{}", rewind_note_tail(&outcome))
+    };
+    state
+        .db
+        .lock()
+        .insert_chat_message(&workspace_id, &thread_id, "stopped", &note, None, None, None, None)?;
+    Ok(outcome)
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkedThread {
+    pub thread: crate::db::ChatThreadRow,
+    /// The forked turn's text, for the new thread's composer.
+    pub draft: String,
+}
+
+/// Fork a conversation from a user turn: a new thread with the history
+/// before it (and those turns' checkpoints); the turn itself becomes the
+/// new thread's draft. The original thread is left as it is.
+#[tauri::command]
+pub async fn fork_chat_thread(
+    state: State<'_, AppState>,
+    thread_id: String,
+    message_id: i64,
+) -> AppResult<ForkedThread> {
+    let home = talk_thread_home(&state, &thread_id).ok();
+    let (thread, draft, pairs) = state.db.lock().fork_chat_thread(&thread_id, message_id)?;
+    if let Some((_, path)) = home {
+        let to = thread.id.clone();
+        crate::talk_checkpoints::off_runtime(move || {
+            crate::talk_checkpoints::copy_to_fork(&path, &thread_id, &to, &pairs);
+            Ok(())
+        })
+        .await?;
+    }
+    Ok(ForkedThread { thread, draft })
+}
+
+/// Drop the Talk checkpoints of every conversation of a workspace that is
+/// being deleted or archived (#958). The refs live in the repository's
+/// shared git directory, so they would otherwise outlive the worktree.
+/// Best-effort, and run before the worktree is removed.
+async fn prune_talk_checkpoints_of(state: &AppState, workspace_id: &str, project_path: &str, worktree: Option<&str>) {
+    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+    if threads.is_empty() {
+        return;
+    }
+    let dirs: Vec<std::path::PathBuf> =
+        worktree.into_iter().chain(std::iter::once(project_path)).map(std::path::PathBuf::from).collect();
+    let pruned = crate::talk_checkpoints::off_runtime(move || {
+        if let Some(dir) = dirs.iter().find(|d| d.is_dir()) {
+            crate::talk_checkpoints::prune_threads(dir, &threads);
+        }
+        Ok(())
+    })
+    .await;
+    if let Err(e) = pruned {
+        tracing::warn!(error = %e, "could not prune the workspace's talk checkpoints");
+    }
 }
 
 /// List the skills available to a worktree (project ∪ user SKILL.md files).
@@ -2833,6 +3203,9 @@ fn dispatch_checkpoint(
 ) -> AppResult<()> {
     // A decision on a stage that was decided elsewhere meanwhile is refused
     // here, synchronously, so the caller sees it (and refreshes) on both paths.
+    // A decision on a run that has ended (aborted from another surface, say)
+    // is refused the same way, before anything changes.
+    orch.check_run_open(&run_id, &action)?;
     orch.check_named_stage(&run_id, stage_id.as_deref(), &action)?;
     // The director acted: a fresh allowance of automatic plan resumes.
     orch.db().lock().reset_plan_resume_count(&run_id)?;
@@ -4112,6 +4485,40 @@ pub async fn set_items_group(
     state.db.lock().set_items_group(&kind, &item_ids, group_id.as_deref())
 }
 
+// ─── Prerequisites ("Starts after", #960) ─────────────────────────
+//
+// A mission (workspace) can wait on another mission of its project until
+// that one's run finishes (`run_finished`) or its PR merges (`pr_merged`).
+
+/// Make `workspace_id` wait on `after_workspace_id`. Refuses cycles, links
+/// across projects and archived prerequisites.
+#[tauri::command]
+pub async fn set_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    after_workspace_id: String,
+    condition: String,
+    branch_from_prerequisite: bool,
+    auto_start: Option<bool>,
+) -> AppResult<crate::db::PrerequisiteRow> {
+    state.db.lock().set_workspace_prerequisite(
+        &workspace_id,
+        &after_workspace_id,
+        &condition,
+        branch_from_prerequisite,
+        auto_start.unwrap_or(false),
+    )
+}
+
+/// Stop `workspace_id` waiting on another mission.
+#[tauri::command]
+pub async fn clear_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<()> {
+    state.db.lock().clear_workspace_prerequisite(&workspace_id)
+}
+
 #[tauri::command]
 pub async fn close_project(
     state: State<'_, AppState>,
@@ -4540,6 +4947,45 @@ pub async fn get_session_usage(
     })
     .await
     .map_err(|e| AppError::Other(format!("session usage: {e}")))?
+}
+
+/// What every request of one project carries (#959): the fixed context
+/// measured from its recent transcripts (its root and its workspaces'
+/// worktrees; Direct stages' CLI sessions left out), priced at its usual
+/// model and cache rate, and the CLAUDE.md chain, skills and agents that
+/// make it up as estimates (`request_context`). Read-only: no file is
+/// edited, no MCP server contacted, nothing leaves the Mac.
+#[tauri::command]
+pub async fn get_request_context(
+    state: State<'_, AppState>,
+    project_id: String,
+) -> AppResult<crate::request_context::RequestContext> {
+    let db = Arc::clone(&state.db);
+    tauri::async_runtime::spawn_blocking(move || {
+        let (path, cwds, direct) = {
+            let db = db.lock();
+            let Some(project) = db.get_project(&project_id)? else {
+                return Err(AppError::Other(format!("project not found: {project_id}")));
+            };
+            let mut cwds = vec![project.path.clone()];
+            for (_, pid, worktree) in db.list_workspace_paths()? {
+                if pid == project_id && !cwds.contains(&worktree) {
+                    cwds.push(worktree);
+                }
+            }
+            (project.path, cwds, db.direct_cli_session_ids()?)
+        };
+        let home = dirs::home_dir();
+        Ok(crate::request_context::request_context(
+            &crate::transcripts::projects_root(),
+            home.as_deref(),
+            std::path::Path::new(&path),
+            &cwds,
+            &direct,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("request context: {e}")))?
 }
 
 /// Answer a turn-limit card: the extra turns to give the paused writing
@@ -5758,7 +6204,7 @@ pub async fn ensure_pr_branch(
 
     let _guard = crate::git_lock::git_lock(&path).await;
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = crate::github::pr_fetch_command(number, &head_ref_name);
+    let cmd = crate::github::pr_fetch_command(number, &head_ref_name)?;
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
         .current_dir(&path)
@@ -5779,6 +6225,9 @@ pub async fn ensure_pr_branch(
 /// Runs in the user's login shell so PATH and keychain credentials behave
 /// like in a terminal.
 async fn try_gh_cli(workspace_path: &str, branch: &str, owner: &str, repo: &str) -> Option<crate::github::Pr> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return None;
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     // `gh pr list --json …` returns a JSON array. `--state all` covers
     // open, draft, merged, and closed PRs. `--limit 1` gives the most recent.
@@ -5840,9 +6289,10 @@ async fn gh_check_runs(
     repo: &str,
     sha: Option<&str>,
 ) -> Option<Vec<serde_json::Value>> {
-    let cmd = crate::github::gh_check_runs_command(owner, repo, sha?)?;
+    let (cmd, path) = crate::github::gh_check_runs_command(owner, repo, sha?)?;
     let output = tokio::process::Command::new(shell)
-        .arg("-l").arg("-c").arg(&cmd)
+        .arg("-l").arg("-c").arg(cmd)
+        .env(crate::github::GH_API_PATH_ENV, path)
         .current_dir(workspace_path)
         .output()
         .await
@@ -6221,6 +6671,23 @@ pub async fn merged_workspaces(
     Ok(out)
 }
 
+/// The login-shell command `push_branch` runs for `branch`. The branch is
+/// single-quoted with `git_ops::quote_git_ref`, so it must pass
+/// `git_ops::is_git_ref_arg` first (a branch git lets exist, like `-x`, is
+/// refused before a shell runs, without echoing the name).
+pub fn push_command(branch: &str) -> AppResult<String> {
+    if !crate::git_ops::is_git_ref_arg(branch) {
+        return Err(AppError::Other(
+            "cannot push: the current branch isn't a valid branch name.".into(),
+        ));
+    }
+    Ok(format!(
+        "git push --set-upstream {} {} 2>&1",
+        crate::secret_scan::PUSH_REMOTE,
+        crate::git_ops::quote_git_ref(branch)
+    ))
+}
+
 /// Push the current branch to `origin` (creating it on the remote if needed,
 /// and tracking it, via `--set-upstream`). Uses the login shell so SSH agents, the
 /// macOS credential helper, and `~/.gitconfig` work like they do in the
@@ -6256,11 +6723,7 @@ pub async fn push_branch(workspace_path: String, allow_findings: Option<String>)
     }
 
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = format!(
-        "git push --set-upstream {} {} 2>&1",
-        crate::secret_scan::PUSH_REMOTE,
-        crate::git_ops::quote_git_ref(&branch)
-    );
+    let cmd = push_command(&branch)?;
 
     let output = std::process::Command::new(&shell)
         .arg("-l").arg("-c").arg(&cmd)
@@ -7332,6 +7795,23 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
     Ok(crate::agent_adapter::claude_cli_version_cached()
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher: the line naming a Claude Code release to skip
+/// (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` (Claude
+/// Code CLI stages and their escalation models) is a gateway model
+/// (`cli_runner::is_gateway_model`). Reads the cached version without
+/// probing; `None` otherwise or when the version is unknown.
+#[tauri::command]
+pub fn claude_known_bad_note(models: Vec<String>) -> AppResult<Option<String>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached().and_then(|cli| {
+        crate::agent_adapter::known_bad_launch_note(
+            &models,
+            cli.version.as_deref(),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+            crate::orchestrator::cli_runner::is_gateway_model,
+        )
+    }))
 }
 
 /// Direct launcher: the line saying Codex will skip this repo's `.codex/`

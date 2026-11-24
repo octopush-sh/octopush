@@ -120,6 +120,18 @@ other users only after that promotion.
   instructions — agents read GitHub through `scripts/routines/read.mjs`.
 - **Website and API PRs never auto-merge** — merging them publishes immediately. They are
   listed in the daily digest and the owner merges them.
+- **Epiku PRs (`octopush-sh/epiku`, a private repo) auto-merge under Epiku's own rules**, not
+  these: its `VISION.md` §2, enforced by `scripts/routines/automerge.mjs` (`epikuRefusals`) on the
+  PR's current head commit — opened by the cycle's App from a branch of that repo into `main` and
+  labelled `agent`, every commit and the head push the App's; CI green on a head that contains
+  `main`; an approving review from the independent, adversarial review workflow on that exact
+  commit, in an unedited comment of the App's; it closes an issue the owner labelled `ready`; at
+  most 800 changed lines; no human-only path of Epiku's; and no breaking data or API change (the
+  reviewer classifies every PR `none` / `additive` / `breaking`; an additive one must carry its
+  test and doc updates). Anything else is labelled `needs-owner` there and waits for the owner. The lane runs in this repo's
+  Actions (`epiku-build.yml`, `epiku-review.yml`). **This repo is public and Epiku is not:** the
+  lane prints only Epiku issue/PR numbers and commit ids here — never a title, a body, a path or
+  content — and Epiku is in no digest, report or audit.
 - **Releases go beta first, always.** Every tag publishes a GitHub prerelease on the beta
   channel (`docs/WHATS-NEW.md` §6). Only the owner promotes a version to stable
   (`promote <version>` in the digest, or `.github/workflows/promote.yml`).
@@ -172,3 +184,4 @@ here if priorities changed.
 | 2026-10-31 | Layout and design quality is guarded by a nightly visual audit, not by per-surface specialist agents: every surface rendered in WebKit (the macOS engine) with real-world stress data; deterministic checks file `visual` issues the builder may fix (`ready`, at most two queued); a design-review agent's findings are filed only as `proposal`. Each escaped layout bug adds a stress case or a check (#312, #313) |
 | 2026-10-31 | The cycle runs continuously, not only at night: the builder every two hours, the reviewer between its runs, a beta release twice a day (05:13, 17:13 Bogotá) when main moved. The owner still only promotes to stable |
 | 2026-10-31 | The cycle extends to the website: a web builder, an independent web reviewer and a nightly web audit (all in this repo's Actions) work on octopush-web through short-lived installation tokens of the "Octopush Cycle" GitHub App, scoped to that repo and never given to an agent. Website ideas are filed in octopush-web; website PRs still never auto-merge — the owner answers `merge web#N` and a fixed script re-checks CI and the approving review on the exact head before merging |
+| 2026-11-22 | The cycle extends to Epiku (`octopush-sh/epiku`, private): a builder and an independent adversarial reviewer in this repo's Actions, through installation tokens of the "Octopush Cycle" App scoped to that repo alone. Epiku agent PRs auto-merge under Epiku's `VISION.md` §2 (CI green + approval on the exact head), except those touching its human-only paths, carrying a breaking data/API change or over 800 changed lines, which are parked for the owner. Nothing of Epiku but numbers and commit ids is printed in this public repo. Shipped manual-only (no schedule) with auto-merge off (`EPIKU_AUTOMERGE`) until the owner enables each |

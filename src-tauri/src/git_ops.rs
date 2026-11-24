@@ -1279,10 +1279,26 @@ pub fn quote_git_ref(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Is `s` a hex commit id (4–64 digits, abbreviated or full)?
+pub fn is_hex_sha(s: &str) -> bool {
+    (4..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// May `s` go through `quote_git_ref`? A hex commit id, or a name git
+/// accepts as a branch (`feat/it's`, or a remote-tracking `origin/x`) that
+/// doesn't start with `-`, so it can't be read as an option. git's ref-name
+/// rules forbid backslashes, whitespace and control bytes.
+pub fn is_git_ref_arg(s: &str) -> bool {
+    is_hex_sha(s) || (s == s.trim() && !s.starts_with('-') && is_valid_branch_name(s))
+}
+
 /// `git switch <name>` via the user's login shell (gitconfig, hooks and
 /// filters behave like the user's terminal). Returns the trimmed combined
 /// output; failures come back as friendly errors via `friendly_switch_error`.
 pub fn switch_branch(path: &Path, name: &str) -> AppResult<String> {
+    if !is_git_ref_arg(name) {
+        return Err(AppError::Other(format!("'{name}' isn't a valid branch name.")));
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let cmd = format!("git switch {} 2>&1", quote_git_ref(name));
     let output = std::process::Command::new(&shell)
@@ -1445,6 +1461,9 @@ pub fn clean_untracked(path: &Path) -> AppResult<Vec<String>> {
 /// `classify_pull` is reused: cherry-pick output never matches its diverged
 /// patterns, so the kinds collapse to Ok / Conflict / Error.
 pub fn cherry_pick(path: &Path, sha: &str) -> AppResult<PullOutcome> {
+    if !is_hex_sha(sha) {
+        return Err(AppError::Other(format!("'{sha}' isn't a commit id.")));
+    }
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
     let cmd = format!("git -c core.editor=true cherry-pick {} 2>&1", quote_git_ref(sha));
     let output = std::process::Command::new(&shell)
@@ -1773,6 +1792,35 @@ mod tests {
         init_repo(dir.path()).unwrap();
         commit_file(dir.path(), "a.txt", "one\n", "first");
         assert!(switch_branch(dir.path(), "no-such-branch").is_err());
+    }
+
+    #[test]
+    fn git_ref_args_accept_refs_and_shas_only() {
+        let full_sha = "f".repeat(40);
+        for ok in ["main", "feat/it's", "origin/x", "JIRA-123", "abc1234", full_sha.as_str()] {
+            assert!(is_git_ref_arg(ok), "{ok:?} should be accepted");
+        }
+        for bad in [
+            "", "a\\b", "-x", "--force", "a..b", "a b", " main", "main\n", "'; touch x",
+            "a\\'; touch x", "x\0y", "a~1", "a:b",
+        ] {
+            assert!(!is_git_ref_arg(bad), "{bad:?} should be rejected");
+        }
+        assert!(is_hex_sha("abcd") && is_hex_sha(&"0".repeat(64)));
+        assert!(!is_hex_sha("abc") && !is_hex_sha(&"0".repeat(65)) && !is_hex_sha("abcg"));
+    }
+
+    #[test]
+    fn switch_branch_and_cherry_pick_refuse_a_hostile_arg_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).unwrap();
+        commit_file(dir.path(), "a.txt", "one\n", "first");
+        let err = switch_branch(dir.path(), "a\\'; touch PWNED; echo '").unwrap_err();
+        assert!(err.to_string().contains("isn't a valid branch name"), "{err}");
+        // `PullOutcome` isn't `Debug`, so no `unwrap_err` here.
+        let err = cherry_pick(dir.path(), "main; touch PWNED").err().expect("cherry_pick should refuse");
+        assert!(err.to_string().contains("isn't a commit id"), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]

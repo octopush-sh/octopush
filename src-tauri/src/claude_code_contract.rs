@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::agent_adapter::{AgentAdapter, ClaudeCodeAdapter};
 use crate::orchestrator::cli_runner::{
     apply_stage_env, build_cli_args, build_cli_args_resume, context_window_env, is_builtin_claude_model, DISABLE_1M_CONTEXT_ENV,
-    MAX_CONTEXT_TOKENS_ENV, cli_auth_from_init, is_result_event,
+    MAX_CONTEXT_TOKENS_ENV, SIMPLE_SYSTEM_PROMPT_ENV, system_prompt_env, cli_auth_from_init, is_result_event,
     parse_cli_result, plan_windows_from_stream_event, read_stream, usage_from_stream_event, CliAuth,
     CliDialect, CodexWriteScope, OpenTools, ReadEnd, ReadLimits, QUIET_TRAFFIC_ENV,
 };
@@ -572,6 +572,81 @@ async fn stream_json_a_hang_before_the_first_request_is_named() {
         "timed out — Claude Code sent no request in 1 minute",
         "[{fx}]"
     );
+}
+
+const EMPTY_RESUME_VERSION: &str = "2.1.329";
+const EMPTY_RESUME_REL: &str = "stream-json/resume-empty.jsonl";
+
+#[test]
+fn stream_json_a_resume_that_came_back_empty_is_named() {
+    use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume, ResumeWatch, CLAUDE_EMPTY_RESUME_FIX};
+    // Synthetic (see the 2.1.329 README): `--resume …0001` answered on a new,
+    // empty session — the bug Claude Code 2.1.330 fixed.
+    let rec = synthesized(EMPTY_RESUME_VERSION);
+    let fx = rec.label(EMPTY_RESUME_REL);
+    let events = rec.jsonl(EMPTY_RESUME_REL);
+    let init = events.first().unwrap_or_else(|| panic!("[{fx}] empty"));
+    assert_eq!(require_str(&fx, init, "subtype"), "init", "[{fx}] the stream opens with system/init");
+    let got = require_str(&fx, init, "session_id");
+    let reply = *of_type(&events, "assistant").first().unwrap_or_else(|| panic!("[{fx}] no assistant event"));
+    let tokens: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .map(|f| require_u64(&fx, reply, &format!("message.usage.{f}")))
+        .sum();
+    assert_eq!(tokens, 14_063, "[{fx}] the first reply read only the system prompt");
+
+    // (a) `system/init` names another session than the one passed to --resume.
+    let requested = "aaaaaaaa-0000-4000-8000-000000000001";
+    let mut watch = ResumeWatch::new(requested, Some(120_000));
+    let found: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(
+        found,
+        vec![EmptyResume::OtherSession { requested: requested.into(), got: got.into() }],
+        "[{fx}] decided once, on the init"
+    );
+    // (b) The same id, but a first reply under 15% of the session's last context.
+    let mut watch = ResumeWatch::new(got, Some(120_000));
+    let small: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(small, vec![EmptyResume::SmallContext { tokens, floor: 18_000 }], "[{fx}]");
+
+    // The CLI that did it names the update; a fixed or unknown one never does.
+    let version = require_str(&fx, init, "claude_code_version");
+    for why in [&found[0], &small[0]] {
+        let n = empty_resume_notice(why, Some(version), false);
+        assert!(n.starts_with("resume came back empty: Claude Code opened a new conversation ("), "[{fx}] {n}");
+        assert!(
+            n.ends_with(
+                "The stage runs fresh, with its full input. \
+                 Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."
+            ),
+            "[{fx}] {n}"
+        );
+        for v in [Some(CLAUDE_EMPTY_RESUME_FIX), Some("2.2.0"), None] {
+            let plain = empty_resume_notice(why, v, false);
+            assert!(!plain.contains("update Claude Code"), "[{fx}] {v:?}: {plain}");
+            assert!(plain.ends_with("The stage runs fresh, with its full input."), "[{fx}] {plain}");
+            let answered = empty_resume_notice(why, v, true);
+            assert!(answered.ends_with("The stage runs fresh, with its full input and your answers."), "[{fx}] {answered}");
+        }
+    }
+}
+
+#[test]
+fn stream_json_a_real_resume_is_never_taken_for_an_empty_one() {
+    use crate::orchestrator::cli_runner::ResumeWatch;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/resume.jsonl");
+        let events = rec.jsonl("stream-json/resume.jsonl");
+        let init = events
+            .iter()
+            .find(|e| e["type"] == "system" && e["subtype"] == "init")
+            .unwrap_or_else(|| panic!("[{fx}] no system/init"));
+        let sid = require_str(&fx, init, "session_id");
+        for prior in [None, Some(14_000), Some(60_000)] {
+            let mut watch = ResumeWatch::new(sid, prior);
+            assert!(events.iter().all(|e| watch.observe(e).is_none()), "[{fx}] prior context {prior:?}");
+        }
+    }
 }
 
 const DENIALS_VERSION: &str = "2.1.326";
@@ -1200,6 +1275,74 @@ fn a_custom_gateway_model_reaches_the_spawn_with_its_catalog_window() {
     // An id no catalog lists: nothing.
     let env = stage_spawn_env_for("claude-unknown-gateway");
     assert!(!env.contains_key(MAX_CONTEXT_TOKENS_ENV) && !env.contains_key(DISABLE_1M_CONTEXT_ENV), "{env:?}");
+}
+
+// ─── Gateway-named Claude models keep the full prompt (#1003) ──
+//
+// 2.1.330: "Changed unrecognized model names containing \"sonnet\" or
+// \"haiku\" to use the shorter system prompt, like other unrecognized names;
+// `CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT=0` gives every model the full one".
+
+#[test]
+fn system_prompt_variable_is_the_documented_name() {
+    assert_eq!(SIMPLE_SYSTEM_PROMPT_ENV, "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT");
+}
+
+#[test]
+fn a_canonical_claude_id_keeps_claude_codes_own_prompt_choice() {
+    let none = |_: &str| false;
+    for model in ["claude-sonnet-5-5", "claude-haiku-4-5", "claude-opus-4-8[1m]", "claude-sonnet-5-5-20261001", " claude-opus-5-5 "] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+        assert!(!stage_spawn_env_for(model).contains_key(SIMPLE_SYSTEM_PROMPT_ENV), "{model}");
+    }
+}
+
+#[test]
+fn a_gateway_named_claude_model_gets_the_full_prompt() {
+    let none = |_: &str| false;
+    let full = vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())];
+    for model in [
+        // dotted
+        "claude-sonnet-5.5",
+        "claude-haiku-4.5",
+        // prefixed
+        "anthropic/claude-sonnet-5.5",
+        "bedrock/claude-haiku-4-5",
+        "openrouter/anthropic/claude-haiku-5-5",
+        "us.anthropic.claude-sonnet-5-5-v1:0",
+    ] {
+        assert_eq!(system_prompt_env(model, is_builtin_claude_model, none), full, "{model}");
+    }
+    // Through the spawn, over whatever the stage inherited.
+    let env = stage_spawn_env_for("anthropic/claude-sonnet-5.5");
+    if std::env::var_os(SIMPLE_SYSTEM_PROMPT_ENV).is_none() {
+        assert_eq!(env.get(SIMPLE_SYSTEM_PROMPT_ENV), Some(&Some("0".to_string())), "{env:?}");
+    }
+    // Codex never gets it.
+    let mut command = tokio::process::Command::new("codex");
+    apply_stage_env(&mut command, CliDialect::Codex, "gpt-4o", None, false, None);
+    assert!(!command.as_std().get_envs().any(|(k, _)| k == SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_non_claude_gateway_model_keeps_the_short_prompt() {
+    let none = |_: &str| false;
+    for model in ["ollama/qwen2.5-coder:7b", "llama3.3:latest", "kimi-k3", "claude-sonnet-latest", "team-sonnet", "gpt-4o"] {
+        assert!(system_prompt_env(model, is_builtin_claude_model, none).is_empty(), "{model}");
+    }
+    assert!(!stage_spawn_env_for("ollama/qwen2.5-coder:7b").contains_key(SIMPLE_SYSTEM_PROMPT_ENV));
+}
+
+#[test]
+fn a_users_own_system_prompt_export_is_never_overridden() {
+    let set = |k: &str| k == SIMPLE_SYSTEM_PROMPT_ENV;
+    assert!(system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, set).is_empty());
+    // Another variable set by the user doesn't count.
+    let other = |k: &str| k == MAX_CONTEXT_TOKENS_ENV;
+    assert_eq!(
+        system_prompt_env("anthropic/claude-sonnet-5.5", is_builtin_claude_model, other),
+        vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())]
+    );
 }
 
 /// [`stage_spawn_env`] for a Claude stage on `model`.

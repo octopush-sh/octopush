@@ -522,6 +522,11 @@ function App() {
   // Git status + diff (refreshed on workspace change)
   const [gitStatus, setGitStatus] = useState<GitStatus | null>(null);
   const [gitDiff, setGitDiff] = useState<string>("");
+  // The workspace `gitDiff` was fetched for; null while none is (a switch
+  // with its fetch in flight, or outside Review, where no diff is read). Lets
+  // Review's open comment draft wait instead of being read against another
+  // workspace's diff (#1051).
+  const [gitDiffWs, setGitDiffWs] = useState<string | null>(null);
   // Lines added and removed per uncommitted file, for Run's Companion
   // (Changes). Counted from the working diff the poll below reads while that
   // panel is open in Run; the diff itself is not kept, so the Review canvas
@@ -900,6 +905,7 @@ function App() {
   useEffect(() => {
     setGitStatus(null);
     setGitDiff("");
+    setGitDiffWs(null);
     setRunChangeStats(NO_CHANGE_STATS);
     setRunAhead(null);
     setReviewAnswers(null);
@@ -916,6 +922,7 @@ function App() {
     if (!path) {
       setGitStatus(null);
       setGitDiff("");
+      setGitDiffWs(null);
       gitSigRef.current = "";
       gitDiffRef.current = "";
       return;
@@ -994,6 +1001,7 @@ function App() {
           gitDiffRef.current = d;
           setGitDiff(d);
         }
+        setGitDiffWs(needDiff ? ws?.id ?? null : null);
       } catch {
         /* non-fatal */
       } finally {
@@ -2551,6 +2559,7 @@ function App() {
                           ([s, d, c]) => {
                             setGitStatus(s);
                             setGitDiff(d);
+                            setGitDiffWs(wsId);
                             useReviewSource.getState().setCommitted(wsId, c);
                           },
                         ).catch(() => {});
@@ -2568,6 +2577,7 @@ function App() {
                         workspacePath={activeWorkspace.worktreePath || project.path}
                         gitStatus={gitStatus}
                         gitDiff={reviewDiff}
+                        diffWorkspaceId={gitDiffWs}
                         source={reviewSource}
                         commitsAhead={committed?.commits ?? 0}
                         base={committed?.base ?? null}
@@ -2580,8 +2590,9 @@ function App() {
                           // Re-fetch git status + diff after a hunk action,
                           // for the workspace it was taken in (#908).
                           const path = activeWorkspace.worktreePath || project.path;
+                          const wsId = activeWorkspaceId!;
                           refetchForWorkspace(
-                            activeWorkspaceId!,
+                            wsId,
                             () =>
                               Promise.all([
                                 ipc.getGitStatus(path),
@@ -2591,6 +2602,7 @@ function App() {
                             ([s, d]) => {
                               setGitStatus(s);
                               setGitDiff(d);
+                              setGitDiffWs(wsId);
                             },
                           ).catch(() => {});
                         }}

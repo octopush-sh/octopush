@@ -1,5 +1,6 @@
 // Thin typed wrappers around Tauri's `invoke` for the Octopush core.
 import type { SecretHold, SecretPreview } from "./secretGuard";
+import type { RewindOutcome, RewindPreview, TalkCheckpoints } from "./talkRewind";
 
 // ─── Updater — types ───────────────────────────────────────────────────────
 
@@ -594,6 +595,7 @@ import type {
   Issue,
   IssueTrackerConfig,
   Mission,
+  UpdatedMission,
   LogbookMissionRow,
   ModelSuggestion,
   ModelWithProvider,
@@ -611,6 +613,7 @@ import type {
   RefreshPricingResult,
   ThreadCost,
   SessionUsage,
+  RequestContext,
   PtySettledEvent,
   Session,
   SessionRecap,
@@ -629,6 +632,8 @@ import type {
   GatewayReconciliation,
   Workspace,
   CreatedWorkspace,
+  ShareOptions,
+  ShareSpec,
   WorkspaceCacheSizes,
   WorkspaceGitSummary,
   ProjectCollisions,
@@ -880,6 +885,13 @@ export const ipc = {
    *  DB. Reading it never runs it. */
   conductorSetupScript: (projectId: string) =>
     invoke<string | null>("conductor_setup_script", { projectId }),
+  /** The project's "Share with new missions" list, and what its main checkout
+   *  could share. The backend reads the project's own path from the DB. */
+  shareWithMissions: (projectId: string) =>
+    invoke<ShareOptions>("share_with_missions", { projectId }),
+  /** Remember what the project shares with new missions (sanitized server-side). */
+  setShareWithMissions: (projectId: string, spec: ShareSpec) =>
+    invoke<void>("set_share_with_missions", { projectId, spec }),
   listWorkspaces: (projectId: string) => invoke<Workspace[]>("list_workspaces", { projectId }),
 
   // ─── Missions ───────────────────────────────────────────────────
@@ -896,7 +908,7 @@ export const ipc = {
   updateMission: (
     missionId: string, title: string | null, status: string | null, linkedIssueKey: string | null,
     execIsolation: string | null = null,
-  ) => invoke<Mission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
+  ) => invoke<UpdatedMission>("update_mission", { missionId, title, status, linkedIssueKey, execIsolation }),
   archiveMission: (missionId: string) => invoke<void>("archive_mission", { missionId }),
 
   // ─── Logbook ────────────────────────────────────────────────────
@@ -951,6 +963,11 @@ export const ipc = {
    *  Code session or no ledger row yet. Read-only. */
   getSessionUsage: (terminalId: string) =>
     invoke<SessionUsage | null>("get_session_usage", { terminalId }),
+  /** What every request of a project carries: the measured fixed context,
+   *  its price at the project's usual model and cache rate, and the files
+   *  that make it up as ranked estimates. Read-only. */
+  getRequestContext: (projectId: string) =>
+    invoke<RequestContext>("get_request_context", { projectId }),
   /** Give a finished sub-agent more turns, optionally with a message from the
    *  user. Resolves when the continuation ends; the report row is rewritten
    *  via `chat://message-updated`. */
@@ -1019,6 +1036,23 @@ export const ipc = {
     invoke<void>("set_thread_pinned", { threadId, pinned }),
   deleteChatThread: (threadId: string) =>
     invoke<void>("delete_chat_thread", { threadId }),
+
+  // ─── Talk checkpoints: rewind files, fork from a turn (#958) ──────
+  // The backend resolves the thread's worktree itself; no path is passed.
+  /** The turns of a thread that can be rewound, the ones without a checkpoint, and whether an undo is on offer. */
+  listTalkCheckpoints: (threadId: string) =>
+    invoke<TalkCheckpoints>("list_talk_checkpoints", { threadId }),
+  /** What rewinding to a turn would change (nothing is written). */
+  previewTalkRewind: (threadId: string, messageId: number) =>
+    invoke<RewindPreview>("preview_talk_rewind", { threadId, messageId }),
+  /** Rewind to a turn; `expected` is the confirmed preview's `current`. */
+  rewindTalkFiles: (threadId: string, messageId: number, expected: string) =>
+    invoke<RewindOutcome>("rewind_talk_files", { threadId, messageId, expected }),
+  undoTalkRewind: (threadId: string) =>
+    invoke<RewindOutcome>("undo_talk_rewind", { threadId }),
+  /** A new thread with the history before a user turn; the turn becomes its draft. */
+  forkChatThread: (threadId: string, messageId: number) =>
+    invoke<{ thread: ChatThread; draft: string }>("fork_chat_thread", { threadId, messageId }),
 
   // ─── Skills ──────────────────────────────────────────────────────
   listSkills: (workspacePath: string) =>
@@ -1747,6 +1781,11 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** Direct launcher: the line naming a Claude Code release to skip
+   *  (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` is a
+   *  gateway model, read from the cached version without probing; null otherwise. */
+  claudeKnownBadNote: (models: string[]) =>
+    invoke<string | null>("claude_known_bad_note", { models }),
   /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
   codexTrustNote: (workspacePath: string) =>
     invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
@@ -1772,6 +1811,9 @@ export interface ReadinessCheck {
   /** A copyable command that fixes it, when there is one. */
   command: string | null;
   timedOut: boolean;
+  /** A recommendation that is no verdict (the Claude Code row's
+   *  `agent_adapter::claude_recommended_notice`); the card decides when it shows. */
+  note?: string | null;
 }
 
 /** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */
@@ -1839,6 +1881,9 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+  /** The release to skip (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) the
+   *  known version is exactly; null for any other version or an unknown one. */
+  knownBad?: { version: string; reason: string; scope: "gatewayStages" } | null;
 }
 
 /** Codex will skip the repo's `.codex/` config: the project is marked

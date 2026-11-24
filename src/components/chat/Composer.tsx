@@ -6,12 +6,19 @@ import { useProvidersStore } from "../../stores/providersStore";
 import { estimateNextTurnTokens, estimatePerMessageCost } from "../../lib/cost";
 import { ipc } from "../../lib/ipc";
 import type { ModelInfo, SkillMeta } from "../../lib/types";
+import { findActiveMention, applyMention } from "../../lib/mentions";
 import {
-  findActiveMention,
-  rankFiles,
-  extractMentions,
-  applyMention,
-} from "../../lib/mentions";
+  blockTokens,
+  contextMentionItems,
+  dirsOf,
+  extractContextRefs,
+  removeContextToken,
+  sessionRefs,
+  type ContextCatalog,
+} from "../../lib/talkContext";
+import { resolveContextBlock } from "../../lib/talkContextResolve";
+import { useTerminalsStore } from "../../stores/terminalsStore";
+import { ContextChips } from "./ContextChips";
 import { ModelPicker } from "../ModelPicker";
 import { EffortSelector } from "./EffortSelector";
 import { MentionPopover } from "./MentionPopover";
@@ -82,9 +89,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 
   // ── @file mentions ──────────────────────────────────────────────────
   // Worktree file catalog (loaded once per workspace) + the active mention
-  // popover state. filesSetRef gives extractMentions an O(1) membership test.
+  // popover state. The context catalog below turns it into what `@` can name.
   const [files, setFiles] = useState<string[]>([]);
-  const filesSetRef = useRef<Set<string>>(new Set());
   const [mention, setMention] = useState<{ query: string; start: number; caret: number } | null>(null);
   const [mentionItems, setMentionItems] = useState<string[]>([]);
   const [mentionIndex, setMentionIndex] = useState(0);
@@ -239,15 +245,65 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     ipc
       .listWorkspaceFiles(workspacePath)
       .then((paths) => {
-        if (cancelled) return;
-        setFiles(paths);
-        filesSetRef.current = new Set(paths);
+        if (!cancelled) setFiles(paths);
       })
       .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [workspacePath]);
+
+  // ── Context mentions (#962) ─────────────────────────────────────────
+  // What an `@` token may name: a file (or its line range), a folder, a Run
+  // session of this workspace, or the diff. Sessions are keyed by id+label
+  // so a busy flag flipping doesn't rebuild the catalog.
+  const terminals = useTerminalsStore((s) => s.getTerminals(workspaceId));
+  const sessionsKey = terminals.map((t) => `${t.id}\u0000${t.label}`).join("\u0001");
+  const sessions = useMemo(
+    () => sessionRefs(terminals),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sessionsKey],
+  );
+  const catalog: ContextCatalog = useMemo(
+    () => ({ files: new Set(files), dirs: dirsOf(files), sessions }),
+    [files, sessions],
+  );
+  const contextRefs = useMemo(() => extractContextRefs(input, catalog), [input, catalog]);
+  // Each chip's token estimate, from its block as resolved now. Send
+  // resolves again, so a session or diff that moved on is sent fresh. An
+  // estimate goes when its token leaves the draft (and on send), so adding
+  // the token back estimates it again.
+  const [tokensByToken, setTokensByToken] = useState<Record<string, number>>({});
+  useEffect(() => {
+    setTokensByToken((prev) => {
+      const live = new Set(contextRefs.map((r) => r.token));
+      const keys = Object.keys(prev);
+      if (keys.every((k) => live.has(k))) return prev;
+      return Object.fromEntries(keys.filter((k) => live.has(k)).map((k) => [k, prev[k]]));
+    });
+  }, [contextRefs]);
+  useEffect(() => {
+    const missing = contextRefs.filter((r) => tokensByToken[r.token] == null);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void Promise.all(
+        missing.map(async (r) => [r.token, blockTokens(await resolveContextBlock(r, workspacePath, files))] as const),
+      ).then((pairs) => {
+        if (!cancelled) setTokensByToken((prev) => ({ ...prev, ...Object.fromEntries(pairs) }));
+      });
+    }, 250);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [contextRefs, tokensByToken, workspacePath, files]);
+  const contextTokens = contextRefs.reduce((n, r) => n + (tokensByToken[r.token] ?? 0), 0);
+
+  function removeContext(token: string) {
+    setInput(removeContextToken(inputRef.current, token));
+    textareaRef.current?.focus();
+  }
 
   function closeMention() {
     setMention(null);
@@ -258,11 +314,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   /** Recompute the active mention from the textarea's current value + caret. */
   function refreshMention(value: string, caret: number) {
     const m = findActiveMention(value, caret);
-    if (!m) {
+    // A `#L10-40` being typed after a path is a range, not a new search.
+    if (!m || m.query.includes("#")) {
       closeMention();
       return;
     }
-    const items = rankFiles(files, m.query);
+    const items = contextMentionItems(m.query, files, catalog.dirs, catalog.sessions);
     closeSlash();
     closeCmdHist();
     setMention({ ...m, caret });
@@ -297,9 +354,42 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setInput("");
     closeMention();
     closeSlash();
+    setTokensByToken({});
     if (textareaRef.current) textareaRef.current.style.height = "auto";
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workspaceId]);
+
+  // A fork from a turn opens with that turn's text as the draft, once
+  // (after whatever is already typed).
+  // Declared after the reset above: effects run in order, so a composer that
+  // mounts with a seed keeps it.
+  const composerSeed = useChatStore((s) => s.composerSeedByWs[workspaceId] ?? null);
+  const takeComposerSeed = useChatStore((s) => s.takeComposerSeed);
+  useEffect(() => {
+    if (composerSeed === null) return;
+    const seed = takeComposerSeed(workspaceId);
+    if (seed === null) return;
+    // A half-typed message is never replaced: the seed goes after it.
+    const typed = inputRef.current;
+    setInput(typed.trim() ? `${typed.replace(/\s+$/, "")}\n\n${seed}` : seed);
+    textareaRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [composerSeed, workspaceId, takeComposerSeed]);
+
+  // Text handed over from another surface (Review's "Ask Talk about this"):
+  // appended to the draft on its own word, caret after it, focus here.
+  // Declared after the reset above so a hand-off that mounts the composer
+  // isn't wiped by it.
+  const draftInsert = useChatStore((s) => s.draftInsertByWs[workspaceId]);
+  useEffect(() => {
+    if (!draftInsert) return;
+    const text = useChatStore.getState().takeDraftInsert(workspaceId);
+    if (!text) return;
+    const cur = inputRef.current;
+    const next = cur && !/\s$/.test(cur) ? `${cur} ${text}` : cur + text;
+    pendingCaretRef.current = next.length;
+    setInput(next);
+  }, [draftInsert, workspaceId]);
 
   // ── Inline cost preview ─────────────────────────────────────────────
   const modelCatalog = useProvidersStore((s) => s.providers);
@@ -315,7 +405,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     }
     return null;
   })();
-  const estimatedTokens = estimateNextTurnTokens(messages, input);
+  // The context chips ride on the estimate too.
+  const estimatedTokens = estimateNextTurnTokens(messages, input) + contextTokens;
   const inlineCost =
     activeModelInfo && estimatedTokens > 0
       ? estimatePerMessageCost(activeModelInfo, estimatedTokens)
@@ -411,6 +502,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
       useChatStore.getState().getAttachments(workspaceId).length > 0;
     if ((!trimmed && !hasAttachments) || streaming || expandingRef.current) return;
     setInput("");
+    // The next draft estimates its tokens afresh (a diff or session moves on).
+    setTokensByToken({});
     historyIdxRef.current = -1;
     setHistoryActive(false);
     closeMention();
@@ -437,11 +530,12 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // the agent instead of running it.
     const outgoing = trimmed.startsWith("\\$") ? trimmed.slice(1) : trimmed;
 
-    // Expand any @file mentions into fenced context blocks appended to the
-    // message, so the model receives the referenced files' contents. The chat
-    // shows exactly what was sent (transparent). Files are read with a byte cap.
-    const mentions = extractMentions(outgoing, filesSetRef.current);
-    if (mentions.length === 0) {
+    // Expand the @ mentions — files, line ranges, folders, Run sessions, the
+    // diff — into fenced context blocks appended to the message, so the model
+    // receives them. The chat shows exactly what was sent (transparent). Each
+    // block is capped at 64k; one that can't be read says so in the message.
+    const refs = extractContextRefs(outgoing, catalog);
+    if (refs.length === 0) {
       send(workspaceId, workspacePath, outgoing);
       return;
     }
@@ -450,19 +544,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     void (async () => {
       try {
         const blocks = await Promise.all(
-          mentions.map(async (rel) => {
-            try {
-              const res = await ipc.readFileChecked(`${workspacePath}/${rel}`, 64_000);
-              if (res.kind === "text") {
-                return `\n\n${rel}\n\`\`\`\n${res.content}\n\`\`\``;
-              }
-              return `\n\n${rel} _(not included: ${res.kind})_`;
-            } catch {
-              // Surface the failure in the message instead of silently dropping
-              // it, so both the user and the model see the file was unreadable.
-              return `\n\n${rel} _(not included: unreadable)_`;
-            }
-          }),
+          refs.map((r) => resolveContextBlock(r, workspacePath, files)),
         );
         send(workspaceId, workspacePath, outgoing + blocks.join(""));
       } finally {
@@ -470,7 +552,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         setExpanding(false);
       }
     })();
-  }, [streaming, send, runShell, workspaceId, workspacePath]);
+  }, [streaming, send, runShell, workspaceId, workspacePath, catalog, files]);
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
     // ── `$` command-recall palette takes precedence while open ──
@@ -620,8 +702,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           attachments={attachments}
           onRemove={(i) => removeAttachment(workspaceId, i)}
         />
+        <ContextChips refs={contextRefs} tokensByToken={tokensByToken} onRemove={removeContext} />
         {mention && (
           <MentionPopover
+            heading="Add context"
             items={mentionItems}
             activeIndex={mentionIndex}
             onSelect={selectMention}
@@ -652,6 +736,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           <SkillHighlights text={input} skillNames={skillNames} scrollRef={highlightRef} />
         <textarea
           ref={textareaRef}
+          data-tour="talk-composer-input"
           value={input}
           role="combobox"
           aria-expanded={activePopover !== null}
@@ -801,6 +886,7 @@ export function Composer({ workspaceId, workspacePath }: Props) {
 function ComposerHelp({ onClose }: { onClose: () => void }) {
   const rows: { key: string; desc: string }[] = [
     { key: "@ file", desc: "Reference a file — its contents ride along with the message" },
+    { key: "@ more", desc: "path#L10-40 lines · folder/ listing · session:name output · diff" },
     { key: "/ skill", desc: "Invoke a skill with this message — several allowed, none sticks" },
     { key: "$ cmd", desc: "Run a command in the shared shell (also /run cmd)" },
     { key: "\\$ …", desc: "Send a literal $… to the agent instead of running it" },

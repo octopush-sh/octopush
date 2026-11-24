@@ -19,6 +19,8 @@ export function nextFocus(flat: FlatHunk[], current: number, key: NavKey): numbe
 export interface DiffKeyboardActions {
   accept: () => void; reject: () => void; acceptFile: () => void;
   toggleViewed: () => void; open: () => void; why: () => void;
+  /** `m`: "Ask for a change" on the focused hunk (#956). */
+  comment?: () => void;
   toggleCollapse: () => void; focusFilter: () => void; focusCommit: () => void; toggleHelp: () => void;
 }
 
@@ -42,6 +44,7 @@ export function useDiffKeyboard(opts: {
         a: actions.accept, x: actions.reject, A: actions.acceptFile, v: actions.toggleViewed,
         o: actions.open, w: actions.why, " ": actions.toggleCollapse, "/": actions.focusFilter,
         c: actions.focusCommit, "?": actions.toggleHelp,
+        ...(actions.comment && { m: actions.comment }),
       };
       if (k in map) { e.preventDefault(); map[k](); }
     };

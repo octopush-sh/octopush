@@ -255,7 +255,19 @@ pub fn build_request(req: &LlmRequest) -> Value {
 pub fn build_responses_request(req: &LlmRequest, provider: &str, api_base: &str) -> Value {
     let base = responses_url(api_base);
     let here = ResponsesOrigin { model: &req.model, provider, base: &base };
-    let mut input: Vec<Value> = Vec::with_capacity(req.messages.len());
+    let mut input: Vec<Value> = Vec::with_capacity(req.messages.len() + 1);
+    // The system prompt is the first `developer` input item, never the
+    // top-level `instructions`: "Models starting with GPT-6.2, including Astra
+    // and Sol, append these instructions after `input`", outside the cacheable
+    // prefix (prompt-caching guide: "Put reusable instructions in the first
+    // `developer` message in `input`"). Every Responses model gets this one
+    // shape. Replayed turns only hold output items, so it is never repeated.
+    if !req.system.is_empty() {
+        input.push(json!({
+            "role": "developer",
+            "content": [{ "type": "input_text", "text": req.system }],
+        }));
+    }
     for m in &req.messages {
         input.extend(message_to_responses(m, &here));
     }
@@ -280,9 +292,6 @@ pub fn build_responses_request(req: &LlmRequest, provider: &str, api_base: &str)
         "store": false,
         "include": ["reasoning.encrypted_content"],
     });
-    if !req.system.is_empty() {
-        body["instructions"] = json!(req.system);
-    }
     if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
     }

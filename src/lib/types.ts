@@ -187,6 +187,32 @@ export interface CreatedWorkspace extends Workspace {
   setupTerminalId: string | null;
   /** Why the setup script couldn't be started; the workspace itself is fine. */
   setupError: string | null;
+  /** What the fresh worktree borrowed from the main checkout; null (or absent)
+   *  when the project shares nothing or the worktree wasn't fresh. */
+  shared?: ShareOutcome | null;
+}
+
+/** "Share with new missions" (#961): dependency folders to link from the main
+ *  checkout and local env files to copy, each a name at the repo root. */
+export interface ShareSpec {
+  link: string[];
+  copy: string[];
+}
+
+/** `share_with_missions`: what the project shares now, and what its main
+ *  checkout could share (present and git-ignored there). */
+export interface ShareOptions {
+  saved: ShareSpec;
+  available: ShareSpec;
+}
+
+/** What applying a project's ShareSpec did to a fresh worktree. */
+export interface ShareOutcome {
+  linked: string[];
+  copied: string[];
+  /** One sentence per entry left out ("node_modules: not linked in a sandboxed mission",
+   *  ".env: not copied into a sandboxed mission"). */
+  skipped: string[];
 }
 
 // ─── Missions ─────────────────────────────────────────────────────
@@ -213,6 +239,16 @@ export interface Mission {
   createdAt: string;
   updatedAt: string;
   archivedAt: string | null;
+}
+
+/** `update_mission`'s response: the mission, plus what "Share with new
+ *  missions" had given its worktree and was taken back because its Execution
+ *  became `sandbox`: links removed, env copies removed, and env copies kept
+ *  because they changed in the mission. */
+export interface UpdatedMission extends Mission {
+  unlinked?: string[];
+  uncopied?: string[];
+  keptCopies?: string[];
 }
 
 // ─── Logbook ──────────────────────────────────────────────────────
@@ -418,6 +454,43 @@ export interface SessionUsage {
   model: string;
   /** When that last message was written (RFC3339 UTC). */
   asOf: string;
+}
+
+/** One thing a project's requests carry (`request_context::CarriedItem`).
+ *  Its `tokens` is always an estimate (bytes ÷ 4, fitted to the measured
+ *  total). */
+export interface CarriedItem {
+  /** A CLAUDE.md-chain file (or one it imports), the skill or agent
+   *  listings, or the measured total minus every other item. */
+  kind: "memory" | "skills" | "agents" | "by_difference";
+  /** `CLAUDE.md`, `~/.claude/CLAUDE.md`, `Skills`, `Agents`, or
+   *  `MCP and built-in tools, by difference`. */
+  label: string;
+  /** The file's full path, for a `memory` item. */
+  path: string | null;
+  /** Skills or agents counted; 1 for a file, 0 for `by_difference`. */
+  count: number;
+  bytes: number;
+  tokens: number;
+}
+
+/** What every request of a project carries (`get_request_context`, #959). */
+export interface RequestContext {
+  /** Measured: the smallest first-request prompt of the project's recent
+   *  sessions. Null with no transcript to read. */
+  measuredTokens: number | null;
+  sessionsMeasured: number;
+  /** The model of most first requests. */
+  model: string | null;
+  /** Share of the sampled sessions' prompt tokens read from cache, 0–100. */
+  cacheHitPct: number | null;
+  /** `measuredTokens` at the model's input price; null when unpriced. */
+  uncachedUsd: number | null;
+  /** `measuredTokens` at the input-side rate the model's requests actually
+   *  paid; null when unpriced. */
+  usualUsd: number | null;
+  /** Largest first; they add up to `measuredTokens` when it is known. */
+  items: CarriedItem[];
 }
 
 export interface ChatStreamEvent {

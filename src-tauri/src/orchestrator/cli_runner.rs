@@ -1405,14 +1405,28 @@ pub fn review_disallowed_tools() -> String {
 /// parks it for the director.
 pub const ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
 
+/// Claude Code's worktree tools, denied to EVERY Claude CLI stage (#1002).
+/// A stage's workspace is the Octopush-made worktree it was spawned in, and
+/// Review, Collision radar and the diff snapshots all watch that path. With
+/// `EnterWorktree` a stage could move its work to a worktree Octopush doesn't
+/// track; before Claude Code 2.1.330, `ExitWorktree` could remove a worktree
+/// another running session was working in, and Octopush runs several at once.
+/// This denies the two tools only: Bash (`git worktree …`, `cd` elsewhere) is
+/// not covered and stays unconfined outside a sandboxed mission.
+pub const WORKTREE_TOOLS: &[&str] = &["EnterWorktree", "ExitWorktree"];
+
 /// The one `--disallowedTools` value for a Claude CLI stage: the question
-/// tool, plus the review denial on a read-only stage.
+/// tool and the worktree tools, plus the review denial on a read-only stage.
 pub fn cli_disallowed_tools(read_only: bool) -> String {
+    let mut tools: String = std::iter::once(ASK_USER_QUESTION_TOOL)
+        .chain(WORKTREE_TOOLS.iter().copied())
+        .collect::<Vec<_>>()
+        .join(",");
     if read_only {
-        format!("{ASK_USER_QUESTION_TOOL},{}", review_disallowed_tools())
-    } else {
-        ASK_USER_QUESTION_TOOL.to_string()
+        tools.push(',');
+        tools.push_str(&review_disallowed_tools());
     }
+    tools
 }
 
 /// Inline `--settings` passed to EVERY Claude CLI stage (read-only ones too,
@@ -1464,6 +1478,153 @@ pub fn confine_reads_in_sandbox(dialect: CliDialect, exec_choice: &str, args: &m
         }
         _ => false,
     }
+}
+
+/// The launch line's note on a Claude stage the Seatbelt profile wraps
+/// ([`turn_off_inner_sandbox`]).
+pub const INNER_SANDBOX_OFF_LABEL: &str =
+    "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage";
+
+/// When the stage's effective `exec_isolation` is `sandbox` (the mission's
+/// own choice, or a `readonly` mission's forced sandbox), merge
+/// `"sandbox":{"enabled":false}` into a Claude stage's `--settings` value
+/// (fresh or resumed argv), beside the permission guards. A user who turned
+/// on Claude Code's Bash sandbox in `~/.claude/settings.json` would otherwise
+/// bring it into the stage, where a nested sandbox can't start
+/// (`sandbox::tests::seatbelt_refuses_a_nested_sandbox`) and, since 2.1.328,
+/// the next sandboxed Bash command is refused "the sandbox is off for the
+/// session".
+/// `--settings` outranks the user's file, so Octopush's profile is the one
+/// boundary. Returns whether it did; Codex stages and unsandboxed stages are
+/// left as they are. Pure.
+pub fn turn_off_inner_sandbox(dialect: CliDialect, exec_isolation: &str, args: &mut [String]) -> bool {
+    if dialect != CliDialect::Claude || exec_isolation != "sandbox" {
+        return false;
+    }
+    let Some(i) = args.iter().position(|a| a == "--settings").filter(|i| i + 1 < args.len()) else {
+        return false;
+    };
+    let Ok(mut v) = serde_json::from_str::<Value>(&args[i + 1]) else {
+        return false;
+    };
+    let Some(map) = v.as_object_mut() else {
+        return false;
+    };
+    map.insert("sandbox".to_string(), serde_json::json!({ "enabled": false }));
+    args[i + 1] = v.to_string();
+    true
+}
+
+/// The phrase Claude Code (≥ 2.1.328) puts in a sandboxed Bash command's
+/// refusal when its own sandbox couldn't start, matched case-insensitively.
+const INNER_SANDBOX_OFF_PHRASE: &str = "sandbox is off for the session";
+
+/// The start of the error, and the done card's last notice, of a Claude
+/// stage in which Claude Code refused a Bash command because its own sandbox
+/// couldn't start ([`InnerSandboxWatch`]).
+pub const INNER_SANDBOX_OFF: &str =
+    "Claude Code's own Bash sandbox couldn't start, so it refused a Bash command (the sandbox is off for the session)";
+
+/// Claude Code's "sandbox is off for the session" refusals in one stage's
+/// stream. It watches only a stage the Seatbelt profile wraps (effective
+/// `exec_isolation` `sandbox`, the same key as [`turn_off_inner_sandbox`]),
+/// and counts only an `is_error` `tool_result` whose `tool_use_id` belongs to
+/// a `Bash` `tool_use`: a Read, Grep or `cat` result quoting the phrase (this
+/// repo's own docs and tests do) is not a refusal.
+#[derive(Debug, Default)]
+pub struct InnerSandboxWatch {
+    watching: bool,
+    /// Ids of the Bash calls opened so far whose result hasn't arrived.
+    bash_open: Vec<String>,
+    refused: bool,
+    last_bash_refused: bool,
+}
+
+impl InnerSandboxWatch {
+    pub fn for_stage(dialect: CliDialect, exec_isolation: &str) -> Self {
+        Self { watching: dialect == CliDialect::Claude && exec_isolation == "sandbox", ..Self::default() }
+    }
+
+    pub fn observe(&mut self, v: &Value) {
+        if !self.watching {
+            return;
+        }
+        let kind = v.get("type").and_then(Value::as_str);
+        let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
+            return;
+        };
+        for b in blocks {
+            match (kind, b.get("type").and_then(Value::as_str)) {
+                (Some("assistant"), Some("tool_use")) => {
+                    if b.get("name").and_then(Value::as_str) != Some("Bash") {
+                        continue;
+                    }
+                    if let Some(id) = b.get("id").and_then(Value::as_str) {
+                        self.bash_open.push(id.to_string());
+                    }
+                }
+                (Some("user"), Some("tool_result")) => {
+                    let Some(id) = b.get("tool_use_id").and_then(Value::as_str) else { continue };
+                    let Some(at) = self.bash_open.iter().position(|o| o == id) else { continue };
+                    self.bash_open.remove(at);
+                    let refused = b.get("is_error").and_then(Value::as_bool) == Some(true)
+                        && tool_result_text(b).to_ascii_lowercase().contains(INNER_SANDBOX_OFF_PHRASE);
+                    self.refused |= refused;
+                    self.last_bash_refused = refused;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Claude Code refused at least one Bash command: the done card's notice.
+    pub fn refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The refusal is the last Bash result of the stage (which is also the
+    /// case when every Bash result after the first refusal was refused), so
+    /// it plausibly caused a failure: the error is named and not escalated.
+    /// A later Bash command that ran means the failure has another cause.
+    pub fn decisive(&self) -> bool {
+        self.refused && self.last_bash_refused
+    }
+}
+
+/// A `tool_result` block's text: its string content, or its text parts joined.
+fn tool_result_text(block: &Value) -> String {
+    match block.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => {
+            parts.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(" ")
+        }
+        _ => String::new(),
+    }
+}
+
+/// True when a stage error is an [`INNER_SANDBOX_OFF`] failure: the drive
+/// must not escalate it — a stronger model meets the same refusal.
+pub fn is_inner_sandbox_off(error: &str) -> bool {
+    error.starts_with(INNER_SANDBOX_OFF)
+}
+
+/// Name the inner-sandbox refusal on a failed stage it decided
+/// ([`InnerSandboxWatch::decisive`]): its error starts with
+/// [`INNER_SANDBOX_OFF`] instead of reading as a generic failure. Any other
+/// outcome, or a stage where it wasn't decisive, is returned unchanged.
+/// Pure.
+pub fn name_inner_sandbox_off(mut outcome: StageOutcome, decisive: bool) -> StageOutcome {
+    if decisive && matches!(outcome.status, StageStatus::Failed) {
+        let err = outcome.error.take().unwrap_or_default();
+        outcome.error = Some(if err.trim().is_empty() {
+            INNER_SANDBOX_OFF.to_string()
+        } else if is_inner_sandbox_off(&err) {
+            err
+        } else {
+            format!("{INNER_SANDBOX_OFF}\n{err}")
+        });
+    }
+    outcome
 }
 
 /// The [`CacheTenant`](crate::orchestrator::sandbox::CacheTenant) a sandboxed
@@ -1522,7 +1683,8 @@ pub fn read_guard_label(reads_confined: bool, cli_version: Option<&str>) -> Opti
 /// (`stream-json` requires `--verbose`) so the stage emits live progress and a
 /// chatty/debug stdout can't break result parsing — each line is parsed
 /// independently and non-JSON log lines are simply skipped. Every stage
-/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`];
+/// carries [`CLAUDE_STAGE_SETTINGS`] and denies [`ASK_USER_QUESTION_TOOL`]
+/// and the [`WORKTREE_TOOLS`];
 /// `read_only` adds the review-stage tool denial (see [`cli_disallowed_tools`]).
 pub fn build_cli_args(model: &str, system_prompt: &str, max_turns: i64, read_only: bool) -> Vec<String> {
     vec![
@@ -2652,10 +2814,79 @@ pub(crate) fn context_window_env(
 /// and `us.anthropic.claude-sonnet-5-v1:0` count) is a builtin Anthropic
 /// catalog id.
 pub(crate) fn is_builtin_claude_model(model: &str) -> bool {
+    is_builtin_claude_id(&crate::token_engine::normalize_model_id(model))
+}
+
+/// Claude Code's switch for its shorter system prompt. 2.1.330: "Changed
+/// unrecognized model names containing \"sonnet\" or \"haiku\" to use the
+/// shorter system prompt, like other unrecognized names;
+/// `CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT=0` gives every model the full one".
+pub const SIMPLE_SYSTEM_PROMPT_ENV: &str = "CLAUDE_CODE_SIMPLE_SYSTEM_PROMPT";
+
+/// The system-prompt variable a Claude stage on `model` gets, so a Claude
+/// model under a gateway's name keeps the full prompt Claude Code's tools
+/// were tuned for. Pure:
+/// - `model` normalizes ([`crate::token_engine::normalize_model_id`], the
+///   pricing engine's) to an id `known` reports (the builtin Anthropic
+///   catalog), and the string Claude Code sees isn't that canonical id (a
+///   `[1m]` suffix or a dated snapshot still counts as canonical):
+///   [`SIMPLE_SYSTEM_PROMPT_ENV`]`=0`;
+/// - a canonical id, and any model that isn't a known Claude model (a local
+///   or Ollama model keeps the short prompt), get nothing;
+/// - the user's own export (`user_set`) is never overridden.
+pub(crate) fn system_prompt_env(
+    model: &str,
+    known: impl Fn(&str) -> bool,
+    user_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
     let id = crate::token_engine::normalize_model_id(model);
+    if !known(&id) || is_canonical_claude_id(model, &id) || user_set(SIMPLE_SYSTEM_PROMPT_ENV) {
+        return Vec::new();
+    }
+    vec![(SIMPLE_SYSTEM_PROMPT_ENV, "0".to_string())]
+}
+
+/// Whether `model` is spelled the way Claude Code knows `id`: exactly, or
+/// with a `[…]` capability suffix or a `-YYYYMMDD` snapshot.
+fn is_canonical_claude_id(model: &str, id: &str) -> bool {
+    let m = model.trim();
+    let m = m.find('[').map_or(m, |i| &m[..i]);
+    m == id
+        || m.strip_prefix(id).is_some_and(|rest| {
+            rest.len() == 9 && rest.starts_with('-') && rest[1..].bytes().all(|c| c.is_ascii_digit())
+        })
+}
+
+/// [`system_prompt_env`] for a stage's model: known per the builtin
+/// Anthropic catalog, a user's export read the way the CLI process will see
+/// it ([`stage_env_value`]). Codex: nothing.
+fn stage_system_prompt_env(dialect: CliDialect, model: &str) -> Vec<(&'static str, String)> {
+    if dialect != CliDialect::Claude {
+        return Vec::new();
+    }
+    system_prompt_env(model, is_builtin_claude_id, |k| stage_env_value(k).is_some())
+}
+
+/// Whether `id` (already normalized) is a builtin Anthropic catalog id.
+fn is_builtin_claude_id(id: &str) -> bool {
     crate::provider_router::builtin_providers()
         .get("anthropic")
         .is_some_and(|p| p.models.iter().any(|m| m.id == id))
+}
+
+/// Whether a Claude stage on `model` runs a gateway's model: neither a
+/// built-in Anthropic id ([`is_builtin_claude_model`]) nor a Claude Code alias
+/// (`sonnet`, `opusplan`, `default`…), which Claude Code resolves to one.
+pub(crate) fn is_gateway_model(model: &str) -> bool {
+    let m = crate::token_engine::normalize_model_id(&model.trim().to_ascii_lowercase());
+    let alias = matches!(m.as_str(), "default" | "best" | "opusplan" | "sonnet" | "opus" | "haiku" | "fable" | "mythos");
+    !alias && !is_builtin_claude_model(model)
+}
+
+/// The launch line's note when the stage keeps Claude Code's full prompt
+/// under a gateway name ([`stage_system_prompt_env`]).
+fn system_prompt_label(dialect: CliDialect, model: &str) -> Option<&'static str> {
+    (!stage_system_prompt_env(dialect, model).is_empty()).then_some("full Claude Code prompt (gateway name)")
 }
 
 /// [`context_window_env`] for a stage's model: built-in per
@@ -2679,8 +2910,9 @@ fn stage_context_env(dialect: CliDialect, model: &str, cli_version: Option<&str>
 /// ([`CliDialect::stage_env`]), the inherited effort override dropped
 /// ([`CliDialect::stage_env_remove`]), the subagent effort
 /// ([`CliDialect::stage_effort_env`]), the quiet-traffic opt-in
-/// ([`CliDialect::stage_quiet_env`]) and a gateway model's context window
-/// ([`stage_context_env`]). The ONE place a stage's env is set — fresh and
+/// ([`CliDialect::stage_quiet_env`]), a gateway model's context window
+/// ([`stage_context_env`]) and a gateway-named Claude model's full prompt
+/// ([`stage_system_prompt_env`]). The ONE place a stage's env is set — fresh and
 /// `--resume` runs, in-process and detached, all spawn through it.
 pub(crate) fn apply_stage_env(
     command: &mut tokio::process::Command,
@@ -2704,6 +2936,9 @@ pub(crate) fn apply_stage_env(
         command.env(k, v);
     }
     for (k, v) in stage_context_env(dialect, model, cli_version) {
+        command.env(k, v);
+    }
+    for (k, v) in stage_system_prompt_env(dialect, model) {
         command.env(k, v);
     }
 }
@@ -3088,6 +3323,10 @@ impl CliRunner {
     /// fails before any assistant message, or Codex answers with another
     /// session, the stage runs fresh ONCE with the feedback in the prompt, and
     /// the journal says why. Both attempts' spend is kept.
+    ///
+    /// A resumed Claude stage whose `--resume` came back on an empty
+    /// conversation ([`ResumeWatch`]) is stopped and runs fresh ONCE the same
+    /// way, with its full input and any feedback; the attempt journals why.
     async fn run_stage(
         &self,
         stage: &StageSpec,
@@ -3095,8 +3334,17 @@ impl CliRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let dialect = dialect_for_model(&stage.agent_model);
-        if dialect != CliDialect::Codex || stage.resume_session.is_none() {
+        if stage.resume_session.is_none() {
             return self.run_attempt(stage, input, ctx, true, &mut AttemptReport::default()).await;
+        }
+        if dialect == CliDialect::Claude {
+            let mut report = AttemptReport::default();
+            let resumed = self.run_attempt(stage, input, ctx, true, &mut report).await?;
+            if report.empty_resume.is_none() {
+                return Ok(resumed);
+            }
+            let fresh = self.run_attempt(stage, input, ctx, false, &mut AttemptReport::default()).await?;
+            return Ok(merge_resume_fallback(resumed, fresh));
         }
         let emitter = crate::orchestrator::live::LiveEmitter::new(ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
         let supported = tokio::task::spawn_blocking(crate::agent_adapter::codex_exec_resume_supported)
@@ -3193,6 +3441,10 @@ impl CliRunner {
         // reads (fresh and resumed). Keyed on the choice, not the effective
         // tier: a readonly mission's forced sandbox keeps the write guard only.
         let reads_confined = confine_reads_in_sandbox(dialect, &ctx.exec_choice, &mut args);
+        // Every stage the Seatbelt profile wraps (the effective tier, so a
+        // readonly mission's forced sandbox too) turns Claude Code's own Bash
+        // sandbox off: it can't nest in the profile.
+        let inner_sandbox_off = turn_off_inner_sandbox(dialect, &ctx.exec_isolation, &mut args);
         // Claude Code meters its own spend: cap the stage at its share of the
         // run's remaining budget so one long stage can't run far past it (the
         // API substrate stops at the same headroom in `run_agentic_loop`).
@@ -3385,14 +3637,16 @@ impl CliRunner {
             Err(e) => return Ok(failed_stage(&format!("failed to launch {}: {e}", dialect.binary()))),
         };
         emitter.notice(&format!(
-            "launching {} · {}{}{}{}{}{}{}",
+            "launching {} · {}{}{}{}{}{}{}{}{}",
             dialect.binary(),
             stage.agent_model,
             dialect.effort_level(&stage.agent_model, effort).map(|e| format!(" · {e} effort")).unwrap_or_default(),
+            system_prompt_label(dialect, &stage.agent_model).map(|s| format!(" · {s}")).unwrap_or_default(),
             dialect.sandbox_label(read_only, write_scope).map(|s| format!(" · {s}")).unwrap_or_default(),
             read_guard_label(reads_confined, cli_version.as_ref().and_then(|v| v.version.as_deref()))
                 .map(|s| format!(" · {s}"))
                 .unwrap_or_default(),
+            if inner_sandbox_off { format!(" · {INNER_SANDBOX_OFF_LABEL}") } else { String::new() },
             if resuming { " · resuming session" } else { "" },
             crate::orchestrator::sandbox::left_out_label(&left_out).map(|s| format!(" · {s}")).unwrap_or_default(),
             dialect.version_label(codex_version.as_deref()).map(|s| format!(" · {s}")).unwrap_or_default(),
@@ -3465,8 +3719,26 @@ impl CliRunner {
         // per message (#895). Claude only: Codex's stream has no per-message
         // prompt size, so its meter stays hidden.
         let mut context_watch = ContextWatch::default();
+        // A resumed Claude stage: did `--resume` come back on an empty
+        // conversation? Set once, then the select below stops the attempt.
+        let mut resume_watch = stage
+            .resume_session
+            .as_deref()
+            .filter(|_| resuming && dialect == CliDialect::Claude)
+            .map(|sid| ResumeWatch::new(sid, stage.resume_context_tokens));
+        let empty_resume: parking_lot::Mutex<Option<EmptyResume>> = parking_lot::Mutex::new(None);
+        let empty_seen = tokio::sync::Notify::new();
+        // Claude Code refused a Bash command because its own sandbox couldn't
+        // start (`InnerSandboxWatch`, only in a stage the profile wraps):
+        // a notice, and named on a failed outcome it decided, below.
+        let sandbox_watch = std::sync::Arc::new(parking_lot::Mutex::new(InnerSandboxWatch::for_stage(
+            dialect,
+            &ctx.exec_isolation,
+        )));
+        let sandbox_watch_in_loop = std::sync::Arc::clone(&sandbox_watch);
         let on_event = |value: &Value| match dialect {
             CliDialect::Claude => {
+                sandbox_watch_in_loop.lock().observe(value);
                 if let Some(ran) = substituted_model(&stage.agent_model, value) {
                     let catalog = crate::token_engine::catalog();
                     emitter.notice(&ran_on_notice(&stage.agent_model, &ran, catalog.as_deref()));
@@ -3491,6 +3763,10 @@ impl CliRunner {
                 forward_plan_and_login(&mut auth, value, &emitter);
                 if auth != Some(CliAuth::ApiKey) {
                     plan_watch_in_loop.lock().observe(value);
+                }
+                if let Some(why) = resume_watch.as_mut().and_then(|w| w.observe(value)) {
+                    *empty_resume.lock() = Some(why);
+                    empty_seen.notify_one();
                 }
             }
             CliDialect::Codex => {
@@ -3545,7 +3821,8 @@ impl CliRunner {
             }
         };
         let read_end = tokio::select! {
-            end = read_loop => end,
+            end = read_loop => Some(end),
+            _ = empty_seen.notified() => None,
             _ = cancel_watch => {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
@@ -3561,6 +3838,37 @@ impl CliRunner {
                 );
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                 out.cli.ran_model = ran;
+                return Ok(out);
+            }
+        };
+        // An empty resume is never trusted, even when the stream already
+        // ended: stop it with what it streamed, and `run_stage` runs fresh.
+        let empty = empty_resume.lock().take();
+        let read_end = match (empty, read_end) {
+            (None, Some(end)) => end,
+            (why, _) => {
+                stop_cli_child(&mut child, STOP_GRACE).await;
+                stderr_task.abort();
+                let (counted, drift) = counted_usage();
+                let ran = ran_model.lock().clone();
+                let mut out = stopped_stage(
+                    dialect,
+                    EMPTY_RESUME_STOP,
+                    ran.as_deref().unwrap_or(&stage.agent_model),
+                    &counted,
+                    false,
+                );
+                flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                out.cli.ran_model = ran;
+                if let Some(why) = why {
+                    let has_feedback = stage.feedback.as_deref().is_some_and(|f| !f.trim().is_empty());
+                    emitter.notice(&empty_resume_notice(
+                        &why,
+                        cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                        has_feedback,
+                    ));
+                    report.empty_resume = Some(why);
+                }
                 return Ok(out);
             }
         };
@@ -3686,9 +3994,24 @@ impl CliRunner {
                         for call in &outcome.cli.refused_calls {
                             emitter.notice(&refused_notice(call));
                         }
-                        Ok(apply_question_guard(apply_plan_limit(
-                            with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
-                            &plan_watch.lock(),
+                        let outcome = with_known_bad_release(
+                            outcome,
+                            &stage.agent_model,
+                            cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                        );
+                        let (refused, decisive) = {
+                            let w = sandbox_watch.lock();
+                            (w.refused(), w.decisive())
+                        };
+                        if refused {
+                            emitter.notice(INNER_SANDBOX_OFF);
+                        }
+                        Ok(apply_question_guard(name_inner_sandbox_off(
+                            apply_plan_limit(
+                                with_free_space(outcome, || free_bytes(&ctx.workspace_path)),
+                                &plan_watch.lock(),
+                            ),
+                            decisive,
                         )))
                     }
                     Err(_) => Ok(failed_stage(&format!(
@@ -3719,7 +4042,19 @@ impl CliRunner {
                     );
                     flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                     out.cli.ran_model = ran;
-                    Ok(apply_plan_limit(out, &plan_watch.lock()))
+                    let out = with_known_bad_release(
+                        out,
+                        &stage.agent_model,
+                        cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                    );
+                    let (refused, decisive) = {
+                        let w = sandbox_watch.lock();
+                        (w.refused(), w.decisive())
+                    };
+                    if refused {
+                        emitter.notice(INNER_SANDBOX_OFF);
+                    }
+                    Ok(name_inner_sandbox_off(apply_plan_limit(out, &plan_watch.lock()), decisive))
                 }
             },
         }
@@ -3734,6 +4069,9 @@ pub(crate) struct AttemptReport {
     /// [`codex_resume_failure`]); `None` on a fresh run, a resume that
     /// worked, or a stop/timeout (never retried).
     pub resume_failure: Option<String>,
+    /// A `claude -p --resume` that came back on an empty conversation
+    /// ([`ResumeWatch`]): the attempt was stopped and the stage runs fresh.
+    pub empty_resume: Option<EmptyResume>,
 }
 
 /// Why a Codex stage with a session to resume runs fresh without trying:
@@ -3809,6 +4147,116 @@ pub(crate) fn codex_resume_failure_notice(why: &str) -> String {
         )
     }
 }
+
+/// The first Claude Code whose `--resume` no longer opens an empty session
+/// (2.1.330: "Fixed `--continue` and `--resume` opening an empty session or
+/// failing"). Older CLIs can answer a resume on a blank conversation.
+pub const CLAUDE_EMPTY_RESUME_FIX: &str = "2.1.330";
+
+/// A resumed Claude stage's first reply must have read at least this share of
+/// the context its session last reported, or it came back empty.
+pub(crate) const EMPTY_RESUME_SHARE_PCT: u64 = 15;
+
+/// The floor when the session's last context isn't known.
+pub(crate) const EMPTY_RESUME_MIN_TOKENS: u64 = 8_000;
+
+/// Why a `claude -p --resume <id>` came back on an empty conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EmptyResume {
+    /// `system/init` named another session than the one passed to `--resume`.
+    OtherSession { requested: String, got: String },
+    /// The first top-level reply read less context than `floor`.
+    SmallContext { tokens: u64, floor: u64 },
+}
+
+/// Watches a resumed Claude stage's stream for an empty resume: decides once,
+/// on the `system/init` session id, then on the first top-level assistant
+/// message's context size ([`context_from_stream_event`]).
+#[derive(Debug)]
+pub(crate) struct ResumeWatch {
+    requested: String,
+    /// The context the session last reported (`None` when none was recorded).
+    prior_context: Option<u64>,
+    decided: bool,
+}
+
+impl ResumeWatch {
+    pub(crate) fn new(requested: &str, prior_context: Option<u64>) -> Self {
+        Self { requested: requested.to_string(), prior_context, decided: false }
+    }
+
+    /// The least context a real continuation's first reply reads: 15% of the
+    /// session's last reading, or 8K tokens when none was recorded. Pure.
+    pub(crate) fn floor(prior_context: Option<u64>) -> u64 {
+        match prior_context.filter(|p| *p > 0) {
+            Some(p) => p * EMPTY_RESUME_SHARE_PCT / 100,
+            None => EMPTY_RESUME_MIN_TOKENS,
+        }
+    }
+
+    /// Feed one stream event; `Some` once, when the resume came back empty.
+    pub(crate) fn observe(&mut self, v: &Value) -> Option<EmptyResume> {
+        if self.decided {
+            return None;
+        }
+        if is_init_event(v) {
+            let got = v.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+            if got != self.requested {
+                self.decided = true;
+                return Some(EmptyResume::OtherSession { requested: self.requested.clone(), got: got.to_string() });
+            }
+            return None;
+        }
+        let (tokens, _) = context_from_stream_event(v)?;
+        self.decided = true;
+        let floor = Self::floor(self.prior_context);
+        (tokens < floor).then_some(EmptyResume::SmallContext { tokens, floor })
+    }
+}
+
+/// `142000` → `142k`; under 1,000 as is. Pure.
+fn short_tokens(t: u64) -> String {
+    if t < 1_000 {
+        t.to_string()
+    } else {
+        format!("{}k", t / 1_000)
+    }
+}
+
+/// The journal line for an empty resume before the stage reruns fresh; on a
+/// known CLI older than [`CLAUDE_EMPTY_RESUME_FIX`] it names the update
+/// (an unknown version never does, like [`idle_timeout_message`]). It names
+/// the answers only when the fresh rerun carries feedback (an answered block;
+/// a plain Resume has none). Pure.
+pub(crate) fn empty_resume_notice(why: &EmptyResume, cli_version: Option<&str>, has_feedback: bool) -> String {
+    let detail = match why {
+        EmptyResume::OtherSession { requested, got } => format!(
+            "it started session {} instead of {}",
+            got.chars().take(8).collect::<String>(),
+            requested.chars().take(8).collect::<String>()
+        ),
+        EmptyResume::SmallContext { tokens, floor } => format!(
+            "its first reply read {} tokens of context, under the {} a continuation reads",
+            short_tokens(*tokens),
+            short_tokens(*floor)
+        ),
+    };
+    let with = if has_feedback { "its full input and your answers" } else { "its full input" };
+    let mut msg = format!(
+        "resume came back empty: Claude Code opened a new conversation ({detail}). \
+         The stage runs fresh, with {with}."
+    );
+    if cli_version.is_some_and(|v| crate::agent_adapter::version_below(v, CLAUDE_EMPTY_RESUME_FIX)) {
+        msg.push_str(&format!(
+            " Claude Code {CLAUDE_EMPTY_RESUME_FIX} fixes --resume opening an empty session; update Claude Code."
+        ));
+    }
+    msg
+}
+
+/// The stage error of a resumed attempt stopped as empty (replaced by the
+/// fresh run's outcome; kept on the outcome if that run never happens).
+pub(crate) const EMPTY_RESUME_STOP: &str = "stopped: the resumed Claude Code session came back empty";
 
 /// `map`'s usage with `baseline` (the session's earlier reported total)
 /// taken off, as one entry; `map` unchanged without a baseline. A resumed
@@ -3923,6 +4371,29 @@ pub(crate) fn merge_resume_fallback(resumed: StageOutcome, mut fresh: StageOutco
     fresh.cli.usage_unreported |= resumed.cli.usage_unreported || resumed_stopped;
     fresh.cli.usage_unreported_journaled = fresh.cli.usage_unreported && journaled;
     fresh
+}
+
+/// A failed Claude stage on a gateway model ([`is_gateway_model`]) whose
+/// error is a `max_tokens` one, on a
+/// `cli_version` that is a known bad release: the error names that release
+/// and asks for the update first ([`crate::agent_adapter::known_bad_stage_error`]).
+/// Any other outcome is unchanged.
+pub(crate) fn with_known_bad_release(mut outcome: StageOutcome, model: &str, cli_version: Option<&str>) -> StageOutcome {
+    if !matches!(outcome.status, StageStatus::Failed) {
+        return outcome;
+    }
+    let named = outcome.error.as_deref().and_then(|e| {
+        crate::agent_adapter::known_bad_stage_error(
+            e,
+            cli_version,
+            is_gateway_model(model),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+        )
+    });
+    if let Some(e) = named {
+        outcome.error = Some(e);
+    }
+    outcome
 }
 
 /// Preview (≤400 chars) of stderr if it has content, else of `fallback`

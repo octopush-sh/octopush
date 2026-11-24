@@ -1,6 +1,6 @@
 {
   "name": "octopush",
-  "version": "0.4.140",
+  "version": "0.4.144",
   "description": "The IDE for Agentic Developers — eight arms, zero wasted tokens.",
   "private": true,
   "type": "module",
@@ -43,7 +43,7 @@
     "@dnd-kit/core": "^6.3.1",
     "@dnd-kit/sortable": "^10.0.0",
     "@dnd-kit/utilities": "^3.2.2",
-    "@tauri-apps/api": "^2.12.4",
+    "@tauri-apps/api": "^2.12.5",
     "@tauri-apps/plugin-clipboard-manager": "^2",
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-notification": "^2.8.1",
@@ -57,21 +57,21 @@
     "cmdk": "^1.1.1",
     "codemirror": "^6.0.2",
     "highlight.js": "^11.12.0",
-    "lucide-react": "^1.72.0",
+    "lucide-react": "^1.77.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",
     "react-markdown": "^10.1.0",
-    "recharts": "^3.10.1",
+    "recharts": "^3.11.0",
     "remark-gfm": "^4.0.1",
     "yaml": "^2.9.1",
     "zustand": "^5.1.0"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.3.5",
-    "@tauri-apps/cli": "^2.12.4",
+    "@tauri-apps/cli": "^2.12.6",
     "@testing-library/jest-dom": "^7.0.1",
     "@testing-library/react": "^16.3.3",
-    "@testing-library/user-event": "^14.6.10",
+    "@testing-library/user-event": "^14.6.13",
     "@types/react": "^19.3.0",
     "@types/react-dom": "^19.3.0",
     "@vitejs/plugin-react": "^6.3.0",
@@ -79,6 +79,6 @@
     "tailwindcss": "^4.3.4",
     "typescript": "^5.7.2",
     "vite": "^8.3.8",
-    "vitest": "^5.1.0"
+    "vitest": "^5.1.1"
   }
 }

@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{AppError, AppResult};
+
 /// The lifecycle state of a pull request, as understood by Octopush.
 ///
 /// GitHub's REST API returns two fields — `state` ("open"/"closed") and
@@ -188,14 +190,19 @@ pub fn gh_rollup_may_be_capped(rollup_json: &serde_json::Value) -> bool {
     rollup_json.as_array().is_some_and(|a| a.len() >= GH_ROLLUP_CAP)
 }
 
-/// The `gh api --paginate` command line that lists every check run on `sha`.
-/// `None` unless `sha` is a hex commit id; owner and repo are single-quoted.
-pub fn gh_check_runs_command(owner: &str, repo: &str, sha: &str) -> Option<String> {
+/// Environment variable holding the API path `gh_check_runs_command` reads.
+pub const GH_API_PATH_ENV: &str = "OCTOPUSH_GH_API_PATH";
+
+/// The `gh api --paginate` command line that lists every check run on `sha`,
+/// and the API path to put in `GH_API_PATH_ENV` for it. The command is
+/// constant, so owner and repo never go into it (see
+/// `commands::login_shell_output`). `None` unless `sha` is a hex commit id.
+pub fn gh_check_runs_command(owner: &str, repo: &str, sha: &str) -> Option<(&'static str, String)> {
     if sha.is_empty() || sha.len() > 64 || !sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return None;
     }
     let path = format!("repos/{owner}/{repo}/commits/{sha}/check-runs?per_page={CHECK_RUNS_PER_PAGE}");
-    Some(format!("gh api --paginate '{}'", path.replace('\'', "'\\''")))
+    Some(("gh api --paginate \"$OCTOPUSH_GH_API_PATH\"", path))
 }
 
 /// The check runs in `gh api --paginate`'s output, which prints each page's
@@ -326,15 +333,20 @@ pub fn pr_infos_from_json(raw: &str) -> Result<Vec<PrInfo>, String> {
 }
 
 /// The login-shell command that materialises a PR's head ref as a local
-/// branch: `git fetch origin pull/<n>/head:<headRefName>`. Single quotes in
-/// the branch name are shell-escaped (`'\''`), which is safe only because a
-/// ref can't contain a backslash (see `git_ops::quote_git_ref`).
-pub fn pr_fetch_command(number: u64, head_ref_name: &str) -> String {
-    format!(
-        "git fetch origin 'pull/{}/head:{}' 2>&1",
-        number,
-        head_ref_name.replace('\'', "'\\''"),
-    )
+/// branch: `git fetch origin pull/<n>/head:<headRefName>`. The refspec is
+/// single-quoted with `git_ops::quote_git_ref`, so the name must pass
+/// `git_ops::is_git_ref_arg` first; anything else is refused before a shell
+/// runs (without echoing the name, which came from GitHub).
+pub fn pr_fetch_command(number: u64, head_ref_name: &str) -> AppResult<String> {
+    if !crate::git_ops::is_git_ref_arg(head_ref_name) {
+        return Err(AppError::Other(format!(
+            "The head branch of PR #{number} isn't a valid branch name."
+        )));
+    }
+    Ok(format!(
+        "git fetch origin {} 2>&1",
+        crate::git_ops::quote_git_ref(&format!("pull/{number}/head:{head_ref_name}")),
+    ))
 }
 
 pub fn pr_from_json(v: &serde_json::Value) -> Pr {

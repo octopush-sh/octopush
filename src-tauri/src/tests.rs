@@ -2624,7 +2624,8 @@ mod pr_checks_tests {
     use crate::github::{
         actions_run_id, check_runs_from_gh_pages, checks_from_gh_rollup, checks_from_gh_rollup_and_runs,
         checks_from_rest_check_runs, gh_check_runs_command, gh_rollup_may_be_capped, join_failed_logs,
-        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_ROLLUP_CAP,
+        more_check_run_pages, tail_chars, ChecksState, FailingCheck, CHECK_RUNS_PER_PAGE, GH_API_PATH_ENV,
+        GH_ROLLUP_CAP,
     };
 
     #[test]
@@ -2639,17 +2640,38 @@ mod pr_checks_tests {
     }
 
     #[test]
-    fn gh_check_runs_command_needs_a_hex_sha_and_quotes_the_path() {
+    fn gh_check_runs_command_needs_a_hex_sha_and_passes_the_path_in_the_env() {
+        assert_eq!(GH_API_PATH_ENV, "OCTOPUSH_GH_API_PATH");
         assert_eq!(
-            gh_check_runs_command("o", "r", "abc123").as_deref(),
-            Some("gh api --paginate 'repos/o/r/commits/abc123/check-runs?per_page=100'"),
+            gh_check_runs_command("o", "r", "abc123"),
+            Some((
+                "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"",
+                "repos/o/r/commits/abc123/check-runs?per_page=100".to_string(),
+            )),
         );
         assert!(gh_check_runs_command("o", "r", "").is_none());
         assert!(gh_check_runs_command("o", "r", "abc; rm -rf ~").is_none());
-        assert_eq!(
-            gh_check_runs_command("o'x", "r", "ab").as_deref(),
-            Some("gh api --paginate 'repos/o'\\''x/r/commits/ab/check-runs?per_page=100'"),
-        );
+        // Owner and repo stay out of the command line, whatever they hold.
+        let (cmd, path) = gh_check_runs_command("o\\'x", "r", "ab").unwrap();
+        assert_eq!(cmd, "gh api --paginate \"$OCTOPUSH_GH_API_PATH\"");
+        assert_eq!(path, "repos/o\\'x/r/commits/ab/check-runs?per_page=100");
+    }
+
+    #[test]
+    fn gh_check_runs_path_reaches_the_command_verbatim_under_every_shell() {
+        use super::login_shell_fixture::available_shells;
+        let dir = tempfile::tempdir().unwrap();
+        let ws = dir.path().to_string_lossy().to_string();
+        let (cmd, path) = gh_check_runs_command("o\\'; touch PWNED; echo '", "r", "ab").unwrap();
+        // `printf %s` stands in for `gh api --paginate`, which isn't installed in CI.
+        let cmd = cmd.replace("gh api --paginate", "printf %s");
+        for shell in available_shells() {
+            let out = crate::commands::login_shell_output(&shell, &ws, &cmd, &[(GH_API_PATH_ENV, path.clone())])
+                .unwrap_or_else(|e| panic!("{shell}: {e}"));
+            assert!(out.status.success(), "{shell}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), path, "{shell}");
+            assert!(!dir.path().join("PWNED").exists(), "{shell} ran part of the path");
+        }
     }
 
     #[test]
@@ -6590,6 +6612,56 @@ mod orchestrator_tests {
         assert_eq!(stages[0].status, "done", "no id resolves the single parked stage");
     }
 
+    /// An abort leaves the parked stage at `awaiting_checkpoint`. A late
+    /// decision on that run (a Send-back from Review's comment tray, a stale
+    /// Approve) is refused and changes nothing; only Abort still passes.
+    #[tokio::test]
+    async fn a_decision_on_a_finished_run_is_refused_and_changes_nothing() {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("P", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "review", "m", "api", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+        let art = serde_json::to_string(&StageArtifact {
+            kind: ArtifactKind::Note, text: "findings".into(), payload: None, refs_worktree: false,
+        }).unwrap();
+        db.lock().set_run_stage_status(&id, "running").unwrap();
+        db.lock().complete_run_stage(&id, "awaiting_checkpoint", 0, 0, 0, 0, 0.0, Some(&art)).unwrap();
+        db.lock().set_run_status(&run_id, "paused", false).unwrap();
+
+        let sink = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(MockRunner));
+        // A run that is still waiting accepts decisions.
+        assert!(orch.check_run_open(&run_id, &CheckpointAction::Approve).is_ok());
+
+        for ended in ["aborted", "completed", "failed"] {
+            db.lock().set_run_status(&run_id, ended, true).unwrap();
+            let actions = || [
+                CheckpointAction::Approve,
+                CheckpointAction::SendBack { feedback: Some("change this".into()) },
+                CheckpointAction::Reject { feedback: None, model_override: None, max_turns_override: None },
+                CheckpointAction::Resume { max_turns_override: None },
+            ];
+            for action in actions() {
+                let err = orch.check_run_open(&run_id, &action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            for action in actions() {
+                let err = orch.resolve_checkpoint_apply_only(&run_id, Some(&id), action).unwrap_err();
+                assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            }
+            let err = orch.resolve_checkpoint_apply_only(&run_id, None, CheckpointAction::Approve).unwrap_err();
+            assert!(err.to_string().contains(&format!("This run is {ended}")), "{err}");
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the parked stage is untouched");
+            assert_eq!(stage.artifact.as_deref(), Some(art.as_str()), "its hand-off is kept");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, ended, "the run stays {ended}");
+            // Abort tears the run down whatever its state.
+            assert!(orch.check_run_open(&run_id, &CheckpointAction::Abort).is_ok());
+        }
+        assert_eq!(orch.resolve_checkpoint_apply_only(&run_id, Some(&id), CheckpointAction::Abort).unwrap(), None);
+    }
+
     #[test]
     fn cap_diff_passes_small_text_through() {
         let text = "diff --git a/x b/x\n+small";
@@ -7791,6 +7863,211 @@ mod orchestrator_tests {
         assert_eq!(db.get_project_setup_script("missing").unwrap(), "");
     }
 
+    /// "Share with new missions" is opt-in, round-trips through the DB, and
+    /// keeps only the allowed names whatever the caller sends.
+    #[test]
+    fn project_share_round_trips_sanitized() {
+        use crate::worktree_share::ShareSpec;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-share", "P", "/tmp/octo-share-p").unwrap();
+        assert!(db.get_project_share("p-share").unwrap().is_empty());
+        let sent = ShareSpec {
+            link: vec!["node_modules".into(), "target".into()],
+            copy: vec![".env".into(), "../id_rsa".into()],
+        };
+        db.set_project_share("p-share", &sent).unwrap();
+        assert_eq!(
+            db.get_project_share("p-share").unwrap(),
+            ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] }
+        );
+        db.set_project_share("p-share", &ShareSpec::default()).unwrap();
+        assert!(db.get_project_share("p-share").unwrap().is_empty());
+        assert!(db.get_project_share("missing").unwrap().is_empty());
+    }
+
+    /// Only a freshly created worktree borrows from the main checkout; the
+    /// main checkout itself and a reused workspace are never touched.
+    #[cfg(unix)]
+    #[test]
+    fn sharing_applies_only_to_a_fresh_worktree() {
+        use crate::commands::share_into_fresh_worktree;
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let row = |path: &std::path::Path| crate::db::WorkspaceRow {
+            id: "w".into(),
+            project_id: "p".into(),
+            name: "m".into(),
+            task: String::new(),
+            branch: "m".into(),
+            worktree_path: Some(path.to_string_lossy().into_owned()),
+            setup_script: String::new(),
+            status: "active".into(),
+            created_at: String::new(),
+            last_active: String::new(),
+            glyph: None,
+            tint: None,
+            test_command: None,
+            linked_issue_key: None,
+            from_branch: None,
+            group_id: None,
+        };
+        for outcome in [CreateOutcome::Existed, CreateOutcome::Restored, CreateOutcome::Adopted] {
+            assert!(share_into_fresh_worktree(&db, outcome, "p", &root_s, &row(&wt), "none").is_none());
+        }
+        assert!(share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &row(&root), "none").is_none());
+        assert!(!wt.join(".env").exists());
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &row(&wt), "none").unwrap();
+        assert_eq!(out.summary().as_deref(), Some("linked node_modules · copied .env"));
+    }
+
+    /// A mission created with Execution = none and switched to sandbox later
+    /// gives back what it was given: its links (the sandbox would refuse
+    /// reads and writes through them) and its untouched env copy (a
+    /// sandboxed stage could read it).
+    #[cfg(unix)]
+    #[test]
+    fn switching_a_mission_to_sandbox_takes_back_what_was_shared() {
+        use crate::commands::{share_into_fresh_worktree, unshare_for_sandbox, unshared_sentences};
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        let wt_s = wt.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock().insert_workspace("w", "p", "m", "", "m", Some(wt_s.as_str()), "", None).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let ws = db.lock().get_workspace("w").unwrap().unwrap();
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &ws, "none").unwrap();
+        assert_eq!(out.linked, vec!["node_modules".to_string()]);
+
+        // Later, Execution becomes sandbox (the launcher's one-click).
+        let done = unshare_for_sandbox(&db, Some("w"));
+        assert_eq!(done.unlinked, vec!["node_modules".to_string()]);
+        assert_eq!(done.uncopied, vec![".env".to_string()]);
+        assert!(done.kept.is_empty());
+        assert_eq!(
+            unshared_sentences(&done),
+            vec![
+                "node_modules: link removed in a sandboxed mission".to_string(),
+                ".env: copy removed in a sandboxed mission".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(root.join("node_modules").is_dir(), "the main checkout keeps its folder");
+        assert!(!wt.join(".env").exists(), "the untouched copy leaves the sandboxed worktree");
+        assert_eq!(std::fs::read_to_string(root.join(".env")).unwrap(), "A=1\n", "the main checkout keeps its file");
+        // Nothing left to take back, and a mission with no workspace has none.
+        assert!(unshare_for_sandbox(&db, Some("w")).is_empty());
+        assert!(unshare_for_sandbox(&db, None).is_empty());
+    }
+
+    /// A sandboxed mission's fresh worktree gets neither links nor env copies.
+    #[cfg(unix)]
+    #[test]
+    fn a_sandboxed_mission_shares_nothing_into_its_worktree() {
+        use crate::commands::share_into_fresh_worktree;
+        use crate::workspace::CreateOutcome;
+        use crate::worktree_share::ShareSpec;
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        std::fs::write(root.join(".gitignore"), "node_modules\n.env\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        std::fs::create_dir(root.join("node_modules")).unwrap();
+        std::fs::write(root.join(".env"), "A=1\n").unwrap();
+        let wt = root.parent().unwrap().join("wt");
+        git(&root, &["worktree", "add", "-q", "-b", "m", wt.to_str().unwrap()]);
+
+        let db_file = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(db_file.path()).unwrap());
+        let root_s = root.to_string_lossy().into_owned();
+        let wt_s = wt.to_string_lossy().into_owned();
+        db.lock().insert_project("p", "P", &root_s).unwrap();
+        db.lock().insert_workspace("w", "p", "m", "", "m", Some(wt_s.as_str()), "", None).unwrap();
+        db.lock()
+            .set_project_share("p", &ShareSpec { link: vec!["node_modules".into()], copy: vec![".env".into()] })
+            .unwrap();
+        let ws = db.lock().get_workspace("w").unwrap().unwrap();
+        let out = share_into_fresh_worktree(&db, CreateOutcome::Created, "p", &root_s, &ws, "sandbox").unwrap();
+        assert_eq!(out.summary(), None);
+        assert_eq!(
+            out.skipped,
+            vec![
+                "node_modules: not linked in a sandboxed mission".to_string(),
+                ".env: not copied into a sandboxed mission".to_string(),
+            ]
+        );
+        assert!(std::fs::symlink_metadata(wt.join("node_modules")).is_err());
+        assert!(!wt.join(".env").exists());
+    }
+
     /// The condition runs with the PATH it's given (the login-shell PATH in
     /// production), so a tool that lives only there resolves.
     #[cfg(unix)]
@@ -8886,27 +9163,26 @@ mod orchestrator_tests {
     }
 
     /// The target's feedback column receives the composed findings+note before
-    /// the re-run starts (checked mid-flight via the archive-free path: a fresh
-    /// loop with no auto-drive). Uses loop_back's persisted effect directly.
+    /// the re-run starts. Checked through the apply-only path, which makes the
+    /// loop-back's changes and leaves the re-drive to its caller, so the
+    /// pending target still holds its feedback. (A send-back on an aborted run,
+    /// which this test once used to skip the re-drive, is refused.)
     #[tokio::test]
     async fn send_back_target_feedback_column_gets_composed_findings() {
         let (orch, run_id, db) = looped_run(1);
         orch.run_to_pause(&run_id).await.unwrap();
-        // Stop the re-drive from consuming the feedback: abort the run after
-        // the loop-back by checking the column straight after resolve starts is
-        // racy — instead mark the run aborted so resolve_checkpoint's re-drive
-        // is a no-op and the pending target keeps its feedback.
-        db.lock().set_run_status(&run_id, "aborted", true).unwrap();
-        orch.resolve_checkpoint(
+        let redrive = orch.resolve_checkpoint_apply_only(
             &run_id,
+            None,
             CheckpointAction::SendBack { feedback: Some("polish".into()) },
-        ).await.unwrap();
+        ).unwrap();
+        assert!(redrive.is_some(), "the run wants driving again");
         let stages = db.lock().list_run_stages(&run_id).unwrap();
         assert_eq!(
             stages[0].feedback.as_deref(),
             Some("did code_review\n\nDirector's note: polish"),
         );
-        assert_eq!(stages[0].status, "pending"); // reset, not re-run (aborted)
+        assert_eq!(stages[0].status, "pending"); // reset, not yet re-run
     }
 
     /// A runner whose review-role output carries a verdict; everything else Done.
@@ -10003,6 +10279,232 @@ mod orchestrator_tests {
         assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
         assert_eq!(seen[1].resume_prior_cost_usd, 0.03);
     }
+
+    /// Records every run's spec and input. The stage at position 1 ends its
+    /// first run the way `first` says (session `sess-b`); every other run
+    /// succeeds.
+    struct SecondStageOnceRunner {
+        first: fn() -> (StageStatus, Option<String>, Option<BlockedAsk>),
+        seen: Arc<Mutex<Vec<(StageSpec, StageInput)>>>,
+    }
+    #[async_trait::async_trait]
+    impl AgentRunner for SecondStageOnceRunner {
+        async fn run(
+            &self,
+            stage: &StageSpec,
+            input: &StageInput,
+            _ctx: &StageContext,
+        ) -> crate::error::AppResult<StageOutcome> {
+            let first_run = stage.position == 1 && !self.seen.lock().iter().any(|(s, _)| s.position == 1);
+            self.seen.lock().push((stage.clone(), input.clone()));
+            let (status, error, blocked) =
+                if first_run { (self.first)() } else { (StageStatus::Done, None, None) };
+            Ok(StageOutcome {
+                cli: Default::default(),
+                artifact: StageArtifact {
+                    kind: ArtifactKind::Note,
+                    text: format!("did {}", stage.role),
+                    payload: None,
+                    refs_worktree: false,
+                },
+                input_tokens: 10,
+                output_tokens: 2,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                cost_usd: 0.01,
+                status,
+                tool_calls: vec![],
+                error,
+                verdict: None,
+                session_id: Some("sess-b".into()),
+                blocked,
+                blocked_transcript: None,
+            })
+        }
+    }
+
+    /// Plan (API) → implement (Claude CLI), driven by `runner` until the
+    /// implement stage stops, which then had a 120k context reading.
+    async fn plan_then_cli_implement(runner: SecondStageOnceRunner) -> (Orchestrator, String, Arc<Mutex<Db>>) {
+        let (db, ws) = db_with_workspace();
+        let pid = db.lock().insert_pipeline("Plan then build", "d", false).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", false, None, 0, None, 25).unwrap();
+        db.lock().insert_pipeline_stage(&pid, 1, "implement", "claude-sonnet-5", "cli", false, None, 0, None, 25).unwrap();
+        let run_id = db.lock().create_run(&ws, &pid, "t", None, None, &[]).unwrap();
+        let sink: Arc<dyn EventSink> = Arc::new(CollectingSink { events: Mutex::new(vec![]) });
+        let sink = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink, Arc::clone(&db)));
+        let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink, Box::new(runner));
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let implement = db.lock().list_run_stages(&run_id).unwrap()[1].clone();
+        db.lock().set_run_stage_context(&implement.id, 120_000, Some(200_000)).unwrap();
+        (orch, run_id, db)
+    }
+
+    #[tokio::test]
+    async fn a_resumed_claude_stage_gets_its_full_input_and_last_context() {
+        // #1025: if `--resume` comes back on an empty conversation the runner
+        // reruns fresh, which needs the dossier; the context reading the
+        // Resume found is what the resumed reply must come back near.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || (StageStatus::Failed, Some("claude stopped early (error_max_turns)".into()), None),
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the resumed implement");
+        assert_eq!(seen[0].0.resume_context_tokens, None, "a fresh run carries no context to come back near");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        assert!(input.sections.iter().any(|s| s.text == "did plan"), "the dossier rides along: {:?}", input.sections);
+    }
+
+    #[tokio::test]
+    async fn an_answered_claude_stage_keeps_the_answers_for_a_fresh_rerun() {
+        // #1025: the fresh fallback after an empty resume is prompted with the
+        // full input AND the director's answers.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, _db) = plan_then_cli_implement(SecondStageOnceRunner {
+            first: || {
+                (
+                    StageStatus::Done,
+                    None,
+                    Some(BlockedAsk {
+                        summary: "which db?".into(),
+                        questions: vec![BlockedQuestion {
+                            question: "SQLite or Postgres?".into(),
+                            why_blocked: "both fit".into(),
+                            recommended_default: "SQLite".into(),
+                        }],
+                    }),
+                )
+            },
+            seen: Arc::clone(&seen),
+        })
+        .await;
+        orch.resolve_checkpoint(&run_id, CheckpointAction::AnswerBlocker { answers: vec!["SQLite".into()], source: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 3, "plan, implement, the answered implement");
+        let (spec, input) = &seen[2];
+        assert_eq!(spec.resume_session.as_deref(), Some("sess-b"));
+        assert_eq!(spec.resume_context_tokens, Some(120_000));
+        let fresh = crate::orchestrator::runner::user_input_for(&spec.role, "t", input, spec.feedback.as_deref());
+        assert!(fresh.contains("did plan"), "{fresh}");
+        assert!(fresh.contains("SQLite"), "{fresh}");
+    }
+
+    fn claude_init(session: &str) -> serde_json::Value {
+        serde_json::json!({ "type": "system", "subtype": "init", "session_id": session })
+    }
+
+    fn claude_reply(tokens: u64, parent: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "type": "assistant",
+            "parent_tool_use_id": parent,
+            "message": { "id": "msg_1", "model": "claude-sonnet-5-5", "usage": {
+                "input_tokens": 10, "output_tokens": 5, "cache_read_input_tokens": tokens - 10, "cache_creation_input_tokens": 0
+            } }
+        })
+    }
+
+    #[test]
+    fn an_empty_resume_is_named_by_its_session_or_its_first_reply() {
+        use crate::orchestrator::cli_runner::{EmptyResume, ResumeWatch};
+        let observe = |prior: Option<u64>, events: &[serde_json::Value]| {
+            let mut w = ResumeWatch::new("sess-a", prior);
+            events.iter().filter_map(|e| w.observe(e)).collect::<Vec<_>>()
+        };
+        // Another session in `system/init`: decided there, never again.
+        assert_eq!(
+            observe(Some(120_000), &[claude_init("sess-new"), claude_reply(3_000, None)]),
+            vec![EmptyResume::OtherSession { requested: "sess-a".into(), got: "sess-new".into() }]
+        );
+        // No reading recorded: under 8K tokens is empty, at or above it is not.
+        assert_eq!(
+            observe(None, &[claude_init("sess-a"), claude_reply(3_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 3_000, floor: 8_000 }]
+        );
+        assert!(observe(None, &[claude_init("sess-a"), claude_reply(8_000, None)]).is_empty());
+        // A recorded reading: 15% of it is the floor.
+        assert!(observe(Some(120_000), &[claude_init("sess-a"), claude_reply(130_000, None)]).is_empty());
+        assert_eq!(ResumeWatch::floor(Some(120_000)), 18_000);
+        assert_eq!(ResumeWatch::floor(Some(0)), 8_000, "a zero reading counts as none");
+        // Only the FIRST top-level reply decides: a sub-agent's small context
+        // is its own, and a later small reply (after a compaction) is fine.
+        assert!(observe(
+            Some(120_000),
+            &[claude_init("sess-a"), claude_reply(2_000, Some("toolu_1")), claude_reply(125_000, None), claude_reply(4_000, None)]
+        )
+        .is_empty());
+        // An init with no session id doesn't decide.
+        assert_eq!(
+            observe(Some(120_000), &[serde_json::json!({ "type": "system", "subtype": "init" }), claude_reply(4_000, None)]),
+            vec![EmptyResume::SmallContext { tokens: 4_000, floor: 18_000 }]
+        );
+    }
+
+    #[test]
+    fn an_empty_resume_notice_names_the_update_only_on_a_known_old_cli() {
+        use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume};
+        let why = EmptyResume::SmallContext { tokens: 4_200, floor: 21_300 };
+        // A plain Resume carries no feedback, so the line promises only the input.
+        assert_eq!(
+            empty_resume_notice(&why, None, false),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input."
+        );
+        // An answered block reruns with the director's answers.
+        assert_eq!(
+            empty_resume_notice(&why, None, true),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input and your answers."
+        );
+        let old = empty_resume_notice(&why, Some("2.1.329"), true);
+        assert!(
+            old.ends_with("your answers. Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
+            "{old}"
+        );
+        for has_feedback in [false, true] {
+            assert_eq!(
+                empty_resume_notice(&why, Some("2.1.330"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+            assert_eq!(
+                empty_resume_notice(&why, Some("not a version"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+        }
+        let other = EmptyResume::OtherSession { requested: "aaaaaaaa-0001".into(), got: "bbbbbbbb-0002".into() };
+        assert!(empty_resume_notice(&other, None, false).contains("(it started session bbbbbbbb instead of aaaaaaaa)"));
+    }
+
+    #[test]
+    fn an_empty_resume_and_its_fresh_rerun_keep_both_spends() {
+        // The stopped attempt's spend is real; the fresh run's result stands.
+        use crate::orchestrator::cli_runner::{merge_resume_fallback, stopped_stage, CliDialect, EMPTY_RESUME_STOP};
+        let stopped = stopped_stage(CliDialect::Claude, EMPTY_RESUME_STOP, "claude-sonnet-5-5", &Default::default(), false);
+        assert_eq!(stopped.status, StageStatus::Failed);
+        assert_eq!(stopped.error.as_deref(), Some(EMPTY_RESUME_STOP));
+        let mut resumed = stopped;
+        resumed.input_tokens = 14_000;
+        resumed.cost_usd = 0.05;
+        let mut fresh = resumed.clone();
+        fresh.status = StageStatus::Done;
+        fresh.error = None;
+        fresh.input_tokens = 30_000;
+        fresh.cost_usd = 0.20;
+        let merged = merge_resume_fallback(resumed, fresh);
+        assert_eq!(merged.status, StageStatus::Done);
+        assert_eq!(merged.input_tokens, 44_000);
+        assert!((merged.cost_usd - 0.25).abs() < 1e-9);
+        assert!(!merged.cli.usage_unreported, "a Claude stop prices what it streamed");
+    }
     /// A Claude CLI stage that reports its `claude -p` session id.
     struct SessionRunner;
     #[async_trait::async_trait]
@@ -10203,6 +10705,35 @@ mod cli_runner_tests {
         assert_eq!(calls.len(), 1, "one call site");
         let arm = src[..calls[0].0].rfind("\"sandbox\" => {").expect("inside the sandbox arm");
         assert!(!src[arm..calls[0].0].contains("\"none\" =>"), "not in the unsandboxed arm");
+    }
+
+    #[test]
+    fn a_gateway_max_tokens_failure_on_2_1_329_names_the_release() {
+        use crate::orchestrator::cli_runner::{is_gateway_model, with_known_bad_release};
+        assert!(is_gateway_model("claude-sonnet-latest") && is_gateway_model("litellm/kimi-k3"));
+        for m in ["claude-sonnet-5-5", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "sonnet", "opusplan", "default"] {
+            assert!(!is_gateway_model(m), "{m}");
+        }
+        let line = r#"{"type":"result","subtype":"success","is_error":true,
+            "result":"API Error: 400 max_tokens: 64000 > 32768, which is the maximum allowed","total_cost_usd":0.01}"#;
+        let failed = || parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(failed().status, StageStatus::Failed);
+        let named = with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.329"));
+        let error = named.error.unwrap();
+        assert!(
+            error.starts_with(
+                "Skip Claude Code 2.1.329 on a gateway model: it drops the retry gateway models need when a max_tokens \
+                 error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.\n"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("API Error: 400 max_tokens: 64000 > 32768"), "the CLI's own error stays: {error}");
+        let unchanged = failed().error;
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.330")).error, unchanged);
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-5-5", Some("2.1.329")).error, unchanged, "built-in model");
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", None).error, unchanged, "version unknown");
+        let done = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(with_known_bad_release(done, "claude-sonnet-latest", Some("2.1.329")).error, None);
     }
 
     const SUCCESS: &str = r#"{
@@ -10688,6 +11219,25 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn every_claude_stage_disallows_the_worktree_tools_once() {
+        // #1002: a stage's workspace is fixed. EnterWorktree would move its
+        // work out of the worktree Octopush watches; before Claude Code
+        // 2.1.330, ExitWorktree could remove one another session works in.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            for tool in ["EnterWorktree", "ExitWorktree"] {
+                let n = args[i + 1].split(',').filter(|t| *t == tool).count();
+                assert_eq!(n, 1, "{tool} exactly once: {args:?}");
+            }
+        }
+    }
+
+    #[test]
     fn args_include_model_format_and_permission() {
         let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40, false);
         assert!(args.contains(&"-p".to_string()));
@@ -10774,6 +11324,171 @@ mod cli_args_tests {
         assert_eq!(read_guard_label(true, Some("2.1.257")), None);
         assert_eq!(read_guard_label(true, None), None, "an unknown version never warns");
         assert_eq!(read_guard_label(false, Some("2.1.250")), None, "unsandboxed: nothing was asked for");
+    }
+
+    #[test]
+    fn every_seatbelt_wrapped_claude_stage_turns_claude_codes_own_bash_sandbox_off() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, turn_off_inner_sandbox, CliDialect, CodexWriteScope, INNER_SANDBOX_OFF_LABEL,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1001: a user's `sandbox.enabled` in ~/.claude/settings.json can't
+        // nest in the mission profile, so every stage the profile wraps
+        // overrides it in `--settings`, beside the guards, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec, wrapped, reads) in [
+            ("worktree", "sandbox", true, true),
+            ("readonly", "sandbox", true, true),
+            ("readonly", "none", true, false),
+            ("worktree", "none", false, false),
+        ] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                assert_eq!(confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args), reads);
+                assert_eq!(turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args), wrapped, "{git}/{exec}");
+                let v = settings(&args);
+                assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+                assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads, "{args:?}");
+                if wrapped {
+                    assert_eq!(v["sandbox"], serde_json::json!({ "enabled": false }), "{git}/{exec}: {args:?}");
+                } else {
+                    assert!(v.get("sandbox").is_none(), "unsandboxed: the user's own sandbox is left alone: {args:?}");
+                }
+            }
+        }
+        // Codex has no `--settings`; its argv is left alone.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let mut same = codex.clone();
+        assert!(!turn_off_inner_sandbox(CliDialect::Codex, "sandbox", &mut same));
+        assert_eq!(same, codex);
+        assert_eq!(
+            INNER_SANDBOX_OFF_LABEL,
+            "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
+        );
+    }
+
+    #[test]
+    fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
+        use crate::orchestrator::cli_runner::{
+            is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result, CliDialect,
+            InnerSandboxWatch, INNER_SANDBOX_OFF,
+        };
+        use crate::orchestrator::types::{ArtifactKind, StageStatus};
+        // #1001: since Claude Code 2.1.328 a sandbox that can't start makes the
+        // next sandboxed Bash command refuse, saying the sandbox is off for the
+        // session. The stage names that instead of failing generically.
+        let refusal_text = "Sandbox is off for the session: the sandbox could not start, so this command was not run.";
+        let tool_use = |name: &str, id: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": { "command": "npm test" } }
+            ] } })
+        };
+        let result = |id: &str, is_error: bool, content: serde_json::Value| {
+            serde_json::json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content }
+            ] } })
+        };
+        fn watch(exec: &str, events: &[serde_json::Value]) -> InnerSandboxWatch {
+            let mut w = InnerSandboxWatch::for_stage(CliDialect::Claude, exec);
+            for e in events {
+                w.observe(e);
+            }
+            w
+        }
+        let refused_bash = |id: &str| [tool_use("Bash", id), result(id, true, serde_json::json!(refusal_text))];
+        let ran_bash = |id: &str| [tool_use("Bash", id), result(id, false, serde_json::json!("ok"))];
+
+        // A Bash refusal counts, as string or block content.
+        let w = watch("sandbox", &refused_bash("t1"));
+        assert!(w.refused() && w.decisive());
+        let w = watch(
+            "sandbox",
+            &[
+                tool_use("Bash", "t1"),
+                result("t1", true, serde_json::json!([{ "type": "text", "text": "Refused: the sandbox is off for the session." }])),
+            ],
+        );
+        assert!(w.refused());
+
+        // Review point 1: only an `is_error` result of a Bash call counts. A
+        // Read or Grep of this repo's docs quoting the phrase does not, nor a
+        // Bash `cat` that printed it, nor a result whose call never opened.
+        for events in [
+            vec![tool_use("Read", "r1"), result("r1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Grep", "g1"), result("g1", true, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", true, serde_json::json!("npm test: 3 failed"))],
+            vec![result("t9", true, serde_json::json!(refusal_text))],
+            vec![serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": "the sandbox is off for the session" }
+            ] } })],
+        ] {
+            let w = watch("sandbox", &events);
+            assert!(!w.refused() && !w.decisive(), "{events:?}");
+        }
+
+        // Review point 2: only a stage the Seatbelt profile wraps is watched.
+        assert!(!watch("none", &refused_bash("t1")).refused(), "an unsandboxed stage's stream doesn't count");
+        let mut codex = InnerSandboxWatch::for_stage(CliDialect::Codex, "sandbox");
+        refused_bash("t1").iter().for_each(|e| codex.observe(e));
+        assert!(!codex.refused());
+
+        // Review point 3: decisive only when the refusal is the last Bash result.
+        let last: Vec<_> = [ran_bash("a"), refused_bash("b")].concat();
+        assert!(watch("sandbox", &last).decisive(), "the refusal was the last Bash result");
+        let all: Vec<_> = [ran_bash("a"), refused_bash("b"), refused_bash("c"), refused_bash("d")].concat();
+        assert!(watch("sandbox", &all).decisive(), "every Bash result after the first refusal was refused");
+        let then_read: Vec<_> =
+            [refused_bash("b").to_vec(), vec![tool_use("Read", "r"), result("r", false, serde_json::json!("x"))]].concat();
+        assert!(watch("sandbox", &then_read).decisive(), "a later non-Bash result doesn't change it");
+        let recovered: Vec<_> = [refused_bash("b"), ran_bash("c")].concat();
+        let w = watch("sandbox", &recovered);
+        assert!(w.refused(), "the notice still says it");
+        assert!(!w.decisive(), "a later Bash command ran: the failure has another cause");
+
+        let failed = parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#,
+            false,
+            ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let named = name_inner_sandbox_off(failed.clone(), true);
+        let err = named.error.as_deref().unwrap();
+        assert!(err.starts_with(INNER_SANDBOX_OFF) && is_inner_sandbox_off(err), "{err}");
+        assert!(err.contains("error_max_turns"), "the CLI's own error is kept: {err}");
+        assert_eq!(name_inner_sandbox_off(named.clone(), true).error, named.error, "named once");
+        assert_eq!(name_inner_sandbox_off(failed.clone(), false).error, failed.error, "no refusal: unchanged");
+        assert!(!is_inner_sandbox_off(failed.error.as_deref().unwrap()));
+        // A refusal a later Bash command got past leaves a max-turns failure's
+        // error as it was, so `try_escalate` still escalates it.
+        let kept = name_inner_sandbox_off(failed.clone(), watch("sandbox", &recovered).decisive());
+        assert_eq!(kept.error, failed.error);
+        assert!(!is_inner_sandbox_off(kept.error.as_deref().unwrap()));
+        let named_last = name_inner_sandbox_off(failed.clone(), watch("sandbox", &last).decisive());
+        assert!(is_inner_sandbox_off(named_last.error.as_deref().unwrap()));
+        assert!(!is_plan_limit(err));
+        // A finished stage keeps its outcome; the notice alone says it.
+        let done = parse_cli_result(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s"}"#,
+            true,
+            ArtifactKind::Note,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(done.status, StageStatus::Done));
+        let kept = name_inner_sandbox_off(done, true);
+        assert!(matches!(kept.status, StageStatus::Done) && kept.error.is_none());
     }
 
     #[test]
@@ -12126,14 +12841,23 @@ mod live_tests {
 
         let bodies = provider.bodies.lock();
         assert_eq!(bodies.len(), 3);
+        // Every turn leads with the one system-prompt developer item (the
+        // cacheable prefix); replays never repeat it.
+        for body in bodies.iter() {
+            assert!(body.get("instructions").is_none());
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["text"], "sys");
+            assert_eq!(input.iter().filter(|i| i["role"] == "developer").count(), 1);
+        }
         // Turn 2: the reasoning item, then its call with its fc id, then the output.
         let input = bodies[1]["input"].as_array().unwrap();
-        assert_eq!(input[1]["type"], "reasoning");
-        assert_eq!(input[1]["encrypted_content"], "enc-rs_1");
-        assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["id"], "fc-call_1");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "reasoning");
+        assert_eq!(input[2]["encrypted_content"], "enc-rs_1");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["id"], "fc-call_1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_1");
         // Turn 3: the truncated turn's reasoning is dropped and its call rebuilt.
         let input = bodies[2]["input"].as_array().unwrap();
         let text = serde_json::to_string(input).unwrap();
@@ -14055,7 +14779,7 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_targets_the_pr_head_ref() {
         assert_eq!(
-            pr_fetch_command(42, "feat/dark-mode"),
+            pr_fetch_command(42, "feat/dark-mode").unwrap(),
             "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
         );
     }
@@ -14063,9 +14787,39 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_escapes_single_quotes_in_the_branch() {
         assert_eq!(
-            pr_fetch_command(1, "weird'name"),
+            pr_fetch_command(1, "weird'name").unwrap(),
             "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
         );
+    }
+
+    #[test]
+    fn fetch_command_refuses_a_head_ref_that_isnt_a_branch_name() {
+        for bad in ["a\\'; touch PWNED; echo '", "-x", "--upload-pack=touch PWNED", "a b", ""] {
+            let err = pr_fetch_command(9, bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            assert!(err.contains("PR #9"), "{err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_pr_branch_refuses_a_hostile_head_ref_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let hostile = "a\\'; touch PWNED; echo '";
+        let err = tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            hostile.into(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+        assert!(!err.contains(hostile), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]
@@ -22168,6 +22922,35 @@ mod secret_guard_tests {
         assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
     }
 
+    #[test]
+    fn the_push_command_quotes_only_a_branch_name() {
+        assert_eq!(
+            crate::commands::push_command("feat/it's").unwrap(),
+            "git push --set-upstream origin 'feat/it'\\''s' 2>&1",
+        );
+        for bad in ["-x", "--force", "a\\'; touch PWNED; echo '", "a b", ""] {
+            let err = crate::commands::push_command(bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    /// git lets a ref like `refs/heads/-x` exist (only `git branch` refuses
+    /// the name), so the branch HEAD is on can read as an option.
+    #[tokio::test]
+    async fn push_refuses_a_branch_that_reads_as_an_option() {
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/heads/-x", head, false, "test").unwrap();
+        repo.set_head("refs/heads/-x").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let err = crate::commands::push_branch(path, None).await.unwrap_err().to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+    }
+
     const HEX: &str = "0123456789abcdef";
     const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -22702,6 +23485,286 @@ mod secret_guard_tests {
                 fp(format!("{m}\n{footer}\n"), vec![header.as_str(), b1.as_str(), b2.as_str(), m, footer.as_str()], 3, staged)
             };
             assert_ne!(tail(&m1), tail(&m2), "the key's unchanged rest (staged: {staged})");
+        }
+    }
+
+    /// An added header over a key body the diff didn't touch is still a
+    /// private key, hashed whole; a header that only names itself in code
+    /// stays quiet.
+    #[test]
+    fn an_added_header_over_an_unchanged_body_is_a_private_key() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(560, 64, B64), rnd(561, 64, B64));
+        let f = AddedFile {
+            path: "deploy.txt".into(),
+            lines: vec![(1, header.clone())],
+            unchanged: std::collections::BTreeMap::from([(0, vec![b1.clone(), footer.clone()])]),
+            ..Default::default()
+        };
+        let r = scan_report(&[f], &[], false);
+        assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        let quiet = AddedFile {
+            path: "src/pem.ts".into(),
+            lines: vec![(1, format!("const HEADER = \"{header}\";"))],
+            unchanged: std::collections::BTreeMap::from([(0, vec!["export default HEADER;".into()])]),
+            ..Default::default()
+        };
+        assert!(scan_added(&[quiet], &[]).is_empty());
+
+        let fp = |b2: &str, staged: bool| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{b1}\n{b2}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("deploy.txt"), format!("{header}\n{b1}\n{b2}\n{footer}\n")).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 1, "only the header is added: {:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            let keys: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").collect();
+            assert_eq!(keys.len(), 1, "{:?}", r.findings);
+            assert_eq!(keys[0].line, Some(1));
+            r.fingerprint
+        };
+        for staged in [true, false] {
+            assert_ne!(fp(&b2, staged), fp(&rnd(562, 64, B64), staged), "hashed whole (staged: {staged})");
+        }
+    }
+
+    /// A range scan appends one diff per commit (newest first). A key's walk
+    /// stays in its own commit's lines and reads its unchanged rest from that
+    /// commit's file, not from an older commit's line that happens to carry
+    /// the next number.
+    #[test]
+    fn a_pem_walk_in_a_range_stays_in_its_own_commit() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(570, 64, B64);
+        let fps = |m: &str| -> Vec<String> {
+            let (dir, repo) = repo();
+            let k = dir.path().join("k.txt");
+            std::fs::write(&k, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            let head = repo.head().unwrap().peel_to_commit().unwrap();
+            repo.branch("feature", &head, false).unwrap();
+            repo.set_head("refs/heads/feature").unwrap();
+            // The older commit adds line 3; the newer one adds the header
+            // and first body line, so its key reads on through line 3 (`m`).
+            std::fs::write(&k, format!("{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "a note");
+            std::fs::write(&k, format!("{header}\n{b1}\n{m}\n{footer}\nnote\n")).unwrap();
+            commit_all(&repo, "the key");
+            [
+                ("history", branch_files(dir.path(), "main")),
+                ("pr", pr_files(dir.path(), "main")),
+                ("push", push_files(dir.path())),
+            ]
+            .into_iter()
+            .map(|(scope, c)| {
+                let c = c.unwrap();
+                let f = c.files.iter().find(|f| f.path == "k.txt").unwrap();
+                let at = f.lines.iter().position(|(_, l)| *l == header).unwrap();
+                assert_eq!(f.lines.get(at + 2), Some(&(3, "note".to_string())), "{scope}: {:?}", f.lines);
+                let r = scan_collected(&c, &[]);
+                assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{scope}: {:?}", r.findings);
+                r.fingerprint
+            })
+            .collect()
+        };
+        let (a, b) = (fps(&rnd(571, 64, B64)), fps(&rnd(572, 64, B64)));
+        for (scope, (x, y)) in ["history", "pr", "push"].iter().zip(a.iter().zip(&b)) {
+            assert_ne!(x, y, "{scope}: the key's unchanged line counts, the older commit's doesn't");
+        }
+    }
+
+    /// A key with no END line runs on into the file's unchanged rest, up to
+    /// the next header, the end of the file or 64 KB, so editing the text
+    /// below it asks again. Fail-safe: a confirm never covers what it didn't see.
+    #[test]
+    fn a_truncated_key_hashes_the_unchanged_text_below_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(575, 64, B64), rnd(576, 64, B64));
+        let fp = |tail: &str| {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("notes.txt"), format!("{tail}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("notes.txt"), format!("{header}\n{b1}\n{b2}\n{tail}\n")).unwrap();
+            stage(&repo, "notes.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert_eq!(c.files[0].lines.len(), 3, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp("see the runbook"), fp("see the wiki"));
+    }
+
+    /// Reading a file's new side to hash a key whole counts against the scan
+    /// budget: one past what is left marks the scan partial and names the file.
+    #[test]
+    fn reading_a_new_side_for_a_key_counts_against_the_budget() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let (dir, repo) = repo();
+        let big = dir.path().join("big.txt");
+        // About 10 MB: one new side fits the 16 MB budget, two don't.
+        let filler: String = (0..10_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        std::fs::write(&big, &filler).unwrap();
+        commit_all(&repo, "base");
+        let head = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch("feature", &head, false).unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+        for (seed, partial) in [(580, false), (581, true)] {
+            let cur = std::fs::read_to_string(&big).unwrap();
+            std::fs::write(&big, format!("{header}\n{}\n{cur}", rnd(seed, 64, B64))).unwrap();
+            commit_all(&repo, "a key on top");
+            let c = branch_files(dir.path(), "main").unwrap();
+            assert_eq!(c.partial, partial, "{:?}", c.unscanned);
+            assert_eq!(c.unscanned.iter().any(|u| u.starts_with("big.txt@")), partial, "{:?}", c.unscanned);
+        }
+    }
+
+    /// The new side is read only when a key reaches a line the diff didn't
+    /// add, and the added lines it holds aren't counted twice: a large file
+    /// with a key in it isn't partial when every line was scanned.
+    #[test]
+    fn a_new_side_is_read_only_when_a_key_needs_it() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let b1 = rnd(600, 64, B64);
+        let whole = vec![(1, header.clone()), (2, b1.clone()), (3, footer.clone())];
+        assert!(!pem_needs_new_side(&whole));
+        assert!(pem_needs_new_side(&whole[..2]), "no END among the added lines");
+        assert!(pem_needs_new_side(&[(1, header.clone()), (3, footer.clone())]), "a gap inside the key");
+        assert!(!pem_needs_new_side(&[(1, "no key here".to_string())]));
+
+        // About 9 MB: more than the budget left once the diff has read it.
+        let filler: String = (0..9_000).map(|i| format!("{i:05} {}\n", "y".repeat(1000))).collect();
+        // A newly added file holding a whole key.
+        {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("README.md"), "base\n").unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(dir.path().join("bundle.txt"), format!("{filler}{header}\n{b1}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+        }
+
+        // A modified file whose key reads on into an unchanged line: the
+        // read is needed, but the added lines it holds were already counted.
+        let fp = |m: &str| {
+            let (dir, repo) = repo();
+            let p = dir.path().join("bundle.txt");
+            std::fs::write(&p, format!("{m}\n{footer}\n")).unwrap();
+            commit_all(&repo, "base");
+            std::fs::write(&p, format!("{filler}{header}\n{b1}\n{m}\n{footer}\n")).unwrap();
+            stage(&repo, "bundle.txt");
+            let c = staged_files(dir.path()).unwrap();
+            assert!(!c.partial, "{:?}", c.unscanned);
+            assert!(c.unscanned.is_empty(), "{:?}", c.unscanned);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        assert_ne!(fp(&rnd(601, 64, B64)), fp(&rnd(602, 64, B64)), "the unchanged line is hashed");
+    }
+
+    /// The new side must hold the diff's lines where the diff saw them: a
+    /// clean filter's output (a Git LFS pointer, git-crypt ciphertext) or a
+    /// file rewritten since lends its lines to no key. CRLF still matches.
+    #[test]
+    fn a_new_side_unlike_the_diff_fills_nothing() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, mid) = (rnd(585, 64, B64), rnd(586, 64, B64));
+        let lines = vec![(1, header.clone()), (2, b1.clone())];
+        let same = format!("{header}\n{b1}\n{mid}\n{footer}\n");
+        let want = vec![mid.clone(), footer.clone()];
+        assert_eq!(pem_unchanged(&lines, &same).get(&1), Some(&want));
+        assert_eq!(pem_unchanged(&lines, &same.replace('\n', "\r\n")).get(&1), Some(&want), "CRLF");
+        let pointer = format!("version https://git-lfs.github.com/spec/v1\noid sha256:{}\nsize 1704\n", rnd(587, 64, "0123456789abcdef"));
+        assert!(pem_unchanged(&lines, &pointer).is_empty());
+        let moved = format!("# moved\n{same}");
+        assert!(pem_unchanged(&lines, &moved).is_empty(), "the lines aren't at the diff's numbers");
+    }
+
+    /// A CRLF key split by an unchanged line is hashed whole, with or without
+    /// `core.autocrlf`, staged or not.
+    #[test]
+    fn a_crlf_key_split_by_an_unchanged_line_is_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, b2) = (rnd(590, 64, B64), rnd(591, 64, B64));
+        let fp = |m: &str, autocrlf: bool, staged: bool| {
+            let (dir, repo) = repo();
+            repo.config().unwrap().set_bool("core.autocrlf", autocrlf).unwrap();
+            std::fs::write(dir.path().join("deploy.txt"), format!("{m}\r\n")).unwrap();
+            commit_all(&repo, "base");
+            let key = [header.as_str(), b1.as_str(), m, b2.as_str(), footer.as_str()].join("\r\n") + "\r\n";
+            std::fs::write(dir.path().join("deploy.txt"), key).unwrap();
+            let c = if staged {
+                stage(&repo, "deploy.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            assert_eq!(c.files[0].lines.len(), 4, "{:?}", c.files[0].lines);
+            let r = scan_report(&c.files, &[], c.partial);
+            assert_eq!(r.findings.iter().filter(|f| f.rule == "private-key").count(), 1, "{:?}", r.findings);
+            r.fingerprint
+        };
+        let (m1, m2) = (rnd(592, 64, B64), rnd(593, 64, B64));
+        for autocrlf in [false, true] {
+            for staged in [true, false] {
+                assert_ne!(fp(&m1, autocrlf, staged), fp(&m2, autocrlf, staged), "autocrlf {autocrlf}, staged {staged}");
+            }
+        }
+    }
+
+    /// Two keys in one file, apart by unchanged lines and each with an
+    /// unchanged line inside: each is hashed whole, and neither runs into
+    /// the other.
+    #[test]
+    fn two_keys_apart_in_a_repo_are_each_hashed_whole() {
+        let header = ["-----BEGIN ", "RSA PRIVATE", " KEY-----"].concat();
+        let footer = ["-----END ", "RSA PRIVATE", " KEY-----"].concat();
+        let (b1, m1, b2, m2) = (rnd(595, 64, B64), rnd(596, 64, B64), rnd(597, 64, B64), rnd(598, 64, B64));
+        for staged in [true, false] {
+            let (dir, repo) = repo();
+            std::fs::write(dir.path().join("keys.txt"), format!("{m1}\nsep one\nsep two\n{m2}\n")).unwrap();
+            commit_all(&repo, "base");
+            let (h, e) = (header.as_str(), footer.as_str());
+            let new = [h, b1.as_str(), m1.as_str(), e, "sep one", "sep two", h, b2.as_str(), m2.as_str(), e];
+            std::fs::write(dir.path().join("keys.txt"), new.join("\n") + "\n").unwrap();
+            let c = if staged {
+                stage(&repo, "keys.txt");
+                staged_files(dir.path()).unwrap()
+            } else {
+                worktree_files(dir.path(), Some("main")).unwrap()
+            };
+            let f = &c.files[0];
+            let numbers: Vec<u32> = f.lines.iter().map(|(n, _)| *n).collect();
+            assert_eq!(numbers, [1, 2, 4, 7, 8, 10], "staged: {staged}");
+            let r = scan_report(&c.files, &[], c.partial);
+            let at: Vec<_> = r.findings.iter().filter(|f| f.rule == "private-key").map(|f| f.line).collect();
+            assert_eq!(at, [Some(1), Some(7)], "staged: {staged}: {:?}", r.findings);
+            let k1 = pem_block(&f.lines, &f.unchanged, 0, 0, &header);
+            let k2 = pem_block(&f.lines, &f.unchanged, 3, 0, &header);
+            for part in [&b1, &m1, &footer] {
+                assert!(k1.contains(part.as_str()), "first key misses {part} (staged: {staged})");
+            }
+            for part in [&b2, &m2, &footer] {
+                assert!(k2.contains(part.as_str()), "second key misses {part} (staged: {staged})");
+            }
+            assert!(!k1.contains("sep one") && !k1.contains(&b2), "the first key ran on (staged: {staged})");
+            assert!(!k2.contains(&b1), "staged: {staged}");
         }
     }
 
@@ -24200,7 +25263,8 @@ mod read_only_role_tests {
         for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
             assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
         }
-        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion");
+        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion,EnterWorktree,ExitWorktree");
+        assert!(cli_disallowed_tools(true).starts_with("AskUserQuestion,EnterWorktree,ExitWorktree,"));
     }
 }
 
@@ -24777,6 +25841,236 @@ mod group_tests {
         // A group made afterwards still goes last.
         workspace_group(&db, "p1", "D", &[]);
         assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B", "D"]);
+    }
+}
+
+// ── "Starts after" (#960/#1031): a mission that waits on another one ───────
+#[cfg(test)]
+mod prerequisite_tests {
+    use crate::db::{Db, PrerequisiteRow, PREREQUISITE_CONDITIONS};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str) {
+        db.insert_project(id, id, &format!("/tmp/octo-prereq-{id}")).unwrap();
+    }
+
+    fn seed_workspace(db: &Db, project_id: &str, id: &str) {
+        db.insert_workspace(id, project_id, id, "", id, None, "", None).unwrap();
+    }
+
+    /// One project `p1` holding `w1`, `w2`, `w3`.
+    fn seeded() -> Db {
+        let db = test_db();
+        seed_project(&db, "p1");
+        for ws in ["w1", "w2", "w3"] {
+            seed_workspace(&db, "p1", ws);
+        }
+        db
+    }
+
+    fn link(db: &Db, ws: &str, after: &str) {
+        db.set_workspace_prerequisite(ws, after, "run_finished", false, false).unwrap();
+    }
+
+    fn after_of(db: &Db, ws: &str) -> Option<String> {
+        db.get_workspace_prerequisite(ws).unwrap().map(|p| p.after_workspace_id)
+    }
+
+    fn refusal(result: crate::error::AppResult<impl std::fmt::Debug>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    /// The raw columns, so a cleared link is checked down to its flags.
+    fn columns(db: &Db, ws: &str) -> (Option<String>, Option<String>, i64, i64) {
+        db.conn_ref()
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                [ws],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    const CLEARED: (Option<String>, Option<String>, i64, i64) = (None, None, 0, 0);
+
+    #[test]
+    fn a_new_mission_has_no_prerequisite_and_auto_start_is_off() {
+        let db = seeded();
+        assert_eq!(db.get_workspace_prerequisite("w1").unwrap(), None);
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(refusal(db.get_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn set_stores_the_link_and_replaces_an_earlier_one() {
+        let db = seeded();
+        let row = db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        let expected = PrerequisiteRow {
+            workspace_id: "w2".into(),
+            after_workspace_id: "w1".into(),
+            after_condition: "pr_merged".into(),
+            branch_from_prerequisite: true,
+            auto_start: true,
+        };
+        assert_eq!(row, expected);
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), Some(expected));
+
+        // Setting again replaces the link, flags included.
+        db.set_workspace_prerequisite("w2", "w3", "run_finished", false, false).unwrap();
+        let row = db.get_workspace_prerequisite("w2").unwrap().unwrap();
+        assert_eq!(row.after_workspace_id, "w3");
+        assert_eq!(row.after_condition, "run_finished");
+        assert!(!row.branch_from_prerequisite);
+        assert!(!row.auto_start);
+
+        // Several missions can wait on the same one.
+        link(&db, "w1", "w3");
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn every_condition_is_accepted_and_nothing_else() {
+        let db = seeded();
+        for condition in PREREQUISITE_CONDITIONS {
+            db.set_workspace_prerequisite("w2", "w1", condition, false, false).unwrap();
+            assert_eq!(db.get_workspace_prerequisite("w2").unwrap().unwrap().after_condition, condition);
+        }
+        db.clear_workspace_prerequisite("w2").unwrap();
+        for bad in ["", "merged", "RUN_FINISHED"] {
+            assert_eq!(
+                refusal(db.set_workspace_prerequisite("w2", "w1", bad, false, false)),
+                format!("other: Unknown condition '{bad}'. Use one of: run_finished, pr_merged.")
+            );
+        }
+        assert_eq!(columns(&db, "w2"), CLEARED);
+    }
+
+    #[test]
+    fn set_refuses_cycles_and_leaves_the_links_as_they_were() {
+        let db = seeded();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w1", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        link(&db, "w2", "w1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w2", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        // Longer loops too: w3 → w2 → w1, then w1 → w3.
+        link(&db, "w3", "w2");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "pr_merged", true, true)),
+            "other: These missions would wait on each other."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+        assert_eq!(after_of(&db, "w3").as_deref(), Some("w2"));
+
+        // A chain that doesn't come back is fine.
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w4", "w3");
+        assert_eq!(after_of(&db, "w4").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn set_refuses_other_projects_missing_and_archived_missions() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "x1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("x1", "w1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "nope", "run_finished", false, false)),
+            "other: The mission to wait on was not found."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("nope", "w1", "run_finished", false, false)),
+            "other: Mission not found."
+        );
+        db.archive_workspace("w3").unwrap();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "run_finished", false, false)),
+            "other: A mission can't wait on an archived mission."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(columns(&db, "x1"), CLEARED);
+    }
+
+    #[test]
+    fn clear_removes_the_link_and_its_flags() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), None);
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Clearing a mission with no link is not an error; an unknown one is.
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(refusal(db.clear_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn deleting_a_prerequisite_clears_the_links_to_it() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w3", "w1");
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w1", "w4");
+
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        assert_eq!(columns(&db, "w3"), CLEARED);
+        let dangling: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE after_workspace_id = 'w1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dangling, 0);
+        assert!(db.get_workspace("w4").unwrap().is_some());
+    }
+
+    #[test]
+    fn archiving_a_prerequisite_clears_the_links_and_restore_keeps_them_cleared() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w1", "w3");
+
+        db.archive_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // The archived mission's own link is not one that points at it.
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Once restored it can be waited on again.
+        link(&db, "w2", "w1");
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn the_migration_is_idempotent() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            seed_project(&db, "p1");
+            seed_workspace(&db, "p1", "w1");
+            seed_workspace(&db, "p1", "w2");
+            link(&db, "w2", "w1");
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
     }
 }
 
@@ -25675,5 +26969,1012 @@ mod sync_contract_tests {
         keys.sort();
         assert_eq!(keys, ["cost_usd", "model", "role", "status"]);
         assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
+    }
+}
+
+#[cfg(test)]
+mod talk_checkpoint_tests {
+    //! #958: Talk checkpoints — rewind a turn's files, undo, fork.
+    use crate::talk_checkpoints::{self as ck, AfterTurn, Budget, RewindChange, Untouched};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    const THREAD: &str = "5b1e-thread-a";
+
+    fn repo(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos();
+        let dir = std::env::temp_dir().join(format!("octo-talk-ckpt-{tag}-{}-{nanos}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "t@t"]);
+        git(&dir, &["config", "user.name", "t"]);
+        dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn write(dir: &Path, rel: &str, body: &str) {
+        let p = dir.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(p, body).unwrap();
+    }
+
+    fn read(dir: &Path, rel: &str) -> String {
+        std::fs::read_to_string(dir.join(rel)).unwrap()
+    }
+
+    fn change<'a>(changes: &'a [RewindChange], path: &str) -> &'a RewindChange {
+        changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("no change for {path}: {changes:?}"))
+    }
+
+    /// The whole loop: a turn edits, creates and deletes files; the director
+    /// edits another between turns; the rewind shows all of it (the
+    /// director's file flagged), restores the turn's start, leaves the index,
+    /// HEAD and ignored files alone, and the undo puts everything back.
+    #[test]
+    fn rewind_restores_the_turn_start_and_undo_puts_it_back() {
+        let dir = repo("loop");
+        write(&dir, "a.txt", "A\n");
+        write(&dir, "b.txt", "B\n");
+        write(&dir, "gone.txt", "G\n");
+        write(&dir, ".gitignore", "ignored.log\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        let head = git(&dir, &["rev-parse", "HEAD"]);
+        // The user has something staged and an ignored file around.
+        write(&dir, "a.txt", "A staged\n");
+        git(&dir, &["add", "a.txt"]);
+        write(&dir, "ignored.log", "secret\n");
+
+        assert!(ck::capture_before(&dir, THREAD, 10));
+        // The turn writes.
+        write(&dir, "a.txt", "A agent\n");
+        write(&dir, "sub/new.txt", "N\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        AfterTurn::new(&dir, THREAD, 10).record();
+        // The director edits between turns; the ignored file changes too.
+        write(&dir, "b.txt", "B director\n");
+        write(&dir, "ignored.log", "changed\n");
+
+        let p = ck::preview(&dir, THREAD, 10).unwrap();
+        assert_eq!(p.changes.len(), 4, "{:?}", p.changes);
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        assert!(!change(&p.changes, "a.txt").outside_talk);
+        assert_eq!(change(&p.changes, "sub/new.txt").kind, "removed");
+        assert_eq!(change(&p.changes, "gone.txt").kind, "restored");
+        assert!(change(&p.changes, "b.txt").outside_talk, "the director's edit is flagged");
+
+        assert_eq!(ck::rewind(&dir, THREAD, 10, &p.current).unwrap().changed, 4);
+        assert_eq!(read(&dir, "a.txt"), "A staged\n");
+        assert_eq!(read(&dir, "b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        assert!(!dir.join("sub").exists(), "the created file and its folder are gone");
+        assert_eq!(read(&dir, "ignored.log"), "changed\n", "ignored files are never touched");
+        assert_eq!(git(&dir, &["rev-parse", "HEAD"]), head, "HEAD never moves");
+        assert_eq!(git(&dir, &["diff", "--cached", "--name-only"]), "a.txt", "the user's index is kept");
+        assert_eq!(git(&dir, &["show", ":a.txt"]), "A staged");
+
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 4);
+        assert_eq!(read(&dir, "a.txt"), "A agent\n");
+        assert_eq!(read(&dir, "b.txt"), "B director\n");
+        assert_eq!(read(&dir, "sub/new.txt"), "N\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(ck::undo(&dir, THREAD).is_err(), "an undo is used once");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rewind_refuses_when_the_files_moved_on_since_the_preview() {
+        let dir = repo("stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 3));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 3).unwrap();
+        write(&dir, "a.txt", "typed after the preview\n");
+        assert!(ck::rewind(&dir, THREAD, 3, &p.current).is_err());
+        assert_eq!(read(&dir, "a.txt"), "typed after the preview\n", "nothing is overwritten");
+        assert!(ck::rewind(&dir, THREAD, 3, "--force").is_err(), "a preview id is never an option");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo only puts back what the rewind changed: once a new turn or
+    /// the user edits the files, it refuses and writes nothing.
+    #[test]
+    fn undo_refuses_when_the_files_moved_on_since_the_rewind() {
+        let dir = repo("undo-stale");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 2));
+        write(&dir, "a.txt", "agent\n");
+        let p = ck::preview(&dir, THREAD, 2).unwrap();
+        assert_eq!(ck::rewind(&dir, THREAD, 2, &p.current).unwrap().changed, 1);
+        write(&dir, "b.txt", "a later turn's file\n");
+        let err = ck::undo(&dir, THREAD).unwrap_err().to_string();
+        assert!(err.contains("changed since the rewind"), "{err}");
+        assert_eq!(read(&dir, "a.txt"), "A\n", "nothing is written");
+        assert_eq!(read(&dir, "b.txt"), "a later turn's file\n");
+        // Back to the state the rewind left, the undo works again.
+        std::fs::remove_file(dir.join("b.txt")).unwrap();
+        assert_eq!(ck::undo(&dir, THREAD).unwrap().changed, 1);
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A project folder that only sits inside a parent repository takes no
+    /// checkpoint: its snapshot would be the parent's whole tree.
+    #[test]
+    fn a_folder_nested_in_a_parent_repo_is_not_a_repo() {
+        let parent = repo("nested");
+        write(&parent, "top.txt", "T\n");
+        git(&parent, &["add", "-A"]);
+        git(&parent, &["commit", "-qm", "init"]);
+        let proj = parent.join("projects/app");
+        write(&proj, "main.txt", "M\n");
+        assert!(!ck::capture_before(&proj, THREAD, 1));
+        assert!(ck::list(&proj, THREAD).unwrap().is_empty());
+        assert!(ck::preview(&proj, THREAD, 1).is_err());
+        assert!(ck::undo(&proj, THREAD).is_err());
+        assert_eq!(git(&parent, &["for-each-ref", ck::REF_ROOT]), "", "no ref in the parent repo");
+        assert_eq!(read(&parent, "top.txt"), "T\n");
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    #[test]
+    fn a_regenerate_keeps_the_first_checkpoint_and_pruning_clears_the_thread() {
+        let dir = repo("regen");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 7));
+        write(&dir, "a.txt", "first attempt\n");
+        assert!(ck::capture_before(&dir, THREAD, 7), "the regenerate still has a checkpoint");
+        assert!(ck::capture_before(&dir, THREAD, 9));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![7, 9]);
+        let p = ck::rewind(&dir, THREAD, 7, &ck::preview(&dir, THREAD, 7).unwrap().current);
+        assert_eq!(p.unwrap().changed, 1);
+        assert_eq!(read(&dir, "a.txt"), "A\n", "back to before the FIRST attempt");
+
+        ck::prune_thread(&dir, THREAD);
+        assert!(ck::list(&dir, THREAD).unwrap().is_empty());
+        assert_eq!(git(&dir, &["for-each-ref", ck::REF_ROOT]), "", "undo ref pruned too");
+        assert!(!ck::capture_before(&dir, "../heads/main", 1), "a bad thread id never reaches a ref");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn works_before_the_first_commit_and_outside_a_repo() {
+        let dir = repo("empty");
+        write(&dir, "x.txt", "X\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("x.txt")).unwrap();
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(change(&p.changes, "x.txt").kind, "restored");
+        ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(read(&dir, "x.txt"), "X\n");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let plain = std::env::temp_dir().join(format!("octo-talk-ckpt-plain-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        assert!(!ck::capture_before(&plain, THREAD, 1));
+        assert!(ck::list(&plain, THREAD).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&plain);
+    }
+
+    #[test]
+    fn a_fork_gets_the_checkpoints_of_the_turns_it_copied() {
+        let dir = repo("fork");
+        write(&dir, "a.txt", "A\n");
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        assert!(ck::capture_before(&dir, THREAD, 4));
+        write(&dir, "a.txt", "turn 4\n");
+        ck::copy_to_fork(&dir, THREAD, "5b1e-thread-b", &[(4, 40), (5, 50)]);
+        assert_eq!(ck::list(&dir, "5b1e-thread-b").unwrap(), vec![40]);
+        let p = ck::preview(&dir, "5b1e-thread-b", 40).unwrap();
+        assert_eq!(change(&p.changes, "a.txt").kind, "reverted");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_diff_parsing_and_age_pruning_are_exact() {
+        let raw = b":100644 100644 aaa bbb M\0src/a.rs\0:000000 100644 000 ccc A\0new file.txt\0:160000 160000 d e M\0vendor/sub\0";
+        let parsed = ck::parse_raw_diff(raw);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!((parsed[0].status, parsed[0].path.as_str(), parsed[0].submodule), ('M', "src/a.rs", false));
+        assert_eq!((parsed[1].status, parsed[1].path.as_str()), ('A', "new file.txt"));
+        assert!(parsed[2].submodule, "submodules are never rewound");
+
+        let lines = "refs/octopush/talk/t/1 100\nrefs/octopush/talk/t/2 500\ngarbage\n";
+        assert_eq!(ck::expired_refs(lines, 200), vec!["refs/octopush/talk/t/1".to_string()]);
+    }
+
+    fn left(untouched: &[Untouched], path: &str) -> &'static str {
+        untouched.iter().find(|u| u.path == path).map(|u| u.reason).unwrap_or("")
+    }
+
+    fn rewind_now(dir: &Path, id: i64) -> ck::RewindOutcome {
+        let p = ck::preview(dir, THREAD, id).unwrap();
+        ck::rewind(dir, THREAD, id, &p.current).unwrap()
+    }
+
+    fn tree_paths(dir: &Path, rev: &str) -> Vec<String> {
+        git(dir, &["ls-tree", "-r", "--name-only", rev]).lines().map(str::to_string).collect()
+    }
+
+    fn committed(tag: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = repo(tag);
+        for (rel, body) in files {
+            write(&dir, rel, body);
+        }
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// The checkpoint ignored a file; the turn un-ignored it, so the
+    /// snapshot of "now" holds it and the checkpoint does not. Neither the
+    /// rewind nor its undo may remove or rewrite it.
+    #[test]
+    fn a_file_ignored_at_the_checkpoint_survives_rewind_and_undo() {
+        let dir = committed("ign-then", &[(".gitignore", "local.cfg\n"), ("a.txt", "A\n")]);
+        write(&dir, "local.cfg", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // The turn drops the rule and edits a file.
+        write(&dir, ".gitignore", "");
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "local.cfg"), "ignored", "{:?}", p.untouched);
+        assert!(p.changes.iter().all(|c| c.path != "local.cfg"));
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 2);
+        assert_eq!(left(&out.untouched, "local.cfg"), "ignored");
+        assert_eq!(read(&dir, "local.cfg"), "mine\n");
+        assert_eq!(read(&dir, ".gitignore"), "local.cfg\n");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+
+        // The file changes while it is ignored again: the undo's target
+        // holds the old copy and must not write it back over this one.
+        write(&dir, "local.cfg", "mine, edited\n");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(left(&undone.untouched, "local.cfg"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "local.cfg"), "mine, edited\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other direction: the turn ADDS an ignore rule and ignored files
+    /// appear. The rewind takes the rule away, so the next snapshot holds
+    /// them, while the undo's target does not. The undo must not remove them.
+    #[test]
+    fn files_ignored_since_the_checkpoint_survive_rewind_and_undo() {
+        let dir = committed("ign-now", &[(".gitignore", ""), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "build/\n.cache\n");
+        write(&dir, "a.txt", "agent\n");
+        write(&dir, "build/out.bin", "artefact\n");
+        write(&dir, "build/deep/more.bin", "artefact 2\n");
+        write(&dir, ".cache", "warm\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.changed, 2, "{out:?}");
+        assert!(out.untouched.is_empty(), "{:?}", out.untouched);
+        assert_eq!(read(&dir, ".gitignore"), "");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None);
+        assert_eq!(left(&undone.untouched, "build/out.bin"), "ignored", "{:?}", undone.untouched);
+        assert_eq!(left(&undone.untouched, "build/deep/more.bin"), "ignored");
+        assert_eq!(left(&undone.untouched, ".cache"), "ignored");
+        assert_eq!(read(&dir, "build/out.bin"), "artefact\n");
+        assert_eq!(read(&dir, "build/deep/more.bin"), "artefact 2\n");
+        assert_eq!(read(&dir, ".cache"), "warm\n");
+        assert_eq!(read(&dir, ".gitignore"), "build/\n.cache\n");
+        assert_eq!(read(&dir, "a.txt"), "agent\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A file the checkpoint holds is ignored now and was edited since: its
+    /// current content is in no snapshot, so the rewind leaves it. Holds for
+    /// an untracked file and for a tracked one.
+    #[test]
+    fn a_file_ignored_now_is_never_overwritten() {
+        let dir = committed("ign-over", &[(".gitignore", ""), ("tracked.cfg", "T\n")]);
+        write(&dir, "loose.cfg", "L\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, ".gitignore", "*.cfg\n");
+        write(&dir, "loose.cfg", "L filled in\n");
+        write(&dir, "tracked.cfg", "T filled in\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "loose.cfg"), "ignored", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "tracked.cfg"), "ignored");
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n");
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "");
+
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "loose.cfg"), "L filled in\n", "{:?}", undone.untouched);
+        assert_eq!(read(&dir, "tracked.cfg"), "T filled in\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.cfg\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rule in a nested `.gitignore` of the destination counts too.
+    #[test]
+    fn a_nested_ignore_file_of_the_destination_is_honoured() {
+        let dir = committed("ign-nested", &[("pkg/.gitignore", "*.local\n"), ("pkg/a.txt", "A\n")]);
+        write(&dir, "pkg/db.local", "mine\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("pkg/.gitignore")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "pkg/db.local"), "ignored", "{:?}", out.untouched);
+        assert_eq!(read(&dir, "pkg/db.local"), "mine\n");
+        assert_eq!(read(&dir, "pkg/.gitignore"), "*.local\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The checkpoint has a FILE where a directory with ignored content now
+    /// sits. The directory is never removed to put the file back, whether
+    /// the whole directory is ignored or only what it holds.
+    #[test]
+    fn a_directory_holding_ignored_content_is_never_removed_to_place_a_file() {
+        let dir = committed("dir-file", &[(".gitignore", "*.bin\n"), ("cache", "a plain file\n"), ("store", "plain\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        // `cache` becomes a directory with one ignored and one plain file.
+        std::fs::remove_file(dir.join("cache")).unwrap();
+        write(&dir, "cache/keep.bin", "ignored bytes\n");
+        write(&dir, "cache/note.txt", "plain\n");
+        // `store` becomes a directory that is ignored as a whole.
+        std::fs::remove_file(dir.join("store")).unwrap();
+        write(&dir, ".gitignore", "*.bin\nstore/\n");
+        write(&dir, "store/data", "ignored too\n");
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(left(&out.untouched, "cache"), "exists", "{:?}", out.untouched);
+        assert_eq!(left(&out.untouched, "store"), "ignored");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert!(!dir.join("cache/note.txt").exists(), "the plain file the turn created is removed");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        assert_eq!(read(&dir, ".gitignore"), "*.bin\n");
+
+        // The undo puts the turn's own file back and still removes nothing.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "cache/keep.bin"), "ignored bytes\n");
+        assert_eq!(read(&dir, "cache/note.txt"), "plain\n");
+        assert_eq!(read(&dir, "store/data"), "ignored too\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Something on disk that the current snapshot doesn't hold (here an
+    /// embedded repository, which a snapshot leaves out) is not replaced by
+    /// the file the checkpoint has at that path.
+    #[test]
+    fn what_the_current_snapshot_does_not_hold_is_not_overwritten() {
+        let dir = committed("unknown", &[("vendor", "a plain file\n"), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_file(dir.join("vendor")).unwrap();
+        write(&dir, "vendor/lib.txt", "someone's checkout\n");
+        git(&dir.join("vendor"), &["init", "-q"]);
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(left(&p.untouched, "vendor"), "exists", "{:?}", p.untouched);
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(read(&dir, "vendor/lib.txt"), "someone's checkout\n");
+        assert!(dir.join("vendor/.git").exists());
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder that became a symbolic link is never written through: the
+    /// link itself goes (it is in the snapshot), what it points at stays.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_never_writes_through_a_symbolic_link() {
+        let dir = committed("symlink", &[("d/f.txt", "F\n")]);
+        let outside = repo("symlink-outside");
+        write(&outside, "f.txt", "outside\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        std::fs::remove_dir_all(dir.join("d")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("d")).unwrap();
+
+        let out = rewind_now(&dir, 1);
+        assert_eq!(out.error, None, "{out:?}");
+        assert_eq!(read(&outside, "f.txt"), "outside\n", "nothing is written outside the worktree");
+        assert!(std::fs::symlink_metadata(dir.join("d")).map(|m| !m.file_type().is_symlink()).unwrap_or(true));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    /// Files the Secret guard's name rules treat as sensitive never enter a
+    /// snapshot, tracked or not, so a rewind never writes or removes them.
+    #[test]
+    fn sensitive_named_files_are_never_stored_or_rewound() {
+        let dir = committed("sensitive", &[("a.txt", "A\n"), ("certs/server.pem", "tracked pem\n"), (".env.example", "KEY=\n")]);
+        write(&dir, ".env", "TOKEN=before\n");
+        write(&dir, "deploy/id_rsa", "key before\n");
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        let stored = tree_paths(&dir, &ck::ref_for(THREAD, 1));
+        assert_eq!(stored, vec![".env.example".to_string(), "a.txt".to_string()], "only plain files are stored");
+
+        write(&dir, ".env", "TOKEN=after\n");
+        write(&dir, "certs/server.pem", "pem after\n");
+        write(&dir, ".env.local", "created by the turn\n");
+        std::fs::remove_file(dir.join("deploy/id_rsa")).unwrap();
+        write(&dir, "a.txt", "agent\n");
+
+        let p = ck::preview(&dir, THREAD, 1).unwrap();
+        assert_eq!(p.changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(), vec!["a.txt"]);
+        assert!(tree_paths(&dir, &p.current).iter().all(|f| f == "a.txt" || f == ".env.example"));
+        // The tracked one the turn edited can't be put back, and says so;
+        // the untracked ones can't be told from the user's own.
+        assert_eq!(left(&p.untouched, "certs/server.pem"), "sensitive", "{:?}", p.untouched);
+        assert_eq!(p.untouched.len(), 1, "{:?}", p.untouched);
+        let out = ck::rewind(&dir, THREAD, 1, &p.current).unwrap();
+        assert_eq!(out.changed, 1);
+        assert_eq!(left(&out.untouched, "certs/server.pem"), "sensitive");
+        assert_eq!(read(&dir, ".env"), "TOKEN=after\n");
+        assert_eq!(read(&dir, "certs/server.pem"), "pem after\n");
+        assert_eq!(read(&dir, ".env.local"), "created by the turn\n");
+        assert!(!dir.join("deploy/id_rsa").exists());
+        assert_eq!(git(&dir, &["status", "--porcelain", "--", "certs/server.pem"]), "M certs/server.pem", "the real index is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Past the budget (files, bytes or time) the turn takes no checkpoint,
+    /// nothing is left to rewind to, and the thread says so with the reason.
+    /// A regenerate of that turn takes none either.
+    #[test]
+    fn a_snapshot_over_its_budget_is_skipped_and_marked() {
+        let dir = committed("budget", &[("a.txt", "A\n")]);
+        for i in 0..4 {
+            write(&dir, &format!("big/f{i}.txt"), "0123456789\n");
+        }
+        let second = std::time::Duration::from_secs(20);
+        let few = Budget { files: 3, bytes: 1 << 20, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 1, &few));
+        let small = Budget { files: 100, bytes: 30, timeout: second };
+        assert!(!ck::capture_before_with(&dir, THREAD, 2, &small));
+        let instant = Budget { files: 100, bytes: 1 << 20, timeout: std::time::Duration::ZERO };
+        assert!(!ck::capture_before_with(&dir, THREAD, 3, &instant));
+        // A refused snapshot wrote none of the files into the object store.
+        let blob = git(&dir, &["hash-object", "big/f0.txt"]);
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "", "nothing was hashed into the repository");
+        assert!(ck::capture_before_with(&dir, THREAD, 4, &Budget::DEFAULT));
+        assert_eq!(git(&dir, &["cat-file", "-t", &blob]), "blob");
+
+        let cps = ck::checkpoints(&dir, THREAD).unwrap();
+        assert_eq!(cps.turns, vec![4]);
+        assert!(!cps.can_undo);
+        let reasons: Vec<(i64, &str)> = cps.skipped.iter().map(|s| (s.message_id, s.reason.as_str())).collect();
+        assert_eq!(
+            reasons,
+            vec![
+                (1, "more than 3 changed or untracked files"),
+                (2, "more than 0 MB of changed or untracked files"),
+                (3, "reading the changed files took too long"),
+            ]
+        );
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        assert!(ck::preview(&dir, THREAD, 1).is_err(), "a skipped turn can't be rewound");
+        // A regenerate must not take a late checkpoint for the skipped turn.
+        assert!(!ck::capture_before(&dir, THREAD, 1));
+        assert_eq!(ck::list(&dir, THREAD).unwrap(), vec![4]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rewind that stops part-way reports it, keeps the state from before
+    /// it as the undo, and a second attempt from the half-rewound state
+    /// keeps that FIRST undo target.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_keeps_the_first_undo_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial", &[("a.txt", "A\n"), ("locked/b.txt", "B\n"), ("gone.txt", "G\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        std::fs::remove_file(dir.join("gone.txt")).unwrap();
+        write(&dir, "made.txt", "agent made\n");
+
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            // Running as a user the mode doesn't bind (root): nothing to test.
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some(), "the locked folder stops it: {first:?}");
+        assert!(first.can_undo);
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert!(!dir.join("made.txt").exists(), "the part that ran did run");
+        assert!(ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+
+        // A second attempt from the half-rewound state finishes the job…
+        let second = rewind_now(&dir, 1);
+        assert_eq!(second.error, None, "{second:?}");
+        assert_eq!(read(&dir, "a.txt"), "A\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "B\n");
+        assert_eq!(read(&dir, "gone.txt"), "G\n");
+        // …and the undo goes back to before the FIRST attempt.
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        assert!(!dir.join("gone.txt").exists());
+        assert!(!ck::checkpoints(&dir, THREAD).unwrap().can_undo);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The undo of a part-way rewind, taken straight away, puts back
+    /// exactly what the rewind managed to change.
+    #[cfg(unix)]
+    #[test]
+    fn a_rewind_that_stops_part_way_can_be_undone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = committed("partial-undo", &[("a.txt", "A\n"), ("locked/b.txt", "B\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent a\n");
+        write(&dir, "locked/b.txt", "agent b\n");
+        write(&dir, "made.txt", "agent made\n");
+        let lock = |mode: u32| std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(mode)).unwrap();
+        lock(0o555);
+        if std::fs::write(dir.join("locked/probe"), "").is_ok() {
+            let _ = std::fs::remove_file(dir.join("locked/probe"));
+            lock(0o755);
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let first = rewind_now(&dir, 1);
+        lock(0o755);
+        assert!(first.error.is_some() && first.can_undo, "{first:?}");
+        let undone = ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(undone.error, None, "{undone:?}");
+        assert_eq!(read(&dir, "a.txt"), "agent a\n");
+        assert_eq!(read(&dir, "locked/b.txt"), "agent b\n");
+        assert_eq!(read(&dir, "made.txt"), "agent made\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Scratch files never sit under a guessable name in the temp folder:
+    /// a snapshot, a preview with destination rules and a rewind leave
+    /// nothing behind there under the old fixed prefixes.
+    #[test]
+    fn scratch_files_use_private_directories_and_are_removed() {
+        let dir = committed("scratch", &[(".gitignore", "*.log\n"), ("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "agent\n");
+        rewind_now(&dir, 1);
+        let pid = std::process::id().to_string();
+        let stray: Vec<String> = std::fs::read_dir(std::env::temp_dir())
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("octopush-talk-idx-") || n.starts_with("octopush-talk-rules-"))
+            .filter(|n| n.contains(&pid))
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A later, unrelated rewind does not inherit a stale undo target.
+    #[test]
+    fn a_fresh_rewind_replaces_the_undo_target() {
+        let dir = committed("fresh-undo", &[("a.txt", "A\n")]);
+        assert!(ck::capture_before(&dir, THREAD, 1));
+        write(&dir, "a.txt", "one\n");
+        rewind_now(&dir, 1);
+        write(&dir, "a.txt", "two\n");
+        rewind_now(&dir, 1);
+        ck::undo(&dir, THREAD).unwrap();
+        assert_eq!(read(&dir, "a.txt"), "two\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Deleting or archiving a workspace prunes its threads' refs from any
+    /// checkout of the repository, the removed worktree's included.
+    #[test]
+    fn pruning_a_workspace_clears_its_threads_from_the_shared_repository() {
+        let dir = committed("ws-prune", &[("a.txt", "A\n")]);
+        let wt = dir.with_file_name(format!("{}-wt", dir.file_name().unwrap().to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&wt);
+        git(&dir, &["worktree", "add", "-q", wt.to_str().unwrap(), "-b", "side"]);
+        write(&wt, "big.txt", "x\n");
+        assert!(ck::capture_before(&wt, THREAD, 1));
+        assert!(!ck::capture_before_with(&wt, THREAD, 2, &Budget { files: 0, ..Budget::DEFAULT }));
+        assert!(ck::capture_before(&wt, "5b1e-thread-b", 1));
+        assert!(ck::capture_before(&dir, "5b1e-thread-c", 1));
+        // Pruned from the main checkout, as after the worktree is removed.
+        ck::prune_threads(&dir, &[THREAD.to_string(), "../heads/side".to_string()]);
+        let refs = git(&dir, &["for-each-ref", "--format=%(refname)", ck::REF_ROOT]);
+        assert_eq!(refs, "refs/octopush/talk/5b1e-thread-b/1\nrefs/octopush/talk/5b1e-thread-c/1");
+        assert!(!git(&dir, &["branch", "--list", "side"]).is_empty(), "a bad id never reaches another ref");
+        let _ = std::fs::remove_dir_all(&wt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_rewind_note_names_the_turn() {
+        use crate::commands::rewind_note;
+        assert_eq!(rewind_note(Some("Fix the parser"), 1), "Files rewound to before “Fix the parser” · 1 file");
+        assert_eq!(
+            rewind_note(Some("\nMake the whole importer stream rows instead of loading them"), 3),
+            "Files rewound to before “Make the whole importer stream rows inst…” · 3 files"
+        );
+        assert_eq!(rewind_note(None, 0), "Files rewound to before a turn · 0 files");
+    }
+
+    #[test]
+    fn fork_copies_the_history_before_a_user_turn() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork", "P", "/tmp/p-fork").unwrap();
+        db.insert_workspace("w-fork", "p-fork", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork", "Parser work").unwrap();
+        let u1 = db.insert_chat_message("w-fork", &t.id, "user", "one", None, None, None, None).unwrap();
+        let a1 = db.insert_chat_message("w-fork", &t.id, "assistant", "ok", Some("m"), Some(5), Some(2), Some(0.01)).unwrap();
+        let u2 = db.insert_chat_message("w-fork", &t.id, "user", "two", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork", &t.id, "assistant", "done", None, None, None, None).unwrap();
+
+        let (fork, draft, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(fork.title, "Parser work · fork");
+        assert_eq!(fork.workspace_id, "w-fork");
+        assert_eq!(draft, "two");
+        assert_eq!(pairs.iter().map(|p| p.0).collect::<Vec<_>>(), vec![u1, a1]);
+        let copied = db.list_chat_messages(&fork.id).unwrap();
+        let shape: Vec<(&str, &str)> = copied.iter().map(|m| (m.role.as_str(), m.content.as_str())).collect();
+        assert_eq!(shape, vec![("user", "one"), ("assistant", "ok")]);
+        assert_eq!(copied[1].output_tokens, Some(2));
+        assert_eq!(db.list_chat_messages(&t.id).unwrap().len(), 4, "the original is untouched");
+        assert!(db.fork_chat_thread(&t.id, a1).is_err(), "only a user turn forks");
+        assert_eq!(db.chat_thread_worktree(&t.id).unwrap(), None);
+    }
+
+    /// What a rewind checks before it writes: every conversation of every
+    /// workspace checked out at the same folder, and a Direct run in
+    /// progress there. The folder comes from the database.
+    #[test]
+    fn the_worktree_a_rewind_writes_to_is_known_from_the_database() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-idle", "P", "/tmp/p-idle").unwrap();
+        db.insert_workspace("w-a", "p-idle", "a", "", "main", Some("/tmp/p-idle/wt"), "", None).unwrap();
+        db.insert_workspace("w-b", "p-idle", "b", "", "main", Some("/tmp/p-idle/wt/"), "", None).unwrap();
+        db.insert_workspace("w-c", "p-idle", "c", "", "side", Some("/tmp/p-idle/other"), "", None).unwrap();
+        db.insert_workspace("w-d", "p-idle", "d", "", "none", None, "", None).unwrap();
+        let ta = db.create_chat_thread("w-a", "A").unwrap();
+        let ta2 = db.create_chat_thread("w-a", "A2").unwrap();
+        let tb = db.create_chat_thread("w-b", "B").unwrap();
+        let tc = db.create_chat_thread("w-c", "C").unwrap();
+        let td = db.create_chat_thread("w-d", "D").unwrap();
+
+        assert_eq!(db.chat_thread_home(&ta.id).unwrap(), Some(("w-a".to_string(), Some("/tmp/p-idle/wt".to_string()))));
+        assert_eq!(db.chat_thread_home(&td.id).unwrap(), Some(("w-d".to_string(), None)));
+        assert_eq!(db.chat_thread_home("no-such-thread").unwrap(), None);
+
+        let mut sharing = db.chat_threads_sharing_worktree(&ta.id).unwrap();
+        sharing.sort();
+        let mut expected = vec![ta.id.clone(), ta2.id.clone(), tb.id.clone()];
+        expected.sort();
+        assert_eq!(sharing, expected, "same folder, a trailing slash ignored; another folder left out");
+        assert_eq!(db.chat_threads_sharing_worktree(&td.id).unwrap(), vec![td.id.clone()]);
+        assert_eq!(db.chat_threads_sharing_worktree(&tc.id).unwrap(), vec![tc.id.clone()]);
+
+        let mut ids = db.chat_thread_ids("w-a").unwrap();
+        ids.sort();
+        let mut own = vec![ta.id.clone(), ta2.id.clone()];
+        own.sort();
+        assert_eq!(ids, own);
+
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline = db.list_pipelines().unwrap()[0].id.clone();
+        let run = db.create_run("w-b", &pipeline, "task", None, None, &[]).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a draft is not in progress");
+        db.set_run_status(&run, "running", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt").unwrap(), "a run in a workspace at the same folder counts");
+        assert!(!db.has_active_run_at("/tmp/p-idle/other").unwrap());
+        db.set_run_status(&run, "paused", false).unwrap();
+        assert!(db.has_active_run_at("/tmp/p-idle/wt/").unwrap());
+        db.set_run_status(&run, "completed", true).unwrap();
+        assert!(!db.has_active_run_at("/tmp/p-idle/wt").unwrap());
+    }
+
+    #[test]
+    fn the_note_says_what_was_left_untouched_or_stopped() {
+        use crate::commands::rewind_note_tail;
+        let mut outcome = ck::RewindOutcome { changed: 2, untouched: Vec::new(), error: None, can_undo: true };
+        assert_eq!(rewind_note_tail(&outcome), "");
+        outcome.untouched.push(Untouched { path: "local.cfg".into(), reason: "ignored" });
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched");
+        outcome.error = Some("checkout-index: failed".into());
+        assert_eq!(rewind_note_tail(&outcome), " · 1 left untouched · stopped part-way");
+    }
+
+    /// A copy that fails part-way leaves no half-copied `· fork` thread.
+    #[test]
+    fn a_fork_that_fails_part_way_leaves_nothing() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-fork2", "P", "/tmp/p-fork2").unwrap();
+        db.insert_workspace("w-fork2", "p-fork2", "ws", "", "main", None, "", None).unwrap();
+        let t = db.create_chat_thread("w-fork2", "Atomic").unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "user", "one", None, None, None, None).unwrap();
+        db.insert_chat_message("w-fork2", &t.id, "assistant", "boom", None, None, None, None).unwrap();
+        let u2 = db.insert_chat_message("w-fork2", &t.id, "user", "two", None, None, None, None).unwrap();
+        // The second row's copy fails, after the thread and the first row.
+        db.conn_ref()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_copy BEFORE INSERT ON chat_messages
+                 WHEN NEW.content = 'boom' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            )
+            .unwrap();
+        assert!(db.fork_chat_thread(&t.id, u2).is_err());
+        let titles: Vec<String> = db.list_chat_threads("w-fork2").unwrap().into_iter().map(|t| t.title).collect();
+        assert_eq!(titles, vec!["Atomic".to_string()], "no half-copied fork");
+        db.conn_ref().execute_batch("DROP TRIGGER fail_copy;").unwrap();
+        let (fork, _, pairs) = db.fork_chat_thread(&t.id, u2).unwrap();
+        assert_eq!(pairs.len(), 2);
+        assert_eq!(db.list_chat_messages(&fork.id).unwrap().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod request_context_tests {
+    use crate::request_context::{
+        agents_item, apportion, estimate_tokens, memory_files, memory_imports, request_context, session_files, skills_item,
+        CarriedItem, MAX_SESSIONS,
+    };
+    use crate::transcripts::project_dir_name;
+    use std::collections::HashSet;
+    use std::path::Path;
+    use tempfile::TempDir;
+
+    fn file_item(label: &str, bytes: u64) -> CarriedItem {
+        CarriedItem { kind: "memory".into(), label: label.into(), path: None, count: 1, bytes, tokens: 0 }
+    }
+
+    fn assistant(session: &str, req: &str, model: &str, i: u64, cr: u64, cc: u64, o: u64, ts: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "requestId": req,
+            "timestamp": ts,
+            "sessionId": session,
+            "message": {
+                "id": format!("msg_{req}"),
+                "model": model,
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": i,
+                    "cache_read_input_tokens": cr,
+                    "cache_creation_input_tokens": cc,
+                    "output_tokens": o
+                }
+            }
+        })
+        .to_string()
+    }
+
+    fn write(path: &Path, text: &str) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+
+    /// Labels of the items whose file sits under one of `roots` (the
+    /// machine's own `/tmp/CLAUDE.md`, if any, is not the test's).
+    fn labels_under(items: &[CarriedItem], roots: &[&Path]) -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| i.path.as_deref().is_some_and(|p| roots.iter().any(|r| Path::new(p).starts_with(r))))
+            .map(|i| i.label.clone())
+            .collect()
+    }
+
+    #[test]
+    fn estimates_fill_the_measured_total_and_the_rest_is_by_difference() {
+        assert_eq!(estimate_tokens(0), 0);
+        assert_eq!(estimate_tokens(1), 1);
+        assert_eq!(estimate_tokens(4_000), 1_000);
+
+        // Under the total: the remainder is one "by difference" row, ranked with the rest.
+        let items = apportion(vec![file_item("CLAUDE.md", 40_000), file_item("AGENTS.md", 4_000)], Some(30_000));
+        let rows: Vec<(&str, &str, u64)> = items.iter().map(|i| (i.kind.as_str(), i.label.as_str(), i.tokens)).collect();
+        assert_eq!(
+            rows,
+            [
+                ("by_difference", "MCP and built-in tools, by difference", 19_000),
+                ("memory", "CLAUDE.md", 10_000),
+                ("memory", "AGENTS.md", 1_000),
+            ]
+        );
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 30_000);
+
+        // Over the total: scaled down to add up to it exactly, no difference row.
+        let items = apportion(vec![file_item("a", 4_000), file_item("b", 4_000), file_item("c", 4_000)], Some(1_000));
+        assert_eq!(items.iter().map(|i| i.tokens).sum::<u64>(), 1_000);
+        assert!(items.iter().all(|i| i.kind == "memory" && (333..=334).contains(&i.tokens)));
+
+        // An exact fit leaves no empty difference row; an empty file is no row.
+        let items = apportion(vec![file_item("a", 400), file_item("empty", 0)], Some(100));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].tokens, 100);
+
+        // Nothing measured: the raw estimates stand.
+        let items = apportion(vec![file_item("a", 400)], None);
+        assert_eq!(items.iter().map(|i| i.tokens).collect::<Vec<_>>(), [100]);
+    }
+
+    #[test]
+    fn imports_are_at_paths_outside_code_fences() {
+        let text = "Read @AGENTS.md, then @docs/style.md.\nMail a@b.co or `@code`.\n```\n@inside-fence.md\n```\nAgain @AGENTS.md\n";
+        assert_eq!(memory_imports(text), ["AGENTS.md", "docs/style.md"]);
+    }
+
+    #[test]
+    fn the_claude_md_chain_is_user_then_top_down_with_imports() {
+        let home = TempDir::new().unwrap();
+        let tree = TempDir::new().unwrap();
+        let project = tree.path().join("work").join("repo");
+        write(&home.path().join(".claude/CLAUDE.md"), "user rules");
+        write(&tree.path().join("work/CLAUDE.md"), "parent rules");
+        // AGENTS.md counts only because CLAUDE.md imports it; it imports
+        // CLAUDE.md back, which is not counted twice.
+        write(&project.join("CLAUDE.md"), "See @AGENTS.md.\n```\n@fenced.md\n```\n");
+        write(&project.join("AGENTS.md"), "agents rules, see @CLAUDE.md");
+        write(&project.join("fenced.md"), "not loaded");
+        write(&project.join("CLAUDE.local.md"), "local");
+        write(&project.join("sub/AGENTS.md"), "never imported");
+
+        let items = memory_files(&project, Some(home.path()));
+        let parent = tree.path().join("work").join("CLAUDE.md").display().to_string();
+        assert_eq!(
+            labels_under(&items, &[home.path(), tree.path()]),
+            ["~/.claude/CLAUDE.md".to_string(), parent, "CLAUDE.md".into(), "AGENTS.md".into(), "CLAUDE.local.md".into()]
+        );
+        let local = items.iter().find(|i| i.label == "CLAUDE.local.md").unwrap();
+        assert_eq!((local.kind.as_str(), local.count, local.bytes), ("memory", 1, 5));
+    }
+
+    #[test]
+    fn skills_and_agents_count_their_listings_project_first() {
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        write(&project.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: abcd\n---\nA long body that is not in context.");
+        write(&home.path().join(".claude/skills/tests/SKILL.md"), "---\nname: tests\ndescription: shadowed by the project's\n---\nx");
+        write(&home.path().join(".claude/skills/docs/SKILL.md"), "---\nname: docs\ndescription: ab\n---\nx");
+        write(&home.path().join(".claude/skills/broken/SKILL.md"), "no frontmatter");
+        let skills = skills_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((skills.kind.as_str(), skills.label.as_str(), skills.count), ("skills", "Skills", 2));
+        assert_eq!(skills.bytes, ("tests".len() + "abcd".len() + "docs".len() + "ab".len()) as u64);
+
+        write(&project.path().join(".claude/agents/reviewer.md"), "---\nname: reviewer\ndescription: Reviews\n---\nbody");
+        write(&project.path().join(".claude/agents/notes.txt"), "---\nname: notes\ndescription: not an agent\n---\n");
+        let agents = agents_item(project.path(), Some(home.path())).unwrap();
+        assert_eq!((agents.kind.as_str(), agents.count, agents.bytes), ("agents", 1, ("reviewer".len() + "Reviews".len()) as u64));
+
+        let empty = TempDir::new().unwrap();
+        assert_eq!(skills_item(empty.path(), Some(empty.path())), None);
+        assert_eq!(agents_item(empty.path(), None), None);
+    }
+
+    #[test]
+    fn the_total_is_the_smallest_first_request_of_the_projects_sessions() {
+        let root = TempDir::new().unwrap();
+        let home = TempDir::new().unwrap();
+        let project = TempDir::new().unwrap();
+        let cwd = project.path().display().to_string();
+        let dir = root.path().join(project_dir_name(&cwd));
+        let m = "claude-sonnet-5-5";
+        write(
+            &dir.join("s-old.jsonl"),
+            &format!(
+                "{}\n{}\n",
+                assistant("s-old", "o1", m, 10, 0, 30_000, 50, "2026-11-20T10:00:00Z"),
+                assistant("s-old", "o2", m, 5, 30_000, 200, 40, "2026-11-20T10:01:00Z"),
+            ),
+        );
+        let mut side: serde_json::Value =
+            serde_json::from_str(&assistant("s-new", "n0", m, 100, 0, 0, 5, "2026-11-21T09:59:00Z")).unwrap();
+        side["isSidechain"] = serde_json::json!(true);
+        write(
+            &dir.join("s-new.jsonl"),
+            &format!(
+                "{}\n{}\n{}\n{}\n",
+                // An inline sub-agent's request is not the session's first.
+                side,
+                serde_json::json!({ "type": "user", "message": { "role": "user", "content": "hi" } }),
+                assistant("s-new", "n1", m, 10, 20_000, 5_000, 30, "2026-11-21T10:00:00Z"),
+                assistant("s-new", "n2", m, 3, 25_000, 100, 20, "2026-11-21T10:01:00Z"),
+            ),
+        );
+        // A Direct stage's session and a sub-agent's file are not the project's sessions.
+        write(&dir.join("d-1.jsonl"), &format!("{}\n", assistant("d-1", "d1", m, 1, 0, 1_000, 5, "2026-11-21T11:00:00Z")));
+        write(
+            &dir.join("s-new/subagents/agent-1.jsonl"),
+            &format!("{}\n", assistant("s-new", "a1", m, 1, 0, 50, 5, "2026-11-21T10:02:00Z")),
+        );
+        write(&project.path().join("CLAUDE.md"), &"x".repeat(4_000));
+
+        let direct: HashSet<String> = ["d-1".to_string()].into();
+        let ctx = request_context(root.path(), Some(home.path()), project.path(), &[cwd.clone()], &direct);
+        assert_eq!(ctx.measured_tokens, Some(25_010));
+        assert_eq!(ctx.sessions_measured, 2);
+        assert_eq!(ctx.model.as_deref(), Some(m));
+        let hit = ctx.cache_hit_pct.unwrap();
+        let expected = 75_000.0 / (128.0 + 75_000.0 + 35_300.0) * 100.0;
+        assert!((hit - expected).abs() < 1e-9, "{hit} vs {expected}");
+
+        let prices = crate::token_engine::prices_for(m).expect("a priced model");
+        let uncached = ctx.uncached_usd.unwrap();
+        assert!((uncached - prices.input_per_m * 25_010.0 / 1_000_000.0).abs() < 1e-12);
+        // Most of these prompts were cache reads: the usual request pays less.
+        let usual = ctx.usual_usd.unwrap();
+        assert!(usual > 0.0 && usual < uncached, "{usual} vs {uncached}");
+
+        let claude_md = ctx.items.iter().find(|i| i.label == "CLAUDE.md").unwrap();
+        assert_eq!(claude_md.tokens, 1_000);
+        assert_eq!(ctx.items[0].kind, "by_difference");
+        assert_eq!(ctx.items.iter().map(|i| i.tokens).sum::<u64>(), 25_010);
+
+        // An unpriced model: tokens measured, no price invented.
+        let other = TempDir::new().unwrap();
+        let cwd2 = other.path().display().to_string();
+        write(
+            &root.path().join(project_dir_name(&cwd2)).join("u.jsonl"),
+            &format!("{}\n", assistant("u", "u1", "mystery-model-9", 10, 0, 900, 5, "2026-11-21T10:00:00Z")),
+        );
+        let ctx = request_context(root.path(), None, other.path(), &[cwd2], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(910));
+        assert_eq!((ctx.uncached_usd, ctx.usual_usd), (None, None));
+
+        // No transcript: nothing measured, the files stand as raw estimates.
+        let none = TempDir::new().unwrap();
+        let ctx = request_context(root.path(), None, project.path(), &[none.path().display().to_string()], &HashSet::new());
+        assert_eq!((ctx.measured_tokens, ctx.sessions_measured, ctx.model.as_deref()), (None, 0, None));
+        assert!(ctx.items.iter().all(|i| i.kind != "by_difference"));
+    }
+
+    #[test]
+    fn only_the_most_recent_sessions_are_read() {
+        let root = TempDir::new().unwrap();
+        let cwd = "/tmp/proj/request-context-recent";
+        let dir = root.path().join(project_dir_name(cwd));
+        let base = std::time::SystemTime::now() - std::time::Duration::from_secs(3_600);
+        for n in 0..=MAX_SESSIONS {
+            let path = dir.join(format!("s{n}.jsonl"));
+            // s0 is the oldest and the smallest.
+            let l = assistant(&format!("s{n}"), &format!("r{n}"), "claude-sonnet-5-5", 1, 0, 1_000 + n as u64, 5, "2026-11-21T10:00:00Z");
+            write(&path, &format!("{l}\n"));
+            let f = std::fs::File::options().write(true).open(&path).unwrap();
+            f.set_modified(base + std::time::Duration::from_secs(n as u64 * 10)).unwrap();
+        }
+        let files = session_files(root.path(), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(files.len(), MAX_SESSIONS);
+        assert_eq!(files[0].file_name().unwrap(), format!("s{MAX_SESSIONS}.jsonl").as_str());
+        assert!(!files.iter().any(|f| f.file_name().unwrap() == "s0.jsonl"));
+        let ctx = request_context(root.path(), None, Path::new(cwd), &[cwd.to_string()], &HashSet::new());
+        assert_eq!(ctx.measured_tokens, Some(1_002));
     }
 }

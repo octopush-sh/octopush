@@ -176,10 +176,12 @@ describe("effortApplies", () => {
   });
 
   it("passes nothing to Codex on a model its catalog doesn't know", () => {
-    for (const m of ["gpt-5-codex", "o3", "o4-mini", "gpt-5", "gpt-4o", "GPT-6"]) {
+    // GPT-6.2 Astra/Sol aren't in the catalog copy: no prefix of theirs is a slug.
+    for (const m of ["gpt-5-codex", "o3", "o4-mini", "gpt-5", "gpt-4o", "GPT-6", "gpt-6.2-astra", "gpt-6.2-sol"]) {
       expect(codexEffortLevels(m)).toBeUndefined();
       for (const e of ["low", "medium", "high", "xhigh", "max"]) expect(codexEffortLevel(m, e)).toBeNull();
     }
+    expect(effortApplies("cli", "gpt-6.2-sol")).toBe(false);
   });
 
   it("matches ids like Codex: longest prefix, then one namespace strip", () => {

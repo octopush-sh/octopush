@@ -8,6 +8,7 @@ import { copyToClipboard } from "../../lib/clipboard";
 import { useReadinessStore } from "../../stores/readinessStore";
 import { usePipelineStore } from "../../stores/pipelineStore";
 import { useRoutinesStore } from "../../stores/routinesStore";
+import { useTerminalsStore } from "../../stores/terminalsStore";
 import { useModelRetirements } from "../../hooks/useModelRetirements";
 import { libraryModels, readinessRetirementCheck } from "../../lib/modelRetirement";
 import { tourId } from "../../lib/tour/ids";
@@ -69,6 +70,13 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
   const modelsRow = readinessRetirementCheck(pipelines, routines, retirements, new Date());
   const rows = checks && checks.length > 0 && modelsRow ? [...checks, modelsRow] : checks;
 
+  // The Claude Code row's recommended note (#1002) matters to interactive
+  // sessions, which share worktrees: it shows only while a Run-mode session
+  // runs Claude Code.
+  const claudeInRun = useTerminalsStore((s) =>
+    Object.values(s.terminalsByWs).some((ts) => ts.some((t) => t.running && t.agentCli === "claude")),
+  );
+
   const neverChecked = !checks && !loading && !error;
 
   return (
@@ -122,7 +130,13 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
         {rows && rows.length > 0 && (
           <ul className="mt-3 divide-y divide-octo-hairline">
             {rows.map((c, i) => (
-              <ReadinessRow key={c.id ?? i} check={c} index={i} onShowCaches={c.id === "disk" ? onShowCaches : undefined} />
+              <ReadinessRow
+                key={c.id ?? i}
+                check={c}
+                index={i}
+                note={c.id === "claude" && claudeInRun ? c.note : null}
+                onShowCaches={c.id === "disk" ? onShowCaches : undefined}
+              />
             ))}
           </ul>
         )}
@@ -142,7 +156,18 @@ export function ReadinessCard({ onShowCaches }: { onShowCaches?: () => void } = 
   );
 }
 
-function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; index: number; onShowCaches?: () => void }) {
+function ReadinessRow({
+  check,
+  index,
+  note,
+  onShowCaches,
+}: {
+  check: ReadinessCheck;
+  index: number;
+  /** Shown under the row whatever its status; never a verdict. */
+  note?: string | null;
+  onShowCaches?: () => void;
+}) {
   const [copied, setCopied] = useState(false);
   const { word, tone, Icon: StatusIcon } = STATUS[check.status] ?? PENDING;
   const Icon = check.timedOut ? Clock : StatusIcon;
@@ -202,6 +227,15 @@ function ReadinessRow({ check, index, onShowCaches }: { check: ReadinessCheck; i
             </button>
           )}
         </div>
+      )}
+      {note && (
+        <p
+          data-tour="settings-readiness-claude-note"
+          data-testid="readiness-note"
+          className="octo-fade-in mt-1.5 pl-[25px] text-[12px] leading-[1.55] text-octo-sage"
+        >
+          {note}
+        </p>
       )}
     </li>
   );

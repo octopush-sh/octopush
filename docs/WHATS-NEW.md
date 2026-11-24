@@ -79,6 +79,7 @@ Current anchors:
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
+| `direct-launcher-known-bad` | Direct launcher: the amber "Claude Code 2.1.329 drops the retry gateway models need … update Claude Code." line (only on that exact release, when a Claude Code CLI stage or its escalation runs a gateway model) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-read-only` | Direct launcher: the amber "A read-only Codex stage can't run in a sandboxed mission yet." line (only when a read-only CLI stage runs on Codex in a sandboxed or readonly mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-commit` | Direct launcher: the amber "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push." line (only when an Action-role CLI stage runs on Codex outside a sandboxed mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-trust` | Direct launcher: the amber "Codex will ignore this repo's .codex/ settings and MCP servers" line and how to trust the project (only when a Codex CLI stage would skip a `.codex/` dir in an untrusted project) | `PipelineSetup.tsx` |
@@ -86,6 +87,8 @@ Current anchors:
 | `direct-launcher-model-retirement` | Direct launcher, under the foot: "Sonnet 4.5 retires Nov 30, so a stage on it will fail from then on." with "Switch to Sonnet 5.5" (only while a stage, launcher pick or escalation of the selected crew uses a model within 30 days of its retirement, or past it) | `direct/RetiringModelLine.tsx` via `PipelineSetup.tsx` |
 | `direct-launcher-low-disk` | Direct launcher: the amber "Only 1.4 GB free" line above Begin (only under 2 GB free) | `PipelineSetup.tsx` |
 | `direct-halt-cause` | Direct run bar, on a halted stage: the role and its cause ("Tester Bash `npm test` gave no result for 11 minutes") | `RunControlBar.tsx` |
+| `direct-gate-document` · `direct-gate-comment-compose` · `direct-gate-comments` | Direct focus pane, only on a stage parked at its gate with a text artifact: the artifact as a commentable document · the comment composer (only after **Comment** was used on a selected or keyboard-marked passage) · the "your comments · N" list (only with comments) | `comments/CommentableDocument.tsx` via `StageFocus.tsx` |
+| `direct-gate-comment-count` | Direct run bar, at a gate with comments: "Plan: 2 comments go with your decision." (or, with no stage left to take them, "Plan: 2 comments. No stage follows to take them: …") | `RunControlBar.tsx` |
 | `direct-halt-rerun-feedback` | Direct run bar, on a halted stage whose primary action is Re-run: "Re-run with feedback" | `RunControlBar.tsx` |
 | `direct-stage-ran-on` | Direct run track, on a stage card's meta line: the amber "ran on sonnet-5-5" note (only when Claude Code ran the stage on another model than it asked for) | `RunFlow.tsx` |
 | `direct-stage-refused` · `direct-focus-refused` | Direct run track, on a finished stage card's live line · the focus pane's header beside the tokens: the amber "2 tool calls refused" (only when Claude Code refused calls in the stage's last attempt) | `RunFlow.tsx` · `StageFocus.tsx` |
@@ -106,6 +109,12 @@ Current anchors:
 | `run-pane-waiting` | Run canvas: the first pane's caption suffix "· waiting on permission" / "· waiting on your input" (only while Claude Code's hooks say that session waits on you) | `run/PaneWaiting.tsx` via `run/RunPanes.tsx` |
 | `talk-seat-toggle` | Talk canvas: the `SquareTerminal` icon that opens or closes the terminal seat beside the conversation | `chat/TalkSeat.tsx` |
 | `talk-seat-leave` | Talk canvas, while the terminal seat is open: the minus on its caption, "Leave the view · the session keeps running" | `chat/TalkSeat.tsx` |
+| `talk-turn-actions` · `talk-turn-rewind` · `talk-turn-fork` | Talk, on a message you sent (revealed on hover or focus, and while a tour points at it): its row of actions · "Rewind files to here" (only when that turn took a checkpoint) · "Fork from here" | `chat/ChatCanvas.tsx` |
+| `talk-rewind-dialog` · `talk-rewind-outside` · `talk-rewind-confirm` | Talk rewind confirm, while open: the dialog · the amber "changed outside this conversation" line (only when such a file is listed) · "Rewind the files" | `chat/RewindDialog.tsx` |
+| `talk-rewind-untouched` · `talk-rewind-storage` · `talk-rewind-undo` | Talk rewind confirm, while open: the list of paths left untouched (only when there is one) · the line saying where checkpoints are stored · "Undo the rewind" (only after a rewind stopped part-way) | `chat/RewindDialog.tsx` |
+| `talk-turn-no-checkpoint` | Talk, on a message you sent whose checkpoint was skipped (in its hover/focus action row): the "This turn has no checkpoint" mark | `chat/ChatCanvas.tsx` |
+| `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
+| `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
 | `run-switcher-waiting` | ⌘⌥K switcher (or Open beside), while open: the first row's "· waiting on permission" / "· waiting on your input" (only while a listed session waits) | `run/SessionSwitcher.tsx` |
@@ -113,6 +122,7 @@ Current anchors:
 | `run-spawn-failed` · `run-spawn-retry` | Run canvas, only when a session didn't start: the rouge eyebrow · "Try the shell again" | `TerminalPane.tsx` |
 | `mission-setup-script` · `mission-setup-template` | New-mission wizard step 3: the setup-script field · the line saying it becomes the project's setup script | `MissionCreator.tsx` |
 | `mission-setup-conductor` | New-mission wizard step 3: "From .conductor/settings.toml · edit before it runs" (only while the field holds a Conductor repo's setup script exactly as read) | `MissionCreator.tsx` |
+| `mission-share` · `mission-share-install` · `mission-share-sandbox` | New-mission wizard step 3: the "Share with new missions" list (only when the main checkout has a dependency folder or env file to share) · its amber "This setup script runs…" line (only while a dependency folder is on and the setup script installs or cleans) · its amber "A sandboxed mission gets neither the links nor the env files" line (only while an entry is on and Execution is Local sandbox) | `MissionCreator.tsx` |
 | `routines-run-now-phase` | Settings › Routines, only while Run now is in flight: the row's phase line ("running the setup script…") | `settings/RoutinesPane.tsx` |
 | `routines-login-expiry` · `mission-control-login-expiry` | Settings › Routines (above the list) · Mission Control header: the claude.ai sign-in note (only within 10 days of its end, or after it) | `ClaudeLoginNote.tsx` via `settings/RoutinesPane.tsx` · `MissionControl.tsx` |
 | `routines-model-retirement` | Settings › Routines: the first row's "Sonnet 4.5 retires Nov 30, so this routine will fail from then on." (only while a Routine's crew uses a model within 30 days of its retirement, or past it) | `settings/RoutinesPane.tsx` |
@@ -131,19 +141,26 @@ Current anchors:
 | `review-accept-all` | Review: "Accept all", the toolbar's one brass action (diff view, with changes) | `ReviewCanvas.tsx` |
 | `review-toolbar-more` | Review: "More view options" (only while the canvas toolbar is ≤ 600px wide; hidden at 1280×800) | `ReviewCanvas.tsx` |
 | `review-editor` | Review, Editor view: the code editor pane (tabs excluded, status bar included) | `EditorPane.tsx` |
+| `review-editor-ask-talk` | Review, Editor view, status bar: "Ask Talk about this" (only while text is selected) | `EditorStatusBar.tsx` |
 | `review-sidebar` | Review: the Changes/Files navigator (expanded, or its icon strip) | `ReviewSidebar.tsx` |
 | `review-diff-hunk` | Review diff: one hunk (its rail and highlighted lines; the first on screen) | `review/FileDiffSection.tsx` |
+| `review-hunk-comment` · `review-comment-composer` · `review-comment-add` | Review diff, working tree only: a hunk rail's "Ask for a change" icon (the first on screen) · the inline comment field under a hunk · its "Ask for this change" (both only while one is open) | `review/HunkRail.tsx` · `review/HunkComments.tsx` |
+| `review-comment-pick-keys` | Review diff, in the open "Ask for a change" field's header: "⌥↑ ⌥↓ lines · ⇧ extends" | `review/HunkComments.tsx` |
+| `review-companion-comments` · `review-companion-send-comments` | Review Companion, only while a comment is waiting: the "For the agent" tray · its "Send to the agent" | `review/CommentTray.tsx` |
+| `review-companion-gate-comments` | Review Companion tray, beside "as send-back to Implementer": ", with 2 comments on Reviewer" (only while the waiting gate has inline comments) | `review/CommentTray.tsx` |
 | `review-file-viewed` · `review-file-changed` | Review diff, file header: "mark viewed" / "✓ viewed" · the "changed since viewed" chip (only after a viewed file changed) | `review/FileDiffSection.tsx` |
 | `review-open-pr` | Review: "Open a pull request" (published branch, no PR yet, `gh` signed in) | `ChangesPanel.tsx` |
 | `pr-composer-create` | PR composer: "Open the pull request" | `PrComposer.tsx` |
 | `pr-composer-draft-note` | PR composer, once a draft answered: the note under the form ("Drafted by claude-sonnet-5-5 · $0.02") | `PrComposer.tsx` |
 | `settings-nav-<tab>` | Settings nav item, for `general` `editor` `models` `routines` `appearance` `usage` `shortcuts` `privacy` `integrations` `account` `about` | `Settings.tsx` |
+| `settings-shortcuts-modes` | Settings › Shortcuts, Navigation: the first mode row ("Run mode" `⌘⇧1`) | `settings/ShortcutsPane.tsx` |
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
+| `settings-readiness-claude-note` | Settings › General, Readiness card: the Claude Code row's sage "Recommended: Claude Code 2.1.330 fixes ExitWorktree…" note (only below 2.1.330, while a Run-mode session runs Claude Code) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-models` | Settings › General, Readiness card: the Crew models row (only while a saved crew or Routine uses a model within 30 days of its retirement, or past it) | `settings/ReadinessCard.tsx` |
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
 | `settings-account-sync-library-unsent` | Settings › Account › Sync: the amber line under the library toggle naming the items the sync service refused (only while library sync is on and an item is unsent) | `settings/AccountPane.tsx` |

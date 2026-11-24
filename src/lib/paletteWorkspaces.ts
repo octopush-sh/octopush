@@ -80,11 +80,16 @@ const ms = (iso: string | null | undefined): number => {
   return Number.isNaN(t) ? 0 : t;
 };
 
+/** Natural order for names: "rollout-3" before "rollout-10" and "rollout-17"
+ *  (#967), case-insensitive. */
+const byName = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
+
 /**
  * Every non-archived workspace across the open projects, in the order the
  * palette lists them: workspaces whose crew needs you first (longest waiting
  * first, like the fleet beacon), then running ones, then the rest by most
- * recent activity. Pure, so the order is testable on its own.
+ * recent activity, ties by name in natural order. Pure, so the order is
+ * testable on its own.
  */
 export function paletteWorkspaces(
   projects: ProjectLike[] | undefined,
@@ -132,7 +137,7 @@ export function paletteWorkspaces(
       tier(a) - tier(b) ||
       (a.needsYou ? a.waitingSince - b.waitingSince : 0) ||
       b.lastActive - a.lastActive ||
-      a.name.localeCompare(b.name),
+      byName.compare(a.name, b.name),
   );
   return rows.map(({ waitingSince: _w, lastActive: _l, ...r }) => r);
 }

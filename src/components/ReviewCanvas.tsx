@@ -70,6 +70,9 @@ interface Props {
   /** The diff on screen: the working tree's, or the committed one when
    *  `source` is "committed". */
   gitDiff: string;
+  /** The workspace the working diff was fetched for (null while none is),
+   *  so an open comment draft is not read against another workspace's diff. */
+  diffWorkspaceId?: string | null;
   /** Which change the diff shows (#851). "committed" is read-only. */
   source?: ReviewSource;
   /** Commits since the base; the source toggle shows only when > 0. */
@@ -106,6 +109,7 @@ export function ReviewCanvas({
   workspacePath,
   gitStatus,
   gitDiff,
+  diffWorkspaceId,
   source = "working",
   commitsAhead = 0,
   base = null,
@@ -717,6 +721,8 @@ export function ReviewCanvas({
             active={active}
             files={diffFiles}
             workspacePath={workspacePath}
+            workspaceId={workspaceId}
+            diffWorkspaceId={diffWorkspaceId}
             readOnly={readOnly}
             // The committed side matches the disk only while the tree is clean.
             diskContext={!readOnly || workingCount === 0}

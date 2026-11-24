@@ -19,6 +19,10 @@ import { Stepper } from "./controls/Stepper";
 import { SegmentedControl } from "./controls/SegmentedControl";
 import { ModelPicker } from "./ModelPicker";
 import { ModalShell } from "./ModalShell";
+import { CommentableDocument } from "./comments/CommentableDocument";
+import { useGateComments, useGateCommentsStore } from "../stores/gateCommentsStore";
+import { tourId } from "../lib/tour/ids";
+import { gateKey } from "../lib/gateComments";
 
 const EMPTY_ENTRIES: LiveEntry[] = [];
 
@@ -104,6 +108,9 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   const [viewedAttempt, setViewedAttempt] = useState<number | null>(null);
   const liveEntries = useRunsStore((s) => s.liveByStage[stage?.id ?? ""] ?? EMPTY_ENTRIES);
   const liveContext = useRunsStore((s) => s.liveContextByStage?.[stage?.id ?? ""]);
+  const gateComments = useGateComments(stage ? gateKey(stage) : null);
+  const addGateComment = useGateCommentsStore((s) => s.add);
+  const removeGateComment = useGateCommentsStore((s) => s.remove);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   // ── Director controls: gate toggle, edit-stage modal, re-run confirm ──
@@ -285,6 +292,13 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
   // (the abort never rewrites the stage row) — the pane shows the abort, not
   // the gate's "Waiting for you" (#844).
   const runAborted = run?.status === "aborted";
+  // A gate holding a finished stage's text (#957): the director can comment
+  // on the passages; the decision bar sends the comments with the decision.
+  const commentable =
+    controllable &&
+    viewedAttempt === null &&
+    stage.status === "awaiting_checkpoint" &&
+    !!artifact?.text.trim();
   const stageCutByAbort =
     runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
   const playerLive = !runAborted && (stage?.status === "running" || stage?.status === "awaiting_checkpoint");
@@ -420,7 +434,8 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
                 ↑{fmtTokens(stage.inputTokens)} ↓{fmtTokens(stage.outputTokens)}
               </span>
             )}
-            <span className="octo-tabular text-xs text-octo-brass">{formatUsd(stage.costUsd)}</span>
+            {/* A cost is data, never brass: the role eyebrow keeps the accent (#1017). */}
+            <span className="octo-tabular text-xs text-octo-ivory">{formatUsd(stage.costUsd)}</span>
           </span>
         </div>
         <div className="truncate font-serif text-[15px] text-octo-ivory" title={stageTitle(stage)}>
@@ -539,8 +554,22 @@ export function StageFocus({ stage, workspacePath, run = null, runBlocked = fals
             </>
           ) : mode === "artifact" ? (
             <>
-              <div className="whitespace-pre-wrap">
-                {artifact!.text || "(no output text)"}
+              <div className={commentable ? undefined : "whitespace-pre-wrap"}>
+                {commentable ? (
+                  <CommentableDocument
+                    text={artifact!.text}
+                    comments={gateComments}
+                    onAdd={(quote, note, at, len) => addGateComment(gateKey(stage), quote, note, at, len)}
+                    onRemove={(id) => removeGateComment(gateKey(stage), id)}
+                    tour={{
+                      document: tourId("direct-gate-document"),
+                      compose: tourId("direct-gate-comment-compose"),
+                      list: tourId("direct-gate-comments"),
+                    }}
+                  />
+                ) : (
+                  artifact!.text || "(no output text)"
+                )}
                 {artifact!.refsWorktree && (
                   snapshot != null ? (
                     <SnapshotDiff diff={snapshot} />

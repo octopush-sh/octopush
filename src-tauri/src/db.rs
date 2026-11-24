@@ -81,6 +81,21 @@ fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
     group_error(format!("Unknown item kind '{kind}'. Use 'project' or 'workspace'."))
 }
 
+/// What a mission can wait for on its prerequisite (`workspaces.after_condition`).
+pub const PREREQUISITE_CONDITIONS: [&str; 2] = ["run_finished", "pr_merged"];
+
+/// A refusal from the prerequisite ("Starts after") layer, worded for the user.
+fn prerequisite_error(message: impl Into<String>) -> crate::error::AppError {
+    crate::error::AppError::Other(message.into())
+}
+
+/// Clears every link that points at `workspace_id` (it is being deleted or
+/// archived), so no mission waits on one that is gone.
+const CLEAR_LINKS_TO_WORKSPACE_SQL: &str =
+    "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+            branch_from_prerequisite = 0, auto_start = 0
+     WHERE after_workspace_id = ?1";
+
 /// Map an UPDATE's row count to "the group exists".
 fn group_found(changed: usize) -> AppResult<()> {
     if changed == 0 {
@@ -467,6 +482,12 @@ impl Db {
         add_column_if_missing(
             &self.conn,
             "ALTER TABLE projects ADD COLUMN setup_script TEXT NOT NULL DEFAULT ''",
+        )?;
+        // What new missions borrow from the main checkout (#961): a JSON
+        // `worktree_share::ShareSpec`, '' for nothing (opt-in).
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE projects ADD COLUMN share_with_missions TEXT NOT NULL DEFAULT ''",
         )?;
         add_column_if_missing(
             &self.conn,
@@ -855,6 +876,10 @@ impl Db {
         // Codex/API stages, and (window) when the catalog doesn't list the model.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_tokens INTEGER")?;
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN context_window INTEGER")?;
+        // #1025: the context reading a Resume (or an answered block) found on
+        // the stage before its reset forgot it — a resumed Claude run whose
+        // first reply reads far less came back on an empty conversation.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_context_tokens INTEGER")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -1272,6 +1297,22 @@ impl Db {
         )?;
         add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN group_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN group_id TEXT")?;
+
+        // ── Starts after (#960): a mission that waits on another mission of
+        // the same project. `after_workspace_id` names the prerequisite (no
+        // foreign key: deleting or archiving it clears the link in
+        // `delete_workspace` / `archive_workspace`); `after_condition` is one
+        // of `PREREQUISITE_CONDITIONS`. Both are NULL when there is no link.
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_workspace_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_condition TEXT")?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN branch_from_prerequisite INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         self.backfill_default_threads()?;
 
@@ -2503,6 +2544,30 @@ impl Db {
         Ok(())
     }
 
+    /// What the project shares with new missions (nothing when unset, or no
+    /// such project). Read leniently and sanitized.
+    pub fn get_project_share(&self, id: &str) -> AppResult<crate::worktree_share::ShareSpec> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT share_with_missions FROM projects WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(crate::worktree_share::ShareSpec::from_stored(&raw.unwrap_or_default()))
+    }
+
+    pub fn set_project_share(&self, id: &str, spec: &crate::worktree_share::ShareSpec) -> AppResult<()> {
+        let spec = spec.sanitized();
+        let raw = if spec.is_empty() { String::new() } else { serde_json::to_string(&spec).unwrap_or_default() };
+        self.conn.execute(
+            "UPDATE projects SET share_with_missions = ?1 WHERE id = ?2",
+            params![raw, id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_project(&self, id: &str, name: Option<&str>, tint: Option<&str>) -> AppResult<()> {
         if let Some(name_val) = name {
             self.conn.execute(
@@ -2912,6 +2977,134 @@ impl Db {
             tx.execute(sql, params![group_id, item_id])?;
         }
         tx.commit()?;
+        Ok(())
+    }
+
+    // ─── Prerequisites ("Starts after", #960) ─────────────────────
+
+    /// The mission `workspace_id` waits on, or None when it has no link.
+    pub fn get_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<Option<PrerequisiteRow>> {
+        let row: Option<(Option<String>, Option<String>, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (after, condition, branch_from, auto_start) =
+            row.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        Ok(match (after, condition) {
+            (Some(after_workspace_id), Some(after_condition)) => Some(PrerequisiteRow {
+                workspace_id: workspace_id.to_string(),
+                after_workspace_id,
+                after_condition,
+                branch_from_prerequisite: branch_from != 0,
+                auto_start: auto_start != 0,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Make `workspace_id` wait on `after_workspace_id` until `condition`
+    /// (one of [`PREREQUISITE_CONDITIONS`]), replacing any earlier link.
+    /// Refuses an unknown condition, a missing or archived prerequisite, one
+    /// from another project, and any link that would close a cycle (itself
+    /// included).
+    pub fn set_workspace_prerequisite(
+        &self,
+        workspace_id: &str,
+        after_workspace_id: &str,
+        condition: &str,
+        branch_from_prerequisite: bool,
+        auto_start: bool,
+    ) -> AppResult<PrerequisiteRow> {
+        if !PREREQUISITE_CONDITIONS.contains(&condition) {
+            return Err(prerequisite_error(format!(
+                "Unknown condition '{condition}'. Use one of: {}.",
+                PREREQUISITE_CONDITIONS.join(", ")
+            )));
+        }
+        // IMMEDIATE, like `set_items_group`: the checks read before the write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let lookup = |id: &str| -> AppResult<Option<(String, String)>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT project_id, status FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?)
+        };
+        let (project, _) = lookup(workspace_id)?.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        let (after_project, after_status) = lookup(after_workspace_id)?
+            .ok_or_else(|| prerequisite_error("The mission to wait on was not found."))?;
+        if after_status == "archived" {
+            return Err(prerequisite_error("A mission can't wait on an archived mission."));
+        }
+        if after_project != project {
+            return Err(prerequisite_error("A mission can only wait on a mission of its own project."));
+        }
+        // Walk the chain up from the prerequisite: reaching `workspace_id`
+        // means the new link would close a loop. `seen` stops on a loop that
+        // somehow exists already.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(after_workspace_id.to_string());
+        while let Some(id) = cursor {
+            if id == workspace_id {
+                return Err(prerequisite_error("These missions would wait on each other."));
+            }
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            cursor = self
+                .conn
+                .query_row(
+                    "SELECT after_workspace_id FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+        }
+        tx.execute(
+            "UPDATE workspaces SET after_workspace_id = ?2, after_condition = ?3,
+                    branch_from_prerequisite = ?4, auto_start = ?5
+             WHERE id = ?1",
+            params![
+                workspace_id,
+                after_workspace_id,
+                condition,
+                branch_from_prerequisite as i64,
+                auto_start as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(PrerequisiteRow {
+            workspace_id: workspace_id.to_string(),
+            after_workspace_id: after_workspace_id.to_string(),
+            after_condition: condition.to_string(),
+            branch_from_prerequisite,
+            auto_start,
+        })
+    }
+
+    /// Remove `workspace_id`'s prerequisite, if it has one.
+    pub fn clear_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+                    branch_from_prerequisite = 0, auto_start = 0
+             WHERE id = ?1",
+            params![workspace_id],
+        )?;
+        if changed == 0 {
+            return Err(prerequisite_error("Mission not found."));
+        }
         Ok(())
     }
 
@@ -3537,6 +3730,7 @@ impl Db {
         // missions must be removed explicitly or they linger as active orphans.
         self.conn
             .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -3549,6 +3743,9 @@ impl Db {
             "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
             params![id],
         )?;
+        // Missions waiting on this one stop waiting; restoring it doesn't
+        // bring the links back.
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         // Keep the paired mission in lockstep: archive its active mission(s) so
         // the writer slot frees and it stops surfacing as an active mission.
         self.conn.execute(
@@ -3735,6 +3932,124 @@ impl Db {
         self.conn.execute("DELETE FROM chat_messages WHERE thread_id = ?1", params![thread_id])?;
         self.conn.execute("DELETE FROM chat_threads WHERE id = ?1", params![thread_id])?;
         Ok(())
+    }
+
+    /// The worktree of the workspace a thread belongs to (its checkpoints
+    /// live in that repository).
+    pub fn chat_thread_worktree(&self, thread_id: &str) -> AppResult<Option<String>> {
+        let path = self
+            .conn
+            .query_row(
+                "SELECT w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(path.flatten())
+    }
+
+    /// The workspace a thread belongs to and its worktree, when it has one.
+    pub fn chat_thread_home(&self, thread_id: &str) -> AppResult<Option<(String, Option<String>)>> {
+        self.conn
+            .query_row(
+                "SELECT w.id, w.worktree_path FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+                 WHERE t.id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Every thread of every workspace checked out at the same path as
+    /// `thread_id`'s workspace (itself included): the conversations whose
+    /// turns write to the same files.
+    pub fn chat_threads_sharing_worktree(&self, thread_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t2.id FROM chat_threads t
+               JOIN workspaces w ON w.id = t.workspace_id
+               JOIN workspaces w2 ON w2.id = w.id
+                 OR (w.worktree_path IS NOT NULL AND rtrim(w2.worktree_path, '/') = rtrim(w.worktree_path, '/'))
+               JOIN chat_threads t2 ON t2.workspace_id = w2.id
+             WHERE t.id = ?1",
+        )?;
+        let rows = stmt.query_map(params![thread_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Whether a Direct run is in progress (`running` or `paused`) in a
+    /// workspace checked out at `worktree_path`.
+    pub fn has_active_run_at(&self, worktree_path: &str) -> AppResult<bool> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM runs r JOIN workspaces w ON w.id = r.workspace_id
+             WHERE r.status IN ('running', 'paused')
+               AND rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+            params![worktree_path],
+            |r| r.get(0),
+        )?;
+        Ok(n > 0)
+    }
+
+    /// The ids of a workspace's threads (their checkpoints go when the
+    /// workspace is deleted or archived).
+    pub fn chat_thread_ids(&self, workspace_id: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM chat_threads WHERE workspace_id = ?1")?;
+        let rows = stmt.query_map(params![workspace_id], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Fork from a user turn (#958): a new thread in the same workspace holding
+    /// a copy of every message BEFORE `message_id`, which must be a user turn
+    /// of `thread_id`. Returns the new thread, the turn's text (the fork's
+    /// draft) and each copied row's (old id, new id).
+    pub fn fork_chat_thread(
+        &self,
+        thread_id: &str,
+        message_id: i64,
+    ) -> AppResult<(ChatThreadRow, String, Vec<(i64, i64)>)> {
+        let (workspace_id, title): (String, String) = self
+            .conn
+            .query_row(
+                "SELECT workspace_id, title FROM chat_threads WHERE id = ?1",
+                params![thread_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("That conversation no longer exists.".into()))?;
+        let draft: String = self
+            .conn
+            .query_row(
+                "SELECT content FROM chat_messages WHERE id = ?1 AND thread_id = ?2 AND role = 'user'",
+                params![message_id, thread_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| crate::error::AppError::Other("Only a message you sent can be forked from.".into()))?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM chat_messages WHERE thread_id = ?1 AND id < ?2 ORDER BY id")?;
+        let ids: Vec<i64> = stmt
+            .query_map(params![thread_id, message_id], |r| r.get(0))?
+            .collect::<Result<Vec<i64>, rusqlite::Error>>()?;
+        drop(stmt);
+        // One transaction: a failure part-way leaves no half-copied fork.
+        let tx = self.conn.unchecked_transaction()?;
+        let thread = self.create_chat_thread(&workspace_id, &format!("{title} · fork"))?;
+        let mut pairs = Vec::with_capacity(ids.len());
+        for old in ids {
+            tx.execute(
+                "INSERT INTO chat_messages (workspace_id, thread_id, role, content, model, input_tokens,
+                    output_tokens, cost_usd, created_at, cache_read_tokens, cache_creation_tokens, context_tokens)
+                 SELECT workspace_id, ?1, role, content, model, input_tokens, output_tokens, cost_usd,
+                    created_at, cache_read_tokens, cache_creation_tokens, context_tokens
+                 FROM chat_messages WHERE id = ?2",
+                params![thread.id, old],
+            )?;
+            pairs.push((old, tx.last_insert_rowid()));
+        }
+        tx.commit()?;
+        Ok((thread, draft, pairs))
     }
 
     /// Delete a message and everything after it in a thread (ids are monotonic
@@ -7334,6 +7649,30 @@ impl Db {
             .and_then(|v| serde_json::from_value(v.get("usage")?.clone()).ok()))
     }
 
+    /// Keep the stage's current context reading for its resumed run (read
+    /// back by [`Self::get_stage_resume_context`]); called before the reset
+    /// that clears `context_tokens`. NULL when it has none.
+    pub fn keep_stage_resume_context(&self, stage_id: &str) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET resume_context_tokens = context_tokens WHERE id = ?1",
+            params![stage_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_resume_context(&self, stage_id: &str) -> AppResult<Option<u64>> {
+        let tokens: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT resume_context_tokens FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        Ok(tokens.and_then(|t| u64::try_from(t).ok()))
+    }
+
     pub fn get_stage_resume_prior_cost(&self, stage_id: &str) -> AppResult<f64> {
         self.conn
             .query_row(
@@ -7558,6 +7897,21 @@ pub struct GroupRow {
     /// groups, the same project). Ascending; not necessarily dense.
     pub sort_order: i64,
     pub created_at: String,
+}
+
+/// A mission's prerequisite ("Starts after", #960): `workspace_id` waits on
+/// `after_workspace_id`, a mission of the same project.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrerequisiteRow {
+    pub workspace_id: String,
+    pub after_workspace_id: String,
+    /// One of [`PREREQUISITE_CONDITIONS`].
+    pub after_condition: String,
+    /// Branch the waiting mission from the prerequisite's branch, not the base.
+    pub branch_from_prerequisite: bool,
+    /// Start the waiting mission's run on its own once the condition holds.
+    pub auto_start: bool,
 }
 
 /// One queued Claude Code hook signal (`hook_signals`).

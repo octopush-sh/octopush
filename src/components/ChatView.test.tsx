@@ -11,7 +11,7 @@
  * specific DOM content.
  */
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, act, fireEvent } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
 type EventHandler = (ev: { payload: unknown }) => void;
@@ -37,6 +37,8 @@ vi.mock("../lib/ipc", () => ({
     currentSpend: vi.fn().mockResolvedValue({ costUsd: 0, tokens: 0 }),
     listWorkspaceFiles: vi.fn().mockResolvedValue([]),
     readFileChecked: vi.fn().mockResolvedValue({ kind: "text", content: "", size: 0, mtime: 0 }),
+    getGitDiff: vi.fn().mockResolvedValue(""),
+    getStagedDiff: vi.fn().mockResolvedValue(""),
     cancelChat: vi.fn().mockResolvedValue(undefined),
     listChatThreads: vi.fn().mockResolvedValue([
       { id: "t1", workspaceId: "ws-1", title: "Conversation", createdAt: "2026-05-17T09:00:00Z", updatedAt: "2026-05-17T09:00:00Z" },
@@ -70,6 +72,7 @@ function resetStore() {
     activeThreadByWs: {},
     streamingThreadByWs: {},
     attachmentsByWs: {},
+    composerSeedByWs: {},
   });
   useBudgetsStore.setState({
     budgets: [],
@@ -624,6 +627,32 @@ describe("ChatView — arrow-key prompt history", () => {
     expect(ta.value).toBe("");
   });
 
+  it("takes a fork's seeded draft into the textarea, once (#958)", async () => {
+    useChatStore.setState({ composerSeedByWs: { "ws-1": "Make it stream" } });
+    const { unmount } = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    expect(getTextarea().value).toBe("Make it stream");
+    expect(useChatStore.getState().composerSeedByWs["ws-1"]).toBeNull();
+    // Opened again, the composer doesn't put it back.
+    unmount();
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    expect(getTextarea().value).toBe("");
+  });
+
+  it("puts a fork's seed after a half-typed message instead of replacing it (#958)", async () => {
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    await act(async () => { await Promise.resolve(); });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "half a thought " } });
+    await act(async () => {
+      useChatStore.setState({ composerSeedByWs: { "ws-1": "Make it stream" } });
+      await Promise.resolve();
+    });
+    expect(getTextarea().value).toBe("half a thought\n\nMake it stream");
+    expect(useChatStore.getState().composerSeedByWs["ws-1"]).toBeNull();
+  });
+
   it("Escape while navigating clears input and exits history mode", async () => {
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     await act(async () => { await Promise.resolve(); });
@@ -773,5 +802,96 @@ describe("ChatView — /skill menu and inline highlight", () => {
     expect("skill" in req).toBe(false);
     expect(ta.value).toBe("");
     expect(screen.queryByTestId("skill-highlight")).toBeNull();
+  });
+});
+
+describe("ChatView — context mentions (#962)", () => {
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(["src/a.ts", "src/lib/b.ts"]);
+    vi.mocked(ipcMock.readFileChecked).mockResolvedValue({
+      kind: "text", content: "1\n2\n3\n4\n5", size: 9, mtime: 0,
+    });
+  });
+
+  function getTextarea() {
+    return screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+  }
+
+  it("shows a removable chip with its token estimate for a line range, and removing it edits the draft", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "why @src/a.ts#L2-3 fails" } });
+    const chip = await screen.findByText("a.ts#L2-3");
+    await waitFor(() =>
+      expect(chip.closest("[data-tour='talk-context-chip']")?.getAttribute("title")).toMatch(/≈ \d+ tokens/),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove @src/a.ts#L2-3" }));
+    expect(ta.value).toBe("why fails");
+    expect(screen.queryByText("a.ts#L2-3")).toBeNull();
+  });
+
+  it("sends only the range's lines", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    await act(async () => {
+      fireEvent.change(ta, { target: { value: "explain @src/a.ts#L2-3" } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toBe("explain @src/a.ts#L2-3\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```");
+  });
+
+  it("estimates @diff again in the next draft once the diff changed", async () => {
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n+a\n");
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    const chipTitle = () =>
+      document.querySelector("[data-tour='talk-context-chip']")?.getAttribute("title") ?? "";
+    fireEvent.change(ta, { target: { value: "review @diff today" } });
+    await waitFor(() => expect(chipTitle()).toMatch(/≈ \d+ tokens$/));
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue(`diff --git a/src/a.ts b/src/a.ts\n+${"x".repeat(8000)}\n`);
+    fireEvent.change(ta, { target: { value: "and @diff again" } });
+    await waitFor(() => expect(chipTitle()).toMatch(/≈ 2k tokens$/));
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue("");
+  });
+
+  it("appends a range handed over from Review to the draft", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "look at" } });
+    act(() => useChatStore.getState().queueDraftInsert("ws-1", "@src/a.ts#L4-5 "));
+    expect(ta.value).toBe("look at @src/a.ts#L4-5 ");
+    expect(useChatStore.getState().draftInsertByWs["ws-1"]).toBeUndefined();
+    expect(await screen.findByText("a.ts#L4-5")).toBeInTheDocument();
+  });
+
+  it("offers folders and the diff in the @ popover, and closes it while a range is typed", async () => {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = getTextarea();
+    fireEvent.change(ta, { target: { value: "@", selectionStart: 1, selectionEnd: 1 } });
+    const list = await screen.findByRole("listbox", { name: "Worktree files" });
+    expect(list.textContent).toContain("Add context");
+    expect(list.textContent).toContain("diff");
+    expect(list.textContent).toContain("src/");
+    fireEvent.change(ta, { target: { value: "@src/a.ts#L1", selectionStart: 12, selectionEnd: 12 } });
+    expect(screen.queryByRole("listbox", { name: "Worktree files" })).toBeNull();
   });
 });
