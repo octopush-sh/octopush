@@ -56,8 +56,11 @@ import {
   DRAGGED_BLOCK,
   type RailTopData,
 } from "../lib/railDnd";
+import { useShallow } from "zustand/react/shallow";
+import { archivableMerge, missionState, runStatesByWs, type MissionState } from "../lib/railState";
 import {
   filterRailItems,
+  filterRailMissions,
   layoutMissions,
   layoutProjects,
   missionGroupOwners,
@@ -82,10 +85,12 @@ import { useGroupsStore } from "../stores/groupsStore";
 import { useMissionsStore } from "../stores/missionsStore";
 import { useRailGroupUi } from "../stores/railGroupUiStore";
 import { useRailSelection } from "../stores/railSelectionStore";
+import { useRunsStore } from "../stores/runsStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { GroupContextMenu } from "./GroupContextMenu";
 import { MoveToGroupMenu } from "./MoveToGroupMenu";
 import { RailSelectionMenu } from "./RailSelectionMenu";
+import { RailStateFilter } from "./RailStateFilter";
 import { RailMissionGroup, groupMarkColor } from "./RailMissionGroup";
 import { EYEBROW, RailProjectSection } from "./RailProjectSection";
 import { ProjectMark } from "./icons/ProjectMark";
@@ -192,6 +197,9 @@ interface Props {
    *  collapsed flyout. Computed by the owner from the same list the shortcut
    *  handler indexes, so the hint can never lie. */
   shortcutByWs?: Record<string, string>;
+  /** "Merged · archive?" on a merged, clean, idle mission's row (#963). The
+   *  action is not drawn when this is left out. */
+  onArchiveMerged?: (workspaceId: string) => void;
 }
 
 const COLLAPSE_KEY = "railProjectCollapsed";
@@ -210,6 +218,13 @@ const HIT_WASH =
   "rounded-[2px] bg-[var(--octo-match)] text-[var(--octo-match-ink)] shadow-[inset_0_0_0_1px_var(--octo-match-ring)]";
 
 type Attention = "beacon" | "dot";
+
+/** The rail's empty line under a state filter alone. */
+const STATE_EMPTY: Record<MissionState, string> = {
+  "needs-you": "No mission needs you",
+  working: "No mission is working",
+  idle: "No mission is idle",
+};
 
 /** Per-project collapsed map from localStorage. Absent id ⇒ expanded (§4.6). */
 function loadCollapsedFromStorage(): Record<string, boolean> {
@@ -353,12 +368,41 @@ export function WorkspaceRail({
   isCollapsed,
   onReorderProjects,
   shortcutByWs,
+  onArchiveMerged,
 }: Props) {
   const [collapsedProjects, setCollapsedProjects] = useState<Record<string, boolean>>(
     loadCollapsedFromStorage,
   );
   const [filter, setFilter] = useState("");
   const q = isCollapsed ? "" : filter.trim();
+  // The state filter (#963): Needs you · Working · Idle, or every mission.
+  const [statePick, setStatePick] = useState<MissionState | null>(null);
+  const stateFilter = isCollapsed ? null : statePick;
+  /** A filter of either kind holds: folds are ignored, nothing drags. */
+  const filtering = q !== "" || stateFilter !== null;
+  const runStateByWs = useRunsStore(useShallow((s) => runStatesByWs(s.runsByWs)));
+  const mergedPrByWs = useWorkspaceStore((s) => s.mergedPrByWs);
+  // Every mission's state, on the fleet chip's terms (`missionState`), and
+  // the merged PR of each one the rail offers to archive.
+  const { stateByWs, archivableByWs } = useMemo(() => {
+    const states: Record<string, MissionState> = {};
+    const archivable: Record<string, Pr> = {};
+    for (const project of projects || []) {
+      for (const ws of project?.workspaces || []) {
+        if (!ws?.id) continue;
+        const state = missionState(runStateByWs[ws.id], runningByWs?.[ws.id]);
+        states[ws.id] = state;
+        const merged = archivableMerge(ws.id, state, mergedPrByWs, prByWs, gitSummaryByWs);
+        if (merged) archivable[ws.id] = merged;
+      }
+    }
+    return { stateByWs: states, archivableByWs: archivable };
+  }, [projects, runStateByWs, runningByWs, mergedPrByWs, prByWs, gitSummaryByWs]);
+  const stateCounts = useMemo(() => {
+    const out: Record<MissionState, number> = { "needs-you": 0, working: 0, idle: 0 };
+    for (const state of Object.values(stateByWs)) out[state] += 1;
+    return out;
+  }, [stateByWs]);
   const flagsByWs = useAttentionStore((s) => s.flagsByWs);
   // Memoised: an attention ping or a git refresh replaces one map, and the
   // rail must not recompute every project's shape for it.
@@ -401,15 +445,20 @@ export function WorkspaceRail({
     restoreProjectLineFocus();
   });
   const visibleTop = useMemo<VisibleTop[]>(() => {
-    const whole = (project: ProjectGroup): VisibleProject => ({
-      project,
-      items: itemsByProject[project.id] ?? [],
-    });
+    // The state filter (#963) narrows whatever the text filter leaves; a
+    // project it leaves with no mission leaves the rail.
+    const byState = (project: ProjectGroup, items: RailItem[]): VisibleProject | null => {
+      if (stateFilter === null) return { project, items };
+      const kept = filterRailMissions(items, (w) => stateByWs[w.id] === stateFilter);
+      return kept.length > 0 ? { project, items: kept } : null;
+    };
+    const whole = (project: ProjectGroup): VisibleProject | null =>
+      byState(project, itemsByProject[project.id] ?? []);
     // A project: every item at rest or on its own name's hit, else its hits.
     const visible = (project: ProjectGroup): VisibleProject | null => {
       if (q === "" || matchRange(project.name ?? "", q)) return whole(project);
       const hits = filterRailItems(itemsByProject[project.id] ?? [], (name) => matchRange(name, q) !== null);
-      return hits.length > 0 ? { project, items: hits } : null;
+      return hits.length > 0 ? byState(project, hits) : null;
     };
     const out: VisibleTop[] = [];
     for (const item of topItems) {
@@ -421,16 +470,15 @@ export function WorkspaceRail({
       const { group, projects: members } = item;
       // A group-name hit keeps the whole group, as a project-name hit keeps
       // the whole project.
-      const entries =
-        q !== "" && matchRange(group.name, q)
-          ? members.map(whole)
-          : members.map(visible).filter((entry): entry is VisibleProject => entry !== null);
+      const entries = (q !== "" && matchRange(group.name, q) ? members.map(whole) : members.map(visible)).filter(
+        (entry): entry is VisibleProject => entry !== null,
+      );
       // At rest an empty group stays (it is a standing bucket); under a
       // filter a group with nothing to show leaves like a project does.
-      if (q === "" || entries.length > 0) out.push({ kind: "section", group, members, entries });
+      if (!filtering || entries.length > 0) out.push({ kind: "section", group, members, entries });
     }
     return out;
-  }, [topItems, itemsByProject, q]);
+  }, [topItems, itemsByProject, q, stateFilter, stateByWs, filtering]);
   // Where the beacon and the dots show when a fold hides their rows. Folds
   // are ignored while a filter holds everything open; the slim rail has no
   // project fold and no project-group fold.
@@ -440,12 +488,12 @@ export function WorkspaceRail({
         projects,
         attentionByWs,
         groupOwners,
-        (id) => !isCollapsed && q === "" && !!collapsedProjects[id],
-        (id) => q === "" && !!collapsedGroups[id],
+        (id) => !isCollapsed && !filtering && !!collapsedProjects[id],
+        (id) => !filtering && !!collapsedGroups[id],
         (projectId) => sectionOfProject.get(projectId) ?? null,
-        (id) => !isCollapsed && q === "" && !!collapsedGroups[id],
+        (id) => !isCollapsed && !filtering && !!collapsedGroups[id],
       ),
-    [projects, attentionByWs, groupOwners, isCollapsed, q, collapsedProjects, collapsedGroups, sectionOfProject],
+    [projects, attentionByWs, groupOwners, isCollapsed, filtering, collapsedProjects, collapsedGroups, sectionOfProject],
   );
 
   const toggleProjectCollapsed = useCallback((projectId: string) => {
@@ -550,8 +598,10 @@ export function WorkspaceRail({
         : item.entry.items.some((i) => i.kind === "group" && i.group.id === group.id),
     );
     if (!shown) {
-      if (filter !== "") setFilter("");
-      else ui.revealDone(group.id); // not in the rail at all (its project is closed)
+      if (filter !== "" || statePick !== null) {
+        setFilter("");
+        setStatePick(null);
+      } else ui.revealDone(group.id); // not in the rail at all (its project is closed)
       return;
     }
     const header = Array.from(
@@ -571,7 +621,7 @@ export function WorkspaceRail({
     setTimeout(() => {
       if (header.isConnected) header.scrollIntoView?.({ block: "nearest", inline: "nearest", behavior });
     }, 300);
-  }, [revealId, groups, isCollapsed, sectionOfProject, collapsedProjects, collapsedGroups, toggleProjectCollapsed, visibleTop, filter]);
+  }, [revealId, groups, isCollapsed, sectionOfProject, collapsedProjects, collapsedGroups, toggleProjectCollapsed, visibleTop, filter, statePick]);
 
   // The header menu of a group (a mission group's or a project group's),
   // owned by the rail.
@@ -608,7 +658,7 @@ export function WorkspaceRail({
   const selectionProjectId = selection?.projectId ?? null;
   const drawnSelectable = useMemo(() => {
     const out = new Set<string>();
-    if (!selectionProjectId || isCollapsed || q !== "" || collapsedProjects[selectionProjectId]) return out;
+    if (!selectionProjectId || isCollapsed || filtering || collapsedProjects[selectionProjectId]) return out;
     const section = sectionOfProject.get(selectionProjectId);
     if (section && collapsedGroups[section]) return out;
     for (const item of itemsByProject[selectionProjectId] ?? []) {
@@ -616,7 +666,7 @@ export function WorkspaceRail({
       else if (!collapsedGroups[item.group.id]) for (const w of item.members) out.add(w.id);
     }
     return out;
-  }, [selectionProjectId, isCollapsed, q, collapsedProjects, sectionOfProject, collapsedGroups, itemsByProject]);
+  }, [selectionProjectId, isCollapsed, filtering, collapsedProjects, sectionOfProject, collapsedGroups, itemsByProject]);
   useEffect(() => {
     useRailSelection.getState().retain(drawnSelectable);
   }, [drawnSelectable]);
@@ -630,7 +680,7 @@ export function WorkspaceRail({
   // selection goes rather than act on rows out of sight.
   useEffect(() => {
     useRailSelection.getState().clear();
-  }, [q, isCollapsed]);
+  }, [q, stateFilter, isCollapsed]);
   // Escape lets a selection go, unless something else is listening for it:
   // only a key pressed in the rail itself, or with the focus nowhere (a menu,
   // a dialog, an editor or a terminal keeps its Escape).
@@ -752,9 +802,9 @@ export function WorkspaceRail({
   );
   // Projects and project groups drag whenever the list is whole and the owner
   // persists the order.
-  const dragEnabled = !isCollapsed && q === "" && !!onReorderProjects;
+  const dragEnabled = !isCollapsed && !filtering && !!onReorderProjects;
   // Missions and group headers drag whenever the list is whole (no filter).
-  const groupDragEnabled = !isCollapsed && q === "";
+  const groupDragEnabled = !isCollapsed && !filtering;
   const [dragging, setDragging] = useState<RailDragSubject | null>(null);
   // How far the list could scroll when the drag began. A project or a group
   // is dragged by a transform, and a transformed block that travels past the
@@ -869,7 +919,10 @@ export function WorkspaceRail({
         onGroupContextMenu={openGroupMenu}
         onNewWorkspaceInGroup={onNewWorkspaceInGroup}
         q={q}
-        folded={q === "" && !!collapsedProjects[project.id]}
+        filtering={filtering}
+        archivableByWs={archivableByWs}
+        onArchiveMerged={onArchiveMerged}
+        folded={!filtering && !!collapsedProjects[project.id]}
         toggleProjectCollapsed={toggleProjectCollapsed}
         activeWorkspaceId={activeWorkspaceId}
         gitSummaryByWs={gitSummaryByWs}
@@ -944,6 +997,7 @@ export function WorkspaceRail({
                 className="min-w-0 flex-1 bg-transparent text-[13px] text-octo-ivory outline-none placeholder:font-serif placeholder:text-octo-mute"
               />
             </label>
+            <RailStateFilter value={statePick} counts={stateCounts} onChange={setStatePick} />
             {onAddProject && (
               <button
                 type="button"
@@ -988,7 +1042,7 @@ export function WorkspaceRail({
                     return renderProject(item.entry, lead, null);
                   }
                   const { group, members, entries } = item;
-                  const sectionFolded = q === "" && !!collapsedGroups[group.id];
+                  const sectionFolded = !filtering && !!collapsedGroups[group.id];
                   return (
                     <RailProjectSection
                       key={`section-${group.id}`}
@@ -1002,7 +1056,7 @@ export function WorkspaceRail({
                             : "after-project"
                       }
                       folded={sectionFolded}
-                      canFold={q === ""}
+                      canFold={!filtering}
                       q={q}
                       holdsActive={members.some((p) => p.workspaces.some((w) => w?.id === activeWorkspaceId))}
                       attention={sectionFolded ? (carriers.bySection[group.id] ?? null) : null}
@@ -1041,9 +1095,9 @@ export function WorkspaceRail({
                 </DragOverlay>
               )}
             </DndContext>
-            {q !== "" && visibleTop.length === 0 && (
+            {filtering && visibleTop.length === 0 && (
               <div className="octo-fade-in px-3.5 py-4 font-serif text-[13px] text-octo-mute">
-                Nothing matches
+                {q === "" && stateFilter ? STATE_EMPTY[stateFilter] : "Nothing matches"}
               </div>
             )}
           </div>
@@ -1345,6 +1399,11 @@ interface SortableProjectGroupProps {
   onGroupContextMenu: (groupId: string, x: number, y: number, fromKeyboard?: boolean) => void;
   onNewWorkspaceInGroup?: (projectId: string, groupId: string) => void;
   q: string;
+  /** A text or state filter holds: folds are ignored. */
+  filtering: boolean;
+  /** The merged PR of each mission whose row offers "Merged · archive?". */
+  archivableByWs: Record<string, Pr>;
+  onArchiveMerged?: (workspaceId: string) => void;
   folded: boolean;
   toggleProjectCollapsed: (projectId: string) => void;
   activeWorkspaceId: string | null;
@@ -1377,7 +1436,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
     project, items, lead, sectionId, sectionTint, hidden, dropCue,
     collapsedGroups, attention, groupAttention, groupDragEnabled, dragging,
     onGroupContextMenu, onNewWorkspaceInGroup,
-    q, folded, toggleProjectCollapsed, activeWorkspaceId,
+    q, filtering, archivableByWs, onArchiveMerged, folded, toggleProjectCollapsed, activeWorkspaceId,
     gitSummaryByWs, prByWs, runningByWs, attentionByWs, flagsByWs, shortcutByWs,
     onSelect, onCustomize, onContextMenu, onNewWorkspaceForProject, onProjectContextMenu,
     dragEnabled, selectedIds, onRowPick,
@@ -1412,7 +1471,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
   const orderedIds = items.flatMap((item) =>
     item.kind === "mission"
       ? [item.workspace.id]
-      : q === "" && collapsedGroups[item.group.id]
+      : !filtering && collapsedGroups[item.group.id]
         ? []
         : item.visible.map((w) => w.id),
   );
@@ -1436,6 +1495,8 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
       ahead={gitSummaryByWs?.[ws?.id ?? ""]?.ahead}
       behind={gitSummaryByWs?.[ws?.id ?? ""]?.behind}
       hasOpenPr={!!prByWs?.[ws?.id ?? ""]}
+      mergedPr={archivableByWs[ws?.id ?? ""] ?? null}
+      onArchiveMerged={onArchiveMerged && ws?.id ? () => onArchiveMerged(ws.id) : undefined}
       running={!!runningByWs?.[ws?.id ?? ""]}
       attention={attentionByWs[ws?.id ?? ""] ?? null}
       attentionKind={flagsByWs?.[ws?.id ?? ""]?.kind ?? null}
@@ -1448,7 +1509,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
 
   // A live filter forces every project open, so folding is not offered while
   // one is typed: the stored fold state is left exactly as it was.
-  const canFold = q === "";
+  const canFold = !filtering;
   const lineRef = useRef<HTMLButtonElement | null>(null);
   const hasActive = workspaces.some((w) => w?.id === activeWorkspaceId);
   const dirtyCount = workspaces.filter((w) => gitSummaryByWs?.[w?.id ?? ""]?.dirty).length;
@@ -1645,7 +1706,7 @@ function SortableProjectGroup(props: SortableProjectGroupProps) {
             {items.map((item) => {
               if (item.kind === "mission") return renderRow(item.workspace, null);
               const { group, members, visible } = item;
-              const groupFolded = q === "" && !!collapsedGroups[group.id];
+              const groupFolded = !filtering && !!collapsedGroups[group.id];
               return (
                 <RailMissionGroup
                   key={`group-${group.id}`}
@@ -1791,6 +1852,10 @@ interface WorkspaceRowProps {
   ahead?: number;
   behind?: number;
   hasOpenPr?: boolean;
+  /** Its PR is merged, its worktree clean and it is idle (`archivableMerge`):
+   *  the meta offers "merged · archive?". */
+  mergedPr?: Pr | null;
+  onArchiveMerged?: () => void;
   /** Workspace is actively processing — the identity edge marches. */
   running?: boolean;
   attention: Attention | null;
@@ -1820,6 +1885,8 @@ function WorkspaceRow({
   ahead,
   behind,
   hasOpenPr,
+  mergedPr = null,
+  onArchiveMerged,
   running,
   attention,
   attentionKind,
@@ -1843,6 +1910,10 @@ function WorkspaceRow({
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
   const collisions = useWorkspaceCollisions(workspace?.id);
+  // An archive of this mission is under way: "merged · archive?" waits.
+  const archiving = useWorkspaceStore((s) => !!s.archivingIds[workspace?.id ?? ""]);
+  // Local files (Claude Code's saved choices among them) are confirmed first.
+  const hasLocalFiles = useWorkspaceStore((s) => (s.localFilesByWs[workspace?.id ?? ""]?.length ?? 0) > 0);
   // Pointer-only: the row is no extra tab stop. In this rail the keyboard
   // moves a mission with ⌘⌥G, or with ⇧F10 into its menu ("Move to group");
   // a slim rail's cell answers neither yet (#918).
@@ -2054,6 +2125,28 @@ function WorkspaceRow({
             title="Needs your attention"
             className="octo-pop-in h-[5px] w-[5px] rounded-full bg-octo-brass"
           />
+        )}
+        {/* #963: offered, never done by itself. Archiving keeps the branch,
+            and the toast that follows can undo it. */}
+        {mergedPr && onArchiveMerged && (
+          <button
+            type="button"
+            data-tour="rail-merged-archive"
+            disabled={archiving}
+            onClick={(e) => {
+              e.stopPropagation();
+              onArchiveMerged();
+            }}
+            title={`PR #${mergedPr.number} is merged and the worktree is clean. Archive ${name}; the branch is kept.${
+              hasLocalFiles
+                ? " Its local files go too and Undo doesn't bring them back, so they are listed first."
+                : " Undo brings it back whole: it holds no local files and no saved Claude Code choices."
+            }`}
+            aria-label={`Merged — archive ${name}`}
+            className="octo-pop-in rounded px-0.5 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:pointer-events-none disabled:opacity-50"
+          >
+            merged · archive?
+          </button>
         )}
       </div>
     </div>

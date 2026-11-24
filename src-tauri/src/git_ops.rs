@@ -427,6 +427,101 @@ pub fn is_dirty(path: &Path) -> AppResult<bool> {
     Ok(!statuses.is_empty())
 }
 
+/// Folders the project's own tooling rebuilds (dependencies, build output,
+/// caches): an ignored path inside one is not the user's work.
+const REBUILDABLE_DIRS: &[&str] = &[
+    "node_modules", ".venv", "venv", "dist", "build", "target", ".next", ".cache", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".turbo", ".parcel-cache", ".gradle",
+];
+
+/// Whether an ignored path (libgit2 lists an ignored folder once, as `dir/`)
+/// is rebuildable: inside or named like a `REBUILDABLE_DIRS` folder, or
+/// Finder's `.DS_Store`. Pure.
+pub fn is_rebuildable_ignored(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path.rsplit('/').next() == Some(".DS_Store") || path.split('/').any(|part| REBUILDABLE_DIRS.contains(&part))
+}
+
+/// Whether `rel` is the Claude Code settings file Octopush writes into its
+/// worktrees (`claude_hooks::EXCLUDE_LINE`) and it holds nothing but
+/// Octopush's own hooks, which restore writes again. Anything more in it
+/// (Claude Code's "don't ask again" choices, say) makes it a local file, and
+/// so does a file that can't be read or parsed.
+pub fn is_hooks_only_settings(root: &Path, rel: &str) -> bool {
+    if rel != crate::claude_hooks::EXCLUDE_LINE.trim_start_matches('/') {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(rel)) else { return false };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    crate::agent_adapter::strip_claude_hooks(value).as_object().is_some_and(|o| o.is_empty())
+}
+
+/// The git-ignored paths in the worktree at `path` that archiving would
+/// delete for good (a local env file, a local database): everything ignored
+/// but `is_rebuildable_ignored` and `is_hooks_only_settings`. An ignored
+/// folder counts once, as `dir/`, and only while it holds such a file
+/// (`folder_holds_local_files`). Untracked folders are examined too: one
+/// holding only ignored files (say `db/dev.sqlite` under `*.sqlite`) is
+/// listed as `db/`, where skipping untracked folders would miss it. So a
+/// `.claude/` folder holding nothing but Octopush's hooks is not listed, nor
+/// is an empty folder (libgit2 reports both as ignored).
+pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
+    let repo = open_repo(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("git status: {e}")))?;
+    Ok(statuses
+        .iter()
+        .filter(|e| e.status().is_ignored())
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| !is_rebuildable_ignored(p) && !is_hooks_only_settings(path, p))
+        .filter(|p| !p.ends_with('/') || folder_holds_local_files(path, p))
+        .collect())
+}
+
+/// Entries `folder_holds_local_files` looks at before it gives up and says
+/// the folder holds local files.
+pub const LOCAL_FILES_WALK_CAP: usize = 2_000;
+
+/// Whether the folder `rel` of the worktree at `root` holds a file, at any
+/// depth, that is neither `is_rebuildable_ignored` nor
+/// `is_hooks_only_settings`. Stops at the first one. Dependency and build
+/// folders inside are skipped whole, not walked; a folder it can't read, or
+/// with more than `LOCAL_FILES_WALK_CAP` other entries, counts as holding
+/// one. Symlinks are not followed (they count as files).
+fn folder_holds_local_files(root: &Path, rel: &str) -> bool {
+    let mut stack = vec![root.join(rel)];
+    let mut budget = LOCAL_FILES_WALK_CAP;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { return true };
+        for entry in entries {
+            let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else { return true };
+            let path = entry.path();
+            let inside = path.strip_prefix(root).ok().and_then(|p| p.to_str()).unwrap_or_default().to_string();
+            if is_rebuildable_ignored(&inside) {
+                continue;
+            }
+            if !kind.is_dir() && !is_hooks_only_settings(root, &inside) {
+                return true;
+            }
+            if budget == 0 {
+                return true;
+            }
+            budget -= 1;
+            if kind.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    false
+}
+
 /// Return (ahead, behind) commits relative to the configured upstream of
 /// HEAD. Returns None if no upstream is configured (e.g. a branch that has
 /// never been pushed) or the comparison cannot be computed.

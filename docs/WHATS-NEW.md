@@ -66,6 +66,8 @@ Current anchors:
 | `rail-group-header` · `rail-group-members` | Rail, only in a project with a mission group: the first group's header line (chevron, name; folded, its count) · its run of indented missions beside the guide (only while the group has missions) | `RailMissionGroup.tsx` via `WorkspaceRail.tsx` |
 | `rail-section-header` · `rail-section-projects` | Rail, only with a project group: the first group's header line (the caps name; folded, its count) · its run of projects (only while the group has projects) | `RailProjectSection.tsx` via `WorkspaceRail.tsx` |
 | `rail-add-project` | Rail "Add project" button | `WorkspaceRail.tsx` |
+| `rail-state-filter` | Rail search line: the state filter (Every mission · Needs you · Working · Idle) | `RailStateFilter.tsx` via `WorkspaceRail.tsx` |
+| `rail-merged-archive` | Rail row meta: "merged · archive?" (only on an idle mission whose PR is merged and worktree clean) | `WorkspaceRail.tsx` |
 | `mode-switcher` | The mode switcher (whole control) | `ModeSwitcher.tsx` |
 | `mode-talk` · `mode-run` · `mode-review` · `mode-direct` | One mode segment | `ModeSwitcher.tsx` |
 | `header-branch` | Workspace header: the branch chip (hover/focus opens its provenance popover) | `ContextHeader.tsx` |

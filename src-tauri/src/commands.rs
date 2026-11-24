@@ -1576,7 +1576,7 @@ pub async fn delete_workspace(
         .as_deref()
         .is_some_and(|wt| is_project_root(&project_path, wt));
 
-    prune_talk_checkpoints_of(&state, &workspace_id, &project_path, worktree_path.as_deref()).await;
+    prune_talk_checkpoints_of(&state.db, &workspace_id, &project_path, worktree_path.as_deref()).await;
 
     // Remove the worktree directory only when Octopush created it (`managed`) and
     // it isn't the project root. An adopted checkout (made by the user/another
@@ -1650,18 +1650,44 @@ pub async fn archive_workspace(
     // IPC/API symmetry but isn't needed here.
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
+    let running = |t: &[String]| state.chat.any_running(t);
+    archive_workspace_at(&state.db, running, &workspace_id, &project_path, worktree_path.as_deref(), None)
+        .await
+        .map(|_| ())
+}
 
-    prune_talk_checkpoints_of(&state, &workspace_id, &project_path, worktree_path.as_deref()).await;
-
+/// The archive itself, shared with `archive_merged_workspaces`, which passes
+/// `named` (the local files the user was shown): right before the worktree
+/// is deleted it is checked once more (`worktree_busy` with `running`, which
+/// asks the chat engine about thread ids, then `changed_since_named`), and a
+/// mission that fails is left in place, untouched, with the reason as
+/// `Ok(Some(..))`. The Talk checkpoints go last: they are refs in the shared
+/// git dir, pruned from the project root once the worktree is gone.
+pub(crate) async fn archive_workspace_at(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    running: impl Fn(&[String]) -> bool,
+    workspace_id: &str,
+    project_path: &str,
+    worktree_path: Option<&str>,
+    named: Option<&[String]>,
+) -> AppResult<Option<&'static str>> {
     // Only remove on disk what Octopush created. An adopted checkout and the
     // main workspace (project root) keep their directory — archiving just flips
     // the DB row. (Archive always keeps the branch.)
-    if owns_worktree_on_disk(&state.db, &workspace_id, &project_path, worktree_path.as_deref()) {
-        crate::claude_hooks::remove_for_workspace(&state.db, &workspace_id, worktree_path.as_deref());
-        if let Some(wt) = &worktree_path {
+    if owns_worktree_on_disk(db, workspace_id, project_path, worktree_path) {
+        if let (Some(named), Some(wt)) = (named, worktree_path) {
+            if worktree_busy(&db.lock(), &running, wt) {
+                return Ok(Some("busy"));
+            }
+            if let Some(reason) = changed_since_named(Path::new(wt), Some(named)) {
+                return Ok(Some(reason));
+            }
+        }
+        crate::claude_hooks::remove_for_workspace(db, workspace_id, worktree_path);
+        if let Some(wt) = worktree_path {
             // Prune the worktree's registry slot (by path), then remove its dir.
             let _ = crate::git_ops::delete_worktree(
-                std::path::Path::new(&project_path),
+                std::path::Path::new(project_path),
                 std::path::Path::new(wt),
             );
             let wt_path = std::path::Path::new(wt);
@@ -1670,9 +1696,10 @@ pub async fn archive_workspace(
             }
         }
     }
+    prune_talk_checkpoints_of(db, workspace_id, project_path, worktree_path).await;
     // Mark archived in DB (row survives, hidden from the rail)
-    state.db.lock().archive_workspace(&workspace_id)?;
-    Ok(())
+    db.lock().archive_workspace(workspace_id)?;
+    Ok(None)
 }
 
 #[tauri::command]
@@ -2098,8 +2125,13 @@ pub async fn fork_chat_thread(
 /// being deleted or archived (#958). The refs live in the repository's
 /// shared git directory, so they would otherwise outlive the worktree.
 /// Best-effort, and run before the worktree is removed.
-async fn prune_talk_checkpoints_of(state: &AppState, workspace_id: &str, project_path: &str, worktree: Option<&str>) {
-    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+async fn prune_talk_checkpoints_of(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: &str,
+    project_path: &str,
+    worktree: Option<&str>,
+) {
+    let threads = db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
     if threads.is_empty() {
         return;
     }
@@ -6676,6 +6708,240 @@ pub async fn open_prs_for_project(project_path: String) -> AppResult<Vec<BranchP
         Err(_) => return Ok(Vec::new()),
     };
     Ok(parse_open_pr_list(&values))
+}
+
+/// A mission whose pull request was merged at its worktree's HEAD, with no
+/// changes left in the worktree: the rail offers to archive it (#963).
+/// `local_files` are its `git_ops::local_ignored_files`, which archiving
+/// deletes and Undo can't bring back.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedWorkspace {
+    pub workspace_id: String,
+    pub pr: crate::github::Pr,
+    pub local_files: Vec<String>,
+}
+
+/// Branch → (merged PR's head commit, PR), from `parse_merged_heads`.
+pub(crate) type MergedHeads = HashMap<String, (String, crate::github::Pr)>;
+
+/// Parse `gh pr list --state merged --json …,headRefName,headRefOid` output
+/// into branch → (head commit, PR). Pure. The first entry of a branch wins:
+/// gh lists the most recent first. Entries without a branch or a head commit
+/// are skipped.
+pub(crate) fn parse_merged_heads(values: &[serde_json::Value]) -> MergedHeads {
+    let mut out = HashMap::new();
+    for v in values {
+        let Some(oid) = v.get("headRefOid").and_then(|x| x.as_str()) else { continue };
+        if oid.is_empty() {
+            continue;
+        }
+        let Some(BranchPr { branch, pr }) = parse_open_pr_list(std::slice::from_ref(v)).pop() else {
+            continue;
+        };
+        out.entry(branch).or_insert((oid.to_string(), pr));
+    }
+    out
+}
+
+/// The repo's most recent merged PRs (`parse_merged_heads`), read with `gh`
+/// in the login shell: 300 of them (three API pages), so a busy repo keeps
+/// its offers for a while; an older merge is just not offered. None when gh
+/// is missing, unauthed or fails, or the repo isn't on GitHub.
+async fn merged_heads_in(project_path: &str) -> Option<MergedHeads> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let cmd = "gh pr list --state merged --json number,title,url,state,isDraft,headRefName,headRefOid --limit 300";
+    let output = tokio::process::Command::new(&shell)
+        .arg("-l")
+        .arg("-c")
+        .arg(cmd)
+        .current_dir(project_path)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let values: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).ok()?;
+    Some(parse_merged_heads(&values))
+}
+
+/// Whether a worktree is merged and clean: the merged PR's head commit is
+/// exactly the worktree's HEAD (no commits came after the merge, and a reused
+/// branch name never matches) and nothing is changed or untracked. Pure.
+pub(crate) fn is_merged_and_clean(head: Option<&str>, merged_head: &str, dirty: bool) -> bool {
+    !dirty && head == Some(merged_head)
+}
+
+/// Why a merged mission checked out at `worktree` can't be archived now, or
+/// None. Checked for the rail's offer and again by `archive_merged_workspaces`
+/// at the moment it acts: "busy" while a Talk turn or a Direct run is active
+/// there; "moved" unless HEAD is exactly `merged_head`, the merged PR's head
+/// commit (None: the branch has no merged PR); then `changed_since_named`.
+/// `named` None (the offer) lists local files rather than skipping for them.
+pub(crate) fn merged_archive_skip(
+    worktree: &Path,
+    merged_head: Option<&str>,
+    busy: bool,
+    named: Option<&[String]>,
+) -> Option<&'static str> {
+    if busy {
+        return Some("busy");
+    }
+    let head = crate::git_ops::head_sha(worktree);
+    if !merged_head.is_some_and(|oid| is_merged_and_clean(head.as_deref(), oid, false)) {
+        return Some("moved");
+    }
+    changed_since_named(worktree, named)
+}
+
+/// "changed" with changes or untracked files (an unreadable status counts);
+/// "local-files" when, with `named` given, the worktree holds a
+/// `local_ignored_files` path the user wasn't shown (an unreadable list
+/// counts). Run again just before the worktree is deleted.
+pub(crate) fn changed_since_named(worktree: &Path, named: Option<&[String]>) -> Option<&'static str> {
+    if crate::git_ops::is_dirty(worktree).unwrap_or(true) {
+        return Some("changed");
+    }
+    let named = named?;
+    match crate::git_ops::local_ignored_files(worktree) {
+        Ok(files) if files.iter().all(|f| named.contains(f)) => None,
+        _ => Some("local-files"),
+    }
+}
+
+/// Whether a Talk turn (`running` asks the chat engine about thread ids) or a
+/// Direct run is active in a workspace checked out at `worktree`. A failed
+/// read counts as busy.
+pub(crate) fn worktree_busy(db: &crate::db::Db, running: impl Fn(&[String]) -> bool, worktree: &str) -> bool {
+    let Ok(threads) = db.chat_threads_at_worktree(worktree) else { return true };
+    db.has_active_run_at(worktree).unwrap_or(true) || running(&threads)
+}
+
+/// Batch: the project's missions that are merged and clean
+/// (`merged_archive_skip`, local files allowed and listed), for the rail's
+/// "Merged · archive?" and the project menu's "Archive merged missions…".
+/// The project root (its main workspace) is never listed. Errs when the
+/// merged PRs can't be read (gh missing/unauthed, not a GitHub repo), so the
+/// app can try again later.
+#[tauri::command]
+pub async fn merged_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+    project_path: String,
+) -> AppResult<Vec<MergedWorkspace>> {
+    let project_path = expand_tilde(&project_path);
+    let Some(mut merged) = merged_heads_in(&project_path).await else {
+        return Err(AppError::Other("merged pull requests unreadable".into()));
+    };
+    if merged.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = state.db.lock().list_workspaces(&project_id)?;
+    let root = Path::new(&project_path);
+    let mut out = Vec::new();
+    for row in rows {
+        let Some(wt) = row.worktree_path else { continue };
+        let path = Path::new(&wt);
+        if path == root || !crate::git_ops::is_git_repo(path) {
+            continue;
+        }
+        let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
+        if head.is_none() || merged_archive_skip(path, head, false, None).is_some() {
+            continue;
+        }
+        let local_files = crate::git_ops::local_ignored_files(path).unwrap_or_default();
+        if let Some((_, pr)) = merged.remove(&row.branch) {
+            out.push(MergedWorkspace { workspace_id: row.id, pr, local_files });
+        }
+    }
+    Ok(out)
+}
+
+/// A mission `archive_merged_workspaces` left in place, and why: a
+/// `merged_archive_skip` reason, "unverified" (the merged PRs couldn't be
+/// read), "gone" (no longer an active mission of the project) or "failed"
+/// (the archive itself failed).
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveSkip {
+    pub workspace_id: String,
+    pub reason: String,
+}
+
+#[derive(serde::Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MergedArchive {
+    pub archived: Vec<String>,
+    pub skipped: Vec<ArchiveSkip>,
+}
+
+/// The worktree of a mission `archive_merged_workspaces` may archive now, or
+/// the reason it may not (see `ArchiveSkip`).
+fn merged_archive_check(
+    state: &AppState,
+    project_id: &str,
+    root: &Path,
+    workspace_id: &str,
+    merged: Option<&MergedHeads>,
+    named: &[String],
+) -> Result<String, &'static str> {
+    let merged = merged.ok_or("unverified")?;
+    let row = state.db.lock().get_workspace(workspace_id).ok().flatten().ok_or("gone")?;
+    if row.project_id != project_id || row.status == "archived" {
+        return Err("gone");
+    }
+    let wt = row.worktree_path.ok_or("gone")?;
+    let path = Path::new(&wt);
+    if path == root || !crate::git_ops::is_git_repo(path) {
+        return Err("gone");
+    }
+    let busy = worktree_busy(&state.db.lock(), |t| state.chat.any_running(t), &wt);
+    let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
+    match merged_archive_skip(path, head, busy, Some(named)) {
+        Some(reason) => Err(reason),
+        None => Ok(wt),
+    }
+}
+
+/// "merged · archive?" and "Archive merged missions…" (#963): archive each of
+/// `workspace_ids` only if it still passes at this moment, against a fresh
+/// read of the merged PRs (`merged_archive_check`). `local_files_ok` holds,
+/// per mission, the local files the confirm named: one that holds any other
+/// is skipped. Dirt and local files are checked once more just before the
+/// worktree is deleted. Branches are kept.
+#[tauri::command]
+pub async fn archive_merged_workspaces(
+    state: State<'_, AppState>,
+    project_id: String,
+    project_path: String,
+    workspace_ids: Vec<String>,
+    local_files_ok: HashMap<String, Vec<String>>,
+) -> AppResult<MergedArchive> {
+    let project_path = expand_tilde(&project_path);
+    let merged = merged_heads_in(&project_path).await;
+    let mut out = MergedArchive::default();
+    for id in workspace_ids {
+        let named = local_files_ok.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let checked = merged_archive_check(&state, &project_id, Path::new(&project_path), &id, merged.as_ref(), named);
+        let reason = match checked {
+            Ok(wt) => {
+                let running = |t: &[String]| state.chat.any_running(t);
+                let archived = archive_workspace_at(&state.db, running, &id, &project_path, Some(&wt), Some(named)).await;
+                match archived {
+                    Ok(None) => {
+                        out.archived.push(id);
+                        continue;
+                    }
+                    Ok(Some(reason)) => reason,
+                    Err(_) => "failed",
+                }
+            }
+            Err(reason) => reason,
+        };
+        out.skipped.push(ArchiveSkip { workspace_id: id, reason: reason.into() });
+    }
+    Ok(out)
 }
 
 /// The login-shell command `push_branch` runs for `branch`. The branch is

@@ -54,6 +54,7 @@ const mockIpc = {
   archiveWorkspace: vi.fn(),
   renameWorkspace: vi.fn(),
   openPrsForProject: vi.fn(),
+  mergedWorkspaces: vi.fn(),
 };
 
 vi.mock("../lib/ipc", () => ({ ipc: mockIpc }));
@@ -71,6 +72,9 @@ function resetStore() {
     workspacesByProjectId: {},
     gitSummaryByWs: {},
     prByWs: {},
+    mergedPrByWs: {},
+    localFilesByWs: {},
+    archivingIds: {},
     launchRestoredId: undefined,
   });
   __resetLaunchRestore();
@@ -701,6 +705,91 @@ describe("workspaceStore — prByWs", () => {
     const map = useWorkspaceStore.getState().prByWs;
     expect(map.other).toBeDefined();
     expect(map[a.id]).toBeNull();
+  });
+});
+
+describe("workspaceStore — mergedPrByWs (#963)", () => {
+  beforeEach(() => resetStore());
+  const merged = { number: 3, title: "M", url: "u3", isDraft: false, state: "merged" as const };
+
+  it("loads the project's merged-and-clean missions with its PRs, and forgets ones no longer listed", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    const b = makeWorkspace("p1", "beta");
+    useWorkspaceStore.setState({
+      workspacesByProjectId: { p1: [a, b] },
+      mergedPrByWs: { [b.id]: merged, other: merged },
+    });
+    mockIpc.openPrsForProject.mockResolvedValueOnce([]);
+    mockIpc.mergedWorkspaces.mockResolvedValueOnce([{ workspaceId: a.id, pr: merged, localFiles: [".env"] }]);
+
+    await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+
+    expect(mockIpc.mergedWorkspaces).toHaveBeenCalledWith("p1", "/repo/p1");
+    const map = useWorkspaceStore.getState().mergedPrByWs;
+    expect(map[a.id]?.number).toBe(3);
+    expect(map[b.id]).toBeUndefined();
+    expect(map.other).toBeDefined();
+    expect(useWorkspaceStore.getState().localFilesByWs[a.id]).toEqual([".env"]);
+  });
+
+  it("rides the open-PR read: not again on a refresh, only once a PR left the open list", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] } });
+    const open = { number: 9, title: "O", url: "u9", isDraft: false, state: "open" as const };
+    mockIpc.mergedWorkspaces.mockResolvedValue([]);
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      mockIpc.openPrsForProject.mockResolvedValue([{ branch: a.branch, pr: open }]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // a focus refresh past the throttle, PR still open
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // the PR left the open list
+      mockIpc.openPrsForProject.mockResolvedValue([]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("tries a failed merged-PR read again later in the session, not on the next refresh", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] } });
+    mockIpc.openPrsForProject.mockResolvedValue([]);
+    mockIpc.mergedWorkspaces.mockRejectedValueOnce(new Error("gh"));
+    let now = 2_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // the next refresh: too soon to ask again
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 5 * 60_000; // later in the session
+      mockIpc.mergedWorkspaces.mockResolvedValueOnce([]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("archive drops the mission's entry", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] }, mergedPrByWs: { [a.id]: merged } });
+    mockIpc.archiveWorkspace.mockResolvedValueOnce(undefined);
+    await useWorkspaceStore.getState().archive(a.id, "/repo", a.branch, a.worktreePath);
+    expect(useWorkspaceStore.getState().mergedPrByWs[a.id]).toBeUndefined();
+  });
+
+  it("a failed read leaves the map as it was", async () => {
+    useWorkspaceStore.setState({ mergedPrByWs: { x: merged } });
+    mockIpc.mergedWorkspaces.mockRejectedValueOnce(new Error("gh"));
+    await useWorkspaceStore.getState().loadMergedPrs("p1", "/repo/p1");
+    expect(useWorkspaceStore.getState().mergedPrByWs.x).toBeDefined();
   });
 });
 

@@ -13,6 +13,7 @@ import {
   ChevronUp,
   ChevronDown,
   FolderPlus,
+  GitMerge,
 } from "lucide-react";
 import { MenuSurface } from "./MenuSurface";
 import { MoveToGroupItem, type MoveTargetGroup } from "./MoveToGroupItem";
@@ -31,6 +32,11 @@ interface Props {
   onChangeTint: () => void;
   onSetJiraProjectKey?: () => void;
   onViewArchived: () => void;
+  /** How many missions say "merged · archive?" (#963). "Archive merged
+   *  missions…" is drawn only while there is one and `onArchiveMerged` is given;
+   *  it opens a confirm that lists them. */
+  mergedCount?: number;
+  onArchiveMerged?: () => void;
   /** "New mission group": create an empty mission group (a folder for this
    *  project's missions; its name opens in edit). Never labelled plain "New
    *  group": in this menu that phrase belongs to "Move to group", which
@@ -75,6 +81,8 @@ export function ProjectContextMenu({
   onChangeTint,
   onSetJiraProjectKey,
   onViewArchived,
+  mergedCount = 0,
+  onArchiveMerged,
   onNewGroup,
   projectGroups,
   projectGroupId,
@@ -171,6 +179,13 @@ export function ProjectContextMenu({
       <button type="button" role="menuitem" className={ITEM} onClick={run(onViewArchived)}>
         <Archive size={12} className="shrink-0" /> Archived workspaces…
       </button>
+      {onArchiveMerged && mergedCount > 0 && (
+        <button type="button" role="menuitem" className={ITEM} onClick={run(onArchiveMerged)}>
+          <GitMerge size={12} className="shrink-0" />
+          <span className="flex-1 text-left">Archive merged missions…</span>
+          <span className="octo-tabular text-octo-mute">{mergedCount}</span>
+        </button>
+      )}
 
       <div className={SEP} />
 

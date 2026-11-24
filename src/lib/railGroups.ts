@@ -133,6 +133,25 @@ export function filterRailItems(items: readonly RailItem[], matches: (name: stri
   return out;
 }
 
+/**
+ * Apply the rail's state filter (#963) to a project's items, after the text
+ * filter: a mission stays when `keep` says so; a group keeps the members it
+ * shows that pass, and leaves when none does (a group has no state of its
+ * own, so its name never keeps it).
+ */
+export function filterRailMissions(items: readonly RailItem[], keep: (workspace: Workspace) => boolean): RailItem[] {
+  const out: RailItem[] = [];
+  for (const item of items) {
+    if (item.kind === "mission") {
+      if (keep(item.workspace)) out.push(item);
+      continue;
+    }
+    const visible = item.visible.filter(keep);
+    if (visible.length > 0) out.push({ ...item, visible });
+  }
+  return out;
+}
+
 // ───────────────────────────── drag and drop ─────────────────────────────
 
 /** What is being dragged in the rail. */

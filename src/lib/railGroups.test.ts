@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
   filterRailItems,
+  filterRailMissions,
   flattenTop,
   layoutMissions,
   layoutProjects,
@@ -168,6 +169,27 @@ describe("filterRailItems", () => {
   it("does not change how many members the group has", () => {
     const [hit] = filterRailItems(items, by("two"));
     expect(hit.kind === "group" && hit.members.length).toBe(2);
+  });
+});
+
+describe("filterRailMissions", () => {
+  const items = layoutMissions(
+    [ws("alpha"), ws("fix-one", "g"), ws("fix-two", "g"), ws("report")],
+    [group("g", { name: "Vulnerability fixes" })],
+  );
+  const only = (...ids: string[]) => (w: Workspace) => ids.includes(w.id);
+
+  it("keeps the passing missions, a group with only its passing members", () => {
+    expect(read(filterRailMissions(items, only("fix-two", "report")))).toBe("[g: fix-two] report");
+  });
+
+  it("drops a group none of whose members pass, whatever its name", () => {
+    expect(read(filterRailMissions(items, only("alpha")))).toBe("alpha");
+  });
+
+  it("narrows what a text filter left, never brings back a member it hid", () => {
+    const hits = filterRailItems(items, (name) => name.includes("one"));
+    expect(read(filterRailMissions(hits, only("fix-one", "fix-two")))).toBe("[g: fix-one]");
   });
 });
 
