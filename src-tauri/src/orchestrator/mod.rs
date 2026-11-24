@@ -9,6 +9,7 @@ pub mod events;
 pub mod launch;
 pub mod git_baseline;
 pub mod live;
+pub mod notify;
 pub mod persist;
 pub mod plan_wait;
 pub mod read_only;
@@ -355,6 +356,14 @@ impl Orchestrator {
         self
     }
 
+    /// Tests: drive as `octopush-run-worker` does (`new_headless`), with the
+    /// test runner.
+    #[cfg(test)]
+    pub(crate) fn into_headless(mut self) -> Self {
+        self.headless = true;
+        self
+    }
+
     /// Test constructor: force a specific runner for every stage.
     pub fn new_with_runner(
         db: Arc<Mutex<Db>>,
@@ -498,7 +507,18 @@ impl Orchestrator {
     /// notifications must ping for the former and stay silent for the latter
     /// (a false "needs you" for the user's own action trains them to ignore
     /// the ping). Other consumers ignore the extra field.
+    ///
+    /// Also the one trigger of "Notify me elsewhere" for a park (#964), in
+    /// process and in the detached worker alike.
     fn emit_checkpoint(&self, run_id: &str, stage_id: &str, reason: &str) {
+        self.relay_checkpoint(run_id, stage_id, reason);
+        self.notify_elsewhere_park(run_id, stage_id, reason);
+    }
+
+    /// The `run://checkpoint` event alone: the bridge's relay of a park the
+    /// detached worker already announced (and sent elsewhere), so the
+    /// webhook never hears about one park twice.
+    fn relay_checkpoint(&self, run_id: &str, stage_id: &str, reason: &str) {
         self.events.emit(
             "run://checkpoint",
             serde_json::json!({ "runId": run_id, "stageId": stage_id, "reason": reason }),
@@ -1974,6 +1994,7 @@ impl Orchestrator {
                 self.db.lock().set_run_status(run_id, "completed", true)?;
                 self.emit_run_update(run_id);
                 self.sync_run_history(run_id);
+                self.notify_elsewhere_completed(run_id);
                 return Ok(RunStatus::Completed);
             }
 

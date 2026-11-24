@@ -6885,6 +6885,23 @@ impl Db {
         Ok(())
     }
 
+    /// The name of the Routine whose last fired run is `run_id`
+    /// (`last_run_id`), if any — how "Notify me elsewhere" (#964) tells a
+    /// Routine's crew from one the director started, and what it calls it. A
+    /// Routine never fires again while its run is live (the fire guards), so
+    /// its run is still `last_run_id` when it ends.
+    pub fn routine_name_for_run(&self, run_id: &str) -> AppResult<Option<String>> {
+        let name: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT name FROM routines WHERE last_run_id = ?1 LIMIT 1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(name)
+    }
+
     /// Record the outcome of a fire evaluation (dispatched, or a skip reason)
     /// on EVERY tick — `last_checked_at`/`last_outcome`. Independent of
     /// `stamp_routine_run` (which records the dispatched run itself); this keeps

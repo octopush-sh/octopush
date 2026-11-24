@@ -5125,6 +5125,34 @@ pub async fn save_settings(state: State<'_, AppState>, settings: crate::settings
     Ok(())
 }
 
+/// "Notify me elsewhere" (#964): the saved switch and webhook URL (off, with
+/// no URL, by default).
+#[tauri::command]
+pub async fn get_notify_elsewhere() -> AppResult<crate::notify_elsewhere::NotifySettings> {
+    Ok(crate::notify_elsewhere::current())
+}
+
+/// Save "Notify me elsewhere" — the only writer of its two settings. The URL
+/// is validated first (https, or http to this Mac only); turning on needs one.
+#[tauri::command]
+pub async fn set_notify_elsewhere(enabled: bool, url: String) -> AppResult<crate::notify_elsewhere::NotifySettings> {
+    crate::notify_elsewhere::save(enabled, &url)
+}
+
+/// "Send a test": the test message to `url` (the field's value, saved or
+/// not), once, without retrying. The error names the cause, never the URL.
+#[tauri::command]
+pub async fn notify_elsewhere_test(url: String) -> AppResult<()> {
+    crate::notify_elsewhere::send_test(&url).await.map_err(AppError::Other)
+}
+
+/// The read-only preview in Settings: the body's fields for a checkpoint gate
+/// and every `event` value.
+#[tauri::command]
+pub async fn notify_elsewhere_preview() -> AppResult<crate::notify_elsewhere::Preview> {
+    Ok(crate::notify_elsewhere::preview())
+}
+
 /// Install or strip the Claude Code hooks in every active managed worktree
 /// to match the setting (#533), off the caller's path (CLI version probe).
 pub fn sync_claude_hooks_later(db: &std::sync::Arc<parking_lot::Mutex<crate::db::Db>>) {

@@ -72,6 +72,21 @@ pub struct AppSettings {
     #[serde(default)]
     pub quiet_claude_code: bool,
 
+    /// Opt-in (Settings › General › Attention › "Notify me elsewhere", #964):
+    /// POST a short JSON message to `notify_elsewhere_url` when a crew needs a
+    /// decision, a crew run fails or a Routine finishes
+    /// (`crate::notify_elsewhere`). **Off by default**, including for every
+    /// settings file written before this field existed. Owned by
+    /// `set_notify_elsewhere`; whole-file saves carry both fields over.
+    #[serde(default)]
+    pub notify_elsewhere_enabled: bool,
+
+    /// The webhook URL for "Notify me elsewhere", validated before it is
+    /// stored (`notify_elsewhere::validate_url`). Never logged: webhook URLs
+    /// carry their secret in the path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notify_elsewhere_url: Option<String>,
+
     /// Secret guard (#730, Settings › General › "Guard commits against
     /// secrets"): `None` = the default, read as **on** by
     /// `secret_scan::guard_enabled`; an explicit `false` turns it off.
@@ -441,6 +456,22 @@ impl AppSettings {
         self.update_channel = on_disk.update_channel;
         self.skipped_update_version = on_disk.skipped_update_version.clone();
     }
+
+    /// Same rule for "Notify me elsewhere" (#964): `set_notify_elsewhere`,
+    /// which validates the URL, is the only writer.
+    pub fn preserve_notify_fields_from(&mut self, on_disk: &AppSettings) {
+        self.notify_elsewhere_enabled = on_disk.notify_elsewhere_enabled;
+        self.notify_elsewhere_url = on_disk.notify_elsewhere_url.clone();
+    }
+}
+
+/// Persist "Notify me elsewhere" (read-modify-write). Callers validate the
+/// URL first (`notify_elsewhere::save`).
+pub fn set_notify_elsewhere(enabled: bool, url: Option<String>) -> AppResult<()> {
+    update_settings(|s| {
+        s.notify_elsewhere_enabled = enabled;
+        s.notify_elsewhere_url = url;
+    })
 }
 
 /// Is "Quiet Claude Code in crews and Routines" on? Reads `settings.json`
@@ -544,14 +575,16 @@ pub fn clear_sync_opt_ins() -> AppResult<()> {
 }
 
 /// A whole-settings save coming from the frontend: everything but the sync
-/// opt-ins (owned by `set_sync_pref`) and the updater prefs (owned by
-/// `set_update_channel` / `set_skipped_update_version`), which are carried
-/// over from disk.
+/// opt-ins (owned by `set_sync_pref`), the updater prefs (owned by
+/// `set_update_channel` / `set_skipped_update_version`) and "Notify me
+/// elsewhere" (owned by `set_notify_elsewhere`), which are carried over from
+/// disk.
 pub fn save_settings_from_ui(mut incoming: AppSettings) -> AppResult<()> {
     let _guard = SETTINGS_WRITE_LOCK.lock();
     let on_disk = load_settings_for_write()?;
     incoming.preserve_sync_fields_from(&on_disk);
     incoming.preserve_update_fields_from(&on_disk);
+    incoming.preserve_notify_fields_from(&on_disk);
     save_settings(&incoming)
 }
 
@@ -749,6 +782,38 @@ mod tests {
         assert!(!quiet_claude_code());
         std::fs::write(&path, "{ not json").unwrap();
         assert!(!quiet_claude_code(), "unparseable ⇒ off");
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn notify_elsewhere_defaults_off_and_only_its_writer_changes_it() {
+        let settings: AppSettings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.notify_elsewhere_enabled, "off for every older file");
+        assert_eq!(settings.notify_elsewhere_url, None);
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(!json.contains("notifyElsewhereUrl"), "no URL key until one is saved: {json}");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        test_settings_path::set(Some(path.clone()));
+        set_notify_elsewhere(true, Some("https://ntfy.sh/t".into())).unwrap();
+        let on_disk = load_settings().unwrap();
+        assert!(on_disk.notify_elsewhere_enabled);
+        assert_eq!(on_disk.notify_elsewhere_url.as_deref(), Some("https://ntfy.sh/t"));
+        assert!(std::fs::read_to_string(&path).unwrap().contains(r#""notifyElsewhereEnabled": true"#));
+
+        // A whole-file save from a pane (stale, or crafted) can't flip it or
+        // slip in an unvalidated URL.
+        let stale = AppSettings { notify_elsewhere_url: Some("http://example.com/x".into()), ..Default::default() };
+        save_settings_from_ui(stale).unwrap();
+        let after = load_settings().unwrap();
+        assert!(after.notify_elsewhere_enabled);
+        assert_eq!(after.notify_elsewhere_url.as_deref(), Some("https://ntfy.sh/t"));
+
+        set_notify_elsewhere(false, None).unwrap();
+        let off = load_settings().unwrap();
+        assert!(!off.notify_elsewhere_enabled);
+        assert_eq!(off.notify_elsewhere_url, None);
         test_settings_path::set(None);
     }
 

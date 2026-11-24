@@ -101,7 +101,8 @@ impl Orchestrator {
     pub(crate) fn bridge_tick(&self) -> AppResult<()> {
         // 1. Repair runs whose worker died mid-segment (stale heartbeat) —
         //    they land in the standard interrupted/Resume shape, and the
-        //    checkpoint ping tells the director the crew stopped.
+        //    checkpoint ping tells the director the crew stopped (and "Notify
+        //    me elsewhere" sends it: the dead worker couldn't).
         let repaired = self.db.lock().reconcile_stale_leases()?;
         for run_id in &repaired {
             let _ = self.flush_log_tail(run_id);
@@ -260,7 +261,14 @@ impl Orchestrator {
                     } else {
                         "decision"
                     };
-                    self.emit_checkpoint(run_id, &s.id, reason);
+                    if repaired_error {
+                        // The worker errored before it could announce a park.
+                        self.emit_checkpoint(run_id, &s.id, reason);
+                    } else {
+                        // The worker announced this park itself, "Notify me
+                        // elsewhere" included (#964): relay it to the app only.
+                        self.relay_checkpoint(run_id, &s.id, reason);
+                    }
                 }
             }
             _ => {}
