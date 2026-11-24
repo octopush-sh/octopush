@@ -260,3 +260,13 @@ describe("parseKeyPhrase — a terminator ends the lead only before whitespace",
     expect(parseKeyPhrase(lead + " Body.").keyPhrase).toBeNull();
   });
 });
+
+describe("parseKeyPhrase performance", () => {
+  it("stays fast on a very long first line full of unclosed brackets", () => {
+    const line = "[x ".repeat(30000) + "end. More text.";
+    const started = performance.now();
+    const out = parseKeyPhrase(line);
+    expect(performance.now() - started).toBeLessThan(50);
+    expect(out.keyPhrase).toBeNull();
+  });
+});

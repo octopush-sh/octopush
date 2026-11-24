@@ -189,7 +189,10 @@ export function parseKeyPhrase(content: string): KeyPhraseSplit {
 
   if (opensWithBlock(trimmed)) return none;
 
-  const end = firstSentenceEnd(trimmed);
+  // A lead longer than the cap is rejected anyway, so scan only that far:
+  // the scan is linear per bracket and a long first line could cost seconds
+  // while a reply streams.
+  const end = firstSentenceEnd(trimmed.slice(0, MAX_KEY_PHRASE_LEN + 2));
   if (end < 0) return none;
 
   const lead = trimmed.slice(0, end).trim();
