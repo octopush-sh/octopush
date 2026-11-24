@@ -113,6 +113,8 @@ Current anchors:
 | `talk-rewind-dialog` · `talk-rewind-outside` · `talk-rewind-confirm` | Talk rewind confirm, while open: the dialog · the amber "changed outside this conversation" line (only when such a file is listed) · "Rewind the files" | `chat/RewindDialog.tsx` |
 | `talk-rewind-untouched` · `talk-rewind-storage` · `talk-rewind-undo` | Talk rewind confirm, while open: the list of paths left untouched (only when there is one) · the line saying where checkpoints are stored · "Undo the rewind" (only after a rewind stopped part-way) | `chat/RewindDialog.tsx` |
 | `talk-turn-no-checkpoint` | Talk, on a message you sent whose checkpoint was skipped (in its hover/focus action row): the "This turn has no checkpoint" mark | `chat/ChatCanvas.tsx` |
+| `talk-turn-ask` | Talk: a message you sent, set on the panel surface with "— You" and the time (every such turn carries it; a tour finds the first) | `ChatMessage.tsx` |
+| `talk-work` · `talk-work-fold` | Talk: the model's work in a turn, its narration and tool calls on one hairline (only when a turn has some) · the summary row of a round of more than five calls (only when one has) | `chat/WorkBlock.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
 | `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |
@@ -232,6 +234,7 @@ cover.
 | `rail-project-groups` | `default` with seven projects in the rail: a pinned one, two project groups and a loose project after them. |
 | `rail-groups-everywhere` | `default` with a project group ("Client work": `acme-api`, `acme-web`), a mission group ("Fixes") in `acme-api`, a crew at work in one of its missions (Mission Control reads `Fixes · fix-json-parser`) and an archived mission of the group. Moves and new groups last until the page reloads. |
 | `direct-running` | `default` with a crew at work in the active workspace: its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card shows the reading. |
+| `talk-work` | `default` with a longer Talk thread in the active workspace: an ask, narration and two rounds of tool calls (the second, six calls, folds into one summary row), a long answer with code and a list, then a short follow-up and its answer. Turn times are minutes before the page loads. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 

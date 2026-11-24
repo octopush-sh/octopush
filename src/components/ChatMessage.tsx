@@ -1,3 +1,4 @@
+import type { ReactNode } from "react";
 import { AUTO_MODEL } from "../lib/policy";
 import ReactMarkdown from "react-markdown";
 import { parseKeyPhrase } from "../lib/parseKeyPhrase";
@@ -15,6 +16,24 @@ interface MessageProps {
   cacheCreationTokens?: number | null;
   contextTokens?: number | null;
   costUsd?: number | null;
+  /** When the turn was sent (ISO). A user turn shows it in its header. */
+  createdAt?: string | null;
+}
+
+/** A turn's time for its header: the clock time today (`14:02`), with the
+ *  date in front on any other day (`Nov 23, 14:02`), so a thread picked up
+ *  the next morning still reads in order. Empty for a missing or bad date. */
+export function turnTime(iso: string | null | undefined, now: Date = new Date()): string {
+  if (!iso) return "";
+  const then = new Date(iso);
+  if (Number.isNaN(then.getTime())) return "";
+  const clock = then.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+  const sameDay =
+    then.getFullYear() === now.getFullYear() &&
+    then.getMonth() === now.getMonth() &&
+    then.getDate() === now.getDate();
+  if (sameDay) return clock;
+  return `${then.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${clock}`;
 }
 
 /** The footer of an answer: `211k in · 94% cached · 2.1k out · $0.42`. The
@@ -44,6 +63,9 @@ interface Props {
   /** The worktree's skill names: a user message's standalone `/name` tokens
    *  that match read as brass skill chips — the skills that rode with it. */
   skillNames?: string[];
+  /** A user turn's actions (Rewind, Fork, Edit, Copy), set in its header
+   *  between the eyebrow and the time. */
+  actions?: ReactNode;
 }
 
 // Maps Anthropic / OpenAI model IDs to short display names. Falls back to
@@ -70,7 +92,7 @@ function modelDisplayName(model: string | null | undefined): string {
   return MODEL_DISPLAY[model] ?? model;
 }
 
-export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
+export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Props) {
   const { role, content, model, inputTokens, outputTokens } = message;
 
   if (!content || !content.trim()) return null;
@@ -94,10 +116,31 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
     // and `break-words` wraps an unbroken token (a digest, a long URL) instead
     // of overflowing. Deliberately NOT Markdown — a pasted log, stack trace or
     // snippet must not lose its `#`, `*`, `<tags>` or indented lines.
+    //
+    // The turn sits on the panel surface, the one filled surface in the thread
+    // that isn't code, so the director's words read apart from the model's at
+    // a glance however long the conversation gets. Brass goes to "— You": the
+    // model's eyebrow and its tool rows stay mute.
+    const time = turnTime(message.createdAt);
     return (
-      <div data-role="user" className="octo-selectable flex flex-col gap-1.5">
-        <div className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
-          — You
+      <article
+        data-role="user"
+        data-tour="talk-turn-ask"
+        aria-label={time ? `You, ${time}` : "You"}
+        className="octo-selectable rounded-md border border-octo-hairline bg-octo-panel px-4 pb-3 pt-2"
+      >
+        <div className="mb-1 flex h-6 items-center gap-2">
+          <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— You</span>
+          {actions && <div className="ml-auto flex items-center">{actions}</div>}
+          {time && (
+            <time
+              dateTime={message.createdAt ?? undefined}
+              title={new Date(message.createdAt ?? "").toLocaleString()}
+              className={`${actions ? "" : "ml-auto "}octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute`}
+            >
+              {time}
+            </time>
+          )}
         </div>
         <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">
           {skillNames && skillNames.length > 0
@@ -118,16 +161,22 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
               )
             : content}
         </div>
-      </div>
+      </article>
     );
   }
 
   // Assistant: parse key phrase + body, render eyebrow + lead + markdown body.
   const { keyPhrase, body } = parseKeyPhrase(content);
 
+  // The model's eyebrow is meta, so it is mute: brass marks the director's
+  // turns, and the serif key phrase is the answer's moment.
   return (
-    <div data-role="assistant" className="octo-selectable flex flex-col gap-2">
-      <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">
+    <article
+      data-role="assistant"
+      aria-label={modelDisplayName(model)}
+      className="octo-selectable flex flex-col gap-2"
+    >
+      <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
         — {modelDisplayName(model)}
       </div>
 
@@ -171,6 +220,6 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
           {usageFooter(message)}
         </div>
       )}
-    </div>
+    </article>
   );
 }

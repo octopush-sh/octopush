@@ -11,7 +11,7 @@
  * specific DOM content.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
+import { render, screen, act, fireEvent, waitFor, within } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
 type EventHandler = (ev: { payload: unknown }) => void;
@@ -529,6 +529,77 @@ describe("ChatView — renders tool cards in the DOM", () => {
     expect(screen.getByText("styles.css")).toBeInTheDocument();
     expect(screen.getAllByText("WRITE")).toHaveLength(2);
     expect(screen.getByText(/landing page está lista/i)).toBeInTheDocument();
+  });
+});
+
+// ─── Turn structure: feed, articles, the work block ─────────────────────────
+
+describe("ChatView — turns read apart in a long thread", () => {
+  beforeEach(() => {
+    resetStore();
+  });
+
+  const row = (id: number, role: string, content: string, model: string | null = null) => ({
+    id, workspaceId: "ws-1", role, content, model,
+    inputTokens: null, outputTokens: null, costUsd: null,
+    createdAt: "2026-05-17T10:00:00Z",
+  });
+  const toolRow = (id: number, toolName: string, toolInput: Record<string, unknown>) =>
+    row(id, "tool", JSON.stringify({ toolName, toolInput, result: "" }));
+
+  it("is a feed of articles: the ask, the work (one hairline), the answer", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [
+          row(1, "user", "Why a 500?"),
+          row(2, "assistant_tool_use", "Let me find where the limiter talks to Redis."),
+          toolRow(3, "grep", { pattern: "RateLimiter" }),
+          toolRow(4, "read_file", { path: "src/lib/redis.ts" }),
+          row(5, "assistant", "The store call has no catch. Here is the fix.", "claude-opus-4-7"),
+        ] as never,
+      },
+      streamingByWs: { "ws-1": false },
+    });
+
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    const feed = screen.getByRole("feed", { name: "Conversation" });
+    const articles = within(feed).getAllByRole("article");
+    expect(articles.map((a) => a.getAttribute("data-role"))).toEqual(["user", "work", "assistant"]);
+    // The narration and both calls are inside the one work article.
+    const work = articles[1];
+    expect(within(work).getByText(/Let me find where the limiter/)).toBeInTheDocument();
+    expect(within(work).getByRole("group", { name: "2 tool calls" })).toBeInTheDocument();
+    expect(work).toHaveAttribute("aria-label", "Work, 2 tool calls");
+  });
+
+  it("puts a user turn's actions inside the ask, and an answer's after its text", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "do a thing"), row(2, "assistant", "did it", "claude-sonnet-4-6")] as never,
+      },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+
+    const ask = document.querySelector('[data-role="user"]')!;
+    expect(within(ask as HTMLElement).getByLabelText("Edit & resend")).toBeInTheDocument();
+    const answer = document.querySelector('[data-role="assistant"]')!;
+    const regenerate = screen.getByLabelText("Regenerate");
+    expect(answer.contains(regenerate)).toBe(false);
+    expect(answer.compareDocumentPosition(regenerate) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("copies exactly what the user sent, without the turn's header", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    useChatStore.setState({
+      messagesByWs: { "ws-1": [row(1, "user", "line one\n  line two")] as never },
+      streamingByWs: { "ws-1": false },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    fireEvent.click(screen.getByLabelText("Copy message"));
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith("line one\n  line two"));
   });
 });
 

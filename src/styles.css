@@ -472,6 +472,22 @@
   .octo-stage-pulse { animation: none; box-shadow: 0 0 0 1px var(--pulse-halo, var(--brass-dim)); }
 }
 
+/* ── Talk work ledger (ToolCallCard, chat/WorkBlock.tsx) ───────────
+   A resolved tool call is a quiet row hung on the work block's hairline,
+   not a card. Its colours are inline tokens (ToolCallCard renders beside
+   react-markdown, where Tailwind's cascade leaked once), so the hover and
+   focus states that inline styles can't express live here. The hover is a
+   faint wash, never a brass border; a row's actions turn brass on hover. */
+.octo-ledger-row { transition: background-color var(--dur-quick) var(--ease-octo); }
+.octo-ledger-row:hover { background: var(--brass-faint); }
+.octo-ledger-action { transition: color var(--dur-quick) var(--ease-octo); }
+.octo-ledger-action:hover { color: var(--color-octo-brass) !important; }
+.octo-ledger-row:focus-visible,
+.octo-ledger-action:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 1px var(--color-octo-brass);
+}
+
 /* ── Row actions over a fade (Talk chat rows, #756) ────────────────
    Hover/focus actions that sit ON the row's right end instead of beside the
    title, so revealing them never moves or rewraps anything. The fade repaints

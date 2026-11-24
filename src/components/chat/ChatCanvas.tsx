@@ -12,10 +12,10 @@ import { useBudgetsStore, BUDGET_CAP_MSG } from "../../stores/budgetsStore";
 import { useCopyFeedback } from "../../hooks/useCopyFeedback";
 import { prefersReducedMotion } from "../../lib/motion";
 import { ChatMessage } from "../ChatMessage";
-import { ChatMarkdown } from "./ChatMarkdown";
 import { OctoWatcher } from "./OctoWatcher";
-import { ToolCallCard } from "../ToolCallCard";
 import { LiveToolCard } from "./LiveToolCard";
+import { WorkBlock } from "./WorkBlock";
+import { groupWork, type TalkBlock } from "../../lib/talkWork";
 import { CrewCard, crewAgentsFromLive, crewAgentsFromTools } from "./CrewCard";
 import { ApprovalCard } from "./ApprovalCard";
 import { SubagentCapCard } from "./SubagentCapCard";
@@ -28,23 +28,6 @@ interface Props {
   onOpenInEditor?: (path: string) => void;
   /** Re-run a tool's shell command in the RUN-mode terminal (cross-mode, P9). */
   onRunInTerminal?: (command: string) => void;
-}
-
-/**
- * The model's words before a round's tool calls — its reasoning in the
- * open ("the tests import X, so let me check…"). A quiet sage line hung on
- * a hairline, so ten tool rounds read as a train of thought instead of a
- * black box; never the eyebrow + key-phrase treatment of an answer.
- */
-function NarrationLine({ text, onOpenInEditor }: { text: string; onOpenInEditor?: (path: string) => void }) {
-  return (
-    <div
-      data-role="narration"
-      className="octo-fade-in octo-selectable border-l border-octo-hairline pl-3 text-[12.5px] leading-[1.55] text-octo-sage"
-    >
-      <ChatMarkdown text={text} onOpenInEditor={onOpenInEditor} />
-    </div>
-  );
 }
 
 /**
@@ -97,6 +80,8 @@ export function ChatCanvas({
     () => buildTimeline(messages),
     [messages],
   );
+  // Narration and tool calls in a row become one work block (lib/talkWork).
+  const blocks = useMemo<TalkBlock[]>(() => groupWork(timeline), [timeline]);
   const liveAgents = useMemo(() => liveTools.filter((t) => isAgentToolName(t.toolName)), [liveTools]);
   const liveOthers = useMemo(() => liveTools.filter((t) => !isAgentToolName(t.toolName)), [liveTools]);
 
@@ -242,8 +227,13 @@ export function ChatCanvas({
       {isEmpty ? (
         <EmptyState areaRef={scrollRef} />
       ) : (
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-6">
-          {timeline.map((item) => {
+        <div
+          role="feed"
+          aria-label="Conversation"
+          aria-busy={streaming}
+          className="mx-auto flex w-full max-w-3xl flex-col gap-6"
+        >
+          {blocks.map((item) => {
             if (item.kind === "crew") {
               return (
                 <CrewCard
@@ -253,19 +243,17 @@ export function ChatCanvas({
                 />
               );
             }
-            if (item.kind === "tool") {
+            if (item.kind === "work") {
               return (
-                <ToolCallCard
-                  key={`tool-${item.id}`}
-                  tool={item.tool}
+                <WorkBlock
+                  key={`work-${item.id}`}
+                  entries={item.entries}
+                  calls={item.calls}
                   workspacePath={workspacePath}
                   onOpenInEditor={onOpenInEditor}
                   onRunInTerminal={onRunInTerminal}
                 />
               );
-            }
-            if (item.kind === "narration") {
-              return <NarrationLine key={`narration-${item.id}`} text={item.text} onOpenInEditor={onOpenInEditor} />;
             }
             if (item.kind === "error") {
               return (
@@ -458,7 +446,9 @@ function MessageRow({
   const [draft, setDraft] = useState("");
 
   function handleCopy() {
-    copy(ref.current?.innerText ?? message.content);
+    // A user turn copies exactly what was sent; its header (eyebrow, time)
+    // is chrome. An answer copies its rendered text, as before.
+    copy(message.role === "user" ? message.content : (ref.current?.innerText ?? message.content));
   }
 
   function startEdit() {
@@ -510,75 +500,88 @@ function MessageRow({
   // A tour pointing at one of these actions shows the bar, as a hover would.
   const toured = tourTarget !== null && actionsRef.current?.contains(tourTarget) === true;
 
+  const isUser = message.role === "user";
+  const actions = (
+    <div
+      ref={actionsRef}
+      data-tour={onFork ? tourId("talk-turn-actions") : undefined}
+      className={`flex items-center gap-0.5 transition group-hover/msg:opacity-100 focus-within:opacity-100 ${
+        isUser ? "" : "absolute -top-1 right-0 "
+      }${toured ? "opacity-100" : "opacity-0"}`}
+    >
+      {onRewind && (
+        <RowAction
+          label="Rewind files to here"
+          tour={tourId("talk-turn-rewind")}
+          onClick={() => onRewind(message.id)}
+          disabled={disabled}
+          icon={<History size={12} />}
+        />
+      )}
+      {!onRewind && noCheckpoint !== undefined && (
+        <span
+          role="img"
+          data-tour={tourId("talk-turn-no-checkpoint")}
+          aria-label={skippedLabel(noCheckpoint)}
+          title={skippedLabel(noCheckpoint)}
+          className="flex h-6 w-6 items-center justify-center rounded p-1 text-octo-mute opacity-60"
+        >
+          <CircleSlash size={12} aria-hidden />
+        </span>
+      )}
+      {onFork && (
+        <RowAction
+          label="Fork from here"
+          tour={tourId("talk-turn-fork")}
+          onClick={() => onFork(message.id)}
+          disabled={disabled}
+          icon={<GitFork size={12} />}
+        />
+      )}
+      {onEdit && (
+        <RowAction
+          label="Edit & resend"
+          onClick={startEdit}
+          disabled={disabled}
+          icon={<Pencil size={12} />}
+        />
+      )}
+      {onRegenerate && (
+        <RowAction
+          label="Regenerate"
+          onClick={() => onRegenerate(message.id)}
+          disabled={disabled}
+          icon={<RefreshCw size={12} />}
+        />
+      )}
+      <RowAction
+        label={copied ? "Copied" : "Copy message"}
+        onClick={handleCopy}
+        icon={
+          copied ? (
+            <Check size={12} className="text-octo-verdigris" />
+          ) : (
+            <Copy size={12} />
+          )
+        }
+      />
+    </div>
+  );
+
+  // A user turn sets its actions in its own header, between "— You" and the
+  // time, so they belong to the ask (and come right after it in focus order).
+  // An answer keeps them over its eyebrow line, after its text.
   return (
     <div className="group/msg relative">
       <div ref={ref}>
-        <ChatMessage message={message} onOpenInEditor={onOpenInEditor} skillNames={skillNames} />
-      </div>
-      <div
-        ref={actionsRef}
-        data-tour={onFork ? tourId("talk-turn-actions") : undefined}
-        className={`absolute -top-1 right-0 flex items-center gap-0.5 transition group-hover/msg:opacity-100 focus-within:opacity-100 ${
-          toured ? "opacity-100" : "opacity-0"
-        }`}
-      >
-        {onRewind && (
-          <RowAction
-            label="Rewind files to here"
-            tour={tourId("talk-turn-rewind")}
-            onClick={() => onRewind(message.id)}
-            disabled={disabled}
-            icon={<History size={12} />}
-          />
-        )}
-        {!onRewind && noCheckpoint !== undefined && (
-          <span
-            role="img"
-            data-tour={tourId("talk-turn-no-checkpoint")}
-            aria-label={skippedLabel(noCheckpoint)}
-            title={skippedLabel(noCheckpoint)}
-            className="flex h-6 w-6 items-center justify-center rounded p-1 text-octo-mute opacity-60"
-          >
-            <CircleSlash size={12} aria-hidden />
-          </span>
-        )}
-        {onFork && (
-          <RowAction
-            label="Fork from here"
-            tour={tourId("talk-turn-fork")}
-            onClick={() => onFork(message.id)}
-            disabled={disabled}
-            icon={<GitFork size={12} />}
-          />
-        )}
-        {onEdit && (
-          <RowAction
-            label="Edit & resend"
-            onClick={startEdit}
-            disabled={disabled}
-            icon={<Pencil size={12} />}
-          />
-        )}
-        {onRegenerate && (
-          <RowAction
-            label="Regenerate"
-            onClick={() => onRegenerate(message.id)}
-            disabled={disabled}
-            icon={<RefreshCw size={12} />}
-          />
-        )}
-        <RowAction
-          label={copied ? "Copied" : "Copy message"}
-          onClick={handleCopy}
-          icon={
-            copied ? (
-              <Check size={12} className="text-octo-verdigris" />
-            ) : (
-              <Copy size={12} />
-            )
-          }
+        <ChatMessage
+          message={message}
+          onOpenInEditor={onOpenInEditor}
+          skillNames={skillNames}
+          actions={isUser ? actions : undefined}
         />
       </div>
+      {!isUser && actions}
     </div>
   );
 }

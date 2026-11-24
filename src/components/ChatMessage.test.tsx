@@ -10,8 +10,8 @@
  * never re-parsed as Markdown — a pasted log or snippet keeps its characters.
  */
 import { describe, it, expect } from "vitest";
-import { render, screen } from "@testing-library/react";
-import { ChatMessage, usageFooter } from "./ChatMessage";
+import { render, screen, within } from "@testing-library/react";
+import { ChatMessage, usageFooter, turnTime } from "./ChatMessage";
 
 const TABLE = [
   "Aquí están los resultados en una tabla:",
@@ -152,5 +152,75 @@ describe("user message — skills invoked with it", () => {
     render(<ChatMessage message={{ role: "user", content: "run /release" }} />);
     expect(screen.queryByTestId("skill-chip")).toBeNull();
     expect(screen.getByText("run /release")).toBeInTheDocument();
+  });
+});
+
+describe("turns read apart at a glance", () => {
+  const SENT = "2026-11-24T14:02:00Z";
+
+  it("sets a user turn on the panel surface, with the brass eyebrow and the time it was sent", () => {
+    render(<ChatMessage message={{ role: "user", content: "Should it fail open?", createdAt: SENT }} />);
+    const time = turnTime(SENT);
+    const turn = screen.getByRole("article", { name: `You, ${time}` });
+    expect(turn).toHaveAttribute("data-role", "user");
+    expect(turn.className).toContain("bg-octo-panel");
+    expect(turn.className).toContain("border-octo-hairline");
+    expect(within(turn).getByText("— You").className).toContain("text-octo-brass");
+    const stamp = turn.querySelector("time")!;
+    expect(stamp).toHaveAttribute("dateTime", SENT);
+    expect(stamp.textContent).toBe(time);
+  });
+
+  it("puts a user turn's actions in its header, between the eyebrow and the time", () => {
+    render(
+      <ChatMessage
+        message={{ role: "user", content: "Do it", createdAt: SENT }}
+        actions={<button type="button">Fork from here</button>}
+      />,
+    );
+    const turn = screen.getByRole("article", { name: /^You/ });
+    const header = within(turn).getByText("— You").parentElement!;
+    const order = Array.from(header.children).map((el) => el.tagName.toLowerCase());
+    expect(order).toEqual(["span", "div", "time"]);
+    expect(within(header).getByRole("button", { name: "Fork from here" })).toBeInTheDocument();
+    // The actions come before the text in the DOM, so focus reaches them
+    // right after the ask's own label.
+    const body = turn.querySelector(".whitespace-pre-wrap")!;
+    expect(header.compareDocumentPosition(body) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("names a turn without a date just 'You'", () => {
+    render(<ChatMessage message={{ role: "user", content: "hi" }} />);
+    expect(screen.getByRole("article", { name: "You" }).querySelector("time")).toBeNull();
+  });
+
+  it("keeps the model's eyebrow mute: brass belongs to the director's turn", () => {
+    render(<ChatMessage message={{ role: "assistant", content: "Done. All green.", model: "claude-opus-4-7" }} />);
+    const answer = screen.getByRole("article", { name: "Opus 4.7" });
+    const eyebrow = within(answer).getByText("— Opus 4.7");
+    expect(eyebrow.className).toContain("text-octo-mute");
+    expect(eyebrow.className).not.toContain("text-octo-brass");
+  });
+});
+
+describe("turnTime", () => {
+  const now = new Date(2026, 10, 24, 18, 0);
+
+  it("is the clock time on the same day", () => {
+    const iso = new Date(2026, 10, 24, 14, 2).toISOString();
+    expect(turnTime(iso, now)).toBe(new Date(iso).toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" }));
+  });
+
+  it("puts the date in front on any other day", () => {
+    const iso = new Date(2026, 10, 23, 9, 30).toISOString();
+    const d = new Date(iso);
+    expect(turnTime(iso, now)).toBe(
+      `${d.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`,
+    );
+  });
+
+  it("is empty for a missing or unreadable date", () => {
+    expect(turnTime(null)).toBe("");
+    expect(turnTime("not a date")).toBe("");
   });
 });

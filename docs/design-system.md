@@ -145,19 +145,50 @@ A changed word in the diff (`.wd-add` / `.wd-del`) is painted in the text ink, n
 </p>
 ```
 
-### Tool call card
+### Talk turns: the ask, the work, the answer (2026-11-24)
+
+A long Talk thread reads in three registers, so whose turn is whose shows at a glance:
+
+| Register | Treatment | Brass |
+|---|---|---|
+| **The ask** (the director's turn) | `panel` inset, hairline border, 6px radius; header = eyebrow, hover/focus actions, time | the `— You` eyebrow, nothing else |
+| **The work** (narration + tool calls) | one hairline on the left; narration lines and one ledger row per call hang from it; a round of more than five calls folds into one summary row | none |
+| **The answer** | flush on the canvas; mute eyebrow, serif key phrase, sage body, mute usage footer | inline code only, as in any prose |
+
+The ask is the one filled surface in the thread that isn't code. Brass goes to the director's eyebrow because the human directs (VISION §3.1); the model's eyebrow is meta, so it is mute.
+
 ```tsx
-<div className="border-l border-octo-brass-dim bg-octo-brass-ghost
-                rounded-r-md px-3 py-2 flex items-center gap-3">
-  <span className="flex items-center gap-1.5 font-mono text-[9px] tracking-[0.2em] uppercase text-octo-brass">
-    <Eye size={12} strokeWidth={1.75} title="Read" /> READ
-  </span>
-  <span className="font-mono text-[11px] text-octo-sage ml-auto">
-    auth/middleware.ts
-  </span>
+{/* The ask — ChatMessage, user branch */}
+<article data-role="user" aria-label="You, 14:02"
+         className="rounded-md border border-octo-hairline bg-octo-panel px-4 pb-3 pt-2">
+  <div className="mb-1 flex h-6 items-center gap-2">
+    <span className="font-mono text-[10px] uppercase tracking-[0.25em] text-octo-brass">— You</span>
+    <div className="ml-auto flex items-center">{/* RowActions, opacity-0 until hover/focus */}</div>
+    <time dateTime={iso} className="octo-tabular font-mono text-[9px] tracking-[0.15em] text-octo-mute">14:02</time>
+  </div>
+  <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">{text}</div>
+</article>
+
+{/* The work — chat/WorkBlock.tsx */}
+<article aria-label="Work, 3 tool calls" className="flex flex-col gap-0.5 border-l border-octo-hairline pl-3">
+  <div className="py-1 text-[12.5px] leading-[1.55] text-octo-sage">Let me find where …</div>
+  <div role="group" aria-label="3 tool calls">
+    {/* one ToolCallCard ledger row per call */}
+  </div>
+</article>
+```
+
+### Tool call (a ledger row)
+A resolved call is a row, never a card: no border, no fill, 24px high, on the work block's hairline.
+```tsx
+<div role="button" aria-expanded={open} className="octo-ledger-row flex h-6 items-center gap-2.5 rounded px-1.5 -ml-1.5">
+  <Eye size={12} strokeWidth={1.75} className="text-octo-mute" />            {/* iconForTool, with a title */}
+  <span className="min-w-12 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">READ</span>
+  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">auth/middleware.ts</span>
+  <ChevronRight size={11} className="text-octo-mute" />
 </div>
 ```
-The `§` prefix is retired — the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
+`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. Its hover wash and focus ring live in `styles.css` (`.octo-ledger-row`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor) are mono caps in mute that turn brass on hover, not brass pills. The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
 ### Input with serif placeholder
 ```tsx
