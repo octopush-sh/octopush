@@ -107,7 +107,7 @@ export function RoutinesPane() {
         subtitle="Put a pipeline on a schedule — a review each morning, a dependency sweep every few hours. Routines fire while Octopush is running (a window missed while it was closed catches up on next launch); once a run starts it's detached, so the crew keeps going even if you quit."
       />
 
-      <div className="max-w-[720px] space-y-6">
+      <div className="space-y-6">
         {/* Upgrade banner (not a full replacement): a user who made routines
             while Pro then downgraded must still see and manage them. */}
         {!entitled && (

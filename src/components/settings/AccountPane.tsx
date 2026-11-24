@@ -186,7 +186,7 @@ export function AccountPane() {
         subtitle="Octopush is free and local-first. An account unlocks Pro — the multi-agent orchestration harness and optional sync across your Macs. Your provider keys never leave this device; your runs and library stay local unless you turn on sync."
       />
 
-      <div className="max-w-[640px] space-y-8">
+      <div className="space-y-8">
         {status.signedIn ? (
           <div className="space-y-4">
             <SectionLabel>Signed in</SectionLabel>

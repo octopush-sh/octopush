@@ -207,6 +207,13 @@
   --shell-stack:  8px;
   --shell-foot:   8px;
 
+  /* Settings content column: the one max width every Settings pane renders
+     in (`Settings.tsx`), so cards and notes end at the same x on every tab.
+     A pane that needs two columns (Models, Integrations) splits inside it;
+     no pane sets a width of its own. See docs/design-system.md, section 8,
+     "Full-screen rooms". */
+  --settings-content: 720px;
+
   /* Motion */
   --ease-octo:    cubic-bezier(0.2, 0.8, 0.3, 1);
   --dur-quick:    220ms;

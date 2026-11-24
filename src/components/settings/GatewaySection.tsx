@@ -53,7 +53,7 @@ export function GatewaySection({ report, filtered = false }: { report: GatewayRe
   const over = g.keyMaxBudgetUsd != null && (g.keySpendUsd ?? 0) >= g.keyMaxBudgetUsd;
   const keyBasis = report.basis === "key";
   return (
-    <div className="octo-fade-in mt-8 max-w-[860px]" data-testid="usage-gateway">
+    <div className="octo-fade-in mt-8" data-testid="usage-gateway">
       <div className="flex items-baseline justify-between gap-3">
         <SectionLabel>
           Gateway · {g.label} · <span className="normal-case tracking-normal">{g.host}</span>

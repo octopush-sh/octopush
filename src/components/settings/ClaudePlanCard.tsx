@@ -28,7 +28,7 @@ export function ClaudePlanCard() {
   if (windows.length === 0) return null;
   const warning = planWarning(windows, now);
   return (
-    <div className="octo-fade-in mt-8 max-w-[860px]" data-tour="usage-claude-plan">
+    <div className="octo-fade-in mt-8" data-tour="usage-claude-plan">
       <SectionLabel>Claude plan</SectionLabel>
       <ul className="space-y-1.5" data-testid="usage-claude-plan">
         {orderWindows(windows).map((w) => {

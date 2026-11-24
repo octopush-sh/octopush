@@ -23,7 +23,7 @@ export function EditorPane() {
         subtitle="Typography and layout for the built-in editor, plus the command used to open files in your editor of choice."
       />
 
-      <div className="max-w-[640px] space-y-4">
+      <div className="space-y-4">
         <SectionLabel>Editor</SectionLabel>
         <ToggleRow
           testId="editor-wrap"
