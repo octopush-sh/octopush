@@ -1062,6 +1062,13 @@ impl Orchestrator {
             } else {
                 0.0
             },
+            // Recorded the same way: the reset that follows a Resume or an
+            // answer forgets the stage's context reading.
+            resume_context_tokens: if stage.resume_pending {
+                self.db.lock().get_stage_resume_context(&stage.id)?
+            } else {
+                None
+            },
             blocked_transcript: stage.blocked_transcript.clone(),
             stage_id: stage.id.clone(),
             role_prompt: role_def.prompt_body,
@@ -1081,16 +1088,16 @@ impl Orchestrator {
         }
 
         // Input dossier = the freshest artifact of each kind from earlier stages.
-        // A resuming CLI stage discards the input for its resumed session, so
-        // don't spend a worktree-diff capture on it.
-        // A Codex resume still captures it: when `codex exec resume` fails the
-        // runner falls back to a fresh run, which needs the full dossier.
-        let fresh_input = !resuming || Self::is_codex_cli(stage);
+        // A resuming CLI stage discards the input for its resumed session, but
+        // still captures it: when `codex exec resume` fails, or a Claude
+        // `--resume` comes back on an empty conversation, the runner falls back
+        // to a fresh run, which needs the full dossier.
+        let fresh_input = !resuming || stage.substrate == "cli";
         let mut input = self.assemble_stage_input(run, stage.position, fresh_input)?;
         // Collision radar, phase 2 (#732): a code-writing stage (its artifact
         // is the worktree diff — implement, fix) hears which other live
         // workspaces of the project change the same files, so it keeps clear
-        // of them. Skipped when the runner discards the input (a resume).
+        // of them. Skipped when the dossier is built without the live diff.
         if fresh_input
             && matches!(spec.artifact_kind, ArtifactKind::Diff)
             && matches!(spec.role_environment, crate::orchestrator::types::RoleEnvironment::Worktree)
@@ -1600,8 +1607,8 @@ impl Orchestrator {
         // the producer's prose summary of them. Best-effort: a capture failure
         // or empty diff degrades to the "inspect with your tools" hint at
         // render time (user_input_for owns emptiness), never blocks the run.
-        // Skipped for a CLI-resume stage, whose runner discards the input in
-        // favor of the resumed session. Deliberate semantics: the worktree is
+        // Skipped when the caller says so (`capture_diff`); a resuming CLI
+        // stage still captures it for its fresh fallback. Deliberate semantics: the worktree is
         // the run's shared blackboard, so in a multi-branch authored graph the
         // diff can include a sibling branch's edits — the same visibility the
         // reviewer always had by inspecting the workspace; the rendered prompt
@@ -2551,6 +2558,9 @@ impl Orchestrator {
                             >(json)
                             .ok();
                             let feedback = format_blocker_feedback(ask.as_ref(), &answers);
+                            // Before the reset forgets it: what the resumed
+                            // session's context should come back near.
+                            self.db.lock().keep_stage_resume_context(&s.id)?;
                             // preserve_transcript: the answered re-run CONTINUES
                             // the asking conversation (D18).
                             self.archive_and_reset_stage(run_id, s, None, Some(&feedback), true)?;
@@ -2737,6 +2747,7 @@ impl Orchestrator {
                             &s.id,
                             if can_resume { s.cost_usd } else { 0.0 },
                         )?;
+                        self.db.lock().keep_stage_resume_context(&s.id)?;
                         self.db.lock().reset_run_stage(&s.id, None, None)?;
                         self.recompute_run_cost(run_id)?;
                     }

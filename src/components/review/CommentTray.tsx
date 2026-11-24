@@ -3,6 +3,8 @@ import { MessageSquare, X } from "lucide-react";
 import { commentLocation, isOutdated, quoteCutNote, type ReviewComment } from "../../lib/reviewComments";
 import { commentTarget, sendReviewComments } from "../../lib/sendReviewComments";
 import { selectComments, useReviewComments } from "../../stores/reviewCommentsStore";
+import { useGateComments } from "../../stores/gateCommentsStore";
+import { commentCount } from "../../lib/gateComments";
 import { useRunsStore } from "../../stores/runsStore";
 import { useChatStore } from "../../stores/chatStore";
 import { Reveal } from "../primitives/Reveal";
@@ -43,6 +45,8 @@ export function CommentTray({
   }, [has, latest, latestDetail]);
 
   const target = commentTarget(workspaceId);
+  // A send-back also carries the comments written on the gate's output.
+  const onGate = useGateComments(target.kind === "gate" ? target.gate : null);
   const blocked = target.kind === "talk" && talkBusy;
   const view = has ? comments : shown;
   const n = view.length;
@@ -73,8 +77,11 @@ export function CommentTray({
             >
               Send to the agent
             </button>
-            <span className="min-w-0 truncate font-mono text-[10px] text-octo-mute">
+            <span className="min-w-0 truncate font-mono text-[10px] text-octo-mute" title={target.kind === "gate" && onGate.length > 0 ? `The ${commentCount(onGate.length)} on ${target.gateRole}'s output at the gate go in the same message.` : undefined}>
               {target.kind === "gate" ? `as send-back to ${target.role}` : "in Talk"}
+              {target.kind === "gate" && onGate.length > 0 && (
+                <span data-tour="review-companion-gate-comments">, with {commentCount(onGate.length)} on {target.gateRole}</span>
+              )}
             </span>
           </div>
         </div>

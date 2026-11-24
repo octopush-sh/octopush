@@ -2,9 +2,27 @@ import { describe, it, expect } from "vitest";
 import { parseFullDiff, hunkFingerprint } from "./diffParser";
 import {
   MAX_QUOTE_LINE_CHARS, MAX_QUOTE_LINES, commentAnchor, commentLocation, commentsMessage, isOutdated, liveHunkKeys,
-  reanchorDraft, sendBackGate, type CommentDraft, type ReviewComment,
+  reanchorDraft, sendBackGate, stepPick, type CommentDraft, type ReviewComment,
 } from "./reviewComments";
 import type { RunStage } from "./ipc";
+
+describe("stepPick", () => {
+  it("starts a whole-hunk draft at its first row going down, its last going up", () => {
+    expect(stepPick(undefined, 4, 1, false)).toEqual({ from: 0, to: 0 });
+    expect(stepPick(undefined, 4, -1, true)).toEqual({ from: 3, to: 3 });
+  });
+  it("moves one row past the range's edge, and stays inside the hunk", () => {
+    expect(stepPick({ from: 1, to: 2 }, 4, 1, false)).toEqual({ from: 3, to: 3 });
+    expect(stepPick({ from: 2, to: 1 }, 4, -1, false)).toEqual({ from: 0, to: 0 });
+    expect(stepPick({ from: 3, to: 3 }, 4, 1, false)).toEqual({ from: 3, to: 3 });
+  });
+  it("extends by moving the free end and keeping where the range began", () => {
+    expect(stepPick({ from: 1, to: 1 }, 4, 1, true)).toEqual({ from: 1, to: 2 });
+    expect(stepPick({ from: 1, to: 2 }, 4, -1, true)).toEqual({ from: 1, to: 1 });
+    expect(stepPick({ from: 1, to: 1 }, 4, -1, true)).toEqual({ from: 1, to: 0 });
+    expect(stepPick({ from: 1, to: 3 }, 4, 1, true)).toEqual({ from: 1, to: 3 });
+  });
+});
 
 const DIFF = `diff --git a/src/foo.ts b/src/foo.ts
 index abc..def 100644
