@@ -21,6 +21,8 @@ import type {
   ChatMessage,
   ChatThread,
   GitStatus,
+  McpServerConfig,
+  McpToolInfo,
   ModelInfo,
   ModelWithProvider,
   PerfStats,
@@ -240,6 +242,15 @@ const PERF: PerfStats = {
   ts: 0,
 };
 
+const MCP_SERVERS = {
+  github: { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: {} },
+} satisfies Record<string, McpServerConfig>;
+
+const MCP_TOOLS = [
+  { server: "github", name: "get_issue", namespaced: "mcp__github__get_issue", description: "Read an issue" },
+  { server: "github", name: "list_pull_requests", namespaced: "mcp__github__list_pull_requests", description: "List pull requests" },
+] satisfies McpToolInfo[];
+
 export const defaultScenario: Scenario = {
   name: "default",
   description: "Signed-in Pro user · project “octopush” with two workspaces · a finished Direct run · a short Talk thread · three providers.",
@@ -318,6 +329,10 @@ export const defaultScenario: Scenario = {
     get_perf_stats: PERF,
     get_workspace_cache_sizes: { entries: [], totalBytes: 0 },
     mcp_connection_status: { binaryFound: true, claudeFound: true, registered: true, manualCommand: "claude mcp add octopush -s user -- octopush-mcp" },
+    // Settings › Integrations › MCP Servers
+    get_mcp_config: MCP_SERVERS,
+    test_mcp_server: MCP_TOOLS,
+    reconnect_mcp_server: MCP_TOOLS,
   },
 };
 
