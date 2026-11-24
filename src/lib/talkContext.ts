@@ -305,10 +305,15 @@ export function diffForFile(diff: string, path: string): string {
  *  tests, docs) apply as they do to a commit. Per section, each hunk's new
  *  side (context and added lines, `+`/space dropped) is one input numbered
  *  from its `@@ +N` header, and each run of removed lines another, numbered
- *  from `-N`. A new or untracked file's first input is `wholeFile`, also
- *  when the diff has no lines for it (binary). Text before the first section
- *  (`# Staged`) and lines no hunk accounts for (a cut note) aren't file
- *  content and are left out. */
+ *  from `-N`. The text after a hunk header's `@@ … @@` is a file's line too:
+ *  git and libgit2 put there the nearest line before the hunk that starts
+ *  with a letter, `_` or `$`, so it is an input of its own, numbered as the
+ *  line before the hunk's new start. A new or untracked file's first input
+ *  is `wholeFile`, also when the diff has no lines for it (binary). The rest
+ *  of what is sent holds no file content and is left out: text before the
+ *  first section (`# Staged`), the extended header (`diff --git`, `index`,
+ *  modes, `---`/`+++`, `Binary files … differ`: paths, hashes and modes),
+ *  `\ No newline at end of file` and cut notes. */
 export function diffScanInputs(diff: string): {
   label: string;
   text: string;
@@ -344,12 +349,15 @@ export function diffScanInputs(diff: string): {
     };
     for (; i < lines.length; i++) {
       const l = lines[i];
-      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@([\s\S]*)/.exec(l);
       if (hunk) {
         flushRemoved();
         flushNew();
         oldN = Number(hunk[1]);
         newAt = Number(hunk[2]);
+        // The header's function context is sent with the diff: scan it too.
+        const context = hunk[3].replace(/^ /, "");
+        if (context.trim()) out.push({ label, text: context, firstLine: Math.max(1, newAt - 1), wholeFile: false });
         cur = { label, text: "", firstLine: Math.max(1, newAt), wholeFile: false };
         out.push(cur);
         continue;

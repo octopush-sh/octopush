@@ -28045,4 +28045,44 @@ mod talk_context_guard_tests {
         assert!(report.findings.iter().any(|f| f.file == "id_rsa" && f.line.is_none() && f.rule == "ssh-private-key-file"));
         assert_eq!(report.total, 2);
     }
+
+    /// libgit2 writes the nearest earlier line that starts with a letter, `_`
+    /// or `$` after a hunk header's `@@ … @@`, so `@diff` sends it even when
+    /// it is far from the change. Talk scans it as an input of its own, by
+    /// the file's path, numbered as the line before the hunk's new start
+    /// (`diffScanInputs`).
+    #[test]
+    fn a_diff_hunk_headers_context_line_is_flagged() {
+        use std::process::Command;
+        let token = ["gh", "p_"].concat() + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        let before = format!("GITHUB_TOKEN={token}\n1\n2\n3\n4\n5\n6\nold\n");
+        std::fs::write(dir.path().join("deploy.sh"), &before).unwrap();
+        Command::new("git").args(["add", "."]).current_dir(dir.path()).output().unwrap();
+        Command::new("git")
+            .args(["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false", "commit", "-m", "x"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        std::fs::write(dir.path().join("deploy.sh"), before.replace("old", "new")).unwrap();
+        let diff = crate::git_ops::get_diff_text(dir.path(), false).unwrap();
+        let header = diff.lines().find(|l| l.starts_with("@@ ")).expect("a hunk header");
+        let (range, context) = header.split_once(" @@ ").expect("function context after the header");
+        assert_eq!(context, format!("GITHUB_TOKEN={token}"));
+        // The changed hunk's own lines don't hold it.
+        assert!(!diff.lines().any(|l| l.starts_with(['+', '-', ' ']) && l.contains(&token)));
+
+        let new_start: u32 = range.split('+').nth(1).unwrap().split(',').next().unwrap().parse().unwrap();
+        let blocks = vec![
+            TextBlock { label: "deploy.sh".into(), text: context.to_string(), first_line: Some(new_start.saturating_sub(1).max(1)), whole_file: false },
+            TextBlock { label: "deploy.sh".into(), text: "4\n5\n6\nnew".into(), first_line: Some(new_start), whole_file: false },
+            TextBlock { label: "deploy.sh".into(), text: "old".into(), first_line: Some(new_start + 3), whole_file: false },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report
+            .findings
+            .iter()
+            .any(|f| f.file == "deploy.sh" && f.line == Some(new_start - 1) && f.rule == "github-token"));
+    }
 }

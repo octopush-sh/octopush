@@ -149,28 +149,42 @@ export function resolveContextBlocks(
   return Promise.all(refs.map((r) => resolveContextBlock(r, workspacePath, files, share)));
 }
 
+/** The guard's verdict on a message's blocks. `unchecked` is the part of
+ *  `flagged` whose scan couldn't run. */
+export interface ContextVerdict {
+  flagged: Set<number>;
+  unchecked: Set<number>;
+  refusal: SecretRefusal;
+}
+
 /** The secret guard's verdict on a message's blocks (#1046): which blocks
  *  hold a possible secret, and the refusal the confirm shows (kind and block,
  *  never the value). Each block is scanned on its own so every flagged one is
- *  known, even past the findings cap. `null` when nothing was found or the
- *  guard is off. */
-export async function scanContextBlocks(
-  blocks: ResolvedBlock[],
-): Promise<{ flagged: Set<number>; refusal: SecretRefusal } | null> {
+ *  known, even past the findings cap. A block whose scan can't run is held
+ *  too, as unchecked (the refusal is `partial` and names it in `unchecked`):
+ *  it is about to leave the Mac, so the confirm asks rather than sending it
+ *  unread. `null` when nothing was found or the guard is off. */
+export async function scanContextBlocks(blocks: ResolvedBlock[]): Promise<ContextVerdict | null> {
   const previews = await Promise.all(
     blocks.map(async (b) => {
       if (b.scan.length === 0) return null;
       try {
         return await ipc.secretScanText(b.scan);
       } catch {
-        return null; // as the commit guard does: a scan that can't run doesn't hold
+        return "unchecked" as const;
       }
     }),
   );
   const flagged = new Set<number>();
+  const unchecked = new Set<number>();
   const findings: SecretFinding[] = [];
   let total = 0;
   previews.forEach((p, i) => {
+    if (p === "unchecked") {
+      flagged.add(i);
+      unchecked.add(i);
+      return;
+    }
     if (!p) return;
     const n = Math.max(p.total, p.findings.length);
     if (n === 0) return;
@@ -179,11 +193,21 @@ export async function scanContextBlocks(
     total += n;
   });
   if (flagged.size === 0) return null;
-  return { flagged, refusal: { findings, total, partial: false, fingerprint: "" } };
+  const refusal: SecretRefusal = { findings, total, partial: unchecked.size > 0, fingerprint: "" };
+  if (unchecked.size > 0) refusal.unchecked = [...unchecked].map((i) => `@${quoteToken(blocks[i].ref.token)}`);
+  return { flagged, unchecked, refusal };
 }
 
 /** The message's blocks as sent: a flagged block the user left out says so
- *  in its place. */
-export function joinBlocks(blocks: ResolvedBlock[], leaveOut: Set<number> = new Set()): string {
-  return blocks.map((b, i) => (leaveOut.has(i) ? note(b.ref, "possible secret") : b.text)).join("");
+ *  in its place, and why (`unchecked`: its scan couldn't run). */
+export function joinBlocks(
+  blocks: ResolvedBlock[],
+  leaveOut: Set<number> = new Set(),
+  unchecked: Set<number> = new Set(),
+): string {
+  return blocks
+    .map((b, i) =>
+      leaveOut.has(i) ? note(b.ref, unchecked.has(i) ? "couldn't be checked for secrets" : "possible secret") : b.text,
+    )
+    .join("");
 }

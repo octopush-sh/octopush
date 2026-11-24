@@ -200,9 +200,67 @@ describe("scanContextBlocks", () => {
     expect(await scanContextBlocks(blocks)).toBeNull();
   });
 
-  it("holds nothing when a scan throws", async () => {
+  it("holds a block whose scan can't run, as one that couldn't be checked", async () => {
     secretScanText.mockRejectedValue(new Error("settings unreadable"));
+    getGitDiff.mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+t\n");
     const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts @diff", cat), "/w", files);
-    expect(await scanContextBlocks(blocks)).toBeNull();
+    const verdict = await scanContextBlocks(blocks);
+    expect(verdict?.flagged).toEqual(new Set([0, 1]));
+    expect(verdict?.unchecked).toEqual(new Set([0, 1]));
+    expect(verdict?.refusal).toEqual({ findings: [], total: 0, partial: true, fingerprint: "", unchecked: ["@src/a.ts", "@diff"] });
+    const sent = joinBlocks(blocks, verdict!.flagged, verdict!.unchecked);
+    expect(sent).toBe(
+      "\n\nsrc/a.ts _(not included: couldn't be checked for secrets)_\n\ndiff _(not included: couldn't be checked for secrets)_",
+    );
+  });
+
+  it("holds a finding and an unchecked block together", async () => {
+    secretScanText.mockImplementation(async ([b]: { label: string; wholeFile?: boolean }[]) => {
+      if (b.wholeFile) throw new Error("scan stopped");
+      return { findings: [finding("src/a.ts")], total: 1, partial: false };
+    });
+    getGitDiff.mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+t\n");
+    const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts @diff", cat), "/w", files);
+    const verdict = await scanContextBlocks(blocks);
+    expect(verdict?.flagged).toEqual(new Set([0, 1]));
+    expect(verdict?.unchecked).toEqual(new Set([0]));
+    expect(verdict?.refusal).toMatchObject({ total: 1, partial: true, unchecked: ["@src/a.ts"] });
+    const sent = joinBlocks(blocks, verdict!.flagged, verdict!.unchecked);
+    expect(sent).toContain("src/a.ts _(not included: couldn't be checked for secrets)_");
+    expect(sent).toContain("diff _(not included: possible secret)_");
+  });
+
+  it("flags a secret git wrote after a hunk header's @@", async () => {
+    // Fake, token-shaped: what the GitHub-token rule matches.
+    const token = ["gh", "p_"].join("") + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+    const tokenRule = /gh[p]_[A-Za-z0-9]{36}/;
+    secretScanText.mockImplementation(async (inputs: { label: string; text: string; firstLine?: number }[]) => {
+      const hit = inputs.find((b) => tokenRule.test(b.text));
+      return hit
+        ? { findings: [{ ...finding(hit.label), line: hit.firstLine ?? 1 }], total: 1, partial: false }
+        : { findings: [], total: 0, partial: false };
+    });
+    getGitDiff.mockResolvedValue(
+      [
+        "diff --git a/deploy.sh b/deploy.sh",
+        "index 1..2 100644",
+        "--- a/deploy.sh",
+        "+++ b/deploy.sh",
+        `@@ -5,4 +5,4 @@ GITHUB_TOKEN=${token}`,
+        " 4",
+        " 5",
+        " 6",
+        "-old",
+        "+new",
+        "",
+      ].join("\n"),
+    );
+    const blocks = await resolveContextBlocks(extractContextRefs("@diff", cat), "/w", files);
+    // Sent to the model as part of the diff…
+    expect(blocks[0].text).toContain(`@@ GITHUB_TOKEN=${token}`);
+    const verdict = await scanContextBlocks(blocks);
+    // …so it is held, and the finding names the file.
+    expect(verdict?.flagged).toEqual(new Set([0]));
+    expect(verdict?.refusal.findings).toEqual([expect.objectContaining({ file: "deploy.sh", line: 4 })]);
   });
 });

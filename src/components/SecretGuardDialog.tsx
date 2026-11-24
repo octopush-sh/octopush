@@ -3,14 +3,24 @@
  * push or pull request is refused with `SecretsFound`. Lists what was found
  * (kind · file:line · masked preview like `sk-ant-…9fQ2` — never the value,
  * #820), and says so when the scan stopped
- * at its 16 MB budget. "Leave it out" is the default focus and Escape's
+ * at its 16 MB budget, or (a Talk message) which `@` blocks it couldn't
+ * scan at all. "Leave it out" is the default focus and Escape's
  * action (for a Talk message, Escape cancels the send instead); the override is an explicit second choice that applies to this one
  * action and these exact findings only (the core rescans and checks the
  * fingerprint).
  */
 import { ShieldAlert } from "lucide-react";
 import { ModalShell } from "./ModalShell";
-import { PARTIAL_NOTE, PREVIEW_TIP, findingLocation, guardHeadline, overrideLabel, type GuardedAction, type SecretRefusal } from "../lib/secretGuard";
+import {
+  PARTIAL_NOTE,
+  PREVIEW_TIP,
+  findingLocation,
+  guardHeadline,
+  overrideLabel,
+  uncheckedNote,
+  type GuardedAction,
+  type SecretRefusal,
+} from "../lib/secretGuard";
 
 const SHOWN = 5;
 
@@ -29,6 +39,7 @@ interface Props {
 
 export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride, onClose }: Props) {
   const { findings, total, partial } = refusal;
+  const unchecked = refusal.unchecked ?? [];
   const shown = findings.slice(0, SHOWN);
   const more = Math.max(total, findings.length) - shown.length;
   const yours = findings.some((f) => f.yours);
@@ -40,7 +51,7 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride, onC
           <span>Possible secret</span>
         </div>
         <h2 className="mt-2 font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory">
-          {guardHeadline(action, findings, total)}
+          {guardHeadline(action, findings, total, unchecked)}
         </h2>
         {findings.length > 1 || total > findings.length ? (
           <ul className="mt-3 space-y-1" aria-label="What was found">
@@ -66,9 +77,11 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride, onC
             </p>
           )
         )}
-        {partial && (
+        {/* Blocks the guard couldn't scan: the lead names them when nothing
+            was found, else this line does. */}
+        {partial && (unchecked.length === 0 || total > 0) && (
           <p data-tour="secret-guard-partial" className="mt-3 font-mono text-[11px] text-octo-mute">
-            {PARTIAL_NOTE}
+            {unchecked.length > 0 ? uncheckedNote(unchecked) : PARTIAL_NOTE}
           </p>
         )}
         <p className="mt-3 text-[12px] leading-relaxed text-octo-sage">

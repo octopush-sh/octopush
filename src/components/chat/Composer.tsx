@@ -334,6 +334,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   const [contextGuard, setContextGuard] = useState<{
     refusal: SecretRefusal;
     flagged: Set<number>;
+    /** The flagged blocks whose scan couldn't run. */
+    unchecked: Set<number>;
     blocks: ResolvedBlock[];
     outgoing: string;
     /** What was typed, put back in the composer if the send is cancelled. */
@@ -589,7 +591,8 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     // receives them. The chat shows exactly what was sent (transparent). Each
     // block is capped at 64k; one that can't be read says so in the message.
     // At most MAX_MENTIONS ride along. Before anything is sent, the secret
-    // guard reads every block; a finding waits for the confirm (#1046).
+    // guard reads every block; a finding, or a block it couldn't scan, waits
+    // for the confirm (#1046).
     const refs = capRefs(extractContextRefs(outgoing, catalog)).kept;
     if (refs.length === 0) {
       send(workspaceId, workspacePath, outgoing);
@@ -624,14 +627,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }, [streaming, send, runShell, workspaceId, workspacePath, catalog, files]);
 
   /** The confirm's answer: send without the flagged blocks (each says it was
-   *  left out), or with them for this one message. */
+   *  left out, and why), or with them for this one message. */
   function resolveContextGuard(sendAnyway: boolean) {
     const g = contextGuard;
     if (!g) return;
     setContextGuard(null);
     expandingRef.current = false;
     setExpanding(false);
-    send(g.workspaceId, g.workspacePath, g.outgoing + joinBlocks(g.blocks, sendAnyway ? undefined : g.flagged));
+    send(g.workspaceId, g.workspacePath, g.outgoing + joinBlocks(g.blocks, sendAnyway ? undefined : g.flagged, g.unchecked));
     textareaRef.current?.focus();
   }
 
@@ -972,9 +975,9 @@ export function Composer({ workspaceId, workspacePath }: Props) {
           onOverride={() => void resolveShellSecret(workspaceId, true)}
         />
       )}
-      {/* An `@` block that holds a possible secret (#1046): its kind and
-          block, never the value; "Leave it out" is the default, Escape
-          cancels the send. */}
+      {/* An `@` block that holds a possible secret, or that the guard
+          couldn't scan (#1046): its kind and block, never the value; "Leave
+          it out" is the default, Escape cancels the send. */}
       {contextGuard && (
         <SecretGuardDialog
           action="message"

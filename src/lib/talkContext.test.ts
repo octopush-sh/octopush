@@ -216,6 +216,42 @@ describe("talkContext — blocks", () => {
     expect(diffScanInputs("(no changes)")).toEqual([]);
   });
 
+  it("reads the line git puts after a hunk header's @@ as the file's own", () => {
+    // Fake, token-shaped: what the GitHub-token rule matches.
+    const token = ["gh", "p_"].join("") + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+    const diff = [
+      "diff --git a/config/app.env b/config/app.env",
+      "index 1..2 100644",
+      "--- a/config/app.env",
+      "+++ b/config/app.env",
+      `@@ -3,2 +3,2 @@ GITHUB_TOKEN=${token}`,
+      " A=1",
+      "-B=2",
+      "+B=3",
+      "@@ -1 +0,0 @@ only_context",
+      "-gone",
+      "@@ -40 +40 @@ ",
+      "+x",
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -10 +10 @@ function load() {\r",
+      "+y",
+    ].join("\n");
+    expect(diffScanInputs(diff)).toEqual([
+      { label: "config/app.env", text: `GITHUB_TOKEN=${token}`, firstLine: 2, wholeFile: false },
+      { label: "config/app.env", text: "A=1\nB=3", firstLine: 3, wholeFile: false },
+      { label: "config/app.env", text: "B=2", firstLine: 4, wholeFile: false },
+      // Numbered as the line before the hunk's new start, never below 1; a
+      // header with nothing after its `@@` adds nothing.
+      { label: "config/app.env", text: "only_context", firstLine: 1, wholeFile: false },
+      { label: "config/app.env", text: "gone", firstLine: 1, wholeFile: false },
+      { label: "config/app.env", text: "x", firstLine: 40, wholeFile: false },
+      { label: "src/a.ts", text: "function load() {\r", firstLine: 9, wholeFile: false },
+      { label: "src/a.ts", text: "y", firstLine: 10, wholeFile: false },
+    ]);
+  });
+
   it("fences a block with more backticks than its content holds", () => {
     expect(fenced("h", "x")).toBe("\n\nh\n```\nx\n```");
     expect(fenced("h", "a\n````\nb", "diff")).toBe("\n\nh\n`````diff\na\n````\nb\n`````");

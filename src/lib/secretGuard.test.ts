@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { branchScanSummary, findingLocation, guardHeadline, holdSummary, overrideLabel, previewSummary, secretRefusal, secretSummary, type SecretFinding } from "./secretGuard";
+import { branchScanSummary, findingLocation, guardHeadline, holdSummary, overrideLabel, previewSummary, secretRefusal, secretSummary, uncheckedNote, type SecretFinding } from "./secretGuard";
 
 const f = (over: Partial<SecretFinding> = {}): SecretFinding => ({
   file: "tests/fixtures.ts", line: 12, rule: "anthropic-key", kind: "Anthropic API key", yours: false, ...over,
@@ -83,6 +83,18 @@ describe("secretGuard", () => {
       "This message attaches what looks like a GitHub token in @diff:4.",
     );
     expect(guardHeadline("message", [f(), f()])).toBe("This message attaches 2 things that look like secrets.");
+    // Blocks the guard couldn't scan (#1046), named by their token.
+    expect(guardHeadline("message", [], 0, ["@diff"])).toBe("This message's @diff couldn't be checked.");
+    expect(guardHeadline("message", [], 0, ["@src/a.ts#L2-3", "@session:dev"])).toBe(
+      "This message's @src/a.ts#L2-3 and @session:dev couldn't be checked.",
+    );
+    expect(guardHeadline("message", [], 0, ["@diff", "@src/", "@a.ts", "@b.ts"])).toBe(
+      "This message's @diff, @src/ and 2 more couldn't be checked.",
+    );
+    expect(guardHeadline("message", [f({ kind: "GitHub token", file: "a.ts", line: 3 })], 1, ["@diff"])).toBe(
+      "This message attaches what looks like a GitHub token in a.ts:3.",
+    );
+    expect(uncheckedNote(["@diff"])).toBe("@diff couldn't be checked.");
     expect(guardHeadline("command", [f({ kind: "GitHub token" })])).toBe(
       "This command adds what looks like a GitHub token in tests/fixtures.ts:12.",
     );

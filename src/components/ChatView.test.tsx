@@ -963,13 +963,18 @@ describe("ChatView — context guard and limits (#1046)", () => {
     expect(req.userMessage).toContain("+t");
   });
 
-  it("sends the message when the scan can't run", async () => {
+  it("asks before sending a block the scan couldn't check, and leaves it out by default", async () => {
     vi.mocked(ipcMock.secretScanText).mockRejectedValue(new Error("secret scan stopped"));
     await sendDraft("check @diff now");
+    expect(await screen.findByText("This message's @diff couldn't be checked.")).toBeInTheDocument();
+    expect(screen.queryByText(/16 MB/)).toBeNull();
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+    const leaveOut = screen.getByRole("button", { name: "Leave it out" });
+    expect(leaveOut).toHaveFocus();
+    fireEvent.click(leaveOut);
     await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
     const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
-    expect(req.userMessage).toContain("+t");
-    expect(screen.queryByRole("button", { name: "Leave it out" })).toBeNull();
+    expect(req.userMessage).toBe("check @diff now\n\ndiff _(not included: couldn't be checked for secrets)_");
   });
 
   it("sends nothing on Escape and gives the draft back", async () => {
