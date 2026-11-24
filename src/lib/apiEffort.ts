@@ -9,8 +9,9 @@ const GPT6_EFFORT_NONE = ["gpt-6-sol", "gpt-6-luna", "gpt-6.1-terra"];
 
 /** The Off segment's tooltip on an API stage. GPT-6 reasons at `medium` when
  *  no effort is sent, so Off is `none` where OpenAI accepts it (Sol, Luna,
- *  6.1 Terra) and the model's default elsewhere (Astra, 6.1 Sol). A gateway
- *  (LiteLLM, OpenRouter) gets no effort at all, so the default applies there. */
+ *  6.1 Terra) and the model's default elsewhere (Astra, 6.1 Sol, 6.2 Astra,
+ *  6.2 Sol). Through a gateway (LiteLLM, OpenRouter) a set effort still goes
+ *  out as `reasoning_effort`, but Off sends nothing, so the default applies. */
 export function apiEffortOffTitle(model: string): string {
   const id = model.trim().toLowerCase().split("/").pop() ?? "";
   if (!id.includes("gpt-6")) return EFFORT_OFF_TITLE;

@@ -270,6 +270,22 @@ pub fn known_bad_stage_error(
 /// How [`known_bad_stage_error`]'s first line starts; `stageHalt.ts` reads it.
 pub const KNOWN_BAD_STAGE_PREFIX: &str = "Skip Claude Code ";
 
+/// Claude Code releases worth updating to that fix no sandbox or permission
+/// escape, oldest first: (version, why it matters in one line). They never
+/// warn a stage or the launcher; the Readiness card's Claude Code row shows
+/// the newest one missing as a recommended note while a Run-mode session runs
+/// Claude Code (`ReadinessCard.tsx`).
+pub const CLAUDE_RECOMMENDED_FIXES: &[(&str, &str)] = &[
+    ("2.1.330", "fixes ExitWorktree removing a worktree another session is using"),
+];
+
+/// "Recommended: Claude Code 2.1.330 fixes …" when the known `version` lacks
+/// a [`CLAUDE_RECOMMENDED_FIXES`] row; `None` otherwise.
+pub fn claude_recommended_notice(version: &str) -> Option<String> {
+    let (fix, reason) = missing_security_fix(version, CLAUDE_RECOMMENDED_FIXES)?;
+    Some(format!("Recommended: Claude Code {fix} {reason}."))
+}
+
 /// Codex CLI releases that fix a sandbox or permission escape, oldest first:
 /// (version, why it matters in one line). Codex writer stages run in Codex's
 /// own `workspace-write` sandbox, so the Readiness card's Codex row warns

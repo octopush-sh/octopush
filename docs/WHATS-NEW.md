@@ -156,6 +156,7 @@ Current anchors:
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
+| `settings-readiness-claude-note` | Settings › General, Readiness card: the Claude Code row's sage "Recommended: Claude Code 2.1.330 fixes ExitWorktree…" note (only below 2.1.330, while a Run-mode session runs Claude Code) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-models` | Settings › General, Readiness card: the Crew models row (only while a saved crew or Routine uses a model within 30 days of its retirement, or past it) | `settings/ReadinessCard.tsx` |
 | `settings-account-sync-history-status` · `settings-account-sync-library-status` | Settings › Account › Sync: the last-attempt line under the run-history · library toggle (only while that toggle is on and an attempt was recorded) | `settings/AccountPane.tsx` |
 | `settings-account-sync-library-unsent` | Settings › Account › Sync: the amber line under the library toggle naming the items the sync service refused (only while library sync is on and an item is unsent) | `settings/AccountPane.tsx` |

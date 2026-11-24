@@ -10967,6 +10967,25 @@ mod cli_args_tests {
     }
 
     #[test]
+    fn every_claude_stage_disallows_the_worktree_tools_once() {
+        // #1002: a stage's workspace is fixed. EnterWorktree would move its
+        // work out of the worktree Octopush watches; before Claude Code
+        // 2.1.330, ExitWorktree could remove one another session works in.
+        for args in [
+            build_cli_args("m", "sys", 10, false),
+            build_cli_args("m", "sys", 10, true),
+            build_cli_args_resume("m", "sess", 10, false),
+            build_cli_args_resume("m", "sess", 10, true),
+        ] {
+            let i = args.iter().position(|a| a == "--disallowedTools").expect("denial flag present");
+            for tool in ["EnterWorktree", "ExitWorktree"] {
+                let n = args[i + 1].split(',').filter(|t| *t == tool).count();
+                assert_eq!(n, 1, "{tool} exactly once: {args:?}");
+            }
+        }
+    }
+
+    #[test]
     fn args_include_model_format_and_permission() {
         let args = build_cli_args("claude-sonnet-4-6", "You are a planner.", 40, false);
         assert!(args.contains(&"-p".to_string()));
@@ -11053,6 +11072,171 @@ mod cli_args_tests {
         assert_eq!(read_guard_label(true, Some("2.1.257")), None);
         assert_eq!(read_guard_label(true, None), None, "an unknown version never warns");
         assert_eq!(read_guard_label(false, Some("2.1.250")), None, "unsandboxed: nothing was asked for");
+    }
+
+    #[test]
+    fn every_seatbelt_wrapped_claude_stage_turns_claude_codes_own_bash_sandbox_off() {
+        use crate::orchestrator::cli_runner::{
+            confine_reads_in_sandbox, turn_off_inner_sandbox, CliDialect, CodexWriteScope, INNER_SANDBOX_OFF_LABEL,
+        };
+        use crate::orchestrator::sandbox::stage_isolation;
+        // #1001: a user's `sandbox.enabled` in ~/.claude/settings.json can't
+        // nest in the mission profile, so every stage the profile wraps
+        // overrides it in `--settings`, beside the guards, fresh and resumed.
+        let settings = |args: &[String]| -> serde_json::Value {
+            let at: Vec<usize> = args.iter().enumerate().filter(|(_, a)| *a == "--settings").map(|(i, _)| i).collect();
+            assert_eq!(at.len(), 1, "exactly one --settings: {args:?}");
+            serde_json::from_str(&args[at[0] + 1]).expect("--settings value is valid JSON")
+        };
+        for (git, exec, wrapped, reads) in [
+            ("worktree", "sandbox", true, true),
+            ("readonly", "sandbox", true, true),
+            ("readonly", "none", true, false),
+            ("worktree", "none", false, false),
+        ] {
+            let iso = stage_isolation(git, exec, "/ws");
+            for mut args in [
+                build_cli_args("m", "sys", 10, false),
+                build_cli_args("m", "sys", 10, true),
+                build_cli_args_resume("m", "sess", 10, false),
+                build_cli_args_resume("m", "sess", 10, true),
+            ] {
+                assert_eq!(confine_reads_in_sandbox(CliDialect::Claude, &iso.exec_choice, &mut args), reads);
+                assert_eq!(turn_off_inner_sandbox(CliDialect::Claude, &iso.exec_isolation, &mut args), wrapped, "{git}/{exec}");
+                let v = settings(&args);
+                assert_eq!(v["permissions"]["blockWritesOutsideWorkingDirectories"], serde_json::json!(true), "{args:?}");
+                assert_eq!(v["permissions"].get("blockReadsOutsideWorkingDirectories").is_some(), reads, "{args:?}");
+                if wrapped {
+                    assert_eq!(v["sandbox"], serde_json::json!({ "enabled": false }), "{git}/{exec}: {args:?}");
+                } else {
+                    assert!(v.get("sandbox").is_none(), "unsandboxed: the user's own sandbox is left alone: {args:?}");
+                }
+            }
+        }
+        // Codex has no `--settings`; its argv is left alone.
+        let codex = CliDialect::Codex.argv("gpt-5", "sys", 10, false, CodexWriteScope::MissionSandbox);
+        let mut same = codex.clone();
+        assert!(!turn_off_inner_sandbox(CliDialect::Codex, "sandbox", &mut same));
+        assert_eq!(same, codex);
+        assert_eq!(
+            INNER_SANDBOX_OFF_LABEL,
+            "Claude Code's own Bash sandbox is off here: Octopush's sandbox confines this stage"
+        );
+    }
+
+    #[test]
+    fn claude_codes_sandbox_is_off_refusal_is_named_and_not_escalated() {
+        use crate::orchestrator::cli_runner::{
+            is_inner_sandbox_off, is_plan_limit, name_inner_sandbox_off, parse_cli_result, CliDialect,
+            InnerSandboxWatch, INNER_SANDBOX_OFF,
+        };
+        use crate::orchestrator::types::{ArtifactKind, StageStatus};
+        // #1001: since Claude Code 2.1.328 a sandbox that can't start makes the
+        // next sandboxed Bash command refuse, saying the sandbox is off for the
+        // session. The stage names that instead of failing generically.
+        let refusal_text = "Sandbox is off for the session: the sandbox could not start, so this command was not run.";
+        let tool_use = |name: &str, id: &str| {
+            serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "tool_use", "id": id, "name": name, "input": { "command": "npm test" } }
+            ] } })
+        };
+        let result = |id: &str, is_error: bool, content: serde_json::Value| {
+            serde_json::json!({ "type": "user", "message": { "content": [
+                { "type": "tool_result", "tool_use_id": id, "is_error": is_error, "content": content }
+            ] } })
+        };
+        fn watch(exec: &str, events: &[serde_json::Value]) -> InnerSandboxWatch {
+            let mut w = InnerSandboxWatch::for_stage(CliDialect::Claude, exec);
+            for e in events {
+                w.observe(e);
+            }
+            w
+        }
+        let refused_bash = |id: &str| [tool_use("Bash", id), result(id, true, serde_json::json!(refusal_text))];
+        let ran_bash = |id: &str| [tool_use("Bash", id), result(id, false, serde_json::json!("ok"))];
+
+        // A Bash refusal counts, as string or block content.
+        let w = watch("sandbox", &refused_bash("t1"));
+        assert!(w.refused() && w.decisive());
+        let w = watch(
+            "sandbox",
+            &[
+                tool_use("Bash", "t1"),
+                result("t1", true, serde_json::json!([{ "type": "text", "text": "Refused: the sandbox is off for the session." }])),
+            ],
+        );
+        assert!(w.refused());
+
+        // Review point 1: only an `is_error` result of a Bash call counts. A
+        // Read or Grep of this repo's docs quoting the phrase does not, nor a
+        // Bash `cat` that printed it, nor a result whose call never opened.
+        for events in [
+            vec![tool_use("Read", "r1"), result("r1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Grep", "g1"), result("g1", true, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", false, serde_json::json!(refusal_text))],
+            vec![tool_use("Bash", "b1"), result("b1", true, serde_json::json!("npm test: 3 failed"))],
+            vec![result("t9", true, serde_json::json!(refusal_text))],
+            vec![serde_json::json!({ "type": "assistant", "message": { "content": [
+                { "type": "text", "text": "the sandbox is off for the session" }
+            ] } })],
+        ] {
+            let w = watch("sandbox", &events);
+            assert!(!w.refused() && !w.decisive(), "{events:?}");
+        }
+
+        // Review point 2: only a stage the Seatbelt profile wraps is watched.
+        assert!(!watch("none", &refused_bash("t1")).refused(), "an unsandboxed stage's stream doesn't count");
+        let mut codex = InnerSandboxWatch::for_stage(CliDialect::Codex, "sandbox");
+        refused_bash("t1").iter().for_each(|e| codex.observe(e));
+        assert!(!codex.refused());
+
+        // Review point 3: decisive only when the refusal is the last Bash result.
+        let last: Vec<_> = [ran_bash("a"), refused_bash("b")].concat();
+        assert!(watch("sandbox", &last).decisive(), "the refusal was the last Bash result");
+        let all: Vec<_> = [ran_bash("a"), refused_bash("b"), refused_bash("c"), refused_bash("d")].concat();
+        assert!(watch("sandbox", &all).decisive(), "every Bash result after the first refusal was refused");
+        let then_read: Vec<_> =
+            [refused_bash("b").to_vec(), vec![tool_use("Read", "r"), result("r", false, serde_json::json!("x"))]].concat();
+        assert!(watch("sandbox", &then_read).decisive(), "a later non-Bash result doesn't change it");
+        let recovered: Vec<_> = [refused_bash("b"), ran_bash("c")].concat();
+        let w = watch("sandbox", &recovered);
+        assert!(w.refused(), "the notice still says it");
+        assert!(!w.decisive(), "a later Bash command ran: the failure has another cause");
+
+        let failed = parse_cli_result(
+            r#"{"type":"result","subtype":"error_max_turns","is_error":true,"session_id":"s"}"#,
+            false,
+            ArtifactKind::Diff,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(failed.status, StageStatus::Failed));
+        let named = name_inner_sandbox_off(failed.clone(), true);
+        let err = named.error.as_deref().unwrap();
+        assert!(err.starts_with(INNER_SANDBOX_OFF) && is_inner_sandbox_off(err), "{err}");
+        assert!(err.contains("error_max_turns"), "the CLI's own error is kept: {err}");
+        assert_eq!(name_inner_sandbox_off(named.clone(), true).error, named.error, "named once");
+        assert_eq!(name_inner_sandbox_off(failed.clone(), false).error, failed.error, "no refusal: unchanged");
+        assert!(!is_inner_sandbox_off(failed.error.as_deref().unwrap()));
+        // A refusal a later Bash command got past leaves a max-turns failure's
+        // error as it was, so `try_escalate` still escalates it.
+        let kept = name_inner_sandbox_off(failed.clone(), watch("sandbox", &recovered).decisive());
+        assert_eq!(kept.error, failed.error);
+        assert!(!is_inner_sandbox_off(kept.error.as_deref().unwrap()));
+        let named_last = name_inner_sandbox_off(failed.clone(), watch("sandbox", &last).decisive());
+        assert!(is_inner_sandbox_off(named_last.error.as_deref().unwrap()));
+        assert!(!is_plan_limit(err));
+        // A finished stage keeps its outcome; the notice alone says it.
+        let done = parse_cli_result(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"s"}"#,
+            true,
+            ArtifactKind::Note,
+            "",
+        )
+        .unwrap();
+        assert!(matches!(done.status, StageStatus::Done));
+        let kept = name_inner_sandbox_off(done, true);
+        assert!(matches!(kept.status, StageStatus::Done) && kept.error.is_none());
     }
 
     #[test]
@@ -14334,7 +14518,7 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_targets_the_pr_head_ref() {
         assert_eq!(
-            pr_fetch_command(42, "feat/dark-mode"),
+            pr_fetch_command(42, "feat/dark-mode").unwrap(),
             "git fetch origin 'pull/42/head:feat/dark-mode' 2>&1",
         );
     }
@@ -14342,9 +14526,39 @@ mod workspace_from_pr_tests {
     #[test]
     fn fetch_command_escapes_single_quotes_in_the_branch() {
         assert_eq!(
-            pr_fetch_command(1, "weird'name"),
+            pr_fetch_command(1, "weird'name").unwrap(),
             "git fetch origin 'pull/1/head:weird'\\''name' 2>&1",
         );
+    }
+
+    #[test]
+    fn fetch_command_refuses_a_head_ref_that_isnt_a_branch_name() {
+        for bad in ["a\\'; touch PWNED; echo '", "-x", "--upload-pack=touch PWNED", "a b", ""] {
+            let err = pr_fetch_command(9, bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            assert!(err.contains("PR #9"), "{err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_pr_branch_refuses_a_hostile_head_ref_before_the_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::git_ops::init_repo(dir.path()).unwrap();
+        crate::git_ops::ensure_initial_commit(dir.path()).unwrap();
+        let hostile = "a\\'; touch PWNED; echo '";
+        let err = tauri::async_runtime::block_on(crate::commands::ensure_pr_branch(
+            dir.path().to_string_lossy().into(),
+            5,
+            hostile.into(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+        assert!(!err.contains(hostile), "{err}");
+        assert!(!dir.path().join("PWNED").exists());
     }
 
     #[test]
@@ -22447,6 +22661,35 @@ mod secret_guard_tests {
         assert!(!matches!(r, Err(crate::error::AppError::SecretsFound { .. })));
     }
 
+    #[test]
+    fn the_push_command_quotes_only_a_branch_name() {
+        assert_eq!(
+            crate::commands::push_command("feat/it's").unwrap(),
+            "git push --set-upstream origin 'feat/it'\\''s' 2>&1",
+        );
+        for bad in ["-x", "--force", "a\\'; touch PWNED; echo '", "a b", ""] {
+            let err = crate::commands::push_command(bad).unwrap_err().to_string();
+            assert!(err.contains("isn't a valid branch name"), "{bad:?}: {err}");
+            if !bad.is_empty() {
+                assert!(!err.contains(bad), "the error echoes {bad:?}: {err}");
+            }
+        }
+    }
+
+    /// git lets a ref like `refs/heads/-x` exist (only `git branch` refuses
+    /// the name), so the branch HEAD is on can read as an option.
+    #[tokio::test]
+    async fn push_refuses_a_branch_that_reads_as_an_option() {
+        let _s = SettingsGuard::new(serde_json::json!({ "secretGuardEnabled": false }));
+        let (dir, repo) = repo();
+        let head = repo.head().unwrap().target().unwrap();
+        repo.reference("refs/heads/-x", head, false, "test").unwrap();
+        repo.set_head("refs/heads/-x").unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let err = crate::commands::push_branch(path, None).await.unwrap_err().to_string();
+        assert!(err.contains("isn't a valid branch name"), "{err}");
+    }
+
     const HEX: &str = "0123456789abcdef";
     const LETTERS: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
 
@@ -24759,7 +25002,8 @@ mod read_only_role_tests {
         for rw in [build_cli_args("m", "sys", 10, false), build_cli_args_resume("m", "sess", 10, false)] {
             assert!(!denied(&rw[..]).iter().any(|x| x.starts_with("Bash(")), "{rw:?}");
         }
-        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion");
+        assert_eq!(cli_disallowed_tools(false), "AskUserQuestion,EnterWorktree,ExitWorktree");
+        assert!(cli_disallowed_tools(true).starts_with("AskUserQuestion,EnterWorktree,ExitWorktree,"));
     }
 }
 

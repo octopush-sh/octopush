@@ -275,6 +275,13 @@ describe("StageFocus live journal", () => {
     expect(container.textContent).not.toMatch(/ctx /);
   });
 
+  it("shows the stage's cost in the header in ivory, leaving brass to the role eyebrow (#1017)", () => {
+    render(<StageFocus stage={{ ...baseStage, costUsd: 0.08 }} workspacePath="/tmp" />);
+    const cost = screen.getByText("$0.08");
+    expect(cost).toHaveClass("text-octo-ivory", "octo-tabular");
+    expect(cost).not.toHaveClass("text-octo-brass");
+  });
+
   it("says in the header how many tool calls Claude Code refused, in amber (#893)", () => {
     const artifact = JSON.stringify({ kind: "diff", text: "done" });
     const { rerender } = render(

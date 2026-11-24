@@ -1804,6 +1804,9 @@ export interface ReadinessCheck {
   /** A copyable command that fixes it, when there is one. */
   command: string | null;
   timedOut: boolean;
+  /** A recommendation that is no verdict (the Claude Code row's
+   *  `agent_adapter::claude_recommended_notice`); the card decides when it shows. */
+  note?: string | null;
 }
 
 /** A DIRECT-mode role definition (mirrors Rust `RoleDef`). */

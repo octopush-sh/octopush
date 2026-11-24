@@ -9,7 +9,7 @@
 //! its exit code is read.
 
 use crate::agent_adapter::{
-    codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
+    claude_recommended_notice, codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
     CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
 };
 use serde::Serialize;
@@ -52,17 +52,21 @@ pub struct ReadinessCheck {
     /// A copyable command that fixes it.
     pub command: Option<String>,
     pub timed_out: bool,
+    /// A recommendation that is no verdict, whatever the status: the Claude
+    /// Code row's [`crate::agent_adapter::claude_recommended_notice`]. The
+    /// card decides when it shows.
+    pub note: Option<String>,
 }
 
 impl ReadinessCheck {
     fn ok(id: &str, label: &str, value: impl Into<String>) -> Self {
         let (id, label, value) = (id.into(), label.into(), value.into());
-        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false }
+        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false, note: None }
     }
 
     fn not_ok(id: &str, label: &str, status: CheckStatus, value: &str, fix: &str, command: Option<&str>) -> Self {
         let (id, label, value, fix) = (id.into(), label.into(), value.into(), Some(fix.into()));
-        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false }
+        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false, note: None }
     }
 
     fn timed_out(id: &str, label: &str, command: &str) -> Self {
@@ -594,7 +598,7 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
             let version = if success { parse_claude_version(&output) } else { None };
             let info = ClaudeCliVersion::new(version, floor);
             let (unknown, old) = ("claude --version didn't print a version. Reinstalling usually fixes it.", "older releases can record wrong token usage.");
-            match info.version.as_deref() {
+            let row = match info.version.as_deref() {
                 None => not_ok(CheckStatus::Warn, "Version unknown", unknown, INSTALL_CLAUDE),
                 Some(v) if info.below_floor => {
                     let fix = format!("Update to {} or newer; {old}", info.recommended);
@@ -605,7 +609,9 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
                     (None, Some(note)) => not_ok(CheckStatus::Warn, v, &format!("{note}. Update Claude Code."), UPDATE_CLAUDE),
                     (None, None) => ReadinessCheck::ok(ID, LABEL, v),
                 },
-            }
+            };
+            let note = info.version.as_deref().and_then(claude_recommended_notice);
+            ReadinessCheck { note, ..row }
         }
     }
 }
@@ -1373,6 +1379,23 @@ mod tests {
             let ok = claude_check(probe(&format!("echo '{v} (Claude Code)'")), "2.1.314");
             assert_eq!((ok.status, ok.fix), (CheckStatus::Ok, None), "{v}: only the exact release warns");
         }
+    }
+
+    #[test]
+    fn claude_row_recommends_the_worktree_exit_fix_without_a_verdict() {
+        // #1002: a recommendation, not a security fix: the status stays as it was.
+        let note = "Recommended: Claude Code 2.1.330 fixes ExitWorktree removing a worktree another session is using.";
+        let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
+        assert_eq!((ok.status, ok.fix.as_deref(), ok.note.as_deref()), (CheckStatus::Ok, None, Some(note)));
+        let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
+        assert_eq!((old.status, old.note.as_deref()), (CheckStatus::Warn, Some(note)));
+        for current in ["2.1.330", "2.1.331", "2.2.0"] {
+            let row = claude_check(probe(&format!("echo '{current} (Claude Code)'")), "2.1.314");
+            assert_eq!((row.status, row.note), (CheckStatus::Ok, None), "{current}");
+        }
+        assert_eq!(claude_check(Probe::Missing, "2.1.314").note, None);
+        assert_eq!(claude_check(probe("echo 2.1.316; exit 1"), "2.1.314").note, None, "an unknown version never recommends");
+        assert_eq!(git_check(probe("echo 'git version 2.39.3'")).note, None);
     }
 
     #[test]
