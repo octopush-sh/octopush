@@ -509,7 +509,13 @@ function App() {
   );
   const [archivedForProject, setArchivedForProject] = useState<{ id: string; name: string; path: string } | null>(null);
   // "Archive merged missions…" (#963): the missions it lists, until confirmed.
-  const [archivingMerged, setArchivingMerged] = useState<{ projectId: string; path: string; missions: Workspace[] } | null>(null);
+  // `localFiles`: what the confirm named, the only local files it may delete.
+  const [archivingMerged, setArchivingMerged] = useState<{
+    projectId: string;
+    path: string;
+    missions: Workspace[];
+    localFiles: Record<string, string[]>;
+  } | null>(null);
   // Counter to trigger re-renders when project customizations change
   const [projectCustomizationsVersion, setProjectCustomizationsVersion] = useState(0);
 
@@ -2413,7 +2419,12 @@ function App() {
             ? (recentProjects.find((p) => p.id === ws.projectId)?.path ??
               (project?.id === ws.projectId ? project.path : undefined))
             : undefined;
-          if (ws && path) void archiveMergedMissions(ws.projectId, path, [ws]);
+          if (!ws || !path) return;
+          // Undo can't bring local files back, so those are confirmed first.
+          const localFiles = useWorkspaceStore.getState().localFilesByWs[ws.id] ?? [];
+          if (localFiles.length > 0) {
+            setArchivingMerged({ projectId: ws.projectId, path, missions: [ws], localFiles: { [ws.id]: localFiles } });
+          } else void archiveMergedMissions(ws.projectId, path, [ws]);
         }}
       />
 
@@ -3051,7 +3062,9 @@ function App() {
             }}
             mergedCount={mergedMissions.length}
             onArchiveMerged={() => {
-              setArchivingMerged({ projectId: proj.id, path: proj.path, missions: mergedMissions });
+              const files = useWorkspaceStore.getState().localFilesByWs;
+              const localFiles = Object.fromEntries(mergedMissions.map((w) => [w.id, files[w.id] ?? []]));
+              setArchivingMerged({ projectId: proj.id, path: proj.path, missions: mergedMissions, localFiles });
               setProjectContextMenu(null);
             }}
             onNewGroup={() => void createMissionGroup(proj.id)}
@@ -3108,15 +3121,21 @@ function App() {
           <ConfirmDialog
             title={
               archivingMerged.missions.length === 1
-                ? "Archive 1 merged mission?"
+                ? "Archive this merged mission?"
                 : `Archive ${archivingMerged.missions.length} merged missions?`
             }
-            body={archiveMergedBody(archivingMerged.missions.map((w) => w.name || w.branch || "Mission"))}
-            destructiveLabel="Archive them"
+            body={archiveMergedBody(
+              archivingMerged.missions.map((w) => ({
+                name: w.name || w.branch || "Mission",
+                localFiles: archivingMerged.localFiles[w.id] ?? [],
+              })),
+            )}
+            destructiveLabel={archivingMerged.missions.length === 1 ? "Archive it" : "Archive them"}
             onConfirm={() => {
-              const { projectId, path, missions } = archivingMerged;
+              const { projectId, path, missions, localFiles } = archivingMerged;
               setArchivingMerged(null);
-              void archiveMergedMissions(projectId, path, missions);
+              const told = missions.filter((w) => (localFiles[w.id] ?? []).length > 0).map((w) => w.id);
+              void archiveMergedMissions(projectId, path, missions, told);
             }}
             onCancel={() => setArchivingMerged(null)}
           />

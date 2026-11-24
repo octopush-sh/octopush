@@ -1,36 +1,67 @@
 // Archiving merged missions (#963): the rail's "Merged · archive?" and the
 // project menu's "Archive merged missions…". Nothing is archived without a
 // click, and the toast offers Undo, which restores the worktrees from their
-// kept branches.
+// kept branches. The backend re-checks every mission at the moment it acts
+// (`archive_merged_workspaces`) and leaves alone the ones that changed since
+// the offer.
 
 import { pushToast } from "../components/Toasts";
 import { ipc } from "./ipc";
-import type { Workspace } from "./types";
+import type { ArchiveSkipReason, Workspace } from "./types";
 import { useGroupsStore } from "../stores/groupsStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 
 const plural = (n: number) => (n === 1 ? "mission" : "missions");
 
-/** Archive `missions` of the project at `projectPath`, one after another,
- *  then say how it went. Resolves to the ids that were archived. */
+/** Why a mission was left in place, finishing "fix-a …". */
+const SKIPPED: Record<ArchiveSkipReason, string> = {
+  busy: "has a Talk turn or a Direct run going",
+  changed: "has uncommitted changes",
+  moved: "has commits after its merged PR",
+  "local-files": "now holds local files",
+  unverified: "couldn't be checked against GitHub",
+  gone: "is no longer an active mission",
+  failed: "could not be archived",
+};
+
+/** The skipped notice's body: one sentence per mission, the first four. */
+export function skippedBody(skipped: readonly { name: string; reason: ArchiveSkipReason }[]): string {
+  const lines = skipped.slice(0, 4).map((s) => `${s.name} ${SKIPPED[s.reason] ?? SKIPPED.failed}.`);
+  const more = skipped.length - lines.length;
+  return [...lines, ...(more > 0 ? [`And ${more} more.`] : [])].join(" ");
+}
+
+/** Archive `missions` of the project at `projectPath`, each only if it still
+ *  passes when the backend acts, then say how it went. `localFilesOk`: the
+ *  missions whose local files the user was told go with them. Resolves to
+ *  the ids that were archived. */
 export async function archiveMergedMissions(
   projectId: string,
   projectPath: string,
   missions: readonly Workspace[],
+  localFilesOk: readonly string[] = [],
 ): Promise<string[]> {
   const store = useWorkspaceStore.getState();
-  const done: Workspace[] = [];
-  let failure: unknown = null;
-  for (const ws of missions) {
-    try {
-      await store.archive(ws.id, projectPath, ws.branch ?? "", ws.worktreePath ?? null);
-      done.push(ws);
-    } catch (err) {
-      failure = err;
-    }
+  let result;
+  try {
+    result = await ipc.archiveMergedWorkspaces(projectId, projectPath, missions.map((w) => w.id), [...localFilesOk]);
+  } catch (err) {
+    pushToast({ level: "error", title: "Archive failed", body: String(err) });
+    return [];
   }
-  if (failure !== null) {
-    pushToast({ level: "error", title: "Archive failed", body: String(failure) });
+  const archived = new Set(result.archived);
+  const done = missions.filter((w) => archived.has(w.id));
+  for (const ws of done) store.forgetArchived(ws.id);
+  if (result.skipped.length > 0) {
+    const name = (id: string) => missions.find((w) => w.id === id)?.name || "A mission";
+    const skipped = result.skipped.map((s) => ({ name: name(s.workspaceId), reason: s.reason }));
+    pushToast({
+      level: "warning",
+      title: skipped.length === 1 ? `Skipped "${skipped[0].name}"` : `Skipped ${skipped.length} missions`,
+      body: skippedBody(skipped),
+    });
+    // What the rail offered is stale for these: read it again.
+    void store.loadMergedPrs(projectId, projectPath);
   }
   if (done.length > 0) {
     pushToast({

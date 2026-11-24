@@ -73,6 +73,7 @@ function resetStore() {
     gitSummaryByWs: {},
     prByWs: {},
     mergedPrByWs: {},
+    localFilesByWs: {},
     launchRestoredId: undefined,
   });
   __resetLaunchRestore();
@@ -718,7 +719,7 @@ describe("workspaceStore — mergedPrByWs (#963)", () => {
       mergedPrByWs: { [b.id]: merged, other: merged },
     });
     mockIpc.openPrsForProject.mockResolvedValueOnce([]);
-    mockIpc.mergedWorkspaces.mockResolvedValueOnce([{ workspaceId: a.id, pr: merged }]);
+    mockIpc.mergedWorkspaces.mockResolvedValueOnce([{ workspaceId: a.id, pr: merged, localFiles: [".env"] }]);
 
     await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
 
@@ -727,6 +728,30 @@ describe("workspaceStore — mergedPrByWs (#963)", () => {
     expect(map[a.id]?.number).toBe(3);
     expect(map[b.id]).toBeUndefined();
     expect(map.other).toBeDefined();
+    expect(useWorkspaceStore.getState().localFilesByWs[a.id]).toEqual([".env"]);
+  });
+
+  it("rides the open-PR read: not again on a refresh, only once a PR left the open list", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] } });
+    const open = { number: 9, title: "O", url: "u9", isDraft: false, state: "open" as const };
+    mockIpc.mergedWorkspaces.mockResolvedValue([]);
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      mockIpc.openPrsForProject.mockResolvedValue([{ branch: a.branch, pr: open }]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // a focus refresh past the throttle, PR still open
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // the PR left the open list
+      mockIpc.openPrsForProject.mockResolvedValue([]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("archive drops the mission's entry", async () => {

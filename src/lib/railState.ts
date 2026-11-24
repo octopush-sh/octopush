@@ -65,8 +65,13 @@ export function archivableMerge(
 }
 
 /** The confirm's body for "Archive merged missions…": the missions by name
- *  (the first eight, then how many more), then what archiving does. */
-export function archiveMergedBody(names: readonly string[]): string {
+ *  (the first eight, then how many more; one with local files says so), what
+ *  archiving does, then the local files it deletes for good. */
+export function archiveMergedBody(missions: readonly { name: string; localFiles: readonly string[] }[]): string {
+  const names = missions.map((m) => (m.localFiles.length > 0 ? `${m.name} (has local files)` : m.name));
+  const files = [...new Set(missions.flatMap((m) => m.localFiles))];
+  const sample = files.length > 3 ? `${files.slice(0, 3).join(", ")} and more` : files.join(", ");
+  const local = files.length > 0 ? ` Archiving also deletes local files git ignores (${sample}); Undo doesn't bring them back.` : "";
   const shown = names.slice(0, 8);
   const more = names.length - shown.length;
   const list =
@@ -76,7 +81,7 @@ export function archiveMergedBody(names: readonly string[]): string {
         ? `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`
         : (shown[0] ?? "");
   const one = names.length === 1;
-  return `${list}: ${one ? "its PR is merged and its worktree is clean" : "their PRs are merged and their worktrees are clean"}. Archiving removes ${one ? "the worktree" : "the worktrees"} and keeps ${one ? "the branch" : "the branches"}; the notice that follows can undo it.`;
+  return `${list}: ${one ? "its PR is merged and its worktree is clean" : "their PRs are merged and their worktrees are clean"}. Archiving removes ${one ? "the worktree" : "the worktrees"} and keeps ${one ? "the branch" : "the branches"}; the notice that follows can undo it.${local}`;
 }
 
 /** The missions among `workspaces` the rail offers to archive, in order: the

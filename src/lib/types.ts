@@ -618,10 +618,21 @@ export interface BranchPr {
 }
 
 /** A mission whose PR was merged at its worktree's HEAD, with a clean
- *  worktree (`merged_workspaces`, #963). */
+ *  worktree (`merged_workspaces`, #963). `localFiles`: its git-ignored files
+ *  other than dependency and build folders, which archiving deletes. */
 export interface MergedWorkspace {
   workspaceId: string;
   pr: Pr;
+  localFiles: string[];
+}
+
+/** Why `archive_merged_workspaces` left a mission in place: re-checked when
+ *  it acts, the mission no longer passes. */
+export type ArchiveSkipReason = "busy" | "changed" | "moved" | "local-files" | "unverified" | "gone" | "failed";
+
+export interface MergedArchive {
+  archived: string[];
+  skipped: { workspaceId: string; reason: ArchiveSkipReason }[];
 }
 
 /** A single text-search hit (line-level match) within the workspace. */

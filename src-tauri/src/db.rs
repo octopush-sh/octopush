@@ -3991,6 +3991,17 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// The threads of every workspace checked out at `worktree_path` (a
+    /// trailing slash ignored), to ask the chat engine whether one runs there.
+    pub fn chat_threads_at_worktree(&self, worktree_path: &str) -> AppResult<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT t.id FROM chat_threads t JOIN workspaces w ON w.id = t.workspace_id
+             WHERE rtrim(w.worktree_path, '/') = rtrim(?1, '/')",
+        )?;
+        let rows = stmt.query_map(params![worktree_path], |r| r.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The ids of a workspace's threads (their checkpoints go when the
     /// workspace is deleted or archived).
     pub fn chat_thread_ids(&self, workspace_id: &str) -> AppResult<Vec<String>> {

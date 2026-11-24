@@ -64,15 +64,24 @@ describe("archivableMerge", () => {
 });
 
 describe("archiveMergedBody", () => {
+  const m = (name: string, localFiles: string[] = []) => ({ name, localFiles });
+
   it("names the missions, then what archiving does", () => {
-    expect(archiveMergedBody(["fix-a"])).toBe(
+    expect(archiveMergedBody([m("fix-a")])).toBe(
       "fix-a: its PR is merged and its worktree is clean. Archiving removes the worktree and keeps the branch; the notice that follows can undo it.",
     );
-    expect(archiveMergedBody(["a", "b", "c"])).toMatch(/^a, b and c: their PRs are merged/);
+    expect(archiveMergedBody(["a", "b", "c"].map((n) => m(n)))).toMatch(/^a, b and c: their PRs are merged/);
   });
 
   it("names the first eight and counts the rest", () => {
-    const names = Array.from({ length: 10 }, (_, i) => `m${i}`);
+    const names = Array.from({ length: 10 }, (_, i) => m(`m${i}`));
     expect(archiveMergedBody(names)).toMatch(/^m0, m1, m2, m3, m4, m5, m6, m7 and 2 more:/);
+  });
+
+  it("marks a mission with local files and says Undo doesn't bring them back", () => {
+    const body = archiveMergedBody([m("fix-a", [".env", "data.db"]), m("fix-b")]);
+    expect(body).toMatch(/^fix-a \(has local files\) and fix-b:/);
+    expect(body).toMatch(/deletes local files git ignores \(\.env, data\.db\); Undo doesn't bring them back\.$/);
+    expect(archiveMergedBody([m("x", ["a", "b", "c", "d"])])).toMatch(/\(a, b, c and more\)/);
   });
 });

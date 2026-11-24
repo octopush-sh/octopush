@@ -10,4 +10,4 @@ steps:
   - target: rail-merged-archive
     caption: Once a mission's PR is merged and its worktree is clean, archive it from here. Undo brings it back.
 ---
-The rail's search line has a state filter: **Needs you**, **Working** or **Idle**, counted the way the fleet chip counts. A mission whose PR is merged and whose worktree is clean offers **merged · archive?**, and the project menu can archive them all at once, after listing them. Nothing is archived without a click.
+The rail filters by state: **Needs you**, **Working** or **Idle**, counted like the fleet chip. A mission whose PR is merged and whose worktree is clean offers **merged · archive?**; the project menu archives them all, after listing them. Each is checked again when you confirm, and skipped with a reason if it changed. Local files git ignores are named first: Undo can't bring them back.

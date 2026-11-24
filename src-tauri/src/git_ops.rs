@@ -427,6 +427,42 @@ pub fn is_dirty(path: &Path) -> AppResult<bool> {
     Ok(!statuses.is_empty())
 }
 
+/// Folders the project's own tooling rebuilds (dependencies, build output,
+/// caches): an ignored path inside one is not the user's work.
+const REBUILDABLE_DIRS: &[&str] = &[
+    "node_modules", ".venv", "venv", "dist", "build", "target", ".next", ".cache", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".turbo", ".parcel-cache", ".gradle",
+];
+
+/// Whether an ignored path (libgit2 lists an ignored folder once, as `dir/`)
+/// is rebuildable: inside or named like a `REBUILDABLE_DIRS` folder, Finder's
+/// `.DS_Store`, or the Claude Code settings file Octopush writes into its own
+/// worktrees (rewritten on restore). Pure.
+pub fn is_rebuildable_ignored(path: &str) -> bool {
+    let path = path.trim_end_matches('/');
+    path == crate::claude_hooks::EXCLUDE_LINE.trim_start_matches('/')
+        || path.rsplit('/').next() == Some(".DS_Store")
+        || path.split('/').any(|part| REBUILDABLE_DIRS.contains(&part))
+}
+
+/// The git-ignored paths in the worktree at `path` that archiving would
+/// delete for good (a local env file, a local database): everything ignored
+/// but `is_rebuildable_ignored`. An ignored folder counts once.
+pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
+    let repo = open_repo(path)?;
+    let mut opts = StatusOptions::new();
+    opts.include_untracked(false).include_ignored(true).recurse_ignored_dirs(false);
+    let statuses = repo
+        .statuses(Some(&mut opts))
+        .map_err(|e| AppError::Other(format!("git status: {e}")))?;
+    Ok(statuses
+        .iter()
+        .filter(|e| e.status().is_ignored())
+        .filter_map(|e| e.path().ok().map(str::to_string))
+        .filter(|p| !is_rebuildable_ignored(p))
+        .collect())
+}
+
 /// Return (ahead, behind) commits relative to the configured upstream of
 /// HEAD. Returns None if no upstream is configured (e.g. a branch that has
 /// never been pushed) or the comparison cannot be computed.

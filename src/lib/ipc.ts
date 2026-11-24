@@ -580,6 +580,7 @@ import type {
   BudgetStatus,
   BranchList,
   BranchPr,
+  MergedArchive,
   MergedWorkspace,
   EditorChoice,
   ChatMessage,
@@ -1450,6 +1451,12 @@ export const ipc = {
    *  without `gh`. */
   mergedWorkspaces: (projectId: string, projectPath: string) =>
     invoke<MergedWorkspace[]>("merged_workspaces", { projectId, projectPath }),
+
+  /** Archive those of `workspaceIds` that still pass when it acts (merged at
+   *  HEAD, clean, no Talk turn or Direct run active, and no local files unless
+   *  named in `localFilesOk`); says which were skipped and why. */
+  archiveMergedWorkspaces: (projectId: string, projectPath: string, workspaceIds: string[], localFilesOk: string[]) =>
+    invoke<MergedArchive>("archive_merged_workspaces", { projectId, projectPath, workspaceIds, localFilesOk }),
 
   /** Open pull requests for the project, for "start a workspace from a PR".
    *  Rejects with a friendly message when the GitHub CLI is missing or not

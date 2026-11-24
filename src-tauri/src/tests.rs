@@ -27978,3 +27978,98 @@ mod request_context_tests {
         assert_eq!(ctx.measured_tokens, Some(1_002));
     }
 }
+
+/// #963: what archiving a merged mission re-checks at the moment it acts.
+#[cfg(test)]
+mod merged_archive_tests {
+    use crate::commands::{merged_archive_skip, worktree_busy};
+    use crate::git_ops::{head_sha, is_rebuildable_ignored, local_ignored_files};
+    use std::process::Command;
+    use tempfile::tempdir;
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A clean repo with one commit; its HEAD stands for the merged PR's head.
+    fn merged_repo() -> (tempfile::TempDir, String) {
+        let dir = tempdir().unwrap();
+        let p = dir.path();
+        git(p, &["init", "-q"]);
+        git(p, &["config", "user.email", "t@t.dev"]);
+        git(p, &["config", "user.name", "T"]);
+        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+        std::fs::write(p.join("a.txt"), "a\n").unwrap();
+        git(p, &["add", "."]);
+        git(p, &["commit", "-qm", "base"]);
+        let head = head_sha(p).unwrap();
+        (dir, head)
+    }
+
+    #[test]
+    fn a_mission_that_changed_after_the_offer_is_skipped() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, false), None, "offered: merged and clean");
+        std::fs::write(p.join("a.txt"), "edited\n").unwrap();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("changed"));
+        git(p, &["commit", "-qam", "after the merge"]);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("moved"));
+        assert_eq!(merged_archive_skip(p, None, false, false), Some("moved"), "no merged PR on the branch");
+    }
+
+    #[test]
+    fn a_turn_or_run_started_while_the_confirm_was_open_is_skipped() {
+        let (dir, head) = merged_repo();
+        let wt = dir.path().to_string_lossy().to_string();
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::Db::open(tmp.path()).unwrap();
+        db.insert_project("p-merged", "P", "/tmp/p-merged").unwrap();
+        db.insert_workspace("w-merged", "p-merged", "ws", "", "fix/a", Some(&wt), "", None).unwrap();
+        let thread = db.create_chat_thread("w-merged", "Talk").unwrap();
+        let idle = |_: &[String]| false;
+        assert!(!worktree_busy(&db, idle, &wt));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), worktree_busy(&db, idle, &wt), false), None);
+
+        // A Talk turn starts on one of its conversations…
+        let talking = |t: &[String]| t.contains(&thread.id);
+        let busy = worktree_busy(&db, talking, &format!("{wt}/"));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, false), Some("busy"));
+
+        // …or a Direct run does.
+        db.seed_builtin_pipelines().unwrap();
+        let pipeline = db.list_pipelines().unwrap()[0].id.clone();
+        let run = db.create_run("w-merged", &pipeline, "task", None, None, &[]).unwrap();
+        db.set_run_status(&run, "running", false).unwrap();
+        let busy = worktree_busy(&db, idle, &wt);
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, false), Some("busy"));
+    }
+
+    #[test]
+    fn local_files_are_skipped_unless_the_user_was_told() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
+        std::fs::write(p.join("node_modules/x/i.js"), "").unwrap();
+        assert!(local_ignored_files(p).unwrap().is_empty(), "a dependency folder is not local work");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, false), None);
+        std::fs::write(p.join(".env"), "TOKEN=1\n").unwrap();
+        assert_eq!(local_ignored_files(p).unwrap(), vec![".env".to_string()]);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("local-files"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, true), None);
+    }
+
+    #[test]
+    fn rebuildable_ignored_paths() {
+        for p in [
+            "node_modules/", "web/node_modules/", ".venv/", "venv/", "dist/", "app/build/", "target/", ".next/",
+            "src/__pycache__/", ".DS_Store", "docs/.DS_Store", ".claude/settings.local.json",
+        ] {
+            assert!(is_rebuildable_ignored(p), "{p}");
+        }
+        for p in [".env", "web/.env.local", "data.db", "notes/", ".claude/"] {
+            assert!(!is_rebuildable_ignored(p), "{p}");
+        }
+    }
+}
