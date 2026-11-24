@@ -604,9 +604,10 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
                     let fix = format!("Update to {} or newer; {old}", info.recommended);
                     not_ok(CheckStatus::Warn, &format!("{v} · tested with {floor}"), &fix, UPDATE_CLAUDE)
                 }
-                Some(v) => match info.security_notice() {
-                    Some(note) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
-                    None => ReadinessCheck::ok(ID, LABEL, v),
+                Some(v) => match (info.security_notice(), info.known_bad_notice()) {
+                    (Some(note), _) => not_ok(CheckStatus::Warn, v, &format!("{note}."), UPDATE_CLAUDE),
+                    (None, Some(note)) => not_ok(CheckStatus::Warn, v, &format!("{note}. Update Claude Code."), UPDATE_CLAUDE),
+                    (None, None) => ReadinessCheck::ok(ID, LABEL, v),
                 },
             };
             let note = info.version.as_deref().and_then(claude_recommended_notice);
@@ -1360,6 +1361,24 @@ mod tests {
         assert_eq!((hung.status, hung.timed_out), (CheckStatus::Warn, true));
         let broken = claude_check(probe("echo 2.1.316; exit 1"), "2.1.314");
         assert_eq!((broken.status, broken.value.as_str()), (CheckStatus::Warn, "Version unknown"));
+    }
+
+    #[test]
+    fn claude_check_names_a_known_bad_release_exactly() {
+        let bad = claude_check(probe("echo '2.1.329 (Claude Code)'"), "2.1.314");
+        assert_eq!((bad.status, bad.value.as_str()), (CheckStatus::Warn, "2.1.329"));
+        assert_eq!(
+            bad.fix.as_deref(),
+            Some(
+                "Claude Code 2.1.329 drops the retry gateway models need when a max_tokens error names a lower \
+                 limit; 2.1.330 restores it. Update Claude Code."
+            )
+        );
+        assert_eq!(bad.command.as_deref(), Some(UPDATE_CLAUDE));
+        for v in ["2.1.328", "2.1.330"] {
+            let ok = claude_check(probe(&format!("echo '{v} (Claude Code)'")), "2.1.314");
+            assert_eq!((ok.status, ok.fix), (CheckStatus::Ok, None), "{v}: only the exact release warns");
+        }
     }
 
     #[test]

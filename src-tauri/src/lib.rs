@@ -230,6 +230,8 @@ pub fn run() {
             commands::delete_group,
             commands::set_item_group,
             commands::set_items_group,
+            commands::set_workspace_prerequisite,
+            commands::clear_workspace_prerequisite,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,
@@ -449,6 +451,7 @@ pub fn run() {
             commands::connect_claude_code,
             commands::claude_cli_version,
             commands::claude_model_floor_note,
+            commands::claude_known_bad_note,
             commands::codex_trust_note,
             commands::model_retirements,
             commands::readiness_check,

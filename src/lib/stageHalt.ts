@@ -26,6 +26,18 @@ export function haltCause(error: string | null, maxIterations: number): HaltCaus
       ? { title: line, preferRerun: true }
       : { title: line.slice(0, cut), remedy: line.slice(cut + 2), preferRerun: true };
   }
+  // "Skip Claude Code 2.1.329 on a gateway model: it drops …; 2.1.330
+  // restores it. Update Claude Code, then resume or re-run." — the first line
+  // `agent_adapter::known_bad_stage_error` puts on a gateway max_tokens failure.
+  const knownBad = /^Skip Claude Code (\S+) on a gateway model: it (.+)\. (Update Claude Code, then resume or re-run\.)$/.exec(
+    raw.split("\n")[0],
+  );
+  if (knownBad) {
+    return {
+      title: `Claude Code ${knownBad[1]} is a release to skip on a gateway model`,
+      remedy: `It ${knownBad[2]}. ${knownBad[3]}`,
+    };
+  }
   if (raw.includes("(plan_limit)")) {
     return {
       title: "Paused by your Claude plan",

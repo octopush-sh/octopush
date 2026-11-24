@@ -30,6 +30,7 @@ vi.mock("../hooks/useEntitlement", () => ({
 const estimateMock = vi.hoisted(() => vi.fn());
 const cliVersionMock = vi.hoisted(() => vi.fn());
 const floorNoteMock = vi.hoisted(() => vi.fn());
+const knownBadMock = vi.hoisted(() => vi.fn());
 const codexTrustMock = vi.hoisted(() => vi.fn());
 const repoCrewsMock = vi.hoisted(() => vi.fn());
 const readRepoCrewMock = vi.hoisted(() => vi.fn());
@@ -38,7 +39,7 @@ vi.mock("../lib/ipc", async (importOriginal) => {
   return {
     ...actual,
     ipc: {
-      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, codexTrustNote: codexTrustMock,
+      ...actual.ipc, estimateRunCost: estimateMock, claudeCliVersion: cliVersionMock, claudeModelFloorNote: floorNoteMock, claudeKnownBadNote: knownBadMock, codexTrustNote: codexTrustMock,
       listRepoCrews: repoCrewsMock, readRepoCrew: readRepoCrewMock,
     },
   };
@@ -74,6 +75,8 @@ beforeEach(() => {
   repoCrewsMock.mockResolvedValue([]);
   floorNoteMock.mockReset();
   floorNoteMock.mockResolvedValue(null);
+  knownBadMock.mockReset();
+  knownBadMock.mockResolvedValue(null);
   codexTrustMock.mockReset();
   codexTrustMock.mockResolvedValue(null);
 });
@@ -542,6 +545,40 @@ describe("PipelineSetup Claude Code version preflight", () => {
     await screen.findByTestId("estimate-range");
     expect(floorNoteMock).not.toHaveBeenCalled();
     expect(screen.queryByTestId("launcher-claude-model-floor")).not.toBeInTheDocument();
+  });
+
+  it("names a Claude Code release to skip when a CLI stage runs a gateway model, and still lets the run begin", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-latest")];
+    const knownBad = { version: "2.1.329", reason: "drops the retry", scope: "gatewayStages" };
+    cliVersionMock.mockResolvedValue({ version: "2.1.329", floor: "2.1.314", belowFloor: false, securityFix: null, knownBad });
+    const note = "Claude Code 2.1.329 drops the retry. A stage on a gateway model may fail every turn; update Claude Code.";
+    knownBadMock.mockResolvedValue(note);
+    const onBegin = vi.fn();
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={onBegin} executingRun={false} onEditPipeline={vi.fn()} />);
+    const line = await screen.findByTestId("launcher-claude-known-bad");
+    expect(line).toHaveTextContent(note);
+    expect(line).toHaveAttribute("data-tour", "direct-launcher-known-bad");
+    expect(knownBadMock).toHaveBeenCalledWith(["claude-sonnet-latest"]);
+    fireEvent.click(screen.getByRole("button", { name: /Begin the run/i }));
+    expect(onBegin).toHaveBeenCalled();
+  });
+
+  it("shows no known-bad line when the backend finds no gateway stage", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-5-5")];
+    const knownBad = { version: "2.1.329", reason: "drops the retry", scope: "gatewayStages" };
+    cliVersionMock.mockResolvedValue({ version: "2.1.329", floor: "2.1.314", belowFloor: false, knownBad });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(knownBadMock).toHaveBeenCalledWith(["claude-sonnet-5-5"]));
+    expect(screen.queryByTestId("launcher-claude-known-bad")).not.toBeInTheDocument();
+  });
+
+  it("never asks about a release to skip on any other version", async () => {
+    storeState.pipelines = [cliPipe("claude-sonnet-latest")];
+    cliVersionMock.mockResolvedValue({ version: "2.1.330", floor: "2.1.314", belowFloor: false, knownBad: null });
+    render(<PipelineSetup workspaceId="w1" workspacePath="/tmp/w1" defaultTask="build it" onBegin={vi.fn()} executingRun={false} onEditPipeline={vi.fn()} />);
+    await vi.waitFor(() => expect(floorNoteMock).toHaveBeenCalled());
+    expect(knownBadMock).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("launcher-claude-known-bad")).not.toBeInTheDocument();
   });
 
   it("reads the version for a Codex stage escalating to Claude, and names the model", async () => {

@@ -4485,6 +4485,40 @@ pub async fn set_items_group(
     state.db.lock().set_items_group(&kind, &item_ids, group_id.as_deref())
 }
 
+// ─── Prerequisites ("Starts after", #960) ─────────────────────────
+//
+// A mission (workspace) can wait on another mission of its project until
+// that one's run finishes (`run_finished`) or its PR merges (`pr_merged`).
+
+/// Make `workspace_id` wait on `after_workspace_id`. Refuses cycles, links
+/// across projects and archived prerequisites.
+#[tauri::command]
+pub async fn set_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    after_workspace_id: String,
+    condition: String,
+    branch_from_prerequisite: bool,
+    auto_start: Option<bool>,
+) -> AppResult<crate::db::PrerequisiteRow> {
+    state.db.lock().set_workspace_prerequisite(
+        &workspace_id,
+        &after_workspace_id,
+        &condition,
+        branch_from_prerequisite,
+        auto_start.unwrap_or(false),
+    )
+}
+
+/// Stop `workspace_id` waiting on another mission.
+#[tauri::command]
+pub async fn clear_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<()> {
+    state.db.lock().clear_workspace_prerequisite(&workspace_id)
+}
+
 #[tauri::command]
 pub async fn close_project(
     state: State<'_, AppState>,
@@ -7664,6 +7698,23 @@ pub async fn claude_cli_version() -> AppResult<crate::agent_adapter::ClaudeCliVe
 pub fn claude_model_floor_note(models: Vec<String>) -> AppResult<Option<crate::agent_adapter::ClaudeModelFloorNote>> {
     Ok(crate::agent_adapter::claude_cli_version_cached()
         .and_then(|cli| crate::agent_adapter::model_floor_note(&models, cli.version.as_deref())))
+}
+
+/// Direct launcher: the line naming a Claude Code release to skip
+/// (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` (Claude
+/// Code CLI stages and their escalation models) is a gateway model
+/// (`cli_runner::is_gateway_model`). Reads the cached version without
+/// probing; `None` otherwise or when the version is unknown.
+#[tauri::command]
+pub fn claude_known_bad_note(models: Vec<String>) -> AppResult<Option<String>> {
+    Ok(crate::agent_adapter::claude_cli_version_cached().and_then(|cli| {
+        crate::agent_adapter::known_bad_launch_note(
+            &models,
+            cli.version.as_deref(),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+            crate::orchestrator::cli_runner::is_gateway_model,
+        )
+    }))
 }
 
 /// Direct launcher: the line saying Codex will skip this repo's `.codex/`
