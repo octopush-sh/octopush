@@ -11,9 +11,13 @@
 //!
 //! Tools are surfaced to the model with namespaced names `mcp__<server>__<tool>`
 //! so the agentic loop can route a tool_use back to the right server. Servers
-//! are spawned lazily on first use and cached for the app's lifetime (killed on
-//! drop). A server that fails to start/list is skipped with a warning — it
-//! never breaks the chat.
+//! are spawned lazily on first use and cached (killed on drop). A cached
+//! connection is only reused for the config it was started with; saving the
+//! config stops every server whose entry changed or was removed
+//! (`apply_config_change`), Settings' Reconnect stops one (`reset_server`),
+//! and a call that fails on the wire drops its connection so the next call
+//! starts a fresh process. A server that fails to start/list is skipped with
+//! a warning — it never breaks the chat.
 //!
 //! NOTE: end-to-end execution requires spawning the configured server binary;
 //! the JSON-RPC framing, config parsing, and name (de)namespacing are
@@ -28,7 +32,7 @@ use std::path::Path;
 use std::process::{Child, ChildStdin, ChildStderr, ChildStdout, Command, Stdio};
 use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct McpServerConfig {
     pub command: String,
     #[serde(default)]
@@ -113,6 +117,142 @@ pub fn load_server_configs(worktree: &Path) -> HashMap<String, McpServerConfig> 
     merged
 }
 
+/// The servers whose entry differs between two configs: changed, removed or
+/// added, sorted by name. These are the ones a save must stop.
+pub fn changed_servers(
+    old: &HashMap<String, McpServerConfig>,
+    new: &HashMap<String, McpServerConfig>,
+) -> Vec<String> {
+    let mut names: Vec<String> = old
+        .keys()
+        .chain(new.keys())
+        .filter(|n| old.get(*n) != new.get(*n))
+        .cloned()
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// How a server is started: the program to run, and the PATH its process
+/// gets (`None` when the server's own `env` sets PATH, which wins).
+#[derive(Debug, PartialEq, Eq)]
+struct SpawnPlan {
+    program: std::path::PathBuf,
+    path: Option<String>,
+}
+
+/// Resolve a server's command the way CLI stages resolve theirs.
+/// `search_path` is the PATH CLI stages spawn with
+/// (`cli_runner::resolved_cli_path`: the login shell's ∪ the app's ∪ common
+/// bin dirs). An absolute command's own dir goes first, so a script such as
+/// an nvm `npx` finds its sibling `node` through `/usr/bin/env`. A bare
+/// command is looked up on the PATH the process will get; a command with a
+/// slash is run as given.
+fn spawn_plan(cfg: &McpServerConfig, search_path: &str) -> Result<SpawnPlan, String> {
+    use crate::orchestrator::cli_runner::{merge_path_dirs, resolve_executable};
+    let own = cfg.env.get("PATH");
+    let child_path = match own {
+        Some(p) => p.clone(),
+        None => {
+            let command = Path::new(&cfg.command);
+            let own_dir = match command.parent() {
+                Some(dir) if command.is_absolute() => dir.display().to_string(),
+                _ => String::new(),
+            };
+            merge_path_dirs(&[&own_dir, search_path])
+        }
+    };
+    let program = if cfg.command.contains('/') {
+        std::path::PathBuf::from(&cfg.command)
+    } else {
+        resolve_executable(&cfg.command, &child_path).ok_or_else(|| {
+            format!(
+                "Octopush couldn't find `{0}` on your PATH. Use its full path (run `which {0}` in Terminal).",
+                cfg.command
+            )
+        })?
+    };
+    Ok(SpawnPlan { program, path: own.is_none().then_some(child_path) })
+}
+
+/// What the model is told when Octopush's connection to a server failed. The
+/// first line of `reason` is the cause; any further lines (the server's own
+/// stdout/stderr) follow the advice as a separate block.
+pub fn connection_failure_text(server: &str, reason: &str) -> String {
+    let reason = reason.trim();
+    let (summary, detail) = match reason.split_once('\n') {
+        Some((s, d)) => (s.trim(), d.trim()),
+        None => (reason, ""),
+    };
+    let summary = summary.trim_end_matches('.');
+    let summary = if summary.is_empty() { "unknown error" } else { summary };
+    let mut text = format!(
+        "Octopush's connection to {server} failed: {summary}. The user can reconnect it in Settings › Integrations."
+    );
+    if !detail.is_empty() {
+        text.push_str("\n\nServer output:\n");
+        text.push_str(detail);
+    }
+    text
+}
+
+/// Why an MCP call failed. Decides what happens to the cached connection and
+/// what the model is told (`Display`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpCallError {
+    /// Octopush's connection to the server failed: it could not start, its
+    /// handshake failed, the process exited or the pipe broke. The cached
+    /// connection is dropped, so the next call starts the server again; this
+    /// call is not retried.
+    Connection { server: String, reason: String },
+    /// The server answered the call with a JSON-RPC error. It is alive, so
+    /// its connection stays.
+    Server { server: String, message: String },
+    /// No server of that name is configured for the worktree.
+    NotConfigured { server: String },
+    /// The name isn't `mcp__<server>__<tool>`.
+    NotMcpTool(String),
+}
+
+impl std::fmt::Display for McpCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connection { server, reason } => f.write_str(&connection_failure_text(server, reason)),
+            Self::Server { server, message } => write!(
+                f,
+                "{server} answered with an error: {message}. If it keeps failing, the user can \
+                 reconnect it in Settings › Integrations."
+            ),
+            Self::NotConfigured { server } => write!(
+                f,
+                "No MCP server named {server} is configured for this project. Talk's MCP servers \
+                 are managed in Settings › Integrations."
+            ),
+            Self::NotMcpTool(name) => write!(f, "{name} is not an MCP tool name."),
+        }
+    }
+}
+
+/// How one JSON-RPC request failed.
+#[derive(Debug)]
+enum RpcError {
+    /// The wire broke: a write or read failed, or the server closed its
+    /// stdout (it exited). The connection is unusable.
+    Transport(String),
+    /// The server answered with a JSON-RPC `error` — it is alive and speaking
+    /// the protocol.
+    Server(String),
+}
+
+impl From<RpcError> for String {
+    fn from(e: RpcError) -> String {
+        match e {
+            RpcError::Transport(m) | RpcError::Server(m) => m,
+        }
+    }
+}
+
 /// `mcp__<server>__<tool>`.
 pub fn namespaced_name(server: &str, tool: &str) -> String {
     format!("mcp__{server}__{tool}")
@@ -150,17 +290,21 @@ struct Connection {
 impl Connection {
     /// Send a JSON-RPC request and block until the matching-id response,
     /// skipping any interleaved notifications.
-    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, RpcError> {
         let id = self.next_id;
         self.next_id += 1;
         let req = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.write_message(&req)?;
+        self.write_message(&req)
+            .map_err(|e| RpcError::Transport(format!("couldn't write to the server: {e}")))?;
         // Non-JSON stdout lines collected for diagnostics (bridge tools like
         // mcp-remote print auth URLs and status to stdout before the handshake).
         let mut stdout_lines: Vec<String> = Vec::new();
         loop {
             let mut buf = String::new();
-            let n = self.reader.read_line(&mut buf).map_err(|e| e.to_string())?;
+            let n = self
+                .reader
+                .read_line(&mut buf)
+                .map_err(|e| RpcError::Transport(format!("couldn't read from the server: {e}")))?;
             if n == 0 {
                 let stderr = self.stderr_log.lock();
                 let stderr = stderr.trim();
@@ -173,7 +317,7 @@ impl Connection {
                 if !stderr.is_empty() {
                     parts.push(stderr);
                 }
-                return Err(parts.join("\n"));
+                return Err(RpcError::Transport(parts.join("\n")));
             }
             let Ok(msg) = serde_json::from_str::<Value>(buf.trim()) else {
                 // Collect non-JSON lines (bridge tools may print auth/status here).
@@ -185,7 +329,7 @@ impl Connection {
             };
             if msg.get("id").and_then(|v| v.as_i64()) == Some(id) {
                 if let Some(err) = msg.get("error") {
-                    return Err(err.to_string());
+                    return Err(RpcError::Server(err.to_string()));
                 }
                 return Ok(msg.get("result").cloned().unwrap_or(Value::Null));
             }
@@ -259,6 +403,15 @@ impl Drop for Connection {
 struct Entry {
     conn: Arc<Mutex<Connection>>,
     child: ChildHandle,
+    /// The config the process was started with: the entry serves only
+    /// callers asking for that same config (`cached`).
+    cfg: McpServerConfig,
+}
+
+/// A server that failed to start, remembered with the config that failed.
+struct Failure {
+    cfg: McpServerConfig,
+    reason: String,
 }
 
 /// Drain `stderr` into `log`, capped at 4 KiB. Runs on a dedicated thread per
@@ -285,8 +438,18 @@ pub struct McpRegistry {
     /// a not-yet-connected server spawn it once, not twice.
     connecting: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// Servers that failed to start this session — skipped on subsequent turns
-    /// so a broken config doesn't re-spawn a failing process every turn.
-    failed: Mutex<std::collections::HashSet<String>>,
+    /// so a broken config doesn't re-spawn a failing process every turn. Only
+    /// while the config is the one that failed: an edited entry is tried
+    /// again, and a reset forgets the failure.
+    failed: Mutex<HashMap<String, Failure>>,
+    /// Per-server reset count (`reset_server`). A start that began before a
+    /// reset neither caches its connection nor records its failure, so a
+    /// save or Reconnect racing a first call can't leave the old config's
+    /// process (or its failure) behind.
+    ///
+    /// Lock order: `conns` or `failed` may be held while taking `resets`,
+    /// never the other way round.
+    resets: Mutex<HashMap<String, u64>>,
 }
 
 /// How long one MCP `tools/call` may take on the wire before the caller
@@ -298,12 +461,13 @@ pub fn server_of(namespaced: &str) -> Option<String> {
     parse_namespaced(namespaced).map(|(s, _)| s)
 }
 
-/// `registry.call(...)` off the async runtime, bounded by `bound`. On a
-/// timeout the server process is **stopped** (`abort_server`), so a call
-/// reported as timed out can never complete later in the background — the
-/// blocked worker gets EOF and returns, and the next call re-spawns the
-/// server. The error says so, and warns that a request the server had
-/// already sent (a write to a tracker) may still have landed.
+/// `registry.call(...)` off the async runtime, bounded by `bound`, with the
+/// error as the model reads it (`McpCallError`'s `Display`). On a timeout
+/// the server process is **stopped** (`abort_server`), so a call reported as
+/// timed out can never complete later in the background — the blocked
+/// worker gets EOF and returns, and the next call re-spawns the server. The
+/// error says so, and warns that a request the server had already sent (a
+/// write to a tracker) may still have landed.
 pub async fn call_bounded(
     registry: Arc<McpRegistry>,
     worktree: std::path::PathBuf,
@@ -315,19 +479,22 @@ pub async fn call_bounded(
     let name = namespaced.clone();
     match tokio::time::timeout(bound, tokio::task::spawn_blocking(move || reg.call(&worktree, &name, &input))).await {
         Ok(Ok(Ok(out))) => Ok(out),
-        Ok(Ok(Err(e))) => Err(format!("MCP error: {e}")),
+        Ok(Ok(Err(e))) => Err(e.to_string()),
         Ok(Err(e)) => Err(format!("MCP error: call task failed: {e}")),
         Err(_) => {
-            if let Some(server) = server_of(&namespaced) {
+            let server = server_of(&namespaced);
+            if let Some(server) = server.clone() {
                 // Kill + reap off the runtime thread.
                 let reg = Arc::clone(&registry);
                 let _ = tokio::task::spawn_blocking(move || reg.abort_server(&server)).await;
             }
             Err(format!(
-                "MCP error: `{namespaced}` timed out after {}s. The server was stopped, so this call \
-                 cannot complete later; if it had already sent its request, the change may exist — \
-                 check before retrying.",
-                bound.as_secs()
+                "{} The server was stopped, so this call cannot complete later; if it had already \
+                 sent its request, the change may exist — check before retrying.",
+                connection_failure_text(
+                    server.as_deref().unwrap_or(&namespaced),
+                    &format!("`{namespaced}` timed out after {}s", bound.as_secs()),
+                )
             ))
         }
     }
@@ -339,8 +506,32 @@ impl McpRegistry {
             conns: Mutex::new(HashMap::new()),
             pending: Mutex::new(HashMap::new()),
             connecting: Mutex::new(HashMap::new()),
-            failed: Mutex::new(std::collections::HashSet::new()),
+            failed: Mutex::new(HashMap::new()),
+            resets: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn reset_count(&self, name: &str) -> u64 {
+        self.resets.lock().get(name).copied().unwrap_or(0)
+    }
+
+    /// The cached connection, if it was started with `cfg`. One started with
+    /// another config is stale (the file was edited, or a project's config
+    /// names the server differently): it is forgotten here, and its process
+    /// ends when the last call still using it lets go.
+    fn cached(&self, name: &str, cfg: &McpServerConfig) -> Option<Arc<Mutex<Connection>>> {
+        let mut conns = self.conns.lock();
+        match conns.get(name) {
+            Some(e) if &e.cfg == cfg => return Some(Arc::clone(&e.conn)),
+            Some(_) => {}
+            None => return None,
+        }
+        let stale = conns.remove(name);
+        // The process may be killed and reaped as the entry drops: never
+        // under the registry lock.
+        drop(conns);
+        drop(stale);
+        None
     }
 
     /// Drop a server's cached connection after IT errored — only when the
@@ -360,12 +551,46 @@ impl McpRegistry {
     /// still in flight. That reader gets EOF and returns an error; the next
     /// call re-spawns the server.
     pub fn abort_server(&self, name: &str) {
+        self.stop(name, "a call timed out");
+    }
+
+    /// Kill a server's live and starting processes and forget its
+    /// connection. Never takes a connection's own lock, so a request blocked
+    /// on it can't hold this up: it gets EOF and returns an error.
+    fn stop(&self, name: &str, why: &str) {
         let live = self.conns.lock().remove(name);
         let pending = self.pending.lock().get(name).cloned();
         for child in live.iter().map(|e| &e.child).chain(pending.iter()) {
-            tracing::warn!(server = %name, "stopping MCP server after a timed-out call");
+            tracing::warn!(server = %name, reason = why, "stopping MCP server");
             kill_and_reap(child);
         }
+    }
+
+    /// Start a server over: stop its process (a call in flight on it fails),
+    /// cancel a start in progress, and forget a failure, so the next use
+    /// spawns it from its current config. Used when its config changes
+    /// (`apply_config_change`) and by Settings' Reconnect.
+    pub fn reset_server(&self, name: &str) {
+        // Count the reset first: a start still running past this point
+        // sees it and discards its process (or its failure).
+        *self.resets.lock().entry(name.to_string()).or_insert(0) += 1;
+        self.stop(name, "reset");
+        self.failed.lock().remove(name);
+    }
+
+    /// After the user-level config was saved: reset every server whose entry
+    /// changed or was removed (or was added, which forgets an old failure
+    /// under that name). Returns the names reset.
+    pub fn apply_config_change(
+        &self,
+        old: &HashMap<String, McpServerConfig>,
+        new: &HashMap<String, McpServerConfig>,
+    ) -> Vec<String> {
+        let changed = changed_servers(old, new);
+        for name in &changed {
+            self.reset_server(name);
+        }
+        changed
     }
 
     /// Spawn a server, run the MCP initialize handshake, and fetch its tools.
@@ -380,33 +605,19 @@ impl McpRegistry {
     }
 
     fn spawn(cfg: &McpServerConfig) -> Result<ChildHandle, String> {
-        let mut cmd = Command::new(&cfg.command);
+        // The PATH CLI stages run with: a GUI app starts from launchd's
+        // minimal PATH, where `npx`, `uvx` or `node` aren't found.
+        let plan = spawn_plan(cfg, &crate::orchestrator::cli_runner::resolved_cli_path())?;
+        let mut cmd = Command::new(&plan.program);
         cmd.args(&cfg.args)
             .envs(&cfg.env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-
-        // When the command is an absolute path (e.g. /Users/foo/.nvm/.../npx),
-        // its parent dir contains sibling binaries (node, npm, …) the script
-        // needs via /usr/bin/env. GUI apps on macOS don't inherit the shell
-        // PATH, so env(1) can't find them. Prepend the command's directory to
-        // the subprocess PATH so the shebang resolves without the user having
-        // to add PATH to the server's env manually.
-        if !cfg.env.contains_key("PATH") {
-            let cmd_path = std::path::Path::new(&cfg.command);
-            if cmd_path.is_absolute() {
-                if let Some(bin_dir) = cmd_path.parent() {
-                    let bin_dir = bin_dir.display().to_string();
-                    let new_path = match std::env::var("PATH") {
-                        Ok(existing) if !existing.is_empty() => {
-                            format!("{bin_dir}:{existing}")
-                        }
-                        _ => bin_dir,
-                    };
-                    cmd.env("PATH", new_path);
-                }
-            }
+        // Only PATH comes from the login shell; the rest of the environment
+        // is the app's own plus the server's `env`, as before.
+        if let Some(path) = &plan.path {
+            cmd.env("PATH", path);
         }
         // Own process group, so an abort can take the wrapper AND the
         // server it spawned (see `kill_and_reap`).
@@ -415,7 +626,7 @@ impl McpRegistry {
             use std::os::unix::process::CommandExt;
             cmd.process_group(0);
         }
-        let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", cfg.command))?;
+        let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", plan.program.display()))?;
         Ok(Arc::new(Mutex::new(child)))
     }
 
@@ -504,29 +715,45 @@ impl McpRegistry {
     /// run under a per-server lock: concurrent first callers (a sub-agent
     /// fan-out) wait for one connection instead of each spawning their own.
     fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<Arc<Mutex<Connection>>, String> {
-        if let Some(e) = self.conns.lock().get(name) {
-            return Ok(Arc::clone(&e.conn));
+        if let Some(conn) = self.cached(name, cfg) {
+            return Ok(conn);
         }
         let spawn_lock = Arc::clone(
             self.connecting.lock().entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))),
         );
         let _spawning = spawn_lock.lock();
-        if let Some(e) = self.conns.lock().get(name) {
-            return Ok(Arc::clone(&e.conn));
+        if let Some(conn) = self.cached(name, cfg) {
+            return Ok(conn);
         }
-        if self.failed.lock().contains(name) {
-            return Err(format!("MCP server '{name}' previously failed; skipping"));
+        if let Some(f) = self.failed.lock().get(name).filter(|f| &f.cfg == cfg) {
+            return Err(format!("it failed to start earlier in this session: {}", f.reason));
         }
+        let resets = self.reset_count(name);
         match self.connect(name, cfg) {
             Ok(conn) => {
                 let child = Arc::clone(&conn.child);
                 let arc = Arc::new(Mutex::new(conn));
-                self.conns.lock().insert(name.to_string(), Entry { conn: Arc::clone(&arc), child });
+                let mut conns = self.conns.lock();
+                if self.reset_count(name) != resets {
+                    // Reset while it started (its config was saved, or the
+                    // user pressed Reconnect): this may be the old config's
+                    // process. Dropping the last handle kills it.
+                    drop(conns);
+                    drop(arc);
+                    return Err("it was restarted while starting; try again".into());
+                }
+                let stale = conns.insert(name.to_string(), Entry { conn: Arc::clone(&arc), child, cfg: cfg.clone() });
+                drop(conns);
+                drop(stale);
                 Ok(arc)
             }
             Err(e) => {
-                // Remember the failure so we don't re-spawn it every turn.
-                self.failed.lock().insert(name.to_string());
+                // Remember the failure so we don't re-spawn it every turn —
+                // unless a reset interrupted this start.
+                let mut failed = self.failed.lock();
+                if self.reset_count(name) == resets {
+                    failed.insert(name.to_string(), Failure { cfg: cfg.clone(), reason: e.clone() });
+                }
                 Err(e)
             }
         }
@@ -548,25 +775,30 @@ impl McpRegistry {
     }
 
     /// Call a namespaced MCP tool (`mcp__server__tool`), returning the textual
-    /// result (MCP `tools/call` content blocks joined).
-    pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, String> {
-        let (server, tool) = parse_namespaced(namespaced).ok_or("not an MCP tool")?;
+    /// result (MCP `tools/call` content blocks joined). A tool that reports
+    /// its own failure (`isError`) is a result like any other.
+    pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
+        let (server, tool) =
+            parse_namespaced(namespaced).ok_or_else(|| McpCallError::NotMcpTool(namespaced.to_string()))?;
         let cfgs = load_server_configs(worktree);
-        let cfg = cfgs
-            .get(&server)
-            .ok_or_else(|| format!("MCP server '{server}' not configured"))?;
-        let conn = self.ensure(&server, cfg)?;
-        let result = match conn
-            .lock()
-            .request("tools/call", json!({ "name": tool, "arguments": input }))
-        {
+        let Some(cfg) = cfgs.get(&server) else {
+            return Err(McpCallError::NotConfigured { server });
+        };
+        let conn = self
+            .ensure(&server, cfg)
+            .map_err(|reason| McpCallError::Connection { server: server.clone(), reason })?;
+        let answer = conn.lock().request("tools/call", json!({ "name": tool, "arguments": input }));
+        let result = match answer {
             Ok(r) => r,
-            Err(e) => {
-                // The connection is likely dead (broken pipe / closed) — evict
-                // it so the next call re-spawns a fresh server instead of
-                // reusing a corpse forever.
+            // The server answered: it is alive, so its connection stays.
+            Err(RpcError::Server(message)) => return Err(McpCallError::Server { server, message }),
+            Err(RpcError::Transport(reason)) => {
+                // The wire broke (the process exited, a pipe closed): evict
+                // the connection so the next call spawns a fresh server
+                // instead of reusing a corpse. This call isn't retried — it
+                // may already have reached the server.
                 self.evict_if_current(&server, &conn);
-                return Err(e);
+                return Err(McpCallError::Connection { server, reason });
             }
         };
         let text = result
@@ -710,24 +942,379 @@ sleep 30
 
     #[cfg(unix)]
     fn fixture_worktree(fixture: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, log) = fixture_dir(fixture);
+        write_servers(dir.path(), &HashMap::from([("hang".to_string(), fixture_config(dir.path(), &[]))]));
+        (dir, log)
+    }
+
+    /// A temp worktree holding the fixture script (`hang.sh`); its spawn log
+    /// is `spawns.log`. No config is written yet.
+    #[cfg(unix)]
+    fn fixture_dir(fixture: &str) -> (tempfile::TempDir, std::path::PathBuf) {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("hang.sh");
         std::fs::write(&script, fixture).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         let log = dir.path().join("spawns.log");
-        let claude = dir.path().join(".claude");
-        std::fs::create_dir_all(&claude).unwrap();
-        std::fs::write(
-            claude.join("mcp.json"),
-            format!(
-                r#"{{"mcpServers":{{"hang":{{"command":"bash","args":[{:?}],"env":{{"SPAWN_LOG":{:?}}}}}}}}}"#,
-                script.to_string_lossy(),
-                log.to_string_lossy()
-            ),
-        )
-        .unwrap();
         (dir, log)
+    }
+
+    /// The config that runs the worktree's fixture, with `SPAWN_LOG` and
+    /// `extra` in its environment.
+    #[cfg(unix)]
+    fn fixture_config(dir: &std::path::Path, extra: &[(&str, &str)]) -> McpServerConfig {
+        let mut env = HashMap::from([("SPAWN_LOG".to_string(), dir.join("spawns.log").to_string_lossy().into_owned())]);
+        env.extend(extra.iter().map(|(k, v)| (k.to_string(), v.to_string())));
+        McpServerConfig {
+            command: "bash".into(),
+            args: vec![dir.join("hang.sh").to_string_lossy().into_owned()],
+            env,
+        }
+    }
+
+    /// Write `servers` as the worktree's project-level `.claude/mcp.json`.
+    #[cfg(unix)]
+    fn write_servers(dir: &std::path::Path, servers: &HashMap<String, McpServerConfig>) {
+        let claude = dir.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("mcp.json"), json!({ "mcpServers": servers }).to_string()).unwrap();
+    }
+
+    // A fixture that answers every call with `$ECHO_TEXT` (also its one
+    // tool's description), and logs `start` each time it starts. The tool
+    // `refuse` fails inside the tool (`isError`); `reject` gets a JSON-RPC
+    // error. Either way the server itself is fine.
+    const ECHO_FIXTURE: &str = r#"#!/usr/bin/env bash
+echo start >> "$SPAWN_LOG"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"2024-11-05","capabilities":{},"serverInfo":{"name":"echo","version":"0"}}}\n' "$id" ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"%s","inputSchema":{"type":"object"}}]}}\n' "$id" "$ECHO_TEXT" ;;
+    *'"name":"refuse"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"isError":true,"content":[{"type":"text","text":"no such issue"}]}}\n' "$id" ;;
+    *'"name":"reject"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"bad arguments"}}\n' "$id" ;;
+    *'"method":"tools/call"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"content":[{"type":"text","text":"%s"}]}}\n' "$id" "$ECHO_TEXT" ;;
+  esac
+done
+"#;
+
+    /// An echo fixture configured as server `fix`, answering `text`.
+    #[cfg(unix)]
+    fn echo_worktree(text: &str) -> (tempfile::TempDir, std::path::PathBuf, HashMap<String, McpServerConfig>) {
+        let (dir, log) = fixture_dir(ECHO_FIXTURE);
+        let servers = HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", text)]))]);
+        write_servers(dir.path(), &servers);
+        (dir, log, servers)
+    }
+
+    #[cfg(unix)]
+    fn reaped(child: &ChildHandle) -> bool {
+        matches!(child.lock().try_wait(), Ok(Some(_)))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_a_changed_config_stops_the_old_server_and_the_next_use_starts_the_new_one() {
+        let (dir, log, before) = echo_worktree("old");
+        let reg = McpRegistry::new();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "old");
+        let old_child = Arc::clone(&reg.conns.lock()["fix"].child);
+
+        // A save that leaves the entry as it was stops nothing.
+        assert!(reg.apply_config_change(&before, &before).is_empty());
+        assert!(reg.conns.lock().contains_key("fix") && !reaped(&old_child));
+
+        // The user saves a new config for the server.
+        let after = HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", "new")]))]);
+        write_servers(dir.path(), &after);
+        assert_eq!(reg.apply_config_change(&before, &after), vec!["fix".to_string()]);
+        assert!(reg.conns.lock().is_empty(), "the old connection is dropped");
+        assert!(reaped(&old_child), "and its process stopped");
+
+        // The next list and call use a fresh process with the new config.
+        let tools = reg.list_tools(dir.path());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].description, "new");
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "new");
+        assert_eq!(log_lines(&log, "start"), 2, "one process per config");
+
+        // Removing the server stops it too.
+        let child = Arc::clone(&reg.conns.lock()["fix"].child);
+        assert_eq!(reg.apply_config_change(&after, &HashMap::new()), vec!["fix".to_string()]);
+        assert!(reg.conns.lock().is_empty() && reaped(&child));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_save_stops_a_call_in_flight_without_blocking_and_the_next_call_respawns() {
+        let (dir, log) = hanging_worktree();
+        let reg = Arc::new(McpRegistry::new());
+        assert_eq!(reg.list_tools(dir.path()).len(), 1);
+        let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
+        let worker = std::thread::spawn(move || r2.call(&wt, "mcp__hang__slow", &json!({})));
+        wait_for(&log, "call", 1);
+
+        let before = HashMap::from([("hang".to_string(), fixture_config(dir.path(), &[]))]);
+        let after = HashMap::from([("hang".to_string(), fixture_config(dir.path(), &[("TOKEN", "fresh")]))]);
+        write_servers(dir.path(), &after);
+        let started = std::time::Instant::now();
+        reg.apply_config_change(&before, &after);
+        let res = worker.join().unwrap();
+        assert!(matches!(res, Err(McpCallError::Connection { .. })), "the old process's call fails: {res:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(reg.list_tools(dir.path()).len(), 1);
+        assert_eq!(log_lines(&log, "start"), 2, "the next use spawned the new config");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reset_during_a_handshake_neither_caches_nor_remembers_a_failure() {
+        let (dir, log) = fixture_worktree(MUTE_FIXTURE);
+        let reg = Arc::new(McpRegistry::new());
+        let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
+        let worker = std::thread::spawn(move || r2.list_tools(&wt).len());
+        wait_for(&log, "start", 1);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        reg.reset_server("hang");
+        assert_eq!(worker.join().unwrap(), 0, "the interrupted start fails instead of blocking");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(reg.conns.lock().is_empty() && reg.pending.lock().is_empty());
+        assert!(reg.failed.lock().is_empty(), "a start a reset interrupted isn't a failure to remember");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_killed_server_fails_its_call_and_the_next_call_respawns() {
+        let (dir, log, _) = echo_worktree("pong");
+        let reg = McpRegistry::new();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        // The process dies behind the registry's back.
+        let child = Arc::clone(&reg.conns.lock()["fix"].child);
+        let pid = child.lock().id() as libc::pid_t;
+        // SAFETY: the child is ours and unreaped, so the pid can't be reused.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let started = std::time::Instant::now();
+        while !reaped(&child) {
+            assert!(started.elapsed() < std::time::Duration::from_secs(10), "the fixture never exited");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+
+        let err = reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap_err();
+        assert!(matches!(err, McpCallError::Connection { .. }), "{err:?}");
+        let text = err.to_string();
+        assert!(text.starts_with("Octopush's connection to fix failed: "), "{text}");
+        assert!(text.contains("The user can reconnect it in Settings › Integrations."), "{text}");
+        assert!(!text.contains("/mcp"), "{text}");
+        assert_eq!(log_lines(&log, "start"), 1, "the failed call isn't retried");
+        assert!(reg.conns.lock().is_empty(), "the dead connection is dropped");
+
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        assert_eq!(log_lines(&log, "start"), 2, "the next call started a fresh server");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tool_level_error_keeps_the_connection() {
+        let (dir, log, _) = echo_worktree("pong");
+        let reg = McpRegistry::new();
+        // The tool failed and said so: a result, from a healthy server.
+        assert_eq!(reg.call(dir.path(), "mcp__fix__refuse", &json!({})).unwrap(), "no such issue");
+        let conn = Arc::clone(&reg.conns.lock()["fix"].conn);
+        // A JSON-RPC error answer: the server is alive too.
+        let err = reg.call(dir.path(), "mcp__fix__reject", &json!({})).unwrap_err();
+        assert!(matches!(&err, McpCallError::Server { message, .. } if message.contains("bad arguments")), "{err:?}");
+        assert!(!err.to_string().contains("connection to fix failed"), "{err}");
+        assert!(Arc::ptr_eq(&conn, &reg.conns.lock()["fix"].conn), "the connection stays cached");
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        assert_eq!(log_lines(&log, "start"), 1, "one process throughout");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconnect_restarts_a_live_server_and_forgets_a_failure() {
+        let (dir, log, _) = echo_worktree("pong");
+        let reg = McpRegistry::new();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        let child = Arc::clone(&reg.conns.lock()["fix"].child);
+        reg.reset_server("fix");
+        assert!(reg.conns.lock().is_empty() && reaped(&child));
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        assert_eq!(log_lines(&log, "start"), 2);
+
+        // A server that failed to start is skipped until it is reset.
+        let broken = HashMap::from([(
+            "gone".to_string(),
+            McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() },
+        )]);
+        write_servers(dir.path(), &broken);
+        assert!(reg.list_tools(dir.path()).is_empty());
+        let err = reg.call(dir.path(), "mcp__gone__x", &json!({})).unwrap_err();
+        assert!(err.to_string().contains("failed to start earlier in this session"), "{err}");
+        reg.reset_server("gone");
+        assert!(reg.failed.lock().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hand_edited_config_is_used_without_a_save() {
+        let (dir, log, _) = echo_worktree("old");
+        let reg = McpRegistry::new();
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "old");
+        // The file changes outside Settings: the cached process was started
+        // with the old entry, so it isn't reused.
+        write_servers(dir.path(), &HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", "new")]))]));
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "new");
+        assert_eq!(log_lines(&log, "start"), 2);
+
+        // A failure is remembered for the config that failed, not the name.
+        let bad = McpServerConfig { command: dir.path().join("missing-server").to_string_lossy().into_owned(), args: vec![], env: HashMap::new() };
+        write_servers(dir.path(), &HashMap::from([("fix".to_string(), bad)]));
+        assert!(matches!(reg.call(dir.path(), "mcp__fix__echo", &json!({})), Err(McpCallError::Connection { .. })));
+        write_servers(dir.path(), &HashMap::from([("fix".to_string(), fixture_config(dir.path(), &[("ECHO_TEXT", "back")]))]));
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "back");
+    }
+
+    /// An executable stand-in for a CLI such as `npx`, in `dir`.
+    #[cfg(unix)]
+    fn fake_bin(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join(name);
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    #[cfg(unix)]
+    fn command(command: &str, env: &[(&str, &str)]) -> McpServerConfig {
+        McpServerConfig {
+            command: command.into(),
+            args: vec!["-y".into(), "mcp-remote".into(), "https://mcp.example/sse".into()],
+            env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_bare_command_resolves_on_the_cli_path_the_server_then_runs_with() {
+        let login = tempfile::tempdir().unwrap();
+        let npx = fake_bin(login.path(), "npx");
+        let search = format!("/nonexistent/xyz:{}", login.path().display());
+        let plan = spawn_plan(&command("npx", &[]), &search).unwrap();
+        assert_eq!(plan.program, npx);
+        assert_eq!(plan.path.as_deref(), Some(search.as_str()));
+
+        assert_eq!(
+            spawn_plan(&command("npx", &[]), "/nonexistent/xyz").unwrap_err(),
+            "Octopush couldn't find `npx` on your PATH. Use its full path (run `which npx` in Terminal)."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_absolute_command_runs_as_given_with_its_own_dir_first() {
+        let nvm = tempfile::tempdir().unwrap();
+        let npx = fake_bin(nvm.path(), "npx");
+        let plan = spawn_plan(&command(&npx.to_string_lossy(), &[]), "/usr/bin:/bin").unwrap();
+        assert_eq!(plan.program, npx);
+        assert_eq!(plan.path, Some(format!("{}:/usr/bin:/bin", nvm.path().display())));
+        // A path that doesn't exist is still run as given: the spawn reports it.
+        let plan = spawn_plan(&command("/nowhere/npx", &[]), "/usr/bin").unwrap();
+        assert_eq!(plan.program, std::path::PathBuf::from("/nowhere/npx"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_servers_own_path_wins() {
+        let own = tempfile::tempdir().unwrap();
+        let uvx = fake_bin(own.path(), "uvx");
+        let own_path = own.path().to_string_lossy().into_owned();
+        let login = tempfile::tempdir().unwrap();
+        fake_bin(login.path(), "npx");
+        let login_path = login.path().to_string_lossy().into_owned();
+
+        let plan = spawn_plan(&command("uvx", &[("PATH", own_path.as_str())]), &login_path).unwrap();
+        assert_eq!(plan.program, uvx);
+        assert_eq!(plan.path, None, "the server's env sets PATH, so it is left alone");
+        // The lookup uses the PATH the server will run with, not the login one.
+        assert!(spawn_plan(&command("npx", &[("PATH", own_path.as_str())]), &login_path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_gets_the_cli_path_and_nothing_else_from_the_login_shell() {
+        const DUMP_FIXTURE: &str = "#!/usr/bin/env bash\ncompgen -e > \"$ENV_DUMP\"\nprintf '%s' \"$PATH\" > \"$PATH_DUMP\"\n";
+        let (dir, _log) = fixture_dir(DUMP_FIXTURE);
+        let (env_dump, path_dump) = (dir.path().join("env.txt"), dir.path().join("path.txt"));
+        let cfg = McpServerConfig {
+            command: "bash".into(),
+            args: vec![dir.path().join("hang.sh").to_string_lossy().into_owned()],
+            env: HashMap::from([
+                ("ENV_DUMP".to_string(), env_dump.to_string_lossy().into_owned()),
+                ("PATH_DUMP".to_string(), path_dump.to_string_lossy().into_owned()),
+            ]),
+        };
+        // The script exits without a handshake: only its environment matters.
+        assert!(McpRegistry::test_connect("dump", &cfg).is_err());
+        let resolved = crate::orchestrator::cli_runner::resolved_cli_path();
+        assert_eq!(std::fs::read_to_string(&path_dump).unwrap(), resolved, "the PATH CLI stages run with");
+        let names: std::collections::HashSet<String> =
+            std::fs::read_to_string(&env_dump).unwrap().lines().map(str::to_string).collect();
+        for (key, _) in crate::orchestrator::cli_runner::login_shell_env() {
+            if key != "PATH" && std::env::var_os(key).is_none() && !cfg.env.contains_key(key) {
+                assert!(!names.contains(key), "{key} came from the login shell");
+            }
+        }
+
+        let err = McpRegistry::test_connect("x", &command("octopush-no-such-server-xyz", &[])).unwrap_err();
+        assert_eq!(
+            err,
+            "Octopush couldn't find `octopush-no-such-server-xyz` on your PATH. Use its full path (run \
+             `which octopush-no-such-server-xyz` in Terminal)."
+        );
+    }
+
+    #[test]
+    fn changed_servers_lists_changed_removed_and_added_entries() {
+        let cfg = |c: &str| McpServerConfig { command: c.into(), args: vec![], env: HashMap::new() };
+        let old = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y")), ("c".to_string(), cfg("z"))]);
+        let new = HashMap::from([("a".to_string(), cfg("x")), ("b".to_string(), cfg("y2")), ("d".to_string(), cfg("w"))]);
+        assert_eq!(changed_servers(&old, &new), vec!["b", "c", "d"]);
+        assert!(changed_servers(&old, &old).is_empty());
+        let mut env_only = old.clone();
+        env_only.get_mut("a").unwrap().env.insert("TOKEN".into(), "new".into());
+        assert_eq!(changed_servers(&old, &env_only), vec!["a"]);
+    }
+
+    #[test]
+    fn connection_failures_tell_the_model_what_applies_in_octopush() {
+        assert_eq!(
+            connection_failure_text("jira", "MCP server closed the connection"),
+            "Octopush's connection to jira failed: MCP server closed the connection. The user can reconnect it in Settings › Integrations."
+        );
+        assert_eq!(
+            connection_failure_text("jira", "MCP server closed the connection\nPlease authenticate\n"),
+            "Octopush's connection to jira failed: MCP server closed the connection. The user can reconnect it in Settings › Integrations.\n\nServer output:\nPlease authenticate"
+        );
+        assert_eq!(
+            connection_failure_text("jira", "it timed out."),
+            "Octopush's connection to jira failed: it timed out. The user can reconnect it in Settings › Integrations."
+        );
+        let server = McpCallError::Server { server: "jira".into(), message: "{\"code\":-32602}".into() }.to_string();
+        assert!(server.starts_with("jira answered with an error: ") && server.contains("Settings › Integrations"), "{server}");
+        let missing = McpCallError::NotConfigured { server: "jira".into() }.to_string();
+        assert!(missing.contains("Settings › Integrations"), "{missing}");
+        for text in [server, missing] {
+            assert!(!text.contains("/mcp") && !text.contains("claude mcp"), "{text}");
+        }
     }
 
     #[cfg(unix)]
@@ -789,6 +1376,8 @@ sleep 30
         .await
         .unwrap_err();
         assert!(err.contains("timed out") && err.contains("server was stopped"), "{err}");
+        assert!(err.starts_with("Octopush's connection to hang failed: "), "{err}");
+        assert!(err.contains("The user can reconnect it in Settings › Integrations."), "{err}");
         // Stopped: the connection is gone and the process was reaped; a
         // later discovery spawns a fresh one.
         assert!(reg.conns.lock().is_empty() && reg.pending.lock().is_empty());

@@ -1083,6 +1083,9 @@ export const ipc = {
     invoke<void>("save_mcp_config", { servers }),
   testMcpServer: (name: string, config: McpServerConfig) =>
     invoke<McpToolInfo[]>("test_mcp_server", { name, config }),
+  /** Stop Talk's cached connection to the server, then run the same smoke test as Test. */
+  reconnectMcpServer: (name: string, config: McpServerConfig) =>
+    invoke<McpToolInfo[]>("reconnect_mcp_server", { name, config }),
 
   // ─── Git ────────────────────────────────────────────────────────
   getGitStatus: (path: string) => invoke<GitStatus>("get_git_status", { path }),
