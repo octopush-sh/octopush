@@ -81,6 +81,21 @@ fn unknown_group_item_kind(kind: &str) -> crate::error::AppError {
     group_error(format!("Unknown item kind '{kind}'. Use 'project' or 'workspace'."))
 }
 
+/// What a mission can wait for on its prerequisite (`workspaces.after_condition`).
+pub const PREREQUISITE_CONDITIONS: [&str; 2] = ["run_finished", "pr_merged"];
+
+/// A refusal from the prerequisite ("Starts after") layer, worded for the user.
+fn prerequisite_error(message: impl Into<String>) -> crate::error::AppError {
+    crate::error::AppError::Other(message.into())
+}
+
+/// Clears every link that points at `workspace_id` (it is being deleted or
+/// archived), so no mission waits on one that is gone.
+const CLEAR_LINKS_TO_WORKSPACE_SQL: &str =
+    "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+            branch_from_prerequisite = 0, auto_start = 0
+     WHERE after_workspace_id = ?1";
+
 /// Map an UPDATE's row count to "the group exists".
 fn group_found(changed: usize) -> AppResult<()> {
     if changed == 0 {
@@ -1278,6 +1293,22 @@ impl Db {
         )?;
         add_column_if_missing(&self.conn, "ALTER TABLE projects ADD COLUMN group_id TEXT")?;
         add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN group_id TEXT")?;
+
+        // ── Starts after (#960): a mission that waits on another mission of
+        // the same project. `after_workspace_id` names the prerequisite (no
+        // foreign key: deleting or archiving it clears the link in
+        // `delete_workspace` / `archive_workspace`); `after_condition` is one
+        // of `PREREQUISITE_CONDITIONS`. Both are NULL when there is no link.
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_workspace_id TEXT")?;
+        add_column_if_missing(&self.conn, "ALTER TABLE workspaces ADD COLUMN after_condition TEXT")?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN branch_from_prerequisite INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &self.conn,
+            "ALTER TABLE workspaces ADD COLUMN auto_start INTEGER NOT NULL DEFAULT 0",
+        )?;
 
         self.backfill_default_threads()?;
 
@@ -2945,6 +2976,134 @@ impl Db {
         Ok(())
     }
 
+    // ─── Prerequisites ("Starts after", #960) ─────────────────────
+
+    /// The mission `workspace_id` waits on, or None when it has no link.
+    pub fn get_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<Option<PrerequisiteRow>> {
+        let row: Option<(Option<String>, Option<String>, i64, i64)> = self
+            .conn
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                params![workspace_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let (after, condition, branch_from, auto_start) =
+            row.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        Ok(match (after, condition) {
+            (Some(after_workspace_id), Some(after_condition)) => Some(PrerequisiteRow {
+                workspace_id: workspace_id.to_string(),
+                after_workspace_id,
+                after_condition,
+                branch_from_prerequisite: branch_from != 0,
+                auto_start: auto_start != 0,
+            }),
+            _ => None,
+        })
+    }
+
+    /// Make `workspace_id` wait on `after_workspace_id` until `condition`
+    /// (one of [`PREREQUISITE_CONDITIONS`]), replacing any earlier link.
+    /// Refuses an unknown condition, a missing or archived prerequisite, one
+    /// from another project, and any link that would close a cycle (itself
+    /// included).
+    pub fn set_workspace_prerequisite(
+        &self,
+        workspace_id: &str,
+        after_workspace_id: &str,
+        condition: &str,
+        branch_from_prerequisite: bool,
+        auto_start: bool,
+    ) -> AppResult<PrerequisiteRow> {
+        if !PREREQUISITE_CONDITIONS.contains(&condition) {
+            return Err(prerequisite_error(format!(
+                "Unknown condition '{condition}'. Use one of: {}.",
+                PREREQUISITE_CONDITIONS.join(", ")
+            )));
+        }
+        // IMMEDIATE, like `set_items_group`: the checks read before the write.
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.conn,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let lookup = |id: &str| -> AppResult<Option<(String, String)>> {
+            Ok(self
+                .conn
+                .query_row(
+                    "SELECT project_id, status FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?)
+        };
+        let (project, _) = lookup(workspace_id)?.ok_or_else(|| prerequisite_error("Mission not found."))?;
+        let (after_project, after_status) = lookup(after_workspace_id)?
+            .ok_or_else(|| prerequisite_error("The mission to wait on was not found."))?;
+        if after_status == "archived" {
+            return Err(prerequisite_error("A mission can't wait on an archived mission."));
+        }
+        if after_project != project {
+            return Err(prerequisite_error("A mission can only wait on a mission of its own project."));
+        }
+        // Walk the chain up from the prerequisite: reaching `workspace_id`
+        // means the new link would close a loop. `seen` stops on a loop that
+        // somehow exists already.
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = Some(after_workspace_id.to_string());
+        while let Some(id) = cursor {
+            if id == workspace_id {
+                return Err(prerequisite_error("These missions would wait on each other."));
+            }
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            cursor = self
+                .conn
+                .query_row(
+                    "SELECT after_workspace_id FROM workspaces WHERE id = ?1",
+                    params![id],
+                    |r| r.get::<_, Option<String>>(0),
+                )
+                .optional()?
+                .flatten();
+        }
+        tx.execute(
+            "UPDATE workspaces SET after_workspace_id = ?2, after_condition = ?3,
+                    branch_from_prerequisite = ?4, auto_start = ?5
+             WHERE id = ?1",
+            params![
+                workspace_id,
+                after_workspace_id,
+                condition,
+                branch_from_prerequisite as i64,
+                auto_start as i64
+            ],
+        )?;
+        tx.commit()?;
+        Ok(PrerequisiteRow {
+            workspace_id: workspace_id.to_string(),
+            after_workspace_id: after_workspace_id.to_string(),
+            after_condition: condition.to_string(),
+            branch_from_prerequisite,
+            auto_start,
+        })
+    }
+
+    /// Remove `workspace_id`'s prerequisite, if it has one.
+    pub fn clear_workspace_prerequisite(&self, workspace_id: &str) -> AppResult<()> {
+        let changed = self.conn.execute(
+            "UPDATE workspaces SET after_workspace_id = NULL, after_condition = NULL,
+                    branch_from_prerequisite = 0, auto_start = 0
+             WHERE id = ?1",
+            params![workspace_id],
+        )?;
+        if changed == 0 {
+            return Err(prerequisite_error("Mission not found."));
+        }
+        Ok(())
+    }
+
     // ─── Workspaces ───────────────────────────────────────────────
 
     pub fn insert_workspace(
@@ -3567,6 +3726,7 @@ impl Db {
         // missions must be removed explicitly or they linger as active orphans.
         self.conn
             .execute("DELETE FROM missions WHERE workspace_id = ?1", params![id])?;
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         self.conn.execute("DELETE FROM workspaces WHERE id = ?1", params![id])?;
         Ok(())
     }
@@ -3579,6 +3739,9 @@ impl Db {
             "UPDATE workspaces SET status = 'archived' WHERE id = ?1",
             params![id],
         )?;
+        // Missions waiting on this one stop waiting; restoring it doesn't
+        // bring the links back.
+        self.conn.execute(CLEAR_LINKS_TO_WORKSPACE_SQL, params![id])?;
         // Keep the paired mission in lockstep: archive its active mission(s) so
         // the writer slot frees and it stops surfacing as an active mission.
         self.conn.execute(
@@ -7706,6 +7869,21 @@ pub struct GroupRow {
     /// groups, the same project). Ascending; not necessarily dense.
     pub sort_order: i64,
     pub created_at: String,
+}
+
+/// A mission's prerequisite ("Starts after", #960): `workspace_id` waits on
+/// `after_workspace_id`, a mission of the same project.
+#[derive(serde::Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PrerequisiteRow {
+    pub workspace_id: String,
+    pub after_workspace_id: String,
+    /// One of [`PREREQUISITE_CONDITIONS`].
+    pub after_condition: String,
+    /// Branch the waiting mission from the prerequisite's branch, not the base.
+    pub branch_from_prerequisite: bool,
+    /// Start the waiting mission's run on its own once the condition holds.
+    pub auto_start: bool,
 }
 
 /// One queued Claude Code hook signal (`hook_signals`).

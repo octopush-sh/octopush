@@ -1792,6 +1792,11 @@ export const ipc = {
    *  cached version without probing; null when none or the version is unknown. */
   claudeModelFloorNote: (models: string[]) =>
     invoke<ClaudeModelFloorNote | null>("claude_model_floor_note", { models }),
+  /** Direct launcher: the line naming a Claude Code release to skip
+   *  (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) when one of `models` is a
+   *  gateway model, read from the cached version without probing; null otherwise. */
+  claudeKnownBadNote: (models: string[]) =>
+    invoke<string | null>("claude_known_bad_note", { models }),
   /** The launcher's untrusted-Codex-project line for `workspacePath`, or null. Reads Codex's config only. */
   codexTrustNote: (workspacePath: string) =>
     invoke<CodexTrustNote | null>("codex_trust_note", { workspacePath }),
@@ -1887,6 +1892,9 @@ export interface ClaudeCliVersion {
   securityFix?: { version: string; reason: string } | null;
   /** The version to update to: the higher of the floor and `securityFix`. */
   recommended?: string;
+  /** The release to skip (`agent_adapter::CLAUDE_KNOWN_BAD_RELEASES`) the
+   *  known version is exactly; null for any other version or an unknown one. */
+  knownBad?: { version: string; reason: string; scope: "gatewayStages" } | null;
 }
 
 /** Codex will skip the repo's `.codex/` config: the project is marked

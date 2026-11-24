@@ -248,6 +248,19 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
     return () => { alive = false; };
   }, [cli?.version, claudeModelsKey]);
   const modelFloorLine = cli?.version ? modelFloorLabel(floorNote) : null;
+  // A Claude Code release to skip (2.1.329) when a CLI stage runs a gateway
+  // model; the backend decides which models are gateway ones.
+  const [knownBadLine, setKnownBadLine] = useState<string | null>(null);
+  const knownBad = cli?.knownBad?.version ?? null;
+  useEffect(() => {
+    setKnownBadLine(null);
+    if (!knownBad || !claudeModelsKey) return;
+    let alive = true;
+    ipc.claudeKnownBadNote(claudeModelsKey.split("\n"))
+      .then((n) => { if (alive) setKnownBadLine(n); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [knownBad, claudeModelsKey]);
   // A Codex stage in a repo whose .codex/ config Codex will skip, because the
   // project isn't trusted in Codex. Octopush never trusts it for the user.
   const usesCodex = !!selected && crewUsesCodex(selected.stages, overrides);
@@ -644,6 +657,16 @@ export function PipelineSetup({ workspaceId, workspacePath, defaultTask, linkedI
                 className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
               >
                 {modelFloorLine}
+              </p>
+            )}
+            {knownBadLine && (
+              <p
+                data-tour="direct-launcher-known-bad"
+                data-testid="launcher-claude-known-bad"
+                title="Only this one release is affected. The run can still begin."
+                className="octo-rise-in octo-tabular m-0 mt-3 font-mono text-[11px] text-octo-warning"
+              >
+                {knownBadLine}
               </p>
             )}
             <RetiringModelLine

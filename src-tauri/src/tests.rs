@@ -10455,6 +10455,35 @@ mod cli_runner_tests {
         assert!(!src[arm..calls[0].0].contains("\"none\" =>"), "not in the unsandboxed arm");
     }
 
+    #[test]
+    fn a_gateway_max_tokens_failure_on_2_1_329_names_the_release() {
+        use crate::orchestrator::cli_runner::{is_gateway_model, with_known_bad_release};
+        assert!(is_gateway_model("claude-sonnet-latest") && is_gateway_model("litellm/kimi-k3"));
+        for m in ["claude-sonnet-5-5", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "sonnet", "opusplan", "default"] {
+            assert!(!is_gateway_model(m), "{m}");
+        }
+        let line = r#"{"type":"result","subtype":"success","is_error":true,
+            "result":"API Error: 400 max_tokens: 64000 > 32768, which is the maximum allowed","total_cost_usd":0.01}"#;
+        let failed = || parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(failed().status, StageStatus::Failed);
+        let named = with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.329"));
+        let error = named.error.unwrap();
+        assert!(
+            error.starts_with(
+                "Skip Claude Code 2.1.329 on a gateway model: it drops the retry gateway models need when a max_tokens \
+                 error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.\n"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("API Error: 400 max_tokens: 64000 > 32768"), "the CLI's own error stays: {error}");
+        let unchanged = failed().error;
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.330")).error, unchanged);
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-5-5", Some("2.1.329")).error, unchanged, "built-in model");
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", None).error, unchanged, "version unknown");
+        let done = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(with_known_bad_release(done, "claude-sonnet-latest", Some("2.1.329")).error, None);
+    }
+
     const SUCCESS: &str = r#"{
         "type":"result","subtype":"success","is_error":false,
         "result":"Implemented the feature.","total_cost_usd":0.0123,
@@ -12560,14 +12589,23 @@ mod live_tests {
 
         let bodies = provider.bodies.lock();
         assert_eq!(bodies.len(), 3);
+        // Every turn leads with the one system-prompt developer item (the
+        // cacheable prefix); replays never repeat it.
+        for body in bodies.iter() {
+            assert!(body.get("instructions").is_none());
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["text"], "sys");
+            assert_eq!(input.iter().filter(|i| i["role"] == "developer").count(), 1);
+        }
         // Turn 2: the reasoning item, then its call with its fc id, then the output.
         let input = bodies[1]["input"].as_array().unwrap();
-        assert_eq!(input[1]["type"], "reasoning");
-        assert_eq!(input[1]["encrypted_content"], "enc-rs_1");
-        assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["id"], "fc-call_1");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "reasoning");
+        assert_eq!(input[2]["encrypted_content"], "enc-rs_1");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["id"], "fc-call_1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_1");
         // Turn 3: the truncated turn's reasoning is dropped and its call rebuilt.
         let input = bodies[2]["input"].as_array().unwrap();
         let text = serde_json::to_string(input).unwrap();
@@ -25551,6 +25589,236 @@ mod group_tests {
         // A group made afterwards still goes last.
         workspace_group(&db, "p1", "D", &[]);
         assert_eq!(names(&db, "workspace", Some("p1")), ["C", "A", "B", "D"]);
+    }
+}
+
+// ── "Starts after" (#960/#1031): a mission that waits on another one ───────
+#[cfg(test)]
+mod prerequisite_tests {
+    use crate::db::{Db, PrerequisiteRow, PREREQUISITE_CONDITIONS};
+    use tempfile::NamedTempFile;
+
+    fn test_db() -> Db {
+        let tmp = NamedTempFile::new().unwrap();
+        Db::open(tmp.path()).unwrap()
+    }
+
+    fn seed_project(db: &Db, id: &str) {
+        db.insert_project(id, id, &format!("/tmp/octo-prereq-{id}")).unwrap();
+    }
+
+    fn seed_workspace(db: &Db, project_id: &str, id: &str) {
+        db.insert_workspace(id, project_id, id, "", id, None, "", None).unwrap();
+    }
+
+    /// One project `p1` holding `w1`, `w2`, `w3`.
+    fn seeded() -> Db {
+        let db = test_db();
+        seed_project(&db, "p1");
+        for ws in ["w1", "w2", "w3"] {
+            seed_workspace(&db, "p1", ws);
+        }
+        db
+    }
+
+    fn link(db: &Db, ws: &str, after: &str) {
+        db.set_workspace_prerequisite(ws, after, "run_finished", false, false).unwrap();
+    }
+
+    fn after_of(db: &Db, ws: &str) -> Option<String> {
+        db.get_workspace_prerequisite(ws).unwrap().map(|p| p.after_workspace_id)
+    }
+
+    fn refusal(result: crate::error::AppResult<impl std::fmt::Debug>) -> String {
+        result.unwrap_err().to_string()
+    }
+
+    /// The raw columns, so a cleared link is checked down to its flags.
+    fn columns(db: &Db, ws: &str) -> (Option<String>, Option<String>, i64, i64) {
+        db.conn_ref()
+            .query_row(
+                "SELECT after_workspace_id, after_condition, branch_from_prerequisite, auto_start
+                 FROM workspaces WHERE id = ?1",
+                [ws],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    const CLEARED: (Option<String>, Option<String>, i64, i64) = (None, None, 0, 0);
+
+    #[test]
+    fn a_new_mission_has_no_prerequisite_and_auto_start_is_off() {
+        let db = seeded();
+        assert_eq!(db.get_workspace_prerequisite("w1").unwrap(), None);
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(refusal(db.get_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn set_stores_the_link_and_replaces_an_earlier_one() {
+        let db = seeded();
+        let row = db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        let expected = PrerequisiteRow {
+            workspace_id: "w2".into(),
+            after_workspace_id: "w1".into(),
+            after_condition: "pr_merged".into(),
+            branch_from_prerequisite: true,
+            auto_start: true,
+        };
+        assert_eq!(row, expected);
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), Some(expected));
+
+        // Setting again replaces the link, flags included.
+        db.set_workspace_prerequisite("w2", "w3", "run_finished", false, false).unwrap();
+        let row = db.get_workspace_prerequisite("w2").unwrap().unwrap();
+        assert_eq!(row.after_workspace_id, "w3");
+        assert_eq!(row.after_condition, "run_finished");
+        assert!(!row.branch_from_prerequisite);
+        assert!(!row.auto_start);
+
+        // Several missions can wait on the same one.
+        link(&db, "w1", "w3");
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn every_condition_is_accepted_and_nothing_else() {
+        let db = seeded();
+        for condition in PREREQUISITE_CONDITIONS {
+            db.set_workspace_prerequisite("w2", "w1", condition, false, false).unwrap();
+            assert_eq!(db.get_workspace_prerequisite("w2").unwrap().unwrap().after_condition, condition);
+        }
+        db.clear_workspace_prerequisite("w2").unwrap();
+        for bad in ["", "merged", "RUN_FINISHED"] {
+            assert_eq!(
+                refusal(db.set_workspace_prerequisite("w2", "w1", bad, false, false)),
+                format!("other: Unknown condition '{bad}'. Use one of: run_finished, pr_merged.")
+            );
+        }
+        assert_eq!(columns(&db, "w2"), CLEARED);
+    }
+
+    #[test]
+    fn set_refuses_cycles_and_leaves_the_links_as_they_were() {
+        let db = seeded();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w1", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        link(&db, "w2", "w1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w2", "run_finished", false, false)),
+            "other: These missions would wait on each other."
+        );
+        // Longer loops too: w3 → w2 → w1, then w1 → w3.
+        link(&db, "w3", "w2");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "pr_merged", true, true)),
+            "other: These missions would wait on each other."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+        assert_eq!(after_of(&db, "w3").as_deref(), Some("w2"));
+
+        // A chain that doesn't come back is fine.
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w4", "w3");
+        assert_eq!(after_of(&db, "w4").as_deref(), Some("w3"));
+    }
+
+    #[test]
+    fn set_refuses_other_projects_missing_and_archived_missions() {
+        let db = seeded();
+        seed_project(&db, "p2");
+        seed_workspace(&db, "p2", "x1");
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "x1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("x1", "w1", "run_finished", false, false)),
+            "other: A mission can only wait on a mission of its own project."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "nope", "run_finished", false, false)),
+            "other: The mission to wait on was not found."
+        );
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("nope", "w1", "run_finished", false, false)),
+            "other: Mission not found."
+        );
+        db.archive_workspace("w3").unwrap();
+        assert_eq!(
+            refusal(db.set_workspace_prerequisite("w1", "w3", "run_finished", false, false)),
+            "other: A mission can't wait on an archived mission."
+        );
+        assert_eq!(columns(&db, "w1"), CLEARED);
+        assert_eq!(columns(&db, "x1"), CLEARED);
+    }
+
+    #[test]
+    fn clear_removes_the_link_and_its_flags() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(db.get_workspace_prerequisite("w2").unwrap(), None);
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Clearing a mission with no link is not an error; an unknown one is.
+        db.clear_workspace_prerequisite("w2").unwrap();
+        assert_eq!(refusal(db.clear_workspace_prerequisite("nope")), "other: Mission not found.");
+    }
+
+    #[test]
+    fn deleting_a_prerequisite_clears_the_links_to_it() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w3", "w1");
+        seed_workspace(&db, "p1", "w4");
+        link(&db, "w1", "w4");
+
+        db.delete_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        assert_eq!(columns(&db, "w3"), CLEARED);
+        let dangling: i64 = db
+            .conn_ref()
+            .query_row("SELECT COUNT(*) FROM workspaces WHERE after_workspace_id = 'w1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dangling, 0);
+        assert!(db.get_workspace("w4").unwrap().is_some());
+    }
+
+    #[test]
+    fn archiving_a_prerequisite_clears_the_links_and_restore_keeps_them_cleared() {
+        let db = seeded();
+        db.set_workspace_prerequisite("w2", "w1", "pr_merged", true, true).unwrap();
+        link(&db, "w1", "w3");
+
+        db.archive_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // The archived mission's own link is not one that points at it.
+        assert_eq!(after_of(&db, "w1").as_deref(), Some("w3"));
+
+        db.restore_workspace("w1").unwrap();
+        assert_eq!(columns(&db, "w2"), CLEARED);
+        // Once restored it can be waited on again.
+        link(&db, "w2", "w1");
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
+    }
+
+    #[test]
+    fn the_migration_is_idempotent() {
+        let tmp = NamedTempFile::new().unwrap();
+        {
+            let db = Db::open(tmp.path()).unwrap();
+            seed_project(&db, "p1");
+            seed_workspace(&db, "p1", "w1");
+            seed_workspace(&db, "p1", "w2");
+            link(&db, "w2", "w1");
+        }
+        let db = Db::open(tmp.path()).unwrap();
+        assert_eq!(after_of(&db, "w2").as_deref(), Some("w1"));
     }
 }
 

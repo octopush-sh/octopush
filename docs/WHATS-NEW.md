@@ -77,6 +77,7 @@ Current anchors:
 | `direct-launcher-estimate` | Direct launcher foot: the "est. $low–$high" range (hover for the per-stage breakdown; once the estimate arrives) | `PipelineSetup.tsx` |
 | `direct-launcher-cli-version` | Direct launcher: the amber "Update Claude Code" note (only on an old CLI) | `PipelineSetup.tsx` |
 | `direct-launcher-model-floor` | Direct launcher: the amber "Fable 5.2 needs Claude Code 2.1.321 or newer" line (only when a Claude Code CLI stage's model or escalation model needs a newer CLI) | `PipelineSetup.tsx` |
+| `direct-launcher-known-bad` | Direct launcher: the amber "Claude Code 2.1.329 drops the retry gateway models need … update Claude Code." line (only on that exact release, when a Claude Code CLI stage or its escalation runs a gateway model) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-read-only` | Direct launcher: the amber "A read-only Codex stage can't run in a sandboxed mission yet." line (only when a read-only CLI stage runs on Codex in a sandboxed or readonly mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-commit` | Direct launcher: the amber "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't commit or push." line (only when an Action-role CLI stage runs on Codex outside a sandboxed mission) | `PipelineSetup.tsx` |
 | `direct-launcher-codex-trust` | Direct launcher: the amber "Codex will ignore this repo's .codex/ settings and MCP servers" line and how to trust the project (only when a Codex CLI stage would skip a `.codex/` dir in an untrusted project) | `PipelineSetup.tsx` |

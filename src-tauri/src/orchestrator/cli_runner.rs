@@ -2874,6 +2874,15 @@ fn is_builtin_claude_id(id: &str) -> bool {
         .is_some_and(|p| p.models.iter().any(|m| m.id == id))
 }
 
+/// Whether a Claude stage on `model` runs a gateway's model: neither a
+/// built-in Anthropic id ([`is_builtin_claude_model`]) nor a Claude Code alias
+/// (`sonnet`, `opusplan`, `default`…), which Claude Code resolves to one.
+pub(crate) fn is_gateway_model(model: &str) -> bool {
+    let m = crate::token_engine::normalize_model_id(&model.trim().to_ascii_lowercase());
+    let alias = matches!(m.as_str(), "default" | "best" | "opusplan" | "sonnet" | "opus" | "haiku" | "fable" | "mythos");
+    !alias && !is_builtin_claude_model(model)
+}
+
 /// The launch line's note when the stage keeps Claude Code's full prompt
 /// under a gateway name ([`stage_system_prompt_env`]).
 fn system_prompt_label(dialect: CliDialect, model: &str) -> Option<&'static str> {
@@ -3927,6 +3936,11 @@ impl CliRunner {
                         for call in &outcome.cli.refused_calls {
                             emitter.notice(&refused_notice(call));
                         }
+                        let outcome = with_known_bad_release(
+                            outcome,
+                            &stage.agent_model,
+                            cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                        );
                         let (refused, decisive) = {
                             let w = sandbox_watch.lock();
                             (w.refused(), w.decisive())
@@ -3970,6 +3984,11 @@ impl CliRunner {
                     );
                     flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                     out.cli.ran_model = ran;
+                    let out = with_known_bad_release(
+                        out,
+                        &stage.agent_model,
+                        cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                    );
                     let (refused, decisive) = {
                         let w = sandbox_watch.lock();
                         (w.refused(), w.decisive())
@@ -4181,6 +4200,29 @@ pub(crate) fn merge_resume_fallback(resumed: StageOutcome, mut fresh: StageOutco
     fresh.cli.usage_unreported |= resumed.cli.usage_unreported || resumed_stopped;
     fresh.cli.usage_unreported_journaled = fresh.cli.usage_unreported && journaled;
     fresh
+}
+
+/// A failed Claude stage on a gateway model ([`is_gateway_model`]) whose
+/// error is a `max_tokens` one, on a
+/// `cli_version` that is a known bad release: the error names that release
+/// and asks for the update first ([`crate::agent_adapter::known_bad_stage_error`]).
+/// Any other outcome is unchanged.
+pub(crate) fn with_known_bad_release(mut outcome: StageOutcome, model: &str, cli_version: Option<&str>) -> StageOutcome {
+    if !matches!(outcome.status, StageStatus::Failed) {
+        return outcome;
+    }
+    let named = outcome.error.as_deref().and_then(|e| {
+        crate::agent_adapter::known_bad_stage_error(
+            e,
+            cli_version,
+            is_gateway_model(model),
+            crate::agent_adapter::CLAUDE_KNOWN_BAD_RELEASES,
+        )
+    });
+    if let Some(e) = named {
+        outcome.error = Some(e);
+    }
+    outcome
 }
 
 /// Preview (≤400 chars) of stderr if it has content, else of `fallback`
