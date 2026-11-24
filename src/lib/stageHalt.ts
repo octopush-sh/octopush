@@ -13,6 +13,12 @@ export function isDeferredToolHalt(error: string | null): boolean {
   return !!error && DEFERRED_MARKERS.some((m) => error.includes(m));
 }
 
+/** Whether a stage error is a resumed session whose deferred tool is gone:
+ *  the halt that can drop the call (`drop_call`). */
+export function isDeferredToolUnavailable(error: string | null): boolean {
+  return !!error && error.includes(DEFERRED_MARKERS[1]);
+}
+
 /** Map a backend stage error string to a plain-English cause + remedy. */
 export function haltCause(error: string | null, maxIterations: number): HaltCause {
   const raw = (error ?? "").trim();

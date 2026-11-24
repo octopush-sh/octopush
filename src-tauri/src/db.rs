@@ -880,6 +880,10 @@ impl Db {
         // the stage before its reset forgot it — a resumed Claude run whose
         // first reply reads far less came back on an empty conversation.
         add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN resume_context_tokens INTEGER")?;
+        // #973: 1 ⇒ the stage's pending `--resume` drops the deferred call
+        // whose tool is gone (`CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL`).
+        // Set by the Drop-the-call action, cleared when the run starts.
+        add_column_if_missing(&self.conn, "ALTER TABLE run_stages ADD COLUMN drop_deferred_pending INTEGER NOT NULL DEFAULT 0")?;
         self.conn.execute_batch(
             "UPDATE pipelines SET updated_at = created_at WHERE updated_at IS NULL;
              UPDATE roles SET updated_at = created_at WHERE updated_at IS NULL;",
@@ -7631,6 +7635,28 @@ impl Db {
             params![stage_id, pending as i64],
         )?;
         Ok(())
+    }
+
+    /// Mark that the stage's pending `--resume` drops its deferred call (read
+    /// back by [`Self::get_stage_drop_deferred`]).
+    pub fn set_stage_drop_deferred(&self, stage_id: &str, drop_call: bool) -> AppResult<()> {
+        self.conn.execute(
+            "UPDATE run_stages SET drop_deferred_pending = ?2 WHERE id = ?1",
+            params![stage_id, drop_call as i64],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_stage_drop_deferred(&self, stage_id: &str) -> AppResult<bool> {
+        let v: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT drop_deferred_pending FROM run_stages WHERE id = ?1",
+                params![stage_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v.unwrap_or(0) != 0)
     }
 
     /// Record the spend the session had reported when `resume_pending` was

@@ -81,8 +81,17 @@ struct CliResult {
 
 #[derive(Deserialize, Debug, Default)]
 struct CliDeferredToolUse {
+    /// The paused call's `tool_use` id. Kept so the halt names the exact
+    /// call; nothing reads it yet.
+    #[serde(default)]
+    #[allow(dead_code)]
+    id: String,
     #[serde(default)]
     name: String,
+    /// The paused call's arguments — previewed in the halt
+    /// ([`deferred_call_preview`]).
+    #[serde(default)]
+    input: Option<Value>,
 }
 
 #[derive(Deserialize, Debug, Default, Clone, PartialEq)]
@@ -1079,6 +1088,60 @@ pub(crate) fn deferred_tool_label(name: &str) -> String {
     }
 }
 
+/// The paused call as a halt names it: the tool ([`deferred_tool_label`]),
+/// then ` · ` and the one-line hint the tool-call cards show
+/// (`live::tool_hint_line`), redacted by the secret guard and only then cut
+/// to [`REFUSED_HINT_CHARS`], so no cut splits a secret past the redaction —
+/// `Bash · npm publish --tag beta`. Just the tool when the input gives no hint.
+pub(crate) fn deferred_call_preview(
+    name: &str,
+    input: Option<&Value>,
+    known: &[crate::secret_scan::KnownSecret],
+) -> String {
+    let tool = deferred_tool_label(name);
+    let hint = short_redacted_line(input.map(crate::orchestrator::live::tool_hint_line).unwrap_or_default(), known);
+    if hint.is_empty() {
+        tool
+    } else {
+        format!("{tool} · {hint}")
+    }
+}
+
+/// `raw` on one line, redacted by the secret guard, then cut to
+/// [`REFUSED_HINT_CHARS`] with an ellipsis.
+fn short_redacted_line(raw: &str, known: &[crate::secret_scan::KnownSecret]) -> String {
+    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let redacted = crate::secret_scan::redact_line(&one_line, known);
+    if redacted.chars().count() > REFUSED_HINT_CHARS {
+        let cut: String = redacted.chars().take(REFUSED_HINT_CHARS - 1).collect();
+        format!("{}…", cut.trim_end())
+    } else {
+        redacted
+    }
+}
+
+/// What a resumed session is told when its paused call is dropped
+/// ([`DROP_DEFERRED_TOOL_ENV`]): Claude gets an error as the call's result,
+/// then this.
+pub const DROP_DEFERRED_PROMPT: &str = "The tool call this session was waiting on isn't available anymore, so it was \
+     dropped and never ran. Continue the task from where you left off without it. You have a fresh turn budget; \
+     finish the remaining work, then stop.";
+
+/// Set to `1` on a `--resume` with a prompt, Claude Code drops a deferred
+/// call whose tool is gone: the call's result is an error and Claude answers
+/// the prompt (hooks docs, "To drop the call").
+pub const DROP_DEFERRED_TOOL_ENV: &str = "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL";
+
+/// The env a stage's process gets for a dropped deferred call: only on a
+/// Claude `--resume` the director chose to drop the call on.
+pub fn drop_deferred_env(dialect: CliDialect, resuming: bool, drop_call: bool) -> Vec<(&'static str, String)> {
+    if dialect == CliDialect::Claude && resuming && drop_call {
+        vec![(DROP_DEFERRED_TOOL_ENV, "1".to_string())]
+    } else {
+        Vec::new()
+    }
+}
+
 /// One kind of tool call Claude Code refused in a stage (the result event's
 /// `permission_denials`): the tool, a redacted one-line hint (its command or
 /// path) and how many times that same call was refused.
@@ -1104,14 +1167,7 @@ fn refused_hint(input: Option<&Value>, known: &[crate::secret_scan::KnownSecret]
         .iter()
         .find_map(|k| input.and_then(|i| i.get(*k)).and_then(Value::as_str).filter(|s| !s.trim().is_empty()))
         .unwrap_or_default();
-    let one_line = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    let redacted = crate::secret_scan::redact_line(&one_line, known);
-    if redacted.chars().count() > REFUSED_HINT_CHARS {
-        let cut: String = redacted.chars().take(REFUSED_HINT_CHARS - 1).collect();
-        format!("{}…", cut.trim_end())
-    } else {
-        redacted
-    }
+    short_redacted_line(raw, known)
 }
 
 /// The calls in a result event's `permission_denials`, repeats of the same
@@ -1274,7 +1330,7 @@ pub fn parse_cli_result_redacting(
         AppError::Other(format!("could not parse claude output: {e}; got: {preview}"))
     })?;
     let refused = refused_calls(parsed.permission_denials.as_ref(), known);
-    let mut outcome = outcome_of_result(&parsed, exit_success, artifact_kind, stderr_text);
+    let mut outcome = outcome_of_result(&parsed, exit_success, artifact_kind, stderr_text, known);
     if matches!(outcome.status, StageStatus::Done) && outcome.artifact.refs_worktree {
         outcome.artifact.text.push_str(&refused_handoff(&refused));
     }
@@ -1288,6 +1344,7 @@ fn outcome_of_result(
     exit_success: bool,
     artifact_kind: ArtifactKind,
     stderr_text: &str,
+    known: &[crate::secret_scan::KnownSecret],
 ) -> StageOutcome {
     let bad_subtype = parsed.subtype.as_deref().filter(|st| *st != "success");
     let kind = artifact_kind;
@@ -1302,13 +1359,16 @@ fn outcome_of_result(
         .as_deref()
         .filter(|r| *r == TOOL_DEFERRED || *r == DEFERRED_TOOL_UNAVAILABLE);
     if let Some(reason) = deferred {
-        let tool = deferred_tool_label(parsed.deferred_tool_use.as_ref().map_or("", |d| d.name.as_str()));
+        let call = parsed.deferred_tool_use.as_ref();
+        let tool = deferred_call_preview(call.map_or("", |d| d.name.as_str()), call.and_then(|d| d.input.as_ref()), known);
+        // The remedy (after the last ". ") holds no ". ": `haltCause` splits
+        // the line there, and the call's hint may hold one.
         let copy = if reason == TOOL_DEFERRED {
             format!("A hook paused {tool} before it ran. Resume once it may run, or re-run the stage.")
         } else {
             format!(
                 "The resumed session was waiting to run {tool}, which isn't available anymore. \
-                 Reconnect it and resume, or re-run the stage fresh."
+                 Reconnect it and resume, drop the call and continue, or re-run the stage fresh."
             )
         };
         let error = format!("{copy}\n{}", terminal_reason_marker(reason));
@@ -2193,6 +2253,16 @@ impl CliDialect {
             (CliDialect::Codex, None) => "Continue the task from where you left off: finish the remaining work, \
                      then end with your final message as before."
                 .to_string(),
+        }
+    }
+
+    /// What a resumed session reads on stdin: [`DROP_DEFERRED_PROMPT`] when
+    /// a Claude session's deferred call is dropped, else [`Self::resume_prompt`].
+    pub fn resume_stdin(&self, feedback: Option<&str>, drop_deferred_call: bool) -> String {
+        if drop_deferred_call && *self == CliDialect::Claude {
+            DROP_DEFERRED_PROMPT.to_string()
+        } else {
+            self.resume_prompt(feedback)
         }
     }
 
@@ -3539,8 +3609,9 @@ impl CliRunner {
                 // decisions in the nudge — the CLI counterpart of the API
                 // substrate's transcript continuation; a Codex loop-back with
                 // the reviewer's findings. A plain halt-recovery resume has no
-                // feedback and keeps the generic nudge.
-                dialect.resume_prompt(stage.feedback.as_deref()),
+                // feedback and keeps the generic nudge. A dropped deferred
+                // call gets its own prompt.
+                dialect.resume_stdin(stage.feedback.as_deref(), stage.drop_deferred_call),
             ),
             None => (
                 dialect.argv(&stage.agent_model, &system, stage.max_iterations, read_only, write_scope),
@@ -3698,6 +3769,9 @@ impl CliRunner {
             ctx.quiet_claude_code,
             cli_version.as_ref().and_then(|v| v.version.as_deref()),
         );
+        for (k, v) in drop_deferred_env(dialect, resuming, stage.drop_deferred_call) {
+            command.env(k, v);
+        }
         command
             .env("PATH", &path_env)
             .stdin(Stdio::piped())

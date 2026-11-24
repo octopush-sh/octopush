@@ -3244,6 +3244,7 @@ pub async fn resolve_checkpoint(
         "abort" => CheckpointAction::Abort,
         "reject" => CheckpointAction::Reject { feedback, model_override, max_turns_override },
         "resume" => CheckpointAction::Resume { max_turns_override },
+        "drop_call" => CheckpointAction::DropDeferredCall { max_turns_override },
         "send_back" => CheckpointAction::SendBack { feedback },
         "discard" => CheckpointAction::Discard,
         other => return Err(crate::error::AppError::Other(format!("unknown action: {other}"))),

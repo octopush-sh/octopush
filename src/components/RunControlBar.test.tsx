@@ -25,7 +25,7 @@ const stage = (over: Partial<RunStage>): RunStage => ({
 
 const handlers = () => ({
   onStart: vi.fn(), onPause: vi.fn(), onStopStage: vi.fn(), onAbort: vi.fn(), onApprove: vi.fn(),
-  onReject: vi.fn(), onResume: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onAnswerBlocker: vi.fn(),
+  onReject: vi.fn(), onResume: vi.fn(), onDropCall: vi.fn(), onDiscard: vi.fn(), onSendBack: vi.fn(), onAnswerBlocker: vi.fn(),
   onRunAgain: vi.fn(),
 });
 
@@ -166,22 +166,53 @@ describe("RunControlBar", () => {
     expect(h.onReject).toHaveBeenCalledWith("fix it", 50);
   });
 
-  it("hook-deferred tool: Re-run is primary and Resume stays available", () => {
+  it("hook-deferred tool gone: Re-run is primary, beside Reconnect and resume and Drop the call (#973)", () => {
     const h = handlers();
     render(<RunControlBar run={run("paused")}
       blockedStage={stage({
         status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
-        error: "The resumed session was waiting to run echo (MCP server srv), which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
+        error: "The resumed session was waiting to run echo (MCP server srv) · hi, which isn't available anymore. Reconnect it and resume, drop the call and continue, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
       })}
       loopTargetRole={null} loopState={null} beacon {...h} />);
-    expect(screen.getByText(/waiting to run echo \(MCP server srv\), which isn't available anymore$/)).toBeInTheDocument();
+    expect(screen.getByText(/waiting to run echo \(MCP server srv\) · hi, which isn't available anymore$/)).toBeInTheDocument();
     const primary = screen.getByRole("button", { name: /^Re-run · 50 turns$/i });
     expect(primary.className).toContain("octo-stage-pulse");
     expect(screen.queryByRole("button", { name: /^Resume · /i })).not.toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: /^Resume$/i }));
+    expect(screen.queryByRole("button", { name: /^Resume$/i })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: /^Reconnect and resume$/i }));
     expect(h.onResume).toHaveBeenCalledWith(50);
+    const drop = screen.getByRole("button", { name: /^Drop the call and continue$/i });
+    expect(drop).toHaveAttribute("data-tour", "direct-halt-drop-call");
+    fireEvent.click(drop);
+    expect(h.onDropCall).toHaveBeenCalledWith(50);
+    expect(h.onResume).toHaveBeenCalledTimes(1);
     fireEvent.click(primary);
     expect(h.onReject).toHaveBeenCalledWith("", 50);
+  });
+
+  it("hook-deferred tool: a paused call (not a gone tool) offers no drop", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: "abc123", maxIterations: 25,
+        error: "A hook paused Bash · npm publish --tag beta before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.getByText(/A hook paused Bash · npm publish --tag beta before it ran$/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /^Resume$/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Drop the call/i })).not.toBeInTheDocument();
+  });
+
+  it("hook-deferred tool gone without a session: nothing to drop or resume", () => {
+    const h = handlers();
+    render(<RunControlBar run={run("paused")}
+      blockedStage={stage({
+        status: "failed", substrate: "cli", sessionId: null, maxIterations: 25,
+        error: "The resumed session was waiting to run Edit, which isn't available anymore. Reconnect it and resume, drop the call and continue, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)",
+      })}
+      loopTargetRole={null} loopState={null} {...h} />);
+    expect(screen.queryByRole("button", { name: /Drop the call/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Reconnect and resume/i })).not.toBeInTheDocument();
   });
 
   it("hook-deferred tool: a transient-looking tool name or stderr tail keeps the halt layout", () => {

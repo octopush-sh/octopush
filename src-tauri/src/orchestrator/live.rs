@@ -90,14 +90,19 @@ impl<'a> LiveEmitter<'a> {
 /// A descriptive one-line hint from a tool-call input object (path/command/…),
 /// else the first string value, else "".
 pub fn tool_hint(input: &Value) -> String {
-    let Some(obj) = input.as_object() else { return String::new() };
+    tool_hint_line(input).chars().take(120).collect()
+}
+
+/// [`tool_hint`]'s first line, uncut — for a caller that redacts it before
+/// cutting (`cli_runner::deferred_call_preview`).
+pub fn tool_hint_line(input: &Value) -> &str {
+    let Some(obj) = input.as_object() else { return "" };
     let pick = TOOL_HINT_KEYS
         .iter()
         .find_map(|k| obj.get(*k).and_then(Value::as_str))
         .or_else(|| obj.values().find_map(Value::as_str))
         .unwrap_or("");
-    let first = pick.lines().next().unwrap_or(pick);
-    first.chars().take(120).collect()
+    pick.lines().next().unwrap_or(pick)
 }
 
 /// First line of a tool result, capped to 120 chars — for the result detail line.
