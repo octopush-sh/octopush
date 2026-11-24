@@ -561,6 +561,12 @@ pub fn run() {
                 });
             }
 
+            // Read the login shell's env now (bounded, once per session), so
+            // the first Talk command, CLI stage or MCP server doesn't wait on it.
+            tauri::async_runtime::spawn_blocking(|| {
+                let _ = orchestrator::cli_runner::login_shell_env();
+            });
+
             // Sandbox build caches nobody used for 30 days.
             tauri::async_runtime::spawn_blocking(|| {
                 let n = orchestrator::sandbox::prune_build_caches(orchestrator::sandbox::BUILD_CACHE_MAX_AGE);

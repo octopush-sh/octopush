@@ -2155,4 +2155,47 @@ mod tests {
         let kinds: Vec<&str> = entries.iter().map(|p| p["entry"]["kind"].as_str().unwrap()).collect();
         assert_eq!(kinds, vec!["text", "tool", "tool_result"]);
     }
+
+    /// A sub-agent's `run_command` gets the PATH CLI stages spawn with (#1087).
+    /// Its commands run on a blocking thread, which the login-env stub doesn't
+    /// reach, so this compares with the real login shell's.
+    #[test]
+    #[serial_test::serial]
+    fn a_subagent_command_gets_the_login_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = ScriptedProvider {
+            turns: Mutex::new(VecDeque::from(vec![
+                resp(
+                    "checking the PATH",
+                    vec![LlmToolUse {
+                        id: "t1".into(),
+                        name: "run_command".into(),
+                        input: serde_json::json!({"command": "printf '%s' \"$PATH\" > path.txt"}),
+                    }],
+                    LlmStopReason::ToolUse,
+                ),
+                resp("Report: wrote path.txt.", vec![], LlmStopReason::EndTurn),
+            ])),
+        };
+        let spec = SubagentSpec {
+            call_id: "c".into(),
+            call: AgentCall { description: "PATH".into(), prompt: "Write the PATH.".into(), subagent_type: None, model: None },
+            workspace_id: "w".into(), thread_id: "t".into(),
+            workspace_path: dir.path().to_string_lossy().into_owned(),
+            default_model: "m".into(), max_iterations: Some(5), max_tokens: 1, sandbox_roots: None, definition: None,
+            policy_auto: false,
+            resume: None,
+            plan: None,
+        };
+        let rec = Recorder { entries: Mutex::new(vec![]) };
+        let client = reqwest::Client::new();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let out = rt
+            .block_on(run_subagent_core(&provider, "http://x", None, &client, "m", &spec, &cancel, &rec, None, None))
+            .unwrap();
+        assert!(out.ok && out.finished, "{}", out.report);
+        let seen = std::fs::read_to_string(dir.path().join("path.txt")).unwrap();
+        assert_eq!(seen, crate::orchestrator::cli_runner::resolved_cli_path());
+    }
 }
