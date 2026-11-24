@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { haltCause } from "./stageHalt";
+import { haltCause, isDeferredToolUnavailable } from "./stageHalt";
 
 describe("haltCause", () => {
   it("names a Claude Code release to skip on a gateway max_tokens failure", () => {
@@ -53,13 +53,23 @@ describe("haltCause", () => {
     expect(c.preferRerun).toBe(true);
   });
   it("explains a resumed session whose deferred tool is gone", () => {
-    const c = haltCause(
-      "The resumed session was waiting to run mcp__a.b__c, which isn't available anymore. Reconnect it and resume, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)\n— stderr —\nexit 1",
-      25,
-    );
+    const error =
+      "The resumed session was waiting to run mcp__a.b__c, which isn't available anymore. Reconnect it and resume, drop the call and continue, or re-run the stage fresh.\n(terminal_reason: tool_deferred_unavailable)\n— stderr —\nexit 1";
+    const c = haltCause(error, 25);
     expect(c.title).toBe("The resumed session was waiting to run mcp__a.b__c, which isn't available anymore");
-    expect(c.remedy).toBe("Reconnect it and resume, or re-run the stage fresh.");
+    expect(c.remedy).toBe("Reconnect it and resume, drop the call and continue, or re-run the stage fresh.");
     expect(c.preferRerun).toBe(true);
+    expect(isDeferredToolUnavailable(error)).toBe(true);
+  });
+  it("keeps the paused call's preview whole in the title, dots and all (#973)", () => {
+    const error =
+      "A hook paused Bash · npm publish --tag beta. && echo done. before it ran. Resume once it may run, or re-run the stage.\n(terminal_reason: tool_deferred)";
+    const c = haltCause(error, 25);
+    expect(c.title).toBe("A hook paused Bash · npm publish --tag beta. && echo done. before it ran");
+    expect(c.remedy).toBe("Resume once it may run, or re-run the stage.");
+    // A paused call whose tool is still there has nothing to drop.
+    expect(isDeferredToolUnavailable(error)).toBe(false);
+    expect(isDeferredToolUnavailable(null)).toBe(false);
   });
   it("prefers Resume for other halts", () => {
     expect(haltCause("claude stopped early (error_max_turns) — review…", 25).preferRerun).toBeFalsy();

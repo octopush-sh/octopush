@@ -7,7 +7,7 @@ import { FadeSwap } from "./primitives/FadeSwap";
 import { Reveal } from "./primitives/Reveal";
 import { Stepper } from "./controls/Stepper";
 import { ModalShell } from "./ModalShell";
-import { haltCause } from "../lib/stageHalt";
+import { haltCause, isDeferredToolUnavailable } from "../lib/stageHalt";
 import { formatUsd } from "../lib/cost";
 import { isPlanLimitHalt, planWaitSentence, planWaitWhy } from "../lib/planWait";
 import { useRunsStore } from "../stores/runsStore";
@@ -44,6 +44,9 @@ interface Props {
   nextStageLabel?: string | null;
   onReject: (feedback: string, maxTurns?: number) => void;
   onResume: (maxTurns?: number) => void;
+  /** Resume a stage whose deferred tool is gone, dropping that call. Offered
+   *  only on that halt, beside "Reconnect and resume". */
+  onDropCall?: (maxTurns?: number) => void;
   onDiscard: () => void;
   onSendBack: (feedback: string) => void;
   /** Answer a stage parked via the `ask_director` escape valve (positional). */
@@ -355,6 +358,7 @@ function DecisionBar({
   onApprove,
   onReject,
   onResume,
+  onDropCall,
   onDiscard,
   onSendBack,
   onAbort,
@@ -387,6 +391,9 @@ function DecisionBar({
   // Resume is the primary action when it can continue the session, unless the
   // cause says a fresh attempt is the likelier way forward (a deferred tool).
   const resumeFirst = canResume && !cause.preferRerun;
+  // A resumed session waiting on a tool that's gone: resume once it's back,
+  // or drop the call and let Claude carry on without it.
+  const toolGone = failed && canResume && isDeferredToolUnavailable(blockedStage.error);
 
   // Reset the editor whenever a new checkpoint arrives (the bar stays mounted).
   useEffect(() => {
@@ -473,8 +480,16 @@ function DecisionBar({
                 )}
                 {canResume && !resumeFirst && (
                   <button type="button" onClick={() => onResume(turns)}
+                    title={toolGone ? "Once the tool is back, resume the session and run the paused call" : undefined}
                     className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
-                    Resume
+                    {toolGone ? "Reconnect and resume" : "Resume"}
+                  </button>
+                )}
+                {toolGone && onDropCall && (
+                  <button type="button" onClick={() => onDropCall(turns)} data-tour="direct-halt-drop-call"
+                    title="Resume without the paused call: Claude gets an error as its result and carries on"
+                    className="rounded-md border border-octo-hairline px-3 py-1.5 font-mono text-xs text-octo-sage transition-colors duration-[180ms] hover:text-octo-ivory">
+                    Drop the call and continue
                   </button>
                 )}
                 <button type="button" onClick={requestAbort}

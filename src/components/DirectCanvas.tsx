@@ -241,6 +241,9 @@ export function DirectCanvas({ active, workspaceId, defaultTask, linkedIssueKey,
           onResume={(maxTurns) => {
             if (blockedStage) void resolve(run.id, blockedStage.id, "resume", { maxTurnsOverride: maxTurns });
           }}
+          onDropCall={(maxTurns) => {
+            if (blockedStage) void resolve(run.id, blockedStage.id, "drop_call", { maxTurnsOverride: maxTurns });
+          }}
           onDiscard={() => {
             if (blockedStage) void resolve(run.id, blockedStage.id, "discard");
           }}

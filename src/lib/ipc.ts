@@ -421,7 +421,9 @@ function stagePatchArgs(patch?: RunStagePatch) {
     loopMode: patch?.loopMode ?? null,
   };
 }
-export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "discard";
+/** `drop_call`: resume a stage whose deferred tool is gone, dropping that call
+ *  (Claude gets an error as its result and carries on). */
+export type CheckpointActionName = "approve" | "reject" | "edit" | "abort" | "send_back" | "resume" | "drop_call" | "discard";
 
 /** What a checkpoint decision carries besides its stage and action. */
 export interface CheckpointOptions {

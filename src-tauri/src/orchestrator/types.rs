@@ -301,6 +301,10 @@ pub struct StageSpec {
     pub instructions: Option<String>,
     /// CLI session to `--resume` on this run (set only by a Resume action).
     pub resume_session: Option<String>,
+    /// The director chose to drop the session's deferred call whose tool is
+    /// gone (set only by a Drop-the-call action): the `--resume` runs with
+    /// `cli_runner::DROP_DEFERRED_TOOL_ENV` and `cli_runner::DROP_DEFERRED_PROMPT`.
+    pub drop_deferred_call: bool,
     /// What the session being resumed had already reported spending (its last
     /// archived attempt's cost; `0.0` for a fresh run). A resumed Claude run
     /// reports the conversation's whole total, so its `--max-budget-usd` cap
@@ -452,6 +456,13 @@ pub enum CheckpointAction {
     /// `--resume`s that session; otherwise it is a fresh re-run (worktree
     /// preserved). `max_turns_override` raises the tool-turn budget.
     Resume {
+        max_turns_override: Option<i64>,
+    },
+    /// Resume a stage whose resumed session was waiting on a deferred call
+    /// whose tool is gone (`cli_runner::is_deferred_tool_unavailable`),
+    /// dropping that call: Claude gets an error as its result and carries on.
+    /// Refused on any other stage.
+    DropDeferredCall {
         max_turns_override: Option<i64>,
     },
     /// Revert the worktree to the failed stage's baseline (drop only this

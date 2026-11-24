@@ -10239,6 +10239,72 @@ mod orchestrator_tests {
     }
 
     #[tokio::test]
+    async fn dropping_a_gone_deferred_call_resumes_that_session_once_with_the_drop() {
+        // #973: on a resume whose deferred tool is gone, the director drops
+        // the call — the next run `--resume`s the session with the drop set.
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Failed,
+                    Some(format!(
+                        "The resumed session was waiting to run Edit, which isn't available anymore.\n(terminal_reason: {})",
+                        crate::orchestrator::cli_runner::DEFERRED_TOOL_UNAVAILABLE
+                    )),
+                    None,
+                )
+            },
+            first_cost: 0.01,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        orch.resolve_checkpoint(&run_id, CheckpointAction::DropDeferredCall { max_turns_override: None })
+            .await
+            .unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2, "the stage ran again after the drop");
+        assert!(!seen[0].drop_deferred_call);
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        assert!(seen[1].drop_deferred_call, "the resumed run drops the call");
+        assert!(!db.lock().get_stage_drop_deferred(&stage.id).unwrap(), "only that run drops it");
+    }
+
+    #[tokio::test]
+    async fn a_drop_is_refused_on_a_stage_not_waiting_on_a_gone_tool() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (orch, run_id, db) = budgeted_cli_run(FirstRunThenDoneRunner {
+            first: || {
+                (
+                    StageStatus::Failed,
+                    Some(format!(
+                        "A hook paused Edit before it ran.\n(terminal_reason: {})",
+                        crate::orchestrator::cli_runner::TOOL_DEFERRED
+                    )),
+                    None,
+                )
+            },
+            first_cost: 0.01,
+            seen: Arc::clone(&seen),
+        });
+        assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+        let err = orch
+            .resolve_checkpoint(&run_id, CheckpointAction::DropDeferredCall { max_turns_override: None })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("can be dropped"), "{err}");
+        let stage = db.lock().list_run_stages(&run_id).unwrap()[0].clone();
+        assert_eq!(stage.status, "failed", "nothing changed");
+        assert!(!db.lock().get_stage_drop_deferred(&stage.id).unwrap());
+        // A plain Resume of it still continues the session, without a drop.
+        orch.resolve_checkpoint(&run_id, CheckpointAction::Resume { max_turns_override: None }).await.unwrap();
+        let seen = seen.lock();
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[1].resume_session.as_deref(), Some("sess-b"));
+        assert!(!seen[1].drop_deferred_call);
+    }
+
+    #[tokio::test]
     async fn answering_a_blocked_cli_stage_carries_its_spend_not_an_older_attempts() {
         // A blocked stage has no artifact or error, so answering it archives
         // nothing: the prior spend must come from the row, never from an
@@ -10972,6 +11038,71 @@ mod cli_runner_tests {
         assert_eq!(deferred_tool_label("mcp____echo"), "mcp____echo");
         assert_eq!(deferred_tool_label("mcp__srv"), "mcp__srv");
         assert_eq!(deferred_tool_label(""), "a tool");
+    }
+
+    #[test]
+    fn a_paused_call_is_shown_with_its_input_like_a_tool_card() {
+        use crate::orchestrator::cli_runner::{deferred_call_preview, is_tool_deferred, parse_cli_result_redacting};
+        use crate::secret_scan::KnownSecret;
+        use serde_json::json;
+        // The card's hint (command, else path, …): its first line, spaces collapsed.
+        assert_eq!(deferred_call_preview("Bash", Some(&json!({"command": "npm publish   --tag beta"})), &[]), "Bash · npm publish --tag beta");
+        assert_eq!(deferred_call_preview("Bash", Some(&json!({"command": "make\nmake install"})), &[]), "Bash · make");
+        assert_eq!(deferred_call_preview("mcp__srv__echo", Some(&json!({"text": "hi"})), &[]), "echo (MCP server srv) · hi");
+        assert_eq!(deferred_call_preview("Edit", Some(&json!({})), &[]), "Edit");
+        assert_eq!(deferred_call_preview("Edit", None, &[]), "Edit");
+        // Cut like a refused call's hint (80 chars).
+        let long = deferred_call_preview("Bash", Some(&json!({"command": format!("echo {}", "word ".repeat(40))})), &[]);
+        assert!(long.starts_with("Bash · echo word") && long.ends_with('…'), "{long}");
+        assert_eq!(long.chars().count(), "Bash · ".chars().count() + 80, "{long}");
+        // Redacted by the secret guard, in the halt too. Built at run time so
+        // no token-shaped literal sits in the source.
+        let gh = format!("ghp_{}", "a1B2c3D4e5F6".repeat(3));
+        let mine = format!("team-gateway-{}", "Zq81".repeat(5));
+        let known = [KnownSecret::new("your LiteLLM key", mine.clone())];
+        let line = json!({
+            "type": "result", "subtype": "success", "is_error": false, "result": "", "session_id": "sess-d",
+            "terminal_reason": "tool_deferred",
+            "deferred_tool_use": {"id": "toolu_9", "name": "Bash", "input": {"command": format!("GH_TOKEN={gh} curl -H {mine} x")}},
+        })
+        .to_string();
+        let o = parse_cli_result_redacting(&line, true, ArtifactKind::Diff, "", &known).unwrap();
+        let err = o.error.as_deref().unwrap();
+        assert!(is_tool_deferred(err), "{err}");
+        assert!(
+            err.starts_with("A hook paused Bash · GH_TOKEN=[redacted] curl -H [redacted] x before it ran. Resume once it may run"),
+            "{err}"
+        );
+        assert!(!err.contains(&gh) && !err.contains(&mine), "{err}");
+        // Redacted before the cut: a token past the card's 120 chars, pulled
+        // inside 80 by collapsed spaces, never shows even in part.
+        let spaced = format!("echo{}{gh} done", " ".repeat(115));
+        let p = deferred_call_preview("Bash", Some(&json!({"command": spaced})), &[]);
+        assert_eq!(p, "Bash · echo [redacted] done", "{p}");
+    }
+
+    #[test]
+    fn dropping_a_deferred_call_sets_its_env_only_on_a_claude_resume() {
+        use crate::orchestrator::cli_runner::{drop_deferred_env, CliDialect, DROP_DEFERRED_TOOL_ENV};
+        assert_eq!(drop_deferred_env(CliDialect::Claude, true, true), vec![(DROP_DEFERRED_TOOL_ENV, "1".to_string())]);
+        assert_eq!(DROP_DEFERRED_TOOL_ENV, "CLAUDE_CODE_DROP_UNAVAILABLE_DEFERRED_TOOL");
+        // A plain resume, a fresh run (the empty-resume fallback) and Codex: none.
+        assert!(drop_deferred_env(CliDialect::Claude, true, false).is_empty());
+        assert!(drop_deferred_env(CliDialect::Claude, false, true).is_empty());
+        assert!(drop_deferred_env(CliDialect::Codex, true, true).is_empty());
+    }
+
+    #[test]
+    fn dropping_a_deferred_call_resumes_with_a_prompt_saying_so() {
+        use crate::orchestrator::cli_runner::{CliDialect, DROP_DEFERRED_PROMPT};
+        // The drop needs a prompt (Claude answers it after the call's error).
+        let p = CliDialect::Claude.resume_stdin(None, true);
+        assert_eq!(p, DROP_DEFERRED_PROMPT);
+        assert!(p.contains("isn't available anymore") && p.contains("without it"), "{p}");
+        // Every other resume keeps today's nudge.
+        assert_eq!(CliDialect::Claude.resume_stdin(None, false), CliDialect::Claude.resume_prompt(None));
+        assert_eq!(CliDialect::Claude.resume_stdin(Some("use sqlite"), false), CliDialect::Claude.resume_prompt(Some("use sqlite")));
+        assert_eq!(CliDialect::Codex.resume_stdin(None, true), CliDialect::Codex.resume_prompt(None));
     }
 
     #[test]

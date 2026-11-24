@@ -429,7 +429,17 @@ fn deferred_outcome(rel: &str, exit_success: bool) -> (String, Value, crate::orc
     let fx = rec.label(rel);
     let events = rec.jsonl(rel);
     let r = result_event(&fx, &events).clone();
-    for f in ["subtype", "is_error", "result", "session_id", "total_cost_usd", "terminal_reason", "deferred_tool_use.name"] {
+    for f in [
+        "subtype",
+        "is_error",
+        "result",
+        "session_id",
+        "total_cost_usd",
+        "terminal_reason",
+        "deferred_tool_use.id",
+        "deferred_tool_use.name",
+        "deferred_tool_use.input",
+    ] {
         require(&fx, &r, f);
     }
     let line = serde_json::to_string(&r).unwrap();
@@ -453,9 +463,11 @@ fn stream_json_hook_deferred_tool_is_a_halt_not_an_empty_success() {
     assert!(is_tool_deferred(err), "[{fx}] {err}");
     assert!(!is_deferred_tool_unavailable(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
     assert!(
-        err.starts_with("A hook paused echo (MCP server fixture-srv) before it ran. Resume once it may run, or re-run the stage."),
+        err.starts_with("A hook paused echo (MCP server fixture-srv) · hi before it ran. Resume once it may run, or re-run the stage."),
         "[{fx}] {err}"
     );
+    // The paused call's input (`deferred_tool_use.input`) is what the halt previews.
+    assert_eq!(require_str(&fx, &r, "deferred_tool_use.input.text"), "hi", "[{fx}]");
     assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
     assert!(outcome.artifact.text.is_empty(), "[{fx}]");
     assert!(outcome.cost_usd > 0.0, "[{fx}] the spend stays on the meter");
@@ -478,10 +490,15 @@ fn stream_json_resume_with_its_deferred_tool_gone_names_the_tool() {
     assert!(!is_tool_deferred(err) && !is_session_not_saved(err) && !is_budget_stop(err), "[{fx}] {err}");
     assert!(
         err.starts_with(
-            "The resumed session was waiting to run echo (MCP server fixture-srv), which isn't available anymore. \
-             Reconnect it and resume, or re-run the stage fresh."
+            "The resumed session was waiting to run echo (MCP server fixture-srv) · hi, which isn't available anymore. \
+             Reconnect it and resume, drop the call and continue, or re-run the stage fresh."
         ),
         "[{fx}] {err}"
+    );
+    // The CLI's own notice names the drop Octopush offers.
+    assert!(
+        require_str(&fx, &r, "result").contains(crate::orchestrator::cli_runner::DROP_DEFERRED_TOOL_ENV),
+        "[{fx}]"
     );
     assert_eq!(outcome.session_id.as_deref(), Some(require_str(&fx, &r, "session_id")), "[{fx}] Resume needs the session");
     assert!(outcome.artifact.text.is_empty(), "[{fx}] the CLI's notice is not the stage's work");

@@ -1022,6 +1022,7 @@ impl Orchestrator {
                 return Ok((StageStatus::Failed, None));
             }
         };
+        let drop_deferred = self.db.lock().get_stage_drop_deferred(&stage.id)?;
         let spec = StageSpec {
             position: stage.position,
             role: stage.role.clone(),
@@ -1047,6 +1048,7 @@ impl Orchestrator {
             tools: stage.tools.clone(),
             instructions: stage.instructions.clone(),
             resume_session: if stage.resume_pending { stage.session_id.clone() } else { None },
+            drop_deferred_call: stage.resume_pending && drop_deferred,
             // A resumed Codex session reports its running total; the runner
             // subtracts what it had reported by the end of its last run.
             resume_baseline: match (&stage.session_id, stage.resume_pending) {
@@ -1080,6 +1082,10 @@ impl Orchestrator {
         let resuming = stage.resume_pending;
         if stage.resume_pending {
             self.db.lock().set_stage_resume_pending(&stage.id, false)?;
+        }
+        // The same for a dropped deferred call: only this run drops it.
+        if drop_deferred {
+            self.db.lock().set_stage_drop_deferred(&stage.id, false)?;
         }
         // Consume-once: the ask_director transcript feeds exactly the run it
         // was answered for — any later re-run starts fresh.
@@ -2519,6 +2525,25 @@ impl Orchestrator {
             ));
         }
 
+        // Dropping a deferred call only makes sense on a stage whose resumed
+        // session waits on one whose tool is gone, and that can be resumed.
+        let drop_deferred = matches!(action, CheckpointAction::DropDeferredCall { .. });
+        if drop_deferred {
+            let droppable = match &blocked {
+                Some(s) => {
+                    s.status == "failed"
+                        && s.error.as_deref().is_some_and(crate::orchestrator::cli_runner::is_deferred_tool_unavailable)
+                        && self.cli_session_resumable(s)?
+                }
+                None => false,
+            };
+            if !droppable {
+                return Err(AppError::Other(
+                    "this stage isn't waiting on a tool call that can be dropped — resume or re-run it instead".into(),
+                ));
+            }
+        }
+
         // Resolving a plan-limited stage (an automatic resume comes through
         // here too, after claiming it) or aborting ends a Claude plan park.
         // Resolving a sibling (a real halt, a gate) leaves the park and its
@@ -2701,7 +2726,8 @@ impl Orchestrator {
                     self.recompute_run_cost(run_id)?;
                 }
             }
-            CheckpointAction::Resume { max_turns_override } => {
+            CheckpointAction::Resume { max_turns_override }
+            | CheckpointAction::DropDeferredCall { max_turns_override } => {
                 // Recover a transient/infra halt: re-run the SAME stage without
                 // treating its output as wrong. Only a failed stage can resume —
                 // an awaiting_checkpoint stage isn't a failure, so this is a no-op
@@ -2741,6 +2767,9 @@ impl Orchestrator {
                         // continued (`cli_session_resumable`).
                         let can_resume = self.cli_session_resumable(s)?;
                         self.db.lock().set_stage_resume_pending(&s.id, can_resume)?;
+                        // Drop the call (#973) on this resume only; a plain
+                        // Resume never inherits an earlier choice.
+                        self.db.lock().set_stage_drop_deferred(&s.id, drop_deferred && can_resume)?;
                         // The session's spend so far, taken from THIS row: the
                         // resumed run's budget cap sits on top of it.
                         self.db.lock().set_stage_resume_prior_cost(
