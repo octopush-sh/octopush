@@ -44,6 +44,31 @@ const RECALL_DEFAULT_LIMIT: usize = 40_000;
 /// Hard ceiling on one `recall_tool_output` window.
 const RECALL_MAX_LIMIT: usize = 100_000;
 
+/// Talk's system prompt when the request brings none.
+fn default_talk_system_prompt(workspace_path: &str) -> String {
+    format!(
+        "You are a helpful coding assistant working in the project at {workspace_path}. \
+         You have tools to run commands, read/write files, and list directories. \
+         run_command executes in a persistent shell SHARED with the user — a \
+         `cd` or env export (yours or theirs) carries over to later commands. It \
+         is NON-interactive: don't run REPLs or commands that wait for stdin \
+         (pass input via flags or a heredoc instead). read_file/write_file/\
+         list_files paths are ALWAYS relative to the project root, regardless of \
+         the shell's current directory — pass a path relative to the root. Tool \
+         outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
+         need an omitted part, call recall_tool_output with that id rather than \
+         re-running the tool. You can delegate independent, self-contained tasks \
+         to sub-agents with the Agent tool — call it several times in ONE response \
+         to run them in parallel; when a skill asks for parallel sub-agents, use \
+         Agent, never emulate them one after another yourself. Your `mcp__` tools \
+         come from MCP servers that Octopush runs and the user manages in Settings › \
+         Integrations (where one can be reconnected), so never point the user to \
+         Claude Code's `/mcp` or any CLI command for them. Use the tools to \
+         help the user; be concise and take action rather than just explaining \
+         what to do."
+    )
+}
+
 fn recall_tool_definition() -> LlmTool {
     LlmTool {
         name: RECALL_TOOL_NAME.to_string(),
@@ -2709,27 +2734,9 @@ impl ChatEngine {
             }
         }
 
-        let mut system_prompt = request.system.unwrap_or_else(|| {
-            format!(
-                "You are a helpful coding assistant working in the project at {}. \
-                 You have tools to run commands, read/write files, and list directories. \
-                 run_command executes in a persistent shell SHARED with the user — a \
-                 `cd` or env export (yours or theirs) carries over to later commands. It \
-                 is NON-interactive: don't run REPLs or commands that wait for stdin \
-                 (pass input via flags or a heredoc instead). read_file/write_file/\
-                 list_files paths are ALWAYS relative to the project root, regardless of \
-                 the shell's current directory — pass a path relative to the root. Tool \
-                 outputs from earlier turns appear abridged as `[Tool #id: …]`; when you \
-                 need an omitted part, call recall_tool_output with that id rather than \
-                 re-running the tool. You can delegate independent, self-contained tasks \
-                 to sub-agents with the Agent tool — call it several times in ONE response \
-                 to run them in parallel; when a skill asks for parallel sub-agents, use \
-                 Agent, never emulate them one after another yourself. Use the tools to \
-                 help the user; be concise and take action rather than just explaining \
-                 what to do.",
-                request.workspace_path
-            )
-        });
+        let mut system_prompt = request
+            .system
+            .unwrap_or_else(|| default_talk_system_prompt(&request.workspace_path));
 
         if let Some(doctrine) = &doctrine {
             system_prompt.push_str(doctrine);
@@ -3833,6 +3840,14 @@ mod continuation_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn talks_prompt_sends_mcp_problems_to_settings_not_the_cli() {
+        let prompt = default_talk_system_prompt("/w");
+        assert!(prompt.starts_with("You are a helpful coding assistant working in the project at /w."));
+        assert!(prompt.contains("the user manages in Settings › Integrations"), "{prompt}");
+        assert!(prompt.contains("never point the user to Claude Code's `/mcp` or any CLI command"), "{prompt}");
+    }
 
     #[test]
     fn execute_tool_reports_structural_status() {
