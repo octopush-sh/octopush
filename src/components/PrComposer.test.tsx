@@ -195,10 +195,15 @@ describe("PrComposer", () => {
     const onClose = vi.fn();
     renderComposer(onClose);
     await screen.findByDisplayValue("Add CSV export");
+    const listen = vi.spyOn(window, "addEventListener");
     fireEvent.click(screen.getByRole("button", { name: "Open the pull request" }));
     // The push's own scan asks first.
     expect(await screen.findByText("This push adds what looks like your Anthropic API key in seed.js:9.")).toBeTruthy();
     expect(ipcMock.createPullRequest).not.toHaveBeenCalled();
+    // The guard takes Escape in an effect that can land after it paints; an
+    // Escape pressed before that goes to the composer and is lost (#1076).
+    await waitFor(() => expect(listen).toHaveBeenCalledWith("keydown", expect.any(Function)));
+    listen.mockRestore();
     // Escape closes only the guard, never the composer underneath.
     fireEvent.keyDown(window, { key: "Escape" });
     await waitFor(() => expect(screen.queryByText(/your Anthropic API key/)).toBeNull());
