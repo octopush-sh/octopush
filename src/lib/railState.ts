@@ -66,11 +66,12 @@ export function archivableMerge(
 
 /** The confirm's body for "Archive merged missions…": the missions by name
  *  (the first eight, then how many more; one with local files says so), what
- *  archiving does, then the local files it deletes for good. */
+ *  archiving does, the local files it deletes for good, and the Claude Code
+ *  settings the worktree takes with it. */
 export function archiveMergedBody(missions: readonly { name: string; localFiles: readonly string[] }[]): string {
   const names = missions.map((m) => (m.localFiles.length > 0 ? `${m.name} (has local files)` : m.name));
   const files = [...new Set(missions.flatMap((m) => m.localFiles))];
-  const sample = files.length > 3 ? `${files.slice(0, 3).join(", ")} and more` : files.join(", ");
+  const sample = files.length > 3 ? `${files.slice(0, 3).join(", ")} and ${files.length - 3} more` : files.join(", ");
   const local = files.length > 0 ? ` Archiving also deletes local files git ignores (${sample}); Undo doesn't bring them back.` : "";
   const shown = names.slice(0, 8);
   const more = names.length - shown.length;
@@ -81,7 +82,7 @@ export function archiveMergedBody(missions: readonly { name: string; localFiles:
         ? `${shown.slice(0, -1).join(", ")} and ${shown[shown.length - 1]}`
         : (shown[0] ?? "");
   const one = names.length === 1;
-  return `${list}: ${one ? "its PR is merged and its worktree is clean" : "their PRs are merged and their worktrees are clean"}. Archiving removes ${one ? "the worktree" : "the worktrees"} and keeps ${one ? "the branch" : "the branches"}; the notice that follows can undo it.${local}`;
+  return `${list}: ${one ? "its PR is merged and its worktree is clean" : "their PRs are merged and their worktrees are clean"}. Archiving removes ${one ? "the worktree" : "the worktrees"} and keeps ${one ? "the branch" : "the branches"}; the notice that follows can undo it.${local} Claude Code's "don't ask again" choices saved in ${one ? "the worktree are" : "the worktrees are"} lost too.`;
 }
 
 /** The missions among `workspaces` the rail offers to archive, in order: the

@@ -44,6 +44,9 @@ interface WorkspaceState {
   /** Each merged mission's local files (`MergedWorkspace.localFiles`):
    *  git-ignored, not a dependency or build folder; archiving deletes them. */
   localFilesByWs: Record<string, string[]>;
+  /** Missions an archive of merged missions is working on right now: their
+   *  "merged · archive?" is disabled and a second click is ignored. */
+  archivingIds: Record<string, true>;
 
   load: (projectId: string) => Promise<void>;
   /** The startup restore is reopening the last project: what the loads make
@@ -84,6 +87,8 @@ interface WorkspaceState {
   archive: (workspaceId: string, projectPath: string, branch: string, worktreePath: string | null) => Promise<void>;
   /** Drop a workspace the backend just archived from every rail map. */
   forgetArchived: (workspaceId: string) => void;
+  /** Mark `ids` as being archived (`on`) or done with (`archivingIds`). */
+  setArchiving: (ids: readonly string[], on: boolean) => void;
   /** Rename a workspace in the backend + both rail maps. */
   rename: (workspaceId: string, name: string) => Promise<void>;
   /** Drop a whole project's workspaces from the rail map; clears the active
@@ -96,8 +101,9 @@ interface WorkspaceState {
   /** Fetch which of a project's missions are merged and clean
    *  (`merged_workspaces`). `loadProjectPrs` calls it on a project's first PR
    *  read of the session and when a PR leaves the open list, never on every
-   *  refresh; the archive itself re-checks everything. */
-  loadMergedPrs: (projectId: string, projectPath: string) => Promise<void>;
+   *  refresh; the archive itself re-checks everything. Resolves to whether
+   *  the merged PRs could be read. */
+  loadMergedPrs: (projectId: string, projectPath: string) => Promise<boolean>;
   updateCustomization: (workspaceId: string, glyph: string | null, tint: string | null) => Promise<void>;
   notify: (workspaceId: string) => void;
   clearNotification: (workspaceId: string) => void;
@@ -113,6 +119,11 @@ const prFetchInFlight = new Set<string>();
 const prFetchLastAt = new Map<string, number>();
 /** Projects whose merged missions were read this session (`loadMergedPrs`). */
 const mergedReadFor = new Set<string>();
+/** When a project whose merged PRs couldn't be read may be asked again. */
+const mergedRetryAt = new Map<string, number>();
+/** How long after a failed merged-PR read the next one waits (gh missing,
+ *  signed out, offline): a later refresh in the session tries again. */
+const MERGED_RETRY_MS = 5 * 60_000;
 
 /** Test-only: clears the module-level PR-fetch dedup/throttle state so the
  *  throttle Map doesn't leak across tests sharing a projectId. */
@@ -120,6 +131,7 @@ export const __resetPrFetchThrottle = (): void => {
   prFetchInFlight.clear();
   prFetchLastAt.clear();
   mergedReadFor.clear();
+  mergedRetryAt.clear();
 };
 
 /** Whether the startup restore is reopening a project whose `load` has not
@@ -150,6 +162,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   prByWs: {},
   mergedPrByWs: {},
   localFilesByWs: {},
+  archivingIds: {},
 
   load: async (projectId) => {
     set({ loading: true });
@@ -371,6 +384,16 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     get().forgetArchived(workspaceId);
   },
 
+  setArchiving: (ids, on) =>
+    set((s) => {
+      const next = { ...s.archivingIds };
+      for (const id of ids) {
+        if (on) next[id] = true;
+        else delete next[id];
+      }
+      return { archivingIds: next };
+    }),
+
   forgetArchived: (workspaceId) => {
     useCollisionStore.getState().forgetWorkspace(workspaceId);
     // Archived rows are excluded from list_workspaces, so drop locally like
@@ -475,10 +498,15 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         return { prByWs: next };
       });
       // "Merged · archive?" rides this read (#963): the merged lookup runs on
-      // the project's first read, then only once a PR left the open list.
-      if (leftOpen || !mergedReadFor.has(projectId)) {
+      // the project's first read (again, a while after one that failed), then
+      // only once a PR left the open list.
+      const firstRead = !mergedReadFor.has(projectId) && now >= (mergedRetryAt.get(projectId) ?? 0);
+      if (leftOpen || firstRead) {
         mergedReadFor.add(projectId);
-        await get().loadMergedPrs(projectId, projectPath);
+        if (!(await get().loadMergedPrs(projectId, projectPath))) {
+          mergedReadFor.delete(projectId);
+          mergedRetryAt.set(projectId, Date.now() + MERGED_RETRY_MS);
+        }
       }
     } catch {
       // Non-critical — no PR indicators for this project.
@@ -508,8 +536,10 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         }
         return { mergedPrByWs: next, localFilesByWs: files };
       });
+      return true;
     } catch {
-      // Non-critical — nothing is offered for archive in this project.
+      // Non-critical — nothing new is offered for archive in this project.
+      return false;
     }
   },
 

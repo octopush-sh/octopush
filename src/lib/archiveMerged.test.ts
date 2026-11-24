@@ -35,9 +35,11 @@ beforeEach(() => {
 
 describe("archiveMergedMissions", () => {
   it("asks the backend to re-check and archive them, then offers Undo", async () => {
-    const done = await archiveMergedMissions("p1", "/repo", [ws("a", "fix-a"), ws("b", "fix-b")], ["b"]);
+    const named = { a: [], b: [".env", "db/"] };
+    const done = await archiveMergedMissions("p1", "/repo", [ws("a", "fix-a"), ws("b", "fix-b")], named);
     expect(done).toEqual(["a", "b"]);
-    expect(mockIpc.archiveMergedWorkspaces).toHaveBeenCalledWith("p1", "/repo", ["a", "b"], ["b"]);
+    // Exactly the paths the confirm named, per mission.
+    expect(mockIpc.archiveMergedWorkspaces).toHaveBeenCalledWith("p1", "/repo", ["a", "b"], { b: [".env", "db/"] });
     expect(useWorkspaceStore.getState().workspacesByProjectId.p1).toEqual([]);
     const toast = pushToast.mock.calls[0][0];
     expect(toast.title).toBe("Archived 2 merged missions");
@@ -65,6 +67,18 @@ describe("archiveMergedMissions", () => {
     );
     expect(pushToast).toHaveBeenCalledWith(expect.objectContaining({ title: 'Archived "fix-b"' }));
     expect(mockIpc.mergedWorkspaces).toHaveBeenCalledWith("p1", "/repo");
+  });
+
+  it("a second click while the first archive runs is ignored", async () => {
+    let finish!: (v: unknown) => void;
+    mockIpc.archiveMergedWorkspaces.mockImplementationOnce(() => new Promise((r) => (finish = r)));
+    const first = archiveMergedMissions("p1", "/repo", [ws("a", "fix-a")]);
+    expect(useWorkspaceStore.getState().archivingIds.a).toBe(true);
+    expect(await archiveMergedMissions("p1", "/repo", [ws("a", "fix-a")])).toEqual([]);
+    finish({ archived: ["a"], skipped: [] });
+    expect(await first).toEqual(["a"]);
+    expect(mockIpc.archiveMergedWorkspaces).toHaveBeenCalledTimes(1);
+    expect(useWorkspaceStore.getState().archivingIds.a).toBeUndefined();
   });
 
   it("archives nothing and says so when the call fails", async () => {

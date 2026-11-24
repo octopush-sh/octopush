@@ -1910,6 +1910,8 @@ function WorkspaceRow({
     (s) => s.missionByWorkspaceId[workspace?.id ?? ""]?.gitIsolation ?? null,
   );
   const collisions = useWorkspaceCollisions(workspace?.id);
+  // An archive of this mission is under way: "merged · archive?" waits.
+  const archiving = useWorkspaceStore((s) => !!s.archivingIds[workspace?.id ?? ""]);
   // Pointer-only: the row is no extra tab stop. In this rail the keyboard
   // moves a mission with ⌘⌥G, or with ⇧F10 into its menu ("Move to group");
   // a slim rail's cell answers neither yet (#918).
@@ -2128,13 +2130,14 @@ function WorkspaceRow({
           <button
             type="button"
             data-tour="rail-merged-archive"
+            disabled={archiving}
             onClick={(e) => {
               e.stopPropagation();
               onArchiveMerged();
             }}
             title={`PR #${mergedPr.number} is merged and the worktree is clean. Archive ${name}; the branch is kept.`}
             aria-label={`Merged — archive ${name}`}
-            className="octo-pop-in rounded px-0.5 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
+            className="octo-pop-in rounded px-0.5 text-octo-mute transition-colors duration-[180ms] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:pointer-events-none disabled:opacity-50"
           >
             merged · archive?
           </button>

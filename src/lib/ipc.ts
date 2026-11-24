@@ -1465,15 +1465,21 @@ export const ipc = {
     invoke<BranchPr[]>("open_prs_for_project", { projectPath }),
 
   /** The project's missions whose PR was merged at their worktree's HEAD,
-   *  with nothing changed in the worktree (never the project root). Empty
-   *  without `gh`. */
+   *  with nothing changed in the worktree (never the project root). Rejects
+   *  when the merged PRs can't be read (no `gh`, not on GitHub). */
   mergedWorkspaces: (projectId: string, projectPath: string) =>
     invoke<MergedWorkspace[]>("merged_workspaces", { projectId, projectPath }),
 
   /** Archive those of `workspaceIds` that still pass when it acts (merged at
-   *  HEAD, clean, no Talk turn or Direct run active, and no local files unless
-   *  named in `localFilesOk`); says which were skipped and why. */
-  archiveMergedWorkspaces: (projectId: string, projectPath: string, workspaceIds: string[], localFilesOk: string[]) =>
+   *  HEAD, clean, no Talk turn or Direct run active, and no local files but
+   *  the ones `localFilesOk` names for it, the paths its confirm showed);
+   *  says which were skipped and why. */
+  archiveMergedWorkspaces: (
+    projectId: string,
+    projectPath: string,
+    workspaceIds: string[],
+    localFilesOk: Record<string, string[]>,
+  ) =>
     invoke<MergedArchive>("archive_merged_workspaces", { projectId, projectPath, workspaceIds, localFilesOk }),
 
   /** Open pull requests for the project, for "start a workspace from a PR".

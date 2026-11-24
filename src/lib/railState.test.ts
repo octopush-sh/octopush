@@ -68,7 +68,7 @@ describe("archiveMergedBody", () => {
 
   it("names the missions, then what archiving does", () => {
     expect(archiveMergedBody([m("fix-a")])).toBe(
-      "fix-a: its PR is merged and its worktree is clean. Archiving removes the worktree and keeps the branch; the notice that follows can undo it.",
+      "fix-a: its PR is merged and its worktree is clean. Archiving removes the worktree and keeps the branch; the notice that follows can undo it. Claude Code's \"don't ask again\" choices saved in the worktree are lost too.",
     );
     expect(archiveMergedBody(["a", "b", "c"].map((n) => m(n)))).toMatch(/^a, b and c: their PRs are merged/);
   });
@@ -81,7 +81,8 @@ describe("archiveMergedBody", () => {
   it("marks a mission with local files and says Undo doesn't bring them back", () => {
     const body = archiveMergedBody([m("fix-a", [".env", "data.db"]), m("fix-b")]);
     expect(body).toMatch(/^fix-a \(has local files\) and fix-b:/);
-    expect(body).toMatch(/deletes local files git ignores \(\.env, data\.db\); Undo doesn't bring them back\.$/);
-    expect(archiveMergedBody([m("x", ["a", "b", "c", "d"])])).toMatch(/\(a, b, c and more\)/);
+    expect(body).toMatch(/deletes local files git ignores \(\.env, data\.db\); Undo doesn't bring them back\./);
+    expect(body).toMatch(/"don't ask again" choices saved in the worktrees are lost too\.$/);
+    expect(archiveMergedBody([m("x", ["a", "b", "c", "d"])])).toMatch(/\(a, b, c and 1 more\)/);
   });
 });

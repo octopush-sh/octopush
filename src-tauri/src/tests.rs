@@ -27982,10 +27982,13 @@ mod request_context_tests {
 /// #963: what archiving a merged mission re-checks at the moment it acts.
 #[cfg(test)]
 mod merged_archive_tests {
-    use crate::commands::{merged_archive_skip, worktree_busy};
+    use crate::commands::{changed_since_named, merged_archive_skip, worktree_busy};
     use crate::git_ops::{head_sha, is_rebuildable_ignored, local_ignored_files};
     use std::process::Command;
     use tempfile::tempdir;
+
+    /// What a confirm named when it named no local files.
+    const NOTHING: &[String] = &[];
 
     fn git(dir: &std::path::Path, args: &[&str]) {
         let ok = Command::new("git").args(args).current_dir(dir).status().unwrap().success();
@@ -27999,7 +28002,7 @@ mod merged_archive_tests {
         git(p, &["init", "-q"]);
         git(p, &["config", "user.email", "t@t.dev"]);
         git(p, &["config", "user.name", "T"]);
-        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n").unwrap();
+        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n*.sqlite\n*.db\n").unwrap();
         std::fs::write(p.join("a.txt"), "a\n").unwrap();
         git(p, &["add", "."]);
         git(p, &["commit", "-qm", "base"]);
@@ -28011,12 +28014,22 @@ mod merged_archive_tests {
     fn a_mission_that_changed_after_the_offer_is_skipped() {
         let (dir, head) = merged_repo();
         let p = dir.path();
-        assert_eq!(merged_archive_skip(p, Some(&head), false, false), None, "offered: merged and clean");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), None, "offered: merged and clean");
         std::fs::write(p.join("a.txt"), "edited\n").unwrap();
-        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("changed"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("changed"));
         git(p, &["commit", "-qam", "after the merge"]);
-        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("moved"));
-        assert_eq!(merged_archive_skip(p, None, false, false), Some("moved"), "no merged PR on the branch");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("moved"));
+        assert_eq!(merged_archive_skip(p, None, false, Some(NOTHING)), Some("moved"), "no merged PR on the branch");
+    }
+
+    #[test]
+    fn an_untracked_file_in_an_untracked_folder_is_a_change() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("notes/draft")).unwrap();
+        std::fs::write(p.join("notes/draft/idea.md"), "x\n").unwrap();
+        assert_eq!(changed_since_named(p, None), Some("changed"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, None), Some("changed"));
     }
 
     #[test]
@@ -28030,12 +28043,12 @@ mod merged_archive_tests {
         let thread = db.create_chat_thread("w-merged", "Talk").unwrap();
         let idle = |_: &[String]| false;
         assert!(!worktree_busy(&db, idle, &wt));
-        assert_eq!(merged_archive_skip(dir.path(), Some(&head), worktree_busy(&db, idle, &wt), false), None);
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), worktree_busy(&db, idle, &wt), Some(NOTHING)), None);
 
         // A Talk turn starts on one of its conversations…
         let talking = |t: &[String]| t.contains(&thread.id);
         let busy = worktree_busy(&db, talking, &format!("{wt}/"));
-        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, false), Some("busy"));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, Some(NOTHING)), Some("busy"));
 
         // …or a Direct run does.
         db.seed_builtin_pipelines().unwrap();
@@ -28043,21 +28056,57 @@ mod merged_archive_tests {
         let run = db.create_run("w-merged", &pipeline, "task", None, None, &[]).unwrap();
         db.set_run_status(&run, "running", false).unwrap();
         let busy = worktree_busy(&db, idle, &wt);
-        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, false), Some("busy"));
+        assert_eq!(merged_archive_skip(dir.path(), Some(&head), busy, Some(NOTHING)), Some("busy"));
     }
 
     #[test]
-    fn local_files_are_skipped_unless_the_user_was_told() {
+    fn local_files_are_skipped_unless_the_confirm_named_them() {
         let (dir, head) = merged_repo();
         let p = dir.path();
         std::fs::create_dir_all(p.join("node_modules/x")).unwrap();
         std::fs::write(p.join("node_modules/x/i.js"), "").unwrap();
         assert!(local_ignored_files(p).unwrap().is_empty(), "a dependency folder is not local work");
-        assert_eq!(merged_archive_skip(p, Some(&head), false, false), None);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), None);
         std::fs::write(p.join(".env"), "TOKEN=1\n").unwrap();
-        assert_eq!(local_ignored_files(p).unwrap(), vec![".env".to_string()]);
-        assert_eq!(merged_archive_skip(p, Some(&head), false, false), Some("local-files"));
-        assert_eq!(merged_archive_skip(p, Some(&head), false, true), None);
+        let named = local_ignored_files(p).unwrap();
+        assert_eq!(named, vec![".env".to_string()]);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("local-files"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&named)), None);
+        assert_eq!(merged_archive_skip(p, Some(&head), false, None), None, "the offer lists them instead");
+
+        // The confirm named `.env`; then a local database appears.
+        std::fs::write(p.join("local.db"), "rows").unwrap();
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&named)), Some("local-files"));
+        assert_eq!(changed_since_named(p, Some(&named)), Some("local-files"), "also just before the delete");
+    }
+
+    #[test]
+    fn ignored_files_inside_an_untracked_folder_are_local_files() {
+        let (dir, head) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join("db")).unwrap();
+        std::fs::write(p.join("db/dev.sqlite"), "rows").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with("db/")), "{files:?}");
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(NOTHING)), Some("local-files"));
+        assert_eq!(merged_archive_skip(p, Some(&head), false, Some(&files)), None);
+    }
+
+    #[test]
+    fn the_hooked_claude_settings_alone_and_empty_folders_are_not_local_files() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        std::fs::create_dir_all(p.join(".git/info")).unwrap();
+        let exclude = p.join(".git/info/exclude");
+        let mut lines = std::fs::read_to_string(&exclude).unwrap_or_default();
+        lines.push_str(crate::claude_hooks::EXCLUDE_LINE);
+        lines.push('\n');
+        std::fs::write(&exclude, lines).unwrap();
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join(".claude/settings.local.json"), "{}").unwrap();
+        std::fs::create_dir_all(p.join("tmp/empty")).unwrap();
+        assert_eq!(local_ignored_files(p).unwrap(), Vec::<String>::new());
+        assert_eq!(changed_since_named(p, Some(NOTHING)), None);
     }
 
     #[test]

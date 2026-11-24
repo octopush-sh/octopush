@@ -3134,8 +3134,8 @@ function App() {
             onConfirm={() => {
               const { projectId, path, missions, localFiles } = archivingMerged;
               setArchivingMerged(null);
-              const told = missions.filter((w) => (localFiles[w.id] ?? []).length > 0).map((w) => w.id);
-              void archiveMergedMissions(projectId, path, missions, told);
+              // Exactly the paths this confirm named: any other stops that mission.
+              void archiveMergedMissions(projectId, path, missions, localFiles);
             }}
             onCancel={() => setArchivingMerged(null)}
           />

@@ -74,6 +74,7 @@ function resetStore() {
     prByWs: {},
     mergedPrByWs: {},
     localFilesByWs: {},
+    archivingIds: {},
     launchRestoredId: undefined,
   });
   __resetLaunchRestore();
@@ -747,6 +748,28 @@ describe("workspaceStore — mergedPrByWs (#963)", () => {
       expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
       now += 20_000; // the PR left the open list
       mockIpc.openPrsForProject.mockResolvedValue([]);
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(2);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it("tries a failed merged-PR read again later in the session, not on the next refresh", async () => {
+    const a = makeWorkspace("p1", "alpha");
+    useWorkspaceStore.setState({ workspacesByProjectId: { p1: [a] } });
+    mockIpc.openPrsForProject.mockResolvedValue([]);
+    mockIpc.mergedWorkspaces.mockRejectedValueOnce(new Error("gh"));
+    let now = 2_000_000;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => now);
+    try {
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 20_000; // the next refresh: too soon to ask again
+      await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
+      expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(1);
+      now += 5 * 60_000; // later in the session
+      mockIpc.mergedWorkspaces.mockResolvedValueOnce([]);
       await useWorkspaceStore.getState().loadProjectPrs("p1", "/repo/p1");
       expect(mockIpc.mergedWorkspaces).toHaveBeenCalledTimes(2);
     } finally {

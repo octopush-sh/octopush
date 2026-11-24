@@ -447,11 +447,20 @@ pub fn is_rebuildable_ignored(path: &str) -> bool {
 
 /// The git-ignored paths in the worktree at `path` that archiving would
 /// delete for good (a local env file, a local database): everything ignored
-/// but `is_rebuildable_ignored`. An ignored folder counts once.
+/// but `is_rebuildable_ignored`. An ignored folder counts once, as `dir/`,
+/// and only while it holds such a file (`folder_holds_local_files`).
+/// Untracked folders are examined too: one holding only ignored files (say
+/// `db/dev.sqlite` under `*.sqlite`) is listed as `db/`, where skipping
+/// untracked folders would miss it. So a `.claude/` folder holding nothing
+/// but the `settings.local.json` Octopush writes is not listed, nor is an
+/// empty folder (libgit2 reports both as ignored).
 pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
     let repo = open_repo(path)?;
     let mut opts = StatusOptions::new();
-    opts.include_untracked(false).include_ignored(true).recurse_ignored_dirs(false);
+    opts.include_untracked(true)
+        .recurse_untracked_dirs(false)
+        .include_ignored(true)
+        .recurse_ignored_dirs(false);
     let statuses = repo
         .statuses(Some(&mut opts))
         .map_err(|e| AppError::Other(format!("git status: {e}")))?;
@@ -460,7 +469,39 @@ pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
         .filter(|e| e.status().is_ignored())
         .filter_map(|e| e.path().ok().map(str::to_string))
         .filter(|p| !is_rebuildable_ignored(p))
+        .filter(|p| !p.ends_with('/') || folder_holds_local_files(path, p))
         .collect())
+}
+
+/// Whether the folder `rel` of the worktree at `root` holds a file, at any
+/// depth, that is not `is_rebuildable_ignored`. Stops at the first one; a
+/// folder it can't read, or too big to finish, counts as holding one.
+/// Symlinks are not followed (they count as files).
+fn folder_holds_local_files(root: &Path, rel: &str) -> bool {
+    let mut stack = vec![root.join(rel)];
+    let mut budget: usize = 2_000;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { return true };
+        for entry in entries {
+            budget -= 1;
+            let Ok(entry) = entry else { return true };
+            if budget == 0 {
+                return true;
+            }
+            let path = entry.path();
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => stack.push(path),
+                Ok(_) => {
+                    let inside = path.strip_prefix(root).ok().and_then(|p| p.to_str()).unwrap_or_default();
+                    if !is_rebuildable_ignored(inside) {
+                        return true;
+                    }
+                }
+                Err(_) => return true,
+            }
+        }
+    }
+    false
 }
 
 /// Return (ahead, behind) commits relative to the configured upstream of

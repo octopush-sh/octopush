@@ -32,22 +32,31 @@ export function skippedBody(skipped: readonly { name: string; reason: ArchiveSki
 }
 
 /** Archive `missions` of the project at `projectPath`, each only if it still
- *  passes when the backend acts, then say how it went. `localFilesOk`: the
- *  missions whose local files the user was told go with them. Resolves to
- *  the ids that were archived. */
+ *  passes when the backend acts, then say how it went. `named`: per mission,
+ *  the local files its confirm showed, the only ones it may delete. A mission
+ *  already being archived is left out (a double click). Resolves to the ids
+ *  that were archived. */
 export async function archiveMergedMissions(
   projectId: string,
   projectPath: string,
-  missions: readonly Workspace[],
-  localFilesOk: readonly string[] = [],
+  candidates: readonly Workspace[],
+  named: Readonly<Record<string, readonly string[]>> = {},
 ): Promise<string[]> {
   const store = useWorkspaceStore.getState();
+  const busy = store.archivingIds;
+  const missions = candidates.filter((w) => !busy[w.id]);
+  if (missions.length === 0) return [];
+  const ids = missions.map((w) => w.id);
+  const localFilesOk = Object.fromEntries(ids.filter((id) => named[id]?.length).map((id) => [id, [...named[id]]]));
+  store.setArchiving(ids, true);
   let result;
   try {
-    result = await ipc.archiveMergedWorkspaces(projectId, projectPath, missions.map((w) => w.id), [...localFilesOk]);
+    result = await ipc.archiveMergedWorkspaces(projectId, projectPath, ids, localFilesOk);
   } catch (err) {
     pushToast({ level: "error", title: "Archive failed", body: String(err) });
     return [];
+  } finally {
+    store.setArchiving(ids, false);
   }
   const archived = new Set(result.archived);
   const done = missions.filter((w) => archived.has(w.id));

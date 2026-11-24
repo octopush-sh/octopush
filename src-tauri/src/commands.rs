@@ -1650,22 +1650,31 @@ pub async fn archive_workspace(
     // IPC/API symmetry but isn't needed here.
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
-    archive_workspace_at(&state, &workspace_id, &project_path, worktree_path.as_deref()).await
+    archive_workspace_at(&state, &workspace_id, &project_path, worktree_path.as_deref(), None).await.map(|_| ())
 }
 
-/// The archive itself, shared with `archive_merged_workspaces`.
+/// The archive itself, shared with `archive_merged_workspaces`, which passes
+/// `named` (the local files the user was shown): right before the worktree
+/// is deleted it is checked once more (`changed_since_named`), and a mission
+/// that changed is left in place, with the reason as `Ok(Some(..))`.
 async fn archive_workspace_at(
     state: &AppState,
     workspace_id: &str,
     project_path: &str,
     worktree_path: Option<&str>,
-) -> AppResult<()> {
+    named: Option<&[String]>,
+) -> AppResult<Option<&'static str>> {
     prune_talk_checkpoints_of(state, workspace_id, project_path, worktree_path).await;
 
     // Only remove on disk what Octopush created. An adopted checkout and the
     // main workspace (project root) keep their directory — archiving just flips
     // the DB row. (Archive always keeps the branch.)
     if owns_worktree_on_disk(&state.db, workspace_id, project_path, worktree_path) {
+        if let (Some(named), Some(wt)) = (named, worktree_path) {
+            if let Some(reason) = changed_since_named(Path::new(wt), Some(named)) {
+                return Ok(Some(reason));
+            }
+        }
         crate::claude_hooks::remove_for_workspace(&state.db, workspace_id, worktree_path);
         if let Some(wt) = worktree_path {
             // Prune the worktree's registry slot (by path), then remove its dir.
@@ -1681,7 +1690,7 @@ async fn archive_workspace_at(
     }
     // Mark archived in DB (row survives, hidden from the rail)
     state.db.lock().archive_workspace(workspace_id)?;
-    Ok(())
+    Ok(None)
 }
 
 #[tauri::command]
@@ -6721,12 +6730,13 @@ pub(crate) fn parse_merged_heads(values: &[serde_json::Value]) -> MergedHeads {
     out
 }
 
-/// The repo's merged PRs (`parse_merged_heads`), read with `gh` in the login
-/// shell. None when gh is missing, unauthed or fails, or the repo isn't on
-/// GitHub.
+/// The repo's most recent merged PRs (`parse_merged_heads`), read with `gh`
+/// in the login shell: 300 of them (three API pages), so a busy repo keeps
+/// its offers for a while; an older merge is just not offered. None when gh
+/// is missing, unauthed or fails, or the repo isn't on GitHub.
 async fn merged_heads_in(project_path: &str) -> Option<MergedHeads> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-    let cmd = "gh pr list --state merged --json number,title,url,state,isDraft,headRefName,headRefOid --limit 100";
+    let cmd = "gh pr list --state merged --json number,title,url,state,isDraft,headRefName,headRefOid --limit 300";
     let output = tokio::process::Command::new(&shell)
         .arg("-l")
         .arg("-c")
@@ -6752,30 +6762,38 @@ pub(crate) fn is_merged_and_clean(head: Option<&str>, merged_head: &str, dirty: 
 /// Why a merged mission checked out at `worktree` can't be archived now, or
 /// None. Checked for the rail's offer and again by `archive_merged_workspaces`
 /// at the moment it acts: "busy" while a Talk turn or a Direct run is active
-/// there; "changed" with changes or untracked files (an unreadable status
-/// counts); "moved" unless HEAD is exactly `merged_head`, the merged PR's head
-/// commit (None: the branch has no merged PR); "local-files" when it holds
-/// `local_ignored_files` the user wasn't told about (`local_files_ok`).
+/// there; "moved" unless HEAD is exactly `merged_head`, the merged PR's head
+/// commit (None: the branch has no merged PR); then `changed_since_named`.
+/// `named` None (the offer) lists local files rather than skipping for them.
 pub(crate) fn merged_archive_skip(
     worktree: &Path,
     merged_head: Option<&str>,
     busy: bool,
-    local_files_ok: bool,
+    named: Option<&[String]>,
 ) -> Option<&'static str> {
     if busy {
         return Some("busy");
-    }
-    if crate::git_ops::is_dirty(worktree).unwrap_or(true) {
-        return Some("changed");
     }
     let head = crate::git_ops::head_sha(worktree);
     if !merged_head.is_some_and(|oid| is_merged_and_clean(head.as_deref(), oid, false)) {
         return Some("moved");
     }
-    if !local_files_ok && !crate::git_ops::local_ignored_files(worktree).is_ok_and(|f| f.is_empty()) {
-        return Some("local-files");
+    changed_since_named(worktree, named)
+}
+
+/// "changed" with changes or untracked files (an unreadable status counts);
+/// "local-files" when, with `named` given, the worktree holds a
+/// `local_ignored_files` path the user wasn't shown (an unreadable list
+/// counts). Run again just before the worktree is deleted.
+pub(crate) fn changed_since_named(worktree: &Path, named: Option<&[String]>) -> Option<&'static str> {
+    if crate::git_ops::is_dirty(worktree).unwrap_or(true) {
+        return Some("changed");
     }
-    None
+    let named = named?;
+    match crate::git_ops::local_ignored_files(worktree) {
+        Ok(files) if files.iter().all(|f| named.contains(f)) => None,
+        _ => Some("local-files"),
+    }
 }
 
 /// Whether a Talk turn (`running` asks the chat engine about thread ids) or a
@@ -6789,9 +6807,9 @@ pub(crate) fn worktree_busy(db: &crate::db::Db, running: impl Fn(&[String]) -> b
 /// Batch: the project's missions that are merged and clean
 /// (`merged_archive_skip`, local files allowed and listed), for the rail's
 /// "Merged · archive?" and the project menu's "Archive merged missions…".
-/// The project root (its main workspace) is never listed. Returns an empty
-/// list, never an error, when gh is missing/unauthed or the repo isn't on
-/// GitHub.
+/// The project root (its main workspace) is never listed. Errs when the
+/// merged PRs can't be read (gh missing/unauthed, not a GitHub repo), so the
+/// app can try again later.
 #[tauri::command]
 pub async fn merged_workspaces(
     state: State<'_, AppState>,
@@ -6799,7 +6817,9 @@ pub async fn merged_workspaces(
     project_path: String,
 ) -> AppResult<Vec<MergedWorkspace>> {
     let project_path = expand_tilde(&project_path);
-    let Some(mut merged) = merged_heads_in(&project_path).await else { return Ok(Vec::new()) };
+    let Some(mut merged) = merged_heads_in(&project_path).await else {
+        return Err(AppError::Other("merged pull requests unreadable".into()));
+    };
     if merged.is_empty() {
         return Ok(Vec::new());
     }
@@ -6813,7 +6833,7 @@ pub async fn merged_workspaces(
             continue;
         }
         let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
-        if head.is_none() || merged_archive_skip(path, head, false, true).is_some() {
+        if head.is_none() || merged_archive_skip(path, head, false, None).is_some() {
             continue;
         }
         let local_files = crate::git_ops::local_ignored_files(path).unwrap_or_default();
@@ -6850,7 +6870,7 @@ fn merged_archive_check(
     root: &Path,
     workspace_id: &str,
     merged: Option<&MergedHeads>,
-    local_files_ok: bool,
+    named: &[String],
 ) -> Result<String, &'static str> {
     let merged = merged.ok_or("unverified")?;
     let row = state.db.lock().get_workspace(workspace_id).ok().flatten().ok_or("gone")?;
@@ -6864,7 +6884,7 @@ fn merged_archive_check(
     }
     let busy = worktree_busy(&state.db.lock(), |t| state.chat.any_running(t), &wt);
     let head = merged.get(&row.branch).map(|(oid, _)| oid.as_str());
-    match merged_archive_skip(path, head, busy, local_files_ok) {
+    match merged_archive_skip(path, head, busy, Some(named)) {
         Some(reason) => Err(reason),
         None => Ok(wt),
     }
@@ -6872,30 +6892,35 @@ fn merged_archive_check(
 
 /// "merged · archive?" and "Archive merged missions…" (#963): archive each of
 /// `workspace_ids` only if it still passes at this moment, against a fresh
-/// read of the merged PRs (`merged_archive_check`). `local_files_ok` names
-/// the missions whose local files the user was told about. Branches are kept.
+/// read of the merged PRs (`merged_archive_check`). `local_files_ok` holds,
+/// per mission, the local files the confirm named: one that holds any other
+/// is skipped. Dirt and local files are checked once more just before the
+/// worktree is deleted. Branches are kept.
 #[tauri::command]
 pub async fn archive_merged_workspaces(
     state: State<'_, AppState>,
     project_id: String,
     project_path: String,
     workspace_ids: Vec<String>,
-    local_files_ok: Vec<String>,
+    local_files_ok: HashMap<String, Vec<String>>,
 ) -> AppResult<MergedArchive> {
     let project_path = expand_tilde(&project_path);
     let merged = merged_heads_in(&project_path).await;
     let mut out = MergedArchive::default();
     for id in workspace_ids {
-        let ok = local_files_ok.contains(&id);
-        let checked = merged_archive_check(&state, &project_id, Path::new(&project_path), &id, merged.as_ref(), ok);
+        let named = local_files_ok.get(&id).map(Vec::as_slice).unwrap_or_default();
+        let checked = merged_archive_check(&state, &project_id, Path::new(&project_path), &id, merged.as_ref(), named);
         let reason = match checked {
             Ok(wt) => {
-                let archived = archive_workspace_at(&state, &id, &project_path, Some(&wt)).await;
-                if archived.is_ok() {
-                    out.archived.push(id);
-                    continue;
+                let archived = archive_workspace_at(&state, &id, &project_path, Some(&wt), Some(named)).await;
+                match archived {
+                    Ok(None) => {
+                        out.archived.push(id);
+                        continue;
+                    }
+                    Ok(Some(reason)) => reason,
+                    Err(_) => "failed",
                 }
-                "failed"
             }
             Err(reason) => reason,
         };
