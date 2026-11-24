@@ -578,6 +578,8 @@ import { emit, listen } from "@tauri-apps/api/event";
 import type {
   AdapterInfo,
   AppSettings,
+  NotifyElsewhere,
+  NotifyElsewherePreview,
   SyncPrefs,
   SyncKind,
   SyncStatus,
@@ -1225,6 +1227,18 @@ export const ipc = {
    *  then shows defaults and refuses every save), else null. */
   unreadableSettingsPath: () =>
     invoke<string | null>("unreadable_settings_path"),
+  // ─── Notify me elsewhere (#964) ────────────────────────────────
+  /** The saved switch and webhook URL (off, no URL, by default). */
+  getNotifyElsewhere: () => invoke<NotifyElsewhere>("get_notify_elsewhere"),
+  /** Save both (the only writer). Rejects an invalid URL (https, or http to
+   *  this Mac only) and turning on without one; returns what was stored. */
+  setNotifyElsewhere: (enabled: boolean, url: string) =>
+    invoke<NotifyElsewhere>("set_notify_elsewhere", { enabled, url }),
+  /** "Send a test": the test message to `url` (saved or not), once. Rejects
+   *  with the cause, never the URL. */
+  notifyElsewhereTest: (url: string) => invoke<void>("notify_elsewhere_test", { url }),
+  /** The exact body for a checkpoint gate, and every `event` value. */
+  notifyElsewherePreview: () => invoke<NotifyElsewherePreview>("notify_elsewhere_preview"),
   // ─── Updater (channels + launch alert) ─────────────────────────
   /** The persisted update channel (`stable` by default). */
   getUpdateChannel: () => invoke<UpdateChannel>("get_update_channel"),

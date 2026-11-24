@@ -13,6 +13,8 @@ vi.mock("../../lib/ipc", () => ({
     getSettings: (...args: unknown[]) => getSettings(...args),
     saveSettings: (...args: unknown[]) => saveSettings(...args),
     readinessCheck: () => Promise.resolve([]),
+    getNotifyElsewhere: () => Promise.resolve({ enabled: false, url: "" }),
+    notifyElsewherePreview: () => Promise.reject(new Error("not needed here")),
   },
 }));
 
@@ -52,6 +54,21 @@ describe("GeneralPane — default workspace mode", () => {
     fireEvent.click(screen.getByRole("radio", { name: "Run" }));
     expect(useWorkspacePrefs.getState().defaultMode).toBe("run");
     expect(screen.getByRole("radio", { name: "Run" })).toHaveAttribute("aria-checked", "true");
+  });
+});
+
+describe("GeneralPane — Notify me elsewhere (#964)", () => {
+  it("sits with the other attention settings, off", async () => {
+    await act(async () => {
+      render(<GeneralPane />);
+    });
+    const row = document.querySelector('[data-tour="settings-notify-elsewhere"]');
+    expect(row).not.toBeNull();
+    // Right after "Notify when a crew needs you", in the Attention section.
+    const crew = screen.getByRole("switch", { name: "Notify when a crew needs you" });
+    const crewRow = crew.closest("label");
+    expect(crewRow?.nextElementSibling).toBe(row);
+    expect(screen.getByTestId("notify-elsewhere-switch")).toHaveAttribute("aria-checked", "false");
   });
 });
 

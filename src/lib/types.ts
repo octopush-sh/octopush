@@ -728,6 +728,12 @@ export interface AppSettings {
   quietClaudeCode?: boolean;
   /** Secret guard (#730): on unless saved `false`. */
   secretGuardEnabled?: boolean | null;
+  /** Settings › General › Attention › "Notify me elsewhere" (#964). Unset →
+   *  **off**. Owned by `set_notify_elsewhere`: whole-file saves carry it and
+   *  the URL through untouched. */
+  notifyElsewhereEnabled?: boolean;
+  /** The webhook URL for "Notify me elsewhere" (validated before it is stored). */
+  notifyElsewhereUrl?: string | null;
   /** Tool-call rounds one sub-agent run may take. Unset/null → **no limit**
    *  (a sub-agent runs until it finishes or is stopped); a definition's
    *  `max-turns` applies under a set value. */
@@ -751,6 +757,28 @@ export interface AppSettings {
   anthropicApiKey?: string | null;
   /** @deprecated use providerKeys.openai */
   openaiApiKey?: string | null;
+}
+
+/** "Notify me elsewhere" (#964) as saved: off, with no URL, by default. */
+export interface NotifyElsewhere {
+  enabled: boolean;
+  url: string;
+}
+
+/** The one body the webhook receives — exactly these five keys. */
+export interface NotifyElsewherePayload {
+  text: string;
+  content: string;
+  mission: string;
+  project: string;
+  event: string;
+}
+
+/** The Settings preview: the exact body for a checkpoint gate (sample names)
+ *  and every `event` value with its label. */
+export interface NotifyElsewherePreview {
+  payload: NotifyElsewherePayload;
+  events: { event: string; label: string }[];
 }
 
 export interface EditorChoice {

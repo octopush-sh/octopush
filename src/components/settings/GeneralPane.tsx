@@ -11,6 +11,7 @@ import { Reveal } from "../primitives/Reveal";
 import { PaneHeader, SectionLabel, SegmentedRow, Switch, ToggleRow } from "./shared";
 import { ReadinessCard } from "./ReadinessCard";
 import { useNotifyPrefs } from "../../stores/notifyPrefsStore";
+import { NotifyElsewhereRow } from "./NotifyElsewhereRow";
 
 const MODE_OPTIONS = MODES.map((m) => ({ value: m, label: MODE_LABELS[m] }));
 
@@ -92,6 +93,7 @@ export function GeneralPane({ onShowCaches }: { onShowCaches?: () => void } = {}
             checked={crewNotifications}
             onChange={setCrewNotifications}
           />
+          <NotifyElsewhereRow />
           <ClaudeHooksRow />
         </div>
       </div>

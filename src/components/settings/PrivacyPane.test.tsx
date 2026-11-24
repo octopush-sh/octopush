@@ -47,6 +47,8 @@ describe("PrivacyPane", () => {
       "Clerk",
       "Dodo Payments",
       "Octopush's sync service, only if you turn on sync",
+      "A webhook URL you set in Notify me elsewhere, only if you turn it on",
+      "never code, diffs or prompts",
       "Jira",
       "GitHub",
       "LiteLLM gateway",
@@ -79,7 +81,8 @@ describe("PrivacyPane", () => {
 
 /** The data inventory as it reads on screen, verbatim. A change here is a
  *  privacy-copy change and needs the owner's approval first (#875 changed
- *  the layout only). */
+ *  the layout only; #964's webhook line is the draft the owner confirms or
+ *  rewrites at merge). */
 const APPROVED_INVENTORY = [
   "Stored on this Mac: projects, workspaces, chats, tool executions, Direct runs, token usage — in ~/Library/Application Support/octopush/octopush.db. Runs and custom pipelines leave it only if you turn on sync.",
   "API keys: stored in ~/.octopush/settings.json. Your account session lives in the macOS Keychain.",
@@ -87,6 +90,7 @@ const APPROVED_INVENTORY = [
     "AI providers you configure — Anthropic, OpenAI-compatible endpoints, local models." +
     "Clerk for sign-in and Dodo Payments for checkout, when you use your account." +
     "Octopush's sync service, only if you turn on sync in Account." +
+    "A webhook URL you set in Notify me elsewhere, only if you turn it on — mission name and what it needs, never code, diffs or prompts." +
     "Integrations you connect — Jira, GitHub, a LiteLLM gateway, MCP servers — and your git remotes." +
     "Update checks — octopush.sh/update/latest.json and GitHub releases." +
     "LiteLLM's public pricing table on GitHub, when you refresh pricing.",
