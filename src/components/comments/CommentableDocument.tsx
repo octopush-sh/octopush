@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { MessageSquarePlus, X } from "lucide-react";
 import { ChatMarkdown } from "../chat/ChatMarkdown";
+import { CommentComposer } from "./CommentComposer";
 import { inDocumentOrder, normalizeQuote, type GateComment } from "../../lib/gateComments";
 
 /** The CSS highlight name the comment marks paint with (styles.css). */
@@ -107,15 +108,8 @@ export function CommentableDocument({ text, comments, onAdd, onRemove, tour }: P
   /** The passage the open composer comments on. */
   const [pending, setPending] = useState<Passage | null>(null);
   const [note, setNote] = useState("");
-  const noteRef = useRef<HTMLTextAreaElement>(null);
   // The composer takes the focus when it opens and when it is pointed at
-  // another passage, so the note goes on where it was.
-  useEffect(() => {
-    const el = noteRef.current;
-    if (!pending || !el) return;
-    el.focus();
-    el.setSelectionRange(el.value.length, el.value.length);
-  }, [pending]);
+  // another passage (`focusKey`), so the note goes on where it was.
   const ordered = inDocumentOrder(comments);
 
   // One element per text: typing a note or a parent's re-render must not
@@ -287,44 +281,23 @@ export function CommentableDocument({ text, comments, onAdd, onRemove, tour }: P
       )}
 
       {pending ? (
-        <div
-          data-tour={tour?.compose}
-          className="octo-rise-in sticky bottom-0 z-10 flex flex-col gap-2 rounded-md border border-[var(--brass-dim)] bg-octo-panel px-3 py-2.5"
-        >
-          <div className="line-clamp-2 border-l border-[var(--brass-dim)] pl-2 font-mono text-[11px] text-octo-mute" title={normalizeQuote(pending.quote)}>
-            {normalizeQuote(pending.quote)}
-          </div>
-          <textarea
-            ref={noteRef}
-            aria-label="Your comment on this passage"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Escape") { e.preventDefault(); cancel(); }
-              if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) { e.preventDefault(); add(); }
-            }}
-            placeholder="What should change here…"
-            className="h-16 resize-none rounded-md border border-octo-border-strong bg-octo-onyx px-3 py-2 font-sans text-xs text-octo-ivory placeholder:font-serif placeholder:text-octo-mute"
-          />
-          <div className="flex gap-2">
-            <button
-              type="button"
-              onClick={add}
-              disabled={!note.trim()}
-              title="Add the comment (⌘⏎)"
-              className="rounded-md border border-octo-brass px-3 py-1.5 font-serif text-[13px] text-octo-brass transition-colors duration-[180ms] hover:bg-[var(--brass-ghost)] disabled:opacity-40"
-            >
-              Add the comment
-            </button>
-            <button
-              type="button"
-              onClick={cancel}
-              className="rounded-md border border-octo-border-strong px-3 py-1.5 font-mono text-xs text-octo-mute transition-colors duration-[180ms] hover:text-octo-sage focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-            >
-              Cancel
-            </button>
-          </div>
-        </div>
+        <CommentComposer
+          tour={{ root: tour?.compose }}
+          className="sticky bottom-0 z-10 rounded-md border border-[var(--brass-dim)]"
+          focusKey={pending}
+          context={
+            <div className="line-clamp-2 border-l border-[var(--brass-dim)] pl-2 font-mono text-[11px] text-octo-mute" title={normalizeQuote(pending.quote)}>
+              {normalizeQuote(pending.quote)}
+            </div>
+          }
+          note={note}
+          onNoteChange={setNote}
+          onSubmit={add}
+          onCancel={cancel}
+          label="Your comment on this passage"
+          submitLabel="Add the comment"
+          submitTitle="Add the comment (⌘⏎)"
+        />
       ) : (
         ordered.length === 0 && (
           <div className="octo-fade-in flex items-center gap-1.5 font-mono text-[10px] text-octo-mute">

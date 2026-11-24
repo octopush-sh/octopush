@@ -91,6 +91,24 @@ export interface CommentDraft {
   stale: boolean;
 }
 
+/** The rows a draft is on after ⌥↑ / ⌥↓ (`extend` = with ⇧), in a hunk of
+ *  `count` rows: the keyboard's click and shift-click on a line number. A
+ *  move picks the one row past the range's edge in that direction; an
+ *  extend moves the range's free end (`to`) and keeps where it began. A
+ *  whole-hunk draft starts at its first row going down, its last going up.
+ *  Pure. */
+export function stepPick(rows: { from: number; to: number } | undefined, count: number, dir: -1 | 1, extend: boolean): { from: number; to: number } | undefined {
+  if (count <= 0) return rows;
+  const clamp = (i: number) => Math.max(0, Math.min(count - 1, i));
+  if (!rows) {
+    const at = dir > 0 ? 0 : count - 1;
+    return { from: at, to: at };
+  }
+  if (extend) return { from: rows.from, to: clamp(rows.to + dir) };
+  const at = clamp(dir > 0 ? Math.max(rows.from, rows.to) + 1 : Math.min(rows.from, rows.to) - 1);
+  return { from: at, to: at };
+}
+
 /** Where a draft sits after the diff was fetched again. The same draft when
  *  its hunk is still there (followed to its new index); a stale one, under
  *  the nearest hunk of its file, when the hunk changed, so what was typed

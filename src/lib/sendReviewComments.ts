@@ -3,21 +3,42 @@
  * one message — the Send-back feedback of the workspace's latest Direct run
  * when it is parked at a gate that can still send back, otherwise a user turn
  * in the workspace's open Talk thread (Talk makes one when there is none).
+ * A send-back carries the comments written inline on the gate's output too
+ * (#1051), in the same message, and clears them once it is applied.
  */
 import { commentsMessage, sendBackGate, type ReviewComment } from "./reviewComments";
+import { composeGateFeedback, gateKey, type GateComment } from "./gateComments";
 import { pickBlockedStage } from "./planWait";
 import { isTerminalRun } from "./runStatus";
 import { labelForRole } from "./stageMeta";
 import { navigate } from "./tour/surfaces";
 import { useReviewComments } from "../stores/reviewCommentsStore";
+import { useGateCommentsStore } from "../stores/gateCommentsStore";
 import { useRunsStore } from "../stores/runsStore";
 import { useChatStore } from "../stores/chatStore";
 import { useWorkspaceStore } from "../stores/workspaceStore";
 import { pushToast } from "../components/Toasts";
 
 export type CommentTarget =
-  | { kind: "gate"; runId: string; stageId: string; role: string; iteration: number }
+  | {
+      kind: "gate";
+      runId: string;
+      stageId: string;
+      /** `gateKey` of the parked attempt: where its inline comments live. */
+      gate: string;
+      /** The stage parked at the gate, and the one a send-back goes to. */
+      gateRole: string;
+      role: string;
+      iteration: number;
+    }
   | { kind: "talk" };
+
+/** The one message a send-back carries: the Review comments, then the
+ *  comments written on the gate's output, each set under its own head. */
+export function sendBackMessage(review: string, gate: readonly GateComment[], gateRole: string): string {
+  if (gate.length === 0) return review;
+  return `${review}\n\nOn ${gateRole}'s output at the gate:\n\n${composeGateFeedback(gate, "")}`;
+}
 
 /** Where `sendReviewComments` would deliver now, read from the runs store.
  *  A run that has ended (the rule the run bar uses) has no gate to send back
@@ -31,7 +52,15 @@ export function commentTarget(workspaceId: string): CommentTarget {
   const ended = !latest || isTerminalRun(latest.status) || (!!detail?.run && isTerminalRun(detail.run.status));
   const gate = sendBackGate(pickBlockedStage(stages), stages);
   if (latest && !ended && gate && !gate.atCap) {
-    return { kind: "gate", runId: latest.id, stageId: gate.stage.id, role: labelForRole(gate.target.role), iteration: gate.iteration };
+    return {
+      kind: "gate",
+      runId: latest.id,
+      stageId: gate.stage.id,
+      gate: gateKey(gate.stage),
+      gateRole: labelForRole(gate.stage.role),
+      role: labelForRole(gate.target.role),
+      iteration: gate.iteration,
+    };
   }
   return { kind: "talk" };
 }
@@ -57,8 +86,12 @@ export async function sendReviewComments(workspaceId: string, workspacePath: str
   let sent = false;
   try {
     if (target.kind === "gate") {
+      // The gate's own comments stay on the gate until the send-back is
+      // applied: a refusal leaves them there for its next decision.
+      const onGate = useGateCommentsStore.getState().byGate[target.gate] ?? [];
+      const feedback = sendBackMessage(message, onGate, target.gateRole);
       const errorsBefore = useRunsStore.getState().runErrors[target.runId]?.n ?? 0;
-      sent = await useRunsStore.getState().resolve(target.runId, target.stageId, "send_back", { feedback: message });
+      sent = await useRunsStore.getState().resolve(target.runId, target.stageId, "send_back", { feedback });
       if (sent) {
         confirmGateSend(workspaceId, target, comments, errorsBefore);
         showWhereItWent(workspaceId, "direct");
@@ -109,8 +142,9 @@ function showWhereItWent(workspaceId: string, mode: "talk" | "direct"): void {
 /** An accepted send-back is not yet an applied one: without detached runs the
  *  backend applies the decision in the background and reports a refusal
  *  ("run is already executing", say) as `run://error`. Watch the run until
- *  the gate's stage moved (applied: the comments are with the agent) or an
- *  error arrived while it still waits (refused: the comments go back). */
+ *  the gate's stage moved (applied: the comments are with the agent, and the
+ *  gate's own are cleared) or an error arrived while it still waits
+ *  (refused: the tray's comments go back; the gate's never left it). */
 function confirmGateSend(
   workspaceId: string,
   target: Extract<CommentTarget, { kind: "gate" }>,
@@ -120,7 +154,10 @@ function confirmGateSend(
   const settled = (): boolean => {
     const runs = useRunsStore.getState();
     const stage = runs.detailByRun[target.runId]?.stages.find((s) => s.id === target.stageId);
-    if (stage && (stage.status !== "awaiting_checkpoint" || stage.loopIterations !== target.iteration)) return true;
+    if (stage && (stage.status !== "awaiting_checkpoint" || stage.loopIterations !== target.iteration)) {
+      useGateCommentsStore.getState().clear(target.gate);
+      return true;
+    }
     const err = runs.runErrors[target.runId];
     if (!err || err.n <= errorsBefore) return false;
     useReviewComments.getState().restore(workspaceId, comments);

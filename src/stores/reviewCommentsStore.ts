@@ -2,15 +2,23 @@
  * reviewCommentsStore — the "Ask for a change" tray of Review (#956), per
  * workspace. `liveByWs` holds the hunk keys of the working-tree diff on
  * screen (`liveHunkKeys`), so the Companion can mark a comment outdated
- * without parsing the diff again. Session-local: nothing is persisted.
+ * without parsing the diff again; `draftByWs` the comment being written.
+ * Session-local: nothing is persisted.
  * Sending them is `lib/sendReviewComments.ts`.
  */
 import { create } from "zustand";
-import type { ReviewComment } from "../lib/reviewComments";
+import type { CommentDraft, ReviewComment } from "../lib/reviewComments";
+
+type DraftUpdate = CommentDraft | null | ((d: CommentDraft | null) => CommentDraft | null);
 
 interface ReviewCommentsState {
   byWs: Record<string, ReviewComment[]>;
   liveByWs: Record<string, Set<string>>;
+  /** The open "Ask for a change" draft of each workspace (#1051): kept here,
+   *  not in the diff view, so a half-typed note waits in its workspace while
+   *  the view shows another, and is there again on the way back. */
+  draftByWs: Record<string, CommentDraft>;
+  setDraft: (workspaceId: string, next: DraftUpdate) => void;
   add: (workspaceId: string, c: Omit<ReviewComment, "id">) => void;
   remove: (workspaceId: string, id: string) => void;
   /** Empty the workspace's tray and hand back what it held. */
@@ -26,6 +34,18 @@ let seq = 0;
 export const useReviewComments = create<ReviewCommentsState>((set, get) => ({
   byWs: {},
   liveByWs: {},
+  draftByWs: {},
+  setDraft: (workspaceId, next) => {
+    const cur = get().draftByWs[workspaceId] ?? null;
+    const d = typeof next === "function" ? next(cur) : next;
+    if (d === cur) return;
+    set((s) => {
+      const draftByWs = { ...s.draftByWs };
+      if (d) draftByWs[workspaceId] = d;
+      else delete draftByWs[workspaceId];
+      return { draftByWs };
+    });
+  },
   add: (workspaceId, c) =>
     set((s) => ({
       byWs: { ...s.byWs, [workspaceId]: [...(s.byWs[workspaceId] ?? EMPTY), { ...c, id: `rc${++seq}` }] },
