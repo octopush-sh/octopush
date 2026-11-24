@@ -113,6 +113,7 @@ Current anchors:
 | `talk-turn-no-checkpoint` | Talk, on a message you sent whose checkpoint was skipped (in its hover/focus action row): the "This turn has no checkpoint" mark | `chat/ChatCanvas.tsx` |
 | `talk-composer-input` | Talk composer: the draft textarea | `chat/Composer.tsx` |
 | `talk-context-chip` | Talk composer, above the draft: the first context chip (a file, line range, folder, Run session or diff the draft's `@` tokens name; only while there is one) | `chat/ContextChips.tsx` |
+| `talk-context-cap` | Talk composer, at the end of the context chips: "10 at most · 2 more sent as text" (only while the draft names more than 10 mentions) | `chat/ContextChips.tsx` |
 | `talk-composer-estimate` | Talk composer: the cost estimate beside Send ("≈ $0.02 · 3k tokens"; only once there is something to estimate) | `chat/ComposerEstimate.tsx` |
 | `run-session-waiting` | Session line: the brass dot of the first session Claude Code's hooks say waits on you while it isn't in focus: on its cell, or on the `+N` / `N sessions` button when it has no cell (only while one does) | `run/SessionLine.tsx` |
 | `run-switcher-waiting` | ⌘⌥K switcher (or Open beside), while open: the first row's "· waiting on permission" / "· waiting on your input" (only while a listed session waits) | `run/SessionSwitcher.tsx` |
@@ -165,7 +166,7 @@ Current anchors:
 | `settings-claude-hooks` | Settings › General › Attention: "Let Claude Code say what it's waiting on" | `settings/GeneralPane.tsx` |
 | `settings-quiet-claude-code` | Settings › Privacy: the "Quiet Claude Code in crews and Routines" toggle | `settings/PrivacyPane.tsx` |
 | `settings-secret-guard` | Settings › General › Safety: "Guard commits against secrets" | `settings/GeneralPane.tsx` |
-| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push, PR or Talk `$` command is refused for a possible secret): "Leave it out" · "Commit regardless" | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` · `chat/Composer.tsx` |
+| `secret-guard-dialog` | The secret guard's confirm (only after a commit, push, PR or Talk `$` command is refused for a possible secret, or a Talk message's `@` block holds one): "Leave it out" · "Commit regardless" (for a message, "Send regardless") | `SecretGuardDialog.tsx` via `ChangesPanel.tsx` · `PrComposer.tsx` · `chat/Composer.tsx` |
 | `secret-guard-preview` | The secret guard's confirm, with one finding that has a masked preview: the mono `sk-ant-…9fQ2` line under the lead | `SecretGuardDialog.tsx` |
 | `talk-secret-approval` | Talk timeline, only while the secret guard holds an agent's commit, push or `gh pr create`: the inline "Possible secret" card ("Leave it out" · "Run regardless") | `chat/ApprovalCard.tsx` via `chat/ChatCanvas.tsx` |
 | `direct-secret-hold` | Direct run bar, on an Action stage held by the secret guard: "Held before Pull request: possible secret · …" | `RunControlBar.tsx` |

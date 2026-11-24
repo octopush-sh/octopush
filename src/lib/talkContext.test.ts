@@ -2,11 +2,17 @@ import { describe, it, expect } from "vitest";
 import {
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
+  MAX_MENTIONS,
+  capRefs,
   capTail,
   capText,
+  fenced,
+  quoteToken,
+  unquoteGitPath,
   chipLabel,
   contextMentionItems,
   diffForFile,
+  diffScanInputs,
   dirsOf,
   extractContextRefs,
   formatFolderListing,
@@ -84,6 +90,28 @@ describe("talkContext — parsing", () => {
     expect(removeContextToken("only @diff:src/a.ts", "diff")).toBe("only @diff:src/a.ts");
   });
 
+  it("reads a quoted token with a space as one, and removes it quoted", () => {
+    const spaced: ContextCatalog = { ...cat, files: new Set([...files, "docs/my notes.md"]) };
+    const text = 'see @"docs/my notes.md#L3-9" and @"diff:docs/my notes.md", not @docs/my';
+    expect(extractContextRefs(text, spaced).map((r) => [r.kind, r.token])).toEqual([
+      ["file", "docs/my notes.md#L3-9"],
+      ["diff", "diff:docs/my notes.md"],
+    ]);
+    expect(removeContextToken(text, "docs/my notes.md#L3-9")).toBe('see and @"diff:docs/my notes.md", not @docs/my');
+    expect(quoteToken("docs/my notes.md#L3")).toBe('"docs/my notes.md#L3"');
+    expect(quoteToken("src/a.ts")).toBe("src/a.ts");
+  });
+
+  it("attaches at most MAX_MENTIONS and counts the rest", () => {
+    const many = Array.from({ length: MAX_MENTIONS + 2 }, (_, i) => `src/f${i}.ts`);
+    const big: ContextCatalog = { ...cat, files: new Set(many) };
+    const { kept, over } = capRefs(extractContextRefs(many.map((f) => `@${f}`).join(" "), big));
+    expect(kept).toHaveLength(MAX_MENTIONS);
+    expect(kept[0].token).toBe("src/f0.ts");
+    expect(over).toBe(2);
+    expect(capRefs(extractContextRefs("@src/a.ts", cat)).over).toBe(0);
+  });
+
   it("labels chips by basename, range, folder, session and diff", () => {
     const labels = extractContextRefs("@src/lib/b.ts#L2-3 @src/lib/ @session:zsh-2 @diff:src/a.ts", cat).map(chipLabel);
     expect(labels).toEqual(["b.ts#L2-3", "lib/", "zsh", "diff · a.ts"]);
@@ -134,6 +162,99 @@ describe("talkContext — blocks", () => {
     expect(diffForFile(diff, "src/a.ts")).toContain("+y");
     expect(diffForFile(diff, "src/a.ts")).not.toContain("README");
     expect(diffForFile(diff, "other.ts")).toBe("");
+  });
+
+  it("finds a file git quoted in the header (non-ASCII, a quote)", () => {
+    expect(unquoteGitPath('"a/caf\\303\\251.ts"')).toBe("a/café.ts");
+    expect(unquoteGitPath('"b/say \\"hi\\".md"')).toBe('b/say "hi".md');
+    expect(unquoteGitPath("a/plain.ts")).toBe("a/plain.ts");
+    const diff =
+      'diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"\n+x\n' +
+      'diff --git a/old.ts "b/say \\"hi\\".md"\n+y\n' +
+      "diff --git a/my file.ts b/my file.ts\n+z\n";
+    expect(diffForFile(diff, "src/café.ts")).toBe('diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"\n+x');
+    expect(diffForFile(diff, 'say "hi".md')).toContain("+y");
+    expect(diffForFile(diff, "old.ts")).toContain("+y");
+    expect(diffForFile(diff, "my file.ts")).toContain("+z");
+  });
+
+  it("splits a diff into what the secret guard reads: each file's own lines, by its path", () => {
+    const diff = [
+      "# Staged",
+      'diff --git "a/caf\\303\\251.env" "b/caf\\303\\251.env"',
+      "--- \"a/caf\\303\\251.env\"",
+      "+++ \"b/caf\\303\\251.env\"",
+      "@@ -3,3 +3,3 @@",
+      " A=1",
+      "-B=2",
+      "-C=3",
+      "+B=4",
+      "\\ No newline at end of file",
+      "@@ -20 +20 @@",
+      "+late",
+      "",
+      "# Not staged",
+      "diff --git a/id_rsa b/id_rsa",
+      "new file mode 100644",
+      "Binary files /dev/null and b/id_rsa differ",
+      "diff --git a/gone.ts b/gone.ts",
+      "deleted file mode 100644",
+      "--- a/gone.ts",
+      "+++ /dev/null",
+      "@@ -1,2 +0,0 @@",
+      "-x",
+      "-y",
+      "… (cut at 64k characters)",
+    ].join("\n");
+    expect(diffScanInputs(diff)).toEqual([
+      { label: "café.env", text: "A=1\nB=4", firstLine: 3, wholeFile: false },
+      { label: "café.env", text: "B=2\nC=3", firstLine: 4, wholeFile: false },
+      { label: "café.env", text: "late", firstLine: 20, wholeFile: false },
+      { label: "id_rsa", text: "", firstLine: 1, wholeFile: true },
+      { label: "gone.ts", text: "x\ny", firstLine: 1, wholeFile: false },
+    ]);
+    expect(diffScanInputs("(no changes)")).toEqual([]);
+  });
+
+  it("reads the line git puts after a hunk header's @@ as the file's own", () => {
+    // Fake, token-shaped: what the GitHub-token rule matches.
+    const token = ["gh", "p_"].join("") + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+    const diff = [
+      "diff --git a/config/app.env b/config/app.env",
+      "index 1..2 100644",
+      "--- a/config/app.env",
+      "+++ b/config/app.env",
+      `@@ -3,2 +3,2 @@ GITHUB_TOKEN=${token}`,
+      " A=1",
+      "-B=2",
+      "+B=3",
+      "@@ -1 +0,0 @@ only_context",
+      "-gone",
+      "@@ -40 +40 @@ ",
+      "+x",
+      "diff --git a/src/a.ts b/src/a.ts",
+      "--- a/src/a.ts",
+      "+++ b/src/a.ts",
+      "@@ -10 +10 @@ function load() {\r",
+      "+y",
+    ].join("\n");
+    expect(diffScanInputs(diff)).toEqual([
+      { label: "config/app.env", text: `GITHUB_TOKEN=${token}`, firstLine: 2, wholeFile: false },
+      { label: "config/app.env", text: "A=1\nB=3", firstLine: 3, wholeFile: false },
+      { label: "config/app.env", text: "B=2", firstLine: 4, wholeFile: false },
+      // Numbered as the line before the hunk's new start, never below 1; a
+      // header with nothing after its `@@` adds nothing.
+      { label: "config/app.env", text: "only_context", firstLine: 1, wholeFile: false },
+      { label: "config/app.env", text: "gone", firstLine: 1, wholeFile: false },
+      { label: "config/app.env", text: "x", firstLine: 40, wholeFile: false },
+      { label: "src/a.ts", text: "function load() {\r", firstLine: 9, wholeFile: false },
+      { label: "src/a.ts", text: "y", firstLine: 10, wholeFile: false },
+    ]);
+  });
+
+  it("fences a block with more backticks than its content holds", () => {
+    expect(fenced("h", "x")).toBe("\n\nh\n```\nx\n```");
+    expect(fenced("h", "a\n````\nb", "diff")).toBe("\n\nh\n`````diff\na\n````\nb\n`````");
   });
 
   it("lists a folder relative to itself with sizes, and says what it left out", () => {

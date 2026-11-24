@@ -64,24 +64,26 @@ export interface SkillToken {
 /** The `[start, end)` ranges of fenced code blocks (``` … ```), including
  *  the fence lines. Text inside a fence is content, never an invocation:
  *  an `@file` expansion pastes the file as a fenced block, and a
- *  CHANGELOG line saying "run /release" must not invoke the skill. Mirrors
+ *  CHANGELOG line saying "run /release" must not invoke the skill. As in
+ *  Markdown, a fence closes only on a bare line of at least as many
+ *  backticks as opened it, so a ```` fence holds ``` lines. Mirrors
  *  `skills::outside_fences` on the backend. */
 export function fencedRanges(text: string): Array<[number, number]> {
   const out: Array<[number, number]> = [];
-  let open: number | null = null;
-  const lineRe = /^[ \t]*```/gmu;
+  let open: { at: number; len: number } | null = null;
+  const lineRe = /^[ \t]*(`{3,})(.*)$/gmu;
   let m: RegExpExecArray | null;
   while ((m = lineRe.exec(text)) !== null) {
     const lineEnd = text.indexOf("\n", m.index);
     if (open === null) {
-      open = m.index;
-    } else {
-      out.push([open, lineEnd === -1 ? text.length : lineEnd + 1]);
+      open = { at: m.index, len: m[1].length };
+    } else if (m[1].length >= open.len && m[2].trim() === "") {
+      out.push([open.at, lineEnd === -1 ? text.length : lineEnd + 1]);
       open = null;
     }
     lineRe.lastIndex = lineEnd === -1 ? text.length : lineEnd + 1;
   }
-  if (open !== null) out.push([open, text.length]); // an unclosed fence runs to the end
+  if (open !== null) out.push([open.at, text.length]); // an unclosed fence runs to the end
   return out;
 }
 

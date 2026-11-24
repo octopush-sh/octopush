@@ -26,17 +26,23 @@ export interface SecretFinding {
 }
 
 /** The action the guard held: it names the confirm CTA and the copy.
- *  `command` is a Talk `$` command that commits, pushes or opens a PR (#819). */
-export type GuardedAction = "commit" | "push" | "pr" | "command";
+ *  `command` is a Talk `$` command that commits, pushes or opens a PR (#819);
+ *  `message` a Talk message whose `@` context blocks hold one (#1046), where
+ *  a finding's `file` names the block. */
+export type GuardedAction = "commit" | "push" | "pr" | "command" | "message";
 
 /** One refusal: what to show, and the fingerprint an override must echo. */
 export interface SecretRefusal {
   findings: SecretFinding[];
   /** Every finding, including those past the cap. */
   total: number;
-  /** The 16 MB budget ran out: the rest of the change wasn't checked. */
+  /** The 16 MB budget ran out: the rest of the change wasn't checked. For a
+   *  Talk message: a block couldn't be scanned (see `unchecked`). */
   partial: boolean;
   fingerprint: string;
+  /** A Talk message's `@` blocks whose scan couldn't run, by token
+   *  (`@diff`), held like a finding (#1046). */
+  unchecked?: string[];
 }
 
 /** The refusal when a thrown value is the guard's, else `null`. */
@@ -77,23 +83,52 @@ function withArticle(kind: string): string {
   return /^[aeiouAEIOU]/.test(kind) ? `an ${kind}` : `a ${kind}`;
 }
 
-const NOUN: Record<GuardedAction, string> = { commit: "change", push: "push", pr: "pull request", command: "command" };
+const NOUN: Record<GuardedAction, string> = {
+  commit: "change",
+  push: "push",
+  pr: "pull request",
+  command: "command",
+  message: "message",
+};
+
+/** "@diff", "@diff and @src/a.ts", "@diff, @src/a.ts and 2 more". */
+function blockNames(tokens: string[]): string {
+  if (tokens.length <= 2) return tokens.join(" and ");
+  return `${tokens[0]}, ${tokens[1]} and ${tokens.length - 2} more`;
+}
+
+/** Under the lead, when a message's findings come with blocks the guard
+ *  couldn't scan: "@diff couldn't be checked." */
+export function uncheckedNote(tokens: string[]): string {
+  return `${blockNames(tokens)} couldn't be checked.`;
+}
 
 /** The dialog's lead sentence: "This change adds what looks like an Anthropic
- *  API key in tests/fixtures.ts:12." `total` defaults to the list's length. */
-export function guardHeadline(action: GuardedAction, findings: SecretFinding[], total = findings.length): string {
+ *  API key in tests/fixtures.ts:12." (a message "attaches" it). `total`
+ *  defaults to the list's length. With nothing found but Talk blocks the
+ *  guard couldn't scan (`unchecked`): "This message's @diff couldn't be
+ *  checked." */
+export function guardHeadline(
+  action: GuardedAction,
+  findings: SecretFinding[],
+  total = findings.length,
+  unchecked: string[] = [],
+): string {
   const noun = NOUN[action];
+  const verb = action === "message" ? "attaches" : "adds";
+  if (total === 0 && unchecked.length > 0) return `This ${noun}'s ${blockNames(unchecked)} couldn't be checked.`;
   if (total === 0) return `This ${noun} is too large to check in full.`;
   if (total === 1 && findings.length === 1) {
     const f = findings[0];
-    return `This ${noun} adds what looks like ${withArticle(f.kind)} in ${findingLocation(f)}.`;
+    return `This ${noun} ${verb} what looks like ${withArticle(f.kind)} in ${findingLocation(f)}.`;
   }
-  return `This ${noun} adds ${total} things that look like secrets.`;
+  return `This ${noun} ${verb} ${total} things that look like secrets.`;
 }
 
 /** The explicit-override CTA, one per action. */
 export function overrideLabel(action: GuardedAction): string {
   if (action === "command") return "Run regardless";
+  if (action === "message") return "Send regardless";
   return action === "commit" ? "Commit regardless" : action === "push" ? "Push regardless" : "Open it regardless";
 }
 
