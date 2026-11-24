@@ -722,27 +722,140 @@ pub fn parse_env0(stdout: &[u8]) -> Vec<(String, String)> {
 /// ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN for a LiteLLM/Bedrock proxy. RUN-mode
 /// terminals work because the PTY runs a login shell that sources the rc files;
 /// the CLI stage must inherit the same environment.
+///
+/// Bounded by [`LOGIN_SHELL_PROBE_TIMEOUT`] ([`probe_login_shell_env`]): an rc
+/// file that blocks (a prompt, a hung network call) yields no login env, and
+/// [`resolved_cli_path`] still gives the app's PATH and the common bin dirs.
+/// App setup warms it in the background, so the first caller rarely waits.
 pub(crate) fn login_shell_env() -> &'static [(String, String)] {
+    if let Some(stub) = login_shell_env_stub() {
+        return stub;
+    }
     static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
-        std::process::Command::new(&shell)
-            .args(["-lic", "env -0"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| parse_env0(&o.stdout))
-            .unwrap_or_default()
+        probe_login_shell_env(&shell, LOGIN_SHELL_PROBE_TIMEOUT)
     })
 }
 
+/// Hard limit on reading the login shell's env ([`probe_login_shell_env`]).
+pub(crate) const LOGIN_SHELL_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// `shell -lic 'env -0'`, parsed, or empty when it fails or outlives `timeout`.
+/// No stdin (an rc file that reads input gets EOF instead of waiting), its
+/// own process group, and on timeout the whole group is killed, so a job the
+/// rc file started can't keep the pipe open either.
+pub(crate) fn probe_login_shell_env(shell: &str, timeout: std::time::Duration) -> Vec<(String, String)> {
+    use std::io::Read as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut child = match std::process::Command::new(shell)
+        .args(["-lic", "env -0"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(shell, error = %e, "couldn't start the login shell to read its env");
+            return Vec::new();
+        }
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut out) = child.stdout.take() {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = out.read_to_end(&mut buf);
+            let _ = tx.send(buf);
+        });
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut exited = None;
+    let stdout = loop {
+        if exited.is_none() {
+            exited = child.try_wait().ok().flatten();
+        }
+        if exited.is_some() {
+            // Exited: its output is complete once the pipe closes.
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left.max(std::time::Duration::from_millis(1))) {
+                Ok(buf) => break Some(buf),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Some(Vec::new()),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        if exited.is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    };
+    match (stdout, exited) {
+        (Some(buf), Some(status)) if status.success() => parse_env0(&buf),
+        (Some(_), _) => Vec::new(),
+        (None, _) => {
+            // SAFETY: signals the probe's own process group (`process_group(0)`).
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            tracing::warn!(
+                shell,
+                timeout_secs = timeout.as_secs(),
+                "the login shell didn't print its env in time; using the app's PATH and the common bin dirs"
+            );
+            Vec::new()
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOGIN_SHELL_ENV_STUB: std::cell::Cell<Option<&'static [(String, String)]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn login_shell_env_stub() -> Option<&'static [(String, String)]> {
+    LOGIN_SHELL_ENV_STUB.with(|s| s.get())
+}
+
+#[cfg(not(test))]
+fn login_shell_env_stub() -> Option<&'static [(String, String)]> {
+    None
+}
+
+/// Test seam: run `f` with [`login_shell_env`] returning `env` instead of the
+/// real probe, on this thread only, so parallel tests never see it. Work `f`
+/// hands to another thread (`spawn_blocking`) sees the real env.
+#[cfg(test)]
+pub(crate) fn with_login_shell_env<R>(env: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<&'static [(String, String)]>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOGIN_SHELL_ENV_STUB.with(|s| s.set(self.0));
+        }
+    }
+    let owned: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let stub: &'static [(String, String)] = Box::leak(owned.into_boxed_slice());
+    let _reset = Reset(LOGIN_SHELL_ENV_STUB.with(|s| s.replace(Some(stub))));
+    f()
+}
+
+/// The login shell's own PATH, `None` when the probe gave none (it failed or
+/// timed out, [`probe_login_shell_env`]).
+pub(crate) fn login_env_path() -> Option<&'static str> {
+    login_shell_env().iter().find(|(k, _)| k == "PATH").map(|(_, v)| v.as_str()).filter(|v| !v.is_empty())
+}
+
 /// The effective PATH for spawning user CLIs: login-shell PATH ∪ inherited ∪ common dirs.
+/// Talk's shells (`run_command`, `$` commands, sub-agents) get exactly this PATH
+/// and no other login-shell variable.
 pub(crate) fn resolved_cli_path() -> String {
-    let login_path = login_shell_env()
-        .iter()
-        .find(|(k, _)| k == "PATH")
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("");
+    let login_path = login_env_path().unwrap_or("");
     let inherited = std::env::var("PATH").unwrap_or_default();
     let defaults = default_bin_dirs().join(":");
     merge_path_dirs(&[login_path, &inherited, &defaults])
@@ -4575,5 +4688,62 @@ fn failed_stage(msg: &str) -> StageOutcome {
         session_id: None,
         blocked: None,
                 blocked_transcript: None,
+    }
+}
+
+/// The login-shell probe is bounded and its fallback keeps the common dirs
+/// (#1087, #1090).
+#[cfg(test)]
+mod login_probe_tests {
+    use super::*;
+
+    /// An executable `/bin/sh` script standing in for the user's `$SHELL`.
+    fn stub_shell(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let file = dir.join("shell");
+        std::fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        file
+    }
+
+    #[test]
+    fn the_probe_reads_the_env_a_shell_prints() {
+        let dir = tempfile::tempdir().unwrap();
+        let shell = stub_shell(dir.path(), "printf 'PATH=/opt/x/bin\\000OCTO_1087=1\\000'");
+        let env = probe_login_shell_env(shell.to_str().unwrap(), std::time::Duration::from_secs(5));
+        assert_eq!(env, vec![("PATH".to_string(), "/opt/x/bin".to_string()), ("OCTO_1087".to_string(), "1".to_string())]);
+        let failing = stub_shell(dir.path(), "printf 'PATH=/opt/x/bin\\000'; exit 1");
+        assert!(probe_login_shell_env(failing.to_str().unwrap(), std::time::Duration::from_secs(5)).is_empty());
+    }
+
+    #[test]
+    fn a_hung_login_shell_times_out_and_its_jobs_are_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("job.pid");
+        let shell = stub_shell(dir.path(), &format!("sleep 30 &\necho $! > '{}'\nwait", pidfile.display()));
+        let started = std::time::Instant::now();
+        let env = probe_login_shell_env(shell.to_str().unwrap(), std::time::Duration::from_millis(500));
+        assert!(env.is_empty(), "{env:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5), "bounded: {:?}", started.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pidfile).unwrap().trim().parse().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        // SAFETY: signal 0 only checks whether the process still exists.
+        while unsafe { libc::kill(pid, 0) } == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0, "the job the shell started was killed with it");
+    }
+
+    #[test]
+    fn without_a_login_path_the_common_dirs_remain() {
+        with_login_shell_env(&[("OCTO_1087", "1")], || {
+            assert_eq!(login_env_path(), None);
+            let path = resolved_cli_path();
+            for dir in ["/opt/homebrew/bin", "/usr/local/bin"] {
+                assert!(path.split(':').any(|d| d == dir), "{dir} in {path}");
+            }
+        });
+        with_login_shell_env(&[("PATH", "")], || assert_eq!(login_env_path(), None));
+        with_login_shell_env(&[("PATH", "/opt/x/bin")], || assert_eq!(login_env_path(), Some("/opt/x/bin")));
     }
 }
