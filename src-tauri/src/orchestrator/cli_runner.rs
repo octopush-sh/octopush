@@ -3323,6 +3323,10 @@ impl CliRunner {
     /// fails before any assistant message, or Codex answers with another
     /// session, the stage runs fresh ONCE with the feedback in the prompt, and
     /// the journal says why. Both attempts' spend is kept.
+    ///
+    /// A resumed Claude stage whose `--resume` came back on an empty
+    /// conversation ([`ResumeWatch`]) is stopped and runs fresh ONCE the same
+    /// way, with its full input and any feedback; the attempt journals why.
     async fn run_stage(
         &self,
         stage: &StageSpec,
@@ -3330,8 +3334,17 @@ impl CliRunner {
         ctx: &StageContext,
     ) -> AppResult<StageOutcome> {
         let dialect = dialect_for_model(&stage.agent_model);
-        if dialect != CliDialect::Codex || stage.resume_session.is_none() {
+        if stage.resume_session.is_none() {
             return self.run_attempt(stage, input, ctx, true, &mut AttemptReport::default()).await;
+        }
+        if dialect == CliDialect::Claude {
+            let mut report = AttemptReport::default();
+            let resumed = self.run_attempt(stage, input, ctx, true, &mut report).await?;
+            if report.empty_resume.is_none() {
+                return Ok(resumed);
+            }
+            let fresh = self.run_attempt(stage, input, ctx, false, &mut AttemptReport::default()).await?;
+            return Ok(merge_resume_fallback(resumed, fresh));
         }
         let emitter = crate::orchestrator::live::LiveEmitter::new(ctx.events.as_ref(), &ctx.run_id, &ctx.stage_id);
         let supported = tokio::task::spawn_blocking(crate::agent_adapter::codex_exec_resume_supported)
@@ -3706,6 +3719,15 @@ impl CliRunner {
         // per message (#895). Claude only: Codex's stream has no per-message
         // prompt size, so its meter stays hidden.
         let mut context_watch = ContextWatch::default();
+        // A resumed Claude stage: did `--resume` come back on an empty
+        // conversation? Set once, then the select below stops the attempt.
+        let mut resume_watch = stage
+            .resume_session
+            .as_deref()
+            .filter(|_| resuming && dialect == CliDialect::Claude)
+            .map(|sid| ResumeWatch::new(sid, stage.resume_context_tokens));
+        let empty_resume: parking_lot::Mutex<Option<EmptyResume>> = parking_lot::Mutex::new(None);
+        let empty_seen = tokio::sync::Notify::new();
         // Claude Code refused a Bash command because its own sandbox couldn't
         // start (`InnerSandboxWatch`, only in a stage the profile wraps):
         // a notice, and named on a failed outcome it decided, below.
@@ -3741,6 +3763,10 @@ impl CliRunner {
                 forward_plan_and_login(&mut auth, value, &emitter);
                 if auth != Some(CliAuth::ApiKey) {
                     plan_watch_in_loop.lock().observe(value);
+                }
+                if let Some(why) = resume_watch.as_mut().and_then(|w| w.observe(value)) {
+                    *empty_resume.lock() = Some(why);
+                    empty_seen.notify_one();
                 }
             }
             CliDialect::Codex => {
@@ -3795,7 +3821,8 @@ impl CliRunner {
             }
         };
         let read_end = tokio::select! {
-            end = read_loop => end,
+            end = read_loop => Some(end),
+            _ = empty_seen.notified() => None,
             _ = cancel_watch => {
                 stop_cli_child(&mut child, STOP_GRACE).await;
                 // Estimated spend from the streamed assistant events — a stop
@@ -3811,6 +3838,37 @@ impl CliRunner {
                 );
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                 out.cli.ran_model = ran;
+                return Ok(out);
+            }
+        };
+        // An empty resume is never trusted, even when the stream already
+        // ended: stop it with what it streamed, and `run_stage` runs fresh.
+        let empty = empty_resume.lock().take();
+        let read_end = match (empty, read_end) {
+            (None, Some(end)) => end,
+            (why, _) => {
+                stop_cli_child(&mut child, STOP_GRACE).await;
+                stderr_task.abort();
+                let (counted, drift) = counted_usage();
+                let ran = ran_model.lock().clone();
+                let mut out = stopped_stage(
+                    dialect,
+                    EMPTY_RESUME_STOP,
+                    ran.as_deref().unwrap_or(&stage.agent_model),
+                    &counted,
+                    false,
+                );
+                flag_usage_drift(&mut out, drift.as_deref(), &emitter);
+                out.cli.ran_model = ran;
+                if let Some(why) = why {
+                    let has_feedback = stage.feedback.as_deref().is_some_and(|f| !f.trim().is_empty());
+                    emitter.notice(&empty_resume_notice(
+                        &why,
+                        cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                        has_feedback,
+                    ));
+                    report.empty_resume = Some(why);
+                }
                 return Ok(out);
             }
         };
@@ -4011,6 +4069,9 @@ pub(crate) struct AttemptReport {
     /// [`codex_resume_failure`]); `None` on a fresh run, a resume that
     /// worked, or a stop/timeout (never retried).
     pub resume_failure: Option<String>,
+    /// A `claude -p --resume` that came back on an empty conversation
+    /// ([`ResumeWatch`]): the attempt was stopped and the stage runs fresh.
+    pub empty_resume: Option<EmptyResume>,
 }
 
 /// Why a Codex stage with a session to resume runs fresh without trying:
@@ -4086,6 +4147,116 @@ pub(crate) fn codex_resume_failure_notice(why: &str) -> String {
         )
     }
 }
+
+/// The first Claude Code whose `--resume` no longer opens an empty session
+/// (2.1.330: "Fixed `--continue` and `--resume` opening an empty session or
+/// failing"). Older CLIs can answer a resume on a blank conversation.
+pub const CLAUDE_EMPTY_RESUME_FIX: &str = "2.1.330";
+
+/// A resumed Claude stage's first reply must have read at least this share of
+/// the context its session last reported, or it came back empty.
+pub(crate) const EMPTY_RESUME_SHARE_PCT: u64 = 15;
+
+/// The floor when the session's last context isn't known.
+pub(crate) const EMPTY_RESUME_MIN_TOKENS: u64 = 8_000;
+
+/// Why a `claude -p --resume <id>` came back on an empty conversation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum EmptyResume {
+    /// `system/init` named another session than the one passed to `--resume`.
+    OtherSession { requested: String, got: String },
+    /// The first top-level reply read less context than `floor`.
+    SmallContext { tokens: u64, floor: u64 },
+}
+
+/// Watches a resumed Claude stage's stream for an empty resume: decides once,
+/// on the `system/init` session id, then on the first top-level assistant
+/// message's context size ([`context_from_stream_event`]).
+#[derive(Debug)]
+pub(crate) struct ResumeWatch {
+    requested: String,
+    /// The context the session last reported (`None` when none was recorded).
+    prior_context: Option<u64>,
+    decided: bool,
+}
+
+impl ResumeWatch {
+    pub(crate) fn new(requested: &str, prior_context: Option<u64>) -> Self {
+        Self { requested: requested.to_string(), prior_context, decided: false }
+    }
+
+    /// The least context a real continuation's first reply reads: 15% of the
+    /// session's last reading, or 8K tokens when none was recorded. Pure.
+    pub(crate) fn floor(prior_context: Option<u64>) -> u64 {
+        match prior_context.filter(|p| *p > 0) {
+            Some(p) => p * EMPTY_RESUME_SHARE_PCT / 100,
+            None => EMPTY_RESUME_MIN_TOKENS,
+        }
+    }
+
+    /// Feed one stream event; `Some` once, when the resume came back empty.
+    pub(crate) fn observe(&mut self, v: &Value) -> Option<EmptyResume> {
+        if self.decided {
+            return None;
+        }
+        if is_init_event(v) {
+            let got = v.get("session_id").and_then(Value::as_str).filter(|s| !s.is_empty())?;
+            if got != self.requested {
+                self.decided = true;
+                return Some(EmptyResume::OtherSession { requested: self.requested.clone(), got: got.to_string() });
+            }
+            return None;
+        }
+        let (tokens, _) = context_from_stream_event(v)?;
+        self.decided = true;
+        let floor = Self::floor(self.prior_context);
+        (tokens < floor).then_some(EmptyResume::SmallContext { tokens, floor })
+    }
+}
+
+/// `142000` → `142k`; under 1,000 as is. Pure.
+fn short_tokens(t: u64) -> String {
+    if t < 1_000 {
+        t.to_string()
+    } else {
+        format!("{}k", t / 1_000)
+    }
+}
+
+/// The journal line for an empty resume before the stage reruns fresh; on a
+/// known CLI older than [`CLAUDE_EMPTY_RESUME_FIX`] it names the update
+/// (an unknown version never does, like [`idle_timeout_message`]). It names
+/// the answers only when the fresh rerun carries feedback (an answered block;
+/// a plain Resume has none). Pure.
+pub(crate) fn empty_resume_notice(why: &EmptyResume, cli_version: Option<&str>, has_feedback: bool) -> String {
+    let detail = match why {
+        EmptyResume::OtherSession { requested, got } => format!(
+            "it started session {} instead of {}",
+            got.chars().take(8).collect::<String>(),
+            requested.chars().take(8).collect::<String>()
+        ),
+        EmptyResume::SmallContext { tokens, floor } => format!(
+            "its first reply read {} tokens of context, under the {} a continuation reads",
+            short_tokens(*tokens),
+            short_tokens(*floor)
+        ),
+    };
+    let with = if has_feedback { "its full input and your answers" } else { "its full input" };
+    let mut msg = format!(
+        "resume came back empty: Claude Code opened a new conversation ({detail}). \
+         The stage runs fresh, with {with}."
+    );
+    if cli_version.is_some_and(|v| crate::agent_adapter::version_below(v, CLAUDE_EMPTY_RESUME_FIX)) {
+        msg.push_str(&format!(
+            " Claude Code {CLAUDE_EMPTY_RESUME_FIX} fixes --resume opening an empty session; update Claude Code."
+        ));
+    }
+    msg
+}
+
+/// The stage error of a resumed attempt stopped as empty (replaced by the
+/// fresh run's outcome; kept on the outcome if that run never happens).
+pub(crate) const EMPTY_RESUME_STOP: &str = "stopped: the resumed Claude Code session came back empty";
 
 /// `map`'s usage with `baseline` (the session's earlier reported total)
 /// taken off, as one entry; `map` unchanged without a baseline. A resumed

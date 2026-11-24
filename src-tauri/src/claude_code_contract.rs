@@ -574,6 +574,81 @@ async fn stream_json_a_hang_before_the_first_request_is_named() {
     );
 }
 
+const EMPTY_RESUME_VERSION: &str = "2.1.329";
+const EMPTY_RESUME_REL: &str = "stream-json/resume-empty.jsonl";
+
+#[test]
+fn stream_json_a_resume_that_came_back_empty_is_named() {
+    use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume, ResumeWatch, CLAUDE_EMPTY_RESUME_FIX};
+    // Synthetic (see the 2.1.329 README): `--resume …0001` answered on a new,
+    // empty session — the bug Claude Code 2.1.330 fixed.
+    let rec = synthesized(EMPTY_RESUME_VERSION);
+    let fx = rec.label(EMPTY_RESUME_REL);
+    let events = rec.jsonl(EMPTY_RESUME_REL);
+    let init = events.first().unwrap_or_else(|| panic!("[{fx}] empty"));
+    assert_eq!(require_str(&fx, init, "subtype"), "init", "[{fx}] the stream opens with system/init");
+    let got = require_str(&fx, init, "session_id");
+    let reply = *of_type(&events, "assistant").first().unwrap_or_else(|| panic!("[{fx}] no assistant event"));
+    let tokens: u64 = ["input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"]
+        .iter()
+        .map(|f| require_u64(&fx, reply, &format!("message.usage.{f}")))
+        .sum();
+    assert_eq!(tokens, 14_063, "[{fx}] the first reply read only the system prompt");
+
+    // (a) `system/init` names another session than the one passed to --resume.
+    let requested = "aaaaaaaa-0000-4000-8000-000000000001";
+    let mut watch = ResumeWatch::new(requested, Some(120_000));
+    let found: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(
+        found,
+        vec![EmptyResume::OtherSession { requested: requested.into(), got: got.into() }],
+        "[{fx}] decided once, on the init"
+    );
+    // (b) The same id, but a first reply under 15% of the session's last context.
+    let mut watch = ResumeWatch::new(got, Some(120_000));
+    let small: Vec<EmptyResume> = events.iter().filter_map(|e| watch.observe(e)).collect();
+    assert_eq!(small, vec![EmptyResume::SmallContext { tokens, floor: 18_000 }], "[{fx}]");
+
+    // The CLI that did it names the update; a fixed or unknown one never does.
+    let version = require_str(&fx, init, "claude_code_version");
+    for why in [&found[0], &small[0]] {
+        let n = empty_resume_notice(why, Some(version), false);
+        assert!(n.starts_with("resume came back empty: Claude Code opened a new conversation ("), "[{fx}] {n}");
+        assert!(
+            n.ends_with(
+                "The stage runs fresh, with its full input. \
+                 Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."
+            ),
+            "[{fx}] {n}"
+        );
+        for v in [Some(CLAUDE_EMPTY_RESUME_FIX), Some("2.2.0"), None] {
+            let plain = empty_resume_notice(why, v, false);
+            assert!(!plain.contains("update Claude Code"), "[{fx}] {v:?}: {plain}");
+            assert!(plain.ends_with("The stage runs fresh, with its full input."), "[{fx}] {plain}");
+            let answered = empty_resume_notice(why, v, true);
+            assert!(answered.ends_with("The stage runs fresh, with its full input and your answers."), "[{fx}] {answered}");
+        }
+    }
+}
+
+#[test]
+fn stream_json_a_real_resume_is_never_taken_for_an_empty_one() {
+    use crate::orchestrator::cli_runner::ResumeWatch;
+    for rec in recordings() {
+        let fx = rec.label("stream-json/resume.jsonl");
+        let events = rec.jsonl("stream-json/resume.jsonl");
+        let init = events
+            .iter()
+            .find(|e| e["type"] == "system" && e["subtype"] == "init")
+            .unwrap_or_else(|| panic!("[{fx}] no system/init"));
+        let sid = require_str(&fx, init, "session_id");
+        for prior in [None, Some(14_000), Some(60_000)] {
+            let mut watch = ResumeWatch::new(sid, prior);
+            assert!(events.iter().all(|e| watch.observe(e).is_none()), "[{fx}] prior context {prior:?}");
+        }
+    }
+}
+
 const DENIALS_VERSION: &str = "2.1.326";
 const DENIALS_REL: &str = "stream-json/result-with-denials.jsonl";
 
