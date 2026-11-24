@@ -3326,7 +3326,7 @@ impl CliRunner {
     ///
     /// A resumed Claude stage whose `--resume` came back on an empty
     /// conversation ([`ResumeWatch`]) is stopped and runs fresh ONCE the same
-    /// way, with its full input and the feedback; the attempt journals why.
+    /// way, with its full input and any feedback; the attempt journals why.
     async fn run_stage(
         &self,
         stage: &StageSpec,
@@ -3861,7 +3861,12 @@ impl CliRunner {
                 flag_usage_drift(&mut out, drift.as_deref(), &emitter);
                 out.cli.ran_model = ran;
                 if let Some(why) = why {
-                    emitter.notice(&empty_resume_notice(&why, cli_version.as_ref().and_then(|v| v.version.as_deref())));
+                    let has_feedback = stage.feedback.as_deref().is_some_and(|f| !f.trim().is_empty());
+                    emitter.notice(&empty_resume_notice(
+                        &why,
+                        cli_version.as_ref().and_then(|v| v.version.as_deref()),
+                        has_feedback,
+                    ));
                     report.empty_resume = Some(why);
                 }
                 return Ok(out);
@@ -4220,8 +4225,10 @@ fn short_tokens(t: u64) -> String {
 
 /// The journal line for an empty resume before the stage reruns fresh; on a
 /// known CLI older than [`CLAUDE_EMPTY_RESUME_FIX`] it names the update
-/// (an unknown version never does, like [`idle_timeout_message`]). Pure.
-pub(crate) fn empty_resume_notice(why: &EmptyResume, cli_version: Option<&str>) -> String {
+/// (an unknown version never does, like [`idle_timeout_message`]). It names
+/// the answers only when the fresh rerun carries feedback (an answered block;
+/// a plain Resume has none). Pure.
+pub(crate) fn empty_resume_notice(why: &EmptyResume, cli_version: Option<&str>, has_feedback: bool) -> String {
     let detail = match why {
         EmptyResume::OtherSession { requested, got } => format!(
             "it started session {} instead of {}",
@@ -4234,9 +4241,10 @@ pub(crate) fn empty_resume_notice(why: &EmptyResume, cli_version: Option<&str>) 
             short_tokens(*floor)
         ),
     };
+    let with = if has_feedback { "its full input and your answers" } else { "its full input" };
     let mut msg = format!(
         "resume came back empty: Claude Code opened a new conversation ({detail}). \
-         The stage runs fresh, with its full input and the feedback."
+         The stage runs fresh, with {with}."
     );
     if cli_version.is_some_and(|v| crate::agent_adapter::version_below(v, CLAUDE_EMPTY_RESUME_FIX)) {
         msg.push_str(&format!(

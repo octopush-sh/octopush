@@ -10427,20 +10427,35 @@ mod orchestrator_tests {
     fn an_empty_resume_notice_names_the_update_only_on_a_known_old_cli() {
         use crate::orchestrator::cli_runner::{empty_resume_notice, EmptyResume};
         let why = EmptyResume::SmallContext { tokens: 4_200, floor: 21_300 };
+        // A plain Resume carries no feedback, so the line promises only the input.
         assert_eq!(
-            empty_resume_notice(&why, None),
+            empty_resume_notice(&why, None, false),
             "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
-             under the 21k a continuation reads). The stage runs fresh, with its full input and the feedback."
+             under the 21k a continuation reads). The stage runs fresh, with its full input."
         );
-        let old = empty_resume_notice(&why, Some("2.1.329"));
+        // An answered block reruns with the director's answers.
+        assert_eq!(
+            empty_resume_notice(&why, None, true),
+            "resume came back empty: Claude Code opened a new conversation (its first reply read 4k tokens of context, \
+             under the 21k a continuation reads). The stage runs fresh, with its full input and your answers."
+        );
+        let old = empty_resume_notice(&why, Some("2.1.329"), true);
         assert!(
-            old.ends_with("feedback. Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
+            old.ends_with("your answers. Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
             "{old}"
         );
-        assert_eq!(empty_resume_notice(&why, Some("2.1.330")), empty_resume_notice(&why, None));
-        assert_eq!(empty_resume_notice(&why, Some("not a version")), empty_resume_notice(&why, None));
+        for has_feedback in [false, true] {
+            assert_eq!(
+                empty_resume_notice(&why, Some("2.1.330"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+            assert_eq!(
+                empty_resume_notice(&why, Some("not a version"), has_feedback),
+                empty_resume_notice(&why, None, has_feedback)
+            );
+        }
         let other = EmptyResume::OtherSession { requested: "aaaaaaaa-0001".into(), got: "bbbbbbbb-0002".into() };
-        assert!(empty_resume_notice(&other, None).contains("(it started session bbbbbbbb instead of aaaaaaaa)"));
+        assert!(empty_resume_notice(&other, None, false).contains("(it started session bbbbbbbb instead of aaaaaaaa)"));
     }
 
     #[test]

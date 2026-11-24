@@ -612,16 +612,21 @@ fn stream_json_a_resume_that_came_back_empty_is_named() {
     // The CLI that did it names the update; a fixed or unknown one never does.
     let version = require_str(&fx, init, "claude_code_version");
     for why in [&found[0], &small[0]] {
-        let n = empty_resume_notice(why, Some(version));
+        let n = empty_resume_notice(why, Some(version), false);
         assert!(n.starts_with("resume came back empty: Claude Code opened a new conversation ("), "[{fx}] {n}");
         assert!(
-            n.ends_with(" Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."),
+            n.ends_with(
+                "The stage runs fresh, with its full input. \
+                 Claude Code 2.1.330 fixes --resume opening an empty session; update Claude Code."
+            ),
             "[{fx}] {n}"
         );
         for v in [Some(CLAUDE_EMPTY_RESUME_FIX), Some("2.2.0"), None] {
-            let n = empty_resume_notice(why, v);
-            assert!(!n.contains("update Claude Code"), "[{fx}] {v:?}: {n}");
-            assert!(n.ends_with("The stage runs fresh, with its full input and the feedback."), "[{fx}] {n}");
+            let plain = empty_resume_notice(why, v, false);
+            assert!(!plain.contains("update Claude Code"), "[{fx}] {v:?}: {plain}");
+            assert!(plain.ends_with("The stage runs fresh, with its full input."), "[{fx}] {plain}");
+            let answered = empty_resume_notice(why, v, true);
+            assert!(answered.ends_with("The stage runs fresh, with its full input and your answers."), "[{fx}] {answered}");
         }
     }
 }
