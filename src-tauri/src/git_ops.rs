@@ -435,25 +435,36 @@ const REBUILDABLE_DIRS: &[&str] = &[
 ];
 
 /// Whether an ignored path (libgit2 lists an ignored folder once, as `dir/`)
-/// is rebuildable: inside or named like a `REBUILDABLE_DIRS` folder, Finder's
-/// `.DS_Store`, or the Claude Code settings file Octopush writes into its own
-/// worktrees (rewritten on restore). Pure.
+/// is rebuildable: inside or named like a `REBUILDABLE_DIRS` folder, or
+/// Finder's `.DS_Store`. Pure.
 pub fn is_rebuildable_ignored(path: &str) -> bool {
     let path = path.trim_end_matches('/');
-    path == crate::claude_hooks::EXCLUDE_LINE.trim_start_matches('/')
-        || path.rsplit('/').next() == Some(".DS_Store")
-        || path.split('/').any(|part| REBUILDABLE_DIRS.contains(&part))
+    path.rsplit('/').next() == Some(".DS_Store") || path.split('/').any(|part| REBUILDABLE_DIRS.contains(&part))
+}
+
+/// Whether `rel` is the Claude Code settings file Octopush writes into its
+/// worktrees (`claude_hooks::EXCLUDE_LINE`) and it holds nothing but
+/// Octopush's own hooks, which restore writes again. Anything more in it
+/// (Claude Code's "don't ask again" choices, say) makes it a local file, and
+/// so does a file that can't be read or parsed.
+pub fn is_hooks_only_settings(root: &Path, rel: &str) -> bool {
+    if rel != crate::claude_hooks::EXCLUDE_LINE.trim_start_matches('/') {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(root.join(rel)) else { return false };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { return false };
+    crate::agent_adapter::strip_claude_hooks(value).as_object().is_some_and(|o| o.is_empty())
 }
 
 /// The git-ignored paths in the worktree at `path` that archiving would
 /// delete for good (a local env file, a local database): everything ignored
-/// but `is_rebuildable_ignored`. An ignored folder counts once, as `dir/`,
-/// and only while it holds such a file (`folder_holds_local_files`).
-/// Untracked folders are examined too: one holding only ignored files (say
-/// `db/dev.sqlite` under `*.sqlite`) is listed as `db/`, where skipping
-/// untracked folders would miss it. So a `.claude/` folder holding nothing
-/// but the `settings.local.json` Octopush writes is not listed, nor is an
-/// empty folder (libgit2 reports both as ignored).
+/// but `is_rebuildable_ignored` and `is_hooks_only_settings`. An ignored
+/// folder counts once, as `dir/`, and only while it holds such a file
+/// (`folder_holds_local_files`). Untracked folders are examined too: one
+/// holding only ignored files (say `db/dev.sqlite` under `*.sqlite`) is
+/// listed as `db/`, where skipping untracked folders would miss it. So a
+/// `.claude/` folder holding nothing but Octopush's hooks is not listed, nor
+/// is an empty folder (libgit2 reports both as ignored).
 pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
     let repo = open_repo(path)?;
     let mut opts = StatusOptions::new();
@@ -468,36 +479,43 @@ pub fn local_ignored_files(path: &Path) -> AppResult<Vec<String>> {
         .iter()
         .filter(|e| e.status().is_ignored())
         .filter_map(|e| e.path().ok().map(str::to_string))
-        .filter(|p| !is_rebuildable_ignored(p))
+        .filter(|p| !is_rebuildable_ignored(p) && !is_hooks_only_settings(path, p))
         .filter(|p| !p.ends_with('/') || folder_holds_local_files(path, p))
         .collect())
 }
 
+/// Entries `folder_holds_local_files` looks at before it gives up and says
+/// the folder holds local files.
+pub const LOCAL_FILES_WALK_CAP: usize = 2_000;
+
 /// Whether the folder `rel` of the worktree at `root` holds a file, at any
-/// depth, that is not `is_rebuildable_ignored`. Stops at the first one; a
-/// folder it can't read, or too big to finish, counts as holding one.
-/// Symlinks are not followed (they count as files).
+/// depth, that is neither `is_rebuildable_ignored` nor
+/// `is_hooks_only_settings`. Stops at the first one. Dependency and build
+/// folders inside are skipped whole, not walked; a folder it can't read, or
+/// with more than `LOCAL_FILES_WALK_CAP` other entries, counts as holding
+/// one. Symlinks are not followed (they count as files).
 fn folder_holds_local_files(root: &Path, rel: &str) -> bool {
     let mut stack = vec![root.join(rel)];
-    let mut budget: usize = 2_000;
+    let mut budget = LOCAL_FILES_WALK_CAP;
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else { return true };
         for entry in entries {
-            budget -= 1;
             let Ok(entry) = entry else { return true };
+            let Ok(kind) = entry.file_type() else { return true };
+            let path = entry.path();
+            let inside = path.strip_prefix(root).ok().and_then(|p| p.to_str()).unwrap_or_default().to_string();
+            if is_rebuildable_ignored(&inside) {
+                continue;
+            }
+            if !kind.is_dir() && !is_hooks_only_settings(root, &inside) {
+                return true;
+            }
             if budget == 0 {
                 return true;
             }
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(t) if t.is_dir() => stack.push(path),
-                Ok(_) => {
-                    let inside = path.strip_prefix(root).ok().and_then(|p| p.to_str()).unwrap_or_default();
-                    if !is_rebuildable_ignored(inside) {
-                        return true;
-                    }
-                }
-                Err(_) => return true,
+            budget -= 1;
+            if kind.is_dir() {
+                stack.push(path);
             }
         }
     }

@@ -27982,8 +27982,8 @@ mod request_context_tests {
 /// #963: what archiving a merged mission re-checks at the moment it acts.
 #[cfg(test)]
 mod merged_archive_tests {
-    use crate::commands::{changed_since_named, merged_archive_skip, worktree_busy};
-    use crate::git_ops::{head_sha, is_rebuildable_ignored, local_ignored_files};
+    use crate::commands::{archive_workspace_at, changed_since_named, merged_archive_skip, worktree_busy};
+    use crate::git_ops::{head_sha, is_hooks_only_settings, is_rebuildable_ignored, local_ignored_files, LOCAL_FILES_WALK_CAP};
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -28113,13 +28113,148 @@ mod merged_archive_tests {
     fn rebuildable_ignored_paths() {
         for p in [
             "node_modules/", "web/node_modules/", ".venv/", "venv/", "dist/", "app/build/", "target/", ".next/",
-            "src/__pycache__/", ".DS_Store", "docs/.DS_Store", ".claude/settings.local.json",
+            "src/__pycache__/", ".DS_Store", "docs/.DS_Store",
         ] {
             assert!(is_rebuildable_ignored(p), "{p}");
         }
-        for p in [".env", "web/.env.local", "data.db", "notes/", ".claude/"] {
+        for p in [".env", "web/.env.local", "data.db", "notes/", ".claude/", ".claude/settings.local.json"] {
             assert!(!is_rebuildable_ignored(p), "{p}");
         }
+    }
+
+    /// Octopush's hooks in a settings file, plus `extra` keys of the user's.
+    fn hooked_settings(extra: serde_json::Value) -> String {
+        let merged = crate::agent_adapter::merge_claude_hooks(extra, std::path::Path::new("/opt/octopush-mcp")).unwrap();
+        serde_json::to_string(&merged).unwrap()
+    }
+
+    fn exclude_hooked_settings(p: &std::path::Path) {
+        std::fs::create_dir_all(p.join(".git/info")).unwrap();
+        let exclude = p.join(".git/info/exclude");
+        let mut lines = std::fs::read_to_string(&exclude).unwrap_or_default();
+        lines.push_str(crate::claude_hooks::EXCLUDE_LINE);
+        lines.push('\n');
+        std::fs::write(&exclude, lines).unwrap();
+    }
+
+    #[test]
+    fn claude_settings_are_local_files_only_with_more_than_our_hooks() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        exclude_hooked_settings(p);
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        let settings = p.join(".claude/settings.local.json");
+        std::fs::write(&settings, hooked_settings(serde_json::json!({}))).unwrap();
+        assert!(is_hooks_only_settings(p, ".claude/settings.local.json"));
+        assert!(local_ignored_files(p).unwrap().is_empty());
+
+        // Claude Code saved a "don't ask again" choice in it.
+        let choices = serde_json::json!({ "permissions": { "allow": ["Bash(npm test)"] } });
+        std::fs::write(&settings, hooked_settings(choices)).unwrap();
+        assert!(!is_hooks_only_settings(p, ".claude/settings.local.json"));
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with(".claude/")), "{files:?}");
+
+        // Only our hooks again, but another ignored file beside them.
+        std::fs::write(&settings, hooked_settings(serde_json::json!({}))).unwrap();
+        std::fs::write(p.join(".claude/.env"), "TOKEN=1\n").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with(".claude/")), "{files:?}");
+    }
+
+    #[test]
+    fn a_dependency_folder_inside_a_folder_is_skipped_not_counted() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        let deps = p.join("pkg/node_modules/big");
+        std::fs::create_dir_all(&deps).unwrap();
+        for i in 0..LOCAL_FILES_WALK_CAP + 100 {
+            std::fs::write(deps.join(format!("f{i}.js")), "").unwrap();
+        }
+        assert!(local_ignored_files(p).unwrap().is_empty(), "pkg/ holds only a dependency folder");
+        std::fs::write(p.join("pkg/.env"), "TOKEN=1\n").unwrap();
+        let files = local_ignored_files(p).unwrap();
+        assert!(!files.is_empty() && files.iter().all(|f| f.starts_with("pkg/")), "{files:?}");
+    }
+
+    #[test]
+    fn a_folder_too_big_to_walk_counts_as_local_files() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        for i in 0..3 {
+            std::fs::create_dir_all(p.join(format!("small/d{i}"))).unwrap();
+        }
+        assert!(local_ignored_files(p).unwrap().is_empty(), "empty folders hold nothing");
+        for i in 0..=LOCAL_FILES_WALK_CAP {
+            std::fs::create_dir_all(p.join(format!("big/d{i}"))).unwrap();
+        }
+        assert_eq!(local_ignored_files(p).unwrap(), vec!["big/".to_string()], "the cap was reached");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_holding_only_a_symlink_counts_and_the_link_is_not_followed() {
+        let (dir, _) = merged_repo();
+        let p = dir.path();
+        std::fs::write(p.join(".gitignore"), ".env\nnode_modules/\n*.sqlite\n*.db\nlinks/\n").unwrap();
+        git(p, &["commit", "-qam", "ignore links"]);
+        std::fs::create_dir_all(p.join("links")).unwrap();
+        std::os::unix::fs::symlink("..", p.join("links/up")).unwrap();
+        assert_eq!(local_ignored_files(p).unwrap(), vec!["links/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_mission_skipped_at_the_last_check_keeps_its_talk_checkpoints() {
+        let root = tempdir().unwrap();
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        git(&project, &["init", "-q"]);
+        git(&project, &["config", "user.email", "t@t.dev"]);
+        git(&project, &["config", "user.name", "T"]);
+        std::fs::write(project.join("a.txt"), "a\n").unwrap();
+        git(&project, &["add", "."]);
+        git(&project, &["commit", "-qm", "base"]);
+        let wt = root.path().join("wt");
+        let wt_s = wt.to_string_lossy().to_string();
+        let project_s = project.to_string_lossy().to_string();
+        git(&project, &["worktree", "add", "-q", "-b", "fix/a", wt_s.as_str()]);
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let db = parking_lot::Mutex::new(crate::db::Db::open(tmp.path()).unwrap());
+        db.lock().insert_project("p-cp", "P", &project_s).unwrap();
+        db.lock().insert_workspace("w-cp", "p-cp", "ws", "", "fix/a", Some(&wt_s), "", None).unwrap();
+        let thread = db.lock().create_chat_thread("w-cp", "Talk").unwrap();
+        let checkpoint = format!("{}/{}/1", crate::talk_checkpoints::REF_ROOT, thread.id);
+        git(&wt, &["update-ref", checkpoint.as_str(), "HEAD"]);
+        let has_checkpoint = || {
+            Command::new("git")
+                .args(["show-ref", "--verify", "--quiet", checkpoint.as_str()])
+                .current_dir(&project)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(has_checkpoint());
+        let status = || db.lock().get_workspace("w-cp").unwrap().unwrap().status;
+
+        // A file changed after the confirm: left in place, checkpoints kept.
+        std::fs::write(wt.join("late.txt"), "x").unwrap();
+        let out = archive_workspace_at(&db, |_| false, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, Some("changed"));
+        assert!(wt.is_dir() && has_checkpoint() && status() != "archived");
+
+        // A Talk turn started there: the same.
+        std::fs::remove_file(wt.join("late.txt")).unwrap();
+        let talking = |t: &[String]| t.contains(&thread.id);
+        let out = archive_workspace_at(&db, talking, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, Some("busy"));
+        assert!(wt.is_dir() && has_checkpoint() && status() != "archived");
+
+        // Clean and idle: archived, and only then are its checkpoints pruned.
+        let out = archive_workspace_at(&db, |_| false, "w-cp", &project_s, Some(&wt_s), Some(NOTHING)).await.unwrap();
+        assert_eq!(out, None);
+        assert!(!wt.exists() && !has_checkpoint());
+        assert_eq!(status(), "archived");
     }
 }
 

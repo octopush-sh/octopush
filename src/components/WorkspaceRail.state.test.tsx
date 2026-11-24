@@ -88,7 +88,14 @@ beforeEach(() => {
   __reloadRailGroupUi();
   useGroupsStore.setState({ groups: [FIXES], loaded: true });
   useAttentionStore.setState({ flagsByWs: {} });
-  useWorkspaceStore.setState({ workspacesByProjectId: { p1: MISSIONS }, mergedPrByWs: {}, gitSummaryByWs: {}, prByWs: {} });
+  useWorkspaceStore.setState({
+    workspacesByProjectId: { p1: MISSIONS },
+    mergedPrByWs: {},
+    localFilesByWs: {},
+    archivingIds: {},
+    gitSummaryByWs: {},
+    prByWs: {},
+  });
   useRunsStore.setState({
     runsByWs: {
       // A crew at a gate: needs you.
@@ -182,6 +189,20 @@ describe("rail: merged · archive?", () => {
       />,
     );
     expect(screen.queryByText("merged · archive?")).toBeNull();
+  });
+
+  it("says what Undo can't bring back, and waits while its archive runs", () => {
+    useWorkspaceStore.setState({ mergedPrByWs: { "w-codec": MERGED } });
+    const { unmount } = render(<Rail onArchiveMerged={vi.fn()} />);
+    const plain = screen.getByRole("button", { name: "Merged — archive fix-codec" });
+    expect(plain.title).toMatch(/Undo brings it back whole: it holds no local files and no saved Claude Code choices\.$/);
+    expect((plain as HTMLButtonElement).disabled).toBe(false);
+    unmount();
+    useWorkspaceStore.setState({ localFilesByWs: { "w-codec": [".claude/"] }, archivingIds: { "w-codec": true } });
+    render(<Rail onArchiveMerged={vi.fn()} />);
+    const action = screen.getByRole("button", { name: "Merged — archive fix-codec" });
+    expect(action.title).toMatch(/Its local files go too and Undo doesn't bring them back, so they are listed first\.$/);
+    expect((action as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("is not drawn without a handler", () => {

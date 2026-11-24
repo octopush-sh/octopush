@@ -1576,7 +1576,7 @@ pub async fn delete_workspace(
         .as_deref()
         .is_some_and(|wt| is_project_root(&project_path, wt));
 
-    prune_talk_checkpoints_of(&state, &workspace_id, &project_path, worktree_path.as_deref()).await;
+    prune_talk_checkpoints_of(&state.db, &workspace_id, &project_path, worktree_path.as_deref()).await;
 
     // Remove the worktree directory only when Octopush created it (`managed`) and
     // it isn't the project root. An adopted checkout (made by the user/another
@@ -1650,32 +1650,40 @@ pub async fn archive_workspace(
     // IPC/API symmetry but isn't needed here.
     let _ = &branch;
     let project_path = expand_tilde(&project_path);
-    archive_workspace_at(&state, &workspace_id, &project_path, worktree_path.as_deref(), None).await.map(|_| ())
+    let running = |t: &[String]| state.chat.any_running(t);
+    archive_workspace_at(&state.db, running, &workspace_id, &project_path, worktree_path.as_deref(), None)
+        .await
+        .map(|_| ())
 }
 
 /// The archive itself, shared with `archive_merged_workspaces`, which passes
 /// `named` (the local files the user was shown): right before the worktree
-/// is deleted it is checked once more (`changed_since_named`), and a mission
-/// that changed is left in place, with the reason as `Ok(Some(..))`.
-async fn archive_workspace_at(
-    state: &AppState,
+/// is deleted it is checked once more (`worktree_busy` with `running`, which
+/// asks the chat engine about thread ids, then `changed_since_named`), and a
+/// mission that fails is left in place, untouched, with the reason as
+/// `Ok(Some(..))`. The Talk checkpoints go last: they are refs in the shared
+/// git dir, pruned from the project root once the worktree is gone.
+pub(crate) async fn archive_workspace_at(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    running: impl Fn(&[String]) -> bool,
     workspace_id: &str,
     project_path: &str,
     worktree_path: Option<&str>,
     named: Option<&[String]>,
 ) -> AppResult<Option<&'static str>> {
-    prune_talk_checkpoints_of(state, workspace_id, project_path, worktree_path).await;
-
     // Only remove on disk what Octopush created. An adopted checkout and the
     // main workspace (project root) keep their directory — archiving just flips
     // the DB row. (Archive always keeps the branch.)
-    if owns_worktree_on_disk(&state.db, workspace_id, project_path, worktree_path) {
+    if owns_worktree_on_disk(db, workspace_id, project_path, worktree_path) {
         if let (Some(named), Some(wt)) = (named, worktree_path) {
+            if worktree_busy(&db.lock(), &running, wt) {
+                return Ok(Some("busy"));
+            }
             if let Some(reason) = changed_since_named(Path::new(wt), Some(named)) {
                 return Ok(Some(reason));
             }
         }
-        crate::claude_hooks::remove_for_workspace(&state.db, workspace_id, worktree_path);
+        crate::claude_hooks::remove_for_workspace(db, workspace_id, worktree_path);
         if let Some(wt) = worktree_path {
             // Prune the worktree's registry slot (by path), then remove its dir.
             let _ = crate::git_ops::delete_worktree(
@@ -1688,8 +1696,9 @@ async fn archive_workspace_at(
             }
         }
     }
+    prune_talk_checkpoints_of(db, workspace_id, project_path, worktree_path).await;
     // Mark archived in DB (row survives, hidden from the rail)
-    state.db.lock().archive_workspace(workspace_id)?;
+    db.lock().archive_workspace(workspace_id)?;
     Ok(None)
 }
 
@@ -2116,8 +2125,13 @@ pub async fn fork_chat_thread(
 /// being deleted or archived (#958). The refs live in the repository's
 /// shared git directory, so they would otherwise outlive the worktree.
 /// Best-effort, and run before the worktree is removed.
-async fn prune_talk_checkpoints_of(state: &AppState, workspace_id: &str, project_path: &str, worktree: Option<&str>) {
-    let threads = state.db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
+async fn prune_talk_checkpoints_of(
+    db: &parking_lot::Mutex<crate::db::Db>,
+    workspace_id: &str,
+    project_path: &str,
+    worktree: Option<&str>,
+) {
+    let threads = db.lock().chat_thread_ids(workspace_id).unwrap_or_default();
     if threads.is_empty() {
         return;
     }
@@ -6912,7 +6926,8 @@ pub async fn archive_merged_workspaces(
         let checked = merged_archive_check(&state, &project_id, Path::new(&project_path), &id, merged.as_ref(), named);
         let reason = match checked {
             Ok(wt) => {
-                let archived = archive_workspace_at(&state, &id, &project_path, Some(&wt), Some(named)).await;
+                let running = |t: &[String]| state.chat.any_running(t);
+                let archived = archive_workspace_at(&state.db, running, &id, &project_path, Some(&wt), Some(named)).await;
                 match archived {
                     Ok(None) => {
                         out.archived.push(id);
