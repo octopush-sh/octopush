@@ -98,3 +98,20 @@ test("a maintenance-only stable still gets a dated heading", () => {
   const log = readFileSync(join(dir, "src/content/docs/docs/changelog.md"), "utf8");
   assert.ok(log.includes('## v0.4.94\n\n<p class="changelog-date">Stable <time datetime="2026-11-24">2026-11-24</time></p>\n\nMaintenance and reliability fixes.\n'));
 });
+
+test("a folded beta is labelled Beta and a stable the landing skipped stays Stable", () => {
+  const dir = mkdtempSync(join(tmpdir(), "webv-"));
+  mkdirSync(join(dir, "src/data"), { recursive: true });
+  mkdirSync(join(dir, "src/content/docs/docs"), { recursive: true });
+  writeFileSync(join(dir, "src/data/release.ts"), "export const VERSION = '0.4.93';\n");
+  writeFileSync(join(dir, "src/content/docs/docs/changelog.md"), "---\ntitle: C\n---\n\n## v0.4.93\n\nOld.\n");
+  apply(dir, "0.4.96", [
+    { tag_name: "v0.4.96", body: "### Fixes\n\n- **Three** — c.", published_at: "2026-11-25T12:00:00Z", prerelease: true },
+    { tag_name: "v0.4.95", body: "### Fixes\n\n- **Two** — b.", published_at: "2026-11-24T12:00:00Z", prerelease: false },
+    { tag_name: "v0.4.94", body: "### Fixes\n\n- **One** — a.", published_at: "2026-11-23T12:00:00Z", prerelease: true },
+  ]);
+  const log = readFileSync(join(dir, "src/content/docs/docs/changelog.md"), "utf8");
+  assert.ok(log.includes('## v0.4.96\n\n<p class="changelog-date">Stable <time datetime="2026-11-25">'), "the promoted version");
+  assert.ok(log.includes('## v0.4.95\n\n<p class="changelog-date">Stable <time datetime="2026-11-24">'), "a stable the landing skipped");
+  assert.ok(log.includes('## v0.4.94\n\n<p class="changelog-date">Beta <time datetime="2026-11-23">'), "a beta folded into the stable");
+});

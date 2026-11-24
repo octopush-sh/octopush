@@ -81,8 +81,9 @@ function heading(version, { date, stable } = {}) {
   return `## v${version}\n\n${line}`;
 }
 
-// The changelog's dates are calendar days in the owner's time zone, as every
-// existing entry is (a release cut at 22:00 there is dated that day, not UTC's).
+// The changelog's dates are calendar days in the owner's time zone, as the
+// entries since web#188 are (a release cut at 22:00 there is dated that day,
+// not UTC's).
 const CHANGELOG_TZ = "America/Bogota";
 
 /** A release's `published_at` as the changelog's YYYY-MM-DD, or null. */
