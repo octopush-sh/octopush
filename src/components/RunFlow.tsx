@@ -22,7 +22,7 @@ import { useElapsed } from "../hooks/useElapsed";
 import { prefersReducedMotion } from "../lib/motion";
 import { tourId } from "../lib/tour/ids";
 import { formatEstimateUsd, formatUsd, unpricedTitle, USAGE_UNREPORTED_TITLE } from "../lib/cost";
-import { RunFlowNav } from "./RunFlowNav";
+import { RunFlowNav, railEdgeFade, useRailEdges } from "./RunFlowNav";
 
 interface Props {
   stages: RunStage[];
@@ -61,11 +61,17 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, runAborted = f
     });
   }, [selectedStageId]);
 
+  // Each chevron sits at the edge whose stages it brings back, and that edge
+  // fades while it hides any.
+  const edges = useRailEdges(railRef, stages.length);
+
   return (
     <div className="flex items-stretch gap-2">
+      {edges.overflowing && <RunFlowNav containerRef={railRef} side="earlier" disabled={edges.atStart} />}
       <div
         ref={railRef}
-        className="octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth"
+        data-tour="direct-run-track"
+        className={`octo-no-scrollbar flex min-w-0 flex-1 snap-x snap-proximity flex-nowrap items-stretch overflow-x-auto py-1 scroll-smooth ${railEdgeFade(edges)}`}
       >
         {stages.map((s, i) => {
           const prev = stages[i - 1];
@@ -102,7 +108,7 @@ export function RunFlow({ stages, selectedStageId, beaconStageId, runAborted = f
           );
         })}
       </div>
-      <RunFlowNav containerRef={railRef} stageCount={stages.length} />
+      {edges.overflowing && <RunFlowNav containerRef={railRef} side="later" disabled={edges.atEnd} />}
     </div>
   );
 }
