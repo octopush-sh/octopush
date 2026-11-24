@@ -28,6 +28,8 @@ import { FlowEdge, LoopEdge } from "./builder/edges";
 import { NodePalette, ARCHETYPE_DND_MIME } from "./builder/NodePalette";
 import { StageInspector, type LoopState } from "./builder/StageInspector";
 import { BuilderProvider } from "./builder/BuilderContext";
+import { FIT_PADDING, flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
+import { useThemeStore } from "../stores/themeStore";
 import {
   draftToGraph,
   graphToStageDrafts,
@@ -85,6 +87,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     void useRolesStore.getState().load();
   }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
+  const colorMode = flowColorMode(useThemeStore((s) => s.theme?.bg));
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [tidying, setTidying] = useState(false);
@@ -181,7 +184,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     tidyTimer.current = window.setTimeout(() => {
       tidyTimer.current = null;
       setTidying(false);
-      void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
+      void rf.fitView({ padding: FIT_PADDING, maxZoom: 1, duration: 280 });
     }, 300);
   }, [pushHistory, setNodes, rf]);
 
@@ -466,6 +469,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
               onNodeClick={(_, n) => setSelectedId(n.id)}
               onPaneClick={() => setSelectedId(null)}
               onNodeDragStart={() => pushHistory()}
+              nodeDragThreshold={NODE_DRAG_THRESHOLD}
+              forceColorMode={colorMode}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
               defaultEdgeOptions={defaultEdgeOptions}
@@ -473,7 +478,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               minZoom={0.4}
               maxZoom={1.75}
               fitView
-              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
               proOptions={{ hideAttribution: true }}
               className="bg-transparent"
             >
@@ -492,9 +497,6 @@ function BuilderInner({ pipeline, onClose }: Props) {
                 className={`octo-flow-minimap !m-4 transition-opacity duration-[220ms] ${
                   miniMapShown ? "" : "pointer-events-none opacity-0"
                 }`}
-                maskColor={`${tokens.onyx}b8`}
-                nodeColor={() => tokens.hairline}
-                nodeStrokeColor={() => tokens.brassDim}
               />
               <Panel position="top-left">
                 <NodePalette
