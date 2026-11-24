@@ -69,6 +69,10 @@ describe("skillTokens / extractSkillMentions", () => {
     ]);
     // An unclosed fence runs to the end.
     expect(extractSkillMentions("```\n/release", known)).toEqual([]);
+    // A longer fence holds a ``` line of its own content (#1046), as the backend reads it.
+    const nested = "see\n\nREADME.md\n````\n```\n/release\n```\n````\nok /code-review";
+    expect(fencedRanges(nested)).toEqual([[15, nested.indexOf("ok")]]);
+    expect(extractSkillMentions(nested, known)).toEqual(["code-review"]);
   });
 
   it("splits a text into runs and tokens for rendering", () => {
