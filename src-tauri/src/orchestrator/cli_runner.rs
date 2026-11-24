@@ -723,6 +723,9 @@ pub fn parse_env0(stdout: &[u8]) -> Vec<(String, String)> {
 /// terminals work because the PTY runs a login shell that sources the rc files;
 /// the CLI stage must inherit the same environment.
 pub(crate) fn login_shell_env() -> &'static [(String, String)] {
+    if let Some(stub) = login_shell_env_stub() {
+        return stub;
+    }
     static CACHE: OnceLock<Vec<(String, String)>> = OnceLock::new();
     CACHE.get_or_init(|| {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
@@ -736,7 +739,42 @@ pub(crate) fn login_shell_env() -> &'static [(String, String)] {
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOGIN_SHELL_ENV_STUB: std::cell::Cell<Option<&'static [(String, String)]>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn login_shell_env_stub() -> Option<&'static [(String, String)]> {
+    LOGIN_SHELL_ENV_STUB.with(|s| s.get())
+}
+
+#[cfg(not(test))]
+fn login_shell_env_stub() -> Option<&'static [(String, String)]> {
+    None
+}
+
+/// Test seam: run `f` with [`login_shell_env`] returning `env` instead of the
+/// real probe, on this thread only, so parallel tests never see it. Work `f`
+/// hands to another thread (`spawn_blocking`) sees the real env.
+#[cfg(test)]
+pub(crate) fn with_login_shell_env<R>(env: &[(&str, &str)], f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<&'static [(String, String)]>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            LOGIN_SHELL_ENV_STUB.with(|s| s.set(self.0));
+        }
+    }
+    let owned: Vec<(String, String)> = env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let stub: &'static [(String, String)] = Box::leak(owned.into_boxed_slice());
+    let _reset = Reset(LOGIN_SHELL_ENV_STUB.with(|s| s.replace(Some(stub))));
+    f()
+}
+
 /// The effective PATH for spawning user CLIs: login-shell PATH ∪ inherited ∪ common dirs.
+/// Talk's shells (`run_command`, `$` commands, sub-agents) get exactly this PATH
+/// and no other login-shell variable.
 pub(crate) fn resolved_cli_path() -> String {
     let login_path = login_shell_env()
         .iter()
