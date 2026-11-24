@@ -39,7 +39,7 @@ describe("resolveContextBlock", () => {
     readFileChecked.mockResolvedValue({ kind: "text", content: "x", size: 1, mtime: 0 });
     const block = await resolveContextBlock(one("src/a.ts"), "/w", files);
     expect(block.text).toBe("\n\nsrc/a.ts\n```\nx\n```");
-    expect(block.scan).toEqual({ label: "src/a.ts", text: "x", wholeFile: true });
+    expect(block.scan).toEqual([{ label: "src/a.ts", text: "x", wholeFile: true }]);
     expect(readFileChecked).toHaveBeenCalledWith("/w/src/a.ts", 64_000);
   });
 
@@ -47,7 +47,7 @@ describe("resolveContextBlock", () => {
     readFileLines.mockResolvedValue({ kind: "text", content: "2\n3", start: 2, end: 3, total: 5, cut: false });
     const block = await resolveContextBlock(one("src/a.ts#L2-3"), "/w", files);
     expect(block.text).toBe("\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```");
-    expect(block.scan).toEqual({ label: "src/a.ts", text: "2\n3", firstLine: 2 });
+    expect(block.scan).toEqual([{ label: "src/a.ts", text: "2\n3", firstLine: 2 }]);
     expect(readFileLines).toHaveBeenCalledWith("/w/src/a.ts", 2, 3, 64_000);
     expect(readFileChecked).not.toHaveBeenCalled();
   });
@@ -78,7 +78,7 @@ describe("resolveContextBlock", () => {
     const block = await resolveContextBlock(one("session:dev-server"), "/w", files);
     off();
     expect(block.text).toBe('\n\nRun session "dev server" · last 2 lines\n```\n$ npm run dev\nready on :5173\n```');
-    expect(block.scan).toEqual({ label: "@session:dev-server", text: "$ npm run dev\nready on :5173" });
+    expect(block.scan).toEqual([{ label: "@session:dev-server", text: "$ npm run dev\nready on :5173" }]);
   });
 
   it("cuts a long session tail at its start, keeping the newest lines", async () => {
@@ -129,7 +129,38 @@ describe("resolveContextBlock", () => {
     readFileLines.mockRejectedValue(new Error("gone"));
     const block = await resolveContextBlock(one("src/a.ts#L1"), "/w", files);
     expect(block.text).toBe("\n\nsrc/a.ts#L1 _(not included: unreadable)_");
-    expect(block.scan).toBeNull();
+    expect(block.scan).toEqual([]);
+  });
+
+  it("scans a diff per file, by the file's path, without the diff's prefixes", async () => {
+    getGitDiff.mockResolvedValue(
+      [
+        "diff --git a/src/a.ts b/src/a.ts",
+        "index 1..2 100644",
+        "--- a/src/a.ts",
+        "+++ b/src/a.ts",
+        "@@ -10,2 +10,2 @@",
+        " keep",
+        "-old",
+        "+new",
+        "diff --git a/.env b/.env",
+        "new file mode 100644",
+        "--- /dev/null",
+        "+++ b/.env",
+        "@@ -0,0 +1,2 @@",
+        "+HOST=localhost",
+        "+DB_PASSWORD=hunter2hunter2",
+        "",
+      ].join("\n"),
+    );
+    const block = await resolveContextBlock(one("diff"), "/w", files);
+    expect(block.scan).toEqual([
+      { label: "src/a.ts", text: "keep\nnew", firstLine: 10, wholeFile: false },
+      { label: "src/a.ts", text: "old", firstLine: 11, wholeFile: false },
+      { label: ".env", text: "HOST=localhost\nDB_PASSWORD=hunter2hunter2", firstLine: 1, wholeFile: true },
+    ]);
+    // What is sent is still the diff itself.
+    expect(block.text).toContain("+DB_PASSWORD=hunter2hunter2");
   });
 });
 
@@ -144,14 +175,15 @@ describe("scanContextBlocks", () => {
   const finding = (file: string) => ({ file, line: 2, rule: "github-token", kind: "GitHub token", yours: false });
 
   it("scans each block on its own and names the flagged ones", async () => {
-    secretScanText.mockImplementation(async ([b]: { label: string }[]) =>
-      b.label === "@diff" ? { findings: [finding("@diff")], total: 1, partial: false } : { findings: [], total: 0, partial: false },
+    secretScanText.mockImplementation(async ([b]: { label: string; firstLine?: number }[]) =>
+      b.firstLine === 1 ? { findings: [finding("src/a.ts")], total: 1, partial: false } : { findings: [], total: 0, partial: false },
     );
+    getGitDiff.mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n+t\n");
     const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts @diff", cat), "/w", files);
     const verdict = await scanContextBlocks(blocks);
     expect(secretScanText).toHaveBeenCalledTimes(2);
     expect(verdict?.flagged).toEqual(new Set([1]));
-    expect(verdict?.refusal).toMatchObject({ total: 1, findings: [{ file: "@diff", kind: "GitHub token" }] });
+    expect(verdict?.refusal).toMatchObject({ total: 1, findings: [{ file: "src/a.ts", kind: "GitHub token" }] });
     // Left out, the block says so in its place; never its value.
     const sent = joinBlocks(blocks, verdict!.flagged);
     expect(sent).toContain("src/a.ts\n```\nk\n```");
@@ -165,6 +197,12 @@ describe("scanContextBlocks", () => {
     const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts", cat), "/w", files);
     expect(await scanContextBlocks(blocks)).toBeNull();
     secretScanText.mockResolvedValue({ findings: [], total: 0, partial: false });
+    expect(await scanContextBlocks(blocks)).toBeNull();
+  });
+
+  it("holds nothing when a scan throws", async () => {
+    secretScanText.mockRejectedValue(new Error("settings unreadable"));
+    const blocks = await resolveContextBlocks(extractContextRefs("@src/a.ts @diff", cat), "/w", files);
     expect(await scanContextBlocks(blocks)).toBeNull();
   });
 });

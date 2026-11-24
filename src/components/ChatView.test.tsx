@@ -903,17 +903,20 @@ describe("ChatView — context mentions (#962)", () => {
 });
 
 describe("ChatView — context guard and limits (#1046)", () => {
-  const finding = { file: "@diff", line: 3, rule: "github-token", kind: "GitHub token", yours: false };
+  const finding = { file: ".env", line: 1, rule: "env-credential", kind: "credential in a .env file (DB_PASSWORD)", yours: false };
   beforeEach(() => {
     resetStore();
     vi.mocked(ipcMock.sendChatMessage).mockClear();
-    vi.mocked(ipcMock.getGitDiff).mockClear().mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n+t\n");
+    // The diff is scanned per file, by the file's path.
+    vi.mocked(ipcMock.getGitDiff)
+      .mockClear()
+      .mockResolvedValue("diff --git a/.env b/.env\nnew file mode 100644\n--- /dev/null\n+++ b/.env\n@@ -0,0 +1 @@\n+t\n");
     vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(["src/a.ts", "src/lib/b.ts"]);
     vi.mocked(ipcMock.readFileLines).mockResolvedValue({
       kind: "text", content: "2\n3", start: 2, end: 3, total: 5, cut: false,
     });
     vi.mocked(ipcMock.secretScanText).mockImplementation(async (blocks) =>
-      blocks[0].label === "@diff"
+      blocks.some((b) => b.label === ".env" && b.wholeFile)
         ? { findings: [finding], total: 1, partial: false }
         : { findings: [], total: 0, partial: false },
     );
@@ -924,8 +927,9 @@ describe("ChatView — context guard and limits (#1046)", () => {
   });
 
   async function sendDraft(value: string) {
+    let view!: ReturnType<typeof render>;
     await act(async () => {
-      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+      view = render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
     });
     const ta = screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
     await act(async () => {
@@ -934,11 +938,14 @@ describe("ChatView — context guard and limits (#1046)", () => {
     await act(async () => {
       fireEvent.keyDown(ta, { key: "Enter" });
     });
+    return view;
   }
 
   it("asks before sending a block that holds a possible secret, and leaves it out", async () => {
     await sendDraft("check @src/a.ts#L2-3 and @diff now");
-    expect(await screen.findByText("This message attaches what looks like a GitHub token in @diff:3.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("This message attaches what looks like a credential in a .env file (DB_PASSWORD) in .env:1."),
+    ).toBeInTheDocument();
     expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole("button", { name: "Leave it out" }));
     await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
@@ -954,6 +961,39 @@ describe("ChatView — context guard and limits (#1046)", () => {
     await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
     const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
     expect(req.userMessage).toContain("+t");
+  });
+
+  it("sends the message when the scan can't run", async () => {
+    vi.mocked(ipcMock.secretScanText).mockRejectedValue(new Error("secret scan stopped"));
+    await sendDraft("check @diff now");
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toContain("+t");
+    expect(screen.queryByRole("button", { name: "Leave it out" })).toBeNull();
+  });
+
+  it("sends nothing on Escape and gives the draft back", async () => {
+    await sendDraft("check @diff now");
+    await screen.findByRole("button", { name: "Leave it out" });
+    fireEvent.keyDown(window, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Leave it out" })).toBeNull());
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+    expect((screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement).value).toBe("check @diff now");
+  });
+
+  it("keeps a held message's draft in its workspace when the workspace changes", async () => {
+    const view = await sendDraft("check @diff now");
+    await screen.findByRole("button", { name: "Leave it out" });
+    await act(async () => {
+      view.rerender(<ChatView workspaceId="ws-2" workspacePath="/tmp2" />);
+    });
+    expect(screen.queryByRole("button", { name: "Leave it out" })).toBeNull();
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+    expect(useChatStore.getState().composerSeedByWs["ws-1"]).toBe("check @diff now");
+    await act(async () => {
+      view.rerender(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    expect((screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement).value).toBe("check @diff now");
   });
 
   it("attaches at most ten mentions and says so", async () => {

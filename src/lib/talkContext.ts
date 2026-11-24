@@ -300,6 +300,107 @@ export function diffForFile(diff: string, path: string): string {
   ).trimEnd();
 }
 
+/** What the secret guard reads of a diff: its file sections as the files'
+ *  own lines, so the rules a path decides (`.env`, `id_rsa`, MCP configs,
+ *  tests, docs) apply as they do to a commit. Per section, each hunk's new
+ *  side (context and added lines, `+`/space dropped) is one input numbered
+ *  from its `@@ +N` header, and each run of removed lines another, numbered
+ *  from `-N`. A new or untracked file's first input is `wholeFile`, also
+ *  when the diff has no lines for it (binary). Text before the first section
+ *  (`# Staged`) and lines no hunk accounts for (a cut note) aren't file
+ *  content and are left out. */
+export function diffScanInputs(diff: string): {
+  label: string;
+  text: string;
+  firstLine: number;
+  wholeFile: boolean;
+}[] {
+  const out: { label: string; text: string; firstLine: number; wholeFile: boolean }[] = [];
+  for (const section of diff.split(/^(?=diff --git )/m)) {
+    if (!section.startsWith("diff --git ")) continue;
+    const lines = section.split("\n");
+    const label = diffSectionPath(lines);
+    let isNew = false;
+    let i = 1;
+    // The extended header, up to the first hunk.
+    for (; i < lines.length && !lines[i].startsWith("@@"); i++) {
+      if (lines[i].startsWith("new file mode") || lines[i] === "--- /dev/null") isNew = true;
+    }
+    const start = out.length;
+    let cur: { label: string; text: string; firstLine: number; wholeFile: boolean } | null = null;
+    let removed: string[] = [];
+    let removedAt = 0;
+    let oldN = 0;
+    let newLines: string[] = [];
+    let newAt = 0;
+    const flushRemoved = () => {
+      if (removed.length) out.push({ label, text: removed.join("\n"), firstLine: removedAt, wholeFile: false });
+      removed = [];
+    };
+    const flushNew = () => {
+      if (cur) cur.text = newLines.join("\n");
+      cur = null;
+      newLines = [];
+    };
+    for (; i < lines.length; i++) {
+      const l = lines[i];
+      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+      if (hunk) {
+        flushRemoved();
+        flushNew();
+        oldN = Number(hunk[1]);
+        newAt = Number(hunk[2]);
+        cur = { label, text: "", firstLine: Math.max(1, newAt), wholeFile: false };
+        out.push(cur);
+        continue;
+      }
+      if (!cur) continue;
+      if (l.startsWith("-")) {
+        if (!removed.length) removedAt = Math.max(1, oldN);
+        removed.push(l.slice(1));
+        oldN++;
+      } else if (l.startsWith("+") || l.startsWith(" ")) {
+        flushRemoved();
+        newLines.push(l.slice(1));
+        if (l.startsWith(" ")) oldN++;
+      }
+      // `\ No newline at end of file`, a cut note: not the file's lines.
+    }
+    flushRemoved();
+    flushNew();
+    // Drop new-side inputs a hunk left empty (a pure deletion).
+    for (let j = out.length - 1; j >= start; j--) {
+      if (out[j].text === "" && out.length - start > 1) out.splice(j, 1);
+    }
+    if (isNew) {
+      if (out.length === start) out.push({ label, text: "", firstLine: 1, wholeFile: true });
+      else out[start].wholeFile = true;
+    }
+  }
+  return out;
+}
+
+/** The path of a diff section, unquoted: the new side's, or the old side's
+ *  for a deleted file, else read from the `diff --git` line itself. */
+function diffSectionPath(lines: string[]): string {
+  let oldPath = "";
+  for (const l of lines.slice(1)) {
+    if (l.startsWith("@@")) break;
+    const side = /^(\+\+\+|---) (.*)$/.exec(l);
+    if (!side || side[2] === "/dev/null") continue;
+    const p = unquoteGitPath(side[2]).replace(/^[ab]\//, "");
+    if (side[1] === "+++") return p;
+    oldPath = p;
+  }
+  if (oldPath) return oldPath;
+  const head = lines[0].slice("diff --git ".length);
+  const quoted = head.match(/"(?:[^"\\]|\\.)*"/g);
+  if (quoted?.length) return unquoteGitPath(quoted[quoted.length - 1]).replace(/^[ab]\//, "");
+  // `a/P b/P`: the two halves are the same path.
+  const half = (head.length - 1) / 2;
+  return Number.isInteger(half) ? head.slice(half + 1).replace(/^b\//, "") : head;
+}
+
 /** "812 B" / "14 KB" / "2.1 MB". */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;

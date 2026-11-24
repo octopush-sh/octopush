@@ -5,8 +5,8 @@ area: app
 steps:
   - open: mode/talk
     target: talk-composer-input
-    caption: Files, ranges, @session output and @diff are checked for credentials before a message goes.
+    caption: Files, ranges, @session output and @diff are checked before a message goes; a diff file by file, so an untracked .env counts.
   - target: talk-context-chip
-    caption: A block that holds a possible secret asks first; Leave it out sends the message without it.
+    caption: A block that holds a possible secret asks first. Leave it out sends the message without it; Escape keeps it as a draft.
 ---
-Before a Talk message is sent, the secret guard now reads every `@` block it attaches and asks first when one holds what looks like a credential. A message attaches up to 10 mentions, a line range reads only its lines, and paths with spaces or non-ASCII names work.
+Before a Talk message is sent, the secret guard now reads every `@` block it attaches, a diff file by file, and asks first when one holds what looks like a credential. A message attaches up to 10 mentions, a line range reads only its lines, and paths with spaces or non-ASCII names work.

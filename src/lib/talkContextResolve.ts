@@ -16,6 +16,7 @@ import {
   capTail,
   capText,
   diffForFile,
+  diffScanInputs,
   fenced,
   formatFolderListing,
   joinDiffs,
@@ -38,8 +39,10 @@ export interface ResolvedBlock {
   ref: ContextRef;
   /** What is appended to the message. */
   text: string;
-  /** What the guard scans; null for a block that only says what's missing. */
-  scan: ScanInput | null;
+  /** What the guard scans, scanned together: one input for most blocks, one
+   *  per file section and hunk side for a diff (`diffScanInputs`); empty for
+   *  a block that only says what's missing. */
+  scan: ScanInput[];
 }
 
 /** Shared by the blocks resolved together, so `@diff` and `@diff:a.ts` in
@@ -58,7 +61,7 @@ export async function resolveContextBlock(
   files: string[],
   share: ResolveShare = {},
 ): Promise<ResolvedBlock> {
-  const missing = (why: string): ResolvedBlock => ({ ref, text: note(ref, why), scan: null });
+  const missing = (why: string): ResolvedBlock => ({ ref, text: note(ref, why), scan: [] });
   try {
     switch (ref.kind) {
       case "file": {
@@ -69,7 +72,7 @@ export async function resolveContextBlock(
           return {
             ref,
             text: fenced(ref.path, res.content),
-            scan: { label: ref.path, text: res.content, wholeFile: true },
+            scan: [{ label: ref.path, text: res.content, wholeFile: true }],
           };
         }
         // Streamed: the read stops after the range's last line.
@@ -81,7 +84,7 @@ export async function resolveContextBlock(
         return {
           ref,
           text: fenced(`${ref.path} · lines ${res.start}–${res.end}${of}`, body),
-          scan: { label: ref.path, text: res.content, firstLine: res.start },
+          scan: [{ label: ref.path, text: res.content, firstLine: res.start }],
         };
       }
       case "folder": {
@@ -96,13 +99,13 @@ export async function resolveContextBlock(
         return {
           ref,
           text: fenced(`${prefix} · folder listing, ${under.length} file${under.length === 1 ? "" : "s"}`, listing),
-          scan: { label: `@${ref.token}`, text: listing },
+          scan: [{ label: `@${ref.token}`, text: listing }],
         };
       }
       case "session": {
         const lines = readTerminalBuffer(ref.session.id);
         if (!lines) {
-          return { ref, text: `\n\nRun session "${ref.session.label}" _(not included: not open)_`, scan: null };
+          return { ref, text: `\n\nRun session "${ref.session.label}" _(not included: not open)_`, scan: [] };
         }
         // The newest output is what matters: a tail over the cap loses its
         // oldest lines, and the heading counts the lines actually sent.
@@ -113,7 +116,7 @@ export async function resolveContextBlock(
             `Run session "${ref.session.label}" · last ${tail.lines} line${tail.lines === 1 ? "" : "s"}`,
             tail.cut ? `… (cut at 64k characters, older lines left out)\n${tail.text}` : tail.text,
           ),
-          scan: { label: `@${ref.token}`, text: tail.text },
+          scan: [{ label: `@${ref.token}`, text: tail.text }],
         };
       }
       case "diff": {
@@ -126,7 +129,9 @@ export async function resolveContextBlock(
           : joinDiffs(staged, unstaged);
         const heading = ref.path ? `Diff of ${ref.path} (uncommitted)` : "Workspace diff (uncommitted)";
         const body = capText(diff || "(no changes)");
-        return { ref, text: fenced(heading, body, "diff"), scan: { label: `@${ref.token}`, text: body } };
+        // Scanned per file, by the file's path: an untracked `.env` or
+        // `id_rsa` in the diff is flagged as it would be in a commit.
+        return { ref, text: fenced(heading, body, "diff"), scan: diffScanInputs(body) };
       }
     }
   } catch {
@@ -154,9 +159,9 @@ export async function scanContextBlocks(
 ): Promise<{ flagged: Set<number>; refusal: SecretRefusal } | null> {
   const previews = await Promise.all(
     blocks.map(async (b) => {
-      if (!b.scan) return null;
+      if (b.scan.length === 0) return null;
       try {
-        return await ipc.secretScanText([b.scan]);
+        return await ipc.secretScanText(b.scan);
       } catch {
         return null; // as the commit guard does: a scan that can't run doesn't hold
       }

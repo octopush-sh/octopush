@@ -27802,4 +27802,21 @@ mod talk_context_guard_tests {
         let report = scan_collected(&text_files(blocks), &[]);
         assert!(report.findings.iter().any(|f| f.line.is_none() && f.file == "keys/server.pem"));
     }
+
+    /// `@diff` with an untracked `.env` and `id_rsa`, as Talk splits it
+    /// (`diffScanInputs`): one block per file section, by the file's path,
+    /// without the `+` prefix, so the rules a path decides apply.
+    #[test]
+    fn a_diff_split_per_file_flags_an_untracked_env_and_key() {
+        let env = "HOST=localhost\nDB_PASSWORD=Vb7qR2mxK9tLw";
+        let blocks = vec![
+            TextBlock { label: "src/a.ts".into(), text: "keep\nnew".into(), first_line: Some(10), whole_file: false },
+            TextBlock { label: ".env".into(), text: env.into(), first_line: Some(1), whole_file: true },
+            TextBlock { label: "id_rsa".into(), text: String::new(), first_line: Some(1), whole_file: true },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report.findings.iter().any(|f| f.file == ".env" && f.line == Some(2) && f.rule == "env-credential"));
+        assert!(report.findings.iter().any(|f| f.file == "id_rsa" && f.line.is_none() && f.rule == "ssh-private-key-file"));
+        assert_eq!(report.total, 2);
+    }
 }

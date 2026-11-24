@@ -329,13 +329,22 @@ export function Composer({ workspaceId, workspacePath }: Props) {
   }
 
   // A message whose blocks the secret guard flagged waits here for the
-  // confirm (#1046): "Leave it out" sends it without those blocks.
+  // confirm (#1046): "Leave it out" sends it without those blocks; Escape
+  // sends nothing and gives the draft back.
   const [contextGuard, setContextGuard] = useState<{
     refusal: SecretRefusal;
     flagged: Set<number>;
     blocks: ResolvedBlock[];
     outgoing: string;
+    /** What was typed, put back in the composer if the send is cancelled. */
+    draft: string;
+    workspaceId: string;
+    workspacePath: string;
   } | null>(null);
+  const contextGuardRef = useRef(contextGuard);
+  contextGuardRef.current = contextGuard;
+  const workspaceIdRef = useRef(workspaceId);
+  workspaceIdRef.current = workspaceId;
   const contextTokens = contextRefs.reduce((n, r) => n + (tokensByToken[r.token] ?? 0), 0);
 
   function removeContext(token: string) {
@@ -393,6 +402,10 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     closeMention();
     closeSlash();
     resetEstimates();
+    // A message held by the secret guard isn't sent: its draft waits in its
+    // own workspace's composer.
+    const held = contextGuardRef.current;
+    if (held && held.workspaceId !== workspaceId) useChatStore.getState().seedComposer(held.workspaceId, held.draft);
     setContextGuard(null);
     expandingRef.current = false;
     setExpanding(false);
@@ -590,8 +603,14 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         const blocks = await resolveContextBlocks(refs, workspacePath, files);
         const verdict = await scanContextBlocks(blocks);
         if (verdict) {
+          // Answered after a workspace switch: nothing is sent, and the
+          // draft waits in its own workspace's composer.
+          if (workspaceIdRef.current !== workspaceId) {
+            useChatStore.getState().seedComposer(workspaceId, trimmed);
+            return;
+          }
           held = true;
-          setContextGuard({ ...verdict, blocks, outgoing });
+          setContextGuard({ ...verdict, blocks, outgoing, draft: trimmed, workspaceId, workspacePath });
           return;
         }
         send(workspaceId, workspacePath, outgoing + joinBlocks(blocks));
@@ -612,8 +631,22 @@ export function Composer({ workspaceId, workspacePath }: Props) {
     setContextGuard(null);
     expandingRef.current = false;
     setExpanding(false);
-    send(workspaceId, workspacePath, g.outgoing + joinBlocks(g.blocks, sendAnyway ? undefined : g.flagged));
+    send(g.workspaceId, g.workspacePath, g.outgoing + joinBlocks(g.blocks, sendAnyway ? undefined : g.flagged));
     textareaRef.current?.focus();
+  }
+
+  /** Escape or closing the confirm: nothing is sent, and the draft comes
+   *  back (before anything typed since). */
+  function cancelContextGuard() {
+    const g = contextGuard;
+    if (!g) return;
+    setContextGuard(null);
+    expandingRef.current = false;
+    setExpanding(false);
+    const typed = inputRef.current;
+    const draft = typed.trim() ? `${g.draft}\n\n${typed}` : g.draft;
+    pendingCaretRef.current = draft.length;
+    setInput(draft);
   }
 
   function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -940,11 +973,13 @@ export function Composer({ workspaceId, workspacePath }: Props) {
         />
       )}
       {/* An `@` block that holds a possible secret (#1046): its kind and
-          block, never the value; "Leave it out" is the default. */}
+          block, never the value; "Leave it out" is the default, Escape
+          cancels the send. */}
       {contextGuard && (
         <SecretGuardDialog
           action="message"
           refusal={contextGuard.refusal}
+          onClose={cancelContextGuard}
           onLeaveOut={() => resolveContextGuard(false)}
           onOverride={() => resolveContextGuard(true)}
         />

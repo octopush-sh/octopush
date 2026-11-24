@@ -4,7 +4,7 @@
  * (kind · file:line · masked preview like `sk-ant-…9fQ2` — never the value,
  * #820), and says so when the scan stopped
  * at its 16 MB budget. "Leave it out" is the default focus and Escape's
- * action; the override is an explicit second choice that applies to this one
+ * action (for a Talk message, Escape cancels the send instead); the override is an explicit second choice that applies to this one
  * action and these exact findings only (the core rescans and checks the
  * fingerprint).
  */
@@ -22,15 +22,18 @@ interface Props {
   onLeaveOut: () => void;
   /** The explicit "regardless" for this one action. */
   onOverride: () => void;
+  /** Escape: `onLeaveOut` unless the caller cancels differently (a held
+   *  Talk message is not sent and its draft comes back). */
+  onClose?: () => void;
 }
 
-export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: Props) {
+export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride, onClose }: Props) {
   const { findings, total, partial } = refusal;
   const shown = findings.slice(0, SHOWN);
   const more = Math.max(total, findings.length) - shown.length;
   const yours = findings.some((f) => f.yours);
   return (
-    <ModalShell onClose={onLeaveOut} closeOnBackdrop={false} ariaLabel="Possible secret" panelClassName="w-full max-w-[460px]">
+    <ModalShell onClose={onClose ?? onLeaveOut} closeOnBackdrop={false} ariaLabel="Possible secret" panelClassName="w-full max-w-[460px]">
       <div data-tour="secret-guard-dialog" className="rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl">
         <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">
           <ShieldAlert size={12} strokeWidth={1.75} aria-hidden />

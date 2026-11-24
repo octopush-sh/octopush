@@ -12,6 +12,7 @@ import {
   chipLabel,
   contextMentionItems,
   diffForFile,
+  diffScanInputs,
   dirsOf,
   extractContextRefs,
   formatFolderListing,
@@ -175,6 +176,44 @@ describe("talkContext — blocks", () => {
     expect(diffForFile(diff, 'say "hi".md')).toContain("+y");
     expect(diffForFile(diff, "old.ts")).toContain("+y");
     expect(diffForFile(diff, "my file.ts")).toContain("+z");
+  });
+
+  it("splits a diff into what the secret guard reads: each file's own lines, by its path", () => {
+    const diff = [
+      "# Staged",
+      'diff --git "a/caf\\303\\251.env" "b/caf\\303\\251.env"',
+      "--- \"a/caf\\303\\251.env\"",
+      "+++ \"b/caf\\303\\251.env\"",
+      "@@ -3,3 +3,3 @@",
+      " A=1",
+      "-B=2",
+      "-C=3",
+      "+B=4",
+      "\\ No newline at end of file",
+      "@@ -20 +20 @@",
+      "+late",
+      "",
+      "# Not staged",
+      "diff --git a/id_rsa b/id_rsa",
+      "new file mode 100644",
+      "Binary files /dev/null and b/id_rsa differ",
+      "diff --git a/gone.ts b/gone.ts",
+      "deleted file mode 100644",
+      "--- a/gone.ts",
+      "+++ /dev/null",
+      "@@ -1,2 +0,0 @@",
+      "-x",
+      "-y",
+      "… (cut at 64k characters)",
+    ].join("\n");
+    expect(diffScanInputs(diff)).toEqual([
+      { label: "café.env", text: "A=1\nB=4", firstLine: 3, wholeFile: false },
+      { label: "café.env", text: "B=2\nC=3", firstLine: 4, wholeFile: false },
+      { label: "café.env", text: "late", firstLine: 20, wholeFile: false },
+      { label: "id_rsa", text: "", firstLine: 1, wholeFile: true },
+      { label: "gone.ts", text: "x\ny", firstLine: 1, wholeFile: false },
+    ]);
+    expect(diffScanInputs("(no changes)")).toEqual([]);
   });
 
   it("fences a block with more backticks than its content holds", () => {
