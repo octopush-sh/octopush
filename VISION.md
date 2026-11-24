@@ -64,7 +64,8 @@ The agent workflow is the product. The editor, terminal, diff and git tooling ex
 |---|---|
 | Conductor | Directed, staged crews with review loops and per-stage model routing — not just parallel agents |
 | Claude Code (CLI/desktop) | Octopush runs *on top of* Claude Code: worktrees, pipelines, review, cost ledger around it |
-| Cursor / Codex | Agent-workflow-first and bring-your-own-key/local, not editor-first or single-vendor |
+| Cursor | Agent-workflow-first and bring-your-own-key/local, not editor-first |
+| Codex | Octopush directs an authored, staged crew that mixes vendors (Claude, OpenAI, local) per stage, with a cost ledger. Codex is OpenAI's agent, and it can be one of those stages |
 | Vibe Kanban, Crystal (deprecated) | A maintained, native successor |
 
 ## 6. Fragile surfaces — upstream contracts
@@ -78,6 +79,7 @@ Claude Code release-watch routine checks each new release against this list:
 - `src-tauri/src/token_engine.rs` — `Total cost:` PTY scrape (most fragile) and the model price table
 - `src-tauri/src/mcp_setup.rs` — `claude mcp add`
 - `src-tauri/src/skills/` — `.claude/skills` and `.claude/agents` frontmatter
+- `src-tauri/src/repo_hooks.rs` — a repo's committed `.claude/settings.json` hooks and `.mcp.json` servers (once #1078 lands)
 - `src-tauri/src/gateway/litellm.rs` — LiteLLM `/key/info`, `/spend/logs`, `/user/daily/activity`
 - `octopush-api` ↔ Clerk (`publicMetadata.plan`) ↔ Dodo Payments webhooks
 
@@ -185,3 +187,4 @@ here if priorities changed.
 | 2026-10-31 | The cycle runs continuously, not only at night: the builder every two hours, the reviewer between its runs, a beta release twice a day (05:13, 17:13 Bogotá) when main moved. The owner still only promotes to stable |
 | 2026-10-31 | The cycle extends to the website: a web builder, an independent web reviewer and a nightly web audit (all in this repo's Actions) work on octopush-web through short-lived installation tokens of the "Octopush Cycle" GitHub App, scoped to that repo and never given to an agent. Website ideas are filed in octopush-web; website PRs still never auto-merge — the owner answers `merge web#N` and a fixed script re-checks CI and the approving review on the exact head before merging |
 | 2026-11-22 | The cycle extends to Epiku (`octopush-sh/epiku`, private): a builder and an independent adversarial reviewer in this repo's Actions, through installation tokens of the "Octopush Cycle" App scoped to that repo alone. Epiku agent PRs auto-merge under Epiku's `VISION.md` §2 (CI green + approval on the exact head), except those touching its human-only paths, carrying a breaking data/API change or over 800 changed lines, which are parked for the owner. Nothing of Epiku but numbers and commit ids is printed in this public repo. Shipped manual-only (no schedule) with auto-merge off (`EPIKU_AUTOMERGE`) until the owner enables each |
+| 2026-11-24 | §5: the Codex angle changes from 'not single-vendor' to authored, staged, mixed-vendor crews, now that Codex runs local models and per-subagent models (#635; research web#101, web#105). §6 gains `repo_hooks.rs` (#971) |
