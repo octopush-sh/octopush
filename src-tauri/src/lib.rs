@@ -230,6 +230,8 @@ pub fn run() {
             commands::delete_group,
             commands::set_item_group,
             commands::set_items_group,
+            commands::set_workspace_prerequisite,
+            commands::clear_workspace_prerequisite,
             // Workspaces
             commands::create_workspace,
             commands::set_project_setup_script,

@@ -4485,6 +4485,40 @@ pub async fn set_items_group(
     state.db.lock().set_items_group(&kind, &item_ids, group_id.as_deref())
 }
 
+// ─── Prerequisites ("Starts after", #960) ─────────────────────────
+//
+// A mission (workspace) can wait on another mission of its project until
+// that one's run finishes (`run_finished`) or its PR merges (`pr_merged`).
+
+/// Make `workspace_id` wait on `after_workspace_id`. Refuses cycles, links
+/// across projects and archived prerequisites.
+#[tauri::command]
+pub async fn set_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+    after_workspace_id: String,
+    condition: String,
+    branch_from_prerequisite: bool,
+    auto_start: Option<bool>,
+) -> AppResult<crate::db::PrerequisiteRow> {
+    state.db.lock().set_workspace_prerequisite(
+        &workspace_id,
+        &after_workspace_id,
+        &condition,
+        branch_from_prerequisite,
+        auto_start.unwrap_or(false),
+    )
+}
+
+/// Stop `workspace_id` waiting on another mission.
+#[tauri::command]
+pub async fn clear_workspace_prerequisite(
+    state: State<'_, AppState>,
+    workspace_id: String,
+) -> AppResult<()> {
+    state.db.lock().clear_workspace_prerequisite(&workspace_id)
+}
+
 #[tauri::command]
 pub async fn close_project(
     state: State<'_, AppState>,
