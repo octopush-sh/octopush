@@ -9,6 +9,7 @@ import { runFourSessions } from "./run-four-sessions";
 import { railGroups } from "./rail-groups";
 import { railProjectGroups } from "./rail-project-groups";
 import { railGroupsEverywhere } from "./rail-groups-everywhere";
+import { directRunning } from "./direct-running";
 
 export const SCENARIOS: Record<string, Scenario> = {
   default: defaultScenario,
@@ -19,4 +20,5 @@ export const SCENARIOS: Record<string, Scenario> = {
   "rail-groups": railGroups,
   "rail-project-groups": railProjectGroups,
   "rail-groups-everywhere": railGroupsEverywhere,
+  "direct-running": directRunning,
 };

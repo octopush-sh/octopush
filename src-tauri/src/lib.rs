@@ -290,6 +290,7 @@ pub fn run() {
             commands::get_mcp_config,
             commands::save_mcp_config,
             commands::test_mcp_server,
+            commands::reconnect_mcp_server,
             // Direct mode (orchestration)
             commands::list_pipelines,
             commands::get_pipeline,

@@ -45,7 +45,7 @@ export function IssueTrackingSection({ onConfigSaved }: { onConfigSaved?: () => 
   }, []);
 
   return (
-    <div className="max-w-[820px]">
+    <div>
       <SectionLabel>Issue tracking</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         Connect a tracker so Octopush can surface your backlog and the ticket chip, and link each

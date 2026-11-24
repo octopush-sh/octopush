@@ -57,7 +57,7 @@ export function AboutPane() {
         subtitle="The IDE for agentic developers — eight arms, zero wasted tokens."
       />
 
-      <div className="max-w-[640px] space-y-6">
+      <div className="space-y-6">
         {/* Version row */}
         <div
           className="flex items-baseline justify-between rounded-lg px-4 py-3"

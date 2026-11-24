@@ -74,6 +74,7 @@ with `scenario:` (default: `default`).
 | `rail-groups` | `default` with eight missions and two mission groups in the rail ("Vulnerability fixes", "PR reviews"), a loose mission before them and one after. |
 | `rail-project-groups` | `default` with seven projects in the rail: the pinned `octopush`, two project groups ("Client work" with three projects, "Side projects" with two) and a loose project after them. Moves, pins and reorders last until the page reloads. |
 | `rail-groups-everywhere` | `default` with a project group ("Client work": `acme-api`, `acme-web`), a mission group ("Fixes") in `acme-api`, a crew at work in one of its missions (Mission Control reads `Fixes · fix-json-parser`) and an archived mission of the group. Moves and new groups last until the page reloads. |
+| `direct-running` | `default` with a crew at work in the active workspace (`run-history-sync`): its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card keeps the reading on its meta line. |
 
 Adding one: create `scenarios/<name>.ts` exporting a `Scenario` (`types.ts`), register
 it in `scenarios/index.ts`, and run a recording with `--verbose` to see which commands

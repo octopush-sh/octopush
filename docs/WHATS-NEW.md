@@ -158,6 +158,7 @@ Current anchors:
 | `settings-models-add-provider` · `settings-models-add-model` | Settings › Models: "Connect another provider" under the provider list · "Bring in another model" in the selected provider's Models header | `settings/ModelsPane.tsx` |
 | `settings-claude-code-card` · `settings-claude-cli-version` · `settings-claude-cli-update` | Settings › Integrations: the Claude Code card · its installed-CLI version line · the amber update note (only on an old CLI or one missing a security fix) | `settings/IntegrationsPane.tsx` |
 | `settings-integrations-project-link` | Settings › Integrations › Jira, Project links: the first project's name (only with a project opened) | `settings/IssueTrackingSection.tsx` |
+| `settings-mcp-reconnect` | Settings › Integrations › MCP Servers: the first server's Reconnect icon button (only with a server configured) | `settings/McpServersSection.tsx` |
 | `settings-readiness-card` · `settings-readiness-again` · `settings-readiness-checked` | Settings › General: the Readiness card · its "Check again" ("Run the check" before the first run) · the "Checked 2m ago" meta (once a check answered) | `settings/ReadinessCard.tsx` |
 | `settings-readiness-disk` | Settings › General, Readiness card: the Disk space row | `settings/ReadinessCard.tsx` |
 | `settings-readiness-codex` | Settings › General, Readiness card: the Codex CLI row (only when a saved crew or Routine has a Codex CLI stage) | `settings/ReadinessCard.tsx` |
@@ -231,6 +232,7 @@ cover.
 | `rail-groups` | `default` with eight missions, two mission groups in the rail and a loose mission after them. |
 | `rail-project-groups` | `default` with seven projects in the rail: a pinned one, two project groups and a loose project after them. |
 | `rail-groups-everywhere` | `default` with a project group ("Client work": `acme-api`, `acme-web`), a mission group ("Fixes") in `acme-api`, a crew at work in one of its missions (Mission Control reads `Fixes · fix-json-parser`) and an archived mission of the group. Moves and new groups last until the page reloads. |
+| `direct-running` | `default` with a crew at work in the active workspace: its Implement stage runs on Claude Code (the CLI substrate) with a context reading of 142k / 200k (`ctx 71%`), and no effort, escalation or ran-on note, so the run card shows the reading. |
 
 Setup, flags and how to add a scenario: [`scripts/clips/README.md`](../scripts/clips/README.md).
 

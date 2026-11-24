@@ -3,6 +3,7 @@ title: A running Claude stage shows how full its context is
 kind: improvement
 area: app
 highlight: true
+scenario: direct-running
 steps:
   - open: mode/direct
     target: direct-stage-context

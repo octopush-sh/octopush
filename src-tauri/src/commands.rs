@@ -2255,18 +2255,53 @@ pub async fn get_mcp_config(
     Ok(crate::mcp::load_user_config())
 }
 
-/// Replace the user-level MCP server config.
+/// Replace the user-level MCP server config, then stop Talk's cached
+/// connection to every server whose entry changed or was removed, so the next
+/// call spawns it from the saved config (a call in flight on the old process
+/// fails).
 #[tauri::command]
 pub async fn save_mcp_config(
+    state: State<'_, AppState>,
     servers: std::collections::HashMap<String, crate::mcp::McpServerConfig>,
 ) -> AppResult<()> {
-    crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)
+    let old = crate::mcp::load_user_config();
+    crate::mcp::save_user_config(&servers).map_err(crate::error::AppError::Other)?;
+    let registry = Arc::clone(&state.chat.mcp);
+    // Kill + reap off the runtime thread.
+    tokio::task::spawn_blocking(move || registry.apply_config_change(&old, &servers))
+        .await
+        .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    Ok(())
 }
 
 /// Smoke-test a single server config: spawn it, run the handshake, and return
 /// its tools (or an error). The connection is dropped immediately after.
 #[tauri::command]
 pub async fn test_mcp_server(
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    smoke_test_mcp_server(name, config).await
+}
+
+/// Settings' Reconnect: stop Talk's cached connection to the server (a call
+/// in flight on it fails, and a remembered start failure is forgotten), then
+/// run the same smoke test as Test. Talk's next call spawns it afresh.
+#[tauri::command]
+pub async fn reconnect_mcp_server(
+    state: State<'_, AppState>,
+    name: String,
+    config: crate::mcp::McpServerConfig,
+) -> AppResult<Vec<crate::mcp::McpToolInfo>> {
+    let registry = Arc::clone(&state.chat.mcp);
+    let server = name.clone();
+    tokio::task::spawn_blocking(move || registry.reset_server(&server))
+        .await
+        .map_err(|e| crate::error::AppError::Other(e.to_string()))?;
+    smoke_test_mcp_server(name, config).await
+}
+
+async fn smoke_test_mcp_server(
     name: String,
     config: crate::mcp::McpServerConfig,
 ) -> AppResult<Vec<crate::mcp::McpToolInfo>> {

@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
-import { Plus, Trash2, Loader2, Check, AlertTriangle } from "lucide-react";
+import { Plus, Trash2, Loader2, Check, AlertTriangle, RefreshCw } from "lucide-react";
 import { ipc } from "../../lib/ipc";
 import type { McpServerConfig } from "../../lib/types";
+import { tourId } from "../../lib/tour/ids";
 import { pushToast } from "../Toasts";
 
 type TestState =
   | { kind: "idle" }
   | { kind: "testing" }
-  | { kind: "ok"; tools: number }
+  | { kind: "reconnecting" }
+  | { kind: "ok"; tools: number; reconnected: boolean }
   | { kind: "error"; message: string };
 
 const inputClass =
@@ -29,8 +31,10 @@ export function parseEnv(text: string): Record<string, string> {
 
 /**
  * Settings UI for the stdio MCP servers Octopush connects to (their tools show
- * up in the TALK chat). Reads/writes `~/.claude/mcp.json` and offers a per-row
- * "Test connection" that spawns the server and lists its tools.
+ * up in the TALK chat). Reads/writes `~/.claude/mcp.json` (a save restarts
+ * every server whose entry changed for Talk) and offers per row a "Test
+ * connection" that spawns the server and lists its tools, and a Reconnect
+ * that also drops Talk's cached connection, so its next call starts afresh.
  *
  * Remote servers (e.g. Atlassian) need a stdio bridge — use `npx mcp-remote
  * <url>` as the command. Project-level `.claude/mcp.json` in a repo is also
@@ -97,7 +101,19 @@ export function McpServersSection() {
     setTests((s) => ({ ...s, [key]: { kind: "testing" } }));
     try {
       const tools = await ipc.testMcpServer(key, config);
-      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length } }));
+      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length, reconnected: false } }));
+    } catch (e) {
+      setTests((s) => ({ ...s, [key]: { kind: "error", message: String(e) } }));
+    }
+  }
+
+  async function reconnectServer(key: string) {
+    const config = servers[key];
+    if (!config) return;
+    setTests((s) => ({ ...s, [key]: { kind: "reconnecting" } }));
+    try {
+      const tools = await ipc.reconnectMcpServer(key, config);
+      setTests((s) => ({ ...s, [key]: { kind: "ok", tools: tools.length, reconnected: true } }));
     } catch (e) {
       setTests((s) => ({ ...s, [key]: { kind: "error", message: String(e) } }));
     }
@@ -108,7 +124,7 @@ export function McpServersSection() {
   const entries = Object.entries(servers).sort(([a], [b]) => a.localeCompare(b));
 
   return (
-    <div className="mt-10 max-w-[640px]">
+    <div className="mt-10">
       <SectionLabel>MCP Servers</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         Local (stdio) Model Context Protocol servers whose tools become available
@@ -120,8 +136,9 @@ export function McpServersSection() {
         {entries.length === 0 && (
           <p className="text-[12px] text-octo-mute">No MCP servers configured.</p>
         )}
-        {entries.map(([key, cfg]) => {
+        {entries.map(([key, cfg], i) => {
           const test = tests[key] ?? { kind: "idle" };
+          const busy = test.kind === "testing" || test.kind === "reconnecting";
           return (
             <div key={key} className="rounded-md border border-octo-hairline bg-octo-panel px-3 py-2.5">
               <div className="flex items-center gap-3">
@@ -132,13 +149,24 @@ export function McpServersSection() {
                 <button
                   type="button"
                   onClick={() => testServer(key)}
-                  disabled={test.kind === "testing"}
+                  disabled={busy}
                   className="flex items-center gap-1.5 rounded border border-octo-hairline px-2.5 py-1 font-mono text-[10px] uppercase tracking-[0.2em] text-octo-sage transition-colors hover:border-[var(--brass-dim)] hover:text-octo-brass disabled:opacity-40"
                 >
                   {test.kind === "testing" ? (
                     <Loader2 size={11} className="animate-spin" />
                   ) : null}
                   Test
+                </button>
+                <button
+                  type="button"
+                  onClick={() => reconnectServer(key)}
+                  disabled={busy}
+                  aria-label={`Reconnect ${key}`}
+                  title="Reconnect: restart Talk's connection to this server, then test it"
+                  data-tour={i === 0 ? tourId("settings-mcp-reconnect") : undefined}
+                  className="flex items-center justify-center rounded p-1 text-octo-mute transition hover:bg-[var(--brass-ghost)] hover:text-octo-brass focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass disabled:opacity-40"
+                >
+                  <RefreshCw size={12} />
                 </button>
                 <button
                   type="button"
@@ -150,13 +178,17 @@ export function McpServersSection() {
                   <Trash2 size={13} />
                 </button>
               </div>
+              {test.kind === "reconnecting" && (
+                <div className="octo-fade-in mt-1.5 text-[11px] text-octo-mute">Reconnecting…</div>
+              )}
               {test.kind === "ok" && (
-                <div className="mt-1.5 flex items-center gap-1.5 text-[11px] text-octo-verdigris">
-                  <Check size={12} /> Connected · {test.tools} tool{test.tools === 1 ? "" : "s"}
+                <div className="octo-fade-in mt-1.5 flex items-center gap-1.5 text-[11px] text-octo-verdigris">
+                  <Check size={12} />{" "}
+                  {`${test.reconnected ? "Reconnected" : "Connected"} · ${test.tools} tool${test.tools === 1 ? "" : "s"}`}
                 </div>
               )}
               {test.kind === "error" && (
-                <div className="mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-rouge">
+                <div className="octo-fade-in mt-1.5 flex items-start gap-1.5 text-[11px] text-octo-rouge">
                   <AlertTriangle size={12} className="mt-0.5 shrink-0" />
                   <span className="break-all">{test.message}</span>
                 </div>
