@@ -78,6 +78,11 @@ describe("secretGuard", () => {
     expect(overrideLabel("push")).toBe("Push regardless");
     expect(overrideLabel("pr")).toBe("Open it regardless");
     expect(overrideLabel("command")).toBe("Run regardless");
+    expect(overrideLabel("message")).toBe("Send regardless");
+    expect(guardHeadline("message", [f({ kind: "GitHub token", file: "@diff", line: 4 })])).toBe(
+      "This message attaches what looks like a GitHub token in @diff:4.",
+    );
+    expect(guardHeadline("message", [f(), f()])).toBe("This message attaches 2 things that look like secrets.");
     expect(guardHeadline("command", [f({ kind: "GitHub token" })])).toBe(
       "This command adds what looks like a GitHub token in tests/fixtures.ts:12.",
     );

@@ -370,6 +370,7 @@ pub fn run() {
             // File I/O
             commands::read_file,
             commands::read_file_checked,
+            commands::read_file_lines,
             commands::write_file,
             commands::file_meta,
             // File edits (Review canvas)
@@ -387,6 +388,7 @@ pub fn run() {
             commands::commit_changes,
             commands::secret_scan_staged,
             commands::secret_scan_branch,
+            commands::secret_scan_text,
             commands::get_staged_diff,
             commands::get_last_commit,
             commands::git_log,

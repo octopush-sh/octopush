@@ -27458,3 +27458,80 @@ mod request_context_tests {
         assert_eq!(ctx.measured_tokens, Some(1_002));
     }
 }
+
+#[cfg(test)]
+mod talk_context_guard_tests {
+    use crate::commands::{read_file_lines_inner, LineRangeResult};
+    use crate::secret_scan::{scan_collected, text_files, TextBlock};
+    use std::io::Write;
+
+    fn temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    fn lines(bytes: &[u8], start: u32, end: u32, max: usize) -> (String, u32, u32, Option<u32>, bool) {
+        let f = temp(bytes);
+        match read_file_lines_inner(f.path().to_str().unwrap(), start, end, max).unwrap() {
+            LineRangeResult::Text { content, start, end, total, cut } => (content, start, end, total, cut),
+            other => panic!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_range_stops_at_its_last_line() {
+        assert_eq!(lines(b"a\nb\nc\nd", 2, 3, 1000), ("b\nc".into(), 2, 3, None, false));
+        // At the end of the file the total is known, counted like split('\n').
+        assert_eq!(lines(b"a\nb\n", 1, 2, 1000), ("a\nb".into(), 1, 2, Some(3), false));
+        assert_eq!(lines(b"a\nb", 2, 9, 1000), ("b".into(), 2, 2, Some(2), false));
+        assert_eq!(lines(b"a\nb", 5, 6, 1000).0, "");
+    }
+
+    #[test]
+    fn a_range_spans_buffer_chunks_and_is_capped() {
+        let body: String = (1..=5000).map(|n| format!("line {n}\n")).collect();
+        let got = lines(body.as_bytes(), 4000, 4002, 1000);
+        assert_eq!(got, ("line 4000\nline 4001\nline 4002".into(), 4000, 4002, None, false));
+        let (content, _, _, _, cut) = lines(body.as_bytes(), 1, 5000, 20);
+        assert_eq!(content.len(), 20);
+        assert!(cut);
+        // A cut never splits a character.
+        let (content, _, _, _, cut) = lines("ééé".as_bytes(), 1, 1, 3);
+        assert_eq!((content.as_str(), cut), ("é", true));
+    }
+
+    #[test]
+    fn a_range_of_a_binary_or_non_utf8_file_says_so() {
+        let f = temp(b"PK\x03\x04\x00binary");
+        assert!(matches!(read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(), LineRangeResult::Binary));
+        let f = temp(&[0xff, 0xfe, 0x41]);
+        assert!(matches!(
+            read_file_lines_inner(f.path().to_str().unwrap(), 1, 1, 100).unwrap(),
+            LineRangeResult::UnsupportedEncoding
+        ));
+    }
+
+    #[test]
+    fn talk_blocks_are_scanned_with_their_labels_and_line_numbers() {
+        let token = ["gh", "p_"].concat() + "Zq8LmT2vXc9RpW4nKs7YbH1dFg6JuE3aQo5V";
+        let blocks = vec![
+            TextBlock { label: "@session:dev".into(), text: "$ echo hi\nhi".into(), first_line: None, whole_file: false },
+            TextBlock { label: "src/a.ts".into(), text: format!("x\nconst t = \"{token}\";"), first_line: Some(40), whole_file: false },
+        ];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert_eq!(report.total, 1);
+        assert_eq!(report.findings[0].file, "src/a.ts");
+        assert_eq!(report.findings[0].line, Some(41));
+        assert_eq!(report.findings[0].rule, "github-token");
+        assert!(!report.partial);
+    }
+
+    #[test]
+    fn a_whole_file_block_is_judged_by_its_name_too() {
+        let blocks = vec![TextBlock { label: "keys/server.pem".into(), text: "x".into(), first_line: None, whole_file: true }];
+        let report = scan_collected(&text_files(blocks), &[]);
+        assert!(report.findings.iter().any(|f| f.line.is_none() && f.file == "keys/server.pem"));
+    }
+}

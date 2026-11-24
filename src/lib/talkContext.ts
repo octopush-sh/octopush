@@ -12,12 +12,15 @@
  * Every expansion shares the 64k cap whole-file mentions already use. The
  * composer shows each resolved token as a removable chip with its token
  * estimate; the chip mirrors the text, so removing it removes the token.
+ * A token with a space in it is quoted whole: `@"docs/my notes.md#L3-9"`.
  */
 
 import { rankFiles } from "./mentions";
 
 /** The byte/char cap every expansion shares (the `@file` read cap). */
 export const CONTEXT_CAP = 64_000;
+/** Most context mentions one message attaches; later ones stay prose. */
+export const MAX_MENTIONS = 10;
 /** How many of a session's last lines `@session` attaches. */
 export const SESSION_TAIL_LINES = 200;
 /** Most entries a folder listing names before it says how many it left out. */
@@ -112,26 +115,42 @@ function resolveToken(token: string, cat: ContextCatalog): ContextRef | null {
   return null;
 }
 
+/** How a token is written after `@`: quoted whole when it holds whitespace,
+ *  so `@"docs/my notes.md#L3"` stays one token. */
+export function quoteToken(token: string): string {
+  return /\s/.test(token) ? `"${token}"` : token;
+}
+
 /** Every context token of a draft, in order, once each. Stray `@handles` and
  *  tokens naming nothing the workspace has are left as prose. */
 export function extractContextRefs(text: string, cat: ContextCatalog): ContextRef[] {
   const out: ContextRef[] = [];
-  const re = /(?:^|[\s([{"'`])@(\S+)/g;
+  const re = /(?:^|[\s([{"'`])@(?:"([^"\n]+)"|(\S+))/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const raw = m[1];
-    const ref = resolveToken(raw, cat) ?? resolveToken(raw.replace(TRAILING_PUNCT, ""), cat);
+    const ref =
+      m[1] != null
+        ? resolveToken(m[1], cat)
+        : (resolveToken(m[2], cat) ?? resolveToken(m[2].replace(TRAILING_PUNCT, ""), cat));
     if (ref && !out.some((r) => r.token === ref.token)) out.push(ref);
   }
   return out;
 }
 
-/** Remove the first `@token` from a draft (and one space after it). The token
- *  only matches where the extractor would have ended it — trailing
- *  punctuation, then whitespace or the end — so `@diff` never matches the
- *  start of `@diff:src/a.ts`. */
+/** The refs a message attaches (the first MAX_MENTIONS) and how many it
+ *  leaves as prose past that cap. */
+export function capRefs(refs: ContextRef[]): { kept: ContextRef[]; over: number } {
+  return { kept: refs.slice(0, MAX_MENTIONS), over: Math.max(0, refs.length - MAX_MENTIONS) };
+}
+
+/** Remove the first `@token` from a draft (and one space after it), quoted
+ *  or not. A bare token only matches where the extractor would have ended it
+ *  — trailing punctuation, then whitespace or the end — so `@diff` never
+ *  matches the start of `@diff:src/a.ts`. */
 export function removeContextToken(text: string, token: string): string {
   const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const quoted = new RegExp(`(^|[\\s([{"'\`])@"${esc}" ?`);
+  if (quoted.test(text)) return text.replace(quoted, "$1");
   const re = new RegExp(`(^|[\\s([{"'\`])@${esc}(?=[.,;:!?)\\]}'"\`]*(?:$|\\s)) ?`);
   return text.replace(re, "$1");
 }
@@ -234,13 +253,49 @@ export function stripAnsi(s: string): string {
     .replace(/\x1b[@-Z\\-_]/g, "");
 }
 
-/** One file's section of a unified diff, or "" when it isn't in it. */
+const GIT_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** Undo git's C-style quoting of a path in a diff header — what it writes
+ *  for a path with a quote, a backslash, a control character or (with
+ *  `core.quotePath`, the default) any non-ASCII byte: `"a/caf\303\251.ts"`
+ *  → `a/café.ts`. An unquoted path comes back as is. */
+export function unquoteGitPath(s: string): string {
+  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s;
+  const body = s.slice(1, -1);
+  const enc = new TextEncoder();
+  const bytes: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "\\" && i + 1 < body.length) {
+      const oct = /^[0-7]{3}/.exec(body.slice(i + 1, i + 4));
+      if (oct) {
+        bytes.push(parseInt(oct[0], 8));
+        i += 3;
+      } else {
+        bytes.push(GIT_ESCAPES[body[i + 1]] ?? body.charCodeAt(i + 1));
+        i += 1;
+      }
+      continue;
+    }
+    const cp = body.codePointAt(i)!;
+    if (cp > 0xffff) i++;
+    bytes.push(...enc.encode(String.fromCodePoint(cp)));
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/** One file's section of a unified diff, or "" when it isn't in it. A path
+ *  git quoted in the header (non-ASCII, a quote…) is matched unquoted. */
 export function diffForFile(diff: string, path: string): string {
   const parts = diff.split(/^(?=diff --git )/m);
   return (
     parts.find((p) => {
       const head = p.slice(0, p.indexOf("\n") === -1 ? p.length : p.indexOf("\n"));
-      return head.endsWith(` b/${path}`) || head.includes(` a/${path} `);
+      if (head.endsWith(` b/${path}`) || head.includes(` a/${path} `)) return true;
+      const quoted = head.match(/"(?:[^"\\]|\\.)*"/g) ?? [];
+      return quoted.some((q) => {
+        const name = unquoteGitPath(q);
+        return name === `a/${path}` || name === `b/${path}`;
+      });
     }) ?? ""
   ).trimEnd();
 }
@@ -279,9 +334,15 @@ export function capText(s: string): string {
   return s.length <= CONTEXT_CAP ? s : `${s.slice(0, CONTEXT_CAP)}\n… (cut at 64k characters)`;
 }
 
-/** A fenced block appended to the outgoing message, headed by a plain line. */
+/** A fenced block appended to the outgoing message, headed by a plain line.
+ *  The fence is longer than any run of backticks in the body, so content
+ *  that holds a fence of its own (a Markdown file, a diff of one) can't
+ *  close the block early. */
 export function fenced(heading: string, body: string, lang = ""): string {
-  return `\n\n${heading}\n\`\`\`${lang}\n${body}\n\`\`\``;
+  let longest = 0;
+  for (const run of body.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `\n\n${heading}\n${fence}${lang}\n${body}\n${fence}`;
 }
 
 /** The chip's short label: the basename (with its range), the folder, the

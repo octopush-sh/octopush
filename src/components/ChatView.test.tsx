@@ -10,7 +10,7 @@
  * that. These tests render ChatView with React Testing Library and assert
  * specific DOM content.
  */
-import { describe, it, expect, beforeEach, vi } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { render, screen, act, fireEvent, waitFor } from "@testing-library/react";
 
 // ─── Mocks (must be set up BEFORE chatStore is imported) ──────────────
@@ -37,6 +37,8 @@ vi.mock("../lib/ipc", () => ({
     currentSpend: vi.fn().mockResolvedValue({ costUsd: 0, tokens: 0 }),
     listWorkspaceFiles: vi.fn().mockResolvedValue([]),
     readFileChecked: vi.fn().mockResolvedValue({ kind: "text", content: "", size: 0, mtime: 0 }),
+    readFileLines: vi.fn().mockResolvedValue({ kind: "text", content: "", start: 1, end: 1, total: 1, cut: false }),
+    secretScanText: vi.fn().mockResolvedValue(null),
     getGitDiff: vi.fn().mockResolvedValue(""),
     getStagedDiff: vi.fn().mockResolvedValue(""),
     cancelChat: vi.fn().mockResolvedValue(undefined),
@@ -812,6 +814,10 @@ describe("ChatView — context mentions (#962)", () => {
     vi.mocked(ipcMock.readFileChecked).mockResolvedValue({
       kind: "text", content: "1\n2\n3\n4\n5", size: 9, mtime: 0,
     });
+    vi.mocked(ipcMock.readFileLines).mockResolvedValue({
+      kind: "text", content: "2\n3", start: 2, end: 3, total: 5, cut: false,
+    });
+    vi.mocked(ipcMock.secretScanText).mockResolvedValue(null);
   });
 
   function getTextarea() {
@@ -893,5 +899,92 @@ describe("ChatView — context mentions (#962)", () => {
     expect(list.textContent).toContain("src/");
     fireEvent.change(ta, { target: { value: "@src/a.ts#L1", selectionStart: 12, selectionEnd: 12 } });
     expect(screen.queryByRole("listbox", { name: "Worktree files" })).toBeNull();
+  });
+});
+
+describe("ChatView — context guard and limits (#1046)", () => {
+  const finding = { file: "@diff", line: 3, rule: "github-token", kind: "GitHub token", yours: false };
+  beforeEach(() => {
+    resetStore();
+    vi.mocked(ipcMock.sendChatMessage).mockClear();
+    vi.mocked(ipcMock.getGitDiff).mockClear().mockResolvedValue("diff --git a/src/a.ts b/src/a.ts\n+t\n");
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(["src/a.ts", "src/lib/b.ts"]);
+    vi.mocked(ipcMock.readFileLines).mockResolvedValue({
+      kind: "text", content: "2\n3", start: 2, end: 3, total: 5, cut: false,
+    });
+    vi.mocked(ipcMock.secretScanText).mockImplementation(async (blocks) =>
+      blocks[0].label === "@diff"
+        ? { findings: [finding], total: 1, partial: false }
+        : { findings: [], total: 0, partial: false },
+    );
+  });
+  afterEach(() => {
+    vi.mocked(ipcMock.getGitDiff).mockResolvedValue("");
+    vi.mocked(ipcMock.secretScanText).mockResolvedValue(null);
+  });
+
+  async function sendDraft(value: string) {
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+    await act(async () => {
+      fireEvent.change(ta, { target: { value } });
+    });
+    await act(async () => {
+      fireEvent.keyDown(ta, { key: "Enter" });
+    });
+  }
+
+  it("asks before sending a block that holds a possible secret, and leaves it out", async () => {
+    await sendDraft("check @src/a.ts#L2-3 and @diff now");
+    expect(await screen.findByText("This message attaches what looks like a GitHub token in @diff:3.")).toBeInTheDocument();
+    expect(ipcMock.sendChatMessage).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Leave it out" }));
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toBe(
+      "check @src/a.ts#L2-3 and @diff now\n\nsrc/a.ts · lines 2–3 of 5\n```\n2\n3\n```\n\ndiff _(not included: possible secret)_",
+    );
+  });
+
+  it("sends the block for this one message when confirmed", async () => {
+    await sendDraft("check @diff now");
+    fireEvent.click(await screen.findByRole("button", { name: "Send regardless" }));
+    await waitFor(() => expect(ipcMock.sendChatMessage).toHaveBeenCalled());
+    const req = vi.mocked(ipcMock.sendChatMessage).mock.calls.at(-1)?.[0] as Record<string, unknown>;
+    expect(req.userMessage).toContain("+t");
+  });
+
+  it("attaches at most ten mentions and says so", async () => {
+    const many = Array.from({ length: 12 }, (_, i) => `src/f${i}.ts`);
+    vi.mocked(ipcMock.listWorkspaceFiles).mockResolvedValue(many);
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: many.map((f) => `@${f}`).join(" ") } });
+    expect(await screen.findByText("10 at most · 2 more sent as text")).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /^Remove @/ })).toHaveLength(10);
+  });
+
+  it("reads the diff once for its estimate while typing goes on", async () => {
+    let answer: (v: string) => void = () => {};
+    vi.mocked(ipcMock.getGitDiff).mockImplementation(() => new Promise<string>((r) => (answer = r)));
+    await act(async () => {
+      render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    });
+    const ta = screen.getByPlaceholderText(/Ask anything/i) as HTMLTextAreaElement;
+    fireEvent.change(ta, { target: { value: "review @diff" } });
+    await waitFor(() => expect(ipcMock.getGitDiff).toHaveBeenCalledTimes(1));
+    for (const value of ["review @diff t", "review @diff to", "review @diff tod"]) {
+      fireEvent.change(ta, { target: { value } });
+      await act(() => new Promise((r) => setTimeout(r, 300)));
+    }
+    expect(ipcMock.getGitDiff).toHaveBeenCalledTimes(1);
+    await act(async () => answer("diff --git a/src/a.ts b/src/a.ts\n+a\n"));
+    await waitFor(() =>
+      expect(document.querySelector("[data-tour='talk-context-chip']")?.getAttribute("title")).toMatch(/≈ \d+ tokens$/),
+    );
   });
 });

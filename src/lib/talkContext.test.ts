@@ -2,8 +2,13 @@ import { describe, it, expect } from "vitest";
 import {
   CONTEXT_CAP,
   FOLDER_MAX_ENTRIES,
+  MAX_MENTIONS,
+  capRefs,
   capTail,
   capText,
+  fenced,
+  quoteToken,
+  unquoteGitPath,
   chipLabel,
   contextMentionItems,
   diffForFile,
@@ -84,6 +89,28 @@ describe("talkContext — parsing", () => {
     expect(removeContextToken("only @diff:src/a.ts", "diff")).toBe("only @diff:src/a.ts");
   });
 
+  it("reads a quoted token with a space as one, and removes it quoted", () => {
+    const spaced: ContextCatalog = { ...cat, files: new Set([...files, "docs/my notes.md"]) };
+    const text = 'see @"docs/my notes.md#L3-9" and @"diff:docs/my notes.md", not @docs/my';
+    expect(extractContextRefs(text, spaced).map((r) => [r.kind, r.token])).toEqual([
+      ["file", "docs/my notes.md#L3-9"],
+      ["diff", "diff:docs/my notes.md"],
+    ]);
+    expect(removeContextToken(text, "docs/my notes.md#L3-9")).toBe('see and @"diff:docs/my notes.md", not @docs/my');
+    expect(quoteToken("docs/my notes.md#L3")).toBe('"docs/my notes.md#L3"');
+    expect(quoteToken("src/a.ts")).toBe("src/a.ts");
+  });
+
+  it("attaches at most MAX_MENTIONS and counts the rest", () => {
+    const many = Array.from({ length: MAX_MENTIONS + 2 }, (_, i) => `src/f${i}.ts`);
+    const big: ContextCatalog = { ...cat, files: new Set(many) };
+    const { kept, over } = capRefs(extractContextRefs(many.map((f) => `@${f}`).join(" "), big));
+    expect(kept).toHaveLength(MAX_MENTIONS);
+    expect(kept[0].token).toBe("src/f0.ts");
+    expect(over).toBe(2);
+    expect(capRefs(extractContextRefs("@src/a.ts", cat)).over).toBe(0);
+  });
+
   it("labels chips by basename, range, folder, session and diff", () => {
     const labels = extractContextRefs("@src/lib/b.ts#L2-3 @src/lib/ @session:zsh-2 @diff:src/a.ts", cat).map(chipLabel);
     expect(labels).toEqual(["b.ts#L2-3", "lib/", "zsh", "diff · a.ts"]);
@@ -134,6 +161,25 @@ describe("talkContext — blocks", () => {
     expect(diffForFile(diff, "src/a.ts")).toContain("+y");
     expect(diffForFile(diff, "src/a.ts")).not.toContain("README");
     expect(diffForFile(diff, "other.ts")).toBe("");
+  });
+
+  it("finds a file git quoted in the header (non-ASCII, a quote)", () => {
+    expect(unquoteGitPath('"a/caf\\303\\251.ts"')).toBe("a/café.ts");
+    expect(unquoteGitPath('"b/say \\"hi\\".md"')).toBe('b/say "hi".md');
+    expect(unquoteGitPath("a/plain.ts")).toBe("a/plain.ts");
+    const diff =
+      'diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"\n+x\n' +
+      'diff --git a/old.ts "b/say \\"hi\\".md"\n+y\n' +
+      "diff --git a/my file.ts b/my file.ts\n+z\n";
+    expect(diffForFile(diff, "src/café.ts")).toBe('diff --git "a/src/caf\\303\\251.ts" "b/src/caf\\303\\251.ts"\n+x');
+    expect(diffForFile(diff, 'say "hi".md')).toContain("+y");
+    expect(diffForFile(diff, "old.ts")).toContain("+y");
+    expect(diffForFile(diff, "my file.ts")).toContain("+z");
+  });
+
+  it("fences a block with more backticks than its content holds", () => {
+    expect(fenced("h", "x")).toBe("\n\nh\n```\nx\n```");
+    expect(fenced("h", "a\n````\nb", "diff")).toBe("\n\nh\n`````diff\na\n````\nb\n`````");
   });
 
   it("lists a folder relative to itself with sizes, and says what it left out", () => {

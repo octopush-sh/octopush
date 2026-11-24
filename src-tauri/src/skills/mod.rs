@@ -205,19 +205,22 @@ pub fn referenced_skills(worktree: &Path, text: &str) -> Vec<Skill> {
 }
 
 /// The text with every fenced code block (``` … ```, fence lines included)
-/// removed; an unclosed fence runs to the end. Mirrors `fencedRanges` in
-/// `src/lib/skillMentions.ts`, so the composer highlights exactly what the
-/// backend will invoke.
+/// removed; an unclosed fence runs to the end. As in Markdown, a fence closes
+/// only on a bare line of at least as many backticks as opened it, so a
+/// ```` fence (what Talk writes around content holding ```) holds ``` lines.
+/// Mirrors `fencedRanges` in `src/lib/skillMentions.ts`, so the composer
+/// highlights exactly what the backend will invoke.
 fn outside_fences(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut in_fence = false;
+    let mut fence: Option<usize> = None;
     for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with("```") {
-            in_fence = !in_fence;
-            continue;
-        }
-        if !in_fence {
-            out.push_str(line);
+        let t = line.trim_start_matches([' ', '\t']);
+        let run = t.bytes().take_while(|&b| b == b'`').count();
+        match fence {
+            None if run >= 3 => fence = Some(run),
+            None => out.push_str(line),
+            Some(open) if run >= open && t[run..].trim().is_empty() => fence = None,
+            Some(_) => {}
         }
     }
     out
@@ -357,6 +360,10 @@ mod tests {
         // An unclosed fence runs to the end.
         assert!(referenced_skills(tmp.path(), "```\n/release").is_empty());
         assert_eq!(outside_fences("a\n```\nb\n```\nc"), "a\nc");
+        // A longer fence holds a ``` line of its own content (#1046).
+        let nested = "see\n\nREADME.md\n````\n```\n/release\n```\n````\nok";
+        assert_eq!(outside_fences(nested), "see\n\nREADME.md\nok");
+        assert!(referenced_skills(tmp.path(), nested).is_empty());
     }
 
     #[test]
