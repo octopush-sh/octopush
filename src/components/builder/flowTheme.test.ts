@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { flowColorMode } from "./flowTheme";
+import { getViewportForBounds } from "@xyflow/react";
+import { FIT_PADDING, flowColorMode } from "./flowTheme";
 
 // The real stylesheets: the one the builder imports, from the installed
 // library, and the app's. Vitest blanks CSS imports (`?raw` included), so the
@@ -44,6 +45,16 @@ describe("builder canvas theme (@xyflow stylesheet)", () => {
     expect(libCss).toMatch(/\.react-flow \{[^}]*color-scheme: light dark;/);
     expect(libCss).toMatch(/\.react-flow\.dark \{\s*color-scheme: dark;/);
     expect(libCss).toMatch(/\.react-flow\.light \{\s*color-scheme: light;/);
+  });
+});
+
+describe("FIT_PADDING", () => {
+  it("leaves v12's margin with the real v13 math: 10% of the canvas per side, not 0px", () => {
+    const bounds = { x: 0, y: 0, width: 1000, height: 500 };
+    // v12's `padding: 0.25` gave (1000 - 1000 / 1.25) / 2 = 100px a side → zoom 0.8.
+    expect(getViewportForBounds(bounds, 1000, 500, 0.4, 1.75, FIT_PADDING).zoom).toBeCloseTo(0.8);
+    // The same number in v13 is 0px: the stages would touch the canvas edges.
+    expect(getViewportForBounds(bounds, 1000, 500, 0.4, 1.75, 0.25).zoom).toBeCloseTo(1);
   });
 });
 

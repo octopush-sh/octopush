@@ -6,6 +6,7 @@ import { render, screen, fireEvent, waitFor, within } from "@testing-library/rea
 // palette, delete) all lives outside the canvas; node/edge rendering is covered
 // by graph.test.ts. The stubbed node-state hooks stay stateful so the initial
 // graph flows through to the save() call.
+const fitViewMock = vi.hoisted(() => vi.fn());
 vi.mock("@xyflow/react", async () => {
   const React = await import("react");
   const Frag = ({ children }: any) => React.createElement(React.Fragment, null, children);
@@ -16,7 +17,12 @@ vi.mock("@xyflow/react", async () => {
       const { children, nodes, nodeTypes, edges, edgeTypes, onNodeClick, onNodeDragStart } = props;
       return React.createElement(
         "div",
-        { "data-testid": "flow", "data-color-mode": props.forceColorMode, "data-drag-threshold": props.nodeDragThreshold },
+        {
+          "data-testid": "flow",
+          "data-color-mode": props.forceColorMode,
+          "data-drag-threshold": props.nodeDragThreshold,
+          "data-fit-padding": JSON.stringify(props.fitViewOptions?.padding),
+        },
         React.createElement("button", {
           "data-testid": "flow-node-select",
           onClick: () => nodes?.[0] && onNodeClick?.({}, nodes[0]),
@@ -61,7 +67,7 @@ vi.mock("@xyflow/react", async () => {
     useReactFlow: () => ({
       screenToFlowPosition: (p: any) => p,
       deleteElements: async () => {},
-      fitView: () => {},
+      fitView: fitViewMock,
     }),
   };
 });
@@ -293,6 +299,17 @@ describe("canvas theme", () => {
 });
 
 describe("tidy", () => {
+  it("fits the view with a unit padding on load and after Tidy, never a bare fraction (v13 reads it as px)", async () => {
+    fitViewMock.mockClear();
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    const onLoad = JSON.parse(screen.getByTestId("flow").getAttribute("data-fit-padding")!);
+    expect(onLoad).toMatch(/^\d+(\.\d+)?(%|px)$/);
+    fireEvent.click(screen.getByText("Plan"));
+    fireEvent.click(screen.getByLabelText(/Tidy layout/));
+    await waitFor(() => expect(fitViewMock).toHaveBeenCalled());
+    expect(fitViewMock.mock.calls[0][0].padding).toBe(onLoad);
+  });
+
   it("re-lays nodes and is a single undo step", async () => {
     render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
     fireEvent.click(screen.getByText("Plan")); // 2 nodes now

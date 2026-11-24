@@ -16,3 +16,10 @@ export function flowColorMode(bg: string | null | undefined): ColorMode {
  *  entry (`onNodeDragStart` records one). v13 dropped `nodeClickDistance`,
  *  and its own threshold of 1px turns a trackpad click's jitter into a drag. */
 export const NODE_DRAG_THRESHOLD = 4;
+
+/** Margin `fitView` leaves around the stages, on load and after Tidy, so the
+ *  outer ones clear the palette, the toolbar, the controls and the minimap.
+ *  v13 reads a bare number as pixels (and floors it), so v12's `0.25` would
+ *  be 0px; v12 turned that fraction into 10% of the canvas per side, which
+ *  is what this string asks v13 for. */
+export const FIT_PADDING = "10%";

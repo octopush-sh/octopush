@@ -28,7 +28,7 @@ import { FlowEdge, LoopEdge } from "./builder/edges";
 import { NodePalette, ARCHETYPE_DND_MIME } from "./builder/NodePalette";
 import { StageInspector, type LoopState } from "./builder/StageInspector";
 import { BuilderProvider } from "./builder/BuilderContext";
-import { flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
+import { FIT_PADDING, flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
 import { useThemeStore } from "../stores/themeStore";
 import {
   draftToGraph,
@@ -184,7 +184,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     tidyTimer.current = window.setTimeout(() => {
       tidyTimer.current = null;
       setTidying(false);
-      void rf.fitView({ padding: 0.25, maxZoom: 1, duration: 280 });
+      void rf.fitView({ padding: FIT_PADDING, maxZoom: 1, duration: 280 });
     }, 300);
   }, [pushHistory, setNodes, rf]);
 
@@ -478,7 +478,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
               minZoom={0.4}
               maxZoom={1.75}
               fitView
-              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              fitViewOptions={{ padding: FIT_PADDING, maxZoom: 1 }}
               proOptions={{ hideAttribution: true }}
               className="bg-transparent"
             >
