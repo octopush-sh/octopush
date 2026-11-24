@@ -21,8 +21,10 @@ interface MessageProps {
 }
 
 /** A turn's time for its header: the clock time today (`14:02`), with the
- *  date in front on any other day (`Nov 23, 14:02`), so a thread picked up
- *  the next morning still reads in order. Empty for a missing or bad date. */
+ *  date in front on any other day (`Nov 23, 14:02`) and the year too in an
+ *  earlier year (`Dec 30, 2025, 14:02`), so a thread picked up later still
+ *  reads in order. Empty for a missing or bad date. (`chatTitle.formatRelTime`
+ *  drops the clock time past today, which a turn needs, so it isn't reused.) */
 export function turnTime(iso: string | null | undefined, now: Date = new Date()): string {
   if (!iso) return "";
   const then = new Date(iso);
@@ -33,7 +35,8 @@ export function turnTime(iso: string | null | undefined, now: Date = new Date())
     then.getMonth() === now.getMonth() &&
     then.getDate() === now.getDate();
   if (sameDay) return clock;
-  return `${then.toLocaleDateString(undefined, { month: "short", day: "numeric" })}, ${clock}`;
+  const year = then.getFullYear() === now.getFullYear() ? undefined : "numeric";
+  return `${then.toLocaleDateString(undefined, { year, month: "short", day: "numeric" })}, ${clock}`;
 }
 
 /** The footer of an answer: `211k in · 94% cached · 2.1k out · $0.42`. The
@@ -63,8 +66,9 @@ interface Props {
   /** The worktree's skill names: a user message's standalone `/name` tokens
    *  that match read as brass skill chips — the skills that rode with it. */
   skillNames?: string[];
-  /** A user turn's actions (Rewind, Fork, Edit, Copy), set in its header
-   *  between the eyebrow and the time. */
+  /** The turn's actions. A user turn sets them in its header, between the
+   *  eyebrow and the time; an answer sets them last in its article (they
+   *  position themselves over its eyebrow line). */
   actions?: ReactNode;
 }
 
@@ -174,7 +178,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
     <article
       data-role="assistant"
       aria-label={modelDisplayName(model)}
-      className="octo-selectable flex flex-col gap-2"
+      className="octo-selectable relative flex flex-col gap-2"
     >
       <div className="animate-keyfade-eyebrow font-mono text-[10px] uppercase tracking-[0.25em] text-octo-mute">
         — {modelDisplayName(model)}
@@ -225,6 +229,7 @@ export function ChatMessage({ message, onOpenInEditor, skillNames, actions }: Pr
           {usageFooter(message)}
         </div>
       )}
+      {actions}
     </article>
   );
 }

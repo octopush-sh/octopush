@@ -103,3 +103,73 @@ describe("WorkBlock", () => {
     expect(reveal).toHaveAttribute("aria-hidden", "false");
   });
 });
+
+describe("WorkBlock — a round that grows or folds keeps its rows", () => {
+  const reads = (n: number) => Array.from({ length: n }, (_, i) => t("read_file", { path: `src/f${i}.ts` }));
+  const block = (n: number, live: boolean) => (
+    <WorkBlock calls={n} live={live} entries={[round(1, reads(n))]} />
+  );
+
+  it("never folds while the turn streams: 5 → 6 calls keeps every row, its state and focus", () => {
+    const { container, rerender } = render(block(5, true));
+    const first = container.querySelector('[data-role="tool"]')!;
+    const header = within(first as HTMLElement).getByRole("button", { name: "READ src/f0.ts" });
+    fireEvent.click(header);
+    header.focus();
+    expect(header).toHaveAttribute("aria-expanded", "true");
+
+    rerender(block(6, true));
+
+    // Same node, still open, still focused, and no fold yet.
+    expect(container.querySelector('[data-role="tool"]')).toBe(first);
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(document.activeElement).toBe(header);
+    expect(screen.queryByRole("button", { name: /6 tool calls/ })).toBeNull();
+    expect(container.querySelectorAll('[data-role="tool"]')).toHaveLength(6);
+    expect(container.querySelector("div.grid[aria-hidden]")).toHaveAttribute("aria-hidden", "false");
+  });
+
+  it("folds when the turn ends, without remounting the rows", () => {
+    const { container, rerender } = render(block(6, true));
+    const first = container.querySelector('[data-role="tool"]');
+    rerender(block(6, false));
+    expect(container.querySelector('[data-role="tool"]')).toBe(first);
+    const fold = screen.getByRole("button", { name: /6 tool calls/ });
+    expect(fold).toHaveAttribute("aria-expanded", "false");
+    expect(container.querySelector("div.grid[aria-hidden]")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("stays open when the turn ends while the reader is in the round", () => {
+    const { container, rerender } = render(block(6, true));
+    const header = screen.getByRole("button", { name: "READ src/f3.ts" });
+    header.focus();
+    rerender(block(6, false));
+    expect(document.activeElement).toBe(header);
+    expect(screen.getByRole("button", { name: /6 tool calls/ })).toHaveAttribute("aria-expanded", "true");
+    expect(container.querySelector("div.grid[aria-hidden]")).toHaveAttribute("aria-hidden", "false");
+  });
+});
+
+describe("ledger row actions", () => {
+  it("are titled icons in their own slot before the chevron, which is always the last column", () => {
+    const onRun = vi.fn();
+    const { container } = render(
+      <WorkBlock
+        calls={2}
+        onRunInTerminal={onRun}
+        entries={[round(1, [t("run_command", { command: "npm test" }), t("read_file", { path: "a.ts" })])]}
+      />,
+    );
+    const [runRow, readRow] = Array.from(container.querySelectorAll('[data-role="tool"] .octo-ledger'));
+    const send = within(runRow as HTMLElement).getByRole("button", { name: "Send to terminal" });
+    expect(send.textContent).toBe("");
+    expect(send).toHaveAttribute("title");
+    // Shown on row hover/focus (CSS), and always in the actions slot.
+    expect(send.closest(".octo-ledger-actions")).not.toBeNull();
+    // Both rows end with the chevron.
+    expect(runRow.lastElementChild!.getAttribute("aria-hidden")).toBe("true");
+    expect(readRow.lastElementChild!.getAttribute("aria-hidden")).toBe("true");
+    fireEvent.click(send);
+    expect(onRun).toHaveBeenCalledWith("npm test");
+  });
+});

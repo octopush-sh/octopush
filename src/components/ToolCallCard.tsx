@@ -1,7 +1,7 @@
 import { useState, useRef, useLayoutEffect, type CSSProperties } from "react";
 import { ipc } from "../lib/ipc";
 import { useCopyFeedback } from "../hooks/useCopyFeedback";
-import { ChevronRight, FolderOpen } from "lucide-react";
+import { ChevronRight, ExternalLink, FilePen, FolderOpen, Terminal } from "lucide-react";
 import { iconForTool } from "../lib/roleIcons";
 import type { ToolExecution } from "../stores/chatStore";
 
@@ -128,16 +128,27 @@ const rowStyle: CSSProperties = {
   boxSizing: "border-box" as const,
 };
 
+// The row's line: icon · label · summary on the left, the row's actions and
+// its chevron on the right. Pulled into the hairline's gutter by its own
+// padding, so the hover wash has room around the text while the icon stays
+// aligned with the narration. The chevron is always the last column, so the
+// chevrons of a round line up whatever actions a row has.
+const lineStyle: CSSProperties = {
+  display: "flex",
+  alignItems: "center",
+  height: 24,
+  padding: "0 6px",
+  marginLeft: -6,
+  gap: 4,
+  borderRadius: 4,
+};
+
 const headerStyle: CSSProperties = {
   display: "flex",
   alignItems: "center",
   flex: 1,
   minWidth: 0,
-  height: 24,
-  // Pulled into the hairline's gutter by its own padding, so the hover wash
-  // has room around the text while the icon stays aligned with the narration.
-  padding: "0 6px",
-  marginLeft: -6,
+  height: "100%",
   gap: 10,
   cursor: "pointer",
   borderRadius: 4,
@@ -149,21 +160,19 @@ const headerStyle: CSSProperties = {
   boxSizing: "border-box" as const,
 };
 
-// The row's quiet actions (Send to terminal, Open in editor, Open): mono
-// caps in mute, brass on hover through `.octo-ledger-action` in styles.css.
+// A row's actions (Send to terminal, Open in editor, Reveal in Finder, Open)
+// are 12px icons with a title, shown while the row is hovered or holds focus
+// (`.octo-ledger-actions`), mute until hovered, then brass.
 const actionStyle: CSSProperties = {
-  fontFamily: MONO,
-  fontSize: 9,
-  letterSpacing: "0.2em",
-  textTransform: "uppercase",
+  display: "inline-flex",
+  alignItems: "center",
+  justifyContent: "center",
+  width: 22,
+  height: 22,
   color: MUTE,
-  background: "transparent",
-  border: "none",
   borderRadius: 4,
-  padding: "3px 6px",
   cursor: "pointer",
   flexShrink: 0,
-  whiteSpace: "nowrap",
 };
 
 export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTerminal }: Props) {
@@ -195,17 +204,18 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
     setOutputOverflows(el.scrollHeight > el.clientHeight + 4);
   }, [expanded, outputExpanded, tool.result]);
 
+  const toggle = () => setExpanded((v) => !v);
   return (
     <div data-role="tool" className="octo-selectable" style={rowStyle}>
-      <div style={{ display: "flex", alignItems: "center", gap: 2 }}>
+      <div className="octo-ledger" style={lineStyle}>
         <div
           role="button"
           tabIndex={0}
           aria-expanded={expanded}
           aria-label={`${label} ${summary}`.trim()}
-          onClick={() => setExpanded((v) => !v)}
-          onKeyDown={keyActivate(() => setExpanded((v) => !v))}
-          className="octo-ledger-row"
+          onClick={toggle}
+          onKeyDown={keyActivate(toggle)}
+          className="octo-ledger-head"
           style={headerStyle}
         >
           <span
@@ -260,92 +270,99 @@ export function ToolCallCard({ tool, workspacePath, onOpenInEditor, onRunInTermi
               {cwd}
             </span>
           )}
-          <span
-            aria-hidden
-            style={{
-              display: "inline-flex",
-              flexShrink: 0,
-              color: MUTE,
-              transform: expanded ? "rotate(90deg)" : "none",
-              transition: "transform var(--dur-quick) var(--ease-octo)",
-            }}
-          >
-            <ChevronRight size={11} strokeWidth={1.75} />
-          </span>
         </div>
 
-        {command && onRunInTerminal && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onRunInTerminal(command);
-            }}
-            onKeyDown={keyActivate(() => onRunInTerminal(command))}
-            title="Send to terminal (copies the command and switches to Run)"
-            aria-label="Send to terminal"
-            className="octo-ledger-action"
-            style={actionStyle}
-          >
-            Send to terminal
-          </div>
-        )}
+        <span className="octo-ledger-actions" style={{ display: "inline-flex", alignItems: "center", flexShrink: 0 }}>
+          {command && onRunInTerminal && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                onRunInTerminal(command);
+              }}
+              onKeyDown={keyActivate(() => onRunInTerminal(command))}
+              title="Send to terminal (copies the command and switches to Run)"
+              aria-label="Send to terminal"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <Terminal size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && onOpenInEditor && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenInEditor(filePath);
+              }}
+              onKeyDown={keyActivate(() => onOpenInEditor(filePath))}
+              title="Open in editor"
+              aria-label="Open in editor"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <FilePen size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={(e) => {
+                e.stopPropagation();
+                if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
+              }}
+              onKeyDown={keyActivate(() => {
+                if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
+              })}
+              title="Reveal in Finder"
+              aria-label="Reveal in Finder"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <FolderOpen size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+          {filePath && tool.toolName === "write_file" && isWebFile && (
+            <span
+              role="button"
+              tabIndex={0}
+              onClick={() => {
+                if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
+              }}
+              onKeyDown={keyActivate(() => {
+                if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
+              })}
+              title="Open in the default browser"
+              aria-label="Open in the default browser"
+              className="octo-ledger-action"
+              style={actionStyle}
+            >
+              <ExternalLink size={12} strokeWidth={1.75} aria-hidden />
+            </span>
+          )}
+        </span>
 
-        {filePath && tool.toolName === "write_file" && onOpenInEditor && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenInEditor(filePath);
-            }}
-            onKeyDown={keyActivate(() => onOpenInEditor(filePath))}
-            title="Open in editor"
-            className="octo-ledger-action"
-            style={actionStyle}
-          >
-            Open in editor
-          </div>
-        )}
-
-        {filePath && tool.toolName === "write_file" && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={(e) => {
-              e.stopPropagation();
-              if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
-            }}
-            onKeyDown={keyActivate(() => {
-              if (workspacePath) ipc.revealInFinder(`${workspacePath}/${filePath}`);
-            })}
-            title="Reveal in Finder"
-            aria-label="Reveal in Finder"
-            className="octo-ledger-action"
-            style={{ ...actionStyle, display: "inline-flex", alignItems: "center" }}
-          >
-            <FolderOpen size={12} strokeWidth={1.75} aria-hidden />
-          </div>
-        )}
-
-        {filePath && tool.toolName === "write_file" && isWebFile && (
-          <div
-            role="button"
-            tabIndex={0}
-            onClick={() => {
-              if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
-            }}
-            onKeyDown={keyActivate(() => {
-              if (workspacePath) ipc.openFileInSystem(`${workspacePath}/${filePath}`);
-            })}
-            title="Open in the default browser"
-            className="octo-ledger-action"
-            style={actionStyle}
-          >
-            Open
-          </div>
-        )}
+        {/* The chevron is pointer decoration for the header's toggle, never
+            a second tab stop: always the last column, so chevrons align. */}
+        <span
+          aria-hidden
+          onClick={toggle}
+          style={{
+            display: "inline-flex",
+            flexShrink: 0,
+            width: 12,
+            cursor: "pointer",
+            color: MUTE,
+            transform: expanded ? "rotate(90deg)" : "none",
+            transition: "transform var(--dur-quick) var(--ease-octo)",
+          }}
+        >
+          <ChevronRight size={11} strokeWidth={1.75} />
+        </span>
       </div>
 
       {expanded && (

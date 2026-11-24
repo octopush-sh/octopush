@@ -82,6 +82,16 @@ export function ChatCanvas({
   );
   // Narration and tool calls in a row become one work block (lib/talkWork).
   const blocks = useMemo<TalkBlock[]>(() => groupWork(timeline), [timeline]);
+  // Work after the last user turn belongs to the turn in flight: while it
+  // streams, its rounds don't fold (they fold when the turn ends).
+  const currentTurnStart = useMemo(() => {
+    for (let i = blocks.length - 1; i >= 0; i--) {
+      const b = blocks[i];
+      if (b.kind === "message" && b.message.role === "user") return i + 1;
+    }
+    return 0;
+  }, [blocks]);
+  const lastIsWork = blocks.length > 0 && blocks[blocks.length - 1].kind === "work";
   const liveAgents = useMemo(() => liveTools.filter((t) => isAgentToolName(t.toolName)), [liveTools]);
   const liveOthers = useMemo(() => liveTools.filter((t) => !isAgentToolName(t.toolName)), [liveTools]);
 
@@ -227,13 +237,8 @@ export function ChatCanvas({
       {isEmpty ? (
         <EmptyState areaRef={scrollRef} />
       ) : (
-        <div
-          role="feed"
-          aria-label="Conversation"
-          aria-busy={streaming}
-          className="mx-auto flex w-full max-w-3xl flex-col gap-6"
-        >
-          {blocks.map((item) => {
+        <section aria-label="Conversation" className="mx-auto flex w-full max-w-3xl flex-col gap-6">
+          {blocks.map((item, index) => {
             if (item.kind === "crew") {
               return (
                 <CrewCard
@@ -249,6 +254,7 @@ export function ChatCanvas({
                   key={`work-${item.id}`}
                   entries={item.entries}
                   calls={item.calls}
+                  live={streaming && index >= currentTurnStart}
                   workspacePath={workspacePath}
                   onOpenInEditor={onOpenInEditor}
                   onRunInTerminal={onRunInTerminal}
@@ -299,11 +305,22 @@ export function ChatCanvas({
             <CrewCard workspaceId={workspaceId} agents={crewAgentsFromLive(liveAgents)} />
           )}
 
-          {/* Live tool cards — one per in-flight tool, in call order. They
+          {/* Live tool rows — one per in-flight tool, in call order, on the
+              work hairline: when the turn's work block is the last thing on
+              screen the rows continue its line (the negative margin closes
+              the feed's gap), otherwise they start one. Always this one
+              wrapper, so a row never remounts as its block appears. They
               retire as their resolved rows arrive (see chatStore). */}
-          {liveOthers.map((t) => (
-            <LiveToolCard key={`live-${t.callId}`} tool={t} />
-          ))}
+          {liveOthers.length > 0 && (
+            <div
+              data-role="live-work"
+              className={`flex flex-col gap-0.5 border-l border-octo-hairline pl-3 ${lastIsWork ? "-mt-[22px] pt-0.5" : ""}`}
+            >
+              {liveOthers.map((t) => (
+                <LiveToolCard key={`live-${t.callId}`} tool={t} />
+              ))}
+            </div>
+          )}
 
           {/* Turn-limit cards — a writing sub-agent stopped mid-work; the
               turn is paused until the user grants turns or accepts. */}
@@ -359,7 +376,7 @@ export function ChatCanvas({
               }
             />
           ) : null}
-        </div>
+        </section>
       )}
     </div>
       {/* Bottom exit wash — keeps the pinned Player legible over the journal
@@ -568,9 +585,10 @@ function MessageRow({
     </div>
   );
 
-  // A user turn sets its actions in its own header, between "— You" and the
-  // time, so they belong to the ask (and come right after it in focus order).
-  // An answer keeps them over its eyebrow line, after its text.
+  // The actions live inside their turn's article. A user turn sets them in
+  // its header, between "— You" and the time, so they come right after the
+  // ask in focus order; an answer sets them over its eyebrow line, last in
+  // its article, so they come after its text.
   return (
     <div className="group/msg relative">
       <div ref={ref}>
@@ -578,10 +596,9 @@ function MessageRow({
           message={message}
           onOpenInEditor={onOpenInEditor}
           skillNames={skillNames}
-          actions={isUser ? actions : undefined}
+          actions={actions}
         />
       </div>
-      {!isUser && actions}
     </div>
   );
 }

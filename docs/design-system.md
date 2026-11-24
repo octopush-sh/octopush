@@ -169,6 +169,8 @@ The ask is the one filled surface in the thread that isn't code. Brass goes to t
   <div className="whitespace-pre-wrap break-words text-[14px] leading-[1.55] text-octo-ivory">{text}</div>
 </article>
 
+{/* The thread is <section aria-label="Conversation">; each turn is an <article>.
+    An answer's actions sit last inside its own article. */}
 {/* The work — chat/WorkBlock.tsx */}
 <article aria-label="Work, 3 tool calls" className="flex flex-col gap-0.5 border-l border-octo-hairline pl-3">
   <div className="py-1 text-[12.5px] leading-[1.55] text-octo-sage">Let me find where …</div>
@@ -179,16 +181,20 @@ The ask is the one filled surface in the thread that isn't code. Brass goes to t
 ```
 
 ### Tool call (a ledger row)
-A resolved call is a row, never a card: no border, no fill, 24px high, on the work block's hairline.
+A resolved call is a row, never a card: no border, no fill, 24px high, on the work block's hairline. The chevron is always the last column, so a round's chevrons line up.
 ```tsx
-<div role="button" aria-expanded={open} className="octo-ledger-row flex h-6 items-center gap-2.5 rounded px-1.5 -ml-1.5">
-  <Eye size={12} strokeWidth={1.75} className="text-octo-mute" />            {/* iconForTool, with a title */}
-  <span className="min-w-12 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">READ</span>
-  <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">auth/middleware.ts</span>
-  <ChevronRight size={11} className="text-octo-mute" />
+<div className="octo-ledger flex h-6 items-center gap-1 rounded px-1.5 -ml-1.5">
+  <div role="button" aria-expanded={open} aria-label="READ auth/middleware.ts"
+       className="octo-ledger-head flex min-w-0 flex-1 items-center gap-2.5">
+    <Eye size={12} strokeWidth={1.75} className="text-octo-mute" />            {/* iconForTool, with a title */}
+    <span className="min-w-12 font-mono text-[9px] uppercase tracking-[0.2em] text-octo-mute">READ</span>
+    <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">auth/middleware.ts</span>
+  </div>
+  <span className="octo-ledger-actions">{/* 12px icons with a title, shown on row hover/focus */}</span>
+  <ChevronRight size={11} aria-hidden className="text-octo-mute" />
 </div>
 ```
-`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. Its hover wash and focus ring live in `styles.css` (`.octo-ledger-row`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor) are mono caps in mute that turn brass on hover, not brass pills. The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
+`ToolCallCard` writes this with inline styles (it renders beside react-markdown, where Tailwind's cascade leaked once), and they hold tokens only: `var(--color-octo-*)` and `var(--font-mono)` / `var(--font-sans)`, never a literal. The whole-row hover wash, the actions' reveal and the inset focus rings live in `styles.css` (`.octo-ledger`, `.octo-ledger-head`, `.octo-ledger-actions`, `.octo-ledger-action`). The row's actions (Send to terminal, Open in editor, Reveal in Finder) are titled icons that keep their room while hidden, so nothing moves; they turn brass on hover. A **running** call (`LiveToolCard`) is the same row with a 6px status dot sitting on the hairline, so it settles into its resolved row in place. A round of more than five calls folds into one summary row once its turn has ended, never while it streams, and always as one tree (the rows stay under the same `Reveal`). The `§` prefix is retired: the tool identity is a `lucide-react` icon from `src/lib/roleIcons.ts` (`iconForTool`), always with a `title`. Same icon recipe for Direct focus-pane journal lines and role eyebrows (`iconForRole`).
 
 ### Input with serif placeholder
 ```tsx

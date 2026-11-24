@@ -2,7 +2,7 @@
 // ONE hairline as quiet ledger rows (src/lib/talkWork.ts groups them). The
 // director's ask sits on the panel surface and the answer is flush; the work
 // between them is the quietest register of the three, mute and sage, no brass.
-import { useState } from "react";
+import { memo, useRef, useState } from "react";
 import { ChevronRight } from "lucide-react";
 import type { ToolExecution } from "../../stores/chatStore";
 import { ROUND_FOLD_AT, toolCallCount, type WorkEntry } from "../../lib/talkWork";
@@ -14,6 +14,11 @@ import { Reveal } from "../primitives/Reveal";
 interface Props {
   entries: WorkEntry[];
   calls: number;
+  /** The turn this work belongs to is still streaming: no round folds yet,
+   *  so a round growing past five calls never swaps rows out from under the
+   *  reader. Rounds fold when the turn ends. */
+  live?: boolean;
+
   workspacePath?: string;
   onOpenInEditor?: (path: string) => void;
   onRunInTerminal?: (command: string) => void;
@@ -36,7 +41,14 @@ export function roundSummary(tools: ToolExecution[]): Array<{ verb: string; obje
   return parts;
 }
 
-export function WorkBlock({ entries, calls, workspacePath, onOpenInEditor, onRunInTerminal }: Props) {
+export const WorkBlock = memo(function WorkBlock({
+  entries,
+  calls,
+  live = false,
+  workspacePath,
+  onOpenInEditor,
+  onRunInTerminal,
+}: Props) {
   return (
     <article
       data-role="work"
@@ -51,6 +63,7 @@ export function WorkBlock({ entries, calls, workspacePath, onOpenInEditor, onRun
           <ToolRound
             key={`round-${entry.id}`}
             tools={entry.tools}
+            live={live}
             workspacePath={workspacePath}
             onOpenInEditor={onOpenInEditor}
             onRunInTerminal={onRunInTerminal}
@@ -59,7 +72,7 @@ export function WorkBlock({ entries, calls, workspacePath, onOpenInEditor, onRun
       )}
     </article>
   );
-}
+});
 
 /**
  * The model's words before a round's tool calls — its reasoning in the
@@ -81,69 +94,87 @@ function NarrationLine({ text, onOpenInEditor }: { text: string; onOpenInEditor?
 
 function ToolRound({
   tools,
+  live,
   workspacePath,
   onOpenInEditor,
   onRunInTerminal,
 }: {
   tools: Array<{ id: number; tool: ToolExecution }>;
+  live: boolean;
   workspacePath?: string;
   onOpenInEditor?: (path: string) => void;
   onRunInTerminal?: (command: string) => void;
 }) {
-  const [open, setOpen] = useState(false);
+  const groupRef = useRef<HTMLDivElement>(null);
   const label = toolCallCount(tools.length);
-  const rows = tools.map(({ id, tool }) => (
-    <ToolCallCard
-      key={`tool-${id}`}
-      tool={tool}
-      workspacePath={workspacePath}
-      onOpenInEditor={onOpenInEditor}
-      onRunInTerminal={onRunInTerminal}
-    />
-  ));
-
-  if (tools.length <= ROUND_FOLD_AT) {
-    return (
-      <div role="group" aria-label={label} className="flex flex-col">
-        {rows}
-      </div>
-    );
+  // A long round folds into one summary row, but only once its turn has
+  // ended: while it streams, a round crossing five calls stays as it is.
+  const foldable = tools.length > ROUND_FOLD_AT && !live;
+  const [open, setOpen] = useState(false);
+  // The moment a round becomes foldable (its turn just ended) it folds,
+  // unless the reader is in it: a focused row keeps the round open, so focus
+  // never drops to the page. Derived during render, before the commit that
+  // would make the rows inert.
+  const [wasFoldable, setWasFoldable] = useState(foldable);
+  if (foldable !== wasFoldable) {
+    setWasFoldable(foldable);
+    if (foldable && typeof document !== "undefined" && groupRef.current?.contains(document.activeElement)) {
+      setOpen(true);
+    }
   }
-
-  // A long round folds into one summary row; the rows stay mounted under the
-  // grid-rows Reveal (inert while folded), so opening it never re-renders them.
-  const summary = roundSummary(tools.map((t) => t.tool));
+  const summary = foldable ? roundSummary(tools.map((t) => t.tool)) : [];
   const plain = summary.map((p) => `${p.verb} ${p.objects.join(", ")}`).join(" · ");
+
+  // ONE tree for every size: the rows always live under the same Reveal with
+  // stable keys, so a round growing from five to six calls (or folding when
+  // its turn ends) never remounts them. An opened row stays open and a
+  // focused one keeps focus. The summary button is the only thing that
+  // comes and goes, and it fades in.
   return (
-    <div role="group" aria-label={label} className="flex flex-col">
-      <button
-        type="button"
-        aria-expanded={open}
-        onClick={() => setOpen((v) => !v)}
-        data-tour={tourId("talk-work-fold")}
-        title={open ? `Fold the ${label}` : `Show the ${label}: ${plain}`}
-        className="-ml-1.5 flex h-6 min-w-0 items-center gap-2.5 rounded px-1.5 text-left text-octo-mute transition-colors duration-[220ms] hover:bg-[var(--brass-faint)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-octo-brass"
-      >
-        <ChevronRight
-          size={12}
-          strokeWidth={1.75}
-          aria-hidden
-          className="shrink-0 transition-transform duration-[220ms] ease-[cubic-bezier(0.2,0.8,0.3,1)]"
-          style={{ transform: open ? "rotate(90deg)" : undefined }}
-        />
-        <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em]">{label}</span>
-        <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">
-          {summary.map((p, i) => (
-            <span key={i}>
-              {i > 0 && <span className="text-octo-mute"> · </span>}
-              <span className="text-[9px] uppercase tracking-[0.2em] text-octo-mute">{p.verb}</span>{" "}
-              {p.objects.join(", ")}
-            </span>
+    <div ref={groupRef} role="group" aria-label={label} className="flex flex-col">
+      {foldable && (
+        <button
+          type="button"
+          aria-expanded={open}
+          onClick={() => setOpen((v) => !v)}
+          data-tour={tourId("talk-work-fold")}
+          title={open ? `Fold the ${label}` : `Show the ${label}: ${plain}`}
+          className="octo-fade-in -ml-1.5 flex h-6 min-w-0 items-center gap-2.5 rounded px-1.5 text-left text-octo-mute transition-colors duration-[var(--dur-quick)] ease-[var(--ease-octo)] hover:bg-[var(--brass-faint)] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-octo-brass"
+        >
+          <ChevronRight
+            size={12}
+            strokeWidth={1.75}
+            aria-hidden
+            className="shrink-0 transition-transform duration-[var(--dur-quick)] ease-[var(--ease-octo)]"
+            style={{ transform: open ? "rotate(90deg)" : undefined }}
+          />
+          <span className="shrink-0 font-mono text-[9px] uppercase tracking-[0.2em]">{label}</span>
+          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-octo-sage">
+            {summary.map((p, i) => (
+              <span key={i}>
+                {i > 0 && <span className="text-octo-mute"> · </span>}
+                <span className="text-[9px] uppercase tracking-[0.2em] text-octo-mute">{p.verb}</span>{" "}
+                {p.objects.join(", ")}
+              </span>
+            ))}
+          </span>
+        </button>
+      )}
+      {/* The Reveal clips its content, so it reaches 6px into the hairline's
+          gutter and gives it back as padding: the rows' hover wash, which
+          pulls left by the same 6px, is never cut. */}
+      <Reveal open={!foldable || open} className="-ml-1.5">
+        <div className="flex flex-col pl-1.5">
+          {tools.map(({ id, tool }) => (
+            <ToolCallCard
+              key={`tool-${id}`}
+              tool={tool}
+              workspacePath={workspacePath}
+              onOpenInEditor={onOpenInEditor}
+              onRunInTerminal={onRunInTerminal}
+            />
           ))}
-        </span>
-      </button>
-      <Reveal open={open}>
-        <div className="flex flex-col pt-0.5">{rows}</div>
+        </div>
       </Reveal>
     </div>
   );

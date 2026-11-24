@@ -243,6 +243,15 @@ describe("turnTime", () => {
     );
   });
 
+  it("adds the year for an earlier year", () => {
+    const iso = new Date(2025, 11, 30, 9, 30).toISOString();
+    const d = new Date(iso);
+    expect(turnTime(iso, now)).toBe(
+      `${d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })}, ${d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })}`,
+    );
+    expect(turnTime(iso, now)).toContain("2025");
+  });
+
   it("is empty for a missing or unreadable date", () => {
     expect(turnTime(null)).toBe("");
     expect(turnTime("not a date")).toBe("");

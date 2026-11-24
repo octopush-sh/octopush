@@ -344,7 +344,8 @@ describe("ChatView — renders tool cards in the DOM", () => {
     });
     const onRunInTerminal = vi.fn();
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" onRunInTerminal={onRunInTerminal} />);
-    fireEvent.click(screen.getByText("Send to terminal"));
+    // An icon with a title and an accessible name (shown on row hover/focus).
+    fireEvent.click(screen.getByRole("button", { name: "Send to terminal" }));
     expect(onRunInTerminal).toHaveBeenCalledWith("npm test");
   });
 
@@ -532,7 +533,7 @@ describe("ChatView — renders tool cards in the DOM", () => {
   });
 });
 
-// ─── Turn structure: feed, articles, the work block ─────────────────────────
+// ─── Turn structure: a section of articles, the work block ─────────────────
 
 describe("ChatView — turns read apart in a long thread", () => {
   beforeEach(() => {
@@ -547,7 +548,7 @@ describe("ChatView — turns read apart in a long thread", () => {
   const toolRow = (id: number, toolName: string, toolInput: Record<string, unknown>) =>
     row(id, "tool", JSON.stringify({ toolName, toolInput, result: "" }));
 
-  it("is a feed of articles: the ask, the work (one hairline), the answer", () => {
+  it("is a section of articles: the ask, the work (one hairline), the answer", () => {
     useChatStore.setState({
       messagesByWs: {
         "ws-1": [
@@ -563,8 +564,11 @@ describe("ChatView — turns read apart in a long thread", () => {
 
     render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
 
-    const feed = screen.getByRole("feed", { name: "Conversation" });
-    const articles = within(feed).getAllByRole("article");
+    // A labelled section, not role="feed": the thread doesn't implement the
+    // feed pattern's keyboard model, so it doesn't claim it.
+    expect(screen.queryByRole("feed")).toBeNull();
+    const thread = screen.getByRole("region", { name: "Conversation" });
+    const articles = within(thread).getAllByRole("article");
     expect(articles.map((a) => a.getAttribute("data-role"))).toEqual(["user", "work", "assistant"]);
     // The narration and both calls are inside the one work article.
     const work = articles[1];
@@ -573,7 +577,7 @@ describe("ChatView — turns read apart in a long thread", () => {
     expect(work).toHaveAttribute("aria-label", "Work, 2 tool calls");
   });
 
-  it("puts a user turn's actions inside the ask, and an answer's after its text", () => {
+  it("puts a user turn's actions inside the ask, and an answer's inside it after its text", () => {
     useChatStore.setState({
       messagesByWs: {
         "ws-1": [row(1, "user", "do a thing"), row(2, "assistant", "did it", "claude-sonnet-4-6")] as never,
@@ -584,10 +588,33 @@ describe("ChatView — turns read apart in a long thread", () => {
 
     const ask = document.querySelector('[data-role="user"]')!;
     expect(within(ask as HTMLElement).getByLabelText("Edit & resend")).toBeInTheDocument();
+    // An answer's actions are inside its article, after its text.
     const answer = document.querySelector('[data-role="assistant"]')!;
     const regenerate = screen.getByLabelText("Regenerate");
-    expect(answer.contains(regenerate)).toBe(false);
-    expect(answer.compareDocumentPosition(regenerate) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(answer.contains(regenerate)).toBe(true);
+    const text = within(answer as HTMLElement).getByText("did it");
+    expect(text.compareDocumentPosition(regenerate) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
+  it("hangs a running call on the work hairline as a ledger row, continuing the turn's block", () => {
+    useChatStore.setState({
+      messagesByWs: {
+        "ws-1": [row(1, "user", "Run the tests"), row(2, "assistant_tool_use", "Running the suite.")] as never,
+      },
+      streamingByWs: { "ws-1": true },
+      liveToolsByWs: {
+        "ws-1": [{ callId: "c1", toolName: "run_command", toolInput: { command: "npm test" }, startedAt: new Date().toISOString(), done: false, ok: false, durationMs: null }],
+      },
+    });
+    render(<ChatView workspaceId="ws-1" workspacePath="/tmp" />);
+    const live = document.querySelector('[data-role="live-work"]') as HTMLElement;
+    expect(live.className).toContain("border-l");
+    // The turn's work block is the last thing on screen, so the live rows
+    // continue its line instead of starting a new one.
+    expect(live.className).toContain("-mt-[22px]");
+    const runRow = within(live).getByText("npm test").parentElement!;
+    expect(runRow.className).not.toContain("border");
+    expect(within(live).getByText(/running ·/)).toBeInTheDocument();
   });
 
   it("copies exactly what the user sent, without the turn's header", async () => {
