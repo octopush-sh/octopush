@@ -246,19 +246,24 @@ const NOT_FOUND_EXIT: i32 = 127;
 
 /// The line a command's result gains when it exits 127, so the model reads a
 /// PATH miss as one instead of concluding the tool isn't installed. Names the
-/// program from bash's last `<name>: command not found` line in `output`; with
-/// none (a missing script path, say) the line names no program. Pure.
+/// program from bash's last `<name>: command not found` (or, for a path such
+/// as `./x`, `<name>: No such file or directory`) line in `output`. A path
+/// wasn't looked up on the PATH, so its line doesn't mention the PATH. Pure.
 fn not_found_note(output: &str) -> String {
     let program = output
         .lines()
         .rev()
-        .find_map(|l| l.trim_end().strip_suffix(": command not found"))
+        .find_map(|l| {
+            let l = l.trim_end();
+            l.strip_suffix(": command not found").or_else(|| l.strip_suffix(": No such file or directory"))
+        })
         .and_then(|head| head.rsplit(": ").next())
         .map(str::trim)
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty() && !p.contains(char::is_whitespace));
     match program {
-        Some(p) => format!("`{p}` wasn't found on your PATH (the login shell's PATH was used)."),
-        None => "A program in this command wasn't found on your PATH (the login shell's PATH was used).".to_string(),
+        Some(p) if p.contains('/') => format!("`{p}` wasn't found."),
+        Some(p) => format!("`{p}` wasn't found (the command ran with your login shell's PATH)."),
+        None => "A program in this command wasn't found (the command ran with your login shell's PATH).".to_string(),
     }
 }
 
@@ -1093,7 +1098,7 @@ fn sandboxed_write(roots: &[String], full: &Path, content: &str, path: &str) -> 
         full.to_string_lossy().into_owned(),
     ];
     let prepared =
-        match crate::orchestrator::sandbox::prepare(roots, None, std::ffi::OsStr::new("bash"), &args) {
+        match crate::orchestrator::sandbox::prepare(roots, None, std::ffi::OsStr::new(crate::talk_shell::TALK_BASH), &args) {
             Ok(p) => p,
             Err(e) => {
                 return (
@@ -1343,7 +1348,7 @@ pub(crate) fn execute_tool_cancellable(
                 match crate::orchestrator::sandbox::prepare(
                     roots,
                     Some(&*scope),
-                    std::ffi::OsStr::new("bash"),
+                    std::ffi::OsStr::new(crate::talk_shell::TALK_BASH),
                     &["-c".to_string(), cmd.to_string()],
                 ) {
                     Ok(p) => {
@@ -1365,7 +1370,7 @@ pub(crate) fn execute_tool_cancellable(
                     }
                 }
             } else {
-                let mut c = std::process::Command::new("bash");
+                let mut c = std::process::Command::new(crate::talk_shell::TALK_BASH);
                 c.arg("-c").arg(cmd).env("PATH", &path);
                 c
             };
@@ -4298,20 +4303,23 @@ mod login_path_tests {
     use crate::orchestrator::cli_runner::{resolved_cli_path, with_login_shell_env};
     use serial_test::serial;
 
-    /// A dir holding `octo-1087-tool`, an executable found only through it.
+    /// A dir holding `octo-1087-tool`, an executable found only through it,
+    /// and a `bash` that isn't one, which a bare `bash` would resolve to.
     fn login_bin() -> tempfile::TempDir {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let tool = dir.path().join("octo-1087-tool");
-        std::fs::write(&tool, "#!/bin/sh\necho found-on-login-path\n").unwrap();
-        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for (name, body) in [("octo-1087-tool", "echo found-on-login-path"), ("bash", "echo wrong-bash")] {
+            let file = dir.path().join(name);
+            std::fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         dir
     }
 
     /// Runs the tool only the login PATH has, then prints the PATH, a variable
-    /// only the login shell sets and `CARGO_HOME` (which the login shell sets too).
-    const PROBE: &str =
-        "octo-1087-tool && printf '%s\\n' \"$PATH\" \"${OCTO_1087_LOGIN_ONLY-unset}\" \"${CARGO_HOME-unset}\"";
+    /// only the login shell sets, `CARGO_HOME` (which the login shell sets too)
+    /// and the bash running the command.
+    const PROBE: &str = "octo-1087-tool && printf '%s\\n' \"$PATH\" \"${OCTO_1087_LOGIN_ONLY-unset}\" \"${CARGO_HOME-unset}\" \"$BASH\"";
 
     /// `run_command` with a stubbed login shell: the output lines, the PATH CLI
     /// stages get under the same stub, and the login PATH dir.
@@ -4345,6 +4353,7 @@ mod login_path_tests {
         assert!(path.starts_with(&bin), "{path}");
         assert_eq!(lines[2], "unset", "no other login-shell variable");
         assert_ne!(lines[3], "/login-shell/cargo");
+        assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
     }
 
     #[test]
@@ -4357,10 +4366,11 @@ mod login_path_tests {
         assert!(path.starts_with(&bin), "{path}");
         assert_eq!(lines[2], "unset");
         assert!(lines[3].contains("build-cache") && lines[3].ends_with("/cargo"), "the sandbox's cache wins: {lines:?}");
+        assert_eq!(lines[4], "/bin/bash", "the pinned bash, not the one first on the PATH");
     }
 
     #[test]
-    fn a_missing_program_says_the_login_path_was_used() {
+    fn a_missing_program_says_which_path_it_ran_with() {
         let ws = tempfile::tempdir().unwrap();
         let input = serde_json::json!({ "command": "octo-1087-missing-tool --version" });
         let (out, ok) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
@@ -4368,9 +4378,14 @@ mod login_path_tests {
         assert!(out.contains("octo-1087-missing-tool: command not found"), "{out}");
         assert_eq!(
             out.lines().last(),
-            Some("`octo-1087-missing-tool` wasn't found on your PATH (the login shell's PATH was used)."),
+            Some("`octo-1087-missing-tool` wasn't found (the command ran with your login shell's PATH)."),
             "{out}"
         );
+        // A path isn't looked up on the PATH, so the line doesn't name it.
+        let input = serde_json::json!({ "command": "./octo-1087-missing.sh" });
+        let (out, ok) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
+        assert!(!ok);
+        assert_eq!(out.lines().last(), Some("`./octo-1087-missing.sh` wasn't found."), "{out}");
         // Any other failure reads as before.
         let input = serde_json::json!({ "command": "echo nope >&2; exit 1" });
         let (out, _) = with_login_shell_env(&[], || execute_tool(ws.path(), "run_command", &input, None));
@@ -4379,22 +4394,27 @@ mod login_path_tests {
 
     #[test]
     fn the_not_found_note_names_the_program_bash_reported() {
-        let named = |p: &str| format!("`{p}` wasn't found on your PATH (the login shell's PATH was used).");
+        let named = |p: &str| format!("`{p}` wasn't found (the command ran with your login shell's PATH).");
         assert_eq!(not_found_note("bash: gh: command not found"), named("gh"));
         assert_eq!(not_found_note("[stderr] bash: line 1: gh: command not found\n"), named("gh"));
         assert_eq!(not_found_note("bash: npx: command not found\r\nbash: line 2: node: command not found\r"), named("node"));
         assert_eq!(not_found_note("./run.sh: line 3: pnpm: command not found"), named("pnpm"));
-        assert_eq!(
-            not_found_note("bash: ./missing.sh: No such file or directory"),
-            "A program in this command wasn't found on your PATH (the login shell's PATH was used)."
-        );
+        assert_eq!(not_found_note("env: uvx: No such file or directory"), named("uvx"));
+        // A path wasn't looked up on the PATH.
+        assert_eq!(not_found_note("bash: ./missing.sh: No such file or directory"), "`./missing.sh` wasn't found.");
+        assert_eq!(not_found_note("bash: line 1: /opt/x/bin/tool: No such file or directory"), "`/opt/x/bin/tool` wasn't found.");
+        assert_eq!(not_found_note("bash: scripts/run: No such file or directory"), "`scripts/run` wasn't found.");
+        // Nothing to name.
+        let unnamed = "A program in this command wasn't found (the command ran with your login shell's PATH).";
+        assert_eq!(not_found_note(""), unnamed);
+        assert_eq!(not_found_note("bash: ./run.sh: /usr/bin/missing: bad interpreter: No such file or directory"), unnamed);
     }
 
     #[test]
     fn shell_output_on_127_gains_the_note() {
         assert_eq!(
             format_command_output("bash: gh: command not found", 127),
-            "bash: gh: command not found\n(exit code 127)\n`gh` wasn't found on your PATH (the login shell's PATH was used)."
+            "bash: gh: command not found\n(exit code 127)\n`gh` wasn't found (the command ran with your login shell's PATH)."
         );
         assert_eq!(format_command_output("nope", 1), "nope\n(exit code 1)");
         assert_eq!(format_command_output("", 0), "(exit code 0)");

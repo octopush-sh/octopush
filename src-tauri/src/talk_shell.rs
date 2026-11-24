@@ -28,6 +28,12 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// The bash every Talk command runs in: this shell, and `chat_engine`'s
+/// `run_command` and sandboxed writes. Pinned, so the login PATH can't swap
+/// in another bash (Homebrew's 5.x, a conda or nix wrapper) and the agent's
+/// commands behave as the user's `$` commands do.
+pub(crate) const TALK_BASH: &str = "/bin/bash";
+
 /// Cap on captured output (bytes), mirroring `execute_tool`'s run_command cap
 /// so output can't bloat the DB row / chat render.
 const MAX_OUTPUT_BYTES: usize = 50_000;
@@ -336,6 +342,10 @@ impl TalkShell {
 
         // The PATH CLI stages spawn with, and no other login-shell variable.
         let path = crate::orchestrator::cli_runner::resolved_cli_path();
+        // Without the login shell's own PATH (its probe failed or timed out),
+        // `path` is only the app's PATH and the common dirs, which puts
+        // `/usr/bin` ahead of Homebrew: leave `bash -l`'s PATH alone then.
+        let has_login_path = crate::orchestrator::cli_runner::login_env_path().is_some();
         if !reattaching {
             Self::spawn_bash(client, &id, cwd, &path)?;
         }
@@ -344,7 +354,9 @@ impl TalkShell {
 
         match init_and_wait_ready(client, &id, &rx, &nonce) {
             Ok(ready_cwd) => {
-                apply_login_path(client, &id, &rx, &nonce, &path);
+                if has_login_path {
+                    apply_login_path(client, &id, &rx, &nonce, &path);
+                }
                 Ok(Session {
                     id,
                     rx: Some(rx),
@@ -368,7 +380,7 @@ impl TalkShell {
 
     fn spawn_bash(client: &Arc<DaemonClient>, id: &str, cwd: &str, path: &str) -> AppResult<()> {
         let env = HashMap::from([("PATH".to_string(), path.to_string())]);
-        client.spawn(id, cwd, &env, Some("/bin/bash"), 40, 120)?;
+        client.spawn(id, cwd, &env, Some(TALK_BASH), 40, 120)?;
         Ok(())
     }
 }
@@ -1156,6 +1168,25 @@ mod e2e {
             let r = done(shell.run("old", "/tmp", "printf '%s' \"$PATH\"", quick, true).unwrap());
             assert_eq!(r.output, resolved_cli_path());
             shell.close("old");
+        });
+    }
+
+    /// Without the login shell's PATH (its probe failed or timed out) the
+    /// shell keeps `bash -l`'s PATH: the fallback puts `/usr/bin` ahead of
+    /// Homebrew.
+    #[test]
+    #[serial]
+    fn without_a_login_path_the_shell_keeps_its_profile_path() {
+        use crate::orchestrator::cli_runner::with_login_shell_env;
+        let d = boot();
+        let quick = Duration::from_secs(5);
+        with_login_shell_env(&[("OCTO_1087_LOGIN_ONLY", "leaked")], || {
+            let shell = shell_on(&d.sock);
+            let r = done(shell.run("nolp", "/tmp", "echo \"${__octo_lp-unset}\"", quick, true).unwrap());
+            assert_eq!(r.output, "unset", "the login PATH step didn't run");
+            let r = done(shell.run("nolp", "/tmp", "echo ok", quick, true).unwrap());
+            assert_eq!(r.output, "ok");
+            shell.close("nolp");
         });
     }
 }
