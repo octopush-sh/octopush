@@ -1019,12 +1019,14 @@ fn openai_responses_reasoning_round_trips_in_order() {
     let body = responses_body(&replay_request(&resp, raw, "gpt-6-sol"));
     let input = body["input"].as_array().unwrap();
     let output = gpt6_reasoning_turn()["output"].as_array().unwrap().clone();
-    // user, the five items verbatim (fc ids kept), then the two outputs.
-    assert_eq!(input.len(), 8);
-    assert_eq!(&input[1..6], &output[..]);
-    assert_eq!(input[3]["id"], "fc_1");
-    assert_eq!(input[6], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
-    assert_eq!(input[7]["call_id"], "call_2");
+    // developer, user, the five items verbatim (fc ids kept), then the two outputs.
+    assert_eq!(input.len(), 9);
+    assert_eq!(input[0]["role"], "developer");
+    assert_eq!(input.iter().filter(|i| i["role"] == "developer").count(), 1);
+    assert_eq!(&input[2..7], &output[..]);
+    assert_eq!(input[4]["id"], "fc_1");
+    assert_eq!(input[7], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
+    assert_eq!(input[8]["call_id"], "call_2");
     let text = body.to_string();
     assert!(!text.contains("octopush."), "the origin item is never sent");
 }
@@ -1041,9 +1043,9 @@ fn openai_responses_replay_dropped_for_another_model_or_empty_raw() {
     ] {
         let body = responses_body(&replay_request(&resp, raw, model));
         let input = body["input"].as_array().unwrap();
-        assert_eq!(input.len(), 6, "{model}: user, text, 2 calls, 2 outputs");
-        assert_eq!(input[1], json!({ "role": "assistant", "content": "Reading both." }));
-        assert!(input[2].get("id").is_none() && input[3].get("id").is_none(), "{model}");
+        assert_eq!(input.len(), 7, "{model}: developer, user, text, 2 calls, 2 outputs");
+        assert_eq!(input[2], json!({ "role": "assistant", "content": "Reading both." }));
+        assert!(input[3].get("id").is_none() && input[4].get("id").is_none(), "{model}");
         assert!(!body.to_string().contains("enc-1"), "{model}");
         assert!(input.iter().all(|i| i["type"] != "reasoning"), "{model}");
     }
@@ -1162,8 +1164,8 @@ fn openai_responses_request_shape() {
     req.max_tokens = 48000;
     let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     assert_eq!(body["model"], "gpt-6-sol");
-    assert_eq!(body["instructions"], "You are helpful.");
-    assert_eq!(body["input"][0], json!({ "role": "user", "content": "Hi there." }));
+    assert_eq!(body["input"][0]["role"], "developer");
+    assert_eq!(body["input"][1], json!({ "role": "user", "content": "Hi there." }));
     assert_eq!(body["max_output_tokens"], 48000);
     assert_eq!(body["store"], false, "nothing is kept server-side");
     assert!(body.get("messages").is_none() && body.get("max_completion_tokens").is_none());
@@ -1179,6 +1181,30 @@ fn openai_responses_request_shape() {
     req.tool_choice = Some("emit_result".into());
     let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     assert_eq!(body["tool_choice"], json!({ "type": "function", "name": "emit_result" }));
+}
+
+#[test]
+fn openai_responses_system_prompt_is_the_first_developer_item() {
+    // GPT-6.2 appends top-level `instructions` after `input`, outside the
+    // cacheable prefix, so the system prompt leads `input` instead.
+    let mut req = sample_request();
+    req.model = "gpt-6.2-sol".into();
+    let body = responses_body(&req);
+    assert!(body.get("instructions").is_none());
+    assert_eq!(body["input"][0], json!({
+        "role": "developer",
+        "content": [{ "type": "input_text", "text": "You are helpful." }],
+    }));
+    assert_eq!(body["input"][1], json!({ "role": "user", "content": "Hi there." }));
+    // Chat Completions keeps its system message.
+    assert_eq!(openai_compat::build_request(&req)["messages"][0]["role"], "system");
+    // No system prompt: no developer item, no `instructions`.
+    req.system = String::new();
+    let body = responses_body(&req);
+    assert!(body.get("instructions").is_none());
+    let input = body["input"].as_array().unwrap();
+    assert_eq!(input.len(), 1);
+    assert_eq!(input[0], json!({ "role": "user", "content": "Hi there." }));
 }
 
 #[test]
@@ -1205,16 +1231,16 @@ fn openai_responses_replays_tool_turns_by_call_id() {
     });
     let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
     let input = body["input"].as_array().unwrap();
-    assert_eq!(input.len(), 6, "user, assistant text, 2 calls, 2 outputs");
-    assert_eq!(input[1], json!({ "role": "assistant", "content": "let me read it" }));
-    assert_eq!(input[2]["type"], "function_call");
-    assert_eq!(input[2]["call_id"], "call_1");
-    assert_eq!(input[2]["name"], "read_file");
-    assert!(input[2].get("id").is_none(), "an fc_ id would demand its reasoning item");
-    let args: serde_json::Value = serde_json::from_str(input[3]["arguments"].as_str().unwrap()).unwrap();
+    assert_eq!(input.len(), 7, "developer, user, assistant text, 2 calls, 2 outputs");
+    assert_eq!(input[2], json!({ "role": "assistant", "content": "let me read it" }));
+    assert_eq!(input[3]["type"], "function_call");
+    assert_eq!(input[3]["call_id"], "call_1");
+    assert_eq!(input[3]["name"], "read_file");
+    assert!(input[3].get("id").is_none(), "an fc_ id would demand its reasoning item");
+    let args: serde_json::Value = serde_json::from_str(input[4]["arguments"].as_str().unwrap()).unwrap();
     assert_eq!(args, json!({ "path": "y" }));
-    assert_eq!(input[4], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
-    assert_eq!(input[5]["call_id"], "call_2");
+    assert_eq!(input[5], json!({ "type": "function_call_output", "call_id": "call_1", "output": "ok" }));
+    assert_eq!(input[6]["call_id"], "call_2");
 }
 
 #[test]
@@ -1229,7 +1255,7 @@ fn openai_responses_multimodal_uses_input_parts() {
         ]),
     }];
     let body = openai_compat::build_responses_request(&req, "openai", "https://api.openai.com/v1");
-    let content = &body["input"][0]["content"];
+    let content = &body["input"][1]["content"];
     assert_eq!(content[0], json!({ "type": "input_text", "text": "hi" }));
     assert_eq!(content[1], json!({ "type": "input_image", "image_url": "data:image/png;base64,ZZ" }));
 }

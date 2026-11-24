@@ -12589,14 +12589,23 @@ mod live_tests {
 
         let bodies = provider.bodies.lock();
         assert_eq!(bodies.len(), 3);
+        // Every turn leads with the one system-prompt developer item (the
+        // cacheable prefix); replays never repeat it.
+        for body in bodies.iter() {
+            assert!(body.get("instructions").is_none());
+            let input = body["input"].as_array().unwrap();
+            assert_eq!(input[0]["role"], "developer");
+            assert_eq!(input[0]["content"][0]["text"], "sys");
+            assert_eq!(input.iter().filter(|i| i["role"] == "developer").count(), 1);
+        }
         // Turn 2: the reasoning item, then its call with its fc id, then the output.
         let input = bodies[1]["input"].as_array().unwrap();
-        assert_eq!(input[1]["type"], "reasoning");
-        assert_eq!(input[1]["encrypted_content"], "enc-rs_1");
-        assert_eq!(input[2]["type"], "function_call");
-        assert_eq!(input[2]["id"], "fc-call_1");
-        assert_eq!(input[3]["type"], "function_call_output");
-        assert_eq!(input[3]["call_id"], "call_1");
+        assert_eq!(input[2]["type"], "reasoning");
+        assert_eq!(input[2]["encrypted_content"], "enc-rs_1");
+        assert_eq!(input[3]["type"], "function_call");
+        assert_eq!(input[3]["id"], "fc-call_1");
+        assert_eq!(input[4]["type"], "function_call_output");
+        assert_eq!(input[4]["call_id"], "call_1");
         // Turn 3: the truncated turn's reasoning is dropped and its call rebuilt.
         let input = bodies[2]["input"].as_array().unwrap();
         let text = serde_json::to_string(input).unwrap();
