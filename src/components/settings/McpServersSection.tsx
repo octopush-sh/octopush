@@ -108,7 +108,7 @@ export function McpServersSection() {
   const entries = Object.entries(servers).sort(([a], [b]) => a.localeCompare(b));
 
   return (
-    <div className="mt-10 max-w-[640px]">
+    <div className="mt-10">
       <SectionLabel>MCP Servers</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         Local (stdio) Model Context Protocol servers whose tools become available

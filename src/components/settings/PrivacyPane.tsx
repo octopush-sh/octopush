@@ -35,7 +35,7 @@ export const AGENT_CLI_LEAD_IN = "Agent CLIs";
  *  a 16px gutter, so a wrapped line hangs under the text and never under the
  *  marker. The marker takes the item's own colour. Exported for the test. */
 export const INVENTORY_LIST_CLASS =
-  "max-w-[640px] list-disc space-y-2 pl-4 text-[13px] leading-[1.6] text-octo-sage";
+  "list-disc space-y-2 pl-4 text-[13px] leading-[1.6] text-octo-sage";
 /** The outbound destinations: the same list, one level in. */
 export const OUTBOUND_LIST_CLASS = "mt-1 list-disc space-y-1 pl-4";
 /** Every item opens with its lead-in in the serif voice. */
@@ -95,7 +95,7 @@ export function PrivacyPane() {
         </li>
       </ul>
 
-      <div className="mt-8 max-w-[640px] space-y-2">
+      <div className="mt-8 space-y-2">
         <QuietClaudeCodeRow />
         <p
           className="text-[12px] leading-[1.55] text-octo-sage"

@@ -92,7 +92,7 @@ function ClaudeCodeCard() {
   const cliNote = updateLabel ?? claudeSecurityLabel(cli);
 
   return (
-    <div className="mt-8 max-w-[640px]">
+    <div className="mt-8">
       <SectionLabel>Coding Agents</SectionLabel>
       <p className="mb-4 text-[12px] leading-[1.55] text-octo-mute">
         The Octopush MCP server lets agents in your terminal author DIRECT-mode pipelines and

@@ -12,7 +12,7 @@ export function ShortcutsPane() {
         subtitle="A reference of every keybinding Octopush respects."
       />
 
-      <div className="max-w-[640px]">
+      <div>
         <ShortcutGroup title="Navigation">
           <Shortcut keys="⌘1 … ⌘9" desc="Switch to workspace N" />
           {/* In switcher order, from the same table as its tooltips. */}
