@@ -146,6 +146,59 @@ describe("HistorySheet unpriced stages", () => {
     expect(screen.queryByText(/\+ unpriced/)).toBeNull();
   });
 
+  it("keeps ' + unpriced' when the unpriced stages were folded into the summary stage (#978)", async () => {
+    const summary = (includes_unpriced?: boolean) => ({
+      role: "… (12 stages truncated)",
+      model: null,
+      status: "truncated",
+      cost_usd: 0,
+      ...(includes_unpriced === undefined ? {} : { includes_unpriced }),
+    });
+    const folded = mkRun(
+      "r6",
+      "Folded run",
+      [{ role: "plan", model: "claude-opus-5-5", status: "done", cost_usd: 0.2 }, summary(true)],
+      0.2,
+    );
+    const allFolded = mkRun("r7", "All folded run", [summary(true)], 0);
+    const older = mkRun(
+      "r8",
+      "Older folded run",
+      [{ role: "plan", model: "claude-opus-5-5", status: "done", cost_usd: 0.2 }, summary()],
+      0.2,
+    );
+    useHistoryStore.setState({ runs: [folded, allFolded, older] });
+    const { unmount } = render(<HistorySheet />);
+    await waitFor(() => expect(unpricedModelsMock).toHaveBeenCalled());
+    const row = screen.getByText("Folded run").closest("button")!;
+    expect(within(row).getByText("$0.20")).toBeInTheDocument();
+    expect(within(row).getByText(/\+ unpriced/)).toHaveAttribute(
+      "title",
+      expect.stringContaining("folded into one summary to fit the sync limit"),
+    );
+    const all = screen.getByText("All folded run").closest("button")!;
+    expect(within(all).getByText("unpriced")).toBeInTheDocument();
+    expect(within(all).queryByText("$0.00")).toBeNull();
+    // A payload from before the marker (or one whose folded stages were all
+    // priced) reads as it always did.
+    const before = screen.getByText("Older folded run").closest("button")!;
+    expect(within(before).getByText("$0.20")).toBeInTheDocument();
+    expect(within(before).queryByText(/unpriced/)).toBeNull();
+    unmount();
+
+    // The detail header keeps it too, naming a model it can see as well.
+    useHistoryStore.setState({
+      runs: [mkRun("r9", "Mixed folded run", [...mixed.stages, summary(true)], 0.3)],
+      viewedRunId: "r9",
+      detailByRun: { r9: { ...mixedDetail, run_id: "r9" } },
+    });
+    render(<HistorySheet />);
+    await waitFor(() => expect(screen.getByText(/\+ unpriced/)).toBeInTheDocument());
+    const title = screen.getByText(/\+ unpriced/).getAttribute("title") ?? "";
+    expect(title).toContain("No price for gw/mystery-1");
+    expect(title).toContain("folded into one summary");
+  });
+
   it("does not add ' + unpriced' for a stage priced on its origin Mac", async () => {
     const origin = mkRun(
       "r5",

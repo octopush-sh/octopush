@@ -680,6 +680,10 @@ export interface SyncedRunStage {
   model: string | null;
   status: string;
   cost_usd: number;
+  /** Only on the summary stage that stands in for stages cut to fit the sync
+   *  size limit: one of them was unpriced on the Mac that ran it (#978).
+   *  Absent (false) on every other stage and on older payloads. */
+  includes_unpriced?: boolean;
 }
 export interface SyncedRunStageDetail {
   position: number;

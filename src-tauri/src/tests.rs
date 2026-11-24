@@ -27267,6 +27267,7 @@ mod sync_contract_tests {
             model: Some("m".repeat(200)),
             status: "completed".into(),
             cost_usd: 0.5,
+            includes_unpriced: false,
         };
         run.stages = (0..2_000).map(stage).collect();
         let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
@@ -27289,6 +27290,227 @@ mod sync_contract_tests {
         keys.sort();
         assert_eq!(keys, ["cost_usd", "model", "role", "status"]);
         assert_eq!(crate::sync::truncated_stages_label(1), "… (1 stage truncated)");
+    }
+
+    // ── Sync follow-ups (#978) ───────────────────────────────────────────
+
+    /// `n` stages of about 290 JSON bytes each, priced (cost 0.5) on a known
+    /// model, so 2,000 of them (about 580 KB) are well over the per-run budget.
+    fn many_stages(n: usize) -> Vec<crate::sync::SyncStage> {
+        (0..n)
+            .map(|i| crate::sync::SyncStage {
+                role: format!("role-{i}-{}", "r".repeat(200)),
+                model: Some("claude-sonnet-4-5".into()),
+                status: "completed".into(),
+                cost_usd: 0.5,
+                includes_unpriced: false,
+            })
+            .collect()
+    }
+
+    fn keys_of(v: &serde_json::Value) -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    /// The test's price check: only `gw/` models are unpriced.
+    fn gw_unpriced(model: &str) -> bool {
+        model.starts_with("gw/")
+    }
+
+    #[test]
+    fn an_unknown_library_kind_is_unreadable() {
+        let raw: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[
+                {"kind":"pipeline","item_id":"p1","updated_at":"2026-11-01T00:00:00Z","data":{"id":"p1"}},
+                {"kind":"role","item_id":"r1","deleted":true},
+                {"kind":"prompt","item_id":"x1","updated_at":"2026-11-01T00:00:00Z","data":{}},
+                {"kind":"prompt","item_id":"x2","deleted":true},
+                {"item_id":"no kind"}
+            ]"#,
+        )
+        .unwrap();
+        let (items, unreadable) = crate::sync::read_library_items(raw);
+        let got: Vec<(&str, &str)> = items.iter().map(|i| (i.kind.as_str(), i.item_id.as_str())).collect();
+        assert_eq!(got, [("pipeline", "p1"), ("role", "r1")]);
+        assert_eq!(unreadable, 3, "two of an unknown kind (an edit and a tombstone) and one malformed");
+        assert_eq!(crate::sync::LIBRARY_KINDS, ["pipeline", "role"]);
+        let (items, unreadable) = crate::sync::read_library_items(Vec::new());
+        assert!(items.is_empty() && unreadable == 0);
+    }
+
+    #[tokio::test]
+    async fn a_pull_with_an_unknown_kind_keeps_no_next_since() {
+        reset(false, true);
+        let dir = tempfile::tempdir().unwrap();
+        library_settings(&dir);
+        let mut body = fixture_json("sync-library.pull.response.json");
+        let known = body["items"].as_array().unwrap().len();
+        body["items"].as_array_mut().unwrap().push(serde_json::json!({
+            "kind": "prompt", "item_id": "x1", "updated_at": "2026-11-01T00:00:00Z", "data": {}
+        }));
+        body["next_since"] = serde_json::Value::String(fresh_since());
+        let (base, _) = scripted(vec![(200, body.to_string())]).await;
+        test_net::set(Some(base), token());
+        let pull = crate::sync::pull_library(&reqwest::Client::new()).await.unwrap();
+        assert_eq!((pull.received, pull.items.len(), pull.unreadable), (known + 1, known, 1));
+        assert!(pull.next_since.is_some());
+        assert_eq!(crate::sync::library_since_to_keep(&pull, 0), None);
+        crate::sync::commit_library_pull(&pull, 0);
+        assert_eq!(library_since::load(), None, "the next pull is full, so the item comes back once it can be read");
+
+        // The same answer with only known kinds keeps it.
+        let mut known_only = pull.clone();
+        known_only.unreadable = 0;
+        assert!(crate::sync::library_since_to_keep(&known_only, 0).is_some());
+        test_settings_path::set(None);
+    }
+
+    #[test]
+    fn folded_unpriced_stages_keep_the_marker_on_the_summary() {
+        let mut run = big_run("short".into());
+        run.stages = many_stages(2_000);
+        // The last stage (certainly folded) ran on a model this Mac can't price.
+        let last = run.stages.last_mut().unwrap();
+        last.model = Some("gw/mystery-1".into());
+        last.cost_usd = 0.0;
+        let total: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+        assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+        let (summary, kept) = run.stages.split_last().unwrap();
+        assert_eq!(summary.status, crate::sync::TRUNCATED_STAGES_STATUS);
+        assert!(summary.includes_unpriced);
+        let after: f64 = run.stages.iter().map(|s| s.cost_usd).sum();
+        assert!((after - total).abs() < 1e-6, "stage costs still add up");
+
+        // On the wire the one new key is on the summary stage only.
+        let v = serde_json::to_value(&run).unwrap();
+        let stages = v["stages"].as_array().unwrap();
+        assert_eq!(
+            keys_of(stages.last().unwrap()),
+            ["cost_usd", "includes_unpriced", "model", "role", "status"]
+        );
+        assert_eq!(stages.last().unwrap()["includes_unpriced"], true);
+        for s in &stages[..kept.len()] {
+            assert_eq!(keys_of(s), ["cost_usd", "model", "role", "status"]);
+        }
+        let want = keys_of(&fixture_json("sync-runs.push.one.json")["runs"][0]);
+        assert_eq!(keys_of(&v), want, "no run-level key is added");
+
+        // It reads back, and the local mirror keeps it.
+        let back: SyncRun = serde_json::from_value(v).unwrap();
+        assert!(back.stages.last().unwrap().includes_unpriced);
+    }
+
+    #[test]
+    fn the_marker_follows_historys_unpriced_rule() {
+        // History flags a stage only with no cost and a model it can't price.
+        for (model, cost, flagged) in [
+            (Some("gw/mystery-1"), 0.0, true),
+            (Some("gw/mystery-1"), 0.25, false), // priced on its origin Mac
+            (Some("claude-sonnet-4-5"), 0.0, false), // a priced model that cost nothing
+            (None, 0.0, false),
+            (Some(""), 0.0, false),
+        ] {
+            let mut run = big_run("short".into());
+            run.stages = many_stages(2_000);
+            let last = run.stages.last_mut().unwrap();
+            last.model = model.map(str::to_string);
+            last.cost_usd = cost;
+            assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+            let summary = run.stages.last().unwrap();
+            assert_eq!(summary.status, crate::sync::TRUNCATED_STAGES_STATUS);
+            assert_eq!(summary.includes_unpriced, flagged, "{model:?} at {cost}");
+            let json = serde_json::to_string(&run).unwrap();
+            assert_eq!(json.contains("includes_unpriced"), flagged, "sent only when true");
+        }
+
+        // An unpriced stage that stays in the list doesn't mark the summary:
+        // History still sees it on its own.
+        let mut run = big_run("short".into());
+        run.stages = many_stages(2_000);
+        run.stages[0].model = Some("gw/mystery-1".into());
+        run.stages[0].cost_usd = 0.0;
+        assert!(crate::sync::cap_run_payload_with(&mut run, &gw_unpriced));
+        assert_eq!(run.stages[0].model.as_deref(), Some("gw/mystery-1"));
+        assert!(!run.stages.last().unwrap().includes_unpriced);
+
+        // A run under the budget is untouched and carries no marker at all.
+        let mut small = big_run("short".into());
+        assert!(!crate::sync::cap_run_payload_with(&mut small, &|_: &str| true));
+        assert!(!serde_json::to_string(&small).unwrap().contains("includes_unpriced"));
+    }
+
+    #[test]
+    fn an_older_payload_reads_the_marker_as_false() {
+        let fixture = fixture_json("sync-runs.push.one.json");
+        let run: SyncRun = serde_json::from_value(fixture["runs"][0].clone()).unwrap();
+        assert!(run.stages.iter().all(|s| !s.includes_unpriced));
+        // Re-serialized (the local mirror, the frontend), it is the same JSON.
+        assert_eq!(serde_json::to_value(&run).unwrap()["stages"], fixture["runs"][0]["stages"]);
+        let marked: crate::sync::SyncStage = serde_json::from_str(
+            r#"{"role":"… (3 stages truncated)","model":null,"status":"truncated","cost_usd":0,"includes_unpriced":true}"#,
+        )
+        .unwrap();
+        assert!(marked.includes_unpriced);
+    }
+
+    #[tokio::test]
+    async fn push_runs_sends_the_marker_only_on_a_folded_summary() {
+        reset(true, false);
+        let (base, seen) = scripted(vec![(200, r#"{"ok":true,"count":2,"skipped":0}"#.into())]).await;
+        test_net::set(Some(base), token());
+        let small = big_run("small".into());
+        let mut folded = big_run("short".into());
+        folded.run_id = "00000000-0000-4000-8000-0000000f0010".into();
+        folded.stages = many_stages(2_000);
+        let last = folded.stages.last_mut().unwrap();
+        last.model = Some("gw/not-in-any-price-table".into());
+        last.cost_usd = 0.0;
+        assert_eq!(crate::sync::push_runs(&reqwest::Client::new(), vec![small, folded]).await, PushOutcome::Sent);
+        let reqs = requests(&seen);
+        let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+        let runs = body["runs"].as_array().unwrap();
+        assert!(!runs[0].to_string().contains("includes_unpriced"), "an uncut run is sent as before");
+        let stages = runs[1]["stages"].as_array().unwrap();
+        assert_eq!(stages.last().unwrap()["includes_unpriced"], true);
+        let marked = stages.iter().filter(|s| s.get("includes_unpriced").is_some()).count();
+        assert_eq!(marked, 1);
+    }
+
+    #[test]
+    fn the_task_keeps_its_4096_byte_floor_while_stages_can_go() {
+        assert_eq!(crate::sync::TASK_FLOOR_BYTES, 4_096);
+        // A long task and too many stages: the task stops at the floor, and
+        // the stages are folded to make the rest of the room.
+        for task in ["t".repeat(100_000), "é".repeat(50_000), "t".repeat(4_097)] {
+            let mut run = big_run(task.clone());
+            run.stages = many_stages(2_000);
+            assert!(cap_run_payload(&mut run));
+            assert!(json_len(&run) <= MAX_RUN_PAYLOAD_BYTES);
+            assert!(run.task.ends_with(TRUNCATION_MARK), "cut, with the mark");
+            assert!(run.task.len() <= crate::sync::TASK_FLOOR_BYTES);
+            // On a char boundary: a two-byte char may leave it one byte short.
+            assert!(run.task.len() >= crate::sync::TASK_FLOOR_BYTES - 1, "{}", run.task.len());
+            assert!(task.starts_with(run.task.trim_end_matches(TRUNCATION_MARK)));
+            assert_eq!(run.stages.last().unwrap().status, crate::sync::TRUNCATED_STAGES_STATUS);
+            assert!(run.stages.len() > 1, "stages were kept as well");
+        }
+        // A task at the floor is not cut at all for the stages' sake.
+        let mut run = big_run("f".repeat(4_096));
+        run.stages = many_stages(2_000);
+        assert!(cap_run_payload(&mut run));
+        assert_eq!(run.task, "f".repeat(4_096));
+        assert_eq!(run.stages.last().unwrap().status, crate::sync::TRUNCATED_STAGES_STATUS);
+        // With stages that fit, a task over the budget is cut to fit the run,
+        // far above the floor, and no stage is folded.
+        let mut run = big_run("g".repeat(300_000));
+        let stages = run.stages.len();
+        assert!(cap_run_payload(&mut run));
+        assert!(run.task.len() > 200_000, "{}", run.task.len());
+        assert_eq!(run.stages.len(), stages);
+        assert!(run.stages.iter().all(|s| s.status != crate::sync::TRUNCATED_STAGES_STATUS));
     }
 }
 
