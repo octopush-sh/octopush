@@ -2046,6 +2046,40 @@ where
     scan_now(collect).await.map(Some)
 }
 
+/// One block of text Talk is about to attach to a message (#1046): a file or
+/// its line range, a folder listing, a Run session's output, a diff.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TextBlock {
+    /// What a finding names: the file's path, or the `@token` of the block.
+    pub label: String,
+    pub text: String,
+    /// The line number of the text's first line (a range starts mid-file).
+    #[serde(default)]
+    pub first_line: Option<u32>,
+    /// The block is a whole file, so a name like `id_rsa` is a finding too.
+    #[serde(default)]
+    pub whole_file: bool,
+}
+
+/// Talk's blocks as what the scan reads: every line of each, numbered from
+/// its first line. Nothing is left unscanned (each block is capped at 64k).
+pub fn text_files(blocks: Vec<TextBlock>) -> Collected {
+    let files = blocks
+        .into_iter()
+        .map(|b| {
+            let first = b.first_line.unwrap_or(1).max(1);
+            AddedFile {
+                path: b.label,
+                is_new: b.whole_file,
+                lines: b.text.split('\n').enumerate().map(|(i, l)| (first + i as u32, l.to_string())).collect(),
+                ..AddedFile::default()
+            }
+        })
+        .collect();
+    Collected { files, partial: false, scope: "talk", unscanned: Vec::new() }
+}
+
 /// Scan what `collect` gathers, on a blocking thread, whatever the guard's
 /// switch says: for a scan the user asked for (#820). Enforces nothing.
 pub async fn scan_now<F>(collect: F) -> AppResult<ScanPreview>

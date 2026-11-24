@@ -12,12 +12,15 @@
  * Every expansion shares the 64k cap whole-file mentions already use. The
  * composer shows each resolved token as a removable chip with its token
  * estimate; the chip mirrors the text, so removing it removes the token.
+ * A token with a space in it is quoted whole: `@"docs/my notes.md#L3-9"`.
  */
 
 import { rankFiles } from "./mentions";
 
 /** The byte/char cap every expansion shares (the `@file` read cap). */
 export const CONTEXT_CAP = 64_000;
+/** Most context mentions one message attaches; later ones stay prose. */
+export const MAX_MENTIONS = 10;
 /** How many of a session's last lines `@session` attaches. */
 export const SESSION_TAIL_LINES = 200;
 /** Most entries a folder listing names before it says how many it left out. */
@@ -112,26 +115,42 @@ function resolveToken(token: string, cat: ContextCatalog): ContextRef | null {
   return null;
 }
 
+/** How a token is written after `@`: quoted whole when it holds whitespace,
+ *  so `@"docs/my notes.md#L3"` stays one token. */
+export function quoteToken(token: string): string {
+  return /\s/.test(token) ? `"${token}"` : token;
+}
+
 /** Every context token of a draft, in order, once each. Stray `@handles` and
  *  tokens naming nothing the workspace has are left as prose. */
 export function extractContextRefs(text: string, cat: ContextCatalog): ContextRef[] {
   const out: ContextRef[] = [];
-  const re = /(?:^|[\s([{"'`])@(\S+)/g;
+  const re = /(?:^|[\s([{"'`])@(?:"([^"\n]+)"|(\S+))/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
-    const raw = m[1];
-    const ref = resolveToken(raw, cat) ?? resolveToken(raw.replace(TRAILING_PUNCT, ""), cat);
+    const ref =
+      m[1] != null
+        ? resolveToken(m[1], cat)
+        : (resolveToken(m[2], cat) ?? resolveToken(m[2].replace(TRAILING_PUNCT, ""), cat));
     if (ref && !out.some((r) => r.token === ref.token)) out.push(ref);
   }
   return out;
 }
 
-/** Remove the first `@token` from a draft (and one space after it). The token
- *  only matches where the extractor would have ended it — trailing
- *  punctuation, then whitespace or the end — so `@diff` never matches the
- *  start of `@diff:src/a.ts`. */
+/** The refs a message attaches (the first MAX_MENTIONS) and how many it
+ *  leaves as prose past that cap. */
+export function capRefs(refs: ContextRef[]): { kept: ContextRef[]; over: number } {
+  return { kept: refs.slice(0, MAX_MENTIONS), over: Math.max(0, refs.length - MAX_MENTIONS) };
+}
+
+/** Remove the first `@token` from a draft (and one space after it), quoted
+ *  or not. A bare token only matches where the extractor would have ended it
+ *  — trailing punctuation, then whitespace or the end — so `@diff` never
+ *  matches the start of `@diff:src/a.ts`. */
 export function removeContextToken(text: string, token: string): string {
   const esc = token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const quoted = new RegExp(`(^|[\\s([{"'\`])@"${esc}" ?`);
+  if (quoted.test(text)) return text.replace(quoted, "$1");
   const re = new RegExp(`(^|[\\s([{"'\`])@${esc}(?=[.,;:!?)\\]}'"\`]*(?:$|\\s)) ?`);
   return text.replace(re, "$1");
 }
@@ -234,15 +253,160 @@ export function stripAnsi(s: string): string {
     .replace(/\x1b[@-Z\\-_]/g, "");
 }
 
-/** One file's section of a unified diff, or "" when it isn't in it. */
+const GIT_ESCAPES: Record<string, number> = { a: 7, b: 8, t: 9, n: 10, v: 11, f: 12, r: 13, '"': 34, "\\": 92 };
+
+/** Undo git's C-style quoting of a path in a diff header — what it writes
+ *  for a path with a quote, a backslash, a control character or (with
+ *  `core.quotePath`, the default) any non-ASCII byte: `"a/caf\303\251.ts"`
+ *  → `a/café.ts`. An unquoted path comes back as is. */
+export function unquoteGitPath(s: string): string {
+  if (s.length < 2 || !s.startsWith('"') || !s.endsWith('"')) return s;
+  const body = s.slice(1, -1);
+  const enc = new TextEncoder();
+  const bytes: number[] = [];
+  for (let i = 0; i < body.length; i++) {
+    if (body[i] === "\\" && i + 1 < body.length) {
+      const oct = /^[0-7]{3}/.exec(body.slice(i + 1, i + 4));
+      if (oct) {
+        bytes.push(parseInt(oct[0], 8));
+        i += 3;
+      } else {
+        bytes.push(GIT_ESCAPES[body[i + 1]] ?? body.charCodeAt(i + 1));
+        i += 1;
+      }
+      continue;
+    }
+    const cp = body.codePointAt(i)!;
+    if (cp > 0xffff) i++;
+    bytes.push(...enc.encode(String.fromCodePoint(cp)));
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/** One file's section of a unified diff, or "" when it isn't in it. A path
+ *  git quoted in the header (non-ASCII, a quote…) is matched unquoted. */
 export function diffForFile(diff: string, path: string): string {
   const parts = diff.split(/^(?=diff --git )/m);
   return (
     parts.find((p) => {
       const head = p.slice(0, p.indexOf("\n") === -1 ? p.length : p.indexOf("\n"));
-      return head.endsWith(` b/${path}`) || head.includes(` a/${path} `);
+      if (head.endsWith(` b/${path}`) || head.includes(` a/${path} `)) return true;
+      const quoted = head.match(/"(?:[^"\\]|\\.)*"/g) ?? [];
+      return quoted.some((q) => {
+        const name = unquoteGitPath(q);
+        return name === `a/${path}` || name === `b/${path}`;
+      });
     }) ?? ""
   ).trimEnd();
+}
+
+/** What the secret guard reads of a diff: its file sections as the files'
+ *  own lines, so the rules a path decides (`.env`, `id_rsa`, MCP configs,
+ *  tests, docs) apply as they do to a commit. Per section, each hunk's new
+ *  side (context and added lines, `+`/space dropped) is one input numbered
+ *  from its `@@ +N` header, and each run of removed lines another, numbered
+ *  from `-N`. The text after a hunk header's `@@ … @@` is a file's line too:
+ *  git and libgit2 put there the nearest line before the hunk that starts
+ *  with a letter, `_` or `$`, so it is an input of its own, numbered as the
+ *  line before the hunk's new start. A new or untracked file's first input
+ *  is `wholeFile`, also when the diff has no lines for it (binary). The rest
+ *  of what is sent holds no file content and is left out: text before the
+ *  first section (`# Staged`), the extended header (`diff --git`, `index`,
+ *  modes, `---`/`+++`, `Binary files … differ`: paths, hashes and modes),
+ *  `\ No newline at end of file` and cut notes. */
+export function diffScanInputs(diff: string): {
+  label: string;
+  text: string;
+  firstLine: number;
+  wholeFile: boolean;
+}[] {
+  const out: { label: string; text: string; firstLine: number; wholeFile: boolean }[] = [];
+  for (const section of diff.split(/^(?=diff --git )/m)) {
+    if (!section.startsWith("diff --git ")) continue;
+    const lines = section.split("\n");
+    const label = diffSectionPath(lines);
+    let isNew = false;
+    let i = 1;
+    // The extended header, up to the first hunk.
+    for (; i < lines.length && !lines[i].startsWith("@@"); i++) {
+      if (lines[i].startsWith("new file mode") || lines[i] === "--- /dev/null") isNew = true;
+    }
+    const start = out.length;
+    let cur: { label: string; text: string; firstLine: number; wholeFile: boolean } | null = null;
+    let removed: string[] = [];
+    let removedAt = 0;
+    let oldN = 0;
+    let newLines: string[] = [];
+    let newAt = 0;
+    const flushRemoved = () => {
+      if (removed.length) out.push({ label, text: removed.join("\n"), firstLine: removedAt, wholeFile: false });
+      removed = [];
+    };
+    const flushNew = () => {
+      if (cur) cur.text = newLines.join("\n");
+      cur = null;
+      newLines = [];
+    };
+    for (; i < lines.length; i++) {
+      const l = lines[i];
+      const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@([\s\S]*)/.exec(l);
+      if (hunk) {
+        flushRemoved();
+        flushNew();
+        oldN = Number(hunk[1]);
+        newAt = Number(hunk[2]);
+        // The header's function context is sent with the diff: scan it too.
+        const context = hunk[3].replace(/^ /, "");
+        if (context.trim()) out.push({ label, text: context, firstLine: Math.max(1, newAt - 1), wholeFile: false });
+        cur = { label, text: "", firstLine: Math.max(1, newAt), wholeFile: false };
+        out.push(cur);
+        continue;
+      }
+      if (!cur) continue;
+      if (l.startsWith("-")) {
+        if (!removed.length) removedAt = Math.max(1, oldN);
+        removed.push(l.slice(1));
+        oldN++;
+      } else if (l.startsWith("+") || l.startsWith(" ")) {
+        flushRemoved();
+        newLines.push(l.slice(1));
+        if (l.startsWith(" ")) oldN++;
+      }
+      // `\ No newline at end of file`, a cut note: not the file's lines.
+    }
+    flushRemoved();
+    flushNew();
+    // Drop new-side inputs a hunk left empty (a pure deletion).
+    for (let j = out.length - 1; j >= start; j--) {
+      if (out[j].text === "" && out.length - start > 1) out.splice(j, 1);
+    }
+    if (isNew) {
+      if (out.length === start) out.push({ label, text: "", firstLine: 1, wholeFile: true });
+      else out[start].wholeFile = true;
+    }
+  }
+  return out;
+}
+
+/** The path of a diff section, unquoted: the new side's, or the old side's
+ *  for a deleted file, else read from the `diff --git` line itself. */
+function diffSectionPath(lines: string[]): string {
+  let oldPath = "";
+  for (const l of lines.slice(1)) {
+    if (l.startsWith("@@")) break;
+    const side = /^(\+\+\+|---) (.*)$/.exec(l);
+    if (!side || side[2] === "/dev/null") continue;
+    const p = unquoteGitPath(side[2]).replace(/^[ab]\//, "");
+    if (side[1] === "+++") return p;
+    oldPath = p;
+  }
+  if (oldPath) return oldPath;
+  const head = lines[0].slice("diff --git ".length);
+  const quoted = head.match(/"(?:[^"\\]|\\.)*"/g);
+  if (quoted?.length) return unquoteGitPath(quoted[quoted.length - 1]).replace(/^[ab]\//, "");
+  // `a/P b/P`: the two halves are the same path.
+  const half = (head.length - 1) / 2;
+  return Number.isInteger(half) ? head.slice(half + 1).replace(/^b\//, "") : head;
 }
 
 /** "812 B" / "14 KB" / "2.1 MB". */
@@ -279,9 +443,15 @@ export function capText(s: string): string {
   return s.length <= CONTEXT_CAP ? s : `${s.slice(0, CONTEXT_CAP)}\n… (cut at 64k characters)`;
 }
 
-/** A fenced block appended to the outgoing message, headed by a plain line. */
+/** A fenced block appended to the outgoing message, headed by a plain line.
+ *  The fence is longer than any run of backticks in the body, so content
+ *  that holds a fence of its own (a Markdown file, a diff of one) can't
+ *  close the block early. */
 export function fenced(heading: string, body: string, lang = ""): string {
-  return `\n\n${heading}\n\`\`\`${lang}\n${body}\n\`\`\``;
+  let longest = 0;
+  for (const run of body.match(/`+/g) ?? []) longest = Math.max(longest, run.length);
+  const fence = "`".repeat(Math.max(3, longest + 1));
+  return `\n\n${heading}\n${fence}${lang}\n${body}\n${fence}`;
 }
 
 /** The chip's short label: the basename (with its range), the folder, the

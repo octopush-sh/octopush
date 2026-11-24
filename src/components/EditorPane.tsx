@@ -41,7 +41,7 @@ import { useEditorPrefs } from "../stores/editorPrefsStore";
 import { useBlameStore } from "../stores/blameStore";
 import { EditorStatusBar } from "./EditorStatusBar";
 import { useChatStore } from "../stores/chatStore";
-import { rangeToken } from "../lib/talkContext";
+import { quoteToken, rangeToken } from "../lib/talkContext";
 import { navigate } from "../lib/tour/surfaces";
 import { EditorBinaryPane } from "./EditorBinaryPane";
 import { ConfirmDialog } from "./ConfirmDialog";
@@ -292,14 +292,15 @@ export function EditorPane({ workspaceId, workspacePath, diffText }: Props) {
   }>({ line: 1, col: 1, selections: 1, selFrom: null, selTo: null });
 
   // "Ask Talk about this": hand the selection's range to Talk's draft as
-  // `@path#L5-10` and switch to Talk. The selection stays as it was, so
-  // coming back to Review finds it still highlighted. Only offered for files
-  // inside the worktree (a token outside it names nothing in the catalog).
+  // `@path#L5-10` (quoted whole when the path has a space) and switch to
+  // Talk. The selection stays as it was, so coming back to Review finds it
+  // still highlighted. Only offered for files inside the worktree (a token
+  // outside it names nothing in the catalog).
   const askTalk = () => {
     if (!activeFile || pos.selFrom == null || pos.selTo == null) return;
     if (!activeFile.path.startsWith(workspacePath + "/")) return;
     const rel = activeFile.path.slice(workspacePath.length + 1);
-    useChatStore.getState().queueDraftInsert(workspaceId, `@${rangeToken(rel, pos.selFrom, pos.selTo)} `);
+    useChatStore.getState().queueDraftInsert(workspaceId, `@${quoteToken(rangeToken(rel, pos.selFrom, pos.selTo))} `);
     navigate({ kind: "mode", mode: "talk" });
   };
 

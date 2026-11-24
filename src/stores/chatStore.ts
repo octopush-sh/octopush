@@ -544,6 +544,10 @@ interface ChatState {
   forkThread: (workspaceId: string, threadId: string, messageId: number) => Promise<void>;
   /** Hand the composer its seeded draft once (null when there is none). */
   takeComposerSeed: (workspaceId: string) => string | null;
+  /** Give a workspace's composer a draft to take (after any seed it hasn't
+   *  taken yet): a Talk message the secret guard held when its workspace
+   *  was left. */
+  seedComposer: (workspaceId: string, draft: string) => void;
 }
 
 /** A turn parked on a turn-limit card outlives a webview reload; when a
@@ -1686,5 +1690,13 @@ export const useChatStore = create<ChatState>((set, get) => {
       }
       return seed;
     },
+
+    seedComposer: (workspaceId, draft) =>
+      set((s) => ({
+        composerSeedByWs: {
+          ...s.composerSeedByWs,
+          [workspaceId]: s.composerSeedByWs[workspaceId] ? `${s.composerSeedByWs[workspaceId]}\n\n${draft}` : draft,
+        },
+      })),
   };
 });

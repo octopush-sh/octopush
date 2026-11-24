@@ -5478,6 +5478,102 @@ pub async fn read_file_checked(path: String, max_bytes: Option<u64>) -> AppResul
     read_file_checked_inner(&path, max_bytes.unwrap_or(READ_CAP_BYTES))
 }
 
+/// Lines `start..=end` of a file, for Talk's `@path#L10-40` (#1046).
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum LineRangeResult {
+    /// `start`/`end` are the lines kept (clamped to the file; `start > end`
+    /// when the file ends before `start`). `total` is the file's line count
+    /// when the read reached its end, `None` when it stopped at `end`.
+    /// `cut`: the range was longer than `max_bytes`.
+    Text { content: String, start: u32, end: u32, total: Option<u32>, cut: bool },
+    Binary,
+    UnsupportedEncoding,
+}
+
+/// Sync core of `read_file_lines`: streams the file and stops after line
+/// `end`, so a range of a large file never reads (or holds) the whole file.
+/// Keeps at most `max_bytes` of the range; lines are counted as `split('\n')`
+/// counts them.
+pub(crate) fn read_file_lines_inner(path: &str, start: u32, end: u32, max_bytes: usize) -> AppResult<LineRangeResult> {
+    use std::io::BufRead;
+    let io = |e: std::io::Error| AppError::Other(format!("read_file_lines({path}): {e}"));
+    let start = start.max(1);
+    let end = end.max(start);
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path).map_err(io)?);
+    if reader.fill_buf().map_err(io)?.iter().take(BINARY_SNIFF_BYTES).any(|&b| b == 0) {
+        return Ok(LineRangeResult::Binary);
+    }
+    let mut out: Vec<u8> = Vec::new();
+    let mut cut = false;
+    let mut line: u32 = 1;
+    let mut done = false;
+    while !done {
+        let chunk = reader.fill_buf().map_err(io)?;
+        if chunk.is_empty() {
+            break;
+        }
+        let mut used = chunk.len();
+        let mut i = 0;
+        while i < chunk.len() {
+            let nl = chunk[i..].iter().position(|&b| b == b'\n').map(|p| i + p);
+            let seg_end = nl.unwrap_or(chunk.len());
+            if line >= start {
+                let room = max_bytes.saturating_sub(out.len());
+                let take = (seg_end - i).min(room);
+                out.extend_from_slice(&chunk[i..i + take]);
+                cut |= take < seg_end - i;
+            }
+            let Some(nl) = nl else { break };
+            if line >= end {
+                used = nl + 1;
+                done = true;
+                break;
+            }
+            if line >= start {
+                if out.len() < max_bytes {
+                    out.push(b'\n');
+                } else {
+                    cut = true;
+                }
+            }
+            line += 1;
+            i = nl + 1;
+        }
+        reader.consume(used);
+    }
+    // Stopped at `end` with nothing after it: the file has exactly `end` lines
+    // plus the empty one after its final newline.
+    let total = if !done {
+        Some(line)
+    } else if reader.fill_buf().map_err(io)?.is_empty() {
+        Some(line + 1)
+    } else {
+        None
+    };
+    let content = match String::from_utf8(out) {
+        Ok(s) => s,
+        // A cut that split a character: keep what precedes it.
+        Err(e) if cut && e.utf8_error().error_len().is_none() => {
+            let valid = e.utf8_error().valid_up_to();
+            let mut bytes = e.into_bytes();
+            bytes.truncate(valid);
+            String::from_utf8(bytes).unwrap_or_default()
+        }
+        Err(_) => return Ok(LineRangeResult::UnsupportedEncoding),
+    };
+    let last = total.map_or(end, |t| end.min(t));
+    Ok(LineRangeResult::Text { content, start, end: last, total, cut })
+}
+
+#[tauri::command]
+pub async fn read_file_lines(path: String, start: u32, end: u32, max_bytes: usize) -> AppResult<LineRangeResult> {
+    let path = expand_tilde(&path);
+    tokio::task::spawn_blocking(move || read_file_lines_inner(&path, start, end, max_bytes))
+        .await
+        .map_err(|e| AppError::Other(format!("read_file_lines: {e}")))?
+}
+
 /// Kept for any non-editor callers that want a plain string read.
 #[tauri::command]
 pub async fn read_file(path: String) -> AppResult<String> {
@@ -5842,6 +5938,14 @@ pub async fn abort_operation(workspace_path: String) -> AppResult<String> {
 pub async fn secret_scan_staged(workspace_path: String) -> AppResult<Option<crate::secret_scan::ScanPreview>> {
     let p = expand_tilde(&workspace_path);
     crate::secret_scan::preview(move || crate::secret_scan::staged_files(std::path::Path::new(&p))).await
+}
+
+/// The secret guard's rules over the context blocks a Talk message is about
+/// to attach (#1046). `None` when the guard is off. The composer asks before
+/// it sends; nothing leaves the Mac to scan them.
+#[tauri::command]
+pub async fn secret_scan_text(blocks: Vec<crate::secret_scan::TextBlock>) -> AppResult<Option<crate::secret_scan::ScanPreview>> {
+    crate::secret_scan::preview(move || Ok(crate::secret_scan::text_files(blocks))).await
 }
 
 /// "Scan this branch's commits" in Review (#820): the secret guard's rules

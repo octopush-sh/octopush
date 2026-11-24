@@ -3,14 +3,24 @@
  * push or pull request is refused with `SecretsFound`. Lists what was found
  * (kind · file:line · masked preview like `sk-ant-…9fQ2` — never the value,
  * #820), and says so when the scan stopped
- * at its 16 MB budget. "Leave it out" is the default focus and Escape's
- * action; the override is an explicit second choice that applies to this one
+ * at its 16 MB budget, or (a Talk message) which `@` blocks it couldn't
+ * scan at all. "Leave it out" is the default focus and Escape's
+ * action (for a Talk message, Escape cancels the send instead); the override is an explicit second choice that applies to this one
  * action and these exact findings only (the core rescans and checks the
  * fingerprint).
  */
 import { ShieldAlert } from "lucide-react";
 import { ModalShell } from "./ModalShell";
-import { PARTIAL_NOTE, PREVIEW_TIP, findingLocation, guardHeadline, overrideLabel, type GuardedAction, type SecretRefusal } from "../lib/secretGuard";
+import {
+  PARTIAL_NOTE,
+  PREVIEW_TIP,
+  findingLocation,
+  guardHeadline,
+  overrideLabel,
+  uncheckedNote,
+  type GuardedAction,
+  type SecretRefusal,
+} from "../lib/secretGuard";
 
 const SHOWN = 5;
 
@@ -22,22 +32,26 @@ interface Props {
   onLeaveOut: () => void;
   /** The explicit "regardless" for this one action. */
   onOverride: () => void;
+  /** Escape: `onLeaveOut` unless the caller cancels differently (a held
+   *  Talk message is not sent and its draft comes back). */
+  onClose?: () => void;
 }
 
-export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: Props) {
+export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride, onClose }: Props) {
   const { findings, total, partial } = refusal;
+  const unchecked = refusal.unchecked ?? [];
   const shown = findings.slice(0, SHOWN);
   const more = Math.max(total, findings.length) - shown.length;
   const yours = findings.some((f) => f.yours);
   return (
-    <ModalShell onClose={onLeaveOut} closeOnBackdrop={false} ariaLabel="Possible secret" panelClassName="w-full max-w-[460px]">
+    <ModalShell onClose={onClose ?? onLeaveOut} closeOnBackdrop={false} ariaLabel="Possible secret" panelClassName="w-full max-w-[460px]">
       <div data-tour="secret-guard-dialog" className="rounded-xl border border-octo-hairline bg-octo-panel p-6 shadow-2xl">
         <div className="flex items-center gap-2 font-mono text-[10px] uppercase tracking-[0.25em] text-octo-rouge">
           <ShieldAlert size={12} strokeWidth={1.75} aria-hidden />
           <span>Possible secret</span>
         </div>
         <h2 className="mt-2 font-serif text-[18px] leading-tight tracking-[-0.005em] text-octo-ivory">
-          {guardHeadline(action, findings, total)}
+          {guardHeadline(action, findings, total, unchecked)}
         </h2>
         {findings.length > 1 || total > findings.length ? (
           <ul className="mt-3 space-y-1" aria-label="What was found">
@@ -63,14 +77,19 @@ export function SecretGuardDialog({ action, refusal, onLeaveOut, onOverride }: P
             </p>
           )
         )}
-        {partial && (
+        {/* Blocks the guard couldn't scan: the lead names them when nothing
+            was found, else this line does. */}
+        {partial && (unchecked.length === 0 || total > 0) && (
           <p data-tour="secret-guard-partial" className="mt-3 font-mono text-[11px] text-octo-mute">
-            {PARTIAL_NOTE}
+            {unchecked.length > 0 ? uncheckedNote(unchecked) : PARTIAL_NOTE}
           </p>
         )}
         <p className="mt-3 text-[12px] leading-relaxed text-octo-sage">
           {yours ? "It matches a key you saved in Octopush. " : ""}
-          {total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one {action === "pr" ? "pull request" : action}. Octopush shows only a provider's prefix and the last four characters, and never stores the value.
+          {action === "message"
+            ? "Leave it out and the rest of the message is sent without it, or confirm for this one message."
+            : `${total > 0 ? "Take it out of the change, or confirm" : "Confirm"} for this one ${action === "pr" ? "pull request" : action}.`}{" "}
+          Octopush shows only a provider's prefix and the last four characters, and never stores the value.
         </p>
         <div className="mt-6 flex items-center justify-end gap-3">
           <button

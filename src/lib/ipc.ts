@@ -476,6 +476,13 @@ export type FileReadResult =
   | { kind: "unsupportedEncoding"; size: number; mtime: number }
   | { kind: "tooLarge"; size: number };
 
+/** `read_file_lines` (#1046): the lines kept (`start > end` when the file
+ *  ends before `start`), the file's line count once the read reached its end. */
+export type LineRangeResult =
+  | { kind: "text"; content: string; start: number; end: number; total: number | null; cut: boolean }
+  | { kind: "binary" }
+  | { kind: "unsupportedEncoding" };
+
 /** Cheap stat for external-change detection. `null` = file no longer exists. */
 export interface FileMeta {
   mtimeMs: number;
@@ -1102,6 +1109,11 @@ export const ipc = {
   readFile: (path: string) => invoke<string>("read_file", { path }),
   readFileChecked: (path: string, maxBytes?: number) =>
     invoke<FileReadResult>("read_file_checked", { path, maxBytes }),
+  /** Lines `start..end` of a file, streamed: stops after `end`, so a range of
+   *  a large file never reads all of it. `total` only when the read reached
+   *  the file's end; `cut` when the range ran past `maxBytes`. */
+  readFileLines: (path: string, start: number, end: number, maxBytes: number) =>
+    invoke<LineRangeResult>("read_file_lines", { path, start, end, maxBytes }),
   writeFile: (path: string, content: string) =>
     invoke<{ mtime: number }>("write_file", { path, content }),
   fileMeta: (path: string) => invoke<FileMeta | null>("file_meta", { path }),
@@ -1298,6 +1310,12 @@ export const ipc = {
    *  Read-only; rejects when no merge base resolves. */
   secretScanBranch: (workspacePath: string, base: string) =>
     invoke<SecretPreview>("secret_scan_branch", { workspacePath, base }),
+
+  /** Secret guard (#1046): the guard's rules over the context blocks a Talk
+   *  message is about to attach. `null` when the guard is off. A finding's
+   *  `file` is the block's `label`; its line counts from `firstLine`. */
+  secretScanText: (blocks: { label: string; text: string; firstLine?: number; wholeFile?: boolean }[]) =>
+    invoke<SecretPreview | null>("secret_scan_text", { blocks }),
 
   getStagedDiff: (path: string) => invoke<string>("get_staged_diff", { path }),
   amendCommit: (workspacePath: string, message: string, allowFindings?: string) =>
