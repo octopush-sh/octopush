@@ -869,6 +869,21 @@ mod effort {
     }
 
     #[test]
+    fn openai_gpt6_through_a_gateway_carries_effort_but_not_off() {
+        // Behind a gateway a GPT-6 id stays on Chat Completions, which sends
+        // the stage's effort as-is; Off sends nothing (`none` is Responses-only).
+        for m in ["gpt-6-sol", "gpt-6-astra", "gpt-6.2-sol", "openai/gpt-6.1-terra"] {
+            assert!(!openai_compat::uses_responses_api(m, "https://litellm.corp:4000/v1"), "{m}");
+            let mut req = sample_request();
+            req.model = m.into();
+            req.effort = Some(Effort::Max);
+            assert_eq!(openai_compat::build_request(&req)["reasoning_effort"], "max", "{m}");
+            req.effort = None;
+            assert!(openai_compat::build_request(&req).get("reasoning_effort").is_none(), "{m}");
+        }
+    }
+
+    #[test]
     fn openai_responses_request_carries_effort_unfolded() {
         let mut req = sample_request();
         req.model = "gpt-6.1-terra".into();
