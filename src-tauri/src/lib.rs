@@ -26,6 +26,7 @@ pub mod gateway;
 pub mod git_ops;
 pub mod git_url;
 pub mod mcp;
+pub mod notify_elsewhere;
 pub mod provider_router;
 pub mod providers;
 pub mod pty_client;
@@ -350,6 +351,10 @@ pub fn run() {
             // Settings
             commands::get_settings,
             commands::save_settings,
+            commands::get_notify_elsewhere,
+            commands::set_notify_elsewhere,
+            commands::notify_elsewhere_test,
+            commands::notify_elsewhere_preview,
             commands::unreadable_settings_path,
             commands::save_git_credentials,
             // Provider catalog

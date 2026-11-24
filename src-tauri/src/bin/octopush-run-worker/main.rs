@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use octopush_lib::db::Db;
+use octopush_lib::notify_elsewhere;
 use octopush_lib::orchestrator::events::EventSink;
 use octopush_lib::orchestrator::types::RunStatus;
 use octopush_lib::orchestrator::plan_wait::{self, PlanClaim};
@@ -181,6 +182,11 @@ async fn main() {
             WaitEnd::Gone => break Ok(RunStatus::Paused),
         }
     };
+
+    // "Notify me elsewhere" (#964): a park or a Routine's end this worker
+    // sent to the webhook may still be in flight. Let it finish (bounded:
+    // two short attempts) so it arrives even with the app closed.
+    notify_elsewhere::flush(notify_elsewhere::FLUSH_MAX).await;
 
     if let Err(e) = result {
         eprintln!("octopush-run-worker: drive failed: {e}");

@@ -10678,6 +10678,264 @@ mod orchestrator_tests {
         let s = ing.ingest().unwrap();
         assert_eq!((s.rows_inserted, s.rows_removed), (0, 0));
     }
+
+    /// "Notify me elsewhere" (#964) at the orchestrator's attention points:
+    /// each event, the names-only body, the quiet cases, and the detached
+    /// worker path (sent by the worker, relayed by the bridge, never twice).
+    mod notify_elsewhere {
+        use super::*;
+
+        type Got = Arc<parking_lot::Mutex<Vec<crate::notify_elsewhere::test_receiver::Seen>>>;
+
+        /// A webhook receiver on this Mac that answers 200.
+        async fn receiver() -> (String, Got) {
+            crate::notify_elsewhere::test_receiver::serve(crate::notify_elsewhere::test_receiver::Answer::Status(200)).await
+        }
+
+        fn bodies(got: &Got) -> Vec<Value> {
+            crate::notify_elsewhere::test_receiver::bodies(got)
+        }
+
+        /// Settings in a temp file, with the webhook on. Keep the dir alive.
+        fn turn_on(url: &str) -> tempfile::TempDir {
+            let dir = tempfile::tempdir().unwrap();
+            crate::settings::test_settings_path::set(Some(dir.path().join("settings.json")));
+            crate::notify_elsewhere::save(true, url).unwrap();
+            dir
+        }
+
+        fn reset() {
+            crate::settings::test_settings_path::set(None);
+        }
+
+        /// Every dispatched send has finished.
+        async fn settle() {
+            crate::notify_elsewhere::flush(crate::notify_elsewhere::FLUSH_MAX).await;
+        }
+
+        fn sent(got: &Got) -> Vec<String> {
+            bodies(got).iter().map(|b| b["event"].as_str().unwrap_or_default().to_string()).collect()
+        }
+
+        /// One-stage crew on the test workspace, whose mission is "Add dark
+        /// mode". The run's task stands in for a prompt that must never leave.
+        fn crew(db: &Arc<Mutex<Db>>, ws: &str, checkpoint: bool) -> (String, String) {
+            db.lock()
+                .insert_mission("m1", Some(ws), "p1", "build", "Add dark mode", "active", None, "worktree", "none", "{}")
+                .unwrap();
+            let pid = db.lock().insert_pipeline("NE", "d", false).unwrap();
+            db.lock().insert_pipeline_stage(&pid, 0, "plan", "m", "api", checkpoint, None, 0, None, 25).unwrap();
+            let run_id = db.lock().create_run(ws, &pid, "PROMPT-TEXT-NEVER-SENT", None, None, &[]).unwrap();
+            (pid, run_id)
+        }
+
+        /// Make `run_id` the run a Routine fired.
+        fn fired_by_routine(db: &Arc<Mutex<Db>>, pid: &str, run_id: &str) {
+            db.lock().insert_routine("r-ne", &routine_input(pid, "interval", "3600"), None, true).unwrap();
+            db.lock().stamp_routine_run("r-ne", run_id, &chrono::Utc::now().to_rfc3339()).unwrap();
+            assert!(db.lock().is_routine_run(run_id).unwrap());
+        }
+
+        fn sink() -> Arc<CollectingSink> {
+            Arc::new(CollectingSink { events: Mutex::new(vec![]) })
+        }
+
+        #[tokio::test]
+        async fn a_gate_sends_the_label_and_the_two_names_only() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let bodies = bodies(&got);
+            assert_eq!(bodies.len(), 1, "{bodies:?}");
+            let text = "Octopush · Checkpoint gate waiting · Add dark mode · P";
+            assert_eq!(
+                bodies[0],
+                serde_json::json!({
+                    "text": text, "content": text, "mission": "Add dark mode", "project": "P",
+                    "event": "checkpoint_gate",
+                })
+            );
+            let raw = bodies[0].to_string();
+            for never in ["PROMPT-TEXT", "did plan", "/tmp", "main", "w1", run_id.as_str()] {
+                assert!(!raw.contains(never), "{never} left the Mac: {raw}");
+            }
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_question_sends_a_fixed_label_never_the_question() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(
+                Arc::clone(&db),
+                sink(),
+                Box::new(BlockOnceRunner { asked: Default::default() }),
+            );
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["director_question"]);
+            let raw = bodies(&got)[0].to_string();
+            for never in ["datastore", "Postgres", "SQLite", "schema"] {
+                assert!(!raw.contains(never), "{never} left the Mac: {raw}");
+            }
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_failed_stage_sends_run_failed_and_never_the_error() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(FailingRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["run_failed"]);
+            assert!(!bodies(&got)[0].to_string().contains("boom"));
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_routine_sends_when_it_finishes_or_fails() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished"]);
+            assert_eq!(bodies(&got)[0]["text"], "Octopush · Routine finished · Add dark mode · P");
+
+            let (db, ws) = db_with_workspace();
+            let (pid, run_id) = crew(&db, &ws, false);
+            fired_by_routine(&db, &pid, &run_id);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(FailingRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["routine_finished", "routine_failed"]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn quiet_cases_send_nothing() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            // A crew the director started finishing is not a decision.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Completed);
+            // Nor is the director's own pause.
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            orch.request_pause(&run_id);
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let quiet = sent(&got);
+            assert!(quiet.is_empty(), "{quiet:?}");
+
+            // Off (and off is the default): a gate sends nothing.
+            crate::notify_elsewhere::save(false, &url).unwrap();
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert!(sent(&got).is_empty());
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_failed_send_is_one_journal_notice_and_the_run_carries_on() {
+            // Nothing listens on this port: connecting fails, once and on retry.
+            let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+            let _dir = turn_on(&format!("http://127.0.0.1:{port}/hook"));
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            let persisted = Arc::new(crate::orchestrator::persist::PersistingSink::new(sink(), Arc::clone(&db)));
+            let orch = Orchestrator::new_with_runner(Arc::clone(&db), persisted, Box::new(MockRunner));
+            assert_eq!(orch.run_to_pause(&run_id).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            let stage = db.lock().list_run_stages(&run_id).unwrap().remove(0);
+            assert_eq!(stage.status, "awaiting_checkpoint", "the park is untouched");
+            assert_eq!(db.lock().get_run(&run_id).unwrap().unwrap().status, "paused");
+            let notices: Vec<String> = db
+                .lock()
+                .list_stage_log(&stage.id)
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.contains("Notify me elsewhere"))
+                .collect();
+            assert_eq!(notices.len(), 1, "{notices:?}");
+            assert!(notices[0].contains("couldn't connect to the webhook"), "{}", notices[0]);
+            assert!(!notices[0].contains("127.0.0.1"), "the URL is never written: {}", notices[0]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn the_detached_worker_sends_and_the_bridge_only_relays() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, true);
+            // The app hands the segment to a worker and watches it.
+            assert!(db.lock().reserve_worker_lease(&run_id, "n1").unwrap());
+            assert!(db.lock().confirm_worker_lease(&run_id, "n1", std::process::id() as i64).unwrap());
+            let app_sink = sink();
+            let app = Orchestrator::new_with_runner(Arc::clone(&db), app_sink.clone(), Box::new(MockRunner));
+            app.prime_detached_watch(&run_id);
+
+            // The worker drives with its own headless orchestrator and a sink
+            // that reaches nobody, parks at the gate, sends, and waits for the
+            // send before it exits (as `octopush-run-worker` does).
+            let worker = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner)).into_headless();
+            assert_eq!(worker.drive_segment(&run_id, false).await.unwrap(), RunStatus::Paused);
+            settle().await;
+            assert_eq!(sent(&got), ["checkpoint_gate"]);
+            db.lock().clear_worker_lease(&run_id, "n1").unwrap();
+
+            // The app's bridge sees the segment end and relays the park to
+            // the window, without sending it a second time.
+            app.bridge_tick().unwrap();
+            assert!(app_sink.events.lock().iter().any(|e| e == "run://checkpoint"));
+            settle().await;
+            assert_eq!(sent(&got), ["checkpoint_gate"]);
+            reset();
+        }
+
+        #[tokio::test]
+        async fn a_worker_that_died_is_sent_by_the_app_that_repairs_it() {
+            let (url, got) = receiver().await;
+            let _dir = turn_on(&url);
+            let (db, ws) = db_with_workspace();
+            let (_, run_id) = crew(&db, &ws, false);
+            let stage_id = db.lock().list_run_stages(&run_id).unwrap()[0].id.clone();
+            db.lock().set_run_stage_status(&stage_id, "running").unwrap();
+            db.lock().set_run_status(&run_id, "running", false).unwrap();
+            // A lease whose worker is gone: no pid, heartbeat long stale.
+            assert!(db.lock().reserve_worker_lease(&run_id, "n-dead").unwrap());
+            let stale = (chrono::Utc::now() - chrono::Duration::seconds(300)).to_rfc3339();
+            db.lock()
+                .conn_ref()
+                .execute("UPDATE runs SET heartbeat_at = ?1 WHERE id = ?2", rusqlite::params![stale, run_id])
+                .unwrap();
+            let app = Orchestrator::new_with_runner(Arc::clone(&db), sink(), Box::new(MockRunner));
+            app.bridge_tick().unwrap();
+            assert_eq!(db.lock().list_run_stages(&run_id).unwrap()[0].status, "failed");
+            settle().await;
+            assert_eq!(sent(&got), ["run_failed"]);
+            reset();
+        }
+    }
 }
 
 #[cfg(test)]

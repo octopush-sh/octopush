@@ -6885,6 +6885,22 @@ impl Db {
         Ok(())
     }
 
+    /// Whether `run_id` is the run a Routine fired last (`last_run_id`) —
+    /// how "Notify me elsewhere" (#964) tells a Routine's crew from one the
+    /// director started. A Routine never fires again while its run is live
+    /// (the fire guards), so its run is still `last_run_id` when it ends.
+    pub fn is_routine_run(&self, run_id: &str) -> AppResult<bool> {
+        let found: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM routines WHERE last_run_id = ?1 LIMIT 1",
+                params![run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
     /// Record the outcome of a fire evaluation (dispatched, or a skip reason)
     /// on EVERY tick — `last_checked_at`/`last_outcome`. Independent of
     /// `stamp_routine_run` (which records the dispatched run itself); this keeps
