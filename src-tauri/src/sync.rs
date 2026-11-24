@@ -495,6 +495,17 @@ pub struct SyncStage {
     pub status: String,
     #[serde(default)]
     pub cost_usd: f64,
+    /// Only on the summary stage [`cap_run_payload`] folds trailing stages
+    /// into: at least one of them had no cost and a model this Mac can't
+    /// price, so History keeps the run's "+ unpriced" (#978). Sent only when
+    /// true, so every other stage, and every run that isn't cut, goes out
+    /// exactly as before; an older payload reads as false.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub includes_unpriced: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A friendly label for this machine ("MacBook Pro"), for "from …" attribution.
@@ -786,6 +797,7 @@ pub fn build_run_payload(db: &Db, run: &crate::db::RunRow, machine_id: &str) -> 
                 model: Some(s.agent_model.clone()),
                 status: s.status.clone(),
                 cost_usd: s.cost_usd,
+                includes_unpriced: false,
             })
             .collect(),
     }
@@ -802,7 +814,7 @@ pub const TRUNCATION_MARK: &str = "… (truncated)";
 const RUN_NAME_CAP_BYTES: usize = 1_024;
 const RUN_STAGE_FIELD_CAP_BYTES: usize = 256;
 /// How much of the task survives while stage summaries can still be dropped.
-const TASK_FLOOR_BYTES: usize = 4_096;
+pub(crate) const TASK_FLOOR_BYTES: usize = 4_096;
 
 /// Cut `s` to at most `max_bytes` (on a char boundary) ending in
 /// [`TRUNCATION_MARK`]. Returns whether it changed.
@@ -835,6 +847,19 @@ pub fn cap_run_payload(run: &mut SyncRun) -> bool {
     if run_json_len(run) <= MAX_RUN_PAYLOAD_BYTES {
         return false;
     }
+    // Only a run that is over budget reads the price catalog: the summary
+    // stage needs it to say whether a folded stage was unpriced.
+    let catalog = crate::token_engine::catalog();
+    let unpriced = |model: &str| crate::token_engine::prices_in(catalog.as_deref(), model).is_none();
+    cap_run_payload_with(run, &unpriced)
+}
+
+/// [`cap_run_payload`] with the price check injected: `unpriced_model` says
+/// whether this Mac can't price a model (the same test as `unpriced_models`).
+pub(crate) fn cap_run_payload_with(run: &mut SyncRun, unpriced_model: &dyn Fn(&str) -> bool) -> bool {
+    if run_json_len(run) <= MAX_RUN_PAYLOAD_BYTES {
+        return false;
+    }
     for name in [&mut run.machine_name, &mut run.workspace_name].into_iter().flatten() {
         truncate_with_mark(name, RUN_NAME_CAP_BYTES);
     }
@@ -860,7 +885,7 @@ pub fn cap_run_payload(run: &mut SyncRun) -> bool {
     };
     cut_task(run, TASK_FLOOR_BYTES);
     if run_json_len(run) > MAX_RUN_PAYLOAD_BYTES {
-        drop_trailing_stages(run);
+        drop_trailing_stages(run, unpriced_model);
     }
     cut_task(run, 0);
     true
@@ -874,12 +899,22 @@ pub fn truncated_stages_label(n: usize) -> String {
     format!("… ({n} stage{} truncated)", if n == 1 { "" } else { "s" })
 }
 
+/// Would History flag this stage "unpriced"? Its rule (`HistorySheet`'s
+/// `unpricedIn`): no cost, and a model the Mac can't price. A summary stage
+/// that already carries the marker counts too.
+fn stage_unpriced(s: &SyncStage, unpriced_model: &dyn Fn(&str) -> bool) -> bool {
+    s.includes_unpriced
+        || (s.cost_usd == 0.0 && s.model.as_deref().is_some_and(|m| !m.is_empty() && unpriced_model(m)))
+}
+
 /// Last resort of [`cap_run_payload`]: drop trailing stage summaries until the
 /// run fits, and say so honestly with one final summary stage in the existing
 /// shape (role `… (N stages truncated)`, status `truncated`, no model, the
 /// dropped stages' summed cost), so the run's stage costs still add up and the
-/// list never silently looks complete. No new field is sent.
-fn drop_trailing_stages(run: &mut SyncRun) {
+/// list never silently looks complete. The one field it may add is
+/// `includes_unpriced: true`, when a dropped stage was unpriced
+/// ([`stage_unpriced`]), so History's "+ unpriced" survives the fold.
+fn drop_trailing_stages(run: &mut SyncRun, unpriced_model: &dyn Fn(&str) -> bool) {
     if run.stages.is_empty() {
         return;
     }
@@ -889,6 +924,7 @@ fn drop_trailing_stages(run: &mut SyncRun) {
         model: None,
         status: TRUNCATED_STAGES_STATUS.to_string(),
         cost_usd: dropped.iter().map(|s| s.cost_usd).sum(),
+        includes_unpriced: dropped.iter().any(|s| stage_unpriced(s, unpriced_model)),
     };
     let mut dropped: Vec<SyncStage> = Vec::new();
     // Pop by size first (each stage plus its comma), leaving room for the
@@ -915,8 +951,8 @@ fn drop_trailing_stages(run: &mut SyncRun) {
             }
         }
     }
-    // `dropped` holds the stages newest-popped-first; only the count and
-    // cost are kept, so the order doesn't matter.
+    // `dropped` holds the stages newest-popped-first; only the count, the
+    // cost and whether any was unpriced are kept, so the order doesn't matter.
 }
 
 /// POST a batch of runs to the sync API. **Best-effort**: logs and returns on any
@@ -1272,8 +1308,28 @@ pub struct LibraryPull {
     /// How many items the service sent, readable or not. At
     /// [`LIBRARY_PULL_MAX_ITEMS`] the answer may have been cut short.
     pub received: usize,
-    /// Items the service sent that this build couldn't read as an envelope.
+    /// Items the service sent that this build couldn't read: not an envelope,
+    /// or an envelope of a kind it doesn't know ([`LIBRARY_KINDS`]).
     pub unreadable: usize,
+}
+
+/// The library kinds this build applies (`commands::apply_pulled_library`).
+pub const LIBRARY_KINDS: [&str; 2] = ["pipeline", "role"];
+
+/// Read a pull's raw items: the envelopes this build can apply, and how many
+/// it can't. An envelope of an unknown kind (one a newer build added) counts
+/// as unreadable, like one that doesn't parse, so the pull's `next_since` is
+/// dropped and the next pull is full: the item comes back once this build
+/// knows its kind, instead of being missed for good by incremental pulls.
+pub fn read_library_items(raw: Vec<serde_json::Value>) -> (Vec<SyncLibraryItem>, usize) {
+    let received = raw.len();
+    let items: Vec<SyncLibraryItem> = raw
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<SyncLibraryItem>(v).ok())
+        .filter(|i| LIBRARY_KINDS.contains(&i.kind.as_str()))
+        .collect();
+    let unreadable = received - items.len();
+    (items, unreadable)
 }
 
 /// The service answers at most this many library items per GET (`LIMIT 2000`,
@@ -1383,7 +1439,8 @@ pub fn commit_library_pull(pull: &LibraryPull, skipped: usize) {
 /// service answers `400 {"error":"bad_since"}` (the stored value is dropped
 /// and the pull retried once without it) it is a full pull. An older service
 /// that ignores `since` answers the whole library, which applies the same way.
-/// Lenient: an item this build can't parse is skipped, never fatal. Storing
+/// Lenient: an item this build can't parse, or of a kind it doesn't know, is
+/// skipped and counted as unreadable ([`read_library_items`]), never fatal. Storing
 /// the answer's `next_since` is the caller's step ([`commit_library_pull`]),
 /// after the items are applied.
 pub async fn pull_library(client: &reqwest::Client) -> AppResult<LibraryPull> {
@@ -1444,13 +1501,9 @@ pub async fn pull_library(client: &reqwest::Client) -> AppResult<LibraryPull> {
             .and_then(|v| v.as_str().map(str::to_string))
             .filter(|s| library_since_usable(s, chrono::Utc::now()));
         let received = parsed.items.len();
-        let items: Vec<SyncLibraryItem> = parsed
-            .items
-            .into_iter()
-            .filter_map(|v| serde_json::from_value::<SyncLibraryItem>(v).ok())
-            .collect();
+        let (items, unreadable) = read_library_items(parsed.items);
         return Ok(LibraryPull {
-            unreadable: received - items.len(),
+            unreadable,
             received,
             items,
             next_since,

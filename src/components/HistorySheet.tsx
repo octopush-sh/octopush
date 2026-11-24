@@ -53,12 +53,37 @@ function unpricedIn(stages: { model: string | null; cost_usd: number }[], unpric
   ];
 }
 
+/** Whether a run's summary stage says stages folded into it (cut to fit the
+ *  sync size limit) were unpriced on the Mac that ran them (#978). Their
+ *  models didn't travel, so this Mac can't check them itself. */
+function foldedUnpriced(stages: { includes_unpriced?: boolean }[]): boolean {
+  return stages.some((s) => s.includes_unpriced === true);
+}
+
+const FOLDED_UNPRICED_TITLE =
+  "Some stages were folded into one summary to fit the sync limit, and at least one had no price on the Mac that ran it — those calls are not counted as spend or as savings.";
+
+function runUnpricedTitle(models: string[], folded: boolean): string {
+  if (models.length === 0) return FOLDED_UNPRICED_TITLE;
+  return folded ? `${unpricedTitle(models)} ${FOLDED_UNPRICED_TITLE}` : unpricedTitle(models);
+}
+
 /** A run's total; " + unpriced" in mute when some of its stages can't be
- *  priced, or just "unpriced" when none of them could (never "$0.00"). */
-function RunTotal({ costUsd, unpricedModels }: { costUsd: number; unpricedModels: string[] }) {
-  if (costUsd === 0 && unpricedModels.length > 0) {
+ *  priced (by model, or folded into its summary stage), or just "unpriced"
+ *  when none of them could (never "$0.00"). */
+function RunTotal({
+  costUsd,
+  unpricedModels,
+  folded = false,
+}: {
+  costUsd: number;
+  unpricedModels: string[];
+  folded?: boolean;
+}) {
+  const flagged = unpricedModels.length > 0 || folded;
+  if (costUsd === 0 && flagged) {
     return (
-      <span className="text-octo-mute" title={unpricedTitle(unpricedModels)}>
+      <span className="text-octo-mute" title={runUnpricedTitle(unpricedModels, folded)}>
         unpriced
       </span>
     );
@@ -66,8 +91,8 @@ function RunTotal({ costUsd, unpricedModels }: { costUsd: number; unpricedModels
   return (
     <>
       {formatUsd(costUsd)}
-      {unpricedModels.length > 0 && (
-        <span className="text-octo-mute" title={unpricedTitle(unpricedModels)}>
+      {flagged && (
+        <span className="text-octo-mute" title={runUnpricedTitle(unpricedModels, folded)}>
           {" "}+ unpriced
         </span>
       )}
@@ -236,7 +261,11 @@ function RunList({
                 <span className={`shrink-0 ${meta.className}`}>{meta.glyph}</span>
                 <span className="min-w-0 flex-1 truncate text-[13px] text-octo-ivory">{run.task}</span>
                 <span className="shrink-0 font-mono text-[12px] text-octo-brass octo-tabular">
-                  <RunTotal costUsd={run.cost_usd} unpricedModels={unpricedIn(run.stages, unpriced)} />
+                  <RunTotal
+                    costUsd={run.cost_usd}
+                    unpricedModels={unpricedIn(run.stages, unpriced)}
+                    folded={foldedUnpriced(run.stages)}
+                  />
                 </span>
               </div>
               <div className="mt-1 flex items-center gap-1.5 font-mono text-[10px] text-octo-mute">
@@ -300,6 +329,7 @@ function RunDetailView({ run, unpriced }: { run: SyncedRun; unpriced: ReadonlySe
           <RunTotal
             costUsd={run.cost_usd}
             unpricedModels={unpricedIn([...run.stages, ...(detail?.stages ?? [])], unpriced)}
+            folded={foldedUnpriced(run.stages)}
           />
         </span>
         {detail && detail.stages.length > 0 && (
