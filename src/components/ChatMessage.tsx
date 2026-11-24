@@ -133,8 +133,13 @@ export function ChatMessage({ message, onOpenInEditor, skillNames }: Props) {
 
       {keyPhrase && (
         <div className="animate-keyfade-key">
+          {/* parseKeyPhrase only elevates plain prose and inline code; the
+              allow-list keeps any other element (a link, emphasis) out of the
+              serif line as its plain text, never as raw syntax. */}
           <ReactMarkdown
             remarkPlugins={REMARK_PLUGINS}
+            allowedElements={["p", "code"]}
+            unwrapDisallowed
             components={{
               code({ children }) {
                 return (

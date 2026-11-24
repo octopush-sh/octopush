@@ -57,6 +57,30 @@ describe("ChatMessage — GFM in assistant prose", () => {
     expect(screen.getByText("Perfecto!")).toBeInTheDocument();
     expect(screen.getByText("Aquí va el resto.")).toBeInTheDocument();
   });
+
+  it("keeps a reply that opens with a URL whole, as one linked body", () => {
+    const { container } = render(
+      <ChatMessage
+        message={{ role: "assistant", content: "The PR is open: https://github.com/acme/api/pull/12", model: "m" }}
+      />,
+    );
+    // No serif lead cut at "github." …
+    expect(container.querySelector(".animate-keyfade-key")).toBeNull();
+    // …and the body links the whole address.
+    const link = container.querySelector("a");
+    expect(link?.getAttribute("href")).toBe("https://github.com/acme/api/pull/12");
+    expect(container.textContent).toContain("The PR is open: https://github.com/acme/api/pull/12");
+  });
+
+  it("renders inline code in the serif lead as code, not backticks", () => {
+    const { container } = render(
+      <ChatMessage message={{ role: "assistant", content: "Bumped `app` to v0.4.141. Tests pass.", model: "m" }} />,
+    );
+    const lead = container.querySelector(".animate-keyfade-key");
+    expect(lead?.textContent).toBe("Bumped app to v0.4.141.");
+    expect(lead?.querySelector("code")?.textContent).toBe("app");
+    expect(lead?.querySelector("a")).toBeNull();
+  });
 });
 
 const USER_TURN = [
