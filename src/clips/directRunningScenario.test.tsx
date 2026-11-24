@@ -14,7 +14,11 @@ const live = vi.hoisted(() => ({ liveByStage: {}, liveContextByStage: {} }));
 vi.mock("../stores/runsStore", () => ({ useRunsStore: (sel: (s: typeof live) => unknown) => sel(live) }));
 vi.mock("../stores/rolesStore", () => ({ useRolesStore: { getState: () => ({ roles: [] }) } }));
 vi.mock("../hooks/useElapsed", () => ({ useElapsed: () => "00:00" }));
-vi.mock("../components/RunFlowNav", () => ({ RunFlowNav: () => null }));
+vi.mock("../components/RunFlowNav", () => ({
+  RunFlowNav: () => null,
+  useRailEdges: () => ({ overflowing: false, atStart: true, atEnd: true }),
+  railEdgeFade: () => "",
+}));
 
 const { RunFlow } = await import("../components/RunFlow");
 

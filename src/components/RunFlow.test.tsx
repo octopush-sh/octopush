@@ -9,7 +9,11 @@ vi.mock("../stores/rolesStore", () => ({
   useRolesStore: { getState: () => ({ roles: [] }) },
 }));
 vi.mock("../hooks/useElapsed", () => ({ useElapsed: () => "00:00" }));
-vi.mock("./RunFlowNav", () => ({ RunFlowNav: () => null }));
+const railEdges = vi.hoisted(() => ({ current: { overflowing: false, atStart: true, atEnd: true } }));
+vi.mock("./RunFlowNav", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./RunFlowNav")>()),
+  useRailEdges: () => railEdges.current,
+}));
 
 const { RunFlow } = await import("./RunFlow");
 
@@ -301,6 +305,42 @@ describe("RunFlow — depth of field & the single beacon", () => {
         }
       }
     }
+  });
+});
+
+describe("RunFlow — an overflowing track (#1053)", () => {
+  const renderWith = (edges: { overflowing: boolean; atStart: boolean; atEnd: boolean }) => {
+    railEdges.current = edges;
+    try {
+      return render(<RunFlow stages={stages} selectedStageId="b" beaconStageId="b" onSelectStage={() => {}} />);
+    } finally {
+      railEdges.current = { overflowing: false, atStart: true, atEnd: true };
+    }
+  };
+  const track = (c: HTMLElement) => c.querySelector('[data-tour="direct-run-track"]')!;
+
+  it("puts Earlier stages at the track's left edge and Later stages at its right", () => {
+    const { container } = renderWith({ overflowing: true, atStart: false, atEnd: false });
+    const row = track(container).parentElement!;
+    const kids = Array.from(row.children);
+    expect(kids).toHaveLength(3);
+    expect(kids[0].querySelector('[aria-label="Earlier stages"]')).toBeTruthy();
+    expect(kids[1]).toBe(track(container));
+    expect(kids[2].querySelector('[aria-label="Later stages"]')).toBeTruthy();
+  });
+
+  it("fades the left edge while it hides a stage, and only that edge", () => {
+    const { container } = renderWith({ overflowing: true, atStart: false, atEnd: true });
+    expect(track(container).className).toContain("[mask-image:linear-gradient(to_right,transparent,black_32px)]");
+    expect(screen.getByLabelText("Earlier stages")).toBeEnabled();
+    expect(screen.getByLabelText("Later stages")).toBeDisabled();
+  });
+
+  it("shows no chevrons and no fade when every stage fits", () => {
+    const { container } = renderWith({ overflowing: false, atStart: true, atEnd: true });
+    expect(screen.queryByLabelText("Earlier stages")).toBeNull();
+    expect(screen.queryByLabelText("Later stages")).toBeNull();
+    expect(track(container).className).not.toContain("mask-image");
   });
 });
 
