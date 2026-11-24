@@ -10455,6 +10455,35 @@ mod cli_runner_tests {
         assert!(!src[arm..calls[0].0].contains("\"none\" =>"), "not in the unsandboxed arm");
     }
 
+    #[test]
+    fn a_gateway_max_tokens_failure_on_2_1_329_names_the_release() {
+        use crate::orchestrator::cli_runner::{is_gateway_model, with_known_bad_release};
+        assert!(is_gateway_model("claude-sonnet-latest") && is_gateway_model("litellm/kimi-k3"));
+        for m in ["claude-sonnet-5-5", "bedrock/us.anthropic.claude-sonnet-5-5-v1:0", "sonnet", "opusplan", "default"] {
+            assert!(!is_gateway_model(m), "{m}");
+        }
+        let line = r#"{"type":"result","subtype":"success","is_error":true,
+            "result":"API Error: 400 max_tokens: 64000 > 32768, which is the maximum allowed","total_cost_usd":0.01}"#;
+        let failed = || parse_cli_result(line, false, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(failed().status, StageStatus::Failed);
+        let named = with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.329"));
+        let error = named.error.unwrap();
+        assert!(
+            error.starts_with(
+                "Skip Claude Code 2.1.329 on a gateway model: it drops the retry gateway models need when a max_tokens \
+                 error names a lower limit; 2.1.330 restores it. Update Claude Code, then resume or re-run.\n"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("API Error: 400 max_tokens: 64000 > 32768"), "the CLI's own error stays: {error}");
+        let unchanged = failed().error;
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", Some("2.1.330")).error, unchanged);
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-5-5", Some("2.1.329")).error, unchanged, "built-in model");
+        assert_eq!(with_known_bad_release(failed(), "claude-sonnet-latest", None).error, unchanged, "version unknown");
+        let done = parse_cli_result(SUCCESS, true, ArtifactKind::Diff, "").unwrap();
+        assert_eq!(with_known_bad_release(done, "claude-sonnet-latest", Some("2.1.329")).error, None);
+    }
+
     const SUCCESS: &str = r#"{
         "type":"result","subtype":"success","is_error":false,
         "result":"Implemented the feature.","total_cost_usd":0.0123,
