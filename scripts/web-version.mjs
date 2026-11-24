@@ -58,8 +58,10 @@ export function plain(s) {
  * One changelog entry from a release body: the bullets of its Features,
  * Improvements and Fixes sections ("- **Title** — text" becomes
  * "**Title.** text"). Null when the release has no user-facing change.
+ * With `meta.date`, the heading is followed by the date line the web's
+ * consistency gate requires on every entry.
  */
-export function changelogEntry(version, body) {
+export function changelogEntry(version, body, meta = {}) {
   const out = [];
   let keep = false;
   for (const line of String(body ?? "").split("\n")) {
@@ -70,7 +72,25 @@ export function changelogEntry(version, body) {
     const b = line.match(/^- \*\*(.+?)\*\*\s*[—–-]\s*(.+)$/);
     if (b) out.push(`**${plain(b[1].replace(/[.:]$/, ""))}.** ${plain(b[2].trim())}`);
   }
-  return out.length ? `## v${version}\n\n${out.join("\n\n")}\n` : null;
+  return out.length ? `${heading(version, meta)}${out.join("\n\n")}\n` : null;
+}
+
+/** The heading, plus the date line when the release date is known. */
+function heading(version, { date, stable } = {}) {
+  const line = date ? `<p class="changelog-date">${stable ? "Stable" : "Beta"} <time datetime="${date}">${date}</time></p>\n\n` : "";
+  return `## v${version}\n\n${line}`;
+}
+
+// The changelog's dates are calendar days in the owner's time zone, as the
+// entries since web#188 are (a release cut at 22:00 there is dated that day,
+// not UTC's).
+const CHANGELOG_TZ = "America/Bogota";
+
+/** A release's `published_at` as the changelog's YYYY-MM-DD, or null. */
+export function changelogDate(publishedAt) {
+  const t = Date.parse(publishedAt ?? "");
+  if (Number.isNaN(t)) return null;
+  return new Intl.DateTimeFormat("en-CA", { timeZone: CHANGELOG_TZ, year: "numeric", month: "2-digit", day: "2-digit" }).format(t);
 }
 
 /** The changelog with `entries` (newest first) above its newest `## v` entry. */
@@ -88,12 +108,18 @@ export function apply(webDir, version, releases) {
   const rel = readFileSync(relPath, "utf8");
   const from = currentVersion(rel);
   if (cmp(version, from) <= 0) return null;
-  const byVersion = new Map(releases.map((r) => [r.tag_name.replace(/^v/, ""), r.body]));
+  const byVersion = new Map(releases.map((r) => [r.tag_name.replace(/^v/, ""), r]));
   const versions = versionsBetween([...byVersion.keys()], from, version);
   if (!versions.includes(version)) throw new Error(`no release v${version}`);
   // Betas folded into this stable each get their entry; the changelog needs
   // at least the new version's heading (consistency-check reads it).
-  const entries = [...versions].reverse().map((v) => changelogEntry(v, byVersion.get(v)) ?? (v === version ? `## v${v}\n\nMaintenance and reliability fixes.\n` : null)).filter(Boolean);
+  // The version being promoted is stable; a beta folded into it is labelled
+  // by its own release (a stable the landing skipped stays "Stable").
+  const entries = [...versions].reverse().map((v) => {
+    const r = byVersion.get(v);
+    const meta = { date: changelogDate(r.published_at), stable: v === version || r.prerelease === false };
+    return changelogEntry(v, r.body, meta) ?? (v === version ? `${heading(v, meta)}Maintenance and reliability fixes.\n` : null);
+  }).filter(Boolean);
   writeFileSync(relPath, bumpReleaseTs(rel, version));
   writeFileSync(logPath, insertEntries(readFileSync(logPath, "utf8"), entries));
   return { from, versions };
@@ -104,7 +130,7 @@ function main() {
   if (!webDir || !SEMVER.test(version ?? "")) { console.error("usage: web-version.mjs <web-checkout> <X.Y.Z>"); return 64; }
   const repo = process.env.OCTOPUSH_APP_REPO || "octopush-sh/octopush";
   // Only the fields used: the full objects (assets included) outgrow any buffer.
-  const out = execFileSync("gh", ["api", "--paginate", `repos/${repo}/releases?per_page=100`, "--jq", ".[] | select(.draft | not) | {tag_name, body}"],
+  const out = execFileSync("gh", ["api", "--paginate", `repos/${repo}/releases?per_page=100`, "--jq", ".[] | select(.draft | not) | {tag_name, body, published_at, prerelease}"],
     { encoding: "utf8", maxBuffer: 64 << 20 });
   const releases = out.split("\n").filter(Boolean).map((l) => JSON.parse(l));
   const r = apply(webDir, version, releases);
