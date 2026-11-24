@@ -28,6 +28,8 @@ import { FlowEdge, LoopEdge } from "./builder/edges";
 import { NodePalette, ARCHETYPE_DND_MIME } from "./builder/NodePalette";
 import { StageInspector, type LoopState } from "./builder/StageInspector";
 import { BuilderProvider } from "./builder/BuilderContext";
+import { flowColorMode, NODE_DRAG_THRESHOLD } from "./builder/flowTheme";
+import { useThemeStore } from "../stores/themeStore";
 import {
   draftToGraph,
   graphToStageDrafts,
@@ -85,6 +87,7 @@ function BuilderInner({ pipeline, onClose }: Props) {
     void useRolesStore.getState().load();
   }, []);
   const rf = useReactFlow<StageNodeT, StageEdge>();
+  const colorMode = flowColorMode(useThemeStore((s) => s.theme?.bg));
   const wrapperRef = useRef<HTMLDivElement>(null);
   const [paletteOpen, setPaletteOpen] = useState(true);
   const [tidying, setTidying] = useState(false);
@@ -466,6 +469,8 @@ function BuilderInner({ pipeline, onClose }: Props) {
               onNodeClick={(_, n) => setSelectedId(n.id)}
               onPaneClick={() => setSelectedId(null)}
               onNodeDragStart={() => pushHistory()}
+              nodeDragThreshold={NODE_DRAG_THRESHOLD}
+              forceColorMode={colorMode}
               nodeTypes={nodeTypes}
               edgeTypes={edgeTypes}
               defaultEdgeOptions={defaultEdgeOptions}
@@ -492,9 +497,6 @@ function BuilderInner({ pipeline, onClose }: Props) {
                 className={`octo-flow-minimap !m-4 transition-opacity duration-[220ms] ${
                   miniMapShown ? "" : "pointer-events-none opacity-0"
                 }`}
-                maskColor={`${tokens.onyx}b8`}
-                nodeColor={() => tokens.hairline}
-                nodeStrokeColor={() => tokens.brassDim}
               />
               <Panel position="top-left">
                 <NodePalette

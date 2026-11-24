@@ -1138,6 +1138,43 @@ button:not(:disabled),
    library's default light chrome. Nodes/edges are fully custom components;
    these rules only retheme the handles, controls, minimap, and connection
    line that @xyflow renders itself. */
+
+/* @xyflow v13 fills these variables with `light-dark()` pairs resolved
+   against the OS appearance. The canvas follows the app theme instead: the
+   builder forces the flow's color mode from the active theme
+   (`builder/flowTheme.ts`), and every variable the library would fill from
+   its own palette is set here from tokens, so Onyx and Vellum look the same
+   under light and dark macOS. `flowTheme.test.ts` checks that this block
+   covers each `light-dark()` default in the library's stylesheet. */
+.octo-flow {
+  --xy-background-color: transparent;
+  --xy-background-pattern-color: var(--brass-faint);
+  --xy-edge-stroke: var(--brass-rule-dim);
+  --xy-edge-stroke-selected: var(--color-octo-brass);
+  --xy-connectionline-stroke: var(--brass-dim);
+  --xy-attribution-background-color: transparent;
+  --xy-minimap-background-color: var(--color-octo-panel);
+  --xy-minimap-mask-background-color: color-mix(in srgb, var(--color-octo-onyx) 72%, transparent);
+  --xy-minimap-node-background-color: var(--color-octo-hairline);
+  --xy-minimap-node-stroke-color: var(--brass-dim);
+  --xy-node-color: var(--color-octo-ivory);
+  --xy-node-border: 1px solid var(--color-octo-hairline);
+  --xy-node-background-color: var(--color-octo-panel);
+  --xy-node-boxshadow-hover: none;
+  --xy-node-boxshadow-selected: 0 0 0 1px var(--brass-dim);
+  --xy-handle-background-color: var(--color-octo-onyx);
+  --xy-handle-border-color: var(--brass-dim);
+  --xy-selection-background-color: var(--brass-ghost);
+  --xy-selection-border: 1px dotted var(--brass-dim);
+  --xy-controls-button-background-color: var(--color-octo-panel);
+  --xy-controls-button-background-color-hover: var(--brass-ghost);
+  --xy-controls-button-color: var(--color-octo-sage);
+  --xy-controls-button-color-hover: var(--color-octo-brass);
+  --xy-controls-button-border-color: var(--color-octo-hairline);
+  --xy-controls-box-shadow: none;
+  --xy-edge-label-background-color: var(--color-octo-panel);
+  --xy-edge-label-color: var(--color-octo-ivory);
+}
 .octo-flow .react-flow__handle {
   width: 9px;
   height: 9px;

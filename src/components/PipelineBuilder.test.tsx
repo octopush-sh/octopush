@@ -13,13 +13,17 @@ vi.mock("@xyflow/react", async () => {
     // Render the real custom node components through nodeTypes so a node that
     // reads context (useBuilder) is exercised — catches provider-scope bugs.
     ReactFlow: (props: any) => {
-      const { children, nodes, nodeTypes, edges, edgeTypes, onNodeClick } = props;
+      const { children, nodes, nodeTypes, edges, edgeTypes, onNodeClick, onNodeDragStart } = props;
       return React.createElement(
         "div",
-        { "data-testid": "flow" },
+        { "data-testid": "flow", "data-color-mode": props.forceColorMode, "data-drag-threshold": props.nodeDragThreshold },
         React.createElement("button", {
           "data-testid": "flow-node-select",
           onClick: () => nodes?.[0] && onNodeClick?.({}, nodes[0]),
+        }),
+        React.createElement("button", {
+          "data-testid": "flow-node-drag",
+          onClick: () => nodes?.[0] && onNodeDragStart?.({}, nodes[0], [nodes[0]]),
         }),
         (nodes ?? []).map((n: any) => {
           const Comp = nodeTypes?.[n.type];
@@ -90,6 +94,8 @@ vi.mock("../stores/rolesStore", () => ({
 }));
 
 const { PipelineBuilder } = await import("./PipelineBuilder");
+const { NODE_DRAG_THRESHOLD } = await import("./builder/flowTheme");
+const { useThemeStore } = await import("../stores/themeStore");
 
 const stage = (over: Record<string, unknown>) => ({
   id: "s", pipelineId: "p1", position: 0, role: "plan", agentModel: "claude-haiku-4-5",
@@ -255,10 +261,34 @@ describe("undo/redo", () => {
     expect(screen.getAllByText(/isn't connected/).length).toBeGreaterThan(0); // graph untouched
   });
 
+  it("a click on a stage adds no undo entry; a drag adds one", () => {
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    const undo = screen.getByLabelText(/Undo/) as HTMLButtonElement;
+    fireEvent.click(screen.getByTestId("flow-node-select"));
+    expect(undo.disabled).toBe(true);
+    fireEvent.click(screen.getByTestId("flow-node-drag"));
+    expect(undo.disabled).toBe(false);
+    // The library starts a drag only past this threshold (flowDrag.test.tsx).
+    expect(screen.getByTestId("flow").getAttribute("data-drag-threshold")).toBe(String(NODE_DRAG_THRESHOLD));
+  });
+
   it("undo buttons disable at the stack ends", () => {
     render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
     expect((screen.getByLabelText(/Undo/) as HTMLButtonElement).disabled).toBe(true);
     expect((screen.getByLabelText(/Redo/) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("canvas theme", () => {
+  it("forces the flow's color mode from the app theme, not the OS", () => {
+    useThemeStore.setState({ theme: null });
+    const { unmount } = render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    expect(screen.getByTestId("flow").getAttribute("data-color-mode")).toBe("dark");
+    unmount();
+    useThemeStore.setState({ theme: { name: "vellum", bg: "#f4efe6" } as never });
+    render(<PipelineBuilder pipeline={null} onClose={vi.fn()} />);
+    expect(screen.getByTestId("flow").getAttribute("data-color-mode")).toBe("light");
+    useThemeStore.setState({ theme: null });
   });
 });
 
