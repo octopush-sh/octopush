@@ -1385,7 +1385,10 @@ mod tests {
     fn claude_row_recommends_the_worktree_exit_fix_without_a_verdict() {
         // #1002: a recommendation, not a security fix: the status stays as it was.
         // #1065: every missing row, oldest first, not only the newest.
-        let versions = |c: &ReadinessCheck| c.recommended.iter().map(|f| f.version.as_str()).collect::<Vec<_>>();
+        // A fn, not a closure: a closure can't tie its return's lifetime to its argument.
+        fn versions(c: &ReadinessCheck) -> Vec<&str> {
+            c.recommended.iter().map(|f| f.version.as_str()).collect()
+        }
         let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
         assert_eq!((ok.status, ok.fix.as_deref()), (CheckStatus::Ok, None));
         assert_eq!(versions(&ok), ["2.1.330", "2.1.330", "2.1.331"]);
