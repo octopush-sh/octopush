@@ -160,15 +160,22 @@ fn spawn_plan(cfg: &McpServerConfig, search_path: &str) -> Result<SpawnPlan, Str
                 Some(dir) if command.is_absolute() => dir.display().to_string(),
                 _ => String::new(),
             };
+            // Only absolute dirs: a relative one would resolve against
+            // whatever the server's working directory is.
             merge_path_dirs(&[&own_dir, search_path])
+                .split(':')
+                .filter(|d| Path::new(d).is_absolute())
+                .collect::<Vec<_>>()
+                .join(":")
         }
     };
     let program = if cfg.command.contains('/') {
         std::path::PathBuf::from(&cfg.command)
     } else {
         resolve_executable(&cfg.command, &child_path).ok_or_else(|| {
+            let whose = if own.is_some() { "the server's own PATH" } else { "the PATH Octopush searched" };
             format!(
-                "Octopush couldn't find `{0}` on your PATH. Use its full path (run `which {0}` in Terminal).",
+                "Octopush couldn't find `{0}` on {whose} ({child_path}). Use its full path (run `which {0}` in Terminal).",
                 cfg.command
             )
         })?
@@ -192,9 +199,41 @@ pub fn connection_failure_text(server: &str, reason: &str) -> String {
     );
     if !detail.is_empty() {
         text.push_str("\n\nServer output:\n");
-        text.push_str(detail);
+        text.push_str(&server_output(detail));
     }
     text
+}
+
+/// The most of a server's own output the model is shown, in bytes.
+const SERVER_OUTPUT_CAP: usize = 1024;
+
+/// An OAuth `code=` parameter (an auth URL a bridge such as mcp-remote prints).
+static AUTH_CODE: std::sync::LazyLock<regex::Regex> =
+    std::sync::LazyLock::new(|| regex::Regex::new(r"(?i)\bcode=([^\s&]+)").unwrap());
+
+/// A server's stdout/stderr as the model may read it: token-like values
+/// redacted line by line (`secret_scan::redact_line`: provider key prefixes,
+/// `TOKEN=…`, `Bearer …`; plus `code=…`), then cut to its last
+/// [`SERVER_OUTPUT_CAP`] bytes from a line start, where the error usually is.
+fn server_output(detail: &str) -> String {
+    let redacted: Vec<String> = detail
+        .lines()
+        .map(|line| {
+            let line = crate::secret_scan::redact_line(line, &[]);
+            AUTH_CODE.replace_all(&line, format!("code={}", crate::secret_scan::REDACTED)).into_owned()
+        })
+        .collect();
+    let text = redacted.join("\n");
+    if text.len() <= SERVER_OUTPUT_CAP {
+        return text;
+    }
+    let mut start = text.len() - SERVER_OUTPUT_CAP;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    let tail = tail.split_once('\n').map_or(tail, |(_, rest)| rest);
+    format!("… (earlier output cut)\n{tail}")
 }
 
 /// Why an MCP call failed. Decides what happens to the cached connection and
@@ -275,6 +314,19 @@ pub fn is_mcp_tool(name: &str) -> bool {
 /// request holds the connection lock (a hung `read_line` inside `request`
 /// would otherwise keep the process alive for as long as the server likes).
 type ChildHandle = Arc<Mutex<Child>>;
+
+/// The process one bounded call is using (`call_bounded`), so its timeout
+/// stops that process and no other.
+type CallTarget = Arc<Mutex<Target>>;
+
+#[derive(Default)]
+struct Target {
+    /// Set once the call has its connection, before it sends its request.
+    child: Option<ChildHandle>,
+    /// The bound passed: a call that gets its connection only now never
+    /// sends its request.
+    aborted: bool,
+}
 
 struct Connection {
     child: ChildHandle,
@@ -463,7 +515,8 @@ pub fn server_of(namespaced: &str) -> Option<String> {
 
 /// `registry.call(...)` off the async runtime, bounded by `bound`, with the
 /// error as the model reads it (`McpCallError`'s `Display`). On a timeout
-/// the server process is **stopped** (`abort_server`), so a call reported as
+/// the server process the call was using is **stopped** (`abort_call`: that
+/// connection's process, or the start it waited on), so a call reported as
 /// timed out can never complete later in the background — the blocked
 /// worker gets EOF and returns, and the next call re-spawns the server. The
 /// error says so, and warns that a request the server had already sent (a
@@ -477,7 +530,10 @@ pub async fn call_bounded(
 ) -> Result<String, String> {
     let reg = Arc::clone(&registry);
     let name = namespaced.clone();
-    match tokio::time::timeout(bound, tokio::task::spawn_blocking(move || reg.call(&worktree, &name, &input))).await {
+    let target = CallTarget::default();
+    let t = Arc::clone(&target);
+    let work = tokio::task::spawn_blocking(move || reg.call_on(&worktree, &name, &input, Some(&t)));
+    match tokio::time::timeout(bound, work).await {
         Ok(Ok(Ok(out))) => Ok(out),
         Ok(Ok(Err(e))) => Err(e.to_string()),
         Ok(Err(e)) => Err(format!("MCP error: call task failed: {e}")),
@@ -486,7 +542,7 @@ pub async fn call_bounded(
             if let Some(server) = server.clone() {
                 // Kill + reap off the runtime thread.
                 let reg = Arc::clone(&registry);
-                let _ = tokio::task::spawn_blocking(move || reg.abort_server(&server)).await;
+                let _ = tokio::task::spawn_blocking(move || reg.abort_call(&server, &target)).await;
             }
             Err(format!(
                 "{} The server was stopped, so this call cannot complete later; if it had already \
@@ -515,14 +571,15 @@ impl McpRegistry {
         self.resets.lock().get(name).copied().unwrap_or(0)
     }
 
-    /// The cached connection, if it was started with `cfg`. One started with
-    /// another config is stale (the file was edited, or a project's config
-    /// names the server differently): it is forgotten here, and its process
-    /// ends when the last call still using it lets go.
-    fn cached(&self, name: &str, cfg: &McpServerConfig) -> Option<Arc<Mutex<Connection>>> {
+    /// The cached connection and its process, if it was started with `cfg`.
+    /// One started with another config is stale (the file was edited, or a
+    /// project's config names the server differently): it is forgotten here,
+    /// and its process ends when the last call still using it lets go — or
+    /// when such a call times out (`abort_connection` holds its handle).
+    fn cached(&self, name: &str, cfg: &McpServerConfig) -> Option<(Arc<Mutex<Connection>>, ChildHandle)> {
         let mut conns = self.conns.lock();
         match conns.get(name) {
-            Some(e) if &e.cfg == cfg => return Some(Arc::clone(&e.conn)),
+            Some(e) if &e.cfg == cfg => return Some((Arc::clone(&e.conn), Arc::clone(&e.child))),
             Some(_) => {}
             None => return None,
         }
@@ -546,12 +603,47 @@ impl McpRegistry {
         }
     }
 
-    /// Stop a server now — kill its process and forget the connection — even
-    /// while a request on it is blocked reading, or while its handshake is
-    /// still in flight. That reader gets EOF and returns an error; the next
-    /// call re-spawns the server.
-    pub fn abort_server(&self, name: &str) {
-        self.stop(name, "a call timed out");
+    /// Stop the process a timed-out call was using — kill it and forget its
+    /// connection if it is still the cached one — even while the request is
+    /// blocked reading. That reader gets EOF and returns an error; the next
+    /// call re-spawns the server. Only that process: one started since with
+    /// another config (an entry edited by hand, or a worktree that defines
+    /// the server differently) keeps running.
+    fn abort_connection(&self, name: &str, child: &ChildHandle) {
+        let mut conns = self.conns.lock();
+        let live = match conns.get(name) {
+            Some(e) if Arc::ptr_eq(&e.child, child) => conns.remove(name),
+            _ => None,
+        };
+        drop(conns);
+        tracing::warn!(server = %name, reason = "a call timed out", "stopping MCP server");
+        kill_and_reap(child);
+        drop(live);
+    }
+
+    /// Stop a server's start in progress (its handshake), for a call that
+    /// timed out before it had a connection. A live connection is left alone:
+    /// it isn't the one that call was waiting on.
+    fn abort_start(&self, name: &str) {
+        let pending = self.pending.lock().get(name).cloned();
+        if let Some(child) = pending {
+            tracing::warn!(server = %name, reason = "a call timed out while it started", "stopping MCP server");
+            kill_and_reap(&child);
+        }
+    }
+
+    /// After `call_bounded`'s bound: stop what the call was using, and make
+    /// sure it never sends its request if it hadn't yet.
+    fn abort_call(&self, name: &str, target: &CallTarget) {
+        let child = {
+            let mut t = target.lock();
+            t.aborted = true;
+            t.child.take()
+        };
+        match child {
+            Some(child) => self.abort_connection(name, &child),
+            None => self.abort_start(name),
+        }
     }
 
     /// Kill a server's live and starting processes and forget its
@@ -714,22 +806,37 @@ impl McpRegistry {
     /// Lazily connect (and cache) a server's connection. Spawn + handshake
     /// run under a per-server lock: concurrent first callers (a sub-agent
     /// fan-out) wait for one connection instead of each spawning their own.
-    fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<Arc<Mutex<Connection>>, String> {
-        if let Some(conn) = self.cached(name, cfg) {
-            return Ok(conn);
+    fn ensure(&self, name: &str, cfg: &McpServerConfig) -> Result<(Arc<Mutex<Connection>>, ChildHandle), String> {
+        if let Some(live) = self.cached(name, cfg) {
+            return Ok(live);
         }
         let spawn_lock = Arc::clone(
             self.connecting.lock().entry(name.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))),
         );
         let _spawning = spawn_lock.lock();
-        if let Some(conn) = self.cached(name, cfg) {
-            return Ok(conn);
+        if let Some(live) = self.cached(name, cfg) {
+            return Ok(live);
         }
         if let Some(f) = self.failed.lock().get(name).filter(|f| &f.cfg == cfg) {
-            return Err(format!("it failed to start earlier in this session: {}", f.reason));
+            // Only the cause: the server's output went with the first failure.
+            let cause = f.reason.trim().lines().next().unwrap_or("").trim();
+            return Err(format!("it failed to start earlier in this session: {cause}"));
         }
         let resets = self.reset_count(name);
-        match self.connect(name, cfg) {
+        let started = self.connect(name, cfg);
+        self.finish_start(name, cfg, resets, started)
+    }
+
+    /// Cache a start's connection, or remember its failure — unless the
+    /// server was reset since the start began (`resets` is the count then).
+    fn finish_start(
+        &self,
+        name: &str,
+        cfg: &McpServerConfig,
+        resets: u64,
+        started: Result<Connection, String>,
+    ) -> Result<(Arc<Mutex<Connection>>, ChildHandle), String> {
+        match started {
             Ok(conn) => {
                 let child = Arc::clone(&conn.child);
                 let arc = Arc::new(Mutex::new(conn));
@@ -742,10 +849,11 @@ impl McpRegistry {
                     drop(arc);
                     return Err("it was restarted while starting; try again".into());
                 }
-                let stale = conns.insert(name.to_string(), Entry { conn: Arc::clone(&arc), child, cfg: cfg.clone() });
+                let stale =
+                    conns.insert(name.to_string(), Entry { conn: Arc::clone(&arc), child: Arc::clone(&child), cfg: cfg.clone() });
                 drop(conns);
                 drop(stale);
-                Ok(arc)
+                Ok((arc, child))
             }
             Err(e) => {
                 // Remember the failure so we don't re-spawn it every turn —
@@ -765,7 +873,7 @@ impl McpRegistry {
         let mut out = Vec::new();
         for (name, cfg) in load_server_configs(worktree) {
             match self.ensure(&name, &cfg) {
-                Ok(conn) => out.extend(conn.lock().tools.clone()),
+                Ok((conn, _)) => out.extend(conn.lock().tools.clone()),
                 Err(e) => {
                     tracing::warn!(server = %name, error = %e, "MCP server unavailable; skipping")
                 }
@@ -778,15 +886,34 @@ impl McpRegistry {
     /// result (MCP `tools/call` content blocks joined). A tool that reports
     /// its own failure (`isError`) is a result like any other.
     pub fn call(&self, worktree: &Path, namespaced: &str, input: &Value) -> Result<String, McpCallError> {
+        self.call_on(worktree, namespaced, input, None)
+    }
+
+    /// [`Self::call`], recording the process it uses in `target` before the
+    /// request goes out (`call_bounded`'s abort stops that one).
+    fn call_on(
+        &self,
+        worktree: &Path,
+        namespaced: &str,
+        input: &Value,
+        target: Option<&CallTarget>,
+    ) -> Result<String, McpCallError> {
         let (server, tool) =
             parse_namespaced(namespaced).ok_or_else(|| McpCallError::NotMcpTool(namespaced.to_string()))?;
         let cfgs = load_server_configs(worktree);
         let Some(cfg) = cfgs.get(&server) else {
             return Err(McpCallError::NotConfigured { server });
         };
-        let conn = self
+        let (conn, child) = self
             .ensure(&server, cfg)
             .map_err(|reason| McpCallError::Connection { server: server.clone(), reason })?;
+        if let Some(target) = target {
+            let mut t = target.lock();
+            if t.aborted {
+                return Err(McpCallError::Connection { server, reason: "the call was stopped before it was sent".into() });
+            }
+            t.child = Some(child);
+        }
         let answer = conn.lock().request("tools/call", json!({ "name": tool, "arguments": input }));
         let result = match answer {
             Ok(r) => r,
@@ -1214,8 +1341,31 @@ done
 
         assert_eq!(
             spawn_plan(&command("npx", &[]), "/nonexistent/xyz").unwrap_err(),
-            "Octopush couldn't find `npx` on your PATH. Use its full path (run `which npx` in Terminal)."
+            "Octopush couldn't find `npx` on the PATH Octopush searched (/nonexistent/xyz). Use its full path \
+             (run `which npx` in Terminal)."
         );
+        assert_eq!(
+            spawn_plan(&command("npx", &[("PATH", "/nonexistent/own")]), "/usr/bin").unwrap_err(),
+            "Octopush couldn't find `npx` on the server's own PATH (/nonexistent/own). Use its full path \
+             (run `which npx` in Terminal)."
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_path_entries_are_skipped() {
+        // `npx` in a dir named relative to the working directory: found only
+        // through the relative entry, which is skipped.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = tempfile::tempdir_in(&cwd).unwrap();
+        fake_bin(rel.path(), "npx");
+        let name = rel.path().file_name().unwrap().to_string_lossy().into_owned();
+        let search = format!(".:{name}:/nonexistent/xyz");
+        assert!(spawn_plan(&command("npx", &[]), &search).is_err());
+        let login = tempfile::tempdir().unwrap();
+        fake_bin(login.path(), "npx");
+        let plan = spawn_plan(&command("npx", &[]), &format!("{name}:{}", login.path().display())).unwrap();
+        assert_eq!(plan.path, Some(login.path().display().to_string()), "the server's PATH drops it too");
     }
 
     #[cfg(unix)]
@@ -1265,6 +1415,8 @@ done
         // The script exits without a handshake: only its environment matters.
         assert!(McpRegistry::test_connect("dump", &cfg).is_err());
         let resolved = crate::orchestrator::cli_runner::resolved_cli_path();
+        // Its absolute dirs (`spawn_plan` drops relative ones).
+        let resolved = resolved.split(':').filter(|d| Path::new(d).is_absolute()).collect::<Vec<_>>().join(":");
         assert_eq!(std::fs::read_to_string(&path_dump).unwrap(), resolved, "the PATH CLI stages run with");
         let names: std::collections::HashSet<String> =
             std::fs::read_to_string(&env_dump).unwrap().lines().map(str::to_string).collect();
@@ -1277,8 +1429,10 @@ done
         let err = McpRegistry::test_connect("x", &command("octopush-no-such-server-xyz", &[])).unwrap_err();
         assert_eq!(
             err,
-            "Octopush couldn't find `octopush-no-such-server-xyz` on your PATH. Use its full path (run \
-             `which octopush-no-such-server-xyz` in Terminal)."
+            format!(
+                "Octopush couldn't find `octopush-no-such-server-xyz` on the PATH Octopush searched ({resolved}). \
+                 Use its full path (run `which octopush-no-such-server-xyz` in Terminal)."
+            )
         );
     }
 
@@ -1326,12 +1480,13 @@ done
         assert_eq!(tools.len(), 1);
         assert!(tools[0].read_only, "readOnlyHint is parsed");
         // A call that the server never answers, on its own thread.
-        let (r2, wt) = (Arc::clone(&reg), dir.path().to_path_buf());
-        let worker = std::thread::spawn(move || r2.call(&wt, "mcp__hang__slow", &json!({})));
+        let target = CallTarget::default();
+        let (r2, wt, t2) = (Arc::clone(&reg), dir.path().to_path_buf(), Arc::clone(&target));
+        let worker = std::thread::spawn(move || r2.call_on(&wt, "mcp__hang__slow", &json!({}), Some(&t2)));
         wait_for(&log, "call", 1);
         assert!(!worker.is_finished(), "the call is blocked on the server");
         let started = std::time::Instant::now();
-        reg.abort_server("hang");
+        reg.abort_call("hang", &target);
         let res = worker.join().unwrap();
         assert!(res.is_err(), "the blocked call returns once the server is stopped: {res:?}");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
@@ -1351,7 +1506,8 @@ done
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(!worker.is_finished(), "the handshake is hung");
         let started = std::time::Instant::now();
-        reg.abort_server("hang");
+        // A call with no connection yet: its abort reaches the start.
+        reg.abort_call("hang", &CallTarget::default());
         assert_eq!(worker.join().unwrap(), 0, "the hung connect fails instead of blocking forever");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
         assert!(reg.pending.lock().is_empty() && reg.conns.lock().is_empty());
@@ -1402,6 +1558,101 @@ done
             assert_eq!(h.join().unwrap(), 1);
         }
         assert_eq!(log_lines(&log, "start"), 1, "one process for four callers");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_timeout_stops_the_process_its_call_was_on_not_a_newer_one() {
+        let (dir, log) = hanging_worktree();
+        let reg = Arc::new(McpRegistry::new());
+        let call = tokio::spawn(call_bounded(
+            Arc::clone(&reg),
+            dir.path().to_path_buf(),
+            "mcp__hang__slow".into(),
+            json!({}),
+            std::time::Duration::from_secs(3),
+        ));
+        let (r2, wt, l2) = (Arc::clone(&reg), dir.path().to_path_buf(), log.clone());
+        let (old, new) = tokio::task::spawn_blocking(move || {
+            wait_for(&l2, "call", 1);
+            let old = Arc::clone(&r2.conns.lock()["hang"].child);
+            // The entry is edited by hand while the call hangs: the next use
+            // starts a second process with the new config.
+            write_servers(&wt, &HashMap::from([("hang".to_string(), fixture_config(&wt, &[("V", "2")]))]));
+            assert_eq!(r2.list_tools(&wt).len(), 1);
+            let new = Arc::clone(&r2.conns.lock()["hang"].child);
+            (old, new)
+        })
+        .await
+        .unwrap();
+        assert!(!Arc::ptr_eq(&old, &new));
+        let err = call.await.unwrap().unwrap_err();
+        assert!(err.contains("timed out") && err.contains("server was stopped"), "{err}");
+        assert!(reaped(&old), "the hung call's process was stopped");
+        assert!(!reaped(&new), "the newer process keeps running");
+        assert!(Arc::ptr_eq(&reg.conns.lock()["hang"].child, &new), "and stays cached");
+        assert_eq!(log_lines(&log, "start"), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_that_completes_after_a_reset_is_discarded() {
+        let (dir, log, servers) = echo_worktree("pong");
+        let reg = McpRegistry::new();
+        let cfg = &servers["fix"];
+        let resets = reg.reset_count("fix");
+        // The handshake finished, and the reset lands before it is cached.
+        let started = reg.connect("fix", cfg);
+        let child = Arc::clone(&started.as_ref().unwrap().child);
+        reg.reset_server("fix");
+        let err = reg.finish_start("fix", cfg, resets, started).err().unwrap();
+        assert!(err.contains("restarted while starting"), "{err}");
+        assert!(reg.conns.lock().is_empty(), "the old start isn't cached");
+        assert!(reaped(&child), "and its process was stopped");
+        // A failure from before the reset isn't remembered either.
+        assert!(reg.finish_start("fix", cfg, resets, Err("boom".into())).is_err());
+        assert!(reg.failed.lock().is_empty());
+        assert_eq!(reg.call(dir.path(), "mcp__fix__echo", &json!({})).unwrap(), "pong");
+        assert_eq!(log_lines(&log, "start"), 2, "the next call started a fresh server");
+    }
+
+    #[test]
+    fn server_output_is_redacted_and_capped() {
+        let gh = format!("ghp_{}", "a".repeat(36));
+        let reason = format!(
+            "MCP server closed the connection\nOpen https://auth.example/cb?code=s3cr3tc0de&state=1\n\
+             Authorization: Bearer abcdefgh12345678\nACCESS_TOKEN=tok-value-123 and {gh}"
+        );
+        let text = connection_failure_text("jira", &reason);
+        for secret in ["s3cr3tc0de", "abcdefgh12345678", "tok-value-123", gh.as_str()] {
+            assert!(!text.contains(secret), "{secret} in {text}");
+        }
+        assert!(text.contains("cb?code=[redacted]&state=1") && text.contains("Bearer [redacted]"), "{text}");
+
+        let lines: Vec<String> = (0..200).map(|i| format!("line {i}")).collect();
+        let text = connection_failure_text("jira", &format!("closed\n{}", lines.join("\n")));
+        let output = text.split_once("Server output:\n").unwrap().1;
+        assert!(output.len() <= SERVER_OUTPUT_CAP + 32, "{} bytes", output.len());
+        assert!(output.starts_with("… (earlier output cut)\nline "), "{output}");
+        assert!(output.ends_with("line 199"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_failure_shows_its_output_once() {
+        const NOISY_FAILURE: &str =
+            "#!/usr/bin/env bash\necho start >> \"$SPAWN_LOG\"\nread -r line\necho 'auth failed: token=abcdef123456'\nexit 1\n";
+        let (dir, _log) = fixture_worktree(NOISY_FAILURE);
+        let reg = McpRegistry::new();
+        let first = reg.call(dir.path(), "mcp__hang__x", &json!({})).unwrap_err().to_string();
+        assert!(first.contains("Server output:\nauth failed: token=[redacted]"), "{first}");
+        assert!(!first.contains("abcdef123456"), "{first}");
+        let again = reg.call(dir.path(), "mcp__hang__x", &json!({})).unwrap_err().to_string();
+        assert!(
+            again.contains("failed: it failed to start earlier in this session: MCP server closed the connection."),
+            "{again}"
+        );
+        assert!(!again.contains("Server output") && !again.contains("auth failed"), "{again}");
     }
 
     #[test]

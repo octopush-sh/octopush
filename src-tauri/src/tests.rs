@@ -12991,6 +12991,18 @@ mod cli_path_tests {
         assert_eq!(found, bin);
 
         assert!(resolve_executable("does-not-exist-xyz", &path_env).is_none());
+
+        // A relative entry would resolve against the working directory: skipped.
+        let cwd = std::env::current_dir().unwrap();
+        let rel = pathdiff_rel(dir.path(), &cwd);
+        assert!(resolve_executable("claude", &format!(".:{rel}")).is_none(), "{rel}");
+    }
+
+    /// `to` written relative to `from` (`../../tmp/x`), so it isn't absolute.
+    fn pathdiff_rel(to: &std::path::Path, from: &std::path::Path) -> String {
+        let depth = from.components().count().saturating_sub(1);
+        let up = "../".repeat(depth);
+        format!("{up}{}", to.strip_prefix("/").unwrap().display())
     }
 
     #[test]
