@@ -118,6 +118,13 @@ pub(crate) struct CliUsage {
     /// [`usage_from_stream_event`]; `None` means the stage's model.
     #[serde(skip)]
     pub(crate) model: Option<String>,
+    /// The usage is ONE request's (a Claude Code `assistant` message), so its
+    /// own prompt size picks a per-request price tier
+    /// ([`crate::token_engine::request_prices`]). Only set per message by
+    /// [`usage_from_stream_event`]; a Codex turn total or a sum spans many
+    /// requests and keeps the base tier.
+    #[serde(skip)]
+    pub(crate) one_request: bool,
 }
 
 fn one_hour_writes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u64, D::Error> {
@@ -167,6 +174,7 @@ pub(crate) fn usage_from_stream_event(v: &Value) -> Option<(Option<String>, CliU
             cache_creation_1h_input_tokens: crate::token_engine::one_hour_cache_writes(u),
             fast: crate::token_engine::is_fast(crate::token_engine::usage_speed(u).as_deref()),
             model: msg.get("model").and_then(Value::as_str).filter(|m| !m.is_empty()).map(str::to_string),
+            one_request: true,
         },
     ))
 }
@@ -2683,6 +2691,7 @@ pub(crate) fn codex_usage_from_event(v: &Value) -> Option<(Option<String>, CliUs
             cache_creation_1h_input_tokens: 0,
             fast: false,
             model: None,
+            one_request: false,
         },
     ))
 }
@@ -4628,7 +4637,10 @@ pub(crate) struct StreamedEstimate {
 /// subagent may run on another model), falling back to the stage's `model` —
 /// and each group is priced for its own model through the normal catalog:
 /// standard speed at the model's price, fast mode at its fast rate
-/// (`token_engine::prices_at_speed`). A group with no price (an unknown
+/// (`token_engine::prices_at_speed`). Inside a group each Claude message is
+/// priced on its own (`token_engine::request_cost_split`), so a request over
+/// a long-prompt threshold (Haiku 5.5 past 100K) pays its own tier; a Codex
+/// turn total spans many requests and keeps the base tier. A group with no price (an unknown
 /// model, or fast mode on a model with no fast rate) is never billed at
 /// another rate and never read as free: it lands in `unpriced`, except a
 /// stage whose usage is all its own unpriced model at standard speed — the
@@ -4636,15 +4648,17 @@ pub(crate) struct StreamedEstimate {
 /// no tokens, or on a CLI placeholder model (`<synthetic>`, which Claude Code
 /// stamps on its own error messages), billed nothing and is never unpriced.
 pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<String, CliUsage>) -> StreamedEstimate {
-    use crate::token_engine::{normalize_model_id, prices_at_speed, prices_for, SPEED_FAST};
+    use crate::token_engine::{normalize_model_id, prices_at_speed, prices_for, request_cost_split, SPEED_FAST};
     let stage = normalize_model_id(model);
-    let mut groups: std::collections::BTreeMap<(String, bool), (String, CliUsage)> = std::collections::BTreeMap::new();
+    let mut groups: std::collections::BTreeMap<(String, bool), (String, CliUsage, Vec<&CliUsage>)> =
+        std::collections::BTreeMap::new();
     for u in map.values() {
         let m = u.model.as_deref().unwrap_or(model);
         let entry = groups
             .entry((normalize_model_id(m), u.fast))
-            .or_insert_with(|| (m.to_string(), CliUsage::default()));
+            .or_insert_with(|| (m.to_string(), CliUsage::default(), Vec::new()));
         entry.1.add(u);
+        entry.2.push(u);
     }
     let mut all = CliUsage::default();
     let mut priced = CliUsage::default();
@@ -4652,20 +4666,23 @@ pub(crate) fn streamed_estimate(model: &str, map: &std::collections::HashMap<Str
     let mut cost = 0.0;
     let mut unpriced = Vec::new();
     let mut only_stage_model_unpriced = true;
-    for ((key, fast), (m, u)) in &groups {
+    for ((key, fast), (m, u, messages)) in &groups {
         all.add(u);
         let speed = if *fast { Some(SPEED_FAST) } else { None };
         match prices_at_speed(m, prices_for(m), speed) {
             Some(p) => {
                 any_priced = true;
                 priced.add(u);
-                cost += p.cost_split(
-                    u.input_tokens,
-                    u.output_tokens,
-                    u.cache_read_input_tokens,
-                    u.cache_creation_input_tokens,
-                    u.cache_creation_1h_input_tokens,
-                );
+                for one in messages {
+                    let (i, o, r, w, w1h) = (
+                        one.input_tokens,
+                        one.output_tokens,
+                        one.cache_read_input_tokens,
+                        one.cache_creation_input_tokens,
+                        one.cache_creation_1h_input_tokens,
+                    );
+                    cost += if one.one_request { request_cost_split(m, p, i, o, r, w, w1h) } else { p.cost_split(i, o, r, w, w1h) };
+                }
             }
             None if u.total() == 0 || m.starts_with('<') => {}
             None => {

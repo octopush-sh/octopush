@@ -13629,6 +13629,42 @@ mod live_tests {
         assert!(notices.iter().any(|n| n.contains("run budget reached mid-stage")), "{notices:?}");
     }
 
+    #[tokio::test]
+    #[serial_test::serial(pricing_catalog)]
+    async fn agentic_loop_prices_each_haiku_5_5_request_at_its_own_tier() {
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn main() {}\n").unwrap();
+        let sized = |mut r: LlmResponse, input: u64, read: u64, output: u64| {
+            (r.input_tokens, r.cache_read_tokens, r.output_tokens) = (input, read, output);
+            r
+        };
+        // A 40K-token request that calls a tool, then a 140K-token answer.
+        let provider = ScriptedProvider { turns: Mutex::new(VecDeque::from(vec![
+            sized(resp("reading",
+                       vec![LlmToolUse { id: "t".into(), name: "read_file".into(),
+                             input: serde_json::json!({"path": "a.rs"}) }],
+                       LlmStopReason::ToolUse), 10_000, 30_000, 1_000),
+            sized(resp("done", vec![], LlmStopReason::EndTurn), 20_000, 120_000, 2_000),
+        ])) };
+        let rec = Recorder { events: Mutex::new(vec![]) };
+        let em = LiveEmitter::new(&rec, "r", "s");
+        let client = reqwest::Client::new();
+        let out = run_agentic_loop(&provider, "http://x", None, &client, "claude-haiku-5-5",
+                                   "sys", crate::orchestrator::agentic::user_messages("do it"), dir.path(), 10,
+                                   &std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)), &em, None, None, None, false,
+                                   None, &[], None,
+                                   None,).await.unwrap();
+        assert!(out.finished);
+        assert_eq!((out.input_tokens, out.cache_read_tokens, out.output_tokens), (30_000, 150_000, 3_000));
+        // 40K at 0.10 / 0.01 / 0.50; 140K at 0.50 / 0.05 / 2.50 — not the
+        // 180K sum at either one tier.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        assert!((out.cost_usd - (short + long)).abs() < 1e-12, "{}", out.cost_usd);
+    }
+
     #[test]
     fn cli_usage_from_stream_events_dedupes_by_message_id() {
         use crate::orchestrator::cli_runner::usage_from_stream_event;
@@ -13712,6 +13748,51 @@ mod live_tests {
         // others still bill at $4/$20.
         let c = streamed_cost("claude-opus-5-5", &map);
         assert!((c - 2.0 * (1_000.0 * 4.0 + 100.0 * 20.0) / 1e6).abs() < 1e-12, "{c}");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_haiku_5_5_stage_prices_each_streamed_request_at_its_own_tier() {
+        use crate::orchestrator::cli_runner::{streamed_cost, usage_from_stream_event};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        let mk = |id: &str, input: u64, read: u64, output: u64| serde_json::json!({
+            "type": "assistant",
+            "message": { "id": id, "model": "claude-haiku-5-5", "usage": { "input_tokens": input,
+                "output_tokens": output, "cache_read_input_tokens": read, "cache_creation_input_tokens": 0 } }
+        });
+        // A 40K-token request, then a 140K-token one streamed as two content
+        // blocks that repeat the same message's usage.
+        let events = [mk("msg_short", 10_000, 30_000, 1_000), mk("msg_long", 20_000, 120_000, 2_000), mk("msg_long", 20_000, 120_000, 2_000)];
+        let mut map = std::collections::HashMap::new();
+        for ev in &events {
+            let (id, u) = usage_from_stream_event(ev).unwrap();
+            assert!(u.one_request);
+            map.insert(id.unwrap(), u);
+        }
+        assert_eq!(map.len(), 2, "the repeated message id counts once");
+        // 40K at 0.10 / 0.01 / 0.50; 140K at 0.50 / 0.05 / 2.50.
+        let short = (10_000.0 * 0.10 + 30_000.0 * 0.01 + 1_000.0 * 0.50) / 1e6;
+        let long = (20_000.0 * 0.50 + 120_000.0 * 0.05 + 2_000.0 * 2.50) / 1e6;
+        let c = streamed_cost("claude-haiku-5-5", &map);
+        assert!((c - (short + long)).abs() < 1e-12, "{c}");
+    }
+
+    #[test]
+    #[serial_test::serial(pricing_catalog)]
+    fn a_stopped_codex_stage_keeps_the_base_tier_for_its_turn_totals() {
+        use crate::orchestrator::cli_runner::{codex_usage_from_event, streamed_cost};
+        // Isolated catalog: never the owner's ~/.octopush/providers.json.
+        let _cfg = crate::provider_router::TestConfigDir::new();
+        // A turn total spans many requests, so its 300K input isn't one
+        // request over GPT-6's 272K threshold.
+        let ev = serde_json::json!({ "type": "turn.completed",
+            "usage": { "input_tokens": 300_000, "cached_input_tokens": 0, "output_tokens": 1_000 } });
+        let (_, u) = codex_usage_from_event(&ev).unwrap();
+        assert!(!u.one_request);
+        let map = std::collections::HashMap::from([("turn".to_string(), u)]);
+        let c = streamed_cost("gpt-6.1-terra", &map);
+        assert!((c - (300_000.0 * 1.0 + 1_000.0 * 5.0) / 1e6).abs() < 1e-12, "{c}");
     }
 
     /// One streamed assistant message: 1,000 in / 100 out, on `model` (none
