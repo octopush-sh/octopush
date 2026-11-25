@@ -9,8 +9,8 @@
 //! its exit code is read.
 
 use crate::agent_adapter::{
-    claude_recommended_notice, codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
-    CLAUDE_LOGIN_END_SINCE, TESTED_CLAUDE_FLOOR,
+    claude_recommended_fixes, codex_security_notice, parse_claude_version, parse_codex_version, version_below, ClaudeCliVersion, ClaudeLoginProbe,
+    RecommendedFix, CLAUDE_LOGIN_END_SINCE, CLAUDE_RECOMMENDED_FIXES, TESTED_CLAUDE_FLOOR,
 };
 use serde::Serialize;
 use std::io::Read;
@@ -52,21 +52,21 @@ pub struct ReadinessCheck {
     /// A copyable command that fixes it.
     pub command: Option<String>,
     pub timed_out: bool,
-    /// A recommendation that is no verdict, whatever the status: the Claude
-    /// Code row's [`crate::agent_adapter::claude_recommended_notice`]. The
-    /// card decides when it shows.
-    pub note: Option<String>,
+    /// Recommendations that are no verdict, whatever the status: the Claude
+    /// Code row's missing [`crate::agent_adapter::CLAUDE_RECOMMENDED_FIXES`]
+    /// rows, oldest first. The card decides, by audience, which show.
+    pub recommended: Vec<RecommendedFix>,
 }
 
 impl ReadinessCheck {
     fn ok(id: &str, label: &str, value: impl Into<String>) -> Self {
         let (id, label, value) = (id.into(), label.into(), value.into());
-        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false, note: None }
+        Self { id, label, status: CheckStatus::Ok, value, fix: None, command: None, timed_out: false, recommended: vec![] }
     }
 
     fn not_ok(id: &str, label: &str, status: CheckStatus, value: &str, fix: &str, command: Option<&str>) -> Self {
         let (id, label, value, fix) = (id.into(), label.into(), value.into(), Some(fix.into()));
-        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false, note: None }
+        Self { id, label, status, value, fix, command: command.map(Into::into), timed_out: false, recommended: vec![] }
     }
 
     fn timed_out(id: &str, label: &str, command: &str) -> Self {
@@ -610,8 +610,8 @@ pub fn claude_check(probe: Probe, floor: &str) -> ReadinessCheck {
                     (None, None) => ReadinessCheck::ok(ID, LABEL, v),
                 },
             };
-            let note = info.version.as_deref().and_then(claude_recommended_notice);
-            ReadinessCheck { note, ..row }
+            let recommended = info.version.as_deref().map_or_else(Vec::new, |v| claude_recommended_fixes(v, CLAUDE_RECOMMENDED_FIXES));
+            ReadinessCheck { recommended, ..row }
         }
     }
 }
@@ -1384,18 +1384,23 @@ mod tests {
     #[test]
     fn claude_row_recommends_the_worktree_exit_fix_without_a_verdict() {
         // #1002: a recommendation, not a security fix: the status stays as it was.
-        let note = "Recommended: Claude Code 2.1.330 fixes ExitWorktree removing a worktree another session is using.";
+        // #1065: every missing row, oldest first, not only the newest.
+        let versions = |c: &ReadinessCheck| c.recommended.iter().map(|f| f.version.as_str()).collect::<Vec<_>>();
         let ok = claude_check(probe("echo '2.1.325 (Claude Code)'"), "2.1.314");
-        assert_eq!((ok.status, ok.fix.as_deref(), ok.note.as_deref()), (CheckStatus::Ok, None, Some(note)));
+        assert_eq!((ok.status, ok.fix.as_deref()), (CheckStatus::Ok, None));
+        assert_eq!(versions(&ok), ["2.1.330", "2.1.330", "2.1.331"]);
+        assert!(ok.recommended[0].reason.contains("ExitWorktree"), "{:?}", ok.recommended);
         let old = claude_check(probe("echo '2.1.307 (Claude Code)'"), "2.1.314");
-        assert_eq!((old.status, old.note.as_deref()), (CheckStatus::Warn, Some(note)));
-        for current in ["2.1.330", "2.1.331", "2.2.0"] {
+        assert_eq!((old.status, versions(&old).len()), (CheckStatus::Warn, 3));
+        let one_short = claude_check(probe("echo '2.1.330 (Claude Code)'"), "2.1.314");
+        assert_eq!((one_short.status, versions(&one_short)), (CheckStatus::Ok, vec!["2.1.331"]));
+        for current in ["2.1.331", "2.2.0"] {
             let row = claude_check(probe(&format!("echo '{current} (Claude Code)'")), "2.1.314");
-            assert_eq!((row.status, row.note), (CheckStatus::Ok, None), "{current}");
+            assert_eq!((row.status, row.recommended), (CheckStatus::Ok, vec![]), "{current}");
         }
-        assert_eq!(claude_check(Probe::Missing, "2.1.314").note, None);
-        assert_eq!(claude_check(probe("echo 2.1.316; exit 1"), "2.1.314").note, None, "an unknown version never recommends");
-        assert_eq!(git_check(probe("echo 'git version 2.39.3'")).note, None);
+        assert_eq!(claude_check(Probe::Missing, "2.1.314").recommended, vec![]);
+        assert_eq!(claude_check(probe("echo 2.1.316; exit 1"), "2.1.314").recommended, vec![], "an unknown version never recommends");
+        assert_eq!(git_check(probe("echo 'git version 2.39.3'")).recommended, vec![]);
     }
 
     #[test]

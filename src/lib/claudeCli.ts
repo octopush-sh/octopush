@@ -2,7 +2,8 @@
 // tested with (`agent_adapter::TESTED_CLAUDE_FLOOR`) and the security fixes it
 // may lack (`CLAUDE_SECURITY_FIXES`). An old CLI is a warning in Settings ›
 // Integrations and the Direct launcher — it never blocks a run.
-import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote } from "./ipc";
+import { ipc, type ClaudeCliVersion, type ClaudeModelFloorNote, type PipelineWithStages, type RecommendedFix, type Routine } from "./ipc";
+import { routineOverrides } from "./modelRetirement";
 import codexCatalog from "./codexEffortLevels.json";
 
 /** Why an old CLI matters, in one line (shared by every surface that warns). */
@@ -125,6 +126,31 @@ export function crewClaudeModels(
     .flatMap((s) => [overrides[s.position] || s.agentModel, s.escalateModel ?? ""])
     .filter((m) => m && runsOnClaudeCode(m));
   return [...new Set(models)];
+}
+
+/** Whether a saved crew, or a Routine with its model overrides, has a Claude
+ *  Code CLI stage (its model or its escalation model). */
+export function libraryUsesClaudeCode(pipelines: PipelineWithStages[], routines: Routine[]): boolean {
+  if (pipelines.some((p) => crewClaudeModels(p.stages, {}).length > 0)) return true;
+  return routines.some((r) => {
+    const crew = pipelines.find((p) => p.pipeline.id === r.pipelineId);
+    return !!crew && crewClaudeModels(crew.stages, routineOverrides(r.stageOverrides)).length > 0;
+  });
+}
+
+/** The Readiness card's Claude Code note: every missing fix whose audience is
+ *  there (`run` while a Run-mode session runs Claude Code; `any` then, or
+ *  while a crew or Routine has a Claude Code CLI stage), oldest first. Null
+ *  when none shows. Never a verdict. */
+export function claudeRecommendedNote(
+  fixes: RecommendedFix[] | undefined,
+  where: { inRun: boolean; inCrews: boolean },
+): string | null {
+  const shown = (fixes ?? []).filter((f) => where.inRun || (f.audience === "any" && where.inCrews));
+  if (shown.length === 0) return null;
+  if (shown.length === 1) return `Recommended: Claude Code ${shown[0].version} ${shown[0].reason}.`;
+  const newest = shown[shown.length - 1].version;
+  return `Recommended: Claude Code ${newest}. ${shown.map((f) => `${f.version} ${f.reason}.`).join(" ")}`;
 }
 
 /** "Ship runs on Codex, whose sandbox keeps .git read-only, so it can't

@@ -270,20 +270,51 @@ pub fn known_bad_stage_error(
 /// How [`known_bad_stage_error`]'s first line starts; `stageHalt.ts` reads it.
 pub const KNOWN_BAD_STAGE_PREFIX: &str = "Skip Claude Code ";
 
+/// Who a [`CLAUDE_RECOMMENDED_FIXES`] row matters to; the Readiness card
+/// shows it only then (`ReadinessCard.tsx`).
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RecommendedAudience {
+    /// While a Run-mode session runs Claude Code.
+    Run,
+    /// That, or while a saved crew or Routine has a Claude Code CLI stage.
+    Any,
+}
+
 /// Claude Code releases worth updating to that fix no sandbox or permission
-/// escape, oldest first: (version, why it matters in one line). They never
-/// warn a stage or the launcher; the Readiness card's Claude Code row shows
-/// the newest one missing as a recommended note while a Run-mode session runs
-/// Claude Code (`ReadinessCard.tsx`).
-pub const CLAUDE_RECOMMENDED_FIXES: &[(&str, &str)] = &[
-    ("2.1.330", "fixes ExitWorktree removing a worktree another session is using"),
+/// escape, oldest first: (version, why it matters in one line, audience).
+/// They never warn a stage or the launcher; the Readiness card's Claude Code
+/// row lists every one missing whose audience is there as a recommended note.
+pub const CLAUDE_RECOMMENDED_FIXES: &[(&str, &str, RecommendedAudience)] = &[
+    ("2.1.330", "fixes ExitWorktree removing a worktree another session is using", RecommendedAudience::Run),
+    (
+        "2.1.330",
+        "fixes settings changes being lost when several Claude Code processes save them at once",
+        RecommendedAudience::Any,
+    ),
+    ("2.1.331", "fixes MCP tool calls hanging up to 30 minutes on a malformed server reply", RecommendedAudience::Any),
 ];
 
-/// "Recommended: Claude Code 2.1.330 fixes …" when the known `version` lacks
-/// a [`CLAUDE_RECOMMENDED_FIXES`] row; `None` otherwise.
-pub fn claude_recommended_notice(version: &str) -> Option<String> {
-    let (fix, reason) = missing_security_fix(version, CLAUDE_RECOMMENDED_FIXES)?;
-    Some(format!("Recommended: Claude Code {fix} {reason}."))
+/// A [`CLAUDE_RECOMMENDED_FIXES`] row the installed Claude Code lacks.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RecommendedFix {
+    pub version: String,
+    /// "fixes …", one line.
+    pub reason: String,
+    pub audience: RecommendedAudience,
+}
+
+/// Every row of `table` (shaped like [`CLAUDE_RECOMMENDED_FIXES`]) the known
+/// `version` is below, oldest first; empty when it has them all or the
+/// version doesn't parse.
+pub fn claude_recommended_fixes(version: &str, table: &[(&str, &str, RecommendedAudience)]) -> Vec<RecommendedFix> {
+    let mut missing: Vec<_> = table.iter().filter(|(fix, _, _)| version_below(version, fix)).collect();
+    missing.sort_by_key(|(fix, _, _)| version_key(fix));
+    missing
+        .into_iter()
+        .map(|&(v, reason, audience)| RecommendedFix { version: v.into(), reason: reason.into(), audience })
+        .collect()
 }
 
 /// Codex CLI releases that fix a sandbox or permission escape, oldest first:
@@ -1718,6 +1749,34 @@ mod tests {
         assert_eq!(rec(None, "2.1.314"), "2.1.314", "an unknown version lacks no fix");
         // A floor already past every fix wins.
         assert_eq!(rec(Some("2.1.300"), "2.1.320"), "2.1.320");
+    }
+
+    #[test]
+    fn recommended_fixes_list_every_missing_row_oldest_first() {
+        use RecommendedAudience::{Any, Run};
+        let missing = |v: &str| {
+            claude_recommended_fixes(v, CLAUDE_RECOMMENDED_FIXES).into_iter().map(|f| (f.version, f.audience)).collect::<Vec<_>>()
+        };
+        let all = vec![("2.1.330".to_string(), Run), ("2.1.330".to_string(), Any), ("2.1.331".to_string(), Any)];
+        // #1065: a 2.1.329 user still learns about ExitWorktree, not only the newest fix.
+        assert_eq!(missing("2.1.329"), all);
+        assert_eq!(missing("2.1.330"), vec![("2.1.331".to_string(), Any)]);
+        assert_eq!(missing("2.1.331"), vec![]);
+        assert_eq!(missing("2.2.0"), vec![]);
+        assert_eq!(missing("unknown"), vec![], "an unknown version never recommends");
+
+        let fixes = claude_recommended_fixes("2.1.329", CLAUDE_RECOMMENDED_FIXES);
+        assert!(fixes.iter().all(|f| f.reason.starts_with("fixes ")), "{fixes:?}");
+        assert!(fixes[0].reason.contains("ExitWorktree"));
+        assert!(fixes[1].reason.contains("settings"));
+        assert!(fixes[2].reason.contains("MCP tool calls hanging"));
+
+        // Oldest first whatever the table order; a row keeps its audience.
+        let table = [("2.1.9", "fixes b", Any), ("2.1.2", "fixes a", Run)];
+        let got = claude_recommended_fixes("2.1.1", &table);
+        assert_eq!(got.iter().map(|f| (f.reason.as_str(), f.audience)).collect::<Vec<_>>(), [("fixes a", Run), ("fixes b", Any)]);
+        let json = serde_json::to_string(&got[0]).unwrap();
+        assert_eq!(json, r#"{"version":"2.1.2","reason":"fixes a","audience":"run"}"#);
     }
 
     #[test]
